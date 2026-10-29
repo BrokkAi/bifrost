@@ -94,12 +94,15 @@ apply to policy mode:
 - `--explain-finding`, `--explain-candidate`, and `--explain-near-misses`
   exclude each other. None can be combined with `--format`, `--fail-on`,
   `--suppressions-file`, `--scope-file`, `--baseline-file`,
-  `--accept-current`, `--evaluation-date`, `--diff-base`, `--policy-timings`,
+  `--accept-current`, `--evaluation-date`, `--diff-base`, `--policy-timings`, `--policy-cost-hints`,
   `--verbose`, `--color`, or `--sources`. An explanation needs an explicit
   `--policy-file` or built-in selector, and the selection must resolve to one
   policy. `--explain-near-misses N` accepts 1 to 64.
 - `--explain-generation HEX` requires one of the three explanation flags.
 - `--verbose` and `--color` require `--format human`.
+- `--policy-cost-hints <path>` reads a JSON object mapping non-empty policy IDs
+  to non-negative integer milliseconds. Parallel batches start unknown policies
+  first, then hinted policies from longest to shortest; hints never change the report.
 - `--policy-timings` adds each policy's elapsed evaluation time to its report
   work metrics. It also prints the stage timings to standard error as one
   JSON object after the text `bifrost: policy stage timings`.
@@ -609,15 +612,45 @@ Compose a typed endpoint set from catalogs, endpoint matches, and local entries.
 
 ```lisp
 (catalog :name ID :version N [:sha256 HEX])
+(catalog :any-registered true :categories (any|all [CATEGORY...]))
 ```
 
 Reference an explicitly registered, optionally content-pinned taint catalog. Legal in: policy, `taint`.
 
 | Field | Required | Value | Meaning |
 | --- | --- | --- | --- |
+| `:any-registered` | optional | `true` | Select registered catalogs; requires `:categories` and excludes `:name`, `:version`, and `:sha256`. |
+| `:categories` | optional | `(any|all [CATEGORY...])` | Filter wildcard entries by declared categories. |
 | `:name` | required | a stable lowercase policy identifier | `:name "catalog.id"`. Name an explicitly registered catalog. |
 | `:version` | required | a positive integer | `:version N`. Select an exact positive catalog version. |
 | `:sha256` | optional | a lowercase 64-hex SHA-256 value | `:sha256 "64-lower-hex"`. Optionally pin canonical typed catalog content. |
+
+A rule pack may declare `catalogs` in `manifest.json`, for example
+`"catalogs": [{"path": "catalogs/jdk-sinks.json", "semantic_hash": "<64-lowercase-hex>"}]`.
+Paths are portable and relative to the pack root. Catalog JSON uses schema 1,
+`name`, positive integer `version`, a declared `categories` vocabulary, and
+`sources`, `sinks`, `sanitizers`, `transforms`, and `external_models` arrays.
+Every entry category must belong to that catalog's vocabulary. Sanitizer,
+transform and external-model entries accept optional `categories`; omission
+means no categories. Policy-local auxiliary entries accept the same field.
+The semantic hash pins canonical typed content, including the vocabulary.
+Hash mismatches and conflicting duplicate name/version identities fail the run.
+
+Use `(catalog :any-registered true :categories (any [sql-injection]))` in
+`:include-sets` to select entries across all catalogs registered for this run.
+`all` requires every listed category. Unknown categories are errors naming the
+unknown identifier; predicates use the union of registered vocabularies.
+Filtering precedes endpoint limits. Uncategorized auxiliary entries are excluded
+from wildcard selection, and remain available through named references.
+A wildcard that selects no entries is an error, including in an optional auxiliary
+set or an empty registry.
+A wildcard cannot be used in an exact `endpoint-ref`. Named references retain
+their exact version and optional hash pin. The output's `packs.catalogs` lists
+matched identities (`name`, `version`, `sha256`); finding provenance identifies
+both the catalog and entry. Catalog-dependent policies read catalog content
+from installed pack roots for each run, including dependencies imported through
+endpoint-set files. Explicit policies without catalog dependencies do not open
+unused installation roots. Catalog content is dropped with its run.
 
 #### `match-directory`
 
@@ -758,17 +791,64 @@ Declare one policy-local taint sink. Legal in: policy, `taint`.
 
 ```lisp
 (sanitizer :id ID :selector SELECTOR :input PORT :output PORT :removes [LABEL...])
+(sanitizer :id ID :selector SELECTOR
+  :when (result true|false|nil|non-nil [:index k])
+  :sanitizes receiver|(argument :index k)
+  [:requires [REQUIREMENT...]] :removes [LABEL...])
 ```
 
-Declare one policy-local sanitizer transfer. Legal in: policy, `taint`.
+Declare one policy-local sanitizer. Legal in: policy, `taint`. Use exactly one
+form: a transfer with `:input` and `:output`, or a conditional sanitizer with
+`:when` and `:sanitizes`. Do not mix the two forms.
 
 | Field | Required | Value | Meaning |
 | --- | --- | --- | --- |
 | `:id` | required | a lowercase local entry identifier | `:id "entry-id"`. Set the sanitizer identity. |
 | `:selector` | required | an inline rql or deferred rql-file selector | `:selector SELECTOR`. Select sanitizer calls or values. |
-| `:input` | required | matched-value, receiver, return-value, an indexed result record, or an argument record | `:input PORT`. Bind the sanitizer input value. |
-| `:output` | required | matched-value, receiver, return-value, an indexed result record, or an argument record | `:output PORT`. Bind the sanitizer output value. |
-| `:removes` | required | normalized taint labels; set (no duplicates) of 1 to 64 items | `:removes [LABEL...]`. Declare the non-empty labels removed by the sanitizer. |
+| `:input` | required for transfer | matched-value, receiver, return-value, an indexed result record, or an argument record | `:input PORT`. Bind the sanitizer input value. |
+| `:output` | required for transfer | matched-value, receiver, return-value, an indexed result record, or an argument record | `:output PORT`. Bind the sanitizer output value. |
+| `:when` | required for conditional | `(result true)`, `(result false)`, `(result nil)`, or `(result non-nil)`, with optional `:index k` inside the record | Choose the accepting branch; `k` selects a zero-based call result. |
+| `:sanitizes` | required for conditional | `receiver` or `(argument :index k)` | Choose the call operand whose taint labels are removed on that branch. |
+| `:requires` | optional, conditional form | a non-empty list of requirement records | Every requirement must hold. Duplicate records are rejected. |
+| `:removes` | required | normalized taint labels; set (no duplicates) of 1 to 64 items | Remove only these labels from the selected flow; other labels remain. |
+
+Each requirement is `(receiver ATTR)` or `(argument :index k ATTR)`, with
+exactly one attribute:
+
+| Attribute | Meaning |
+| --- | --- |
+| `:constant true` | Require a compile-time constant. |
+| `:equals LIT` | Require the decoded constant value to equal a string, number, or Boolean literal. The language must decode a string literal's payload; otherwise the guard declines. |
+| `:result-of SELECTOR` | Require the operand to originate from a call matched by the selector. Use the same inline `rql` or deferred `rql-file` forms as `:selector`. |
+
+A requirement can follow a local only through a unique single writer that
+dominates its use at the call. Out-of-range argument or result indices are
+rejected where the call's arity is known.
+
+For a multi-result call, supply `:index k` for the tested result.
+Conditional sanitizers require a direct condition on the call result;
+storing that result in a local and testing it later declines. The
+sanitized carrier needs a unique binding origin and a resolved type whose
+referent is immutable. The guard declines when the language cannot report
+the carrier's type, or when the type is unknown or its referent is mutable.
+
+Example fragment for a test predicate contract and a policy-defined label:
+
+```lisp
+(sanitizer :id prefix
+  :selector (rql :schema-version 1
+    (language go (call :callee (name "HasPrefix"))))
+  :when (result true)
+  :sanitizes (argument :index 0)
+  :requires [(argument :index 1 :constant true)]
+  :removes [example.checked])
+```
+
+Here only `example.checked` is removed from argument zero on the accepting
+branch. A decline leaves the flow unsanitized. If that flow produces a
+finding, the decline appears as advisory related-location evidence labelled
+`sanitizer prefix declined: REASON`; it never creates a finding of its own or
+makes a result incomplete by itself.
 
 #### `store-write`
 
@@ -2506,7 +2586,8 @@ Diff review (`diff`):
 Incremental review (`incremental`): `base` is `evaluated` or `reused`.
 `policies` holds one entry per policy with `policy_id`, `mode` (`sliced` or
 `full`), `units_total`, `units_reused`, `units_recomputed`,
-`units_unbounded`, and, for a `full` policy, `widen_reason`. The widen
+`units_unbounded`, `lookups_replayed`, the `base_` counterparts of the reuse
+and replay counts, and, for a `full` policy, `widen_reason`. The widen
 reasons are listed in
 [What a second run reuses](/static-analysis-policies/#what-a-second-run-reuses).
 
@@ -2514,12 +2595,13 @@ Pack activation review (`packs`):
 
 | Field | Meaning |
 | --- | --- |
-| `document_path` | The packs document path, `.bifrost/packs.json`. |
+| `document_path` | The packs document path, `.bifrost/packs.json`, or an empty string when only catalog evidence is present and no activation review exists. |
 | `dependency_mode` | `default` (no packs document), `configured`, or `disabled` (empty `ecosystems`). |
 | `ecosystems` | Ecosystems considered. |
 | `complete` | True when activation evidence was complete. |
 | `decisions` | `{pack, status, reason}` per pack. `reason` is omitted when there is none. `status` is `selected`, `version_mismatch`, `missing`, `incompatible`, or `rejected`. Each Python, PHP, Rust, TypeScript, and JavaScript workspace has a row for its expected standard-library pack, whose `reason` starts with the language. A row whose `pack` is `node:<module>` is a Node built-in module the workspace imports that no active pack declares. |
 | `decisions_truncated` | True when decisions were dropped. |
+| `catalogs` | Matched taint catalog identities as `{name, version, sha256}`. Omitted when none matched. |
 
 Baseline review (`baseline`):
 

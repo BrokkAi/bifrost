@@ -384,7 +384,7 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_active_workspace",
-            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect. Also reports usage_index_ready: other tools block until any background usage-analysis catch-up finishes, so call this first if you would rather do something else than wait.",
+            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect. Also reports usage_index_ready: other tools block until any background usage-analysis catch-up finishes, so call this first if you would rather do something else than wait. semantic_packs_ready reports whether pack warm-up has settled; semantic_model_overlay reports whether models are active (ready, partially usable with reasons, unavailable with a reason, no_models when nothing is selected, or pending).",
             json_schema_object(&[]),
         ),
     ]

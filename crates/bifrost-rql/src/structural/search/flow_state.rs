@@ -18,12 +18,12 @@ use super::super::flow_state::{
     flow_state_for_file_with_snapshot, flow_state_for_materialized_artifact,
     flow_state_for_materialized_procedure, flow_state_for_selected_property,
 };
-use super::rel_path_string;
 use super::results::{
     CodeQueryBindingInitializerCall, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryFlowRelation, CodeQueryRange, CodeQueryStateEvent,
     CodeQueryStateEventRef,
 };
+use super::{DerivationExecutionCause, rel_path_string};
 #[cfg(test)]
 use crate::analyzer::semantic::SemanticGapKind;
 use crate::analyzer::semantic::{
@@ -31,9 +31,9 @@ use crate::analyzer::semantic::{
     SemanticCapability, SemanticOutcome,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::{IAnalyzer, Language, ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashMap;
 use brokk_bifrost_rql::{FlowRelationFilter, StateEventFilter};
 use std::sync::Arc;
 
@@ -41,9 +41,8 @@ use std::sync::Arc;
 const STATE_EVENT_ID_DOMAIN: &[u8] = b"bifrost.code_query.state_event.v1";
 const FLOW_RELATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.flow_relation.v1";
 
-/// Per-request memo of derived flow state plus the diagnostics already
-/// reported, so one file/procedure scope is derived once and one reason is
-/// reported once.
+/// Per-request value memo of derived flow state. Every invocation reports its
+/// own completeness evidence; policy normalization deduplicates diagnostics.
 pub(super) struct FlowStateTraversalCache {
     /// One immutable activation snapshot for every file this request derives.
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
@@ -51,7 +50,6 @@ pub(super) struct FlowStateTraversalCache {
     /// distinct from the hash of an activated but empty model set.
     active_model_set_hash: Option<Arc<str>>,
     files: HashMap<FlowStateCacheKey, CachedFileFlowState>,
-    reported: HashSet<(String, &'static str)>,
 }
 
 struct CachedFileFlowState {
@@ -125,7 +123,9 @@ fn record_flow_artifact_read(
     artifact: Option<&brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact>,
 ) {
     let analyzer = workspace.analyzer();
-    if !analyzer.read_ledger_attached() {
+    if !brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        analyzer.read_ledger_attached()
+    }) {
         return;
     }
     let Some(artifact) = artifact else {
@@ -147,12 +147,10 @@ impl FlowStateTraversalCache {
             active_semantic_model_snapshot,
             active_model_set_hash,
             files: HashMap::default(),
-            reported: HashSet::default(),
         }
     }
 
     /// Release derived rows for a completed artifact-independent file window.
-    /// Completeness diagnostics remain deduplicated across the whole request.
     pub(super) fn release_file_window(&mut self) {
         self.files.clear();
     }
@@ -207,6 +205,7 @@ impl FlowStateTraversalCache {
         let artifact = outcome.available_value().cloned();
         record_flow_artifact_read(workspace, artifact.as_deref());
         self.cached_materialized_scope(
+            workspace.analyzer(),
             file,
             outcome,
             artifact,
@@ -237,6 +236,7 @@ impl FlowStateTraversalCache {
             );
         }
         self.cached_materialized_scope(
+            workspace.analyzer(),
             file,
             outcome,
             artifact,
@@ -274,8 +274,10 @@ impl FlowStateTraversalCache {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cached_materialized_scope<F>(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
         artifact: Option<Arc<SemanticArtifact>>,
@@ -307,6 +309,16 @@ impl FlowStateTraversalCache {
         let mut request = FlowStateRequest::new(&token)
             .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
         let derived = Arc::new(derive(outcome, &mut request));
+        if request.refusal_count() > 0 {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=budget:cfg",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
+        }
         self.files.insert(
             key,
             CachedFileFlowState {
@@ -336,6 +348,7 @@ impl FlowStateTraversalCache {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn report_completeness(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         subject: &str,
         procedure: Option<&super::semantic::SemanticProcedureValue>,
         language: Language,
@@ -344,14 +357,11 @@ impl FlowStateTraversalCache {
         generation: u64,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
-        let report_subject = procedure
-            .map(|procedure| procedure.wire_id())
-            .unwrap_or_else(|| subject.to_owned());
         for reason in completeness.reasons() {
             if !axes.iter().any(|axis| reason.blocks(*axis)) {
                 continue;
             }
-            let (code, detail) = classify_reason(reason);
+            let (code, detail, cause) = classify_reason(reason);
             let source = procedure.and_then(|procedure| procedure.diagnostic_source());
             let related = procedure
                 .map(|procedure| {
@@ -368,27 +378,12 @@ impl FlowStateTraversalCache {
                     )
                 })
                 .unwrap_or_default();
-            if !self.reported.insert((report_subject.clone(), detail)) {
-                if let Some(existing) = diagnostics.iter_mut().find(|diagnostic| {
-                    diagnostic.code == code
-                        && diagnostic.source == source
-                        && diagnostic.message.contains(detail)
-                }) {
-                    let mut seen = existing.related.iter().cloned().collect::<HashSet<_>>();
-                    existing.related.extend(
-                        related
-                            .into_iter()
-                            .filter(|related| seen.insert(related.clone())),
-                    );
-                }
-                continue;
-            }
             let uncovered = FLOW_STATE_AXES
                 .iter()
                 .filter(|axis| !completeness.covers(**axis))
                 .map(|axis| axis.label())
                 .collect::<Vec<_>>();
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
                 related,
                 source,
                 code,
@@ -401,7 +396,7 @@ impl FlowStateTraversalCache {
                 ),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }, cause));
         }
     }
 }
@@ -424,89 +419,169 @@ pub(super) const FLOW_RELATION_AXES: &[FlowStateAxis] = &[
 ///
 /// Total on purpose: a reason added to the derivation layer must be classified
 /// here deliberately rather than defaulting into a generic message.
-fn classify_reason(reason: &FlowStateIncompleteReason) -> (CodeQueryDiagnosticCode, &'static str) {
+fn classify_reason(
+    reason: &FlowStateIncompleteReason,
+) -> (
+    CodeQueryDiagnosticCode,
+    &'static str,
+    Option<DerivationExecutionCause>,
+) {
     use FlowStateIncompleteReason::*;
     match reason {
         AxisUnsupported(_) => (
             CodeQueryDiagnosticCode::FlowStateAxisUnsupported,
             "the lowering declares an axis this derivation stands on unsupported",
+            None,
         ),
         NoSemanticProvider => (
             CodeQueryDiagnosticCode::FlowStateAxisUnsupported,
             "no semantic provider is registered for the file's language",
+            None,
         ),
         SemanticProviderFailed { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the semantic provider returned a typed error",
+            Some(DerivationExecutionCause::Provider),
         ),
         SemanticAnalysisPartial { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the semantic lowering itself is partial",
+            None,
         ),
         Cancelled => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the derivation was cancelled",
+            Some(DerivationExecutionCause::Cancelled),
         ),
         SourceGenerationChanged => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the analyzed content changed under the derivation",
+            Some(DerivationExecutionCause::Snapshot),
         ),
         NoStructuralFacts => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the language has no structural facts arena to join events onto",
+            None,
+        ),
+        LoweringGap {
+            kind: crate::analyzer::semantic::SemanticGapKind::ExceededBudget,
+            ..
+        } => (
+            CodeQueryDiagnosticCode::FlowStateAxisUnsupported,
+            "the lowering published an explicit capability gap",
+            Some(DerivationExecutionCause::Budget),
         ),
         LoweringGap { .. } => (
             CodeQueryDiagnosticCode::FlowStateAxisUnsupported,
             "the lowering published an explicit capability gap",
+            None,
         ),
         BudgetExhausted { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "a control-flow algorithm exhausted its budget, so its relation emitted no rows",
+            Some(DerivationExecutionCause::Budget),
         ),
         SelectedPropertyEndpointUnavailable { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "a selected semantic property endpoint has no public event projection",
+            None,
         ),
         PropertyBaseNotCanonical { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "a field access has no binding-rooted base, so it contributes no property subject",
+            None,
         ),
         BindingWithoutEstablishment { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the lowering declares a local binding it never establishes",
+            None,
         ),
         BindingScopeLivenessUnavailable { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "Rust lexical-scope future-frame liveness could not be derived completely",
+            None,
         ),
         BindingStateNotClosed { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "aliasing, capture, or ownership transfer leaves the binding's read/write state open",
+            None,
         ),
         PropertyProviderUnavailable => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the structured property-reaching provider was unavailable",
+            Some(DerivationExecutionCause::Provider),
         ),
         PropertyProviderFailed { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the structured property-reaching provider returned a typed error",
+            Some(DerivationExecutionCause::Provider),
         ),
         PropertyAnalysisPartial { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the structured property-reaching snapshot was unavailable from a partial outcome",
+            None,
         ),
-        PropertyReaching { .. } => (
+        PropertyReaching { reason } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "structured property-reaching evidence was incomplete",
+            property_execution_cause(reason),
         ),
         ControlProjectionRejected { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the request-local control projection did not match the semantic artifact",
+            None,
         ),
         ModeledControlProjectionIncomplete { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "an applicable modeled control projection could not be proved exactly",
+            None,
         ),
+    }
+}
+
+fn property_execution_cause(
+    reason: &crate::analyzer::semantic::PropertyReachingIncompleteReason,
+) -> Option<DerivationExecutionCause> {
+    use crate::analyzer::semantic::PropertyReachingIncompleteReason::*;
+    use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError;
+    match reason {
+        Cancelled => Some(DerivationExecutionCause::Cancelled),
+        InputRelationBudgetExceeded { .. } | ReachingPairBudgetExceeded { .. } => {
+            Some(DerivationExecutionCause::Budget)
+        }
+        CandidateCoverage(crate::analyzer::semantic::CandidateCoverage::Truncated) => {
+            Some(DerivationExecutionCause::Budget)
+        }
+        SelectedSemanticGap { gap }
+            if gap.kind == crate::analyzer::semantic::SemanticGapKind::ExceededBudget =>
+        {
+            Some(DerivationExecutionCause::Budget)
+        }
+        Reachability(error)
+        | ReachingDefinitions(error)
+        | Dominators(error)
+        | ReachingPairs(error) => match error {
+            CfgAlgorithmError::Cancelled { .. } => Some(DerivationExecutionCause::Cancelled),
+            CfgAlgorithmError::ExceededBudget(_) => Some(DerivationExecutionCause::Budget),
+            CfgAlgorithmError::InvalidNode(_) => None,
+        },
+        SelectedReadMissing { .. }
+        | SelectedReadAmbiguous { .. }
+        | SelectedRelationEndpointUnavailable { .. }
+        | SelectedRuntimeAccess { .. }
+        | SelectedAncestorStore { .. }
+        | SelectedAliasClosureUnavailable { .. }
+        | SelectedSemanticGap { .. }
+        | CandidateCoverage(_)
+        | UnsupportedLocation { .. }
+        | DurableIdentityUnavailable { .. }
+        | SourceMappingUnavailable { .. }
+        | StoreEvidenceIncomplete { .. }
+        | ReadEvidenceIncomplete { .. }
+        | FieldMemoryEndpointUnavailable { .. }
+        | EvaluationEndpointUnavailable { .. }
+        | EvaluationEvidenceIncomplete { .. }
+        | EvaluationSourceUnknown => None,
     }
 }
 
@@ -838,8 +913,18 @@ fn uncovered_axes(completeness: &FlowStateCompleteness) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
     #[test]
-    fn an_incomplete_derivation_reports_every_reason_once_per_subject() {
+    #[hardwon("#7107: flow-state value memo suppressed diagnostics across invocation boundaries")]
+    fn an_incomplete_derivation_replays_every_invocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let analyzer =
+            crate::analyzer::JavascriptAnalyzer::from_project(crate::analyzer::TestProject::new(
+                directory.path().to_path_buf(),
+                crate::analyzer::Language::JavaScript,
+            ));
+
         let mut cache = FlowStateTraversalCache::default();
         let completeness = FlowStateCompleteness::Incomplete {
             reasons: vec![
@@ -852,6 +937,7 @@ mod tests {
         };
         let mut diagnostics = Vec::new();
         cache.report_completeness(
+            &analyzer,
             "src/main.js",
             None,
             Language::JavaScript,
@@ -861,8 +947,9 @@ mod tests {
             &mut diagnostics,
         );
         crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
-        // The second call adds nothing: one reason is reported once per subject.
+        // A fresh invocation reports the same evidence independently.
         cache.report_completeness(
+            &analyzer,
             "src/main.js",
             None,
             Language::JavaScript,
@@ -871,7 +958,7 @@ mod tests {
             7,
             &mut diagnostics,
         );
-        crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
+        crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 4);
         assert!(!completeness.covers(FlowStateAxis::PropertyEvents));
         assert!(!completeness.covers(FlowStateAxis::ReachingRelation));
     }
@@ -883,6 +970,13 @@ mod tests {
     /// partial by that.
     #[test]
     fn a_reason_outside_the_requested_axes_is_not_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        let analyzer =
+            crate::analyzer::JavascriptAnalyzer::from_project(crate::analyzer::TestProject::new(
+                directory.path().to_path_buf(),
+                crate::analyzer::Language::JavaScript,
+            ));
+
         let mut cache = FlowStateTraversalCache::default();
         let completeness = FlowStateCompleteness::Incomplete {
             reasons: vec![FlowStateIncompleteReason::LoweringGap {
@@ -894,6 +988,7 @@ mod tests {
         };
         let mut diagnostics = Vec::new();
         cache.report_completeness(
+            &analyzer,
             "src/main.js",
             None,
             Language::JavaScript,
@@ -906,6 +1001,7 @@ mod tests {
         assert!(completeness.covers(FlowStateAxis::BindingEvents));
 
         cache.report_completeness(
+            &analyzer,
             "src/main.js",
             None,
             Language::JavaScript,

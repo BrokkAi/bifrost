@@ -482,6 +482,179 @@ fn complete_with_evidence(
 }
 
 #[test]
+fn go_native_point_projects_direct_composite_type_shapes() {
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        FactIntrinsicTypeDescriptor, FactProjectedTypeNodeForm, FactProjectedTypeShape,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeTypes;
+    type Projected = (
+        Option<FactProjectedTypeShape>,
+        Vec<FactIntrinsicTypeDescriptor>,
+    );
+
+    let source = "package p\nfunc f() {\n\tvar bytes []byte\n\tvar lookup map[string]int\n\tvar values [4]int\n\tvar callback func(int) string\n\tvar stream chan int\n\tconsume(bytes, lookup, values, callback, stream)\n}\n";
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/shapes\n\ngo 1.22\n")
+        .file(CALLER, source)
+        .build();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file(CALLER);
+    let cancellation = CancellationToken::default();
+    let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source)
+        .expect("parse local composite type shape cases");
+    let mut pending = vec![tree.root_node()];
+    let mut arguments = std::collections::HashMap::new();
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "argument_list")
+        {
+            arguments.insert(source[node.start_byte()..node.end_byte()].to_owned(), node);
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    let mut request = match GoNativePointRequest::open_for_file(
+        &analyzer,
+        &file,
+        analyzer.inner.semantic_model_overlay(),
+        &cancellation,
+    )
+    .expect("open selected Go native point request")
+    {
+        GoNativePointRequestOpen::Ready(request) => request,
+        GoNativePointRequestOpen::Unavailable { kind, message } => {
+            panic!("selected Go point request unavailable: {kind}: {message}")
+        }
+        GoNativePointRequestOpen::Cancelled => panic!("selected Go point request cancelled"),
+    };
+
+    let mut resolve = |name: &str| {
+        let node = arguments
+            .get(name)
+            .unwrap_or_else(|| panic!("AST has no argument reference for {name}"));
+        let start = node.start_byte();
+        let end = node.end_byte();
+        let site = ResolvedReferenceSite {
+            path: CALLER.into(),
+            text: source[start..end].to_owned(),
+            range: Range {
+                start_byte: start,
+                end_byte: end,
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
+            },
+            focus_start_byte: start,
+            focus_end_byte: end,
+        };
+        let mut projected = (None, Vec::new());
+        let outcome = request.resolve_type_with_evidence(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: Some(&cancellation),
+            },
+            |evidence| {
+                let intrinsics = match &evidence.value_types {
+                    SelectedNativeTypes::Ready { intrinsic, .. } => intrinsic.to_vec(),
+                    SelectedNativeTypes::Unavailable | SelectedNativeTypes::Cancelled => Vec::new(),
+                };
+                projected = (
+                    evidence.answer.projected_type_shapes().first().cloned(),
+                    intrinsics,
+                );
+            },
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("native type lookup did not complete for {name}: {outcome:?}")
+        };
+        assert!(
+            matches!(
+                value.status,
+                TypeLookupStatus::Resolved | TypeLookupStatus::Incomplete
+            ),
+            "unexpected native type lookup status for {name}: {value:?}"
+        );
+        projected
+    };
+
+    let root_form = |projected: &Projected| {
+        let (shape, _) = projected;
+        let shape = shape.as_ref().expect("projected type shape");
+        shape
+            .nodes()
+            .iter()
+            .find(|node| node.slot() == shape.root_slot())
+            .expect("shape root node")
+            .form()
+            .clone()
+    };
+    let assert_component = |projected: &Projected, slot, spelling: &str| {
+        let (shape, intrinsics) = projected;
+        let component = shape
+            .as_ref()
+            .expect("projected type shape")
+            .nodes()
+            .iter()
+            .find(|node| node.slot() == slot)
+            .expect("component node");
+        assert_eq!(component.form(), &FactProjectedTypeNodeForm::Leaf);
+        assert!(intrinsics.iter().any(|intrinsic| {
+            intrinsic.identity() == component.identity() && intrinsic.spelling() == spelling
+        }));
+    };
+
+    let bytes = resolve("bytes");
+    let root = root_form(&bytes);
+    let FactProjectedTypeNodeForm::Slice(element) = root else {
+        panic!("[]byte must project as Slice: {root:?}")
+    };
+    // Go's predeclared byte alias resolves to the canonical uint8 intrinsic.
+    assert_component(&bytes, element, "uint8");
+
+    let lookup = resolve("lookup");
+    let root = root_form(&lookup);
+    let FactProjectedTypeNodeForm::Map { key, value } = root else {
+        panic!("map[string]int must project as Map: {root:?}")
+    };
+    assert_component(&lookup, key, "string");
+    assert_component(&lookup, value, "int");
+
+    let values = resolve("values");
+    let root = root_form(&values);
+    let FactProjectedTypeNodeForm::Array(element) = root else {
+        panic!("[4]int must project as Array: {root:?}")
+    };
+    assert_component(&values, element, "int");
+
+    // This records the current boundary, not a goal: function signatures only
+    // project the intrinsic leaf because they have no component rows, and
+    // channels project Unsupported.
+    let callback = resolve("callback");
+    let root = root_form(&callback);
+    assert_eq!(root, FactProjectedTypeNodeForm::Leaf);
+    let (shape, intrinsics) = &callback;
+    let shape = shape.as_ref().expect("function projected leaf shape");
+    assert!(intrinsics.iter().any(|intrinsic| {
+        intrinsic.identity()
+            == shape
+                .nodes()
+                .iter()
+                .find(|node| node.slot() == shape.root_slot())
+                .expect("function root")
+                .identity()
+            && intrinsic.spelling() == "function-type"
+    }));
+    let stream = resolve("stream");
+    assert_eq!(root_form(&stream), FactProjectedTypeNodeForm::Unsupported);
+}
+
+#[test]
 fn go_native_point_request_reuses_operation_and_path_context_per_file() {
     // The points are value references. A type-name site answers no_type, so the
     // reuse check reads the imported type through the declared values instead.
@@ -1528,6 +1701,45 @@ fn go_native_point_reads_unsaved_package_peer_only_with_proven_placement() {
         DefinitionLookupStatus::Unavailable,
         "{outcome:?}"
     );
+}
+
+#[test]
+fn go_native_point_projects_function_literal_results() {
+    let source = r#"package consumer
+
+type Other struct{}
+func (Other) M() {}
+func use() {
+    mk := func() Other { return Other{} }
+    mk().M()
+    var (
+        grouped = func() Other { return Other{} }
+    )
+    grouped().M()
+}
+"#;
+    let (fixture, analyzer) = fixture(source);
+    for ordinal in 0..2 {
+        let outcome = resolve_at(
+            &analyzer,
+            &fixture,
+            CALLER,
+            source,
+            selector_field_start(source, "M", ordinal),
+            "M",
+        );
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+        assert_eq!(
+            outcome.definitions[0].fq_name().to_string(),
+            "example.test/native/consumer.Other.M",
+            "{outcome:?}"
+        );
+    }
 }
 
 #[test]
@@ -3627,6 +3839,7 @@ type S struct { Result Result }
 #[hardwon(
     "#6524: interface method names hid signature types; parenthesized conversions lost their type"
 )]
+#[hardwon("#7517: retyped parenthesized Go callees retained invalid field receiver origins")]
 fn go_native_parenthesized_conversions_preserve_type_targets() {
     let source = r#"package consumer
 import vocabulary "example.test/native/provider"
@@ -3938,5 +4151,283 @@ func shutdown(inner pluginClient) { inner.Shutdown() }
             expected,
             "{outcome:?}"
         );
+    }
+}
+
+/// Declaration coordinates select their published static value slot.
+#[test]
+#[hardwon("#7509: Go declaration-name type queries omitted the published declaration value slot")]
+fn go_native_type_answers_select_declaration_values_and_references() {
+    use crate::analyzer::go::type_identity_proof::{ObservedCarrierType, go_observed_value_type};
+    use brokk_bifrost_analysis::analyzer::semantic::ObservedValueType;
+    use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus;
+    let source = "package consumer\nfunc Source() string { return \"\" }\nfunc HasPrefix(p string) bool { return true }\nfunc run() { p := Source(); if HasPrefix(p) { return } }\n";
+    let (fixture, analyzer) = fixture(source);
+    let file = fixture.file(CALLER);
+    let cancellation = CancellationToken::default();
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let mut declaration = None;
+    let mut reference = None;
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "short_var_declaration" {
+            declaration = node
+                .child_by_field_name("left")
+                .and_then(|left| left.named_child(0));
+        }
+        if node.kind() == "call_expression"
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|function| {
+                    function.utf8_text(source.as_bytes()).unwrap() == "HasPrefix"
+                })
+        {
+            reference =
+                brokk_bifrost_core::analyzer::tree_walk::named_children_by_field(node, "arguments")
+                    .first()
+                    .copied();
+        }
+        pending.extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+    }
+    let GoNativePointRequestOpen::Ready(mut request) = GoNativePointRequest::open_for_file(
+        &analyzer,
+        &file,
+        analyzer.inner.semantic_model_overlay(),
+        &cancellation,
+    )
+    .unwrap() else {
+        panic!("native context available");
+    };
+    for (label, node) in [
+        ("declaration", declaration.unwrap()),
+        ("reference", reference.unwrap()),
+    ] {
+        let site = ResolvedReferenceSite {
+            path: CALLER.into(),
+            text: "p".into(),
+            range: Range {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
+            },
+            focus_start_byte: node.start_byte(),
+            focus_end_byte: node.end_byte(),
+        };
+        let mut native = None;
+        let result = request.resolve_type_with_evidence(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                cancellation: Some(&cancellation),
+            },
+            |answer| native = Some(go_observed_value_type(answer)),
+        );
+        let BoundedResolution::Complete { value: outcome, .. } = result else {
+            panic!("bounded native query completes");
+        };
+        assert_eq!(
+            outcome.status,
+            TypeLookupStatus::Resolved,
+            "{label}: {outcome:?}"
+        );
+        assert!(
+            matches!(native, Some(ObservedCarrierType::Type(ObservedValueType::Named { canonical })) if canonical == "string"),
+            "{label}: the selected native value slot proves the declared string type"
+        );
+    }
+}
+
+#[test]
+#[hardwon("#7616: a call into a pack-modeled Go package published an empty Complete result type")]
+fn go_native_modeled_package_results_retain_unindexed_external_frontier() {
+    use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOptions, CompilerOptions, SemanticModelActivationEvidence, SessionPackSource,
+        SessionPackSourceKind, SourceFormat, acquire_active_semantic_models, compile_source,
+    };
+
+    // Test-only declaration authority. These signatures identify the external
+    // package; native result types still require selected source declarations.
+    let declarations = serde_json::json!({
+        "schema_version": 8,
+        "pack_id": "test.go-unindexed-results",
+        "version": "0.1.0",
+        "producer": {"name": "bifrost-engine-test", "version": "0.1.0"},
+        "language": "go", "ecosystem": "go-stdlib",
+        "compatibility": {"toolchains": []},
+        "provenance": {"source": "https://pkg.go.dev/path/filepath", "revision": "go1.22"},
+        "license": "BSD-3-Clause", "completeness": "partial",
+        "safety": {"generated_code_only": false, "review_required": false},
+        "shards": [{
+            "id": "test.go-unindexed-results.shard",
+            "activation": [{"configurations": ["test.go-unindexed-results"]}],
+            "payload": {
+                "kind": "declaration_facts",
+                "types": [{
+                    "id": "test.filepath", "name": "path/filepath", "type_kind": "module",
+                    "visibility": "public", "aliases": ["filepath"],
+                    "locator": {"kind": "artifact", "path": "path/filepath/test.go", "symbol": "path/filepath"}
+                }],
+                "members": [
+                    {
+                        "id": "test.filepath.rel", "owner": "test.filepath", "name": "Rel",
+                        "member_kind": "function", "visibility": "public", "is_static": true,
+                        "callable_family_complete": true,
+                        "signature": {
+                            "parameters": [
+                                {"name": "base", "type": {"kind": "named", "name": "string"}},
+                                {"name": "target", "type": {"kind": "named", "name": "string"}}
+                            ],
+                            "returns": {"kind": "tuple", "elements": [
+                                {"kind": "named", "name": "string"}, {"kind": "named", "name": "error"}
+                            ]}
+                        },
+                        "locator": {"kind": "artifact", "path": "path/filepath/test.go", "symbol": "path/filepath.Rel"}
+                    },
+                    {
+                        "id": "test.filepath.base", "owner": "test.filepath", "name": "Base",
+                        "member_kind": "function", "visibility": "public", "is_static": true,
+                        "callable_family_complete": true,
+                        "signature": {
+                            "parameters": [{"name": "path", "type": {"kind": "named", "name": "string"}}],
+                            "returns": {"kind": "named", "name": "string"}
+                        },
+                        "locator": {"kind": "artifact", "path": "path/filepath/test.go", "symbol": "path/filepath.Base"}
+                    }
+                ]
+            }
+        }]
+    });
+    let pack = compile_source(
+        SourceFormat::Json,
+        &serde_json::to_vec(&declarations).unwrap(),
+        &CompilerOptions::default(),
+    )
+    .unwrap();
+    for modeled in [true, false] {
+        let source = r#"package consumer
+import "path/filepath"
+func f(p string) {
+    rel, err := filepath.Rel("/srv/", p)
+    base := filepath.Base(p)
+    _, _, _ = rel, err, base
+}
+"#;
+        let fixture = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+            .file(CALLER, source)
+            .build();
+        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        if modeled {
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: "test:go-unindexed-results".into(),
+                    },
+                )
+                .unwrap();
+            let activation = acquire_active_semantic_models(
+                workspace.analyzer(),
+                &catalog,
+                None,
+                &SemanticModelActivationRequest {
+                    approximate_standard_libraries: vec![],
+                    bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                    evidence: vec![SemanticModelActivationEvidence {
+                        language: "go".into(),
+                        ecosystem: "go-stdlib".into(),
+                        configuration: Some("test.go-unindexed-results".into()),
+                        package: None,
+                        module: None,
+                        toolchain: None,
+                        target: None,
+                        artifact_sha256: None,
+                    }],
+                    controls: vec![],
+                    limits: SemanticModelRuntimeLimits::default(),
+                },
+                &cancellation,
+            );
+            assert!(matches!(activation, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelRuntimeOutcome::Ready { .. }), "{activation:?}");
+        }
+        let analyzer = workspace.analyzer();
+        let file = fixture.file(CALLER);
+        let GoNativePointRequestOpen::Ready(mut request) = GoNativePointRequest::open(
+            resolve_analyzer::<GoAnalyzer>(analyzer).unwrap(),
+            analyzer.semantic_model_overlay(),
+            &cancellation,
+        )
+        .unwrap() else {
+            panic!("native Go request must open")
+        };
+        for identifier in ["filepath", "rel", "err", "base"]
+            .into_iter()
+            .filter(|identifier| modeled || *identifier != "filepath")
+        {
+            let mut observed = false;
+            let site = site_for(source, identifier);
+            let outcome = request.resolve_type_with_evidence(
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: None,
+                    site: &site,
+                    budget: ReceiverAnalysisBudget::default(),
+                    cancellation: None,
+                },
+                |native| {
+                    observed = true;
+                    if identifier == "filepath" {
+                        assert_eq!(native.answer.binding().completion(), &ResolutionCompletion::Complete);
+                        assert!(native.answer.projected_frontiers().iter().all(|frontier| frontier.completion() == &ResolutionCompletion::Complete));
+                        return;
+                    }
+                    assert!(
+                        !native.answer.projected_frontiers().is_empty(),
+                        "{:?}",
+                        native.answer
+                    );
+                    for frontier in native.answer.projected_frontiers() {
+                        assert!(
+                            matches!(frontier.completion(), ResolutionCompletion::Incomplete(_)),
+                            "modeled={modeled} {identifier}: {frontier:?}"
+                        );
+                        assert!(
+                            !frontier.unindexed_external().is_empty(),
+                            "modeled={modeled} {identifier}: {frontier:?}"
+                        );
+                        if !modeled {
+                            let ResolutionCompletion::Incomplete(reasons) = frontier.completion() else { unreachable!() };
+                            assert!(reasons.iter().all(|reason| !matches!(reason,
+                                brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason::OpenBoundary {
+                                    status: brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus::ExternalDeclaredUnindexed, ..
+                                }
+                            )), "presumed-import reasons must retain their prior shape: {frontier:?}");
+                        }
+                        // The marker's provider/member fields are intentionally private.
+                        let external = format!("{:?}", frontier.unindexed_external());
+                        assert!(
+                            external.contains("path/filepath") && external.contains("member: Some"),
+                            "{external}"
+                        );
+                    }
+                },
+            );
+            assert!(observed, "native evidence must be read: {outcome:?}");
+        }
     }
 }

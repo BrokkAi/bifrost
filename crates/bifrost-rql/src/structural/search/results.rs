@@ -289,10 +289,12 @@ pub fn code_query_completion(
     let codes_with_impact = |impact: CodeQueryDiagnosticImpact| {
         let mut codes = Vec::new();
         for diagnostic in diagnostics {
-            if diagnostic.impact == impact && !codes.contains(&diagnostic.code) {
+            if diagnostic.impact == impact {
                 codes.push(diagnostic.code);
             }
         }
+        codes.sort_unstable();
+        codes.dedup();
         codes
     };
     let invalid = codes_with_impact(CodeQueryDiagnosticImpact::Invalid);

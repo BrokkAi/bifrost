@@ -22,7 +22,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOver
 
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
-use crate::analyzer::usages::go_graph::go_graph_source;
+use crate::analyzer::go::go_graph_source;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 

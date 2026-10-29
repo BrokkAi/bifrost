@@ -339,6 +339,8 @@ impl JdkJmodSetPackProducer {
                 id: format!("declarations.jdk.{module}"),
                 activation: activation_for(request, artifact.sha256()),
                 payload: AuthoredPayload::DeclarationFacts {
+                    assembly_identity: None,
+                    type_forwards: Vec::new(),
                     types,
                     members,
                     relations: Vec::new(),
@@ -1586,6 +1588,7 @@ mod tests {
                     types,
                     members,
                     relations,
+                    ..
                 } => types.len() + members.len() + relations.len(),
                 _ => 0,
             })

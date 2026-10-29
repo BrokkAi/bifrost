@@ -1293,6 +1293,8 @@ fn finish_production(
         id: "declarations.scala.external".to_owned(),
         activation: request.activation.clone(),
         payload: AuthoredPayload::DeclarationFacts {
+            assembly_identity: None,
+            type_forwards: Vec::new(),
             types,
             members,
             relations: Vec::new(),

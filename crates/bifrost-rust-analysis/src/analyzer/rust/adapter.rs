@@ -212,12 +212,16 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for RustAdapt
         String::new()
     }
 
-    fn hydrate_content_qualifier(&self, content_qualifier: &str, file: &ProjectFile) -> String {
-        if content_qualifier.is_empty() {
+    fn hydrate_content_qualifier(
+        &self,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<String> {
+        Ok(if content_qualifier.is_empty() {
             rust_package_name(file)
         } else {
             content_qualifier.to_string()
-        }
+        })
     }
 
     fn default_package_anchor(&self) -> Option<PackageAnchor> {

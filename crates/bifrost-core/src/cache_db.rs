@@ -31,6 +31,34 @@ fn unsafe_no_fsync() -> bool {
     })
 }
 
+/// Whether this blob receives the full publication consistency checks (#6390).
+/// Tests and test-support always validate; production samples one blob in 64.
+/// The environment override is read once and shared with the SQL seal function.
+pub fn seal_validates(blob_id: i64) -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    cfg!(any(test, feature = "test-support"))
+        || *ALL.get_or_init(|| {
+            std::env::var_os("BIFROST_SEAL_VALIDATION").as_deref()
+                == Some(std::ffi::OsStr::new("all"))
+        })
+        || blob_id % 64 == 0
+}
+
+/// Install `bifrost_seal_validates`, which the publication-state seal triggers
+/// call. Store writers register it when they open; a harness that plans
+/// production write SQL on another connection registers it the same way.
+pub fn register_seal_validation(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "bifrost_seal_validates",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| Ok(seal_validates(context.get::<i64>(0)?)),
+    )
+}
+
 /// SQLite synchronous setting for cache stores; see `unsafe_no_fsync`.
 pub fn sqlite_synchronous() -> &'static str {
     if unsafe_no_fsync() { "OFF" } else { "NORMAL" }
@@ -441,6 +469,34 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 211,
         sql: include_str!("../migrations/cache/0211-procedure-dispatch-site-ordinal.sql"),
     },
+    CacheMigration {
+        version: 212,
+        sql: include_str!("../migrations/cache/0212-declaration-read-identity.sql"),
+    },
+    CacheMigration {
+        version: 213,
+        sql: include_str!("../migrations/cache/0213-drop-redundant-reverse-gap-site-index.sql"),
+    },
+    CacheMigration {
+        version: 215,
+        sql: include_str!("../migrations/cache/0215-sample-seal-validation.sql"),
+    },
+    CacheMigration {
+        version: 216,
+        sql: include_str!("../migrations/cache/0216-rust-unresolved-impl-half-declarations.sql"),
+    },
+    CacheMigration {
+        version: 217,
+        sql: include_str!("../migrations/cache/0217-csharp-compilation-metadata.sql"),
+    },
+    CacheMigration {
+        version: 218,
+        sql: include_str!("../migrations/cache/0218-policy-unit-snapshots.sql"),
+    },
+    CacheMigration {
+        version: 219,
+        sql: include_str!("../migrations/cache/0219-deferred-member-selection.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -466,8 +522,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    78, 32, 64, 210, 167, 158, 101, 42, 223, 223, 171, 254, 248, 247, 46, 198, 246, 58, 7, 130, 95,
-    16, 117, 219, 122, 130, 151, 227, 249, 154, 64, 147,
+    146, 91, 134, 77, 55, 39, 89, 128, 163, 170, 226, 240, 17, 244, 71, 207, 122, 92, 29, 155, 161,
+    130, 220, 99, 84, 44, 148, 113, 53, 205, 24, 44,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -695,6 +751,7 @@ fn open_store_connection(
 ) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open_with_flags(db_path, flags)?;
     if !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        register_seal_validation(&conn)?;
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
     }
     sql_profile::install(&conn, role);
@@ -707,6 +764,7 @@ fn open_store_connection(
 /// reaches a store.
 pub fn open_in_memory_store_connection() -> rusqlite::Result<Connection> {
     let mut conn = Connection::open_in_memory()?;
+    register_seal_validation(&conn)?;
     conn.set_transaction_behavior(TransactionBehavior::Immediate);
     sql_profile::install(&conn, ConnectionRole::Ephemeral);
     Ok(conn)
@@ -2022,6 +2080,8 @@ fn install_busy_timeout(conn: &Connection) -> Result<()> {
 }
 
 fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> {
+    register_seal_validation(conn)
+        .map_err(|err| format!("cache DB seal validation registration error: {err}"))?;
     let writer_page_cache_kib = match std::env::var(WRITER_PAGE_CACHE_ENV) {
         Err(std::env::VarError::NotPresent) => WRITER_PAGE_CACHE_KIB,
         value => {
@@ -3592,6 +3652,49 @@ mod tests {
             .expect("importer thread panicked")
             .unwrap_err();
         assert!(error.contains("SQLite error"), "{error}");
+    }
+
+    #[test]
+    fn persistent_writer_registers_seal_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_unified_connection(&dir.path().join("seal.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO blobs(id, blob_oid, lang, generation)
+               VALUES(64, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'go', 0);
+             INSERT INTO resolution_fragment_interiors(
+               blob_id, lang, semantic_language, producer_epoch, interior_digest,
+               expected_semantic_site_count, logical_rows, payload_bytes, publication_state
+             ) VALUES(64, 'go', 'go', 'seal-test', zeroblob(32), 0, 1, 0, 'building');",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE resolution_fragment_interiors SET publication_state = 'complete'
+                 WHERE blob_id = 64",
+                [],
+            )
+            .unwrap(),
+            1,
+        );
+        let validates: bool = conn
+            .query_row("SELECT bifrost_seal_validates(1)", [], |row| row.get(0))
+            .unwrap();
+        assert!(validates, "test builds validate even unsampled blobs");
+        // A raw connection must fail loudly, including for an empty UPDATE.
+        let raw = Connection::open(dir.path().join("seal.db")).unwrap();
+        let error = raw
+            .execute(
+                "UPDATE resolution_fragment_interiors SET publication_state = 'complete'
+             WHERE blob_id = 65",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no such function: bifrost_seal_validates"),
+            "{error}"
+        );
     }
 
     fn open_in_memory_cache() -> Connection {
@@ -5264,6 +5367,152 @@ mod tests {
     }
 
     #[test]
+    fn csharp_compilation_metadata_migration_withdraws_old_sets_and_selections() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 217)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO workspace_revisions(workspace_id,lang,generation,revision)
+             VALUES(printf('%064d',0),'csharp',1,1);
+             INSERT INTO csharp_compilation_sets(set_id,workspace_id,lang,generation,
+                 derivation_version,input_digest,output_digest,membership_complete,gaps)
+             VALUES(1,printf('%064d',0),'csharp',1,1,zeroblob(32),zeroblob(32),1,jsonb('[]'));
+             INSERT INTO csharp_compilations(compilation_id,set_id,project_path,references_complete,transitive_flow)
+             VALUES(1,1,'App.csproj',1,1),(2,1,'Lib.csproj',1,1);
+             INSERT INTO csharp_compilation_items(compilation_id,ordinal,set_id,kind,rel_path)
+             VALUES(1,0,1,'include','App.cs');
+             INSERT INTO csharp_project_references(from_compilation_id,target_compilation_id) VALUES(1,2);
+             INSERT INTO csharp_compilation_selections(workspace_id,lang,generation,revision,set_id)
+             VALUES(printf('%064d',0),'csharp',1,1,1);"
+        ).unwrap();
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 217)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        for table in [
+            "csharp_compilation_sets",
+            "csharp_compilations",
+            "csharp_compilation_items",
+            "csharp_project_references",
+            "csharp_compilation_selections",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "withdraw v1 relation {table}");
+        }
+        validate_foreign_keys(&conn).unwrap();
+        // The assertions above isolate migration 217. The current-schema check
+        // also needs every migration added after it.
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 217)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn unresolved_impl_declaration_migration_rebuilds_and_constrains_resolved_halves() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 216) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(1,?1,'rust',0)",
+            [seeded_oid("unresolved-impl-declaration-migration")],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state)
+             VALUES(1,'rust','rust','test',zeroblob(32),0,1,0,'building');
+             INSERT INTO rust_crate_topologies VALUES(1,zeroblob(32),zeroblob(32),'test','lib','example','2021','std',jsonb('[]'),1,zeroblob(32),'complete');
+             INSERT INTO rust_crate_unresolved_trait_impls VALUES(1,'subject','Alias',1,1,'src/lib.rs',NULL,'resolved','crate');",
+        )
+        .unwrap();
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|m| m.version == 216)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM rust_crate_unresolved_trait_impls",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "legacy halves lack declaration identities and must be re-derived"
+        );
+        let mut insert = conn.prepare(
+            "INSERT INTO rust_crate_unresolved_trait_impls VALUES(1,'subject','Alias',1,1,'src/lib.rs',NULL,?1,'crate',?2,?3,?4,'crate')",
+        ).unwrap();
+        for (reason, blob, site, path) in [
+            ("resolved", None, None, None),
+            ("resolved", Some(1), None, Some("src/lib.rs")),
+            ("resolved", Some(1), Some(1), None),
+            ("unbound", Some(1), Some(1), Some("src/lib.rs")),
+            ("unbound", None, Some(1), None),
+            ("bound_without_declaration", None, None, Some("src/lib.rs")),
+            ("resolved", Some(1), Some(-1), Some("src/lib.rs")),
+            (
+                "resolved",
+                Some(1),
+                Some(4_294_967_296_i64),
+                Some("src/lib.rs"),
+            ),
+            ("resolved", Some(1), Some(1), Some("")),
+        ] {
+            let error = insert
+                .execute(rusqlite::params![reason, blob, site, path])
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("CHECK constraint failed"),
+                "{reason:?}, {blob:?}, {site:?}, {path:?}: {error}"
+            );
+        }
+        let error = insert
+            .execute(rusqlite::params!["resolved", 2, 1, "src/lib.rs"])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("FOREIGN KEY constraint failed"),
+            "{error}"
+        );
+        insert
+            .execute(rusqlite::params![
+                "resolved",
+                1,
+                4_294_967_295_i64,
+                "src/lib.rs"
+            ])
+            .unwrap();
+        insert
+            .execute(rusqlite::params![
+                "unbound",
+                None::<i64>,
+                None::<i64>,
+                None::<&str>
+            ])
+            .unwrap();
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
     fn current_schema_digest_matches_the_baseline_chain() {
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS {
@@ -6484,6 +6733,41 @@ mod tests {
             );
             assert!(current_schema_is_valid(&conn).unwrap());
         }
+    }
+
+    #[test]
+    fn deferred_member_selection_migration_preserves_existing_calls() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 219)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let previous_version = POST_BASELINE_MIGRATIONS
+            .iter()
+            .rfind(|migration| migration.version < 219)
+            .unwrap()
+            .version;
+        conn.pragma_update(None, "user_version", previous_version)
+            .unwrap();
+        conn.execute("INSERT INTO blobs(blob_oid, lang, generation) VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'go', 0)", []).unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute("INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch, content_digest, source_bytes, outcome, procedure_count, logical_rows, payload_bytes, go_predeclared_builtins, publication_state) VALUES(?1, 'go', 'before-member-selection', zeroblob(32), 17, 0, 1, 2, 0, jsonb('[]'), 'complete')", [blob]).unwrap();
+        conn.execute("INSERT INTO semantic_ir_call_sites(blob_id, procedure, call_site, point, invocation_mode, execution_timing, callee, receiver, result, thrown, normal_results, target_resolution, targets, target_evidence, normal_continuation, normal_target, exceptional_continuation, exceptional_target, source, evidence) VALUES(?1, 0, 0, 3, 0, 0, 1, 2, NULL, 5, jsonb('[6,7]'), 2, NULL, 0, 0, 4, 1, NULL, 0, 0)", [blob]).unwrap();
+        migrate(&mut conn).unwrap();
+        let actual = conn.query_row("SELECT point, receiver, thrown, json(normal_results), member, receiver_place_kind, receiver_place_locator, receiver_place_location, receiver_pointer_depth FROM semantic_ir_call_sites WHERE blob_id = ?1 AND procedure = 0 AND call_site = 0", [blob], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?, (4..9).map(|index| row.get::<_, Option<i64>>(index)).collect::<rusqlite::Result<Vec<_>>>()?))).unwrap();
+        assert_eq!(actual, (3, 2, 5, "[6,7]".to_owned(), vec![None; 5]));
+        validate_foreign_keys(&conn).unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
+        conn.execute("DELETE FROM blobs WHERE id = ?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM semantic_ir_call_sites", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

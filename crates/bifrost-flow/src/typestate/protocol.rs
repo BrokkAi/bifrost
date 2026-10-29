@@ -876,10 +876,6 @@ impl ProtocolDiagnostic {
         self.code
     }
 
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -921,7 +917,7 @@ impl fmt::Display for ProtocolCompileError {
                     "protocol validation failed with {} diagnostic(s)",
                     diagnostics.len()
                 )?;
-                for diagnostic in diagnostics.iter().take(8) {
+                for diagnostic in diagnostics.iter() {
                     write!(formatter, "; {diagnostic}")?;
                 }
                 Ok(())

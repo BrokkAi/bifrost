@@ -1399,13 +1399,102 @@ impl Validator {
         }
     }
 
+    fn assembly_reference(&mut self, path: &str, identity: &AssemblyReference) {
+        self.text(&format!("{path}.name"), &identity.name);
+        if identity.name.is_empty() {
+            self.error(
+                "assembly.name",
+                format!("{path}.name"),
+                "assembly name must not be empty",
+            );
+        }
+        self.text(&format!("{path}.version"), &identity.version);
+        if let Some(culture) = &identity.culture {
+            self.text(&format!("{path}.culture"), culture);
+        }
+        if let Some(token) = &identity.public_key_token {
+            self.text(&format!("{path}.public_key_token"), token);
+        }
+        if identity.version_components().is_none() {
+            self.error(
+                "assembly.version",
+                format!("{path}.version"),
+                "assembly version must have four unsigned 16-bit parts",
+            );
+        }
+        if identity.public_key_token.as_ref().is_some_and(|token| {
+            token.len() != 16
+                || !token
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            self.error(
+                "assembly.public_key_token",
+                format!("{path}.public_key_token"),
+                "public key token must contain sixteen lower-case hexadecimal digits",
+            );
+        }
+    }
+
     fn payload(&mut self, path: &str, payload: &AuthoredPayload) {
         match payload {
             AuthoredPayload::DeclarationFacts {
                 types,
                 members,
                 relations,
+                assembly_identity,
+                type_forwards,
             } => {
+                if assembly_identity.is_some()
+                    && self.predates_schema(ASSEMBLY_IDENTITY_MIN_SCHEMA_VERSION)
+                {
+                    self.error("schema.assembly_identity_version", format!("{path}.assembly_identity"),
+                        format!("assembly identity requires schema version {ASSEMBLY_IDENTITY_MIN_SCHEMA_VERSION}"));
+                }
+                if !type_forwards.is_empty()
+                    && self.predates_schema(TYPE_FORWARDS_MIN_SCHEMA_VERSION)
+                {
+                    self.error("schema.type_forwards_version", format!("{path}.type_forwards"),
+                        format!("type forwards require schema version {TYPE_FORWARDS_MIN_SCHEMA_VERSION}"));
+                }
+                if let Some(identity) = assembly_identity {
+                    self.assembly_reference(&format!("{path}.assembly_identity"), identity);
+                }
+                let mut forwards = HashMap::new();
+                for (index, forward) in type_forwards.iter().enumerate() {
+                    let forward_path = format!("{path}.type_forwards[{index}]");
+                    self.qualified_name(&format!("{forward_path}.name"), &forward.name);
+                    if !forward.namespace.is_empty() {
+                        self.qualified_name(
+                            &format!("{forward_path}.namespace"),
+                            &forward.namespace,
+                        );
+                    }
+                    self.assembly_reference(&format!("{forward_path}.target"), &forward.target);
+                    if forwards.insert(&forward.name, forward).is_some() {
+                        self.error(
+                            "identity.duplicate_type_forward",
+                            &forward_path,
+                            "forwarded names must be unique",
+                        );
+                    }
+                }
+                for (index, forward) in type_forwards.iter().enumerate() {
+                    if let Some(outer) = &forward.outer {
+                        let valid = forwards.get(outer).is_some_and(|parent| {
+                            parent.target == forward.target
+                                && parent.namespace == forward.namespace
+                                && forward.name.starts_with(&format!("{outer}."))
+                        });
+                        if !valid {
+                            self.error(
+                                "reference.type_forward_outer",
+                                format!("{path}.type_forwards[{index}].outer"),
+                                "outer must name a containing export with the same namespace and target",
+                            );
+                        }
+                    }
+                }
                 for (index, fact) in types.iter().enumerate() {
                     if fact.callable_surface_complete
                         && self.predates_schema(CALLABLE_SURFACE_MIN_SCHEMA_VERSION)
@@ -2982,6 +3071,34 @@ impl Validator {
                     "covers_overrides requires a receiver target: a receiverless callee has no overrides to cover",
                 );
             }
+        }
+
+        let identity_return = summary.transfers.iter().any(|transfer| {
+            transfer.exit_kind == AuthoredSummaryExitKind::Normal
+                && matches!(transfer.output, AuthoredSummaryOutput::NormalReturn {})
+                && matches!(
+                    transfer.value_transfer.as_ref().map(|value| &value.kind),
+                    Some(SummaryValueTransferKind::Conversion {
+                        preservation: SummaryValuePreservation::Identity,
+                    })
+                )
+        });
+        if identity_return
+            && summary.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    AuthoredSummaryEffect::Allocation {
+                        output: AuthoredSummaryOutput::NormalReturn {},
+                        ..
+                    }
+                )
+            })
+        {
+            self.error(
+                "summary.identity_return_allocation_conflict",
+                format!("{path}.effects"),
+                "an Identity normal-return transfer cannot also allocate NormalReturn",
+            );
         }
 
         self.ordinary_heap_unchanged(path, summary);

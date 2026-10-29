@@ -638,7 +638,16 @@ pub fn receiver_seed(
     };
     let mount = selection.mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
     let conn = selection.connection();
-    let rows = conn.prepare_cached(
+    let memo_key = (mount.blob_id(), key);
+    let cached = selection
+        .python_receiver_rows
+        .borrow()
+        .get(&memo_key)
+        .cloned();
+    let rows = if let Some(rows) = cached {
+        rows
+    } else {
+        let rows = conn.prepare_cached(
         "SELECT DISTINCT owner.semantic_key,role.member
          FROM resolution_declaration_types declaration
          JOIN resolution_semantic_sites parameter ON parameter.blob_id=declaration.blob_id
@@ -658,6 +667,15 @@ pub fn receiver_seed(
         .query_map(params![mount.blob_id(),key,super::python_binding_rows::NATIVE_SOURCE_FORMAT,
             code(ALL_DECLARATION_TYPE_ROLES,&DeclarationTypeRole::Parameter)], |r| Ok((r.get::<_,u32>(0)?,r.get::<_,u32>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(
+            selection
+                .python_receiver_rows
+                .borrow_mut()
+                .insert(memo_key, rows.clone())
+                .is_none()
+        );
+        rows
+    };
     let [(owner, member)] = rows.as_slice() else {
         return Ok(None);
     };

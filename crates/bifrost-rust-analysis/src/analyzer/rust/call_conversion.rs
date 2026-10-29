@@ -185,10 +185,7 @@ pub(crate) fn matches_model_type(
             TypeRef::Named {
                 name, arguments, ..
             } if arguments.is_empty() => {
-                let expected = name
-                    .strip_prefix("std.primitive.")
-                    .or_else(|| name.strip_prefix("core.primitive."))
-                    .and_then(primitive_for_spelling)?;
+                let expected = modeled_primitive(name)?;
                 match actual {
                     RustConversionType::Primitive(actual) => {
                         if *actual != expected {
@@ -546,6 +543,13 @@ fn source_type_error(error: ConversionUnknown) -> ConversionUnknown {
         ConversionUnknown::UnresolvedTargetType => ConversionUnknown::UnresolvedSourceType,
         other => other,
     }
+}
+
+/// Interpret the canonical identity of an already selected model type.
+pub(crate) fn modeled_primitive(name: &str) -> Option<RustPrimitive> {
+    name.strip_prefix("std.primitive.")
+        .or_else(|| name.strip_prefix("core.primitive."))
+        .and_then(primitive_for_spelling)
 }
 
 fn primitive_for_spelling(spelling: &str) -> Option<RustPrimitive> {

@@ -27,6 +27,7 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallTargetOutcomeC
 use brokk_bifrost_analysis::analyzer::usages::effects::EffectCoverage;
 use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, ReadKey, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
+use brokk_bifrost_rql::PlanWidenDetail;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryCallBinding, CodeQueryExecutionScope, CodeQueryRowFamilySession,
     CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence, DetailedCodeQueryDomain,
@@ -390,7 +391,6 @@ fn usable_taint_row(
                 value.argument_id.is_some()
                     && value.actual_index.is_some()
                     && value.formal_index.is_some()
-                    && value.formal_name.is_some()
                     && value.formal_layout_id.is_some()
                     && (exact_site || located_source_binding)
             }
@@ -591,7 +591,7 @@ pub(super) struct PolicySelectedCallBinding {
     pub(super) call_span: ByteRange<usize>,
     pub(super) actual_index: usize,
     pub(super) formal_index: usize,
-    pub(super) formal_name: String,
+    pub(super) formal_name: Option<String>,
     pub(super) semantic_target_id: Option<String>,
     pub(super) model_callable_id: Option<String>,
     pub(super) formal_layout_id: String,
@@ -670,12 +670,22 @@ impl PolicySelectedCallBinding {
 pub(super) struct IncompleteTaintSelector {
     pub(super) path: crate::definition::PolicySelectorPath,
     pub(super) message: String,
+    /// The code and source site of each query diagnostic that left discovery
+    /// open, in the order the query reported them. Empty for a selector that
+    /// could not be applied at all.
+    pub(super) discovery: Vec<(&'static str, Option<DiscoverySite>)>,
 }
+
+/// A workspace-relative path and, when the diagnostic named an exact site, its
+/// one-based line.
+pub(super) type DiscoverySite = (String, Option<usize>);
 
 pub(super) struct PolicySelectorSession<'a> {
     workspace: &'a WorkspaceAnalyzer,
+    flow_state: brokk_bifrost_rql::SemanticFlowResources,
     analysis: &'static str,
     query_limits: CodeQueryExecutionLimits,
+    root_allotment: brokk_bifrost_rql::CodeQueryRootAllotment,
     max_selector_results: usize,
     cancellation: &'a CancellationToken,
     /// Which files every selector this session runs enumerates seeds over.
@@ -771,12 +781,14 @@ impl<'a> PolicySelectorSession<'a> {
     /// as it always has.
     pub(super) fn new(
         workspace: &'a WorkspaceAnalyzer,
+        flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
         analysis: &'static str,
         query_limits: CodeQueryExecutionLimits,
         max_selector_results: usize,
         cancellation: &'a CancellationToken,
         execution_scope: CodeQueryExecutionScope<'a>,
     ) -> Self {
+        let flow_state = flow_state.into();
         // Size the materialized-file budget to the workspace, not the fixed
         // per-query IDE cap. That cap bounds how much a single interactive query
         // loads; a policy compile is a whole-workspace analysis that must reach
@@ -796,8 +808,12 @@ impl<'a> PolicySelectorSession<'a> {
             CallTargetOutcomeCache::for_policy_compilation(workspace.analyzer());
         Self {
             workspace,
+            flow_state: flow_state.clone(),
             analysis,
             query_limits,
+            root_allotment: brokk_bifrost_rql::CodeQueryRootAllotment::from_execution_limits(
+                &query_limits,
+            ),
             max_selector_results,
             cancellation,
             execution_scope,
@@ -957,8 +973,10 @@ impl<'a> PolicySelectorSession<'a> {
         let artifact_leases = self.artifact_leases.snapshot();
         let mut detailed = execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
             self.workspace,
+            &self.flow_state,
             &query,
             query_limits,
+            self.root_allotment,
             Some(self.cancellation),
             &self.semantic_budget,
             &self.semantic_execution_budget,
@@ -1023,8 +1041,8 @@ impl<'a> PolicySelectorSession<'a> {
         files: &[ProjectFile],
     ) -> Result<(Vec<PolicySelectedSite>, Option<WidenReason>), PolicySelectorSessionError> {
         let query = self.selector_query(selector)?;
-        if let Some(reason) = query_slicing_widen_reason(&query) {
-            return Ok((self.select_taint(selector)?, Some(reason)));
+        if let Some(widen) = query_slicing_widen_reason(&query) {
+            return Ok((self.select_taint(selector)?, Some(widen.reason)));
         }
         // The whole-workspace enumeration is what seed diagnostics still walk;
         // the slice narrows only which files seed.
@@ -1104,6 +1122,21 @@ impl<'a> PolicySelectorSession<'a> {
                 .iter()
                 .map(|diagnostic| format!("{}: {diagnostic:?}", diagnostic.code.as_str()))
                 .collect::<Vec<_>>();
+            let discovery = detailed
+                .result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let site = match (&diagnostic.source, &diagnostic.withheld_rows_path) {
+                        (Some(source), _) => {
+                            Some((source.path.clone(), Some(source.range.start_line)))
+                        }
+                        (None, Some(path)) => Some((path.clone(), None)),
+                        (None, None) => None,
+                    };
+                    (diagnostic.code.as_str(), site)
+                })
+                .collect();
             self.incomplete_taint_selectors
                 .push(IncompleteTaintSelector {
                     path: selector.path.clone(),
@@ -1111,6 +1144,7 @@ impl<'a> PolicySelectorSession<'a> {
                         "selector `{}` discovery is {:?}; only individually usable rows were retained: {:?}",
                         selector.path, completion, diagnostics
                     ),
+                    discovery,
                 });
             detailed.retained_incomplete_taint_rows = true;
         }
@@ -1132,6 +1166,7 @@ impl<'a> PolicySelectorSession<'a> {
                 "selector `{}` could not be applied: {}: {}",
                 selector.path, error.diagnostic.code, error.diagnostic.message,
             ),
+            discovery: Vec::new(),
         };
         if !self.incomplete_taint_selectors.contains(&gap) {
             self.incomplete_taint_selectors.push(gap);
@@ -1323,23 +1358,28 @@ impl<'a> PolicySelectorSession<'a> {
         let query_limits = self.remaining_query_limits()?;
         let artifact_leases = self.artifact_leases.snapshot();
         let semantic_before = self.semantic_budget.replay_snapshot();
+        let refusals_before = self.semantic_budget.refusal_count();
         let execution_before = self.semantic_execution_budget.work();
-        let (executed, reads) = recompute_unit(self.workspace.analyzer(), || {
-            execute_code_query_selector_unit(
-                self.workspace,
-                query,
-                query_limits,
-                Some(self.cancellation),
-                &self.semantic_budget,
-                &self.semantic_execution_budget,
-                artifact_leases,
-                CodeQueryExecutionScope::for_seed_files(
-                    std::slice::from_ref(file),
-                    &units.workspace_files,
+        let (executed, mut reads, elapsed) =
+            recompute_unit(self.workspace.analyzer(), Some(self.cancellation), || {
+                execute_code_query_selector_unit(
+                    self.workspace,
+                    &self.flow_state,
+                    query,
+                    query_limits,
+                    self.root_allotment,
+                    Some(self.cancellation),
+                    &self.semantic_budget,
+                    &self.semantic_execution_budget,
+                    artifact_leases,
+                    CodeQueryExecutionScope::for_seed_files(
+                        std::slice::from_ref(file),
+                        &units.workspace_files,
+                    )
+                    .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
                 )
-                .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
-            )
-        });
+            });
+        units.reuse.record_recompute(elapsed);
         let mut detailed = executed.detailed;
         let rows = executed.unit;
         let semantic_receipt = detailed.take_semantic_receipt();
@@ -1385,6 +1425,18 @@ impl<'a> PolicySelectorSession<'a> {
         }
         let semantic = self.semantic_budget.replay_since(&semantic_before);
         let execution_after = self.semantic_execution_budget.work();
+        if self.semantic_budget.refusal_count() > refusals_before || execution_after.exhausted {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=selector_boundary semantic={} execution={}",
+                    file!(),
+                    line!(),
+                    self.semantic_budget.refusal_count() > refusals_before,
+                    execution_after.exhausted
+                )
+            });
+            reads = None;
+        }
         Ok(ExecutedSelectorUnit {
             reads,
             publishable: !retained_artifacts && sites.iter().all(selector_site_is_projectable),
@@ -1477,8 +1529,10 @@ impl<'a> PolicySelectorSession<'a> {
         let artifact_leases = self.artifact_leases.snapshot();
         let mut detailed = execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_and_row_family_session(
             self.workspace,
+    &self.flow_state,
             query,
             query_limits,
+            self.root_allotment,
             Some(self.cancellation),
             &self.semantic_budget,
             &self.semantic_execution_budget,
@@ -1790,12 +1844,7 @@ impl<'a> PolicySelectorSession<'a> {
                                     selector.path
                                 ))
                             })?,
-                            formal_name: value.formal_name.clone().ok_or_else(|| {
-                                PolicySelectorSessionError::Unavailable(format!(
-                                    "selector `{}` selected a binding without a formal name",
-                                    selector.path
-                                ))
-                            })?,
+                            formal_name: value.formal_name.clone(),
                             semantic_target_id: value.semantic_target_id.clone(),
                             model_callable_id: value.model_callable_id.clone(),
                             formal_layout_id: value.formal_layout_id.clone().ok_or_else(|| {
@@ -2807,12 +2856,24 @@ impl<'a> SelectorUnits<'a> {
         query: &CodeQuery,
         selector_path: &str,
     ) -> Result<Vec<ProjectFile>, PolicySelectorSessionError> {
+        if let Some(reason) = self
+            .incremental
+            .base_workspace_widen(&self.policy.definition().metadata.id)
+        {
+            return Err(PolicySelectorSessionError::Widen(reason));
+        }
         // Selector products contain live selected-site lists, already deduplicated
         // within each file. Unlike row products, they cannot retain branch
         // contributions until a global branch-major merge.
-        if matches!(query.plan.source, CodeQueryPlanSource::Set { .. })
-            || !PlanPartitioning::classify(&query.plan).is_by_seed()
-        {
+        if matches!(query.plan.source, CodeQueryPlanSource::Set { .. }) {
+            self.attempt
+                .set_widen_detail(Some(PlanWidenDetail::TypestateSetSource));
+            return Err(PolicySelectorSessionError::Widen(
+                WidenReason::PlanCrossesSeeds,
+            ));
+        }
+        if let PlanPartitioning::Whole(detail) = PlanPartitioning::classify(&query.plan) {
+            self.attempt.set_widen_detail(Some(detail));
             return Err(PolicySelectorSessionError::Widen(
                 WidenReason::PlanCrossesSeeds,
             ));
@@ -4167,6 +4228,7 @@ mod tests {
         let limits = PolicyBudget::default().query_limits();
         let mut limited = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "taint",
             limits,
             1,
@@ -4181,6 +4243,7 @@ mod tests {
 
         let mut complete = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "taint",
             limits,
             16,
@@ -4210,6 +4273,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "taint",
             PolicyBudget::default().query_limits(),
             16,
@@ -4408,6 +4472,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         let budget = PolicyBudget::default();
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             budget.query_limits(),
             64,
@@ -4514,6 +4579,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         let rows = budget.query_limits().semantic.max_rows_per_dimension;
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             budget.query_limits(),
             64,
@@ -4566,6 +4632,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
 
         let mut calibration = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             default_limits,
             64,
@@ -4585,6 +4652,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             limits_for_one_census_and_repeats(default_limits, census, retained_peak, 1);
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             tight_limits,
             64,
@@ -4634,6 +4702,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
 
         let mut calibration = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             default_limits,
             64,
@@ -4656,6 +4725,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
         assert_eq!(tight_limits.semantic.max_retained_bytes, retained_peak);
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             tight_limits,
             64,
@@ -4779,6 +4849,7 @@ func caller() { target() }
         );
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             PolicyBudget::default().query_limits(),
             64,
@@ -4803,6 +4874,7 @@ func caller() { target() }
         let rows = budget.query_limits().semantic.max_rows_per_dimension;
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             budget.query_limits(),
             64,
@@ -4851,6 +4923,7 @@ func caller() { target() }
         let budget = PolicyBudget::default();
         let mut session = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             budget.query_limits(),
             64,
@@ -4879,6 +4952,7 @@ func caller() { target() }
 
         let mut whole = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             limits,
             64,
@@ -4900,6 +4974,7 @@ func caller() { target() }
         let seed = project.file("a.go");
         let mut narrowed = PolicySelectorSession::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             "test",
             limits,
             64,

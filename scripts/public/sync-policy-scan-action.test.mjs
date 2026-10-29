@@ -67,6 +67,8 @@ function withFixture(body, { action = ACTION, readme = README } = {}) {
     fs.mkdirSync(path.join(checkout, ".github/actions/policy-scan"), { recursive: true });
     fs.mkdirSync(path.join(checkout, "packaging/policy-scan-action"), { recursive: true });
     fs.writeFileSync(path.join(checkout, ".github/actions/policy-scan/action.yml"), action);
+    fs.writeFileSync(path.join(checkout, ".github/actions/policy-scan/check-open-pack-selection.sh"),
+      "#!/usr/bin/env bash\n", { mode: 0o755 });
     fs.writeFileSync(path.join(checkout, "packaging/policy-scan-action/README.md"), readme);
     fs.writeFileSync(path.join(checkout, "LICENSE.md"), "Apache 2.0\n");
 
@@ -884,8 +886,11 @@ test('binary acquisition runs after stale scan output is cleared', () => {
 test("standalone alias carries only the composite action contract", () => {
   withFixture(({ checkout, bare, dir }) => {
     assert.equal(sync(checkout, bare, "v0.11.0").status, 0);
-    const aliasFiles = execFileSync('git', ['--git-dir', bare, 'ls-tree', '-r', '--name-only', 'v0.11.0'], { encoding: 'utf8' }).trim().split('\n').sort();
-    assert.deepEqual(aliasFiles, ['LICENSE.md', 'README.md', 'action.yml']);
+    const aliasFiles = execFileSync('git', ['--git-dir', bare, 'ls-tree', '-r', 'v0.11.0'], { encoding: 'utf8' })
+      .trim().split('\n').map((line) => { const [mode, , , name] = line.split(/\s+/u); return `${mode} ${name}`; }).sort();
+    // The action runs its selection check from its own directory (#7497).
+    assert.deepEqual(aliasFiles, ['100644 LICENSE.md', '100644 README.md', '100644 action.yml',
+      '100755 check-open-pack-selection.sh']);
   });
 });
 

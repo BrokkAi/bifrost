@@ -1291,7 +1291,7 @@ export function shadowed(raw) {
         ];
         let mut boundaries = Vec::new();
         assert_eq!(
-            apply_dynamic_dispatch_gap(&gap, &mut boundaries),
+            apply_dynamic_dispatch_gap(&gap, &[], &mut boundaries),
             DispatchQuality::Truncated
         );
         assert!(matches!(

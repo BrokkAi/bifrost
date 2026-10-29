@@ -94,15 +94,22 @@ impl CppAnalyzer {
                 .is_empty()
                 .then(|| (*cached.value).clone());
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-cpp-analysis/src/analyzer/cpp/hierarchy.rs",
+            );
         let scope = AnalyzerQueryScope::new(self);
         let resolved = cpp_resolve_direct_ancestors(self, scope.token(), code_unit, keep_going)?;
         if scope.read_completion().is_err() {
             return None;
         }
-        self.direct_ancestors.insert(
-            code_unit.clone(),
-            CachedFileRead::complete(Arc::new(resolved.clone())),
-        );
+        {
+            let cache_key = code_unit.clone();
+            let cache_value = CachedFileRead::complete(Arc::new(resolved.clone()));
+            persistent_fill_guard.installed("direct_ancestors");
+            self.direct_ancestors.insert(cache_key, cache_value);
+        };
         Some(resolved)
     }
 }
@@ -150,7 +157,11 @@ impl TypeHierarchyProvider for CppAnalyzer {
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
         descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
-            build_direct_descendant_index(self, self, scope)
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                build_direct_descendant_index(self, self, scope)
+            })
+            .ok()
+            .flatten()
         })
     }
 }

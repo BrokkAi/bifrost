@@ -1109,6 +1109,7 @@ fn validate_wrapper(
         | RqlForm::Async
         | RqlForm::UnsafeContext
         | RqlForm::Modifier
+        | RqlForm::TypeKind
         | RqlForm::StringValueRegex
         | RqlForm::Not
         | RqlForm::All
@@ -1952,7 +1953,7 @@ fn validate_decorator_binding_options(options: &[Expr], analysis: &mut Analysis)
     if !even_option_pairs(
         options,
         || {
-            "decorator-bindings expects :module and :imported-name option/value pairs followed by a query"
+            "decorator-bindings expects :module, :imported-name and :annotation-type option/value pairs followed by a query"
                 .to_string()
         },
         analysis,
@@ -1977,7 +1978,7 @@ fn validate_decorator_binding_options(options: &[Expr], analysis: &mut Analysis)
             analysis.error(
                 pair[0].range.clone(),
                 "unknown-property",
-                "decorator-bindings accepts only :module and :imported-name",
+                "decorator-bindings accepts only :module, :imported-name and :annotation-type",
             );
             continue;
         };
@@ -3396,6 +3397,7 @@ fn rql_property_path(path: &str, property: RqlProperty) -> String {
         RqlProperty::Async => "async",
         RqlProperty::UnsafeContext => "unsafe_context",
         RqlProperty::Modifier => "modifier",
+        RqlProperty::TypeKind => "type_kind",
         RqlProperty::DuplicateKey => "duplicate_key",
         RqlProperty::Parenthesized => "parenthesized",
         RqlProperty::IntegerValue => "integer_value",
@@ -3449,6 +3451,7 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
             ("exact string", MAX_STRING_PREDICATE_LENGTH, false)
         }
         RqlProperty::LanguageRule => ("language rule label", MAX_STRING_PREDICATE_LENGTH, false),
+        RqlProperty::TypeKind => ("type-kind label", MAX_STRING_PREDICATE_LENGTH, false),
         RqlProperty::Modifier => ("modifier label", MAX_STRING_PREDICATE_LENGTH, false),
         RqlProperty::BodyState => ("body-state label", MAX_STRING_PREDICATE_LENGTH, false),
         RqlProperty::BodyOwner => ("body-owner label", MAX_STRING_PREDICATE_LENGTH, false),
@@ -3508,6 +3511,14 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
             value.range.clone(),
             "invalid-query",
             format!("unknown body-owner label {text:?}"),
+        );
+    } else if property == RqlProperty::TypeKind
+        && !crate::query::schema::DECLARATION_TYPE_KINDS.contains(&text.as_str())
+    {
+        analysis.error(
+            value.range.clone(),
+            "invalid-query",
+            format!("unknown type-kind label {text:?}"),
         );
     } else if property == RqlProperty::Modifier && DeclarationModifier::from_label(text).is_none() {
         analysis.error(

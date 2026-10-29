@@ -2,7 +2,18 @@ use std::sync::Arc;
 
 use super::*;
 use brokk_bifrost_analysis::analyzer::nested_loop_facts;
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
+
+pub(super) fn supports_kind(language: Language, kind: StatementFactKind) -> bool {
+    let syntax = brokk_bifrost_analysis::analyzer::structural_spec_for(language)
+        .and_then(|spec| spec.statement_fact_syntax());
+    if kind == StatementFactKind::NestedLoopsWithSameVariable {
+        return matches!(language, Language::Cpp | Language::CSharp | Language::Java)
+            && syntax.is_none_or(|syntax| syntax.supports_kind(kind));
+    }
+    syntax.is_some_and(|syntax| syntax.supports_kind(kind))
+}
 
 pub(super) fn statement_fact_expansions(
     workspace: Option<&WorkspaceAnalyzer>,
@@ -13,16 +24,33 @@ pub(super) fn statement_fact_expansions(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
-    if kind == StatementFactKind::NestedLoopsWithSameVariable {
-        return nested_loop_fact_expansions(workspace, semantic, seed, cancellation, diagnostics);
-    }
-    if seed.language != Language::Cpp {
+    if !supports_kind(seed.language, kind) {
         return Vec::new();
     }
-    let Some(rows) = analyzer.cpp_statement_source_facts(&seed.file) else {
+    if kind == StatementFactKind::NestedLoopsWithSameVariable {
+        return nested_loop_fact_expansions(
+            analyzer,
+            workspace,
+            semantic,
+            seed,
+            cancellation,
+            diagnostics,
+        );
+    }
+    let rows = analyzer.statement_source_facts(&seed.file);
+    let range = super::relations::seed_range(seed);
+    report_conditional_undecided(
+        seed,
+        kind,
+        rows.iter()
+            .flat_map(|rows| &rows.undecided)
+            .filter(|site| site.kind == kind)
+            .map(|site| site.range),
+        diagnostics,
+    );
+    let Some(rows) = rows else {
         return Vec::new();
     };
-    let range = super::relations::seed_range(seed);
     let matches = match kind {
         StatementFactKind::ComplexCondition => rows
             .conditions
@@ -50,56 +78,111 @@ pub(super) fn statement_fact_expansions(
     }
 }
 
-fn report_nested_loop_incomplete(
+fn report_conditional_undecided(
     seed: &SeedMatch,
-    reason: impl std::fmt::Debug,
+    kind: StatementFactKind,
+    sites: impl Iterator<Item = Range>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
+    let range = super::relations::seed_range(seed);
+    let undecided = sites
+        .filter(|site| range.contains(site))
+        .map(|site| {
+            super::language_rules::UndecidedSite::at(
+                site,
+                "conditional-compilation activation is unproven",
+            )
+        })
+        .collect();
+    diagnostics.extend(
+        super::language_rules::LanguageRuleMatches::decided(
+            Vec::<Range>::new(),
+            undecided,
+            seed.language.config_label(),
+            kind.label(),
+            &seed.file,
+        )
+        .diagnostics,
+    );
+}
+
+fn report_nested_loop_incomplete(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    reason: impl std::fmt::Debug,
+    cause: Option<DerivationExecutionCause>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) {
+    let code = CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete;
     let language = seed.language.config_label();
     let message = format!(
         "nested-loops-with-same-variable: loop relation evidence is incomplete ({reason:?})"
     );
     if diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete
-            && diagnostic.language == language
-            && diagnostic.message == message
+        diagnostic.code == code && diagnostic.language == language && diagnostic.message == message
     }) {
         return;
     }
-    diagnostics.push(CodeQueryDiagnostic {
-        related: Vec::new(),
-        source: None,
-        code: CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language,
-        message,
-        exhausted_roots: Vec::new(),
-        withheld_rows_path: None,
-    });
+    diagnostics.push(super::QueryExecutionState::diagnostic(
+        analyzer,
+        CodeQueryDiagnostic {
+            related: Vec::new(),
+            source: None,
+            code,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language,
+            message,
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        },
+        cause,
+    ));
 }
 
 fn nested_loop_fact_expansions(
+    analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
     seed: &Arc<SeedMatch>,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
-    if !matches!(seed.language, Language::Cpp | Language::CSharp) {
+    if !supports_kind(
+        seed.language,
+        StatementFactKind::NestedLoopsWithSameVariable,
+    ) {
         return Vec::new();
     }
     let Some(workspace) = workspace else {
-        report_nested_loop_incomplete(seed, "workspace_unavailable", diagnostics);
+        report_nested_loop_incomplete(
+            analyzer,
+            seed,
+            "workspace_unavailable",
+            Some(DerivationExecutionCause::Provider),
+            diagnostics,
+        );
         return Vec::new();
     };
     let Some(semantic) = semantic.as_mut() else {
-        report_nested_loop_incomplete(seed, "semantic_workspace_unavailable", diagnostics);
+        report_nested_loop_incomplete(
+            analyzer,
+            seed,
+            "semantic_workspace_unavailable",
+            Some(DerivationExecutionCause::Provider),
+            diagnostics,
+        );
         return Vec::new();
     };
     let procedures = semantic.cfg().procedure_of_match(seed);
     if procedures.is_empty() {
-        report_nested_loop_incomplete(seed, "no_enclosing_procedure", diagnostics);
+        report_nested_loop_incomplete(
+            analyzer,
+            seed,
+            derivation_reason::NO_ENCLOSING_PROCEDURE,
+            None,
+            diagnostics,
+        );
         return Vec::new();
     }
     let range = super::relations::seed_range(seed);
@@ -108,10 +191,41 @@ fn nested_loop_fact_expansions(
     for procedure in procedures {
         let facts = nested_loop_facts(workspace, &procedure.handle, cancellation);
         if !facts.complete {
+            if DerivationExecutionCause::from_reason(
+                facts.reason.unwrap_or(derivation_reason::UNKNOWN),
+            )
+            .is_some()
+            {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=candidate_derivation detail={:?}",
+                        file!(),
+                        line!(),
+                        facts.reason
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
+            }
             incomplete = true;
-            report_nested_loop_incomplete(seed, facts.reason, diagnostics);
+            report_nested_loop_incomplete(
+                analyzer,
+                seed,
+                facts.reason,
+                CodeQueryDiagnosticCode::from_execution_reason(
+                    CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
+                    facts.reason.unwrap_or(derivation_reason::UNKNOWN),
+                )
+                .1,
+                diagnostics,
+            );
             continue;
         }
+        report_conditional_undecided(
+            seed,
+            StatementFactKind::NestedLoopsWithSameVariable,
+            facts.undecided.iter().copied(),
+            diagnostics,
+        );
         if facts.rows.contains(&range) {
             matches = true;
         }

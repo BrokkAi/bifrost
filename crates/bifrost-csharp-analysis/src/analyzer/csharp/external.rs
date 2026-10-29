@@ -123,9 +123,11 @@ use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::HashMap;
 
 use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_semantic::analyzer::semantic_model::{AssemblyReference, TypeForwardFact};
 use goblin::pe::PE;
 use semver::Version;
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -257,7 +259,13 @@ impl DecodedType {
                 element: Box::new(element.type_ref(owner_type_parameters, member_type_parameters)?),
             }),
             Self::Array { .. } => Err("multidimensional array types are not representable"),
-            Self::Pointer(_) => Err("pointer types are not representable"),
+            Self::Pointer(inner) => Ok(TypeRef::Pointer {
+                element: Box::new(if matches!(inner.as_ref(), Self::Void) {
+                    TypeRef::named("System.Void")
+                } else {
+                    inner.type_ref(owner_type_parameters, member_type_parameters)?
+                }),
+            }),
             Self::ByRef(inner) => Ok(TypeRef::ByRef {
                 element: Box::new(inner.type_ref(owner_type_parameters, member_type_parameters)?),
                 reference_kind: TypeRefReferenceKind::Lvalue,
@@ -357,6 +365,9 @@ pub struct CSharpExternalType {
     base: Option<DecodedType>,
     interfaces: Vec<String>,
     interface_refs: Vec<DecodedType>,
+    supertypes_complete: bool,
+    nested_owner: Option<String>,
+    omitted_members: Vec<(String, CSharpExternalMemberKind, CSharpVisibility)>,
     source: CSharpExternalDeclarationSource,
     members: Vec<CSharpExternalMember>,
     is_effectively_visible: bool,
@@ -452,6 +463,10 @@ pub struct CSharpExternalDeclarationIndex {
     /// turn every `using System;` in a loose `.cs` file into an error.
     has_dependency_inputs: bool,
     production_diagnostics: Vec<ProducerDiagnostic>,
+    /// Constant-time no-reader guard; forward names live only in catalog rows.
+    has_type_forwards: bool,
+    /// Pack-level provenance for the no-reader diagnostic, never a name index.
+    forwarding_packs: Vec<brokk_bifrost_analysis::analyzer::semantic_model::AssemblyReference>,
 }
 
 impl Default for CSharpExternalDeclarationIndex {
@@ -466,6 +481,8 @@ impl Default for CSharpExternalDeclarationIndex {
             complete: true,
             has_dependency_inputs: false,
             production_diagnostics: Vec::new(),
+            has_type_forwards: false,
+            forwarding_packs: Vec::new(),
         }
     }
 }
@@ -587,6 +604,15 @@ impl CSharpExternalDeclarationIndex {
     pub fn has_dependency_inputs(&self) -> bool {
         self.has_dependency_inputs
     }
+    pub(crate) fn forwarding_packs(
+        &self,
+    ) -> &[brokk_bifrost_analysis::analyzer::semantic_model::AssemblyReference] {
+        &self.forwarding_packs
+    }
+    pub(crate) fn unreadable_type_forwards(&self) -> Option<String> {
+        self.has_type_forwards.then(|| format!(
+            "forward rows are unreadable without an activated semantic-pack catalog; forwarding packs: {:?}", self.forwarding_packs))
+    }
     pub fn production_diagnostics(&self) -> &[ProducerDiagnostic] {
         &self.production_diagnostics
     }
@@ -650,6 +676,38 @@ impl CSharpExternalDeclarationIndex {
         let Some(pack) = production.pack.as_ref() else {
             return;
         };
+        for shard in &pack.shards {
+            if let AuthoredPayload::DeclarationFacts {
+                assembly_identity,
+                type_forwards,
+                ..
+            } = &shard.payload
+                && !type_forwards.is_empty()
+            {
+                self.has_type_forwards = true;
+                self.forwarding_packs.push(
+                    assembly_identity
+                        .as_ref()
+                        .expect("C# packs publish AssemblyDef identity")
+                        .clone(),
+                );
+            }
+        }
+        self.forwarding_packs.sort_by(|left, right| {
+            (
+                &left.name,
+                &left.version,
+                &left.culture,
+                &left.public_key_token,
+            )
+                .cmp(&(
+                    &right.name,
+                    &right.version,
+                    &right.culture,
+                    &right.public_key_token,
+                ))
+        });
+        self.forwarding_packs.dedup();
         for ty in project_pack_types(path, pack) {
             if ty.externally_visible() {
                 self.namespaces.insert(ty.namespace.clone());
@@ -728,6 +786,21 @@ impl<'a> CSharpExternalDeclarations<'a> {
         >,
     ) -> Self {
         Self { artifacts, packs }
+    }
+
+    pub(crate) fn forward_boundary_in_file(
+        &self,
+        reference: &str,
+        namespace: &str,
+        usings: &[String],
+        aliases: &HashMap<String, String>,
+    ) -> Option<String> {
+        let packs = self.packs.as_ref()?;
+        let reasons: Vec<_> = csharp_type_reference_keys(reference, namespace, usings, aliases)
+            .into_iter()
+            .flat_map(|name| packs.type_forward_boundaries(&name))
+            .collect();
+        (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 
     /// Whether no surface can answer anything, so a caller may skip the ladder.
@@ -1178,6 +1251,9 @@ fn project_pack_types(path: &Path, pack: &AuthoredSemanticModelPack) -> Vec<CSha
                     .map(DecodedType::legacy_name)
                     .collect(),
                 interface_refs,
+                supertypes_complete: false,
+                nested_owner: None,
+                omitted_members: Vec::new(),
                 source,
                 members: Vec::new(),
                 is_effectively_visible: true,
@@ -1292,10 +1368,17 @@ fn decoded_type_from_semantic(
         TypeRef::ByRef { element, .. } => Some(DecodedType::ByRef(Box::new(
             decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
         ))),
+        TypeRef::Pointer { element } => Some(DecodedType::Pointer(Box::new(
+            if matches!(element.as_ref(), TypeRef::Named { name, arguments, .. } if name == "System.Void" && arguments.is_empty())
+            {
+                DecodedType::Void
+            } else {
+                decoded_type_from_semantic(element, owner_parameters, member_parameters)?
+            },
+        ))),
         TypeRef::Projection { .. }
         | TypeRef::Unknown
         | TypeRef::Declared { .. }
-        | TypeRef::Pointer { .. }
         | TypeRef::Slice { .. }
         | TypeRef::FixedArray { .. }
         | TypeRef::Map { .. }
@@ -1578,6 +1661,14 @@ impl CSharpAssemblyPackProducer {
                 limits,
             );
         };
+        let Some(mut exports) = parse_assembly_exports(artifact.bytes(), cancellation) else {
+            let cancelled = cancellation.is_some_and(CancellationToken::is_cancelled);
+            return ArtifactProduction::failed(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error, source_entry: None,
+                code: if cancelled {"artifact.cancelled"} else {"csharp.metadata.invalid"}.to_owned(), location: None, declaration: None,
+                message: if cancelled {".NET assembly export production was cancelled"} else {"artifact does not contain supported bounded assembly identity/export metadata"}.to_owned(),
+            },limits);
+        };
         let Some(locator_path) = artifact
             .path()
             .file_name()
@@ -1607,6 +1698,36 @@ impl CSharpAssemblyPackProducer {
                 ),
             );
         }
+        if exports.omitted > 0 {
+            diagnostics.warning("csharp.metadata.export_omitted",None,
+                format!("omitted {} exported types with unreadable metadata or no assembly forward root",exports.omitted));
+        }
+        exports.forwards.sort_by(|left, right| {
+            left.name
+                .len()
+                .cmp(&right.name.len())
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        if exports.forwards.len() > limits.max_records {
+            exports.forwards.truncate(limits.max_records);
+            // A truncated nested export must not retain a link to an omitted outer.
+            let admitted: HashSet<_> = exports
+                .forwards
+                .iter()
+                .map(|forward| forward.name.clone())
+                .collect();
+            exports.forwards.retain(|forward| {
+                forward
+                    .outer
+                    .as_ref()
+                    .is_none_or(|outer| admitted.contains(outer))
+            });
+            diagnostics.warning(
+                "limit.records",
+                None,
+                "assembly forwards exceed the configured record limit",
+            );
+        }
         let mut type_ids = HashMap::default();
         for ty in external_types.iter().filter(|ty| ty.externally_visible()) {
             type_ids.insert(
@@ -1618,11 +1739,22 @@ impl CSharpAssemblyPackProducer {
             );
         }
 
+        let mut nested_types_by_owner = HashMap::<&str, Vec<&CSharpExternalType>>::default();
+        for nested in external_types.iter().filter(|ty| ty.externally_visible()) {
+            if let Some(owner) = nested.nested_owner.as_deref() {
+                nested_types_by_owner.entry(owner).or_default().push(nested);
+            }
+        }
         let mut types = Vec::new();
         let mut members = Vec::new();
         let mut record_limit_reported = false;
         for ty in external_types.iter().filter(|ty| ty.externally_visible()) {
-            if types.len().saturating_add(members.len()) >= limits.max_records {
+            if types
+                .len()
+                .saturating_add(members.len())
+                .saturating_add(exports.forwards.len())
+                >= limits.max_records
+            {
                 if !record_limit_reported {
                     diagnostics.warning(
                         "limit.records",
@@ -1632,6 +1764,7 @@ impl CSharpAssemblyPackProducer {
                             limits.max_records
                         ),
                     );
+                    record_limit_reported = true;
                 }
                 break;
             }
@@ -1639,8 +1772,19 @@ impl CSharpAssemblyPackProducer {
                 .get(&ty.fqn)
                 .expect("visible types receive stable ids")
                 .clone();
+            let mut omitted_members = ty.omitted_members.clone();
             let mut hierarchy = Vec::new();
+            let mut supertypes = Vec::new();
+            let mut supertypes_complete = ty.supertypes_complete;
             if let Some(base) = &ty.base {
+                match base.type_ref(&ty.type_parameters, &[]) {
+                    Ok(target) => supertypes.push(HierarchyFact {
+                        hierarchy_kind: HierarchyKind::Extends,
+                        target,
+                        declaration_ordinal: None,
+                    }),
+                    Err(_) => supertypes_complete = false,
+                }
                 let base_name = base.legacy_name();
                 if !matches!(
                     base_name.as_str(),
@@ -1665,22 +1809,53 @@ impl CSharpAssemblyPackProducer {
             }
             for interface in &ty.interface_refs {
                 match interface.type_ref(&ty.type_parameters, &[]) {
-                    Ok(target) => hierarchy.push(HierarchyFact {
-                        hierarchy_kind: HierarchyKind::Implements,
-                        target,
-                        declaration_ordinal: None,
-                    }),
-                    Err(message) => diagnostics.warning(
-                        "csharp.type.unsupported_interface",
-                        Some(metadata_location(ty.source())),
-                        message,
-                    ),
+                    Ok(target) => {
+                        let fact = HierarchyFact {
+                            hierarchy_kind: HierarchyKind::Implements,
+                            target,
+                            declaration_ordinal: None,
+                        };
+                        supertypes.push(fact.clone());
+                        hierarchy.push(fact);
+                    }
+                    Err(message) => {
+                        supertypes_complete = false;
+                        diagnostics.warning(
+                            "csharp.type.unsupported_interface",
+                            Some(metadata_location(ty.source())),
+                            message,
+                        );
+                    }
                 }
             }
             types.push(TypeFact {
                 implemented_traits_complete: false,
                 generic_trait_impls_complete: false,
-                jvm_inventory: None,
+                jvm_inventory: Some(
+                    brokk_bifrost_analysis::analyzer::semantic_model::JvmOwnerInventory {
+                        supertypes,
+                        supertypes_complete,
+                        nested_types: nested_types_by_owner
+                            .get(ty.fqn.as_str())
+                            .into_iter()
+                            .flatten()
+                            .map(|nested| {
+                                brokk_bifrost_analysis::analyzer::semantic_model::JvmNestedType {
+                                    name: nested.short_name.clone(),
+                                    owner_fqn: nested.fqn.clone(),
+                                    visibility: semantic_visibility(nested.visibility),
+                                    // The JVM sense: no enclosing instance is
+                                    // needed, which holds for every C# nested type.
+                                    is_static: true,
+                                }
+                            })
+                            .collect(),
+                        types_complete: true,
+                        callables_complete: false,
+                        values_complete: false,
+                        additional_members: Vec::new(),
+                    },
+                ),
                 type_parameter_defaults: Vec::new(),
                 implemented_traits: Vec::new(),
                 generic_trait_impls: Vec::new(),
@@ -1714,7 +1889,12 @@ impl CSharpAssemblyPackProducer {
                 .iter()
                 .filter(|member| member.externally_visible())
             {
-                if types.len().saturating_add(members.len()) >= limits.max_records {
+                if types
+                    .len()
+                    .saturating_add(members.len())
+                    .saturating_add(exports.forwards.len())
+                    >= limits.max_records
+                {
                     if !record_limit_reported {
                         diagnostics.warning(
                             "limit.records",
@@ -1741,6 +1921,7 @@ impl CSharpAssemblyPackProducer {
                             Some(metadata_location(member.source())),
                             message,
                         );
+                        omitted_members.push((member.name.clone(), member.kind, member.visibility));
                         continue;
                     }
                 };
@@ -1755,6 +1936,11 @@ impl CSharpAssemblyPackProducer {
                                     Some(metadata_location(member.source())),
                                     message,
                                 );
+                                omitted_members.push((
+                                    member.name.clone(),
+                                    member.kind,
+                                    member.visibility,
+                                ));
                                 continue;
                             }
                         }
@@ -1828,9 +2014,61 @@ impl CSharpAssemblyPackProducer {
                     },
                 });
             }
+            let visible_omissions = omitted_members
+                .iter()
+                .filter(|(_, _, visibility)| {
+                    semantic_visibility(*visibility).is_externally_visible()
+                })
+                .collect::<Vec<_>>();
+            // A family is keyed by owner and name only, deliberately coarser than a
+            // consumer's (owner, name, receiver form, declared arity): a member whose
+            // signature could not be decoded has no known arity, so it can hold only
+            // the coarse family open, and certifying that family proves the finer ones.
+            for member in members
+                .iter_mut()
+                .rev()
+                .take_while(|member| member.owner == type_id)
+            {
+                member.callable_family_complete = matches!(
+                    member.member_kind,
+                    MemberKind::Constructor | MemberKind::Method | MemberKind::Function
+                ) && !visible_omissions
+                    .iter()
+                    .any(|(name, _, _)| *name == member.name);
+            }
+            let owner = types.last_mut().expect("emitted owner");
+            owner.callable_surface_complete = visible_omissions.is_empty();
+            let inventory = owner.jvm_inventory.as_mut().expect("C# owner inventory");
+            inventory.callables_complete = !visible_omissions.iter().any(|(_, kind, _)| {
+                matches!(
+                    kind,
+                    CSharpExternalMemberKind::Method | CSharpExternalMemberKind::Constructor
+                )
+            });
+            inventory.values_complete = !visible_omissions.iter().any(|(_, kind, _)| {
+                matches!(
+                    kind,
+                    CSharpExternalMemberKind::Field
+                        | CSharpExternalMemberKind::Property
+                        | CSharpExternalMemberKind::Event
+                )
+            });
+        }
+        // A cut may omit later overloads or nested types of any emitted owner.
+        if record_limit_reported {
+            for member in &mut members {
+                member.callable_family_complete = false;
+            }
+            for owner in &mut types {
+                owner.callable_surface_complete = false;
+                let inventory = owner.jvm_inventory.as_mut().expect("C# owner inventory");
+                inventory.callables_complete = false;
+                inventory.values_complete = false;
+                inventory.types_complete = false;
+            }
         }
 
-        if types.is_empty() {
+        if types.is_empty() && exports.forwards.is_empty() {
             diagnostics.error(
                 "csharp.metadata.no_external_declarations",
                 None,
@@ -1846,6 +2084,9 @@ impl CSharpAssemblyPackProducer {
             };
         }
 
+        exports
+            .forwards
+            .sort_by(|left, right| left.name.cmp(&right.name));
         let mut activation = request.activation.clone();
         for selector in &mut activation {
             selector.artifact_sha256 = Some(artifact.sha256().to_owned());
@@ -1885,6 +2126,8 @@ impl CSharpAssemblyPackProducer {
                 id: "declarations.external".to_owned(),
                 activation,
                 payload: AuthoredPayload::DeclarationFacts {
+                    assembly_identity: Some(exports.identity),
+                    type_forwards: exports.forwards,
                     types,
                     members,
                     relations: Vec::new(),
@@ -2006,7 +2249,7 @@ fn metadata_type_identity(reference: &str) -> String {
     format!("{}`{arity}", reference[..open].trim())
 }
 
-fn csharp_type_reference_keys(
+pub(super) fn csharp_type_reference_keys(
     reference: &str,
     namespace: &str,
     usings: &[String],
@@ -2328,13 +2571,40 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
                 .rsplit_once('/')
                 .map(|(name, version)| (name.to_owned(), version.to_owned()))
                 .unwrap_or_else(|| (library.clone(), String::new()));
-            let project_path = root
+            let library_entry = root
                 .get("libraries")
                 .and_then(Value::as_object)
-                .and_then(|libraries| libraries.get(library))
-                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("project"))
-                .and_then(|entry| entry.get("path"))
-                .and_then(Value::as_str);
+                .and_then(|libraries| libraries.get(library));
+            let Some(library_entry) = library_entry else {
+                diagnostics.push(format!("library {library} has no libraries entry"));
+                continue;
+            };
+            let Some(library_type) = library_entry.get("type").and_then(Value::as_str) else {
+                diagnostics.push(format!("library {library} has no string libraries type"));
+                continue;
+            };
+            // NuGet installs a package under the folder `libraries[key].path`
+            // records (lower case), not under the targets key's declared case.
+            let (package_path, project_path) = match library_type {
+                "package" => match library_entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .and_then(safe_relative_path)
+                {
+                    Some(package_path) => (Some(package_path), None),
+                    None => {
+                        diagnostics.push(format!(
+                            "package library {library} has no usable libraries path (missing, non-string, or unsafe relative path)"
+                        ));
+                        continue;
+                    }
+                },
+                "project" => (None, library_entry.get("path").and_then(Value::as_str)),
+                kind => {
+                    diagnostics.push(format!("library {library} has unsupported type {kind}"));
+                    continue;
+                }
+            };
             for (section, role) in [
                 ("ref", DotNetAssetRole::Reference),
                 ("compile", DotNetAssetRole::Compile),
@@ -2352,28 +2622,27 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
                     let Some(relative) = safe_relative_path(relative) else {
                         continue;
                     };
-                    let Some(library) = safe_relative_path(library) else {
-                        continue;
-                    };
                     let out_start = out.len();
-                    for folder in &folders {
-                        let candidate = folder.join(library).join(relative);
-                        if let Ok(candidate) = candidate.canonicalize()
-                            && candidate.starts_with(folder)
-                            && candidate.is_file()
-                        {
-                            out.push(ResolvedCSharpAssembly {
-                                path: candidate,
-                                package_name: Some(package_name.clone()),
-                                package_version: (!package_version.is_empty())
-                                    .then(|| package_version.clone()),
-                                target: Some(target_name.clone()),
-                                configuration: None,
-                                role,
-                                project_reference: false,
-                                assembly_name: None,
-                                framework_reference: None,
-                            });
+                    if let Some(package_path) = package_path {
+                        for folder in &folders {
+                            let candidate = folder.join(package_path).join(relative);
+                            if let Ok(candidate) = candidate.canonicalize()
+                                && candidate.starts_with(folder)
+                                && candidate.is_file()
+                            {
+                                out.push(ResolvedCSharpAssembly {
+                                    path: candidate,
+                                    package_name: Some(package_name.clone()),
+                                    package_version: (!package_version.is_empty())
+                                        .then(|| package_version.clone()),
+                                    target: Some(target_name.clone()),
+                                    configuration: None,
+                                    role,
+                                    project_reference: false,
+                                    assembly_name: None,
+                                    framework_reference: None,
+                                });
+                            }
                         }
                     }
                     if let (Some(root), Some(project_path)) =
@@ -2422,7 +2691,7 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
                         diagnostics.push(format!(
                             "restored assembly {} for {} target {} was not found under an approved root",
                             relative.display(),
-                            library.display(),
+                            library,
                             target_name
                         ));
                     }
@@ -2611,7 +2880,7 @@ fn assembly_identity_mismatch(
     artifact: &ExactArtifact,
     declared: &str,
 ) -> Option<ProducerDiagnostic> {
-    let name = assembly_definition_name(artifact.bytes());
+    let name = assembly_definition_identity(artifact.bytes()).map(|identity| identity.name);
     (name.as_deref() != Some(declared)).then(|| ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Error,
         source_entry: None,
@@ -2624,24 +2893,206 @@ fn assembly_identity_mismatch(
     })
 }
 
-/// The name in the single Assembly (0x20) metadata row.
-fn assembly_definition_name(bytes: &[u8]) -> Option<String> {
+/// The strong identity in the single Assembly (0x20) metadata row.
+fn assembly_definition_identity(bytes: &[u8]) -> Option<AssemblyReference> {
     let pe = PE::parse(bytes).ok()?;
     let streams = Streams::parse(metadata_bytes(&pe, bytes)?)?;
     let layout = TableLayout::parse(streams.tables?)?;
     if layout.rows(32) != 1 {
         return None;
     }
-    let row = layout.row(32, 1)?;
-    // HashAlgId, four version parts and Flags precede the PublicKey blob.
-    let mut p = 16 + if layout.heap & 4 != 0 { 4 } else { 2 };
-    str_index(
-        row,
+    let mut p = 4; // AssemblyDef HashAlgId precedes the common identity fields.
+    read_assembly_identity_fields(
+        layout.row(32, 1)?,
         &mut p,
-        layout.heap,
+        &layout,
         streams.strings?,
+        streams.blobs?,
         &mut MetadataDecodeBudget::default(),
     )
+}
+
+fn read_assembly_identity_fields(
+    row: &[u8],
+    p: &mut usize,
+    layout: &TableLayout<'_>,
+    strings: &[u8],
+    blobs: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<AssemblyReference> {
+    let version = format!(
+        "{}.{}.{}.{}",
+        u16at(row, p)?,
+        u16at(row, p)?,
+        u16at(row, p)?,
+        u16at(row, p)?
+    );
+    let flags = u32at(row, p)?;
+    let key = blob_index(row, p, layout.heap, blobs, budget)?;
+    let name = str_index(row, p, layout.heap, strings, budget)?;
+    let culture = str_index(row, p, layout.heap, strings, budget)?;
+    let public_key_token = if key.is_empty() {
+        None
+    } else {
+        let token = if flags & 1 != 0 {
+            // ECMA-335 II.6.2.1: low eight SHA-1 bytes, in reverse order.
+            Sha1::digest(&key)[12..]
+                .iter()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            if key.len() != 8 {
+                return None;
+            }
+            key
+        };
+        Some(token.iter().map(|byte| format!("{byte:02x}")).collect())
+    };
+    Some(AssemblyReference {
+        name,
+        version,
+        culture: (!culture.is_empty()).then_some(culture),
+        public_key_token,
+    })
+}
+
+struct AssemblyExports {
+    identity: AssemblyReference,
+    forwards: Vec<TypeForwardFact>,
+    omitted: usize,
+}
+
+fn parse_assembly_exports(
+    bytes: &[u8],
+    cancellation: Option<&CancellationToken>,
+) -> Option<AssemblyExports> {
+    let identity = assembly_definition_identity(bytes)?;
+    let pe = PE::parse(bytes).ok()?;
+    let streams = Streams::parse(metadata_bytes(&pe, bytes)?)?;
+    let layout = TableLayout::parse(streams.tables?)?;
+    let strings = streams.strings?;
+    let blobs = streams.blobs?;
+    if layout.rows.iter().any(|count| *count > MAX_METADATA_ROWS)
+        || layout
+            .rows
+            .iter()
+            .try_fold(0u32, |total, count| total.checked_add(*count))?
+            > MAX_METADATA_TOTAL_ROWS
+        || strings.len() > MAX_ASSETS_BYTES as usize
+        || blobs.len() > MAX_ASSETS_BYTES as usize
+    {
+        return None;
+    }
+    let mut budget = MetadataDecodeBudget::default();
+    let references = collect_metadata_rows(layout.rows(35), cancellation, |i| {
+        let mut p = 0;
+        Some(read_assembly_identity_fields(
+            layout.row(35, i)?,
+            &mut p,
+            &layout,
+            strings,
+            blobs,
+            &mut budget,
+        ))
+    })?;
+    struct ExportRow {
+        flags: u32,
+        name: String,
+        namespace: String,
+        implementation: u32,
+    }
+    let exports = collect_metadata_rows(layout.rows(39), cancellation, |i| {
+        let mut read = || {
+            let row = layout.row(39, i)?;
+            let mut p = 0;
+            let flags = u32at(row, &mut p)?;
+            u32at(row, &mut p)?; // TypeDefId is a hint, never an identity.
+            let name = str_index(row, &mut p, layout.heap, strings, &mut budget)?;
+            let namespace = str_index(row, &mut p, layout.heap, strings, &mut budget)?;
+            let implementation = index(row, &mut p, coded_size(&layout.rows, &[38, 35, 39], 2))?;
+            Some(ExportRow {
+                flags,
+                name,
+                namespace,
+                implementation,
+            })
+        };
+        Some(read())
+    })?;
+    let mut forwards = Vec::new();
+    let mut omitted = 0;
+    for ordinal in 0..exports.len() {
+        if !cancellation_checkpoint(cancellation, ordinal) {
+            return None;
+        }
+        let mut chain = Vec::new();
+        let mut visited = HashSet::default();
+        let mut current = ordinal;
+        let target = loop {
+            if !visited.insert(current) {
+                break None;
+            }
+            let Some(Some(export)) = exports.get(current) else {
+                break None;
+            };
+            chain.push(export);
+            match export.implementation & 3 {
+                1 if export.flags & 0x0020_0000 != 0 => {
+                    let Some(reference) = (export.implementation >> 2).checked_sub(1) else {
+                        break None;
+                    };
+                    break references.get(reference as usize).cloned().flatten();
+                }
+                2 => {
+                    let Some(parent) = (export.implementation >> 2).checked_sub(1) else {
+                        break None;
+                    };
+                    current = parent as usize;
+                }
+                _ => break None, // File exports and malformed/unrooted chains stay omissions.
+            }
+        };
+        let Some(target) = target else {
+            omitted += 1;
+            continue;
+        };
+        let root = chain.pop().expect("a forward root was read");
+        let mut name = if root.namespace.is_empty() {
+            root.name.clone()
+        } else {
+            format!("{}.{}", root.namespace, root.name)
+        };
+        let mut outer = None;
+        while let Some(nested) = chain.pop() {
+            if chain.is_empty() {
+                outer = Some(name.clone());
+            }
+            name.push('.');
+            name.push_str(&nested.name);
+        }
+        // Account for repeated full names as well as raw heap strings.
+        budget.consume(
+            name.len()
+                + root.namespace.len()
+                + outer.as_ref().map_or(0, String::len)
+                + target.name.len()
+                + target.version.len()
+                + target.culture.as_ref().map_or(0, String::len)
+                + target.public_key_token.as_ref().map_or(0, String::len),
+        )?;
+        forwards.push(TypeForwardFact {
+            name,
+            namespace: root.namespace.clone(),
+            outer,
+            target,
+        });
+    }
+    Some(AssemblyExports {
+        identity,
+        forwards,
+        omitted,
+    })
 }
 
 fn parse_assembly_bounded(
@@ -2696,7 +3147,8 @@ fn parse_assembly_bounded(
     let event_owners = event_owners(&layout, types.len() as u32, events.len() as u32);
     let event_accessors = association_accessors(&layout, &methods, 0);
     let generic = generic_parameters(&layout, strings, &mut decode_budget);
-    let interfaces = interfaces_for(&layout, &types, &type_refs, &type_specs);
+    let (interfaces, incomplete_interfaces) =
+        interfaces_for(&layout, &types, &type_refs, &type_specs);
     let mut names = Vec::new();
     for (idx, row) in types.iter().enumerate() {
         if !cancellation_checkpoint(cancellation, idx) {
@@ -2721,6 +3173,7 @@ fn parse_assembly_bounded(
             .map(|r| r.method_start)
             .unwrap_or(methods.len() as u32 + 1);
         let mut members = Vec::new();
+        let mut omitted_members = Vec::new();
         for (field_index, f) in fields
             .iter()
             .enumerate()
@@ -2745,6 +3198,11 @@ fn parse_assembly_bounded(
                 members.push(member);
             } else {
                 omitted_signatures = omitted_signatures.saturating_add(1);
+                omitted_members.push((
+                    f.name.clone(),
+                    CSharpExternalMemberKind::Field,
+                    member_visibility(f.flags),
+                ));
             }
         }
         for (method_index, m) in methods
@@ -2780,6 +3238,7 @@ fn parse_assembly_bounded(
                 members.push(member);
             } else {
                 omitted_signatures = omitted_signatures.saturating_add(1);
+                omitted_members.push((m.name.clone(), kind, member_visibility(m.flags)));
             }
         }
         for (pidx, p) in properties
@@ -2809,6 +3268,11 @@ fn parse_assembly_bounded(
                 members.push(member);
             } else {
                 omitted_signatures = omitted_signatures.saturating_add(1);
+                omitted_members.push((
+                    p.name.clone(),
+                    CSharpExternalMemberKind::Property,
+                    member_visibility(flags),
+                ));
             }
         }
         for (event_index, event) in events.iter().enumerate().filter(|(event_index, _)| {
@@ -2827,6 +3291,11 @@ fn parse_assembly_bounded(
                 0,
             ) else {
                 omitted_signatures = omitted_signatures.saturating_add(1);
+                omitted_members.push((
+                    event.name.clone(),
+                    CSharpExternalMemberKind::Event,
+                    member_visibility(flags),
+                ));
                 continue;
             };
             members.push(CSharpExternalMember {
@@ -2888,6 +3357,14 @@ fn parse_assembly_bounded(
                 .get(&((idx + 1) as u32))
                 .cloned()
                 .unwrap_or_default(),
+            supertypes_complete: (row.extends == 0
+                || matches!(&base, Some(DecodedType::Named { name, .. }) if !name.is_empty()))
+                && !incomplete_interfaces.contains(&((idx + 1) as u32)),
+            nested_owner: nested
+                .get(&((idx + 1) as u32))
+                .and_then(|owner| names.get(owner.saturating_sub(1) as usize))
+                .cloned(),
+            omitted_members,
             base,
             interfaces: interfaces
                 .get(&((idx + 1) as u32))
@@ -3402,8 +3879,9 @@ fn interfaces_for(
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
-) -> HashMap<u32, Vec<DecodedType>> {
+) -> (HashMap<u32, Vec<DecodedType>>, HashSet<u32>) {
     let mut out = HashMap::default();
+    let mut incomplete = HashSet::default();
     for i in 1..=l.rows(9) {
         let Some(r) = l.row(9, i) else { continue };
         let mut p = 0;
@@ -3411,13 +3889,19 @@ fn interfaces_for(
             continue;
         };
         let Some(interface) = index(r, &mut p, coded_size(&l.rows, &[2, 1, 27], 2)) else {
+            incomplete.insert(owner);
             continue;
         };
         if let Some(value) = resolve_typedef_or_ref_type(interface, types, type_refs, type_specs) {
+            if !matches!(&value, DecodedType::Named { name, .. } if !name.is_empty()) {
+                incomplete.insert(owner);
+            }
             out.entry(owner).or_insert_with(Vec::new).push(value);
+        } else {
+            incomplete.insert(owner);
         }
     }
-    out
+    (out, incomplete)
 }
 fn full_type_name(
     index: u32,

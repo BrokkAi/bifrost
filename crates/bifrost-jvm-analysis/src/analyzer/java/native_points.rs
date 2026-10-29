@@ -6,8 +6,6 @@ use brokk_bifrost_core::analyzer::model::DeclarationKind;
 
 use crate::analyzer::java::imports::JavaTypeResolution;
 
-use crate::analyzer::jvm::external::JvmExternalDeclarationSource;
-
 use crate::analyzer::jvm::external::JvmExternalMember;
 
 use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
@@ -27,17 +25,11 @@ use brokk_bifrost_analysis::analyzer::native_points::unavailable_definition;
 use brokk_bifrost_analysis::analyzer::native_points::unavailable_type;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
-use brokk_bifrost_analysis::analyzer::semantic_model::{
-    SemanticModelCallableKey, SemanticModelSymbolKind, TypeRef,
-};
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JavaExternalStaticImportBoundary;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JavaImportContext;
-
-use brokk_bifrost_analysis::analyzer::usages::call_conversion::CallArgumentConversionProver;
-
-use brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionUnknown;
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 
@@ -469,6 +461,13 @@ fn java_imported_type_route_nodes(
     Some((owner, Some(member)))
 }
 
+fn native_external_member_inventory_selected(outcome: &DefinitionLookupOutcome) -> bool {
+    outcome
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == "native_external_member_inventory")
+}
+
 fn apply_static_import_boundary(
     site_text: &str,
     boundaries: &[JavaExternalStaticImportBoundary],
@@ -490,6 +489,8 @@ fn apply_static_import_boundary(
     if value.status != DefinitionLookupStatus::Incomplete
         || !value.definitions.is_empty()
         || value.lexical_definition.is_some()
+        // #7619: the nearer selected family owns both navigation and call evidence.
+        || native_external_member_inventory_selected(&value)
     {
         return BoundedResolution::Complete { value, work };
     }
@@ -593,10 +594,7 @@ fn java_native_call_evidence(
                 | DefinitionLookupStatus::Ambiguous
         )
         || (outcome.status == DefinitionLookupStatus::Ambiguous
-            && !outcome
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.kind == "native_external_member_inventory"))
+            && !native_external_member_inventory_selected(outcome))
         || (outcome.status == DefinitionLookupStatus::Incomplete
             && !outcome
                 .diagnostics
@@ -640,6 +638,10 @@ fn java_native_call_evidence(
                     )
                     | None => None,
                 }
+            } else if native_external_member_inventory_selected(outcome) {
+                // #7619: a selected nearer inherited member owns this call.
+                // Static imports cannot replace its external inventory family.
+                None
             } else {
                 let mut matching = external_static_imports
                     .iter()
@@ -665,12 +667,7 @@ fn java_native_call_evidence(
             let external_call = external_call.or_else(|| {
                 // This canonical value comes from selected external inventory
                 // rows, not from parsing the call's source text.
-                if receiver.is_some()
-                    || !outcome
-                        .diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.kind == "native_external_member_inventory")
-                {
+                if receiver.is_some() || !native_external_member_inventory_selected(outcome) {
                     return None;
                 }
                 let (owner, selected_member) = outcome.reference.as_ref()?.text.rsplit_once('.')?;
@@ -1105,6 +1102,17 @@ fn java_native_external_receiver_from_site_type(
     let Some(value) = java_native_expression_value_type_at_node(query, site_node) else {
         return JavaNativeReceiverResolution::Untyped;
     };
+    let mut receiver_expression = receiver;
+    while receiver_expression.kind() == "parenthesized_expression" {
+        let Some(inner) = receiver_expression.named_child(0) else {
+            return JavaNativeReceiverResolution::Untyped;
+        };
+        receiver_expression = inner;
+    }
+    let is_type_name = matches!(
+        receiver_expression.kind(),
+        "identifier" | "type_identifier" | "scoped_type_identifier" | "field_access"
+    );
     let receiver_target_kind = value.value_types.target_kind.clone();
     let static_type = value.static_type;
     let Some(TypeRef::Named {
@@ -1125,7 +1133,8 @@ fn java_native_external_receiver_from_site_type(
     };
     JavaNativeReceiverResolution::External {
         owner: owner.fqn().to_owned(),
-        form: if receiver_target_kind == TypeLookupTargetKind::TypeReference {
+        // Only name-like references can denote a static type qualifier.
+        form: if is_type_name && receiver_target_kind == TypeLookupTargetKind::TypeReference {
             JavaNativeReceiverForm::TypeQualifier
         } else {
             JavaNativeReceiverForm::BoundValue
@@ -1180,6 +1189,14 @@ fn java_native_receiver_type_site_node(mut receiver: Node<'_>) -> Option<Node<'_
     }
     match receiver.kind() {
         "identifier" | "type_identifier" | "scoped_type_identifier" => Some(receiver),
+        // The expression-value resolver indexes references by source range;
+        // a cast's target reference is the selected site for its value type.
+        "cast_expression" => {
+            let mut cursor = receiver.walk();
+            let mut types = receiver.children_by_field_name("type", &mut cursor);
+            let type_node = types.next()?;
+            types.next().is_none().then_some(type_node)
+        }
         "method_invocation" => receiver.child_by_field_name("name"),
         "field_access" => receiver.child_by_field_name("field"),
         "object_creation_expression" => receiver
@@ -1290,25 +1307,38 @@ fn java_native_external_method_resolution(
         Some(digest) => java
             .external_declarations_for_source_jdk(query.analyzer.semantic_model_overlay(), digest),
         None => java.external_declarations(query.analyzer.semantic_model_overlay()),
-    };
-    let Some(parameter_count) = resolved.applicable_parameter_count_for_argument_types(
-        bound_receiver,
-        actual_types,
-        Some(&surface),
-    ) else {
-        return Some(JavaNativeExternalMethodResolution {
-            owner: owner.to_owned(),
-            member: member.to_owned(),
-            invocation: if resolved.may_apply_to_argument_types(
-                bound_receiver,
-                actual_types,
-                Some(&surface),
-            ) {
-                JavaNativeExternalInvocation::Witnessed
-            } else {
-                JavaNativeExternalInvocation::Rejected
-            },
-        });
+    }
+    .with_active_models(
+        query
+            .analyzer
+            .active_semantic_model_snapshot()
+            .map(|snapshot| std::sync::Arc::clone(snapshot.active_models())),
+    );
+    let selection =
+        resolved.invocation_parameter_count(bound_receiver, actual_types, Some(&surface));
+    record_external_invocation(
+        query.site.focus_start_byte,
+        owner,
+        member,
+        selection.as_ref().err().copied(),
+    );
+    let parameter_count = match selection {
+        Ok(count) => count,
+        Err(cause) => {
+            return Some(JavaNativeExternalMethodResolution {
+                owner: owner.to_owned(),
+                member: member.to_owned(),
+                invocation: match cause {
+                    JavaExternalInvocationFailure::NoApplicable => {
+                        JavaNativeExternalInvocation::Rejected
+                    }
+                    JavaExternalInvocationFailure::Ambiguous
+                    | JavaExternalInvocationFailure::Unproven => {
+                        JavaNativeExternalInvocation::Witnessed
+                    }
+                },
+            });
+        }
     };
     let proof = match form {
         JavaNativeReceiverForm::BoundValue => {
@@ -1601,11 +1631,6 @@ fn java_native_argument_projection(mut expression: Node<'_>) -> Option<(Node<'_>
     ))
 }
 
-enum JavaNativeConstructorSelection {
-    Proven(usize),
-    IncompleteHierarchy,
-}
-
 fn java_native_constructor_type_name(
     query: BoundedReceiverQuery<'_>,
     creation: Node<'_>,
@@ -1665,109 +1690,38 @@ fn java_native_external_constructor_proof(
             "constructor type facts share the structured actual inventory"
         );
     }
-    let overlay = query.analyzer.semantic_model_overlay()?;
-    let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } = owner.source() else {
-        return None;
-    };
-    let arity = u32::try_from(actuals.len()).ok()?;
-    let mut matching = overlay
-        .members_of(declaration_id)
-        .records
-        .into_iter()
-        .filter(|symbol| {
-            symbol.language == "java"
-                && symbol.kind == SemanticModelSymbolKind::Constructor
-                && !symbol.has_receiver()
-                && symbol.visibility
-                    == brokk_bifrost_analysis::analyzer::semantic_model::Visibility::Public
-                && symbol
-                    .structured_signature
-                    .as_ref()
-                    .is_some_and(|signature| {
-                        signature.parameters.len() == arity as usize
-                            && signature
-                                .parameters
-                                .iter()
-                                .all(|parameter| !parameter.variadic)
-                    })
-        });
-    let selected = matching.next()?;
-    let candidates = std::iter::once(selected)
-        .chain(matching)
-        .collect::<Vec<_>>();
-    if candidates.iter().any(|symbol| {
-        !symbol.callable_family_complete
-            && symbol.provenance.completeness
-                != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCompleteness::Complete
-    }) {
-        return None;
-    }
-    let signatures = candidates
-        .iter()
-        .map(|symbol| {
-            symbol
-                .structured_signature
-                .as_ref()
-                .expect("constructor candidates have a structured signature")
-                .parameters
-                .iter()
-                .map(|parameter| parameter.r#type.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let selection = actual_types
-        .and_then(|actual_types| {
-            crate::analyzer::jvm::external::select_java_external_signature_for_types(
-                actual_types,
-                &signatures,
-            )
-        })
-        .map(JavaNativeConstructorSelection::Proven)
-        .or_else(|| {
-            let [signature] = signatures.as_slice() else {
-                return None;
-            };
-            assert_eq!(
-                actuals.len(),
-                signature.len(),
-                "constructor applicability uses the same structured actual count"
-            );
-            let mut incomplete_hierarchy = false;
-            for (actual, formal) in actuals.iter().copied().zip(signature) {
-                match crate::analyzer::java::call_conversion::CALL_ARGUMENT_CONVERSION_PROVER
-                    .prove_model_argument(java, query.file, actual, query.source, formal)
-                {
-                    Ok(_) => {}
-                    Err(
-                        ConversionUnknown::IncompleteHierarchy
-                        | ConversionUnknown::UnresolvedSourceType
-                        | ConversionUnknown::UnresolvedTargetType
-                        | ConversionUnknown::AmbiguousBinding
-                        | ConversionUnknown::GenericSubstitution
-                        | ConversionUnknown::UnsupportedExpression
-                        | ConversionUnknown::BudgetExhausted
-                        | ConversionUnknown::SignatureApplicability,
-                    ) => {
-                        incomplete_hierarchy = true;
-                    }
-                    Err(_) => return None,
-                }
-            }
-            if incomplete_hierarchy {
-                Some(JavaNativeConstructorSelection::IncompleteHierarchy)
-            } else {
-                Some(JavaNativeConstructorSelection::Proven(0))
-            }
-        })?;
-    let JavaNativeConstructorSelection::Proven(selected_index) = selection else {
+    let Some(actual_types) = actual_types else {
         return Some((None, owner.fqn().to_owned(), "<init>".to_owned()));
     };
-    let selected = candidates.into_iter().nth(selected_index)?;
-    let key = SemanticModelCallableKey::new("java", owner.fqn(), &selected.name, false, arity);
-    overlay.callable_family_id_for_target(key)?;
-    let member = selected.name.clone();
-    let proof = ExactExternalCallProof::java_external_constructor(owner.fqn(), &member, arity);
-    Some((Some(proof), owner.fqn().to_owned(), member))
+    // Constructor descriptors have the same instance declaration shape as
+    // methods. Reuse their strict, loose and variable-arity selection, then
+    // publish a receiverless constructor application of the selected formal
+    // count and exact inventory identity.
+    let resolution = java_native_external_method_resolution(
+        java,
+        query,
+        token,
+        owner.fqn(),
+        "<init>",
+        actual_types,
+        JavaNativeReceiverForm::BoundValue,
+    )?;
+    match resolution.invocation {
+        JavaNativeExternalInvocation::Selected { proof, .. } => {
+            let constructor = ExactExternalCallProof::java_external_constructor(
+                &resolution.owner,
+                &resolution.member,
+                proof.parameter_count,
+            )
+            .with_external_member_identity(proof.external_member_identity().cloned())
+            .with_source_jdk_artifact(proof.source_jdk_artifact.clone());
+            Some((Some(constructor), resolution.owner, resolution.member))
+        }
+        JavaNativeExternalInvocation::Witnessed => {
+            Some((None, resolution.owner, resolution.member))
+        }
+        JavaNativeExternalInvocation::Rejected => None,
+    }
 }
 
 fn publish_java_external_call_boundary(
@@ -1925,6 +1879,235 @@ fn resolve_java_expression_value_type_bounded(
     resolve_native_expression_value_type_bounded(&java.inner, query, prepare_context, after_open)
 }
 
+/// Translate a carrier only after the shared public-frontier agreement proof.
+/// Java's producer erases a type variable to its bound. A complete, single-valued
+/// bound is a static type proof; the immutable whitelist still decides admission.
+/// Intersection bounds and other multi-valued/incomplete frontiers decline.
+/// Go differs because its producer leaves type-parameter frontiers incomplete by
+/// design. Kotlin and Scala do not call this observed-type bridge: their language
+/// hooks retain UnsupportedLanguage, so their type-variable behavior is unchanged.
+fn java_observed_value_type(
+    answer: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeReferenceTypes,
+) -> brokk_bifrost_analysis::analyzer::semantic::ObservedValueType {
+    use brokk_bifrost_analysis::analyzer::native_points::selected_value_type_for_barrier;
+    use brokk_bifrost_analysis::analyzer::resolution::FactProjectedTypeNodeForm;
+    use brokk_bifrost_analysis::analyzer::semantic::{
+        ObservedValueType, ValueShape, ValueTypeBarrierReason,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedNativeDefinition, SelectedNativeTypes,
+    };
+    let selected = match selected_value_type_for_barrier(&answer.answer, answer.query_result_slot) {
+        Ok(Some(selected)) => selected,
+        Ok(None) => return ObservedValueType::Undecided(ValueTypeBarrierReason::IncompleteType),
+        Err(reason) => return ObservedValueType::Undecided(reason),
+    };
+    let SelectedNativeTypes::Ready {
+        nominal,
+        intrinsic,
+        external_owners,
+    } = &answer.value_types
+    else {
+        return ObservedValueType::Undecided(ValueTypeBarrierReason::IncompleteType);
+    };
+    for shape in answer.answer.projected_type_shapes() {
+        if let Some(root) = shape
+            .nodes()
+            .iter()
+            .find(|node| node.slot() == shape.root_slot() && node.identity() == selected.identity())
+        {
+            match root.form() {
+                FactProjectedTypeNodeForm::Array(_) => {
+                    return ObservedValueType::NonNamed(ValueShape::Array);
+                }
+                FactProjectedTypeNodeForm::Unsupported => {
+                    return ObservedValueType::Undecided(ValueTypeBarrierReason::UnknownType);
+                }
+                _ => {}
+            }
+        }
+    }
+    // An external owner that a selected provider declares is a nominal proof.
+    // Decide it before the intrinsic descriptors: the store also gives every
+    // selected external owner a synthesized LanguageBuiltin descriptor (#7853),
+    // which the rule below would reject. An implicit-package name that no
+    // provider declares proves nothing and falls through to that rule.
+    if let Some((_, owner)) = external_owners
+        .iter()
+        .find(|(identity, owner)| *identity == selected.identity() && owner.is_provider_declared())
+    {
+        return ObservedValueType::Named {
+            canonical: owner.owner_fqn.to_string(),
+        };
+    }
+    if let Some(descriptor) = intrinsic
+        .iter()
+        .find(|item| item.identity() == selected.identity())
+    {
+        use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+        return match descriptor.kind() {
+            IntrinsicTypeKind::Array => ObservedValueType::NonNamed(ValueShape::Array),
+            IntrinsicTypeKind::Primitive if descriptor.spelling() != "null" => {
+                ObservedValueType::Named {
+                    canonical: descriptor.spelling().to_owned(),
+                }
+            }
+            // String is Java's resolved literal intrinsic. Any other LanguageBuiltin
+            // without a provider-declared owner does not prove resolution.
+            IntrinsicTypeKind::LanguageBuiltin if descriptor.spelling() == "java.lang.String" => {
+                ObservedValueType::Named {
+                    canonical: descriptor.spelling().to_owned(),
+                }
+            }
+            _ => ObservedValueType::Undecided(ValueTypeBarrierReason::IncompleteType),
+        };
+    }
+    if let Some((_, definition)) = nominal
+        .iter()
+        .find(|(identity, _)| *identity == selected.identity())
+    {
+        return match definition {
+            SelectedNativeDefinition::Lexical(_) => {
+                ObservedValueType::Undecided(ValueTypeBarrierReason::UnknownType)
+            }
+            SelectedNativeDefinition::Unit(unit) => ObservedValueType::Named {
+                canonical: unit.fq_name().to_string(),
+            },
+            SelectedNativeDefinition::Intrinsic { canonical_name, .. } => {
+                ObservedValueType::Named {
+                    canonical: canonical_name.clone(),
+                }
+            }
+        };
+    }
+    // An identity without a selected nominal declaration is not a named proof.
+    ObservedValueType::Undecided(ValueTypeBarrierReason::UnknownType)
+}
+
+pub(super) fn observed_value_type(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+    observation: &brokk_bifrost_analysis::analyzer::semantic::BarrierObservation,
+    request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+) -> Result<
+    brokk_bifrost_analysis::analyzer::semantic::ObservedValueType,
+    brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+> {
+    use ValueTypeBarrierReason::{
+        BudgetExceeded, Cancelled, IncompleteType, UnavailableObservation, UnsupportedLanguage,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic::{
+        ObservedValueType, SemanticWork, ValueTypeBarrierReason, frozen_call_operand_node,
+        prepare_value_type_barrier_source, value_type_barrier_source_matches,
+    };
+    if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_none() {
+        return Ok(ObservedValueType::Undecided(UnsupportedLanguage));
+    }
+    if request.cancellation.is_cancelled() {
+        return Ok(ObservedValueType::Undecided(Cancelled));
+    }
+    if !request.charge_execution_traversal(1) {
+        return Ok(ObservedValueType::Undecided(BudgetExceeded));
+    }
+    let java =
+        resolve_analyzer::<JavaAnalyzer>(analyzer).expect("Java support belongs to Java analyzer");
+    let semantics = observation.point().procedure().semantics();
+    let value = semantics
+        .value(observation.value())
+        .expect("validated value");
+    let mapping = semantics
+        .source_mapping(value.source)
+        .expect("validated mapping");
+    if mapping.kind != brokk_bifrost_analysis::analyzer::semantic::SourceMappingKind::Exact {
+        return Ok(ObservedValueType::Undecided(UnavailableObservation));
+    }
+    let file = brokk_bifrost_core::analyzer::model::ProjectFile::new(
+        java.inner.project().root(),
+        mapping.locator.path().as_path(),
+    );
+    if observation.point().procedure().artifact().key().mount()
+        != brokk_bifrost_analysis::analyzer::semantic::WorkspaceMountId::from_root(file.root())
+    {
+        return Ok(ObservedValueType::Undecided(UnavailableObservation));
+    }
+    let prepared = match prepare_value_type_barrier_source(
+        &java.inner,
+        &mut Default::default(),
+        &file,
+        request,
+    ) {
+        Ok(prepared) => prepared,
+        Err(reason) => return Ok(ObservedValueType::Undecided(reason)),
+    };
+    if !value_type_barrier_source_matches(observation, &prepared) {
+        return Ok(ObservedValueType::Undecided(UnavailableObservation));
+    }
+    let Some(mut node) =
+        frozen_call_operand_node(observation, &prepared, "method_invocation", |call| {
+            call.child_by_field_name("object")
+        })
+    else {
+        return Ok(ObservedValueType::Undecided(UnavailableObservation));
+    };
+    while node.kind() == "parenthesized_expression" {
+        let Some(child) = node.named_child(0) else {
+            return Ok(ObservedValueType::Undecided(IncompleteType));
+        };
+        node = child;
+    }
+    // #7612: reference casts have no native target-type publication on this base.
+    // Decline rather than accidentally using the operand's type.
+    if matches!(node.kind(), "cast_expression" | "null_literal") {
+        return Ok(ObservedValueType::Undecided(IncompleteType));
+    }
+    let Some(site_node) = java_native_receiver_type_site_node(node) else {
+        return Ok(ObservedValueType::Undecided(IncompleteType));
+    };
+    let site = ResolvedReferenceSite {
+        path: brokk_bifrost_core::path_utils::rel_path_string(&file),
+        text: prepared.source()[site_node.byte_range()].to_owned(),
+        range: brokk_bifrost_core::analyzer::model::Range {
+            start_byte: site_node.start_byte(),
+            end_byte: site_node.end_byte(),
+            start_line: site_node.start_position().row + 1,
+            end_line: site_node.end_position().row + 1,
+        },
+        focus_start_byte: site_node.start_byte(),
+        focus_end_byte: site_node.end_byte(),
+    };
+    let result =
+        brokk_bifrost_analysis::analyzer::native_points::resolve_native_observed_value_type_bounded(
+            &java.inner,
+            BoundedReceiverQuery {
+                analyzer,
+                file: &file,
+                source: prepared.source(),
+                tree: Some(prepared.tree()),
+                site: &site,
+                budget: Default::default(),
+                cancellation: Some(request.cancellation),
+            },
+            prepare_context,
+            java_observed_value_type,
+        );
+    let work = match &result {
+        BoundedResolution::Complete { work, .. }
+        | BoundedResolution::Cancelled { work }
+        | BoundedResolution::Exceeded { work, .. } => work,
+    };
+    request.budget.charge_work(SemanticWork {
+        events: work.scope_nodes,
+        ..Default::default()
+    });
+    if !request.charge_execution_traversal(work.scope_nodes) {
+        return Ok(ObservedValueType::Undecided(BudgetExceeded));
+    }
+    Ok(match result {
+        BoundedResolution::Complete { value, .. } => value,
+        BoundedResolution::Cancelled { .. } => ObservedValueType::Undecided(Cancelled),
+        BoundedResolution::Exceeded { .. } => ObservedValueType::Undecided(BudgetExceeded),
+    })
+}
+
 fn prepare_context(
     operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
     path: &str,
@@ -1979,5 +2162,68 @@ impl brokk_bifrost_analysis::analyzer::languages::StructuralReceiverResolver
             }
             BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         }
+    }
+}
+
+/// The actual selector result at a source call site, for regression goldens.
+pub use crate::analyzer::jvm::external::JavaExternalInvocationFailure;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct JavaExternalInvocationObservation {
+    pub start_byte: usize,
+    pub owner: String,
+    pub member: String,
+    pub failure: Option<JavaExternalInvocationFailure>,
+}
+
+static EXTERNAL_INVOCATION_OBSERVATIONS: std::sync::Mutex<
+    Option<std::collections::BTreeSet<JavaExternalInvocationObservation>>,
+> = std::sync::Mutex::new(None);
+
+/// Capture only during the supplied test query; no observations survive it.
+pub fn with_external_invocation_observations<T>(
+    run: impl FnOnce() -> T,
+) -> (T, Vec<JavaExternalInvocationObservation>) {
+    struct Capture;
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            EXTERNAL_INVOCATION_OBSERVATIONS.lock().unwrap().take();
+        }
+    }
+    assert!(
+        EXTERNAL_INVOCATION_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .replace(Default::default())
+            .is_none(),
+        "invocation captures cannot overlap"
+    );
+    let guard = Capture;
+    let value = run();
+    let rows = EXTERNAL_INVOCATION_OBSERVATIONS
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .into_iter()
+        .collect();
+    drop(guard);
+    (value, rows)
+}
+
+fn record_external_invocation(
+    start_byte: usize,
+    owner: &str,
+    member: &str,
+    failure: Option<JavaExternalInvocationFailure>,
+) {
+    if let Some(rows) = EXTERNAL_INVOCATION_OBSERVATIONS.lock().unwrap().as_mut() {
+        assert!(rows.len() < 4096, "bounded test observation capture");
+        rows.insert(JavaExternalInvocationObservation {
+            start_byte,
+            owner: owner.to_owned(),
+            member: member.to_owned(),
+            failure,
+        });
     }
 }

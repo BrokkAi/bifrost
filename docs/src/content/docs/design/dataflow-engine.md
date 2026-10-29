@@ -317,6 +317,16 @@ leave the remainder open. Class-qualified calls keep the class-selected callable
 the explicit receiver argument does not select a different method. Feedback runs
 under the request's existing iteration, work, and cancellation limits.
 
+A language resolver can also close a resolved member call by itself. It
+publishes the selection as a bound receiver with closed dispatch extensibility.
+The shared exact-member discharge then answers the call's dynamic-dispatch gap,
+provided every retained target materializes as a proven, complete member body
+and no boundary remains. Java uses this for nonvirtual `super` calls and Rust
+for concrete receivers. Ruby uses it for an exact receiver whose method table
+is closed within the caller's file and the files that declare the receiver's
+ancestry. The proof names its scope, so mutation spelled elsewhere is a stated
+limit, not a hidden assumption.
+
 Class membership and evidence of a value alternative are distinct. A guard
 can establish a class conditional on entering its arm even when its input
 comes from an unmodeled load or call. That class remains useful for member
@@ -582,7 +592,8 @@ Otherwise, derive it per query from rows that the query already reads.
 ### Value-type barriers
 
 A taint policy may declare a separate `:barriers` endpoint set. A barrier
-names a type predicate, such as `(intrinsic bool)` or `(enum :fieldless true)`,
+names a type predicate, such as `(intrinsic bool)`, `(intrinsic numeric)`, or
+`(enum :fieldless true)`,
 rather than a call transfer or a label removal. A proven matching value stops
 all taint facts observed at that node, including sources, interior values,
 procedure boundaries and sink operands. Language support classifies the type;
@@ -591,6 +602,16 @@ identity from native primitive resolution and proves a fieldless enum only
 from a complete inventory of lowered variants. A payload variant is a
 non-match. Unknown or ambiguous types, incomplete or macro-generated variant
 surfaces, and unavailable observations remain undecided.
+
+`(intrinsic numeric)` covers Rust integer and floating-point primitives. In Go
+it covers the predeclared integer and floating-point types (including `byte`
+and `rune`) and named types with one of those underlying types. Complex types
+are excluded: this predicate describes integer and floating-point carriers,
+not every arithmetic type. Untyped constants match only after conversion to a
+numeric type. Interface carriers remain undecided, so they keep the flow and
+make its proof incomplete. Go uses the existing ICFG refinement; eligibility
+requires the language's request-local value-type barrier context. The barrier
+belongs to its policy and cannot remove labels tracked by another policy.
 
 Classification runs at query time through a native resolver operation and
 request-owned value and type memos. It publishes no policy-specific
@@ -775,10 +796,19 @@ equivalence tests.
 ### Completeness and reporting
 
 A composed finding is certain only when its path is proven and the search
-reached a fixed point. It is complete when the run's derivation was complete
-and the path was complete, or when every origin has a certain path at the
-fixed point, so an incomplete run keeps a complete finding only through
-certain paths. A certain path is proven and complete at every hop. A complete,
+reached a fixed point. A finding that groups several origins of one source
+is certain when the run's derivation was complete and every path meeting the
+sink is proven, or when at least one origin has a certain path at the fixed
+point: one established path proves the finding, and an uncertain sibling
+origin does not negate it (#5597). An origin whose value also meets the sink
+with an unproven fact, such as through an unproven transform selection, is not
+certain.
+Each reported origin carries its own certainty, so a certain finding does not
+claim that every listed origin is certain. A finding
+is complete when the run's derivation was complete and the path was complete,
+or when every origin has a certain path at the fixed point, so an incomplete
+run keeps a complete finding only through certain paths. A certain path is
+proven and complete at every hop. A complete,
 exactly bound authored transfer from an active pack can establish certainty,
 with its closure retained as provenance, by the same rule the ICFG engine uses
 (#5218, #5306).
@@ -829,10 +859,13 @@ and cold completion cannot differ because of a semantic work grant.
 
 Cached refinements admit the measured returned value only. Fixpoint scratch is
 admitted during derivation and refunded on every exit; scans and comparisons
-are work. Identical fact replacements leave residency unchanged. Root children
-inherit live resident census, start work at zero, and fold cumulative work and
-component-wise peaks on return. Failed staged publication preserves performed
-work while discarding unpublished admissions.
+are work. Identical fact replacements leave residency unchanged. Class-set
+type-flow roots start from a fresh ledger under an engine-owned root allotment
+(owner decision, 2026-10-26, #2445). Other root children inherit live resident
+census and start work at zero. Root returns fold cumulative work and
+component-wise peaks; continuations transfer actual surviving admissions.
+Failed staged publication preserves performed work while discarding unpublished
+admissions.
 
 Inside a value-flow plan, kill and trigger lists use dense insertion-order
 source IDs and shared interned ID lists. Public identities, digests, witnesses

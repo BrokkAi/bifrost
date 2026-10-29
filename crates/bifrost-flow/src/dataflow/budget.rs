@@ -131,14 +131,18 @@ pub struct SolverBudget {
 }
 
 impl SolverBudget {
-    pub const fn new(limits: SolverWork) -> Self {
+    pub fn new(limits: SolverWork) -> Self {
         Self {
             ledger: BudgetLedger::with_zero_usage(limits),
         }
     }
 
-    pub const fn uniform(limit: usize) -> Self {
+    pub fn uniform(limit: usize) -> Self {
         Self::new(SolverWork::uniform(limit))
+    }
+
+    pub fn refusal_count(&self) -> usize {
+        self.ledger.refusal_count()
     }
 
     pub const fn limits(&self) -> SolverWork {

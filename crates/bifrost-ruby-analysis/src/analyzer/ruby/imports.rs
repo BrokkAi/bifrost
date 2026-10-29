@@ -18,9 +18,9 @@ use brokk_bifrost_core::analyzer::query_token::QueryScope;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_ruby::imports::{
     build_autoload_constant_files, build_zeitwerk_autoload_code_units,
-    build_zeitwerk_autoload_files, build_zeitwerk_consumer_files,
-    detect_zeitwerk_autoload_conventions, ruby_effective_imported_code_units,
-    ruby_imported_files_from_infos, ruby_required_files, ruby_transitive_referencing_files_of,
+    gemfile_declares_zeitwerk_autoloading, gemfile_lock_declares_zeitwerk_autoloading,
+    is_zeitwerk_autoload_file, ruby_effective_imported_code_units, ruby_imported_files_from_infos,
+    ruby_required_files, ruby_transitive_referencing_files_of,
 };
 use brokk_bifrost_ruby::mixins::RubyOwnerRelationFact;
 use std::sync::Arc;
@@ -46,6 +46,22 @@ impl RubyAnalyzer {
                 .cloned()
                 .collect(),
         )
+    }
+
+    fn zeitwerk_files(&self) -> HashSet<ProjectFile> {
+        if !brokk_bifrost_ruby::graph_support::RubySource::has_zeitwerk_autoload_conventions(self) {
+            return HashSet::default();
+        }
+        match self.project().analyzable_files(Language::Ruby) {
+            Ok(files) => files.into_iter().collect(),
+            Err(error) => {
+                self.record_degraded_persistent_fill(
+                    "ruby.zeitwerk_files",
+                    &format!("project_io:{error}"),
+                );
+                HashSet::default()
+            }
+        }
     }
 
     pub(crate) fn canonical_sources_ready(&self) -> bool {
@@ -75,8 +91,12 @@ impl RubyAnalyzer {
     }
 
     pub(crate) fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile> {
-        self.zeitwerk_autoload_files
-            .get_or_init(|| build_zeitwerk_autoload_files(self))
+        self.zeitwerk_autoload_files.get_or_init(|| {
+            self.zeitwerk_files()
+                .into_iter()
+                .filter(is_zeitwerk_autoload_file)
+                .collect()
+        })
     }
 
     pub(crate) fn build_reverse_import_index(
@@ -88,8 +108,20 @@ impl RubyAnalyzer {
         }
         brokk_bifrost_core::analyzer::capabilities::memoized_reverse_file_index(
             &self.reverse_import_index,
-            || self.inner.all_files(),
-            |file| self.required_files(token, file),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "ruby.reverse_file_index",
+                    || self.inner.all_files(),
+                )
+            },
+            |file| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "ruby.reverse_file_index",
+                    || self.required_files(token, file),
+                )
+            },
         )
     }
 }
@@ -125,12 +157,21 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-ruby-analysis/src/analyzer/ruby/imports.rs",
+            );
         if !self.canonical_sources_ready() {
             return Arc::new(HashSet::default());
         }
         let units = Arc::new(ruby_effective_imported_code_units(self, token, file));
-        self.imported_code_units
-            .insert(file.clone(), Arc::clone(&units));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&units);
+            persistent_fill_guard.installed("imported_code_units");
+            self.imported_code_units.insert(cache_key, cache_value);
+        };
         units
     }
 
@@ -138,12 +179,21 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-ruby-analysis/src/analyzer/ruby/imports.rs",
+            );
         if !self.canonical_sources_ready() {
             return HashSet::default();
         }
         let referencing = ruby_transitive_referencing_files_of(self, file);
-        self.referencing_files
-            .insert(file.clone(), Arc::new(referencing.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(referencing.clone());
+            persistent_fill_guard.installed("referencing_files");
+            self.referencing_files.insert(cache_key, cache_value);
+        };
         referencing
     }
 
@@ -205,9 +255,30 @@ impl brokk_bifrost_ruby::graph_support::RubySource for RubyAnalyzer {
     }
 
     fn has_zeitwerk_autoload_conventions(&self) -> bool {
-        *self
-            .zeitwerk_project
-            .get_or_init(|| detect_zeitwerk_autoload_conventions(self))
+        *self.zeitwerk_project.get_or_init(|| {
+            for (path, matches) in [
+                (
+                    "Gemfile",
+                    gemfile_declares_zeitwerk_autoloading as fn(&str) -> bool,
+                ),
+                (
+                    "Gemfile.lock",
+                    gemfile_lock_declares_zeitwerk_autoloading as fn(&str) -> bool,
+                ),
+            ] {
+                let file = ProjectFile::new(self.project().root().to_path_buf(), path);
+                match self.project().read_source(&file) {
+                    Ok(source) if matches(&source) => return true,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => self.record_degraded_persistent_fill(
+                        "ruby.zeitwerk_project",
+                        &format!("project_io:{path}:{error}"),
+                    ),
+                }
+            }
+            false
+        })
     }
 
     fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile> {
@@ -216,12 +287,17 @@ impl brokk_bifrost_ruby::graph_support::RubySource for RubyAnalyzer {
 
     fn zeitwerk_consumer_files(&self) -> &HashSet<ProjectFile> {
         self.zeitwerk_consumer_files
-            .get_or_init(|| build_zeitwerk_consumer_files(self))
+            .get_or_init(|| self.zeitwerk_files())
     }
 
     fn zeitwerk_autoload_code_units(&self) -> &HashSet<CodeUnit> {
-        self.zeitwerk_autoload_code_units
-            .get_or_init(|| build_zeitwerk_autoload_code_units(self))
+        self.zeitwerk_autoload_code_units.get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "ruby.zeitwerk_autoload_code_units",
+                || build_zeitwerk_autoload_code_units(self),
+            )
+        })
     }
 
     fn reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {

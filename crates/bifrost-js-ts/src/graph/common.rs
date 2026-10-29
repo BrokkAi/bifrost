@@ -9,7 +9,12 @@ pub(crate) fn enclosing_function_scope<'tree>(mut node: Node<'tree>) -> Option<N
     loop {
         if matches!(
             node.kind(),
-            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+            "function_declaration"
+                | "generator_function_declaration"
+                | "generator_function"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
         ) {
             return Some(node);
         }

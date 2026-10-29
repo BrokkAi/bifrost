@@ -2563,6 +2563,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: argument_values.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),

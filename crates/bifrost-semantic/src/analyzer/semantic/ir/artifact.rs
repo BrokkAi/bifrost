@@ -1062,6 +1062,383 @@ impl ProcedureSemantics {
         self.call_sites.get(id.index())
     }
 
+    fn same_source_occurrence(&self, left: SourceMappingId, right: SourceMappingId) -> bool {
+        self.source_mapping(left)
+            .zip(self.source_mapping(right))
+            .is_some_and(|(left, right)| {
+                left.kind == SourceMappingKind::Exact
+                    && right.kind == SourceMappingKind::Exact
+                    && left.locator == right.locator
+                    && left.ast_identity == right.ast_identity
+            })
+    }
+
+    /// Callable evaluations for this exact source occurrence that precede its
+    /// invocation. A selector may be evaluated before arguments or retained
+    /// until cleanup; its references need not live on the Invoke point.
+    /// Keep all alternatives and their evidence for the consumer's proof.
+    pub fn callable_selection_events(
+        &self,
+        id: CallSiteId,
+    ) -> Vec<(ProgramPointId, usize, &SemanticEvent)> {
+        let Some(call) = self.call_site(id) else {
+            return Vec::new();
+        };
+        let Some(callee) = self.value(call.callee) else {
+            return Vec::new();
+        };
+        let Some(callee_source) = self.source_mapping(callee.source) else {
+            return Vec::new();
+        };
+        let Some(call_source) = self.source_mapping(call.source) else {
+            return Vec::new();
+        };
+        let callee_span = callee_source.locator.anchor().span();
+        let call_span = call_source.locator.anchor().span();
+        let Some(dominance) = self.callable_selection_dominance() else {
+            return Vec::new();
+        };
+        let invoke_index = self.point(call.point).and_then(|point| {
+            point.events.iter().position(|event|
+            matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == id))
+        });
+        self.points()
+            .iter()
+            .filter(|point| dominance.dominates(self, point.id, call.point))
+            .flat_map(|point| {
+                point
+                    .events
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, event)| (point.id, index, event))
+            })
+            .filter(|(point, index, event)| {
+                if *point == call.point && invoke_index.is_none_or(|invoke| *index >= invoke) {
+                    return false;
+                }
+                let result = match event.effect {
+                    SemanticEffect::CallableReference { result, .. }
+                    | SemanticEffect::CallableCreation { result, .. } => result,
+                    _ => return false,
+                };
+                if result != call.callee {
+                    return false;
+                }
+                let Some(source) = self.source_mapping(event.source) else {
+                    return false;
+                };
+                let span = source.locator.anchor().span();
+                call_span.start_byte() <= span.start_byte()
+                    && span.end_byte() <= call_span.end_byte()
+                    && span.start_byte() <= callee_span.start_byte()
+                    && callee_span.end_byte() <= span.end_byte()
+            })
+            .collect()
+    }
+
+    /// Match a selected receiver to the invocation's receiver, including an
+    /// exact registration-time capture. Source identity and the ordered flow
+    /// edge distinguish a capture from a later assignment or another selector.
+    pub fn selected_receiver_matches(&self, id: CallSiteId, selected: ValueId) -> bool {
+        let Some(call) = self.call_site(id) else {
+            return false;
+        };
+        let Some(receiver) = call.receiver else {
+            return false;
+        };
+        if receiver == selected {
+            return true;
+        }
+        let (Some(source), Some(target)) = (self.value(selected), self.value(receiver)) else {
+            return false;
+        };
+        if !self.same_source_occurrence(source.source, target.source) {
+            return false;
+        }
+        let mut definitions = self.points().iter().flat_map(|point| {
+            point
+                .events
+                .iter()
+                .filter_map(move |event| match event.effect {
+                    SemanticEffect::ValueFlow { source, target, .. } if target == receiver => {
+                        Some((point.id, event, source))
+                    }
+                    _ => None,
+                })
+        });
+        let Some((capture_point, event, source)) = definitions.next() else {
+            return false;
+        };
+        if definitions.next().is_some() || source != selected {
+            return false;
+        }
+        let Some(evidence) = self.evidence_row(event.evidence) else {
+            return false;
+        };
+        if evidence.proof != ProofStatus::Proven
+            || evidence.completeness != EvidenceCompleteness::Complete
+        {
+            return false;
+        }
+        let Some(dominance) = self.callable_selection_dominance() else {
+            return false;
+        };
+        if !dominance.dominates(self, capture_point, call.point) {
+            return false;
+        }
+        self.callable_selection_events(id)
+            .iter()
+            .any(|(point, index, _)| {
+                dominance.dominates(self, *point, capture_point)
+                    && (*point != capture_point
+                        || self.point(capture_point).is_some_and(|point| {
+                            point
+                                .events
+                                .iter()
+                                .position(|candidate| std::ptr::eq(candidate, event))
+                                .is_some_and(|capture| *index < capture)
+                        }))
+            })
+    }
+
+    fn callable_selection_dominance(
+        &self,
+    ) -> Option<crate::analyzer::semantic::cfg_algorithms::Dominators<ProgramPointId>> {
+        use crate::analyzer::semantic::cfg_algorithms::{
+            CfgAlgorithmBudget, CfgAlgorithmRequest, dominators,
+        };
+        let mut budget = CfgAlgorithmBudget::default();
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        // A failed bounded proof leaves receiver binding unknown.
+        dominators(
+            self,
+            self.entry_point(),
+            &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+        )
+        .ok()
+    }
+
+    /// Values introduced at a callable-selection boundary to prepare its
+    /// receiver are not additional evaluations of the written operand. Follow
+    /// their defining effects at that boundary, not their value kind or type.
+    pub fn implicit_receiver_preparation_values(&self) -> HashSet<ValueId> {
+        let mut prepared = self.receiver_preparation_values();
+        for (point, index) in self.receiver_preparation_memory_events(&prepared) {
+            match self.points()[point.index()].events[index].effect {
+                SemanticEffect::MemoryLoad { result, .. } => {
+                    prepared.insert(result);
+                }
+                SemanticEffect::MemoryStore { value, .. } => {
+                    prepared.insert(value);
+                }
+                _ => unreachable!("preparation memory events are loads or stores"),
+            }
+        }
+        prepared
+    }
+
+    /// Internal field snapshots of an implicit receiver copy, keyed by exact
+    /// event occurrence. These remain heap/flow operations, but do not denote
+    /// field accesses written in the source.
+    pub fn implicit_receiver_preparation_memory_events(&self) -> HashSet<(ProgramPointId, usize)> {
+        self.receiver_preparation_memory_events(&self.receiver_preparation_values())
+    }
+
+    fn receiver_preparation_memory_events(
+        &self,
+        prepared: &HashSet<ValueId>,
+    ) -> HashSet<(ProgramPointId, usize)> {
+        let mut snapshots = HashSet::default();
+        for point in self.points() {
+            for transfer in &point.events {
+                let SemanticEffect::ValueFlow {
+                    kind:
+                        ValueFlowKind::Transfer(ValueTransfer {
+                            kind: TransferKind::AggregateCopy,
+                            ..
+                        }),
+                    source,
+                    target,
+                } = transfer.effect
+                else {
+                    continue;
+                };
+                if !prepared.contains(&target) {
+                    continue;
+                }
+                for (store_index, store) in point.events.iter().enumerate() {
+                    if store.source != transfer.source {
+                        continue;
+                    }
+                    let SemanticEffect::MemoryStore {
+                        location,
+                        value: stored,
+                        ..
+                    } = store.effect
+                    else {
+                        continue;
+                    };
+                    let Some(MemoryLocationKind::Field { base, member }) =
+                        self.memory_location(location).map(|row| &row.kind)
+                    else {
+                        continue;
+                    };
+                    if *base != target {
+                        continue;
+                    }
+                    // The destination and source field must be the same exact
+                    // declaration, and the stored value must come from that
+                    // snapshot load through boundary-local copy effects.
+                    let mut origins = HashSet::default();
+                    let mut pending = vec![stored];
+                    while let Some(value) = pending.pop() {
+                        if !origins.insert(value) {
+                            continue;
+                        }
+                        for definition in &point.events[..store_index] {
+                            if definition.source != transfer.source {
+                                continue;
+                            }
+                            match definition.effect {
+                                SemanticEffect::Assignment {
+                                    target,
+                                    value: input,
+                                } if target == value => pending.push(input),
+                                SemanticEffect::ValueFlow {
+                                    kind:
+                                        ValueFlowKind::Transfer(ValueTransfer {
+                                            kind: TransferKind::Copy | TransferKind::AggregateCopy,
+                                            ..
+                                        }),
+                                    source: input,
+                                    target,
+                                } if target == value => pending.push(input),
+                                _ => {}
+                            }
+                        }
+                    }
+                    for (load_index, load) in point.events[..store_index].iter().enumerate() {
+                        if load.source != transfer.source {
+                            continue;
+                        }
+                        let SemanticEffect::MemoryLoad {
+                            location, result, ..
+                        } = load.effect
+                        else {
+                            continue;
+                        };
+                        if origins.contains(&result) && self.memory_location(location).is_some_and(|row|
+                            matches!(&row.kind, MemoryLocationKind::Field { base, member: selected } if *base == source && selected == member)) {
+                            snapshots.insert((point.id, load_index));
+                            snapshots.insert((point.id, store_index));
+                        }
+                    }
+                }
+            }
+        }
+        snapshots
+    }
+
+    fn receiver_preparation_values(&self) -> HashSet<ValueId> {
+        let mut prepared = HashSet::default();
+        for point in self.points() {
+            for event in &point.events {
+                let SemanticEffect::CallableReference { result, callable } = &event.effect else {
+                    continue;
+                };
+                // The boundary must be the selected callable expression,
+                // rather than a whole invocation that also evaluates operands.
+                if self.value(*result).is_none_or(|callee| {
+                    self.source_mapping(callee.source)
+                        .zip(self.source_mapping(event.source))
+                        .is_none_or(|(value, boundary)| {
+                            value.kind != SourceMappingKind::Exact
+                                || boundary.kind != SourceMappingKind::Exact
+                                || value.locator.path() != boundary.locator.path()
+                                || value.locator.declaration() != boundary.locator.declaration()
+                                || value.locator.anchor().span() != boundary.locator.anchor().span()
+                        })
+                }) {
+                    continue;
+                }
+                let Some(receiver) = callable.bound_receiver else {
+                    continue;
+                };
+                let Some(receiver_value) = self.value(receiver) else {
+                    continue;
+                };
+                let Some(operand) = self.source_mapping(receiver_value.source) else {
+                    continue;
+                };
+                let Some(boundary) = self.source_mapping(event.source) else {
+                    continue;
+                };
+                let operand_span = operand.locator.anchor().span();
+                let boundary_span = boundary.locator.anchor().span();
+                if !(boundary_span.start_byte() <= operand_span.start_byte()
+                    && operand_span.end_byte() < boundary_span.end_byte())
+                {
+                    continue;
+                }
+                let mut pending = vec![receiver];
+                while let Some(value) = pending.pop() {
+                    if self
+                        .pointer_aliases()
+                        .iter()
+                        .any(|alias| alias.point == point.id && alias.pointer == value)
+                        && self.value(value).is_some_and(|value| {
+                            self.same_source_occurrence(value.source, receiver_value.source)
+                        })
+                    {
+                        prepared.insert(value);
+                    }
+                    if prepared.contains(&value)
+                        || self.value(value).is_none_or(|value| {
+                            !self.same_source_occurrence(value.source, receiver_value.source)
+                        })
+                    {
+                        continue;
+                    }
+                    for definition in &point.events {
+                        if definition.source != event.source {
+                            continue;
+                        }
+                        let input = match definition.effect {
+                            SemanticEffect::ValueFlow {
+                                kind:
+                                    ValueFlowKind::Transfer(ValueTransfer {
+                                        kind: TransferKind::Copy | TransferKind::AggregateCopy,
+                                        ..
+                                    }),
+                                source,
+                                target,
+                            } if target == value => Some(source),
+                            SemanticEffect::MemoryLoad {
+                                result, location, ..
+                            } if result == value && value != receiver => {
+                                match self
+                                    .memory_location(location)
+                                    .map(|location| &location.kind)
+                                {
+                                    Some(MemoryLocationKind::Dereference { address }) => {
+                                        Some(*address)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(input) = input {
+                            prepared.insert(value);
+                            pending.push(input);
+                        }
+                    }
+                }
+            }
+        }
+        prepared
+    }
+
     /// Return a receiver fact proved by the callable evaluation at this call.
     ///
     /// Target resolution is deliberately irrelevant: a language adapter can
@@ -1078,8 +1455,8 @@ impl ProcedureSemantics {
             return None;
         }
 
-        let point = self.point(call.point)?;
-        let mut references = point.events.iter().filter_map(|event| {
+        let selections = self.callable_selection_events(id);
+        let mut references = selections.iter().filter_map(|(_, _, event)| {
             let SemanticEffect::CallableReference { result, callable } = &event.effect else {
                 return None;
             };
@@ -1098,7 +1475,7 @@ impl ProcedureSemantics {
 
         match (call.receiver, callable.kind, callable.bound_receiver) {
             (Some(receiver), CallableReferenceKind::BoundMethod, Some(bound_receiver))
-                if receiver == bound_receiver =>
+                if self.selected_receiver_matches(id, bound_receiver) =>
             {
                 Some(CallerReceiverBinding::Bound(receiver))
             }
@@ -2027,6 +2404,7 @@ mod tests {
             execution_timing: ExecutionTiming::SameEvaluation,
             callee: ValueId::new(id),
             receiver: None,
+            member_selection: None,
             arguments: Box::new([]),
             normal_results: Box::new([]),
             result: Some(ValueId::new(7)),

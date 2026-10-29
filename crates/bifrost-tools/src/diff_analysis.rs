@@ -1308,46 +1308,51 @@ fn analyze_prepared_diff_from_images(
         .map(|(path, lines)| (path.clone(), lines.new.clone()))
         .collect();
     let cancellation = &prepared.cancellation;
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let (mut graph_before, mut graph_after) = rayon::join(
         || {
-            if call_edges == DiffCallEdges::ChangedLines {
-                return usage_graph_at_lines(
+            attribution.run(|| {
+                if call_edges == DiffCallEdges::ChangedLines {
+                    return usage_graph_at_lines(
+                        base_analyzer.analyzer(),
+                        &selected_before,
+                        include_tests,
+                        cancellation,
+                    );
+                }
+                usage_graph_with_cancellation(
                     base_analyzer.analyzer(),
-                    &selected_before,
-                    include_tests,
-                    cancellation,
-                );
-            }
-            usage_graph_with_cancellation(
-                base_analyzer.analyzer(),
-                UsageGraphParams {
-                    include_same_owner: false,
-                    include_tests,
-                    paths: Some(changed_paths.clone()),
-                    depth: 1,
-                },
-                cancellation.clone(),
-            )
+                    UsageGraphParams {
+                        include_same_owner: false,
+                        include_tests,
+                        paths: Some(changed_paths.clone()),
+                        depth: 1,
+                    },
+                    cancellation.clone(),
+                )
+            })
         },
         || {
-            if call_edges == DiffCallEdges::ChangedLines {
-                return usage_graph_at_lines(
+            attribution.run(|| {
+                if call_edges == DiffCallEdges::ChangedLines {
+                    return usage_graph_at_lines(
+                        target_analyzer.analyzer(),
+                        &selected_after,
+                        include_tests,
+                        cancellation,
+                    );
+                }
+                usage_graph_with_cancellation(
                     target_analyzer.analyzer(),
-                    &selected_after,
-                    include_tests,
-                    cancellation,
-                );
-            }
-            usage_graph_with_cancellation(
-                target_analyzer.analyzer(),
-                UsageGraphParams {
-                    include_same_owner: false,
-                    include_tests,
-                    paths: Some(changed_paths.clone()),
-                    depth: 1,
-                },
-                cancellation.clone(),
-            )
+                    UsageGraphParams {
+                        include_same_owner: false,
+                        include_tests,
+                        paths: Some(changed_paths.clone()),
+                        depth: 1,
+                    },
+                    cancellation.clone(),
+                )
+            })
         },
     );
     if call_edges == DiffCallEdges::ChangedLines {
@@ -3193,6 +3198,17 @@ impl RevisionTempDir {
             match create_private_dir(&path) {
                 Ok(()) => {
                     set_private_dir_permissions(&path)?;
+                    // Project roots are canonical (`FilesystemProject::new`), and
+                    // tools such as `go list` report canonical directories. On
+                    // macOS the temp directory is under the `/var` ->
+                    // `/private/var` symlink, so an export rooted at the raw path
+                    // fails to join with what those tools report.
+                    let path = path.canonicalize().map_err(|err| {
+                        format!(
+                            "unable to resolve temp revision directory {}: {err}",
+                            path.display()
+                        )
+                    })?;
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -5405,6 +5421,22 @@ mod tests {
             "export const second = 2;\n",
             fs::read_to_string(image.root().join("deep/one/two/second.ts")).unwrap()
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7584: a macOS diff-base export rooted under /var did not join with the /private/var paths go list reports"
+    )]
+    fn revision_export_root_is_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("root.ts"), "export const root = 1;\n").unwrap();
+        let commit = test_repo::commit_all(&repo, "canonical root");
+
+        let image =
+            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
+
+        assert_eq!(image.root().canonicalize().unwrap(), image.root());
     }
 
     #[test]

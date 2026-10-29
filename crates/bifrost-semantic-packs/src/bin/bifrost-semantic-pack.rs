@@ -113,12 +113,211 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "verify" => verify_command(arguments, format),
         "install" => install_command(arguments, format),
         "reindex" => reindex_command(arguments, format),
+        "codeql-jdk-summaries" => codeql_jdk_summaries_command(arguments, format),
+        "codeql-jvm-catalogs" => codeql_jvm_catalogs_command(arguments, format),
         "summary-corpus-join" => summary_corpus_join_command(arguments, format),
         "sanitizer-pack" => sanitizer_pack_command(arguments, format),
         "framework-decl-pack" => framework_decl_pack_command(arguments, format),
         "golden-summary-pack" => golden_summary_pack_command(arguments, format),
         _ => Err(failure(2, usage(), format)),
     }
+}
+
+fn codeql_jdk_summaries_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    let [models, commit, java_home, pack_path, report_path] = arguments.as_slice() else {
+        return Err(failure(
+            2,
+            "usage: bifrost-semantic-pack codeql-jdk-summaries EXT_DIRECTORY CODEQL_COMMIT JAVA_HOME PACK_JSON REPORT_JSON",
+            format,
+        ));
+    };
+    use brokk_bifrost_semantic_packs::summary_foundry::codeql::jdk;
+    let JdkGenerationInputs { files, types } =
+        jdk_generation_inputs(models, commit, java_home, format)?;
+    let commit = commit.to_str().expect("validated UTF-8 commit");
+    let (pack, report) = jdk::generate_jdk_summaries(&files, &types, commit)
+        .map_err(|error| failure(2, error.to_string(), format))?;
+    let source = serde_json::to_string_pretty(&pack).expect("pack is serializable") + "\n";
+    compile_source(
+        SourceFormat::Json,
+        source.as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .map_err(|errors| failure(2, format!("generated pack is invalid: {errors:?}"), format))?;
+    let report = serde_json::to_string_pretty(&report).expect("report is serializable") + "\n";
+    for (path, bytes) in [
+        (Path::new(pack_path), source),
+        (Path::new(report_path), report),
+    ] {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| failure(2, error.to_string(), format))?;
+        }
+        fs::write(path, bytes).map_err(|error| failure(2, error.to_string(), format))?;
+    }
+    Ok(0)
+}
+
+struct JdkGenerationInputs {
+    files: Vec<(String, Vec<u8>)>,
+    types: Vec<brokk_bifrost_semantic_packs::summary_foundry::codeql::jdk::JvmType>,
+}
+
+fn jdk_generation_inputs(
+    models: &OsString,
+    commit: &OsString,
+    java_home: &OsString,
+    format: OutputFormat,
+) -> Result<JdkGenerationInputs, CommandFailure> {
+    use brokk_bifrost_jvm_analysis::analyzer::jvm::external::JvmDependencyPackAdapter;
+    use brokk_bifrost_semantic_packs::summary_foundry::{codeql::jdk, read_codeql_models};
+    validate_codeql_commit(commit, format)?;
+    let files = read_codeql_models(Path::new(models))
+        .map_err(|error| failure(2, error.to_string(), format))?;
+    let production = JvmDependencyPackAdapter::read_jdk_jmod_declarations(Path::new(java_home))
+        .map_err(|error| failure(2, error, format))?;
+    if production.completeness
+        != brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Complete
+    {
+        return Err(failure(
+            2,
+            format!(
+                "JDK declarations are incomplete: {:?}",
+                production.diagnostics
+            ),
+            format,
+        ));
+    }
+    let declarations = production
+        .pack
+        .ok_or_else(|| failure(2, "JDK producer emitted no pack", format))?;
+    let types = jdk::declarations(&declarations).map_err(|error| failure(2, error, format))?;
+    Ok(JdkGenerationInputs { files, types })
+}
+
+fn codeql_jvm_catalogs_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    let [
+        models,
+        commit,
+        prefix,
+        version,
+        directory,
+        report_path,
+        inputs @ ..,
+    ] = arguments.as_slice()
+    else {
+        return Err(failure(
+            2,
+            "usage: bifrost-semantic-pack codeql-jvm-catalogs EXT_DIRECTORY CODEQL_COMMIT CATALOG_PREFIX CATALOG_VERSION CATALOG_DIR REPORT_JSON (--java-home DIR | --jar FILE)...",
+            format,
+        ));
+    };
+    if inputs.is_empty() || inputs.len() % 2 != 0 {
+        return Err(failure(2, usage(), format));
+    }
+    let prefix = prefix
+        .to_str()
+        .filter(|prefix| {
+            !prefix.is_empty()
+                && prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+        .ok_or_else(|| {
+            failure(
+                2,
+                "CATALOG_PREFIX must be lowercase ASCII letters, digits, and hyphens",
+                format,
+            )
+        })?;
+    let version = version
+        .to_str()
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|version| *version > 0)
+        .ok_or_else(|| {
+            failure(
+                2,
+                "CATALOG_VERSION must be a positive 32-bit integer",
+                format,
+            )
+        })?;
+    use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
+    use brokk_bifrost_jvm_analysis::analyzer::jvm::external::JvmDependencyPackAdapter;
+    use brokk_bifrost_semantic_packs::summary_foundry::{codeql::jdk, read_codeql_models};
+    let commit_text = validate_codeql_commit(commit, format)?;
+    let files = read_codeql_models(Path::new(models))
+        .map_err(|error| failure(2, error.to_string(), format))?;
+    let mut types = Vec::new();
+    let (input_pairs, remainder) = inputs.as_chunks::<2>();
+    assert!(remainder.is_empty(), "input pairs were validated above");
+    for pair in input_pairs {
+        let input_path = Path::new(&pair[1]);
+        let production = match pair[0].to_str() {
+            Some("--java-home") => JvmDependencyPackAdapter::read_jdk_jmod_declarations(input_path)
+                .map_err(|error| failure(2, error, format))?,
+            Some("--jar") => JvmDependencyPackAdapter::read_jar_declarations(input_path)
+                .map_err(|error| failure(2, error, format))?,
+            _ => return Err(failure(2, usage(), format)),
+        };
+        if production.completeness != Completeness::Complete {
+            return Err(failure(
+                2,
+                format!(
+                    "JVM declarations are incomplete for {}: {:?}",
+                    input_path.display(),
+                    production.diagnostics
+                ),
+                format,
+            ));
+        }
+        let declarations = production.pack.ok_or_else(|| {
+            failure(
+                2,
+                format!("JVM producer emitted no pack for {}", input_path.display()),
+                format,
+            )
+        })?;
+        types.extend(jdk::declarations(&declarations).map_err(|error| failure(2, error, format))?);
+    }
+    let (catalogs, report) = brokk_bifrost_semantic_packs::summary_foundry::codeql::jdk::catalogs::generate_jvm_catalogs(
+        &files, &types, commit_text, prefix, version,
+    ).map_err(|error| failure(2, error.to_string(), format))?;
+    fs::create_dir_all(directory).map_err(|error| failure(2, error.to_string(), format))?;
+    for (name, catalog) in catalogs {
+        let bytes = serde_json::to_string_pretty(&catalog).expect("catalog JSON") + "\n";
+        fs::write(Path::new(directory).join(format!("{name}.json")), bytes)
+            .map_err(|error| failure(2, error.to_string(), format))?;
+    }
+    if let Some(parent) = Path::new(report_path).parent() {
+        fs::create_dir_all(parent).map_err(|error| failure(2, error.to_string(), format))?;
+    }
+    let mut report = serde_json::to_value(&report).expect("report JSON");
+    report.sort_all_objects();
+    fs::write(
+        report_path,
+        serde_json::to_string_pretty(&report).expect("report JSON") + "\n",
+    )
+    .map_err(|error| failure(2, error.to_string(), format))?;
+    Ok(0)
+}
+
+fn validate_codeql_commit(commit: &OsString, format: OutputFormat) -> Result<&str, CommandFailure> {
+    let commit = commit
+        .to_str()
+        .ok_or_else(|| failure(2, "CodeQL commit must be UTF-8", format))?;
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(failure(
+            2,
+            "CodeQL commit must be a full 40-character hexadecimal revision",
+            format,
+        ));
+    }
+    Ok(commit)
 }
 
 fn csmi_check_command(
@@ -1161,6 +1360,8 @@ fn usage() -> &'static str {
         "  bifrost-semantic-pack verify OUTPUT\n",
         "  bifrost-semantic-pack install BUNDLE CATALOG\n",
         "  bifrost-semantic-pack reindex CATALOG [--format human|json]\n",
+        "  bifrost-semantic-pack codeql-jdk-summaries EXT_DIRECTORY CODEQL_COMMIT JAVA_HOME PACK_JSON REPORT_JSON\n",
+        "  bifrost-semantic-pack codeql-jvm-catalogs EXT_DIRECTORY CODEQL_COMMIT CATALOG_PREFIX CATALOG_VERSION CATALOG_DIR REPORT_JSON (--java-home DIR | --jar FILE)...\n",
         "  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS ",
         "JOERN_SOURCE REPORT.json [JVM_SOURCES]\n",
         "  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n",

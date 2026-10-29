@@ -67,6 +67,7 @@ mod jvm_registry_tests {
             SemanticLanguage::Standard(Language::Java),
             Some(semantic_call),
             None,
+            &[],
         );
 
         let target = named
@@ -99,6 +100,7 @@ mod jvm_registry_tests {
             SemanticLanguage::Standard(Language::Java),
             Some(semantic_call),
             None,
+            &[],
         );
         assert_eq!(unnamed.kind, DispatchBoundaryKind::Unresolved);
         assert!(unnamed.target_locator().is_none());

@@ -836,8 +836,7 @@ fn exact_external_call(
         budget,
         cancellation: Some(cancellation),
     };
-    let selector =
-        brokk_bifrost_go::graph::reference::go_selector_descriptor(tree.root_node(), &site);
+    let selector = brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), &site);
     if let Some(selector) = selector.as_ref()
         && matches!(selector.base.kind(), "identifier" | "package_identifier")
         && selector.focus_segment == 1

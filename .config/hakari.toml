@@ -1,0 +1,23 @@
+# Regenerate with cargo-hakari 0.9.39; see CONTRIBUTING.md.
+hakari-package = "workspace-hack"
+resolver = "2"
+dep-format-version = "4"
+workspace-hack-line-style = "workspace-dotted"
+# Build-only behavior switches (notably JSON ordering) must stay on the host.
+unify-target-host = "none"
+platforms = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+[final-excludes]
+third-party = [
+    # Python extension linkage must stay separate from executable test builds.
+    { name = "pyo3" },
+    { name = "pyo3-ffi" },
+    { name = "pyo3-build-config" },
+]

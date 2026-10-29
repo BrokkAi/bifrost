@@ -451,6 +451,7 @@ fn limit_production_records(
         types,
         members,
         relations,
+        ..
     } = &mut shard.payload
     else {
         return;
@@ -495,6 +496,7 @@ fn production_record_count(production: &ArtifactProduction) -> usize {
                 types,
                 members,
                 relations,
+                ..
             } => Some(types.len() + members.len() + relations.len()),
             _ => None,
         })
@@ -866,46 +868,37 @@ fn contract_type_ref(
             args,
             self_type,
             trait_,
-        } => TypeRef::Projection {
-            owner: Box::new(contract_type_ref(
-                self_type,
-                document,
-                type_ids,
-                limits,
-                diagnostics,
-                depth + 1,
-            )),
-            trait_type: trait_.as_ref().map(|path| {
-                Box::new(contract_type_ref(
-                    &Type::ResolvedPath(path.clone()),
-                    document,
-                    type_ids,
-                    limits,
-                    diagnostics,
-                    depth + 1,
-                ))
-            }),
-            name: name.clone(),
-            arguments: if let Some(GenericArgs::AngleBracketed { args, .. }) = args.as_deref() {
-                args.iter()
-                    .filter_map(|arg| match arg {
-                        GenericArg::Type(ty) => Some(contract_type_ref(
-                            ty,
-                            document,
-                            type_ids,
-                            limits,
-                            diagnostics,
-                            depth + 1,
-                        )),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-        },
+        } => qualified_projection(name, args.as_deref(), self_type, trait_.as_ref(), |ty| {
+            contract_type_ref(ty, document, type_ids, limits, diagnostics, depth + 1)
+        }),
         Type::Infer | Type::DynTrait(_) | Type::ImplTrait(_) => TypeRef::Unknown,
         _ => rust_type_ref(ty, document, type_ids, limits, diagnostics, depth),
+    }
+}
+
+// Both contract facts and callable signatures retain the same projection shape,
+// while their recursive conversion applies the appropriate binder scope.
+fn qualified_projection(
+    name: &str,
+    args: Option<&GenericArgs>,
+    self_type: &Type,
+    trait_type: Option<&RustdocPath>,
+    mut project: impl FnMut(&Type) -> TypeRef,
+) -> TypeRef {
+    TypeRef::Projection {
+        owner: Box::new(project(self_type)),
+        trait_type: trait_type.map(|path| Box::new(project(&Type::ResolvedPath(path.clone())))),
+        name: name.to_owned(),
+        arguments: if let Some(GenericArgs::AngleBracketed { args, .. }) = args {
+            args.iter()
+                .filter_map(|arg| match arg {
+                    GenericArg::Type(ty) => Some(project(ty)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -1311,6 +1304,7 @@ fn merge_source_set_productions(
             types: shard_types,
             members: shard_members,
             relations: shard_relations,
+            ..
         } = shard.payload
         else {
             completeness = Completeness::Partial;
@@ -1556,6 +1550,8 @@ fn source_set_declaration_shards(
             id: format!("declarations.rust.external.{name}"),
             activation: activation.clone(),
             payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
                 types: Vec::new(),
                 members: Vec::new(),
                 relations: Vec::new(),
@@ -1621,6 +1617,7 @@ fn source_set_declaration_shards(
             types,
             members,
             relations,
+            ..
         } = &mut packed[position].payload
         else {
             unreachable!("source-set shards contain declaration facts")
@@ -1629,6 +1626,7 @@ fn source_set_declaration_shards(
             types: module_types,
             members: module_members,
             relations: module_relations,
+            ..
         } = shard.payload
         else {
             unreachable!("source-set shards contain declaration facts")
@@ -2612,15 +2610,68 @@ fn type_shape<'a>(
     let hierarchy = bounds
         .iter()
         .filter_map(|bound| match bound {
-            GenericBound::TraitBound { trait_, .. } => Some(HierarchyFact {
-                hierarchy_kind: HierarchyKind::Extends,
-                target: path_type_ref(trait_, document, type_ids, limits, diagnostics, 0),
-                declaration_ordinal: None,
-            }),
+            GenericBound::TraitBound { trait_, .. } => {
+                let target = path_type_ref(trait_, document, type_ids, limits, diagnostics, 0);
+                nominal_hierarchy_fact(HierarchyKind::Extends, target, item.id, diagnostics)
+            }
             _ => None,
         })
         .collect();
     (kind, generics, hierarchy)
+}
+
+fn nominal_hierarchy_fact(
+    hierarchy_kind: HierarchyKind,
+    mut target: TypeRef,
+    item: Id,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> Option<HierarchyFact> {
+    if !matches!(target, TypeRef::Named { .. } | TypeRef::Declared { .. }) {
+        diagnostics.warning(
+            "rust.rustdoc.nonconcrete_hierarchy_unprojected",
+            Some(format!("item.{}", item.0)),
+            format!("hierarchy {hierarchy_kind:?} requires a named target: {target:?}"),
+        );
+        return None;
+    }
+    // Keep the nominal edge without claiming to solve its projected arguments.
+    // Signatures and implementation contracts retain their projections.
+    let mut pending = vec![&mut target];
+    while let Some(reference) = pending.pop() {
+        match reference {
+            TypeRef::Projection { .. } => {
+                *reference = TypeRef::Wildcard {
+                    variance: WildcardVariance::Any,
+                    bound: None,
+                };
+            }
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments);
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => pending.push(element),
+            TypeRef::Map { key, value } => {
+                pending.push(key);
+                pending.push(value);
+            }
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref_mut()),
+            TypeRef::Tuple { elements } => pending.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter_mut().map(|parameter| &mut parameter.r#type));
+                pending.extend(result.as_deref_mut());
+            }
+            TypeRef::TypeParameter { .. } | TypeRef::Unknown => {}
+        }
+    }
+    Some(HierarchyFact {
+        hierarchy_kind,
+        target,
+        declaration_ordinal: None,
+    })
 }
 
 fn empty_generics() -> &'static Generics {
@@ -2853,16 +2904,20 @@ impl RustdocTypeProjection<'_> {
                     .map(|ty| Box::new(self.project(ty, diagnostics, next))),
             },
             Type::Pat { type_, .. } => self.project(type_, diagnostics, next),
-            // DeclarationFacts cannot encode Rust existential/trait-object bounds
-            // or associated projections without inventing one qualified-name
-            // string. Preserve that uncertainty explicitly instead of emitting
-            // Rust syntax (which is not a declaration identifier) as a name.
-            Type::DynTrait(_) | Type::ImplTrait(_) | Type::QualifiedPath { .. } => {
-                TypeRef::Wildcard {
-                    variance: WildcardVariance::Any,
-                    bound: None,
-                }
-            }
+            Type::QualifiedPath {
+                name,
+                args,
+                self_type,
+                trait_,
+            } => qualified_projection(name, args.as_deref(), self_type, trait_.as_ref(), |ty| {
+                self.project(ty, diagnostics, next)
+            }),
+            // Existential and trait-object bounds have no structured signature
+            // representation. Preserve their uncertainty explicitly.
+            Type::DynTrait(_) | Type::ImplTrait(_) => TypeRef::Wildcard {
+                variance: WildcardVariance::Any,
+                bound: None,
+            },
             Type::Infer => TypeRef::named("_"),
         }
     }
@@ -3176,10 +3231,10 @@ fn project_impl_hierarchy(
         0,
     );
     let position = projection.type_position[&owner_item];
-    let hierarchy = HierarchyFact {
-        hierarchy_kind: HierarchyKind::Implements,
-        target,
-        declaration_ordinal: None,
+    let Some(hierarchy) =
+        nominal_hierarchy_fact(HierarchyKind::Implements, target, item.id, diagnostics)
+    else {
+        return;
     };
     if hierarchy_seen[position].insert(hierarchy.clone()) {
         types[position].hierarchy.push(hierarchy);
@@ -3742,6 +3797,8 @@ fn finish(
             id: "declarations.rust.external".to_owned(),
             activation: request.activation.clone(),
             payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
                 types,
                 members,
                 relations,
@@ -4198,6 +4255,9 @@ mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#6542: Rust std production discarded cross-document owners and trait contracts"
     )]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6704: qualified projection return types became wildcards"
+    )]
     fn rustdoc_source_set_contract_survives_pack_roundtrip() {
         use brokk_bifrost_semantic::analyzer::semantic_model::artifact::{
             DecodeLimits, decode_shard,
@@ -4515,6 +4575,19 @@ mod tests {
                 .unwrap();
             assert_eq!(member.signature.as_ref().unwrap().returns, Some(expected));
         }
+        let projected = members
+            .iter()
+            .find(|member| member.owner == boxed.id && member.name == "projected")
+            .unwrap();
+        assert_eq!(
+            projected.signature.as_ref().unwrap().returns,
+            Some(TypeRef::Projection {
+                owner: Box::new(TypeRef::TypeParameter { name: "I".into() }),
+                trait_type: Some(Box::new(TypeRef::named("core.Traverse"))),
+                name: "Item".into(),
+                arguments: vec![TypeRef::named("u8")],
+            })
+        );
         let slice = members
             .iter()
             .find(|member| member.owner == "core.primitive.slice" && member.name == "iter")
@@ -4540,6 +4613,61 @@ mod tests {
                 )
         );
 
+        let other_traverse = types
+            .iter()
+            .find(|fact| fact.name == "core.OtherTraverse")
+            .unwrap();
+        assert_eq!(
+            traverse.hierarchy,
+            [
+                vec![],
+                vec![TypeRef::Wildcard {
+                    variance: WildcardVariance::Any,
+                    bound: None,
+                }]
+            ]
+            .map(|arguments| HierarchyFact {
+                hierarchy_kind: HierarchyKind::Extends,
+                target: TypeRef::Declared {
+                    id: other_traverse.id.clone(),
+                    arguments,
+                    nullable: false,
+                },
+                declaration_ordinal: None,
+            })
+        );
+        assert!(!production.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "rust.rustdoc.nonconcrete_hierarchy_unprojected"
+        }));
+        // A projected member return remains intact, but cannot itself name a
+        // hierarchy target. Rustdoc trait bounds normally expose named paths.
+        let mut hierarchy_diagnostics = BoundedProducerDiagnostics::new(&limits);
+        assert!(
+            nominal_hierarchy_fact(
+                HierarchyKind::Extends,
+                projected
+                    .signature
+                    .as_ref()
+                    .unwrap()
+                    .returns
+                    .clone()
+                    .unwrap(),
+                Id(123),
+                &mut hierarchy_diagnostics,
+            )
+            .is_none()
+        );
+        let (hierarchy_diagnostics, suppressed) = hierarchy_diagnostics.finish();
+        assert_eq!(suppressed.total(), 0);
+        assert_eq!(hierarchy_diagnostics.len(), 1);
+        assert_eq!(
+            hierarchy_diagnostics[0].code,
+            "rust.rustdoc.nonconcrete_hierarchy_unprojected"
+        );
+        assert_eq!(
+            hierarchy_diagnostics[0].location.as_deref(),
+            Some("item.123")
+        );
         let forwarding = traverse
             .generic_trait_impls
             .iter()
@@ -5114,6 +5242,7 @@ mod tests {
             types,
             members,
             relations,
+            ..
         } = &pack.shards[0].payload
         else {
             panic!("expected declaration facts")
@@ -5433,6 +5562,7 @@ mod tests {
             types,
             members,
             relations,
+            ..
         } = &pack.shards[0].payload
         else {
             panic!("Rustdoc source set must produce declaration facts");
@@ -5467,6 +5597,7 @@ mod tests {
             types,
             members,
             relations,
+            ..
         } = &pack.shards[0].payload
         else {
             panic!("expected declaration facts")

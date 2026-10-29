@@ -1276,6 +1276,10 @@ impl WitnessArena {
         {
             return Ok(WitnessAdmission::Duplicate);
         }
+        if alternatives.ids(quality).len() >= self.max_alternatives_per_quality() {
+            alternatives.mark_truncated(quality);
+            return Ok(WitnessAdmission::Truncated);
+        }
         if self.limits.is_best_effort()
             && (candidate_budget
                 .request_remaining_relations
@@ -1297,10 +1301,6 @@ impl WitnessArena {
                     }))
         {
             return Ok(WitnessAdmission::Exhausted);
-        }
-        if alternatives.ids(quality).len() >= self.max_alternatives_per_quality() {
-            alternatives.mark_truncated(quality);
-            return Ok(WitnessAdmission::Truncated);
         }
         let candidate = candidate();
         debug_assert_eq!(candidate.retained_bytes(), candidate_budget.retained_bytes);
@@ -2086,8 +2086,10 @@ fn best_effort_request_admission_is_checked_before_candidate_allocation() {
 }
 
 #[test]
+#[hardwon("#7755: a refused witness alternative still tripped whole-sidecar abandonment")]
 fn full_best_effort_alternative_slot_is_checked_before_candidate_allocation() {
-    let arena = WitnessArena::new(WitnessRetentionLimits::best_effort(1, 64, 1024).unwrap());
+    let mut arena = WitnessArena::new(WitnessRetentionLimits::best_effort(1, 1, 1).unwrap());
+    arena.retained_bytes = 1;
     let mut alternatives = WitnessAlternatives::default();
     alternatives.push(
         PathQuality::PROVEN_COMPLETE,

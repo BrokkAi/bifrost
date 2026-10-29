@@ -425,7 +425,7 @@ pub fn resolve_active_semantic_models(
 }
 
 /// Test-only per-language backing choice. Every selected shard of a language
-/// uses the same backing; product activation selects rows for Rust only.
+/// uses the same backing; product activation uses each language's catalog-row capability.
 #[cfg(any(test, feature = "test-support"))]
 pub fn resolve_row_backed_semantic_models_for_test(
     catalog: &SemanticPackCatalog,
@@ -1073,6 +1073,56 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     runtime_artifacts: RuntimeArtifactPublication<'_>,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    acquire_with_resolution(
+        analyzer,
+        catalog,
+        persistence,
+        request,
+        dependency_evidence,
+        runtime_artifacts,
+        cancellation,
+        || resolve_active_semantic_models(catalog, request, cancellation),
+    )
+}
+
+/// Exercise the pre-row activation path through the same publication and limits.
+#[cfg(any(test, feature = "test-support"))]
+pub fn acquire_eager_semantic_models_for_test(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+    cancellation: &CancellationToken,
+) -> SemanticModelRuntimeOutcome {
+    acquire_with_resolution(
+        analyzer,
+        catalog,
+        None,
+        request,
+        None,
+        RuntimeArtifactPublication::default(),
+        cancellation,
+        || {
+            resolve_active_semantic_models_with_loader(
+                catalog,
+                request,
+                cancellation,
+                |candidate| catalog.load_decoded_for_test(candidate),
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_with_resolution(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    persistence: Option<SemanticModelActivationPersistence<'_>>,
+    request: &SemanticModelActivationRequest,
+    dependency_evidence: Option<&[DependencyEvidencePublication]>,
+    runtime_artifacts: RuntimeArtifactPublication<'_>,
+    cancellation: &CancellationToken,
+    resolve: impl Fn() -> SemanticModelResolutionOutcome,
+) -> SemanticModelRuntimeOutcome {
     let RuntimeArtifactPublication {
         jdk_artifacts_by_configured_home,
         python_runtime,
@@ -1113,10 +1163,7 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     let snapshot_content = analyzer.workspace_content_identity();
     let content_is_current = || analyzer.workspace_content_identity() == snapshot_content;
     let Some(caches) = analyzer.snapshot_caches() else {
-        let outcome = with_python_provider_identity(
-            resolve_active_semantic_models(catalog, request, cancellation),
-            python_runtime,
-        );
+        let outcome = with_python_provider_identity(resolve(), python_runtime);
         if !content_is_current() {
             return stale_generation_outcome(request.limits);
         }
@@ -1159,10 +1206,7 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
             }
         }
         CompleteValueAcquisition::Leader { permit } => {
-            let outcome = with_python_provider_identity(
-                resolve_active_semantic_models(catalog, request, cancellation),
-                python_runtime,
-            );
+            let outcome = with_python_provider_identity(resolve(), python_runtime);
             let SemanticModelResolutionOutcome::Ready(active) = outcome else {
                 return runtime_outcome(
                     outcome,
@@ -1213,7 +1257,8 @@ pub(crate) fn overlay_build_outcome(
     let mut report = active.activation_report().clone();
     match error {
         SemanticModelOverlayBuildError::Cancelled => SemanticModelRuntimeOutcome::Cancelled(report),
-        SemanticModelOverlayBuildError::RetainedBytesExceeded => {
+        SemanticModelOverlayBuildError::RetainedBytesExceeded(measurements) => {
+            report.overlay_budget_exceeded = Some(measurements);
             push_request_explanation(
                 &mut report,
                 limits,

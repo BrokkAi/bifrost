@@ -1,0 +1,4 @@
+Relative.consume -> Relative.touch
+Written.consume -> A.touch
+declared_agreement -> A.touch
+doc_agreement -> A.touch

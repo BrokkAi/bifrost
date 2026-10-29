@@ -474,3 +474,62 @@ impl PrimaryLocalBindings {
         self.timelines[scope].is_active_at(name, position)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::declarations::parse_ruby_tree;
+
+    #[test]
+    fn callable_parameter_grammar_keeps_keyword_defaults_and_nested_lambdas_separate() {
+        for (source, kind, expected_parameters, defaults) in [
+            (
+                "def f(required:); nil; end",
+                "method",
+                Some("(required:)"),
+                false,
+            ),
+            (
+                "def f(optional: side_effect()); nil; end",
+                "method",
+                Some("(optional: side_effect())"),
+                true,
+            ),
+            ("def f = ->(x = side_effect()) { x }", "method", None, false),
+            ("def f = ->(x) { x }", "method", None, false),
+            (
+                "->(x = side_effect()) { x }",
+                "lambda",
+                Some("(x = side_effect())"),
+                true,
+            ),
+            ("->(x) { x }", "lambda", Some("(x)"), false),
+        ] {
+            let tree = parse_ruby_tree(source).expect("Ruby grammar");
+            assert!(!tree.root_node().has_error(), "{source}");
+            let callable = tree.root_node().named_child(0).expect("callable");
+            assert_eq!(callable.kind(), kind, "{source}");
+            let body = callable.child_by_field_name("body").expect("callable body");
+            let parameters = callable_parameters(callable, body);
+            assert_eq!(
+                parameters.map(|node| &source[node.byte_range()]),
+                expected_parameters,
+                "{source}"
+            );
+            let collection = collect_local_bindings(
+                source,
+                callable,
+                body,
+                None,
+                &mut UnboundedLocalBindingBudget,
+            )
+            .unwrap();
+            assert_eq!(collection.has_parameter_defaults, defaults, "{source}");
+            assert_eq!(
+                collection.timeline.is_active_at("x", body.end_byte()),
+                kind == "lambda",
+                "{source}"
+            );
+        }
+    }
+}

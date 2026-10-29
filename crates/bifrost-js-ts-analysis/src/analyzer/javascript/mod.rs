@@ -109,6 +109,22 @@ pub(crate) const JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY: &str = "javascript:jsx";
 pub struct JavascriptAdapter;
 
 impl LanguageAdapter for JavascriptAdapter {
+    fn nul_payload_kinds(&self) -> &'static [&'static str] {
+        brokk_bifrost_js_ts::parse::JS_TS_NUL_PAYLOAD_KINDS
+    }
+
+    fn supports_structural_line_data(&self) -> bool {
+        true
+    }
+
+    fn is_structural_line_data(
+        &self,
+        node: tree_sitter::Node<'_>,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> std::ops::ControlFlow<(), bool> {
+        brokk_bifrost_js_ts::parse::is_string_line_data(node, should_stop)
+    }
+
     fn query_directory(&self) -> &'static str {
         JAVASCRIPT_QUERY_DIRECTORY
     }
@@ -218,8 +234,9 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for Javascrip
         file: &ProjectFile,
         source: &str,
         state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
-    ) {
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
         synthesize_js_ts_hydrated_module_unit(file, source, state);
+        Ok(())
     }
     fn synthesize_summary_projection(
         &self,
@@ -1052,6 +1069,10 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Java
         changed_files: &BTreeSet<ProjectFile>,
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
         Box::new(IAnalyzer::update(self, changed_files))
+    }
+
+    fn read_configuration_file(&self, file: &ProjectFile) -> bool {
+        self.alias_resolver.read_config_path(file)
     }
 
     fn update_all_with_progress(

@@ -3,7 +3,7 @@ title: C#
 description: Query C# null-conditional calls, named arguments, attributes, and using aliases with query_code.
 ---
 
-> Last verified end to end: 2026-10-06 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-27 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
@@ -488,10 +488,10 @@ case-insensitive decoded values with numeric bounds on one XML attribute.
       "parent_id": "<public-id>",
       "path": "csharp/Web.config",
       "range": {
-        "end_column": 1,
-        "end_line": 1,
-        "start_column": 1,
-        "start_line": 1
+        "end_column": 34,
+        "end_line": 3,
+        "start_column": 18,
+        "start_line": 3
       },
       "result_type": "configuration_fact",
       "role": "xml-attribute",
@@ -913,6 +913,58 @@ class QueryLeaf : QueryRoot {
       "result_type": "declaration",
       "signature": "class QueryLeaf : QueryRoot {",
       "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Select locked bodies
+
+A `lock` exposes the locked `value` and its `body` as separate roles.
+
+<!-- code-query-fixture:csharp/Locking.cs -->
+```csharp
+class Locking {
+    void Guard(object gate) {
+        lock (gate) {
+            Touch();
+        }
+    }
+    void Touch() {}
+}
+```
+
+<!-- code-query-case:lock-body:rql -->
+```lisp
+(language csharp (lock :value (capture "gate") :body (block)))
+```
+
+<!-- code-query-case:lock-body:json -->
+```json
+{"languages":["csharp"],"match":{"kind":"lock","value":{"capture":"gate"},"body":{"kind":"block"}}}
+```
+
+<!-- code-query-case:lock-body:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "csharp/Locking.cs",
+      "language": "csharp",
+      "kind": "lock",
+      "start_line": 3,
+      "end_line": 5,
+      "text": "lock (gate) {\u2026",
+      "enclosing_symbol": "Locking.Guard",
+      "captures": [
+        {
+          "name": "gate",
+          "text": "gate",
+          "start_line": 3
+        }
+      ]
     }
   ],
   "truncated": false

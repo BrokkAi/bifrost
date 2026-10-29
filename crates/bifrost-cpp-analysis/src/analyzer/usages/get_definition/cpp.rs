@@ -73,6 +73,7 @@ use brokk_bifrost_cpp::graph::extractor::{
     is_malformed_wrapper_function_definition as cpp_malformed_wrapper_function_definition,
     macro_fracture_boundary as cpp_macro_fracture_boundary, qualified_receiver_base,
 };
+use brokk_bifrost_cpp::graph::extractor::{QualifierOwnerSelection, select_qualifier_owner};
 use brokk_bifrost_cpp::graph::resolver::CppTemplateResolutionError;
 use brokk_bifrost_cpp::graph::resolver::DesignatedInitializerOwner as CppDesignatedInitializerOwner;
 use brokk_bifrost_cpp::graph::resolver::LexicalTypeResolution as CppLexicalTypeResolution;
@@ -2563,6 +2564,37 @@ fn cpp_bounded_type_candidates(
             ambiguous: false,
         });
     }
+    // Block scope precedes every lexical tier below: a local class hides the
+    // outer types of its spelling, and a name a block declares without a
+    // minted class resolves to nothing rather than to an outer type.
+    if !brokk_bifrost_cpp::graph::resolver::is_globally_qualified_cpp_name(node)
+        && let Some(components) =
+            brokk_bifrost_cpp::graph::resolver::cpp_type_name_components(node, source)
+    {
+        let scope = AnalyzerQueryScope::new(provider.analyzer);
+        let dispatch = CppDispatch::new(provider.analyzer, scope.token());
+        if let Some(resolution) = brokk_bifrost_cpp::graph::resolver::function_local_type_resolution(
+            &dispatch.source(),
+            file,
+            node,
+            &components,
+            source,
+        ) {
+            let CppLexicalTypeResolution::Resolved { unit, .. } = resolution else {
+                return None;
+            };
+            return Some(CppBoundedTypeResolution {
+                fqn: unit.fq_name(),
+                candidates: vec![unit],
+                target_kind: if cpp_bounded_type_reference(node, provider.session) {
+                    TypeLookupTargetKind::TypeReference
+                } else {
+                    TypeLookupTargetKind::ValueExpression
+                },
+                ambiguous: false,
+            });
+        }
+    }
     let name_node = cpp_bounded_type_name_node(node, provider.session)?;
     let name = cpp_node_text(name_node, source);
     if name.is_empty() || matches!(name, "auto" | "decltype") {
@@ -4124,7 +4156,9 @@ fn resolve_cpp_type_without_focused_qualifier(
 }
 
 /// The owner a qualified name's scope components select under C++ lookup
-/// from the reference site. A leading `::` anchors lookup at global scope.
+/// from the reference site. A leading `::` anchors lookup at global scope,
+/// and a qualifier's template arguments or alias select the owner before its
+/// member is looked up (#6902).
 enum CppLexicalQualifiedOwner {
     Resolved(CodeUnit),
     // no candidates: the lexical resolver reports the fail-closed verdict
@@ -4143,6 +4177,44 @@ fn cpp_lexical_qualified_owner(
     globally_qualified: bool,
 ) -> CppLexicalQualifiedOwner {
     let owner_reference = owner_components.join("::");
+    // `Owner<int>::Alias` names the explicit specialization's alias, never
+    // the primary template's: the plain components below lose the arguments.
+    match select_qualifier_owner(
+        node,
+        globally_qualified,
+        &dispatch.source(),
+        visibility,
+        &visibility.ordinary_type_import_cell(file),
+        file,
+        source,
+    ) {
+        QualifierOwnerSelection::Unchanged => {}
+        QualifierOwnerSelection::Selected(mut path) => {
+            path.pop();
+            return match visibility.resolve_type_components_lexically_for_forward(
+                &dispatch.source(),
+                file,
+                &path,
+                true,
+                &[],
+            ) {
+                CppLexicalTypeResolution::Resolved { unit, .. } => {
+                    CppLexicalQualifiedOwner::Resolved(unit)
+                }
+                CppLexicalTypeResolution::Ambiguous | CppLexicalTypeResolution::Missing => {
+                    CppLexicalQualifiedOwner::Ambiguous(format!(
+                        "the owner `{owner_reference}` selects is not uniquely indexed"
+                    ))
+                }
+            };
+        }
+        QualifierOwnerSelection::Ambiguous => {
+            return CppLexicalQualifiedOwner::Ambiguous(format!(
+                "`{owner_reference}` does not select one C++ owner: its template arguments or \
+                 alias arms are undecided"
+            ));
+        }
+    }
     let lexical_scope = match cpp_enclosing_lexical_scope_components(
         node,
         &dispatch.source(),
@@ -11180,6 +11252,27 @@ fn cpp_seed_binding(
                         ),
                         Vec::new(),
                     )
+                } else if let Some(local) = (!is_globally_qualified_cpp_name(node))
+                    .then(|| {
+                        brokk_bifrost_cpp::graph::resolver::function_local_type_resolution(
+                            &graph,
+                            file,
+                            node,
+                            &components,
+                            source,
+                        )
+                    })
+                    .flatten()
+                {
+                    // A C++ block-scope class: the minted local class, or no
+                    // type when the block declares the name without one.
+                    let unit = match local {
+                        CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+                        CppLexicalTypeResolution::Ambiguous | CppLexicalTypeResolution::Missing => {
+                            None
+                        }
+                    };
+                    (unit, Vec::new())
                 } else if cpp_active_template_parameter_reference(node, source)
                     || bare_name.is_some_and(|name| {
                         cpp_active_block_tag_type_node(node, name, source).is_some()

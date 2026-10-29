@@ -229,6 +229,7 @@ pub(crate) struct JvmExternalDeclarationIndex {
 }
 
 pub(crate) fn get_or_build_external_declaration_index<'a>(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
     index: &'a OnceLock<Arc<JvmExternalDeclarationIndex>>,
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
@@ -236,11 +237,35 @@ pub(crate) fn get_or_build_external_declaration_index<'a>(
 ) -> &'a JvmExternalDeclarationIndex {
     index
         .get_or_init(|| {
-            JvmExternalDeclarationIndex::build_for_project_with_inventory(config, project, store)
-                .unwrap_or_else(|error| {
-                    eprintln!("JVM external inventory publication failed: {error}");
-                    JvmExternalDeclarationIndex::build_for_project(config, project)
-                })
+            let value = JvmExternalDeclarationIndex::build_for_project_with_inventory(
+                config, project, store,
+            )
+            .unwrap_or_else(|error| {
+                analyzer.record_degraded_persistent_fill(
+                    "jvm.external_index",
+                    &format!("inventory_store:{error}"),
+                );
+                eprintln!("JVM external inventory publication failed: {error}");
+                JvmExternalDeclarationIndex::build_for_project(config, project)
+            });
+            // These diagnostics describe absent configuration or immutable
+            // content, not a failed provider attempt. Every other provider
+            // diagnostic is conservatively execution-dependent.
+            if value.production_diagnostics.iter().any(|diagnostic| {
+                !matches!(
+                    diagnostic.code.as_str(),
+                    "jdk.home.unavailable"
+                        | "java.source_binary_conflict"
+                        | "artifact.kind"
+                        | "artifact.role"
+                )
+            }) {
+                analyzer.record_degraded_persistent_fill(
+                    "jvm.external_index",
+                    &format!("provider:{:?}", value.production_diagnostics),
+                );
+            }
+            value
         })
         .as_ref()
 }
@@ -532,7 +557,125 @@ enum JvmDependencyOrigin {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JvmDependencyPackAdapter;
 
+fn replace_generic_callable_parameters(
+    pack: &mut AuthoredSemanticModelPack,
+    limits: &ArtifactProducerLimits,
+    artifact_kind: &str,
+) -> Result<(), String> {
+    for shard in &mut pack.shards {
+        let AuthoredPayload::DeclarationFacts { members, .. } = &mut shard.payload else {
+            continue;
+        };
+        for member in members {
+            if !matches!(
+                member.member_kind,
+                MemberKind::Method | MemberKind::Constructor
+            ) {
+                continue;
+            }
+            let Some(signature) = &mut member.signature else {
+                continue;
+            };
+            let mut erased = crate::analyzer::jvm::java_artifact::erased_class_method_parameters(
+                &member.locator,
+                limits.max_signature_depth,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "no erased {artifact_kind} signature for {}: {:?}",
+                    member.id, member.locator
+                )
+            })?;
+            if member.member_kind == MemberKind::Constructor {
+                // A constructor descriptor can prepend implicit enclosing
+                // instance parameters absent from its generic signature.
+                // The declaration reader owns the source-visible arity.
+                // Trailing captured-local parameters occur only on local
+                // and anonymous classes, which are not exported API members,
+                // so exported constructors have no trailing hidden parameters.
+                assert!(
+                    erased.len() >= signature.parameters.len(),
+                    "constructor descriptor arity for {:?}",
+                    member.locator
+                );
+                let implicit_prefix = erased.len() - signature.parameters.len();
+                erased.drain(..implicit_prefix);
+            }
+            assert_eq!(
+                signature.parameters.len(),
+                erased.len(),
+                "generic and erased callable arities agree for {:?}",
+                member.locator
+            );
+            for (parameter, erased) in signature.parameters.iter_mut().zip(erased) {
+                parameter.r#type = erased;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl JvmDependencyPackAdapter {
+    /// Produce complete declarations from one Java class JAR for offline
+    /// generators. This uses the same producer and limits as dependency packs.
+    pub fn read_jar_declarations(path: &Path) -> Result<ArtifactProduction, String> {
+        let limits = DependencyPackLimits::default();
+        let mut production = JavaJarPackProducer.produce_exact_artifact(
+            &local_jvm_artifact_production_request(
+                path,
+                ExternalArtifactKind::JavaClassJar,
+                "bifrost.external.java",
+            ),
+            &limits.producer,
+        );
+        if let Some(pack) = &mut production.pack {
+            replace_generic_callable_parameters(pack, &limits.producer, "JAR")?;
+        }
+        Ok(production)
+    }
+
+    /// Read one JDK's exported JMOD declarations for offline pack producers.
+    /// Uses the same bounded readers and diagnostics as runtime acquisition.
+    pub fn read_jdk_jmod_declarations(home: &Path) -> Result<ArtifactProduction, String> {
+        let release = read_jdk_release(home)?;
+        if release.version.components.first() != Some(&21) {
+            return Err(format!(
+                "CodeQL JDK 21 expansion requires JDK 21, got {}",
+                release.version.raw
+            ));
+        }
+        let jmods =
+            discover_jdk_jmods(home)?.ok_or_else(|| format!("no jmods in {}", home.display()))?;
+        let paths = jmods
+            .into_iter()
+            .map(|jmod| jmod.relative_path)
+            .collect::<Vec<_>>();
+        let limits = DependencyPackLimits::default();
+        let artifact =
+            brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_source_set(
+                home,
+                &paths,
+                limits.max_source_files_per_artifact,
+                limits.max_source_path_depth,
+                &limits.producer,
+            )
+            .map_err(|error| format!("read JDK JMODs: {error:?}"))?;
+        let dependency = resolved_jdk_dependency(release.version, None);
+        let mut request = jvm_dependency_production_request(&dependency);
+        request.path = home.to_owned();
+        request.artifact_kind = ExternalArtifactKind::JdkJmodSet;
+        let mut production = JdkJmodSetPackProducer.produce_loaded_artifact(
+            &request,
+            &limits.producer,
+            None,
+            &artifact,
+        );
+        if let Some(pack) = &mut production.pack {
+            replace_generic_callable_parameters(pack, &limits.producer, "JMOD")?;
+        }
+        Ok(production)
+    }
+
     /// Build the exact JDK dependency when no local source archive is available.
     pub fn jdk_dependency(version: JdkVersion) -> ResolvedDependency {
         resolved_jdk_dependency(version, None)
@@ -1627,6 +1770,7 @@ fn merge_java_dependency_packs(
             types,
             members,
             relations,
+            ..
         } = &shard.payload
         else {
             continue;
@@ -1662,6 +1806,7 @@ fn merge_java_dependency_packs(
                 types,
                 members,
                 relations,
+                ..
             } => (types, members, relations),
             payload => {
                 if !pack.shards.iter().any(|shard| shard.id == id) {
@@ -1698,6 +1843,8 @@ fn merge_java_dependency_packs(
                     id,
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+                        assembly_identity: None,
+                        type_forwards: Vec::new(),
                         types: Vec::new(),
                         members: Vec::new(),
                         relations: Vec::new(),
@@ -3048,6 +3195,12 @@ pub(crate) struct JvmExternalDeclarations<'a> {
         Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
     >,
     selected_jdk_artifact_sha256: Option<Box<str>>,
+    #[cfg(any(test, feature = "test-support"))]
+    active_models: Option<
+        Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::runtime::ResolvedActiveSemanticModels,
+        >,
+    >,
 }
 
 impl<'a> JvmExternalDeclarations<'a> {
@@ -3061,7 +3214,20 @@ impl<'a> JvmExternalDeclarations<'a> {
             artifacts,
             packs,
             selected_jdk_artifact_sha256: None,
+            #[cfg(any(test, feature = "test-support"))]
+            active_models: None,
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_active_models(
+        mut self,
+        active: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::runtime::ResolvedActiveSemanticModels>,
+        >,
+    ) -> Self {
+        self.active_models = active;
+        self
     }
 
     /// Scope JDK declaration facts to the exact artifact selected for this
@@ -3090,7 +3256,7 @@ impl<'a> JvmExternalDeclarations<'a> {
             java_external_reference_name(formal)?,
         );
         let source_type = self.get(source)?;
-        match &source_type.source {
+        let nominal = match &source_type.source {
             JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } => {
                 let overlay = self.packs.as_ref()?;
                 let source_symbol = overlay
@@ -3109,12 +3275,21 @@ impl<'a> JvmExternalDeclarations<'a> {
                     .records
                     .into_iter()
                     .find(|symbol| self.admits_pack_symbol(symbol))?;
-                let answer = overlay.java_reference_widening(
-                    &source_symbol,
-                    &target_symbol,
-                    MAX_MEMBER_SURFACE_OWNERS,
-                    None,
-                );
+                let answer = match &self.active_models {
+                    Some(active) => overlay.java_erased_reference_widening(
+                        active,
+                        &source_symbol,
+                        &target_symbol,
+                        MAX_MEMBER_SURFACE_OWNERS,
+                        None,
+                    ),
+                    None => overlay.java_reference_widening(
+                        &source_symbol,
+                        &target_symbol,
+                        MAX_MEMBER_SURFACE_OWNERS,
+                        None,
+                    ),
+                };
                 if answer.witness.is_some() {
                     Some(true)
                 } else if answer.incomplete.is_empty() {
@@ -3135,6 +3310,24 @@ impl<'a> JvmExternalDeclarations<'a> {
                     None
                 }
             }
+        };
+        // An incompatible erased owner cannot be repaired by generic arguments.
+        // A positive nominal path still needs substitution, except for a raw
+        // use of the very same generic declaration (unchecked invocation
+        // conversion, JLS 5.3), or a non-parameterized target.
+        if nominal != Some(true) {
+            return nominal;
+        }
+        let arguments = |ty: &TypeRef| match ty {
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                !arguments.is_empty()
+            }
+            _ => false,
+        };
+        if arguments(formal) && (source != target || arguments(actual)) {
+            None
+        } else {
+            Some(true)
         }
     }
 
@@ -3603,50 +3796,16 @@ impl JvmExternalMember {
     ///
     /// Arity alone is not Java applicability: a unique `m(String)` does not
     /// accept `m(1)`. Unknown conversions keep the external call unproved.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn applicable_parameter_count_for_argument_types(
         &self,
         instance_receiver: bool,
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<u32> {
-        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)
+        self.invocation_for_argument_types(instance_receiver, actuals, surface)
+            .ok()
             .map(|shape| shape.parameter_count)
-    }
-
-    /// A declared member can remain a possible call when discovery or
-    /// conversions are unknown. A complete family that rejects every
-    /// invocation phase does not supply a call candidate.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn may_apply_to_argument_types(
-        &self,
-        instance_receiver: bool,
-        actuals: &[TypeRef],
-        surface: Option<&JvmExternalDeclarations<'_>>,
-    ) -> bool {
-        if self.call_shapes_incomplete {
-            return true;
-        }
-        self.call_shapes.iter().any(|shape| {
-            if shape.is_static == instance_receiver {
-                return false;
-            }
-            let signature = JavaExternalSignature {
-                parameters: &shape.parameters,
-                variadic: shape.variadic,
-                has_type_parameters: shape.has_type_parameters,
-            };
-            [
-                JavaExternalInvocationPhase::Strict,
-                JavaExternalInvocationPhase::Loose,
-                JavaExternalInvocationPhase::Variable,
-            ]
-            .into_iter()
-            .any(|phase| {
-                signature.applicability(actuals, phase, surface)
-                    != JavaExternalApplicability::Inapplicable
-            })
-        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3841,12 +4000,34 @@ impl JvmExternalMember {
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<&JvmExternalCallShape> {
+        self.invocation_for_argument_types(instance_receiver, actuals, surface)
+            .ok()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn invocation_parameter_count(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> Result<u32, JavaExternalInvocationFailure> {
+        self.invocation_for_argument_types(instance_receiver, actuals, surface)
+            .map(|shape| shape.parameter_count)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn invocation_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> Result<&JvmExternalCallShape, JavaExternalInvocationFailure> {
         if let Some(selected) = self.exact_shape_for_argument_types(instance_receiver, actuals) {
-            return Some(selected);
+            return Ok(selected);
         }
         let wants_static = !instance_receiver;
         if self.call_shapes_incomplete {
-            return None;
+            return Err(JavaExternalInvocationFailure::Unproven);
         }
         let mut candidates = Vec::new();
         for shape in &self.call_shapes {
@@ -3872,7 +4053,7 @@ impl JvmExternalMember {
                 .collect::<Vec<_>>(),
             surface,
         )?;
-        candidates.get(selected.0).copied()
+        Ok(candidates[selected.0])
     }
 }
 
@@ -3890,7 +4071,7 @@ pub(crate) use brokk_bifrost_jvm::java::conversion::JavaConversion as JavaExtern
 /// Select the unique most-specific signature under Java's fixed-arity
 /// invocation phases. `None` preserves uncertainty when one of the structured
 /// parameter types cannot decide applicability or specificity.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn select_java_external_signature(actuals: &[TypeRef], candidates: &[&[TypeRef]]) -> Option<usize> {
     select_java_external_invocation(
         actuals,
@@ -3904,6 +4085,7 @@ fn select_java_external_signature(actuals: &[TypeRef], candidates: &[&[TypeRef]]
             .collect::<Vec<_>>(),
         None,
     )
+    .ok()
     .map(|(selected, _)| selected)
 }
 
@@ -3982,12 +4164,21 @@ impl JavaExternalSignature<'_> {
     }
 }
 
+/// Why a complete Java invocation family did not yield one proven selection.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JavaExternalInvocationFailure {
+    NoApplicable,
+    Ambiguous,
+    Unproven,
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn select_java_external_invocation(
     actuals: &[TypeRef],
     candidates: &[JavaExternalSignature<'_>],
     surface: Option<&JvmExternalDeclarations<'_>>,
-) -> Option<(usize, JavaExternalInvocationPhase)> {
+) -> Result<(usize, JavaExternalInvocationPhase), JavaExternalInvocationFailure> {
     use crate::analyzer::jvm::external::JavaExternalInvocationPhase::Loose;
 
     use crate::analyzer::jvm::external::JavaExternalInvocationPhase::Strict;
@@ -4006,7 +4197,7 @@ fn select_java_external_invocation(
         // Unknown applicability in an earlier phase can change whether the
         // later phase is reached; it must not be silently discarded.
         if uncertain {
-            return None;
+            return Err(JavaExternalInvocationFailure::Unproven);
         }
         if applicable.is_empty() {
             continue;
@@ -4043,13 +4234,19 @@ fn select_java_external_invocation(
         };
         let mut maximal = Vec::new();
         for &index in &applicable {
-            let formals = expanded_formals(index)?;
+            let formals = expanded_formals(index).ok_or(JavaExternalInvocationFailure::Unproven)?;
             let mut dominated = false;
             for &other in &applicable {
                 if index == other {
                     continue;
                 }
-                if java_external_more_specific(&expanded_formals(other)?, &formals, surface)? {
+                if java_external_more_specific(
+                    &expanded_formals(other).ok_or(JavaExternalInvocationFailure::Unproven)?,
+                    &formals,
+                    surface,
+                )
+                .ok_or(JavaExternalInvocationFailure::Unproven)?
+                {
                     dominated = true;
                     break;
                 }
@@ -4059,15 +4256,15 @@ fn select_java_external_invocation(
             }
         }
         return match maximal.as_slice() {
-            [selected] => Some((*selected, phase)),
-            _ => None,
+            [selected] => Ok((*selected, phase)),
+            _ => Err(JavaExternalInvocationFailure::Ambiguous),
         };
     }
-    None
+    Err(JavaExternalInvocationFailure::NoApplicable)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn select_java_external_signature_for_types(
+#[cfg(test)]
+fn select_java_external_signature_for_types(
     actuals: &[TypeRef],
     candidates: &[Vec<TypeRef>],
 ) -> Option<usize> {
@@ -4268,10 +4465,8 @@ fn java_external_primitive(
 #[cfg(any(test, feature = "test-support"))]
 fn java_external_reference_name(type_ref: &TypeRef) -> Option<&str> {
     match type_ref {
-        TypeRef::Named {
-            name, arguments, ..
-        } if arguments.is_empty() => Some(name),
-        TypeRef::Declared { id, arguments, .. } if arguments.is_empty() => Some(id),
+        TypeRef::Named { name, .. } => Some(name),
+        TypeRef::Declared { id, .. } => Some(id),
         _ => None,
     }
 }
@@ -4801,9 +4996,11 @@ fn classify_kotlin_metadata(
     path: &Path,
     cancellation: Option<&CancellationToken>,
 ) -> KotlinArchiveClassification {
-    const MAX_CLASSIFICATION_CLASSES: usize = 1_024;
-    const MAX_CLASSIFICATION_BYTES: u64 = 32 * 1024 * 1024;
-
+    // Classification gates which producer reads the jar, so it must reach the
+    // end of any archive that producer can read: the same entry, per-class and
+    // total-byte bounds. A tighter bound here refused every pure-Java jar of
+    // more than 1,024 classes as possibly Kotlin (#7473: javax:javaee-api:6.0
+    // has 1,830), so its declarations were never produced.
     let mut archive = match classification_archive(path, cancellation) {
         Ok(archive) => archive,
         Err(classification) => return classification,
@@ -4811,7 +5008,6 @@ fn classify_kotlin_metadata(
     if archive.len() > MAX_ARCHIVE_ENTRIES {
         return KotlinArchiveClassification::Incomplete;
     }
-    let mut classes_read = 0usize;
     let mut bytes_read = 0u64;
     let mut incomplete = false;
     for index in 0..archive.len() {
@@ -4832,16 +5028,13 @@ fn classify_kotlin_metadata(
         if !name.ends_with(".class") || name.ends_with("module-info.class") {
             continue;
         }
-        if classes_read == MAX_CLASSIFICATION_CLASSES
-            || bytes_read.saturating_add(entry.size()) > MAX_CLASSIFICATION_BYTES
-        {
+        if bytes_read.saturating_add(entry.size()) > MAX_TOTAL_ARCHIVE_BYTES {
             return KotlinArchiveClassification::Incomplete;
         }
         if entry.size() > MAX_CLASS_ENTRY_BYTES {
             incomplete = true;
             continue;
         }
-        classes_read += 1;
         bytes_read = bytes_read.saturating_add(entry.size());
         let mut bytes = Vec::with_capacity(entry.size() as usize);
         if entry
@@ -5550,7 +5743,8 @@ pub(crate) fn select_java_external_model_invocation(
     {
         return None;
     }
-    let (selected, phase) = select_java_external_invocation(actuals, &shapes, Some(surface))?;
+    let (selected, phase) =
+        select_java_external_invocation(actuals, &shapes, Some(surface)).ok()?;
     let formals = &parameters[selected];
     let layout = if phase == JavaExternalInvocationPhase::Variable {
         let (TypeRef::Array { element }, prefix) = formals.split_last()? else {
@@ -7612,6 +7806,8 @@ mod tests {
                     id: "declarations.first".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+                        assembly_identity: None,
+                        type_forwards: Vec::new(),
                         types: Vec::new(),
                         members: Vec::new(),
                         relations: Vec::new(),
@@ -8485,6 +8681,48 @@ mod tests {
                 entry.key == "kotlin.classification" && entry.value == "incomplete"
             }));
         }
+    }
+
+    #[test]
+    #[hardwon("#7473: a Java jar of more than 1,024 classes was refused as possibly Kotlin")]
+    fn large_java_class_jar_classifies_as_java() {
+        // javax:javaee-api:6.0 has 1,830 classes and no sources jar.
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("large-api-1.0.jar");
+        let names = (0..1_830)
+            .map(|index| format!("com/example/api/Type{index}"))
+            .collect::<Vec<_>>();
+        let classes = names
+            .iter()
+            .map(|internal_name| TestClassFile {
+                internal_name,
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            })
+            .collect::<Vec<_>>();
+        write_test_class_jar(&jar, &classes);
+
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: jar,
+            source_artifact_path: None,
+            coordinate: Some(JvmMavenCoordinate::new("example", "large-api", "1.0")),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+
+        assert_eq!(dependency.evidence.language, "java", "{dependency:#?}");
+        assert_eq!(
+            dependency.artifacts[0].kind,
+            ExternalArtifactKind::JavaClassJar,
+            "{dependency:#?}"
+        );
+        assert!(
+            !dependency
+                .provenance
+                .iter()
+                .any(|entry| entry.key == "kotlin.classification"),
+            "{dependency:#?}"
+        );
     }
 
     #[test]

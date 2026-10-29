@@ -1075,4 +1075,89 @@ pub(crate) mod jvm_extraction_tests {
             "a no-base owner finishes without any HierarchyOrder charge"
         );
     }
+    /// A foreign on-disk anchor fails one lookup rather than panicking the server.
+    #[test]
+    fn persisted_module_anchor_without_language_policy_is_corrupt() {
+        use brokk_bifrost_analysis::analyzer::resolution::SelectedSemanticLocator;
+        use brokk_bifrost_analysis::analyzer::store::StoreErrorKind;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::LocatedSemantic;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::project_native_definition_units;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+        let source = "class A {}";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("A.java", source)
+            .build();
+        let root = fixture.root();
+        let database = root.join("store.db");
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        let project = MutableGenerationProject::new(root, Language::Java);
+        let workspace =
+            WorkspaceId("3939393939393939393939393939393939393939393939393939393939393939".into());
+        let path = "A.java";
+        let (snapshot, facts) = publish_shared_jvm_consumer(
+            &store,
+            root,
+            &workspace,
+            path,
+            source,
+            "java",
+            Language::Java,
+            &JavaAdapter,
+            &[],
+        );
+        // Simulate a foreign producer writing a valid anchor shape for a frontend
+        // whose declarations must have absolute identities.
+        let changed = rusqlite::Connection::open(&database).unwrap().execute(
+            "UPDATE code_units SET fq_anchor_kind='own_module',fq_anchor_pop=0 WHERE short_name='A'", [],
+        ).unwrap();
+        assert_eq!(changed, 1, "the persisted class row was changed");
+        let mut snapshots = WorkspaceSnapshots::default();
+        snapshots.insert("java".into(), snapshot);
+        let languages = [SelectedResolutionLanguage::new("java", Language::Java)];
+        let cancellation = CancellationToken::new();
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+            .open_selected_resolution_operation(
+                SelectedResolutionOperationInput::new(
+                    &project,
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                ),
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("selected fixture opens")
+        };
+        // Java publishes both a type and its constructor at the class name.
+        // Select the type's own producer site rather than the shared name range.
+        let site = site_for_identifier(
+            &facts,
+            "A",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+        );
+        let locator =
+            SelectedSemanticLocator::new("java", path, site, LoweredSemanticRole::Definition);
+        let LocatedSemantic::Found(definition) = operation
+            .ready
+            .lookup_locator(&operation.ready.lexical_source(), &locator, &cancellation)
+            .unwrap()
+        else {
+            panic!("class type declaration was selected")
+        };
+        let error = match project_native_definition_units(
+            &operation.ready,
+            &[definition],
+            &cancellation,
+            &ResolutionSession::unbounded(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("Java cannot project a persisted module anchor"),
+        };
+        assert_eq!(error.kind, StoreErrorKind::Corrupt);
+        assert!(error.to_string().contains("unsupported package anchor"));
+    }
 }

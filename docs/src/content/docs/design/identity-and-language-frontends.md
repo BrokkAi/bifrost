@@ -165,6 +165,17 @@ references made through either copy. Each source declaration keeps its own
 identity: declaration navigation still answers with the copy the reference
 can reach.
 
+A qualified member such as `Owner<int>::Alias` belongs to the class its
+qualifier selects, not to the primary template the bare spelling `Owner`
+names. The qualifier's template arguments select the specialization the same
+way an unqualified `Owner<int>` does, including a partial specialization. An
+alias qualifier denotes the class its alias declaration names. When the alias
+is defined in several conditional arms, only the arms the reference's guards
+admit count, and they must agree. Arguments that cannot be bound, an ambiguous
+specialization, or alias arms that disagree leave the member undecided:
+definition lookup reports it as ambiguous, and inverse usages report the
+reference as unproven, never as a proven use of the primary template's member.
+
 Ordinary structured receiver types use lookup at the declaration site and
 preserve a selected alias. An ambiguous or missing lexical result cannot fall
 back to a pool of unrelated types with the same terminal name. Navigation of

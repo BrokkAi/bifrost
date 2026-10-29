@@ -1,6 +1,7 @@
 //! Exact assignment relations over prepared syntax and procedure-local flow.
 
 use super::*;
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 
 use crate::analyzer::semantic::{
     BindingOriginIndex, LengthDelimitedDigest, SemanticCapability, SemanticGapKind,
@@ -208,21 +209,44 @@ fn ordinary_assignment_relation_expansions(
         plain_assignment_candidates(workspace, &procedure.handle, cancellation)
     };
     if !candidates.complete {
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: procedure.diagnostic_source(),
-            code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: language.config_label(),
-            message: format!(
-                "{} has incomplete assignment syntax qualification ({})",
-                procedure.wire_id(),
-                candidates.reason.unwrap_or("unknown")
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: Some(rel_path_string(procedure.file())),
-        });
+        if DerivationExecutionCause::from_reason(
+            candidates.reason.unwrap_or(derivation_reason::UNKNOWN),
+        )
+        .is_some()
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=candidate_derivation detail={:?}",
+                    file!(),
+                    line!(),
+                    candidates.reason
+                )
+            });
+            workspace.analyzer().mark_execution_dependent();
+        }
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            workspace.analyzer(),
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: procedure.diagnostic_source(),
+                code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: language.config_label(),
+                message: format!(
+                    "{} has incomplete assignment syntax qualification ({})",
+                    procedure.wire_id(),
+                    candidates.reason.unwrap_or(derivation_reason::UNKNOWN)
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: Some(rel_path_string(procedure.file())),
+            },
+            CodeQueryDiagnosticCode::from_execution_reason(
+                CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                candidates.reason.unwrap_or(derivation_reason::UNKNOWN),
+            )
+            .1,
+        ));
     }
     if candidates.rows.is_empty() {
         return Vec::new();
@@ -411,6 +435,7 @@ fn ordinary_assignment_relation_expansions(
             }
         };
         flow_state_cache.report_completeness(
+            workspace.analyzer(),
             &procedure.wire_id(),
             Some(procedure),
             language,
@@ -513,21 +538,44 @@ fn overwritten_unread_expansions(
         }
     }
     if !candidates.complete {
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: procedure.diagnostic_source(),
-            code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: dialect.language().config_label(),
-            message: format!(
-                "{} has incomplete overwritten-local syntax qualification ({})",
-                procedure.wire_id(),
-                candidates.reason.unwrap_or("unknown")
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: Some(rel_path_string(procedure.file())),
-        });
+        if DerivationExecutionCause::from_reason(
+            candidates.reason.unwrap_or(derivation_reason::UNKNOWN),
+        )
+        .is_some()
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=candidate_derivation detail={:?}",
+                    file!(),
+                    line!(),
+                    candidates.reason
+                )
+            });
+            workspace.analyzer().mark_execution_dependent();
+        }
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            workspace.analyzer(),
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: procedure.diagnostic_source(),
+                code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: dialect.language().config_label(),
+                message: format!(
+                    "{} has incomplete overwritten-local syntax qualification ({})",
+                    procedure.wire_id(),
+                    candidates.reason.unwrap_or(derivation_reason::UNKNOWN)
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: Some(rel_path_string(procedure.file())),
+            },
+            CodeQueryDiagnosticCode::from_execution_reason(
+                CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                candidates.reason.unwrap_or(derivation_reason::UNKNOWN),
+            )
+            .1,
+        ));
     }
     if candidates.rows.is_empty() {
         return Vec::new();
@@ -540,8 +588,8 @@ fn overwritten_unread_expansions(
                 overwritten_row(
                     procedure,
                     candidate,
-                    "unknown",
-                    "unknown",
+                    derivation_reason::UNKNOWN,
+                    derivation_reason::UNKNOWN,
                     EffectCoverage::Open,
                     Some("semantic_artifact_unavailable"),
                     Vec::new(),
@@ -570,8 +618,8 @@ fn overwritten_unread_expansions(
                 overwritten_row(
                     procedure,
                     candidate,
-                    "unknown",
-                    "unknown",
+                    derivation_reason::UNKNOWN,
+                    derivation_reason::UNKNOWN,
                     EffectCoverage::Open,
                     Some("flow_state_unavailable"),
                     Vec::new(),
@@ -582,6 +630,7 @@ fn overwritten_unread_expansions(
         return expansions;
     };
     flow_state_cache.report_completeness(
+        workspace.analyzer(),
         &procedure.wire_id(),
         Some(procedure),
         dialect.language(),
@@ -611,8 +660,8 @@ fn overwritten_unread_expansions(
                 expansions.push(overwritten_row(
                     procedure,
                     candidate,
-                    "unknown",
-                    "unknown",
+                    derivation_reason::UNKNOWN,
+                    derivation_reason::UNKNOWN,
                     EffectCoverage::Open,
                     None,
                     Vec::new(),
@@ -625,8 +674,8 @@ fn overwritten_unread_expansions(
             expansions.push(overwritten_row(
                 procedure,
                 candidate,
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 Some("semantic_join_missing"),
                 Vec::new(),
@@ -684,21 +733,40 @@ fn overwritten_unread_expansions(
                 OverwrittenUnreadAnswer::Open { reasons } => {
                     incomplete = Some("overwrite_proof_open");
                     incomplete_reasons.extend(reasons.iter().cloned());
-                    diagnostics.push(CodeQueryDiagnostic {
-                        related: procedure.related_flow_reasons(&reasons),
-                        source: procedure.diagnostic_source(),
-                        code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
-                        impact: CodeQueryDiagnosticImpact::Incomplete,
-                        branch: Vec::new(),
-                        language: dialect.language().config_label(),
-                        message: format!(
-                            "{} has open overwritten-unread proof at {:?}: {reasons:?}",
-                            procedure.wire_id(),
-                            candidate.range,
-                        ),
-                        exhausted_roots: Vec::new(),
-                        withheld_rows_path: Some(rel_path_string(procedure.file())),
+                    let cause = reasons.iter().find_map(|reason| match reason {
+                        brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::Cancelled => Some(DerivationExecutionCause::Cancelled),
+                        brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::BudgetExhausted { .. } => Some(DerivationExecutionCause::Budget),
+                        _ => None,
                     });
+                    if request.refusal_count() > 0 {
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=budget:cfg",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        workspace.analyzer().mark_execution_dependent();
+                    }
+                    diagnostics.push(super::QueryExecutionState::diagnostic(
+                        workspace.analyzer(),
+                        CodeQueryDiagnostic {
+                            related: procedure.related_flow_reasons(&reasons),
+                            source: procedure.diagnostic_source(),
+                            code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                            impact: CodeQueryDiagnosticImpact::Incomplete,
+                            branch: Vec::new(),
+                            language: dialect.language().config_label(),
+                            message: format!(
+                                "{} has open overwritten-unread proof at {:?}: {reasons:?}",
+                                procedure.wire_id(),
+                                candidate.range,
+                            ),
+                            exhausted_roots: Vec::new(),
+                            withheld_rows_path: Some(rel_path_string(procedure.file())),
+                        },
+                        cause,
+                    ));
                 }
             }
         }
@@ -706,8 +774,8 @@ fn overwritten_unread_expansions(
             overwritten_row(
                 procedure,
                 candidate,
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 Some(reason),
                 Vec::new(),
@@ -766,7 +834,7 @@ fn overwritten_row(
     let storage_kind = if candidate.verdict == PlainAssignmentVerdict::Supported {
         "ordinary_local"
     } else {
-        "unknown"
+        derivation_reason::UNKNOWN
     };
     let mut expansion = row(
         procedure,
@@ -817,8 +885,8 @@ fn unavailable_expansions(
                     procedure,
                     candidate,
                     None,
-                    "unknown",
-                    "unknown",
+                    derivation_reason::UNKNOWN,
+                    derivation_reason::UNKNOWN,
                     EffectCoverage::Open,
                     Some(reason),
                 )
@@ -833,8 +901,8 @@ fn unavailable_expansions(
             &candidates[first],
             &candidates[second],
             None,
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some(reason),
         ));
@@ -851,7 +919,7 @@ fn report_open_candidates(
         .iter()
         .filter_map(|expansion| match &expansion.value {
             PipelineValue::AssignmentRelation(value) if value.coverage == EffectCoverage::Open => {
-                Some(value.reason.unwrap_or("unknown"))
+                Some(value.reason.unwrap_or(derivation_reason::UNKNOWN))
             }
             _ => None,
         })
@@ -934,8 +1002,8 @@ fn qualify_c_candidate(
                 procedure,
                 candidate,
                 None,
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 None,
             );
@@ -947,8 +1015,8 @@ fn qualify_c_candidate(
             procedure,
             candidate,
             None,
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some("flow_state_incomplete"),
         );
@@ -962,8 +1030,8 @@ fn qualify_c_candidate(
             procedure,
             candidate,
             None,
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some("semantic_join_missing"),
         );
@@ -973,8 +1041,8 @@ fn qualify_c_candidate(
             procedure,
             candidate,
             None,
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some("assignment_establishment_ambiguous"),
         );
@@ -1003,8 +1071,8 @@ fn qualify_c_candidate(
             procedure,
             candidate,
             None,
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some("rhs_read_join_ambiguous"),
         );
@@ -1018,8 +1086,8 @@ fn qualify_c_candidate(
             procedure,
             candidate,
             Some(read.value),
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some("rhs_read_join_ambiguous"),
         );
@@ -1091,8 +1159,8 @@ fn qualify_c_candidate(
                 procedure,
                 candidate,
                 Some(read.value),
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 Some("initialization_unproved"),
             ),
@@ -1104,8 +1172,8 @@ fn qualify_c_candidate(
         procedure,
         candidate,
         Some(read.value),
-        "unknown",
-        "unknown",
+        derivation_reason::UNKNOWN,
+        derivation_reason::UNKNOWN,
         EffectCoverage::Open,
         Some("prior_definition_not_exact"),
     )
@@ -1140,8 +1208,8 @@ fn qualify_candidate(
                 procedure,
                 candidate,
                 None,
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 None,
             );
@@ -1175,8 +1243,8 @@ fn qualify_candidate(
             procedure,
             candidate,
             None,
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some("flow_state_incomplete"),
         );
@@ -1186,8 +1254,8 @@ fn qualify_candidate(
             procedure,
             candidate,
             None,
-            "unknown",
-            "unknown",
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
             EffectCoverage::Open,
             Some("semantic_join_missing"),
         );
@@ -1201,8 +1269,8 @@ fn qualify_candidate(
                 procedure,
                 candidate,
                 None,
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 Some("assignment_establishment_ambiguous"),
             );
@@ -1215,8 +1283,8 @@ fn qualify_candidate(
                         procedure,
                         candidate,
                         None,
-                        "unknown",
-                        "unknown",
+                        derivation_reason::UNKNOWN,
+                        derivation_reason::UNKNOWN,
                         EffectCoverage::Open,
                         Some("same_evaluation_open"),
                     ),
@@ -1230,8 +1298,8 @@ fn qualify_candidate(
                 procedure,
                 candidate,
                 None,
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 Some("rhs_read_join_ambiguous"),
             );
@@ -1245,8 +1313,8 @@ fn qualify_candidate(
                 procedure,
                 candidate,
                 Some(read.value),
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 Some("rhs_read_join_ambiguous"),
             );
@@ -1282,8 +1350,8 @@ fn qualify_candidate(
                 procedure,
                 candidate,
                 Some(read),
-                "unknown",
-                "unknown",
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
                 EffectCoverage::Open,
                 Some(reason),
             ),
@@ -1335,8 +1403,8 @@ fn qualify_failed_swap(
                     first,
                     second,
                     rhs_read,
-                    "unknown",
-                    "unknown",
+                    derivation_reason::UNKNOWN,
+                    derivation_reason::UNKNOWN,
                     EffectCoverage::Open,
                     Some(reason),
                 ),

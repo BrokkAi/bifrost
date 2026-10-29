@@ -419,18 +419,24 @@ fn resolve_endpoint<'a>(
                 },
             ) => policy_id == &policy.definition().metadata.id && actual == entry_id,
             (
-                EndpointRef::Catalog { catalog, entry_id },
+                EndpointRef::Catalog {
+                    catalog:
+                        crate::definition::CatalogRef::Named {
+                            name,
+                            version,
+                            sha256,
+                        },
+                    entry_id,
+                },
                 ResolvedEndpointIdentity::Catalog {
                     catalog: actual_catalog,
                     entry_id: actual_entry,
                 },
             ) => {
                 actual_entry == entry_id
-                    && actual_catalog.name == catalog.name
-                    && actual_catalog.version == catalog.version
-                    && catalog
-                        .sha256
-                        .is_none_or(|hash| hash == actual_catalog.semantic_hash)
+                    && &actual_catalog.name == name
+                    && &actual_catalog.version == version
+                    && sha256.is_none_or(|hash| hash == actual_catalog.semantic_hash)
             }
             (
                 EndpointRef::MatchEndpoint { endpoint_id },

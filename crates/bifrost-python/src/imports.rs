@@ -1721,7 +1721,33 @@ fn python_current_package(
     project: &dyn brokk_bifrost_core::analyzer::project::Project,
     source_file: &ProjectFile,
 ) -> String {
-    let module = python_module_name(project, source_file);
+    let module = match project.selected_module_name(source_file) {
+        Ok(Some(name))
+            if crate::declarations::python_module_components_from_name(source_file, &name)
+                .is_some() =>
+        {
+            name
+        }
+        Ok(Some(name)) => {
+            tracing::warn!(
+                file = %source_file.abs_path().display(),
+                published_name = %name,
+                mounted_path = ?source_file.rel_path(),
+                "published Python module is not a suffix of its mounted path; deriving module identity from package probes"
+            );
+            python_module_name(project, source_file)
+        }
+        Ok(None) => python_module_name(project, source_file),
+        Err(error) => {
+            tracing::warn!(
+                file = %source_file.abs_path().display(),
+                mounted_path = ?source_file.rel_path(),
+                %error,
+                "cannot read published Python module; deriving module identity from package probes"
+            );
+            python_module_name(project, source_file)
+        }
+    };
     if source_file
         .rel_path()
         .file_name()

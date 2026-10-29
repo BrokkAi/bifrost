@@ -113,9 +113,7 @@ pub fn dynamic_dispatch_target_argument<'tree>(
     if !is_dynamic_dispatch_method(method, source) {
         return None;
     }
-    let arguments = node.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let first_argument = arguments.named_children(&mut cursor).next()?;
+    let first_argument = crate::syntax::ruby_first_call_argument(node)?;
     symbol_or_string_value(first_argument, source).map(|member| (member, first_argument))
 }
 
@@ -135,12 +133,62 @@ pub fn constant_hit_node(node: Node<'_>) -> Node<'_> {
 }
 
 pub fn symbol_or_string_value(node: Node<'_>, source: &str) -> Option<String> {
-    let text = node_text(node, source);
-    let stripped = text
-        .strip_prefix(':')
-        .unwrap_or(text)
-        .trim_matches(['"', '\'']);
-    (!stripped.is_empty()).then(|| stripped.to_string())
+    match node.kind() {
+        "simple_symbol" => node_text(node, source).strip_prefix(':').map(str::to_owned),
+        "string" | "delimited_symbol" => crate::structural::ruby_string_literal_value(node, source),
+        _ => None,
+    }
 }
 
 pub use brokk_bifrost_core::analyzer::common::node_source_text_trimmed as node_text;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Ripper distinguishes const_path_field from const_path_ref, def/defs
+    // names from vcalls, and var_field from var_ref. This table pins the
+    // corresponding released tree-sitter fields at those boundaries.
+    #[test]
+    fn declaration_and_reference_grammar() {
+        let source = "module Owner; end\nOwner::VALUE = 1\nOwner::VALUE\nOther = Owner::VALUE\ndef run; end\ndef self.run; end\n@value = 0\n@@count = 0\n@value\n@@count\nrun\n";
+        let tree = crate::declarations::parse_ruby_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut constants = Vec::new();
+        let mut methods = Vec::new();
+        let mut variables = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "constant" => {
+                    constants.push((node_text(node, source), is_declaration_constant(node)))
+                }
+                "identifier" if node_text(node, source) == "run" => {
+                    methods.push(is_declaration_identifier(node))
+                }
+                "instance_variable" | "class_variable" => {
+                    variables.push(is_plain_assignment_left_variable(node))
+                }
+                _ => {}
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).unwrap());
+            }
+        }
+        assert_eq!(
+            constants,
+            [
+                ("Owner", true),
+                ("Owner", false),
+                ("VALUE", true),
+                ("Owner", false),
+                ("VALUE", false),
+                ("Other", true),
+                ("Owner", false),
+                ("VALUE", false)
+            ]
+        );
+        assert_eq!(methods, [true, true, false]);
+        assert_eq!(variables, [true, true, false, false]);
+    }
+}

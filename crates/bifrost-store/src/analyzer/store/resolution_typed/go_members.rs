@@ -611,11 +611,11 @@ pub(super) fn source_participation(
 
 // Keep ignored files in the inventory: their selected role proves exclusion,
 // while a saved source-inventory sibling still needs its own placement proof.
-const PACKAGE_MEMBER_SOURCES: &str = r#"
+pub(crate) const PACKAGE_MEMBER_SOURCES: &str = r#"
 WITH probe AS (
  SELECT ?1 AS revision
 ), caller AS (
- SELECT package.package_id, versions.workspace_id,
+ SELECT package.package_id, package.for_test, versions.workspace_id,
         versions.generation
  FROM probe
  JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=?2
@@ -626,6 +626,23 @@ WITH probe AS (
   AND (versions.valid_until IS NULL OR probe.revision<versions.valid_until)
  JOIN main.go_package_files source ON source.rel_path=versions.rel_path
  JOIN main.go_package_instances package ON package.package_id=source.package_id AND package.context_id=?3
+ -- Same-package callers retain their selected variant. An external test's
+ -- import binds the package under test with its internal test files included.
+ AND (package.package_id=?4 OR (NOT EXISTS (
+   SELECT 1 FROM main.go_package_files active
+   WHERE active.package_id=?4 AND active.rel_path=versions.rel_path
+ ) AND (
+   (?5='xtest' AND EXISTS (
+     SELECT 1 FROM main.go_package_imports imported
+     WHERE imported.importer_package_id=?4 AND imported.import_role='xtest'
+       AND imported.target_package_id=package.package_id
+   )) OR (package.for_test='' AND NOT EXISTS (
+     SELECT 1 FROM main.go_package_imports imported
+     JOIN main.go_package_files selected ON selected.package_id=imported.target_package_id
+       AND selected.rel_path=versions.rel_path
+     WHERE ?5='xtest' AND imported.importer_package_id=?4 AND imported.import_role='xtest'
+   ))
+ )))
  JOIN main.go_context_publications publication ON publication.context_id=package.context_id
   AND publication.workspace_id=versions.workspace_id AND publication.generation=versions.generation
   AND publication.lang=versions.lang AND publication.valid_from<=probe.revision
@@ -634,6 +651,12 @@ WITH probe AS (
 SELECT coalesce(mount.mount_ordinal,placed.mount_ordinal)
 FROM caller
 JOIN main.go_package_files member ON member.package_id=caller.package_id
+ -- For a same-package go-role caller, choosing the production variant is a
+ -- single-build-configuration policy, not a Go rule: go test includes test files.
+ AND (member.source_role NOT IN ('test','xtest')
+      OR (member.source_role='test' AND ?5 IN ('test','xtest')
+          AND (caller.package_id=?4 OR caller.for_test<>''))
+      OR (member.source_role='xtest' AND caller.package_id=?4 AND ?5='xtest'))
 LEFT JOIN main.workspace_file_versions version ON version.rel_path=member.rel_path
  AND version.workspace_id=caller.workspace_id AND version.generation=caller.generation
  AND version.lang='go' AND version.input_kind='source' AND version.valid_from<=?1
@@ -671,6 +694,7 @@ pub(super) fn package_member_sources(
                 context.revision,
                 ordinal,
                 context.context_id,
+                binder.active_package(),
                 &mount.persisted_relative_path,
                 cancellation,
             )
@@ -736,11 +760,18 @@ pub(in crate::analyzer::store) fn package_member_sources_in_context(
     revision: i64,
     ordinal: SelectedResolutionMountOrdinal,
     context_id: i64,
+    active_package: Option<(i64, Option<&str>)>,
     caller_path: &str,
     cancellation: &CancellationToken,
 ) -> StoreResult<Option<Vec<Option<SemanticId>>>> {
     let mut statement = connection.prepare_cached(PACKAGE_MEMBER_SOURCES)?;
-    let mut rows = statement.query(rusqlite::params![revision, ordinal.get(), context_id])?;
+    let mut rows = statement.query(rusqlite::params![
+        revision,
+        ordinal.get(),
+        context_id,
+        active_package.map(|(package, _)| package),
+        active_package.and_then(|(_, role)| role)
+    ])?;
     let mut members = Vec::new();
     while let Some(row) = rows.next()? {
         if cancellation.is_cancelled() {

@@ -410,6 +410,7 @@ pub struct WorkspaceTopology {
     ownership: Vec<FileOwnership>,
     support: TopologySupport,
     completeness: TopologyCompleteness,
+    provider_failed: bool,
 }
 
 impl WorkspaceTopology {
@@ -426,7 +427,17 @@ impl WorkspaceTopology {
             ownership,
             support,
             completeness,
+            provider_failed: false,
         }
+    }
+
+    pub fn mark_provider_failed(&mut self) {
+        self.provider_failed = true;
+        self.completeness = TopologyCompleteness::Incomplete;
+    }
+
+    pub fn provider_failed(&self) -> bool {
+        self.provider_failed
     }
 
     /// The answer for a workspace this provider has no build evidence for: no
@@ -440,6 +451,7 @@ impl WorkspaceTopology {
             ownership: Vec::new(),
             support,
             completeness: TopologyCompleteness::Incomplete,
+            provider_failed: false,
         }
     }
 
@@ -538,9 +550,11 @@ pub fn workspace_topology(project: &dyn Project) -> WorkspaceTopology {
     let mut ownership = Vec::new();
     let mut support = TopologySupport::NONE;
     let mut completeness = TopologyCompleteness::Complete;
+    let mut provider_failed = false;
     for provider in crate::analyzer::languages::build_model_providers() {
         let topology = provider.topology(project);
         completeness = completeness.meet(topology.completeness);
+        provider_failed |= topology.provider_failed;
         for (axis, axis_support) in provider.support().iter() {
             if axis_support.is_supported() {
                 support = support.supported(axis);
@@ -556,6 +570,7 @@ pub fn workspace_topology(project: &dyn Project) -> WorkspaceTopology {
         ownership,
         support,
         completeness,
+        provider_failed,
     }
 }
 
@@ -577,6 +592,56 @@ mod tests {
         let (declared, completeness) = topology.declares_dependency("domain", "persistence");
         assert!(!declared);
         assert_eq!(completeness, TopologyCompleteness::Incomplete);
+    }
+
+    #[test]
+    fn topology_coordinates_and_queries_are_exact() {
+        let base = TopologyEntity {
+            kind: TopologyEntityKind::Target,
+            name: "app".to_owned(),
+            owner: Some("root".to_owned()),
+            root: Some(PathBuf::from("src")),
+            provenance: vec![],
+            completeness: TopologyCompleteness::Complete,
+        };
+        let mut other_owner = base.clone();
+        other_owner.owner = Some("other".to_owned());
+        assert_ne!(base.id(), other_owner.id());
+        let edge = |from: &str, to: &str| TopologyEdge {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            kind: DependencyScope::Compile,
+            provenance: vec![],
+            completeness: TopologyCompleteness::Complete,
+        };
+        let a = edge("a", "b");
+        let c = edge("a", "c");
+        let mut other_scope = a.clone();
+        other_scope.kind = DependencyScope::Test;
+        assert_ne!(a.id(), other_scope.id());
+        let topology = WorkspaceTopology::new(
+            vec![],
+            vec![c, edge("d", "b")],
+            vec![FileOwnership {
+                file: PathBuf::from("src/main/A.java"),
+                source_set: Some("main".into()),
+                target: Some("app".into()),
+                state: FileOwnershipState::Owned,
+            }],
+            TopologySupport::NONE,
+            TopologyCompleteness::Complete,
+        );
+        for path in ["src", "src/main/A.java/child", "src/main/A.javax"] {
+            assert_eq!(
+                topology.ownership_of(Path::new(path)).state,
+                FileOwnershipState::Unknown
+            );
+        }
+        assert_eq!(
+            topology.ownership_of(Path::new("src/main/A.java")).state,
+            FileOwnershipState::Owned
+        );
+        assert!(!topology.declares_dependency("a", "b").0);
     }
 
     /// Entity identity is a function of the entity's coordinates only, so the

@@ -187,6 +187,8 @@ schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                     id: "declarations.ruby.external".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),

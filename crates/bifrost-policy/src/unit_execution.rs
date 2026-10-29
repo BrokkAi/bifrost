@@ -27,7 +27,9 @@
 //! one compiled plan is not served under another. Adding an admitted partition
 //! or product kind requires updating the `policy_units` check constraint.
 
+use std::cell::Cell;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
@@ -44,12 +46,12 @@ use brokk_bifrost_analysis::analyzer::{
     verify_read_set_for_artifact,
 };
 use brokk_bifrost_analysis::path_utils::rel_path_string;
-use brokk_bifrost_rql::PlanPartitioning;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
     merge_unit_rows, plan_seed_files,
 };
 use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryExecutionLimits};
+use brokk_bifrost_rql::{PlanPartitioning, PlanWidenDetail};
 
 use super::budget::PolicyBudget;
 use super::definition::PolicyId;
@@ -57,7 +59,7 @@ use super::evaluator::SubjectQueryBatch;
 use super::resolved::LoadedPolicy;
 use super::units::{
     IncrementalMode, PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnit, PolicyUnitKey,
-    PolicyUnitProduct, UnitPartition, WidenReason,
+    PolicyUnitProduct, UnitPartition, UnitPhaseMetrics, WidenReason,
 };
 
 /// What one policy's sliced attempt did, whether or not it widened.
@@ -72,9 +74,13 @@ pub(crate) struct UnitAttempt {
     reused: u64,
     recomputed: u64,
     unbounded: u64,
+    widen_detail: Option<PlanWidenDetail>,
 }
 
 impl UnitAttempt {
+    pub(crate) fn set_widen_detail(&mut self, detail: Option<PlanWidenDetail>) {
+        self.widen_detail = detail;
+    }
     /// Count `count` more units this attempt will decide about.
     pub(crate) fn enumerated(&mut self, count: usize) {
         self.total = self
@@ -117,10 +123,14 @@ impl UnitAttempt {
             units_reused: self.reused,
             units_recomputed: self.recomputed,
             units_unbounded: self.unbounded,
+            lookups_replayed: 0,
             widen_reason,
             base_units_reused: 0,
             base_units_recomputed: 0,
+            base_lookups_replayed: 0,
             base_widen_reason: None,
+            widen_detail: self.widen_detail,
+            base_widen_detail: None,
         }
     }
 }
@@ -141,6 +151,25 @@ pub(crate) struct UnitReuse<'a> {
     replay_limits: LookupReplayLimits,
     limits: CodeQueryExecutionLimits,
     memo: LookupMemo,
+    /// Where this attempt's time went, handed to the incremental context once
+    /// when the attempt ends so the per-unit loop never takes its lock.
+    phase: Cell<UnitPhaseMetrics>,
+}
+
+impl Drop for UnitReuse<'_> {
+    fn drop(&mut self) {
+        // While unwinding, a poisoned metrics mutex would turn this into a
+        // second panic and abort the process; losing one attempt's metrics is
+        // the cheaper outcome.
+        if std::thread::panicking() {
+            return;
+        }
+        let mut phase = self.phase.get();
+        phase.lookup_replay = self.memo.replay_elapsed();
+        phase.lookups_replayed =
+            u64::try_from(self.memo.len()).expect("lookup replay count fits u64");
+        self.incremental.add_unit_metrics(self.policy_id, phase);
+    }
 }
 
 impl<'a> UnitReuse<'a> {
@@ -158,6 +187,7 @@ impl<'a> UnitReuse<'a> {
             replay_limits: lookup_replay_limits(&limits),
             limits,
             memo: LookupMemo::new(),
+            phase: Cell::default(),
         }
     }
 
@@ -166,19 +196,30 @@ impl<'a> UnitReuse<'a> {
         self.incremental
     }
 
+    /// Count `elapsed` as time one unit spent recomputing.
+    pub(crate) fn record_recompute(&self, elapsed: Duration) {
+        let mut phase = self.phase.get();
+        phase.recompute += elapsed;
+        self.phase.set(phase);
+    }
+
     /// Load every key this policy will ask about, in one batch.
     ///
     /// A persisted store answers one query instead of one per partition. A
     /// store that cannot answer has said nothing about what was published, so
     /// the policy widens instead of reading its silence as absence.
     pub(crate) fn prefetch(&self, keys: &[PolicyUnitKey]) -> Result<(), WidenReason> {
-        if let Err(error) = self
+        let started = Instant::now();
+        let loaded = self
             .incremental
             .store()
             .lock()
             .expect("policy-unit store mutex poisoned")
-            .prefetch(keys, self.budget)
-        {
+            .prefetch(keys, self.budget);
+        let mut phase = self.phase.get();
+        phase.prefetch += started.elapsed();
+        self.phase.set(phase);
+        if let Err(error) = loaded {
             let policy_id = self.policy_id;
             brokk_bifrost_analysis::profiling::note_with(|| {
                 format!("policy.units policy={policy_id} store_error={error}")
@@ -199,7 +240,38 @@ impl<'a> UnitReuse<'a> {
         &mut self,
         key: &PolicyUnitKey,
     ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
-        let store = self
+        let degraded_fills = self
+            .incremental
+            .workspace()
+            .analyzer()
+            .degraded_persistent_fills();
+        if degraded_fills > 0 {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=degraded_persistent_fill count={degraded_fills}",
+                    file!(),
+                    line!()
+                )
+            });
+            return Err(WidenReason::UnitUnbounded);
+        }
+        let started = Instant::now();
+        let replayed_before = self.memo.replay_elapsed();
+        let result = self.published_inner(key);
+        // Lookup replay runs inside verification; it is reported on its own,
+        // so `verify` keeps only the rest of the decision and the two add up.
+        let replay = self.memo.replay_elapsed() - replayed_before;
+        let mut phase = self.phase.get();
+        phase.verify += started.elapsed().saturating_sub(replay);
+        self.phase.set(phase);
+        result
+    }
+
+    fn published_inner(
+        &mut self,
+        key: &PolicyUnitKey,
+    ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
+        let mut store = self
             .incremental
             .store()
             .lock()
@@ -226,18 +298,19 @@ impl<'a> UnitReuse<'a> {
         // request. Only its name-index reads are proved relative to a
         // snapshot; every other read is checked against this head itself. So
         // a unit without index reads is verified wherever it came from, and
-        // one with index reads from a snapshot this comparison is not between
-        // is recomputed rather than verified against the wrong difference.
-        let changed = match self.incremental.changed_since(unit.snapshot()) {
-            Some(changed) => changed,
-            None if !unit.reads_name_index() => self.incremental.changed(),
+        // one with index reads that holds on neither snapshot this comparison
+        // is between is recomputed rather than verified against the wrong
+        // difference.
+        let (verified_on, changed) = match self.incremental.changed_since(unit.snapshots()) {
+            Some((snapshot, changed)) => (Some(snapshot), changed),
+            None if !unit.reads_name_index() => (None, self.incremental.changed()),
             None => {
                 let policy_id = self.policy_id;
                 brokk_bifrost_analysis::profiling::note_with(|| {
                     format!(
-                        "policy.units policy={policy_id} partition={:?} foreign_snapshot={}",
+                        "policy.units policy={policy_id} partition={:?} foreign_snapshots={:?}",
                         key.partition,
-                        unit.snapshot()
+                        unit.snapshots()
                     )
                 });
                 self.incremental
@@ -245,7 +318,7 @@ impl<'a> UnitReuse<'a> {
                     .record(ArtifactVerdict::Invalidated(
                         InvalidationReason::InputContentChanged {
                             artifact,
-                            before: unit.snapshot(),
+                            before: unit.snapshots()[0],
                             after: self.incremental.snapshot(),
                         },
                     ));
@@ -275,7 +348,26 @@ impl<'a> UnitReuse<'a> {
                     .record(ArtifactVerdict::Retained(
                         RetentionReason::InputsUnchanged { artifact },
                     ));
-                Ok(Some(unit.product().clone()))
+                let product = unit.product().clone();
+                // Verification proved the unit's index answers on
+                // `verified_on` are its answers on this head too, and on the
+                // base when no probe names a moved name. Recording that is
+                // what lets the next check in a chain, whose base is this
+                // head, verify the unit again instead of recomputing it.
+                if let Some(verified_on) = verified_on
+                    && unit.reads_name_index()
+                {
+                    let attested = self
+                        .incremental
+                        .publication_snapshots(unit.reads())
+                        .into_iter()
+                        .filter(|snapshot| !unit.snapshots().contains(snapshot))
+                        .collect::<Vec<_>>();
+                    if !attested.is_empty() {
+                        store.attest(key, verified_on, &attested);
+                    }
+                }
+                Ok(Some(product))
             }
             ReadVerdict::Changed(changed) => {
                 let missing = matches!(
@@ -316,10 +408,10 @@ impl<'a> UnitReuse<'a> {
         product: PolicyUnitProduct,
         reads: Vec<ReadKey>,
     ) {
-        let snapshot = self.incremental.publication_snapshot(&reads);
+        let snapshots = self.incremental.publication_snapshots(&reads);
         self.incremental.stage_unit(
             self.policy_id.clone(),
-            PolicyUnit::new(key, product, reads, BudgetMode::Exhaustive, snapshot),
+            PolicyUnit::new(key, product, reads, BudgetMode::Exhaustive, snapshots),
         );
     }
 }
@@ -334,15 +426,53 @@ impl<'a> UnitReuse<'a> {
 /// is still the answer this run computed, and the caller uses it.
 pub(crate) fn recompute_unit<T>(
     analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
     run: impl FnOnce() -> T,
-) -> (T, Option<Vec<ReadKey>>) {
+) -> (T, Option<Vec<ReadKey>>, Duration) {
     let ledger = Arc::new(ReadLedger::new());
+    let generation_before = analyzer.project().analysis_generation();
     let product = {
+        let started = Instant::now();
         let _reads = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
-        run()
+        let product = run();
+        let degraded_fills = analyzer.degraded_persistent_fills();
+        if degraded_fills > 0 {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=degraded_persistent_fill count={degraded_fills}",
+                    file!(),
+                    line!()
+                )
+            });
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled)
+            || analyzer
+                .active_query_cancellation()
+                .is_some_and(|token| token.is_cancelled())
+            || analyzer.project().analysis_generation() != generation_before
+            || _reads.store_error().is_some()
+            || analyzer.degraded_persistent_fills() > 0
+        {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=unit_boundary cancelled={} snapshot={} store={}",
+                    file!(),
+                    line!(),
+                    cancellation.is_some_and(CancellationToken::is_cancelled)
+                        || analyzer
+                            .active_query_cancellation()
+                            .is_some_and(|token| token.is_cancelled()),
+                    analyzer.project().analysis_generation() != generation_before,
+                    _reads.store_error().is_some()
+                )
+            });
+            ledger.mark_execution_dependent();
+        }
+        (product, started.elapsed())
     };
+    let (product, elapsed) = product;
     let reads = ledger.is_bounded().then(|| ledger.keys());
-    (product, reads)
+    (product, reads, elapsed)
 }
 
 /// The limits a replayed lookup re-runs its funnel under.
@@ -372,6 +502,7 @@ fn lookup_replay_limits(limits: &CodeQueryExecutionLimits) -> LookupReplayLimits
 /// count rather than quadratic.
 pub(crate) struct UnitQueryExecution<'a> {
     pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) flow_state: brokk_bifrost_rql::SemanticFlowResources,
     /// The generation-bound workspace oracles, when this family's whole
     /// execution uses them. A unit that ran without them where the whole run
     /// had them would produce different rows, not fewer.
@@ -426,13 +557,26 @@ pub(crate) struct SlicedQuery {
     pub(crate) keys: Vec<PolicyUnitKey>,
 }
 
-pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<WidenReason> {
-    if query.plan.requires_workspace_field_index() {
-        Some(WidenReason::WorkspacePreparationRequired)
-    } else if !PlanPartitioning::classify(&query.plan).is_by_seed() {
-        Some(WidenReason::PlanCrossesSeeds)
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QuerySlicingWiden {
+    pub(crate) reason: WidenReason,
+    pub(crate) detail: PlanWidenDetail,
+}
+
+pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<QuerySlicingWiden> {
+    if let Some(detail) = query.plan.requires_workspace_field_index() {
+        Some(QuerySlicingWiden {
+            reason: WidenReason::WorkspacePreparationRequired,
+            detail,
+        })
     } else {
-        None
+        match PlanPartitioning::classify(&query.plan) {
+            PlanPartitioning::Whole(detail) => Some(QuerySlicingWiden {
+                reason: WidenReason::PlanCrossesSeeds,
+                detail,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -452,7 +596,7 @@ pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<WidenReaso
 /// blob; the frontier evaluates it once over the workspace and indexes the
 /// rows by where they lie.
 pub(crate) fn frontier_slicing_widen_reason(query: &CodeQuery) -> Option<WidenReason> {
-    if query.plan.requires_workspace_field_index() {
+    if query.plan.requires_workspace_field_index().is_some() {
         Some(WidenReason::WorkspacePreparationRequired)
     } else if !PlanPartitioning::restricts_to_seed_file(&query.plan) {
         Some(WidenReason::PlanCrossesSeeds)
@@ -481,8 +625,12 @@ pub(crate) fn sliced_query_units(
     attempt: &mut UnitAttempt,
 ) -> Result<SlicedQuery, WidenReason> {
     let incremental = reuse.incremental();
-    if let Some(reason) = query_slicing_widen_reason(query) {
+    if let Some(reason) = incremental.base_workspace_widen(&policy.definition().metadata.id) {
         return Err(reason);
+    }
+    if let Some(widen) = query_slicing_widen_reason(query) {
+        attempt.set_widen_detail(Some(widen.detail));
+        return Err(widen.reason);
     }
     // A changed-fact set that could not be completed is smaller than the truth,
     // and a smaller set would let a changed input pass verification.
@@ -539,33 +687,36 @@ pub(crate) fn sliced_query_units(
             }
             None => {
                 attempt.recomputed();
-                let (rows, reads) = recompute_unit(execution.analyzer, || {
-                    let execute = || {
-                        let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
-                            format!("policy.query_unit[{}]", rel_path_string(file))
-                        });
-                        execute_code_query_unit(
-                            execution.analyzer,
-                            execution.workspace,
-                            query,
-                            execution.limits,
-                            execution.cancellation,
-                            CodeQueryExecutionScope::for_seed_files(
-                                std::slice::from_ref(file),
-                                execution.workspace_files,
+                let (rows, reads, elapsed) =
+                    recompute_unit(execution.analyzer, execution.cancellation, || {
+                        let execute = || {
+                            let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+                                format!("policy.query_unit[{}]", rel_path_string(file))
+                            });
+                            execute_code_query_unit(
+                                execution.analyzer,
+                                execution.flow_state.clone(),
+                                execution.workspace,
+                                query,
+                                execution.limits,
+                                execution.cancellation,
+                                CodeQueryExecutionScope::for_seed_files(
+                                    std::slice::from_ref(file),
+                                    execution.workspace_files,
+                                ),
+                            )
+                        };
+                        match &shared {
+                            Some(shared) => shared.execute(
+                                Some(file),
+                                execution.analyzer,
+                                execution.cancellation,
+                                execute,
                             ),
-                        )
-                    };
-                    match &shared {
-                        Some(shared) => shared.execute(
-                            Some(file),
-                            execution.analyzer,
-                            execution.cancellation,
-                            execute,
-                        ),
-                        None => execute(),
-                    }
-                });
+                            None => execute(),
+                        }
+                    });
+                reuse.record_recompute(elapsed);
                 let Some(reads) = reads else {
                     attempt.unbounded();
                     return Err(WidenReason::UnitUnbounded);
@@ -588,14 +739,17 @@ pub(crate) fn sliced_query_units(
     Ok(SlicedQuery { merged, keys })
 }
 
-/// Exhaustiveness is checked on the product rather than on how it was obtained:
-/// a unit that truncated or raised a diagnostic is not a partition of a whole
-/// execution, whichever run computed it.
+/// Truncation prevents a partition from representing its complete rows.
+/// Diagnostics are additive; execution dependence is checked by its ledger.
 pub(super) fn check_exhaustive_rows(rows: &UnitExecutionResult) -> Result<(), WidenReason> {
     if rows.truncated {
         return Err(WidenReason::UnitNotExhaustive);
     }
-    if !rows.diagnostics.is_empty() {
+    if rows
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code.is_execution_state())
+    {
         return Err(WidenReason::UnitDiagnostics);
     }
     Ok(())

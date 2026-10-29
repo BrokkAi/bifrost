@@ -125,11 +125,17 @@ fn analyze_cpp(
             let body = node.child_by_field_name("body")?;
             let parameters = node.child_by_field_name("parameters")?;
             let catch_type = cpp_catch_type(parameters, source);
-            Some((
-                body,
-                catch_type.clone(),
-                classify_cpp_type(&catch_type, weights),
-            ))
+            let broad = if let Some(ty) = cpp_catch_type_node(parameters) {
+                if has_descendant_of_kind(ty, "template_argument_list") {
+                    None
+                } else {
+                    brokk_bifrost_cpp::declarations::cpp_structured_type_path(ty, source)
+                        .and_then(|path| classify_cpp_type(&path.join("::"), weights))
+                }
+            } else {
+                classify_cpp_type(&catch_type, weights)
+            };
+            Some((body, catch_type, broad))
         },
         cpp_statement_count,
         &["throw_statement"],
@@ -736,25 +742,22 @@ fn classify_exact_java_family(
     })
 }
 
+/// Classifies a canonical type path rendered from grammar fields.
 fn classify_cpp_type(catch_type: &str, weights: &ExceptionSmellWeights) -> Option<(i32, String)> {
-    let normalized = catch_type.to_ascii_lowercase();
-    if normalized == "..." {
-        Some((
+    match catch_type {
+        "..." => Some((
             weights.generic_throwable_weight,
             "generic-catch:catch-all".to_string(),
-        ))
-    } else if normalized.contains("runtime_error") {
-        Some((
+        )),
+        "runtime_error" | "std::runtime_error" | "::std::runtime_error" => Some((
             weights.generic_runtime_exception_weight,
             "generic-catch:runtime_error".to_string(),
-        ))
-    } else if normalized.contains("exception") {
-        Some((
+        )),
+        "exception" | "std::exception" | "::std::exception" => Some((
             weights.generic_exception_weight,
             "generic-catch:exception".to_string(),
-        ))
-    } else {
-        None
+        )),
+        _ => None,
     }
 }
 
@@ -772,33 +775,28 @@ fn classify_ruby_name(catch_type: &str, weights: &ExceptionSmellWeights) -> Opti
     classify_exception_family(weights, RUBY_EXCEPTION_FAMILIES, |name| catch_type == name)
 }
 
-fn cpp_catch_type(parameters: Node<'_>, source: &str) -> String {
-    for kind in [
-        "qualified_identifier",
-        "template_type",
-        "type_identifier",
-        "primitive_type",
-    ] {
-        if let Some(node) = find_first_named_descendant(parameters, kind)
-            && let Some(text) = node_text(node, source)
-        {
-            return text;
-        }
-    }
-    "...".to_string()
+fn cpp_catch_type_node(parameters: Node<'_>) -> Option<Node<'_>> {
+    named_child_by_kind(parameters, "parameter_declaration")
+        .and_then(|parameter| parameter.child_by_field_name("type"))
 }
 
-fn handler_statement_count(body: Node<'_>) -> u32 {
-    if body.kind() == "catch_block" {
-        return named_child_by_kind(body, "statements")
-            .map(handler_statement_count)
-            .unwrap_or(0);
-    }
-    if body.kind() == "rescue" {
-        return body
-            .child_by_field_name("body")
-            .map(handler_statement_count)
-            .unwrap_or(0);
+fn cpp_catch_type(parameters: Node<'_>, source: &str) -> String {
+    cpp_catch_type_node(parameters)
+        .and_then(|ty| node_text(ty, source))
+        .unwrap_or_else(|| "...".to_string())
+}
+
+fn handler_statement_count(mut body: Node<'_>) -> u32 {
+    loop {
+        let inner = match body.kind() {
+            "catch_block" => named_child_by_kind(body, "statements"),
+            "rescue" => body.child_by_field_name("body"),
+            _ => break,
+        };
+        let Some(inner) = inner else {
+            return 0;
+        };
+        body = inner;
     }
     if body.kind() == "case_clause" {
         return children_by_field_name(body, "body").len() as u32;
@@ -824,6 +822,10 @@ fn cpp_statement_count(body: Node<'_>) -> u32 {
     let mut statements = 0_u32;
     let mut pending = vec![body];
     while let Some(node) = pending.pop() {
+        // Defining a callable does not execute the statements in its body.
+        if matches!(node.kind(), "lambda_expression" | "function_definition") {
+            continue;
+        }
         let kind = node.kind();
         let is_wrapper = matches!(
             kind,
@@ -848,6 +850,16 @@ fn js_ts_statement_count(body: Node<'_>) -> u32 {
     direct_statement_count(
         body,
         &[
+            "lexical_declaration",
+            "variable_declaration",
+            "using_declaration",
+            "function_declaration",
+            "generator_function_declaration",
+            "class_declaration",
+            "statement_block",
+            "debugger_statement",
+            "with_statement",
+            "labeled_statement",
             "expression_statement",
             "throw_statement",
             "return_statement",
@@ -869,6 +881,22 @@ fn python_statement_count(body: Node<'_>) -> u32 {
     direct_statement_count(
         body,
         &[
+            // pass is deliberately empty; definitions execute their binding,
+            // but their deferred bodies are not counted as handler statements.
+            "future_import_statement",
+            "import_statement",
+            "import_from_statement",
+            "print_statement",
+            "assert_statement",
+            "delete_statement",
+            "global_statement",
+            "nonlocal_statement",
+            "exec_statement",
+            "type_alias_statement",
+            "with_statement",
+            "function_definition",
+            "class_definition",
+            "decorated_definition",
             "expression_statement",
             "raise_statement",
             "return_statement",
@@ -1087,7 +1115,7 @@ fn single_statement_through_wrappers(mut node: Node<'_>) -> Option<Node<'_>> {
         let child = single_non_comment_named_child(node)?;
         if matches!(
             child.kind(),
-            "block" | "statement_list" | "block_expression" | "statements"
+            "block" | "statement_list" | "block_expression" | "statements" | "expression_statement"
         ) {
             node = child;
         } else {
@@ -1113,4 +1141,494 @@ fn direct_named_child_matching(
     mut predicate: impl FnMut(&str) -> bool,
 ) -> Option<Node<'_>> {
     first_named_child_matching(node, |child| predicate(child.kind()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parse(path: &str, language: Language, source: &str) -> tree_sitter::Tree {
+        let grammar = parser_language_for_path(language, std::path::Path::new(path)).unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: declarations and Python statements were counted as empty handlers"
+    )]
+    fn handler_statement_grammar_categories() {
+        let mut failures = Vec::new();
+        for (path, language, source, body_kind, expected) in [
+            (
+                "sample.js",
+                Language::JavaScript,
+                "try {} catch(e) { const value = logger.error(e); let other = work(); var third = work(); }",
+                "statement_block",
+                vec![
+                    "lexical_declaration",
+                    "lexical_declaration",
+                    "variable_declaration",
+                ],
+            ),
+            (
+                "sample.ts",
+                Language::TypeScript,
+                "try {} catch(e) { const value = logger.error(e); let other = work(); var third = work(); }",
+                "statement_block",
+                vec![
+                    "lexical_declaration",
+                    "lexical_declaration",
+                    "variable_declaration",
+                ],
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n assert ready\n del old\n global state\n nonlocal outer\n with lock:\n  work()\n",
+                "block",
+                vec![
+                    "assert_statement",
+                    "delete_statement",
+                    "global_statement",
+                    "nonlocal_statement",
+                    "with_statement",
+                ],
+            ),
+        ] {
+            let tree = parse(path, language, source);
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let handler = collect_nodes_by_kind(
+                tree.root_node(),
+                if language == Language::Python {
+                    "except_clause"
+                } else {
+                    "catch_clause"
+                },
+            )[0];
+            let body = named_child_by_kind(handler, body_kind).unwrap();
+            let kinds: Vec<_> = named_children_iter(body).map(|node| node.kind()).collect();
+            assert_eq!(kinds, expected);
+            let count = if language == Language::Python {
+                python_statement_count(body)
+            } else {
+                js_ts_statement_count(body)
+            };
+            if count as usize != expected.len() {
+                failures.push(format!("{path}: expected {}, got {count}", expected.len()));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: C++ catch type came from nested template arguments"
+    )]
+    fn cpp_parameter_type_field_owns_the_caught_type() {
+        for caught in [
+            "Box<std::exception>",
+            "std::vector<int>",
+            "std::exception",
+            "std::runtime_error",
+        ] {
+            let source = format!("void run() {{ try {{}} catch ({caught}& error) {{}} }}");
+            let tree = parse("sample.cpp", Language::Cpp, &source);
+            assert!(!tree.root_node().has_error());
+            let handler = collect_nodes_by_kind(tree.root_node(), "catch_clause")[0];
+            let parameters = handler.child_by_field_name("parameters").unwrap();
+            let declaration = named_child_by_kind(parameters, "parameter_declaration").unwrap();
+            let ty = declaration.child_by_field_name("type").unwrap();
+            assert_eq!(node_text_ref(ty, &source), Some(caught));
+            assert_eq!(cpp_catch_type(parameters, &source), caught);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: narrow C++ names received broad exception weights"
+    )]
+    fn cpp_broad_families_require_exact_type_names() {
+        let weights = ExceptionSmellWeights::defaults();
+        for (name, expected) in [
+            ("std::runtime_error", Some(2)),
+            ("std::exception", Some(3)),
+            ("...", Some(5)),
+            ("DomainException", None),
+            ("my_runtime_error_wrapper", None),
+            ("Box<std::exception>", None),
+        ] {
+            assert_eq!(
+                classify_cpp_type(name, &weights).map(|value| value.0),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: C++ statement credit entered deferred lambda bodies"
+    )]
+    fn cpp_statement_credit_stops_at_deferred_bodies() {
+        for (body, expected) in [
+            ("auto f = [] { audit(); notify_ops(); };", 1),
+            (
+                "if (recoverable()) { audit(); notify_ops(); recover(); }",
+                3,
+            ),
+        ] {
+            let source = format!("void run() {{ try {{}} catch (...) {{ {body} }} }}");
+            let tree = parse("sample.cpp", Language::Cpp, &source);
+            assert!(!tree.root_node().has_error());
+            let handler = collect_nodes_by_kind(tree.root_node(), "catch_clause")[0];
+            assert_eq!(
+                cpp_statement_count(handler.child_by_field_name("body").unwrap()),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: Rust semicolon return wrappers hid explicit Err propagation"
+    )]
+    fn explicit_propagation_grammar_wrappers() {
+        let source = "// UTF-8: \u{e9}\nfn run() { match work() { Err(e) => return Err(e), Err(e) => { /* note */ return Err(e); }, Err(e) => { /* note */ }, Err(e) => { log(e); return Err(e); }, _ => {} } }";
+        let tree = parse("sample.rs", Language::Rust, source);
+        assert!(!tree.root_node().has_error());
+        let arms = collect_nodes_by_kind(tree.root_node(), "match_arm");
+        assert_eq!(arms.len(), 5);
+        let expected = [
+            ("return_expression", true),
+            ("block", true),
+            ("block", false),
+            ("block", false),
+            ("block", false),
+        ];
+        let markers = [
+            "return Err(e)",
+            "{ /* note */ return Err(e); }",
+            "{ /* note */ }",
+            "{ log(e); return Err(e); }",
+            "{}",
+        ];
+        for ((arm, (kind, propagates)), marker) in arms.into_iter().zip(expected).zip(markers) {
+            let body = arm.child_by_field_name("value").unwrap();
+            assert_eq!(body.kind(), kind);
+            let start = source.find(marker).unwrap();
+            assert_eq!(body.byte_range(), start..start + marker.len());
+            if propagates && kind == "block" {
+                let statement = single_non_comment_named_child(body).unwrap();
+                assert_eq!(statement.kind(), "expression_statement");
+                assert_eq!(
+                    first_named_child(statement).unwrap().kind(),
+                    "return_expression"
+                );
+            }
+            assert_eq!(
+                rust_body_is_result_propagation(body, source),
+                propagates,
+                "{}",
+                body.to_sexp()
+            );
+        }
+        let source =
+            "package p\n// UTF-8: \u{e9}\nfunc run() { if err != nil { /* note */ return err } }";
+        let tree = parse("sample.go", Language::Go, source);
+        assert!(!tree.root_node().has_error());
+        let conditional = collect_nodes_by_kind(tree.root_node(), "if_statement")[0];
+        let body = conditional.child_by_field_name("consequence").unwrap();
+        assert_eq!(body.kind(), "block");
+        let marker = "{ /* note */ return err }";
+        let start = source.find(marker).unwrap();
+        assert_eq!(body.byte_range(), start..start + marker.len());
+        let statements = named_child_by_kind(body, "statement_list").unwrap();
+        assert_eq!(
+            single_non_comment_named_child(statements).unwrap().kind(),
+            "return_statement"
+        );
+        assert!(go_body_is_error_propagation(body, source));
+    }
+    fn reports(
+        path: &str,
+        language: Language,
+        source: &str,
+        weights: ExceptionSmellWeights,
+    ) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(path), source).unwrap();
+        let analyzer = crate::analyzer::workspace::EmptyAnalyzer::new(std::sync::Arc::new(
+            crate::TestProject::new(directory.path(), language),
+        ));
+        let file = ProjectFile::new(directory.path(), std::path::Path::new(path));
+        let ExceptionHandlingAnalysis::Analyzed(findings) =
+            analyzer.find_exception_handling_smells(&file, weights)
+        else {
+            panic!("expected analyzed handlers for {path}");
+        };
+        findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{}; {}; {}; {}\n",
+                    finding.catch_type,
+                    finding.body_statement_count,
+                    finding.score,
+                    finding.reasons.join(", ")
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn handler_reports_cover_executed_body_shapes() {
+        // Known answers use the public default scoring contract: broad families
+        // 5/3/2, empty/comment 5/4, small/log-only 2, one credit per statement.
+        for (path, language, source, expected) in [
+            (
+                "sample.cpp",
+                Language::Cpp,
+                "void run() { try {} catch (std /* type */ :: exception& e) {} }",
+                "std /* type */ :: exception; 0; 10; generic-catch:exception, empty-body, small-body:0\n",
+            ),
+            (
+                "sample.cpp",
+                Language::Cpp,
+                "void run() { try {} catch (Box<std::exception>& e) {} }",
+                "Box<std::exception>; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "sample.cpp",
+                Language::Cpp,
+                "void run() { try {} catch (DomainException& e) {} }",
+                "DomainException; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "sample.cpp",
+                Language::Cpp,
+                "void run() { try {} catch (...) { auto f = [] { audit(); notify_ops(); }; } }",
+                "...; 1; 6; generic-catch:catch-all, small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.js",
+                Language::JavaScript,
+                "try {} catch(e) { const value = logger.error(e); }",
+                "<untyped>; 1; 6; generic-catch:<untyped>, small-body:1, log-only-body, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n assert ready\n",
+                "DomainError; 1; 1; small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.rs",
+                Language::Rust,
+                "fn run() { match work() { Err(e) => { /* note */ return Err(e); }, _ => {} } }",
+                "",
+            ),
+            (
+                "sample.rs",
+                Language::Rust,
+                "fn run() { match work() { Err(e) => { log(e); return Err(e); }, _ => {} } }",
+                "Err; 2; 3; generic-catch:Err, small-body:2, meaningful-body-credit:2\n",
+            ),
+            (
+                "sample.cpp",
+                Language::Cpp,
+                "void run() { try {} catch (...) { throw logger.error(e); } }",
+                "...; 1; 6; generic-catch:catch-all, small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.cpp",
+                Language::Cpp,
+                "void run() { try {} catch (...) { logger.error(e); } }",
+                "...; 1; 8; generic-catch:catch-all, small-body:1, log-only-body, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n if flag:\n  def report():\n   logger.error(e)\n",
+                "DomainError; 1; 1; small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n callback = lambda: logger.error(e)\n",
+                "DomainError; 1; 1; small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n logger.emit(e)\n",
+                "DomainError; 1; 3; small-body:1, log-only-body, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n log.emit(e)\n",
+                "DomainError; 1; 3; small-body:1, log-only-body, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n logging.emit(e)\n",
+                "DomainError; 1; 3; small-body:1, log-only-body, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n sink.error(e)\n",
+                "DomainError; 1; 3; small-body:1, log-only-body, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n sink.warn(e)\n",
+                "DomainError; 1; 3; small-body:1, log-only-body, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n process(logger)\n",
+                "DomainError; 1; 1; small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n raise e\n",
+                "DomainError; 1; 1; small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n return e\n",
+                "DomainError; 1; 1; small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n pass\n",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "sample.py",
+                Language::Python,
+                "try:\n work()\nexcept DomainError:\n pass\n # handled by caller\n pass\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "Sample.cs",
+                Language::CSharp,
+                "class Sample { void Run() { try {} catch {} } }",
+                "Exception; 0; 10; generic-catch:Exception, empty-body, small-body:0\n",
+            ),
+            (
+                "Sample.kt",
+                Language::Kotlin,
+                "fun run() { try {} catch (e: Exception) { // explanation\n } }",
+                "Exception; 0; 9; generic-catch:Exception, comment-only-body, small-body:0\n",
+            ),
+            (
+                "Sample.kt",
+                Language::Kotlin,
+                "fun run() { try {} catch (e: Exception) { /* explanation */ } }",
+                "Exception; 0; 9; generic-catch:Exception, comment-only-body, small-body:0\n",
+            ),
+            (
+                "Sample.kt",
+                Language::Kotlin,
+                "fun run() { try {} catch (e: Exception) {} }",
+                "Exception; 0; 10; generic-catch:Exception, empty-body, small-body:0\n",
+            ),
+            (
+                "sample.rs",
+                Language::Rust,
+                "fn run() { match work() { Err(e) => recover(e), _ => {} } }",
+                "Err; 1; 4; generic-catch:Err, small-body:1, meaningful-body-credit:1\n",
+            ),
+        ] {
+            assert_eq!(
+                reports(path, language, source, ExceptionSmellWeights::defaults()),
+                expected,
+                "{path}: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_repeated_exception_fields_preserve_broad_alternatives() {
+        for (alternatives, count, weight) in [
+            ("BaseException, ValueError", 2, 5),
+            ("ValueError, BaseException", 2, 5),
+            ("Exception, ValueError", 2, 3),
+            ("ValueError, Exception", 2, 3),
+            ("(BaseException, ValueError)", 1, 5),
+            ("(Exception, ValueError)", 1, 3),
+        ] {
+            let source = format!("try:\n work()\nexcept {alternatives}:\n pass\n");
+            let tree = parse("sample.py", Language::Python, &source);
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let clause = collect_nodes_by_kind(tree.root_node(), "except_clause")[0];
+            let values = children_by_field_name(clause, "value");
+            assert_eq!(values.len(), count);
+            if count == 1 {
+                assert_eq!(values[0].kind(), "tuple");
+            }
+            let expected_type = if count == 2 {
+                alternatives.replace(", ", " | ")
+            } else {
+                alternatives.to_string()
+            };
+            let expected = format!(
+                "{expected_type}; 0; {}; generic-catch:{expected_type}, empty-body, small-body:0\n",
+                weight + 7
+            );
+            assert_eq!(
+                reports(
+                    "sample.py",
+                    Language::Python,
+                    &source,
+                    ExceptionSmellWeights::defaults()
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn scala_equal_weight_alternatives_keep_the_first_reason() {
+        let mut weights = ExceptionSmellWeights::defaults();
+        weights.generic_throwable_weight = 3;
+        weights.generic_runtime_exception_weight = 3;
+        for (types, reason) in [
+            ("_: Throwable | _: Exception", "Throwable"),
+            ("_: Exception | _: Throwable", "Exception"),
+            ("_: RuntimeException | _: Exception", "RuntimeException"),
+        ] {
+            let source = format!(
+                "object Sample {{ def run(): Unit = try work() catch {{ case {types} => }} }}"
+            );
+            let expected_types = types.replace("_: ", "");
+            let expected = format!(
+                "{expected_types}; 0; 10; generic-catch:{reason}, empty-body, small-body:0\n"
+            );
+            assert_eq!(
+                reports("Sample.scala", Language::Scala, &source, weights),
+                expected
+            );
+        }
+    }
 }

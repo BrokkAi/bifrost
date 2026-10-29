@@ -654,7 +654,7 @@ where
                     .any(|(_, _, key)| key == &file_scope_key)
                     && let Some(source) = analyzer.indexed_source(file)
                 {
-                    declarations.add_file_scope(file_scope_key, source.len());
+                    declarations.add_file_scope(file_scope, source.len());
                 }
             }
             let class_ranges = state

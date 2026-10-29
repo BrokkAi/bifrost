@@ -66,6 +66,7 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashMap;
 
 use brokk_bifrost_core::analyzer::RelationalName;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::DeclarationKinds;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_php::graph::resolver::{TargetKind, TargetSpec};
 use brokk_bifrost_php::graph::{PhpCallableFacts, PhpGraphSource};
@@ -270,13 +271,27 @@ pub(crate) fn php_graph_source<'a>(
 pub(crate) fn build_php_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
+    kinds: &DeclarationKinds,
     keep_file: F,
 ) -> Option<UsageEdges>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = PhpEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, nodes, kinds, keep_file))
+}
+
+/// Exercise the closed-callee scan and its location-bearing evidence together.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn closed_php_usage_edges_for_test(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+) -> Option<UsageEdges> {
+    let declarations = analyzer.all_declarations().collect::<Vec<_>>();
+    let kinds =
+        brokk_bifrost_core::analyzer::usages::inverted_edges::declaration_kind_index(&declarations);
+    build_php_usage_edges(analyzer, nodes, &kinds, |_| true)
 }
 
 pub(crate) fn build_rooted_php_usage_edges<F>(
@@ -294,13 +309,14 @@ where
 pub(crate) fn build_php_usage_edge_weights<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
+    kinds: &DeclarationKinds,
     keep_file: F,
 ) -> Option<UsageEdgeWeights>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = PhpEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, nodes, kinds, keep_file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

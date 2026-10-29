@@ -12,7 +12,9 @@ use brokk_bifrost_analysis::{
 
 use crate::analyzer::java::source_facts::JavaSourceFacts;
 
+pub use crate::analyzer::java::annotation::JavaAnnotationArtifact;
 pub use crate::analyzer::java::annotation::JavaAnnotationTypeResolution;
+pub use crate::analyzer::java::annotation::JavaAnnotationTypeRoute;
 
 pub use crate::analyzer::java::annotation::JavaAnnotationTypeStatus;
 
@@ -279,7 +281,8 @@ impl JavaAnalyzer {
             .0
     }
 
-    #[cfg(any(test, debug_assertions))]
+    // Integration tests also use the measure profile, without debug assertions.
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     #[doc(hidden)]
     pub fn reverse_import_indexes_ready_for_test(&self) -> (bool, bool) {
         (
@@ -524,6 +527,7 @@ impl JavaAnalyzer {
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
         crate::analyzer::jvm::external::get_or_build_external_declaration_index(
+            self,
             &self.external_index,
             &self.java_config,
             self.inner.project(),
@@ -635,13 +639,24 @@ impl JavaSource for JavaAnalyzer {
     }
 
     fn cached_package_name(&self, file: &ProjectFile) -> Option<Arc<str>> {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/java/mod.rs",
+            );
+
         if let Some(package) = self.memo_caches.package_names.get(file) {
             return Some(package);
         }
         let package: Arc<str> = Arc::from(self.inner.package_name_of(file)?);
-        self.memo_caches
-            .package_names
-            .insert(file.clone(), Arc::clone(&package));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&package);
+            persistent_fill_guard.installed("package_names");
+            self.memo_caches
+                .package_names
+                .insert(cache_key, cache_value);
+        };
         Some(package)
     }
 
@@ -981,6 +996,108 @@ impl CodeUnitIndex for JavaAnalyzer {
 }
 
 impl IAnalyzer for JavaAnalyzer {
+    fn statement_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
+        use brokk_bifrost_analysis::analyzer::structural::lexical_environment::{
+            BindingOfOutcome, binding_of, environment_for_file,
+        };
+        use brokk_bifrost_core::analyzer::statement_facts::producer::{
+            StatementFacts, capture_statement_facts,
+        };
+        use brokk_bifrost_core::analyzer::structural::occurrences::Namespace;
+        use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
+        let source = self.inner.file_source(file)?;
+        let oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+            .expect("source blob hash");
+        let key = (oid, file.clone());
+        if let Some(rows) = self.memo_caches.statement_facts.get(&key) {
+            return Some(rows);
+        }
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
+        let tree = parse_tree(&source)?;
+        let root = tree.root_node();
+        let mut rows = capture_statement_facts(&JAVA_STRUCTURAL_SPEC, root, &source);
+        if !rows.switches.is_empty() {
+            let environment = environment_for_file(self, file);
+            let support = brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::AnalyzerDefinitionLookup::new(self, Language::Java);
+            let session =
+                crate::analyzer::usages::get_definition::java::JavaResolutionSession::unbounded(
+                    &support,
+                );
+            let lookup = |name: tree_sitter::Node<'_>, namespace| {
+                let text = name.utf8_text(source.as_bytes()).ok()?;
+                let binding =
+                    match binding_of(&environment, text, name.start_byte(), Some(namespace)) {
+                        BindingOfOutcome::Reached(binding)
+                        | BindingOfOutcome::Shadowed {
+                            winner: binding, ..
+                        } => binding,
+                        BindingOfOutcome::NoBinding | BindingOfOutcome::Incomplete(_) => {
+                            return None;
+                        }
+                    };
+                let range = environment.bindings[binding].range;
+                root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
+            };
+            let producer =
+                StatementFacts::new(&JAVA_STRUCTURAL_SPEC).expect("Java statement syntax");
+            // Bind values through the shared lexical environment and types
+            // through Java's existing context-aware resolver. Only an enum
+            // declaration in this source snapshot supplies a local proof.
+            let switches: Vec<_> = rows.switches.iter().map(|switch| switch.range).collect();
+            for range in switches {
+                let Some(switch) =
+                    root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                else {
+                    continue;
+                };
+                let Some(operand) = switch
+                    .child_by_field_name("condition")
+                    .map(brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression)
+                else {
+                    continue;
+                };
+                if operand.kind() != "identifier" {
+                    continue;
+                }
+                let Some(binder) = lookup(operand, Namespace::Value) else {
+                    continue;
+                };
+                let Some(type_node) = binder.parent().and_then(declared_type_node) else {
+                    continue;
+                };
+                if type_node.kind() != "type_identifier" {
+                    continue;
+                }
+                let Some(unit) = crate::analyzer::usages::get_definition::java::java_type_from_node_with_context(
+                    self, scope.token(), self, &session, file, &source, type_node,
+                ).filter(|unit| unit.source() == file) else { continue; };
+                let Some(enumeration) = self
+                    .ranges(&unit)
+                    .into_iter()
+                    .filter_map(|range| {
+                        root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    })
+                    .find(|node| node.kind() == "enum_declaration")
+                else {
+                    continue;
+                };
+                producer.complete_enum_switch(switch, enumeration, &source, &mut rows);
+            }
+        }
+        let rows = Arc::new(rows);
+        // A transient store/cancellation failure must not turn a partial
+        // enum proof into a source-keyed negative for later requests.
+        if scope.captured_read_incompleteness().is_empty() {
+            self.memo_caches
+                .statement_facts
+                .insert(key, Arc::clone(&rows));
+        }
+        Some(rows)
+    }
+
     delegate_inner_procedure_fact_methods!();
 
     forward_relational_definition_batch!();
@@ -1082,12 +1199,21 @@ impl IAnalyzer for JavaAnalyzer {
             changed_files,
             is_jvm_dependency_input,
         );
-        Self {
+        let updated = Self {
             inner: self.inner.update(changed_files),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
             java_config: self.java_config.clone(),
             external_index,
+        };
+        if Arc::ptr_eq(&self.external_index, &updated.external_index)
+            && self.degraded_persistent_fills() > 0
+        {
+            updated.record_degraded_persistent_fill(
+                "retained_external_index",
+                "inherited_degraded_owner",
+            );
         }
+        updated
     }
 
     fn update_all(&self) -> Self {
@@ -1553,7 +1679,74 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Java
 #[doc(hidden)]
 pub struct JavaSupport;
 
+fn java_branch_reference_site(
+    node: tree_sitter::Node<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite> {
+    use brokk_bifrost_analysis::analyzer::structural::branch_relations::{
+        BranchReferenceKind, BranchReferenceSite,
+    };
+    let (focus, kind) = match node.kind() {
+        "method_invocation" => (
+            node.child_by_field_name("name")?,
+            BranchReferenceKind::Method,
+        ),
+        "field_access" => (
+            node.child_by_field_name("field")?,
+            BranchReferenceKind::Field,
+        ),
+        "identifier"
+            if node.parent().is_some_and(|parent| {
+                parent.kind() == "method_invocation"
+                    && parent.child_by_field_name("name") == Some(node)
+            }) =>
+        {
+            return None;
+        }
+        "identifier" => (node, BranchReferenceKind::Field),
+        _ => return None,
+    };
+    Some(BranchReferenceSite {
+        range: (focus.start_byte(), focus.end_byte()),
+        kind,
+    })
+}
+
 impl LanguageSupport for JavaSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn observed_value_type(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        observation: &brokk_bifrost_analysis::analyzer::semantic::BarrierObservation,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::semantic::ObservedValueType,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        native_points::observed_value_type(analyzer, observation, request)
+    }
+
+    fn branch_body_reference_site(
+        &self,
+        node: tree_sitter::Node<'_>,
+        _source: &str,
+    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite>
+    {
+        java_branch_reference_site(node)
+    }
+
+    fn branch_condition_reference_site(
+        &self,
+        node: tree_sitter::Node<'_>,
+        _source: &str,
+    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite>
+    {
+        java_branch_reference_site(node)
+    }
+
+    fn supports_selected_resolution_overlays(&self) -> bool {
+        true
+    }
+
     fn formal_parameter_owner_kinds(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "method_declaration",
@@ -1871,6 +2064,23 @@ impl LanguageSupport for JavaSupport {
         })
     }
 
+    fn lexical_pattern_bindings(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::LexicalPatternBindings> {
+        use brokk_bifrost_jvm::java::structural::{
+            java_pattern_binding_declaration, java_pattern_binding_visible,
+            java_pattern_bindings_may_escape_scope, java_pattern_scope,
+        };
+        Some(
+            brokk_bifrost_analysis::analyzer::languages::LexicalPatternBindings {
+                declaration_for_name: java_pattern_binding_declaration,
+                is_scope: java_pattern_scope,
+                visible_at: java_pattern_binding_visible,
+                bindings_may_escape_scope: java_pattern_bindings_may_escape_scope,
+            },
+        )
+    }
+
     fn pattern_binding_name_provider(&self) -> Option<PatternBindingNameProvider> {
         Some(brokk_bifrost_jvm::java::structural::java_pattern_binding_name)
     }
@@ -2143,6 +2353,10 @@ impl LanguageSupport for JavaSupport {
     }
 }
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for JavaSupport {
+    fn supports_direct_type_shapes(&self) -> bool {
+        true
+    }
+
     fn root_source_horizon_follows_provenance(&self) -> bool {
         // Local identities stay in their host mount, including nonshared stage
         // allocations. Selected root and JVM bridges cannot classify as Import
@@ -2260,9 +2474,12 @@ impl DeadCodeBulkProof for JavaDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        build_fqn_bulk_edges(analyzer, Language::Java, candidates, |analyzer, nodes| {
-            build_java_usage_edges(analyzer, nodes, |_| true)
-        })
+        build_fqn_bulk_edges(
+            analyzer,
+            Language::Java,
+            candidates,
+            |analyzer, nodes, _kinds| build_java_usage_edges(analyzer, nodes, |_| true),
+        )
     }
 }
 

@@ -155,3 +155,40 @@ fn declaration_name_range(php: &dyn PhpSource, declaration: &CodeUnit) -> Option
     let range = source.source.occurrence(name).range;
     Some((range.start_byte, range.end_byte))
 }
+
+#[cfg(test)]
+mod source_range_boundary_tests {
+    use super::*;
+    use crate::graph::syntax::graph_boundary_tests::Fixture;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: uppercase interface implementations lost override hits"
+    )]
+    fn published_override_name_range_selects_the_forward_identifier() {
+        let fixture = Fixture::new(
+            "<?php\ninterface Notifier {\n function notify();\n}\nclass Concrete implements Notifier {\n public function NOTIFY() {}\n}\n",
+        );
+        for name in ["Notifier.notify", "Concrete.NOTIFY"] {
+            let unit = fixture.unit(name);
+            let (start, end) = declaration_name_range(&fixture, &unit).unwrap();
+            assert!(start < end);
+            assert_eq!(&fixture.source[start..end], unit.identifier());
+        }
+        let spec = crate::graph::resolver::TargetSpec::from_target(
+            &fixture,
+            &fixture.unit("Notifier.notify"),
+        )
+        .unwrap();
+        let hierarchy =
+            crate::graph::resolver::PhpHierarchyIndex::for_target_owner(&fixture, &spec);
+        let implementations = hierarchy.overriding_methods(
+            &fixture,
+            &spec,
+            &brokk_bifrost_core::hash::HashSet::from_iter([fixture.file.clone()]),
+            None,
+        );
+        assert_eq!(implementations, vec![fixture.unit("Concrete.NOTIFY")]);
+    }
+}

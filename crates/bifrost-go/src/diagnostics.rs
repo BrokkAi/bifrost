@@ -26,11 +26,11 @@ use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::Node;
 
 use crate::declarations::{declared_go_package_name, is_predeclared_go_type};
-use crate::graph::ast::{
-    for_each_parameter_declaration, range_clause_binding_names, range_clause_is_short_declaration,
-};
 use crate::graph::resolver::GoImportBindings;
 use crate::packages::{GO_MODULE_SCOPE_SEGMENT, canonical_go_package_name};
+use crate::syntax::{
+    for_each_parameter_declaration, range_clause_binding_names, range_clause_is_short_declaration,
+};
 
 pub const GO_UNRECOGNIZED_SYMBOL: &str = "go_unrecognized_symbol";
 pub const GO_UNRECOGNIZED_PACKAGE_MEMBER: &str = "go_unrecognized_package_member";
@@ -154,6 +154,7 @@ enum ExternalOutcome {
 enum ScanFrame<'tree> {
     Node(Node<'tree>),
     ExitScope,
+    SeedSpec(Node<'tree>),
     SeedShortVar(Node<'tree>),
     SeedRange(Node<'tree>),
 }
@@ -171,6 +172,7 @@ impl GoDiagnosticCollector<'_> {
             match frame {
                 ScanFrame::Node(node) => self.scan_node(node, &mut scopes, &mut stack),
                 ScanFrame::ExitScope => scopes.exit(),
+                ScanFrame::SeedSpec(node) => self.seed_spec_names(node, &mut scopes),
                 ScanFrame::SeedShortVar(node) => self.seed_short_var_declaration(node, &mut scopes),
                 ScanFrame::SeedRange(node) => self.seed_range_clause(node, &mut scopes),
             }
@@ -200,7 +202,7 @@ impl GoDiagnosticCollector<'_> {
                     ScanFrame::Node,
                 );
             }
-            "function_declaration" | "method_declaration" => {
+            "function_declaration" | "method_declaration" | "func_literal" => {
                 scopes.enter();
                 self.seed_function_scope(node, scopes);
                 stack.push(ScanFrame::ExitScope);
@@ -249,7 +251,22 @@ impl GoDiagnosticCollector<'_> {
                 );
             }
             "var_declaration" | "const_declaration" => {
-                self.seed_value_declaration(node, scopes);
+                // Package bindings have file-wide scope; local bindings begin
+                // only after their individual VarSpec or ConstSpec.
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "source_file")
+                {
+                    self.seed_value_declaration(node, scopes);
+                }
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    stack,
+                    ScanFrame::Node,
+                );
+            }
+            "var_spec" | "const_spec" => {
+                stack.push(ScanFrame::SeedSpec(node));
                 brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
                     node,
                     stack,
@@ -643,10 +660,17 @@ fn selector_parts<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<(String, Node<'tree>, String, Node<'tree>)> {
-    let mut cursor = node.walk();
-    let mut children = node.named_children(&mut cursor);
-    let qualifier = children.next()?;
-    let field = children.next()?;
+    let (qualifier, field) = match node.kind() {
+        "selector_expression" => (
+            node.child_by_field_name("operand")?,
+            node.child_by_field_name("field")?,
+        ),
+        "qualified_type" => (
+            node.child_by_field_name("package")?,
+            node.child_by_field_name("name")?,
+        ),
+        _ => return None,
+    };
     Some((
         node_text(qualifier, source).to_string(),
         qualifier,
@@ -782,7 +806,19 @@ fn is_keyed_element_key(node: Node<'_>) -> bool {
                 .child_by_field_name("key")
                 .is_some_and(|key| contains_node(key, node))
             {
-                return true;
+                // The grammar wraps keys in literal_element. Only an explicit
+                // map/array/slice type proves that the key is an expression;
+                // a named composite type needs type resolution.
+                let literal = parent.parent().and_then(|body| body.parent());
+                return !literal
+                    .filter(|literal| literal.kind() == "composite_literal")
+                    .and_then(|literal| literal.child_by_field_name("type"))
+                    .is_some_and(|ty| {
+                        matches!(
+                            ty.kind(),
+                            "map_type" | "array_type" | "slice_type" | "implicit_length_array_type"
+                        )
+                    });
             }
             return false;
         }
@@ -822,4 +858,148 @@ pub fn is_predeclared_go_name(name: &str) -> bool {
                 | "real"
                 | "recover"
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::{CodeUnit, Language};
+    use brokk_bifrost_test_macros::hardwon;
+
+    struct EmptyWorkspace;
+    impl BoundedDefinitionLookup for EmptyWorkspace {
+        fn fqn(&self, _: &str) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+        fn fqn_in_language(&self, _: &str, _: Language) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+        fn file_identifier(&self, _: &ProjectFile, _: &str) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+        fn fqn_direct_children(&self, _: &str) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+        fn package_exists(&self, _: &str) -> bool {
+            false
+        }
+        fn package_exists_in_language(&self, _: &str, _: Language) -> bool {
+            false
+        }
+        fn fqn_prefix_exists(&self, _: &str) -> bool {
+            false
+        }
+    }
+    impl GoExternalEvidence for EmptyWorkspace {
+        fn package_surface(&self, _: &str) -> GoPackageSurface {
+            GoPackageSurface::Unpublished
+        }
+        fn publishes_member(&self, _: &str, _: &str) -> bool {
+            false
+        }
+        fn unindexed_boundary(&self, _: &str) -> BoundaryStatus {
+            BoundaryStatus::ExternalUnknown
+        }
+    }
+    fn report(source: &str) -> SemanticDiagnosticReport {
+        collect_go_semantic_diagnostics(
+            &GoImportBindings::default(),
+            &EmptyWorkspace,
+            &EmptyWorkspace,
+            &ProjectFile::new(std::env::temp_dir(), "main.go"),
+            source,
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: local initializers and closure parameters escaped lexical scope"
+    )]
+    fn local_scope_boundaries() {
+        // Go specification: local var/const scope starts after the spec;
+        // parameters end with their function body, including function literals.
+        let mut failures = Vec::new();
+        for (body, absent) in [
+            ("const x=x; _=x", vec!["x"]),
+            ("var x=x; _=x", vec!["x"]),
+            ("x := x+1; _=x", vec!["x"]),
+            ("var (a=b; b=1); _=a; _=b", vec!["b"]),
+            ("const (a=b; b=1); _=a; _=b", vec!["b"]),
+            ("const (a=1; b=a); var (c=b; d=c); _=d", vec![]),
+            ("x:=1; {var x=x; _=x}; _=x", vec![]),
+            ("_=func(x int){_=x}; _=x", vec!["x"]),
+            ("_=func(x Missing){}; _=x", vec!["Missing", "x"]),
+            ("_=func(x ...Missing){}", vec!["Missing"]),
+            ("clear(map[int]int{}); clear([]int{1})", vec![]),
+        ] {
+            let source = format!("package p\nfunc f(){{{body}}}\n");
+            let result = report(&source);
+            let names: Vec<_> = result
+                .diagnostics()
+                .iter()
+                .map(|d| source[d.range.start_byte..d.range.end_byte].to_string())
+                .collect();
+            if names != absent {
+                failures.push(format!("{body}: expected {absent:?}, got {names:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        let result = report("package p\nfunc F[T interface{ ~[]U }, U any](x T){}\n");
+        assert!(result.diagnostics().is_empty(), "{result:?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: explicit map keys hid undefined expressions"
+    )]
+    fn explicit_composite_key_expressions() {
+        let result = report("package p\nvar M=map[string]int{missing:1}\n");
+        assert_eq!(result.diagnostics().len(), 1, "{result:?}");
+        assert_eq!(
+            result.diagnostics()[0].message,
+            "unrecognized Go symbol `missing`"
+        );
+        let result = report("package p\nvar S=struct{x int}{x:1}\n");
+        assert!(result.diagnostics().is_empty(), "{result:?}");
+    }
+
+    #[test]
+    fn diagnostic_budget_boundaries() {
+        use brokk_bifrost_core::analyzer::model::SemanticDiagnosticOutcome;
+        let base = "package p\n/*";
+        for extra in [0, 1] {
+            let source = format!(
+                "{base}{}*/",
+                " ".repeat(MAX_GO_SEMANTIC_DIAGNOSTIC_BYTES - base.len() - 2 + extra)
+            );
+            let result = report(&source);
+            assert_eq!(result.outcomes().len(), extra, "{result:?}");
+            if extra == 1 {
+                assert!(
+                    matches!(&result.outcomes()[0], SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                    if reasons == &[SemanticDiagnosticIncompleteReason::Truncated])
+                );
+            }
+        }
+        let source = format!(
+            "package p\nfunc f(){{{}}}",
+            (0..201)
+                .map(|i| format!("_=missing{i};"))
+                .collect::<String>()
+        );
+        let result = report(&source);
+        assert_eq!(result.diagnostics().len(), 200);
+        assert!(
+            matches!(result.outcomes().last(), Some(SemanticDiagnosticOutcome::Incomplete { reasons, .. })
+            if reasons == &[SemanticDiagnosticIncompleteReason::Truncated])
+        );
+        assert!(
+            result
+                .diagnostics()
+                .last()
+                .unwrap()
+                .message
+                .ends_with("`missing199`")
+        );
+    }
 }

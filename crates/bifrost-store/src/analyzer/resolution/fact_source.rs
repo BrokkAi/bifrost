@@ -634,6 +634,25 @@ pub struct ExternalOwnerIdentity {
     pub owner_fqn: std::sync::Arc<str>,
 }
 
+impl ExternalOwnerIdentity {
+    /// Provider id of an implicit-package name that no selected provider
+    /// declares. Such an owner names a type, but supplies no declaration,
+    /// hierarchy or member inventory, so it does not prove the type exists.
+    pub const UNINDEXED_IMPORT_PROVIDER: &'static str = "jvm-unindexed-import";
+
+    /// Whether a selected provider declares this owner.
+    pub fn is_provider_declared(&self) -> bool {
+        &*self.provider_id != Self::UNINDEXED_IMPORT_PROVIDER
+    }
+}
+
+/// Query-local member coordinates; model members have no JVM inventory ordinal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExternalMemberCoordinate {
+    InventoryOrdinal(u32),
+    ModelMember(crate::analyzer::semantic_model::ModelSymbolRef),
+}
+
 /// One member row in its provider's durable owner inventory. A callable
 /// family locator is dispatch evidence, not this per-overload identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1752,6 +1771,16 @@ pub trait SelectedTypedFactSource {
         Ok(None)
     }
 
+    /// Associated Target declarations of impls for one selected nominal owner.
+    /// The selected subject index is the driver even when the trait is external.
+    fn rust_receiver_impl_targets(
+        &self,
+        _owner: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<SemanticId>> {
+        Ok(Vec::new())
+    }
+
     /// The traits the type declared at `owner` implements that the module
     /// `reference` is written in can name, as those traits' definitions.
     ///
@@ -2504,6 +2533,9 @@ pub trait SelectedTypedFactSource {
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallableSignatureProperty>>,
     ) -> StoreResult<TypedFactReadOutcome>;
 
+    /// Read persisted gap provenance from a possibly mixed completion-reason
+    /// set. Semantic reasons without a persisted gap row contribute no rows;
+    /// absence of provenance does not discharge their completion obligation.
     fn visit_gap_reason_provenance_pages_for_reasons(
         &self,
         reasons: TypedFactRequest<'_, SemanticId>,
@@ -2607,15 +2639,11 @@ pub(crate) fn language_jvm_import_binary_owner(
 }
 
 /// The declared-visibility rules selected for one JVM declaration language.
-pub(crate) const fn language_jvm_declaration_access_rules(
+pub(crate) fn language_jvm_declaration_access_rules(
     language: Language,
 ) -> Option<JvmDeclarationAccessRules> {
-    match language {
-        Language::Java => Some(JvmDeclarationAccessRules::Java),
-        Language::Kotlin => Some(JvmDeclarationAccessRules::Kotlin),
-        Language::Scala => Some(JvmDeclarationAccessRules::Scala),
-        _ => None,
-    }
+    crate::analyzer::store::resolution_operation::nominal_rules::nominal_language_rules(language)
+        .map(|rules| rules.declaration_access_rules())
 }
 
 #[doc(hidden)]
@@ -2849,14 +2877,14 @@ pub(crate) const fn language_applied_members_search_hierarchy(language: Language
 /// clauses (SLS 9.2), including package objects and successive package clauses.
 /// Kotlin likewise takes membership from its package declaration rather than its
 /// source directory. Keep Java and foreign-language admission rules unchanged.
-pub(crate) const fn language_jvm_package_requires_directory_agreement(
+pub(crate) fn language_jvm_package_requires_directory_agreement(
     query_language: Language,
     source_language: Language,
 ) -> bool {
-    !matches!(
-        (query_language, source_language),
-        (Language::Scala, Language::Scala) | (Language::Kotlin, Language::Kotlin)
+    !crate::analyzer::store::resolution_operation::nominal_rules::nominal_language_rules(
+        query_language,
     )
+    .is_some_and(|rules| rules.lexical_package_languages().contains(&source_language))
 }
 
 /// The declared extractor members a language uses for this pattern-head role.

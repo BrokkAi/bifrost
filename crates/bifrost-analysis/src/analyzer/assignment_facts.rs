@@ -2,6 +2,7 @@
 
 use crate::CancellationToken;
 use crate::analyzer::common::{CandidateState, exact_span};
+use crate::analyzer::read_ledger::reason as derivation_reason;
 use crate::analyzer::semantic::statement_entries::ProcedureSyntax;
 use crate::analyzer::semantic::{
     ProcedureHandle, ProcedureSemantics, ProgramPoint, ProgramPointId, SemanticEffect,
@@ -112,7 +113,7 @@ fn pilot_plain_assignment_candidates(
     language: Language,
 ) -> PlainAssignmentCandidates {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
@@ -159,7 +160,7 @@ fn pilot_plain_assignment_candidates(
             }
         },
     ) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     assignments.sort_unstable_by_key(Node::start_byte);
     let points_by_span = exact_program_points_by_span(semantics);
@@ -205,9 +206,9 @@ fn exact_assignment_procedure_node<'syntax>(
     let semantics = procedure.semantics();
     let mapping = semantics
         .source_mapping(semantics.source())
-        .ok_or("procedure_mapping_missing")?;
+        .ok_or(derivation_reason::PROCEDURE_MAPPING_MISSING)?;
     if mapping.kind != SourceMappingKind::Exact {
-        return Err("procedure_mapping_inexact");
+        return Err(derivation_reason::PROCEDURE_MAPPING_INEXACT);
     }
     let span = mapping.locator.anchor().span();
     let node = prepared
@@ -215,9 +216,9 @@ fn exact_assignment_procedure_node<'syntax>(
         .tree()
         .root_node()
         .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-        .ok_or("procedure_syntax_missing")?;
+        .ok_or(derivation_reason::PROCEDURE_SYNTAX_MISSING)?;
     if !exact_span(span, node) || node.has_error() {
-        return Err("procedure_syntax_inexact");
+        return Err(derivation_reason::PROCEDURE_SYNTAX_INEXACT);
     }
     Ok(node)
 }
@@ -276,10 +277,10 @@ pub fn java_overwritten_local_candidates(
         reason: Some(reason),
     };
     if procedure.artifact().key().language().language() != Language::Java {
-        return unavailable("unsupported_language");
+        return unavailable(derivation_reason::UNSUPPORTED_LANGUAGE);
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
@@ -309,7 +310,7 @@ pub fn java_overwritten_local_candidates(
             }
         },
     ) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     nodes.sort_unstable_by_key(Node::start_byte);
     let points_by_span = exact_program_points_by_span(semantics);
@@ -498,10 +499,10 @@ pub fn js_ts_overwritten_local_candidates(
     };
     let language = procedure.artifact().key().language().language();
     if !matches!(language, Language::JavaScript | Language::TypeScript) {
-        return unavailable("unsupported_language");
+        return unavailable(derivation_reason::UNSUPPORTED_LANGUAGE);
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
@@ -521,7 +522,7 @@ pub fn js_ts_overwritten_local_candidates(
                 reason: None,
             }
         } else {
-            unavailable("unsupported_callable_kind")
+            unavailable(derivation_reason::UNSUPPORTED_CALLABLE_KIND)
         };
     }
 
@@ -543,7 +544,7 @@ pub fn js_ts_overwritten_local_candidates(
             }
         },
     ) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     nodes.sort_unstable_by_key(Node::start_byte);
     let points_by_span = exact_program_points_by_span(semantics);
@@ -755,7 +756,7 @@ pub fn python_overwritten_local_candidates(
         reason: Some(reason),
     };
     if procedure.artifact().key().language().language() != Language::Python {
-        return unavailable("unsupported_language");
+        return unavailable(derivation_reason::UNSUPPORTED_LANGUAGE);
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
@@ -790,7 +791,7 @@ pub fn python_overwritten_local_candidates(
             _ => {}
         },
     ) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     nodes.sort_unstable_by_key(Node::start_byte);
     let points_by_span = exact_program_points_by_span(semantics);
@@ -896,7 +897,7 @@ pub fn go_overwritten_local_candidates(
         reason: Some(reason),
     };
     if procedure.artifact().key().language().language() != Language::Go {
-        return unavailable("unsupported_language");
+        return unavailable(derivation_reason::UNSUPPORTED_LANGUAGE);
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
@@ -920,7 +921,7 @@ pub fn go_overwritten_local_candidates(
             _ => {}
         },
     ) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     statements.sort_unstable_by_key(Node::start_byte);
     let points_by_span = exact_program_points_by_span(semantics);
@@ -1142,7 +1143,7 @@ pub fn single_target_overwritten_local_candidates(
             Language::Scala => scala_single_target_write,
             Language::Php => php_single_target_write,
             Language::Ruby => ruby_single_target_write,
-            _ => return unavailable("unsupported_language"),
+            _ => return unavailable(derivation_reason::UNSUPPORTED_LANGUAGE),
         };
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
@@ -1160,7 +1161,7 @@ pub fn single_target_overwritten_local_candidates(
     let mut stack = vec![procedure_node];
     while let Some(node) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
+            return unavailable(derivation_reason::CANCELLED);
         }
         if node.id() != procedure_node.id() && (roles.nested_procedure)(node) {
             continue;
@@ -1438,7 +1439,7 @@ fn single_target_plain_assignment_candidates(
             }
         },
     ) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
     let points_by_span = exact_program_points_by_span(semantics);
 
@@ -2257,9 +2258,15 @@ fn php_dynamic_function_call(node: Node<'_>, source: &str, expected: &str) -> bo
     ) {
         return false;
     }
-    source
-        .get(function.byte_range())
-        .and_then(|name| name.rsplit('\\').next())
+    let terminal = if function.kind() == "name" {
+        Some(function)
+    } else {
+        brokk_bifrost_core::analyzer::tree_walk::single_named_child_matching(function, |child| {
+            child.kind() == "name"
+        })
+    };
+    terminal
+        .and_then(|name| source.get(name.byte_range()))
         .is_some_and(|name| name.eq_ignore_ascii_case(expected))
 }
 
@@ -2374,11 +2381,6 @@ fn ruby_statement_assignment(node: Node<'_>) -> Option<Node<'_>> {
             .child_by_field_name("body")
             .filter(|child| matches!(child.kind(), "assignment" | "operator_assignment"));
     }
-    if node.kind() == "expression_statement" && node.named_child_count() == 1 {
-        return node
-            .named_child(0)
-            .filter(|child| matches!(child.kind(), "assignment" | "operator_assignment"));
-    }
     None
 }
 
@@ -2399,7 +2401,6 @@ fn is_ruby_statement_list(kind: &str) -> bool {
             | "else"
             | "do"
             | "begin"
-            | "rescue"
             | "ensure"
             | "parenthesized_statements"
     )
@@ -2587,7 +2588,7 @@ fn ruby_identifier_value_position(node: Node<'_>) -> bool {
         "parenthesized_statements" => true,
         "assignment" | "operator_assignment" => field_is("right"),
         "call" => field_is("receiver"),
-        "pair" => field_is("value"),
+        "pair" => field_is("key") || field_is("value"),
         "unary" => field_is("operand"),
         _ => false,
     }
@@ -2702,7 +2703,10 @@ fn ruby_closure_procedure(node: Node<'_>) -> bool {
 fn ruby_callable_observes_name(callable: Node<'_>, name: &str, source: &str) -> bool {
     let mut stack = vec![callable];
     while let Some(current) = stack.pop() {
-        if current.id() != callable.id() && ruby_assignment_nested_procedure(current) {
+        if current.id() != callable.id()
+            && ruby_assignment_nested_procedure(current)
+            && !ruby_closure_procedure(current)
+        {
             continue;
         }
         let target_write = matches!(current.kind(), "assignment" | "operator_assignment")
@@ -2747,7 +2751,7 @@ fn ruby_rhs_has_method_or_unresolved_name(
     false
 }
 
-/// C#: an initialized local declarator, an `=` assignment, or an integral
+/// C#: an initialized local declarator, an assignment, or an integral
 /// update expression on a simple name. Field initializers belong to other
 /// procedures. Update candidates join only when the lowering publishes the
 /// exact binding write; a user-defined or non-integral update stays open.
@@ -2778,12 +2782,9 @@ fn csharp_single_target_write<'tree>(
         }
         "assignment_expression" => {
             let left = node.child_by_field_name("left")?;
-            if node
-                .child_by_field_name("operator")
-                .is_none_or(|operator| operator.kind() != "=")
-            {
-                return Some(SingleTargetWrite::Open(node, "compound_assignment"));
-            }
+            // Compound operators read the old target, but their computed
+            // result is a new write. The exact binding-write join below admits
+            // only assignments actually published by semantic lowering.
             Some(match left.kind() {
                 "identifier" => SingleTargetWrite::Candidate {
                     point_node: node,
@@ -3657,5 +3658,309 @@ fn bare_identifier_rhs(mut node: Node<'_>) -> Option<Node<'_>> {
             }
             _ => return None,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parse(source: &str, language: tree_sitter::Language) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        tree
+    }
+
+    fn nodes<'tree>(tree: &'tree tree_sitter::Tree, kind: &str) -> Vec<Node<'tree>> {
+        use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+        let mut found = Vec::new();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if node.kind() == kind {
+                found.push(node);
+            }
+            WalkControl::Continue
+        });
+        found
+    }
+
+    #[test]
+    fn procedure_walk_discards_a_cancelled_prefix() {
+        let tree = parse(
+            "def f(a); a = a; a = 2; end",
+            tree_sitter_ruby::LANGUAGE.into(),
+        );
+        let procedure = nodes(&tree, "method")[0];
+        let cancellation = CancellationToken::default();
+        let mut all = Vec::new();
+        assert!(for_each_procedure_node(
+            procedure,
+            None,
+            |_| false,
+            |n| all.push(n.id())
+        ));
+        assert!(all.len() > 1);
+        let mut prefix = Vec::new();
+        assert!(!for_each_procedure_node(
+            procedure,
+            Some(&cancellation),
+            |_| false,
+            |n| {
+                prefix.push(n.id());
+                cancellation.cancel();
+            }
+        ));
+        assert_eq!(prefix, all[..1]);
+    }
+
+    #[test]
+    fn ruby_assignment_grammar_preserves_modifiers_comments_and_scopes() {
+        for modifier in ["if", "unless", "while", "until"] {
+            let source = format!("def f(a,b,flag); a=b; # inert\n b=a {modifier} flag; end");
+            let tree = parse(&source, tree_sitter_ruby::LANGUAGE.into());
+            let writes = nodes(&tree, "assignment");
+            let wrapper = writes[1].parent().unwrap();
+            assert_eq!(wrapper.child_by_field_name("body"), Some(writes[1]));
+            assert_eq!(ruby_statement_assignment(wrapper), Some(writes[1]));
+            assert_eq!(
+                ruby_next_assignment_start(writes[0]),
+                Some(writes[1].start_byte())
+            );
+        }
+        for source in ["def f; each { x=x }; end", "def f; each do x=x end; end"] {
+            let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+            let write = nodes(&tree, "assignment")[0];
+            let procedure = nearest_ruby_assignment_procedure(write).unwrap();
+            assert!(ruby_closure_procedure(procedure), "{}", procedure.kind());
+            assert_eq!(
+                ruby_dynamic_scope_reason(write, source),
+                Some("block_local_or_captured_write")
+            );
+        }
+    }
+
+    #[test]
+    fn ruby_rescue_and_receiver_fields_preserve_binding_roles() {
+        for source in [
+            "def f; begin; fail; rescue => eval; eval; end; end",
+            "def f; for eval in values; eval; end; end",
+            "def f(eval); eval; end",
+        ] {
+            let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+            let procedure = nodes(&tree, "method")[0];
+            let uses = nodes(&tree, "identifier")
+                .into_iter()
+                .filter(|n| &source[n.byte_range()] == "eval")
+                .collect::<Vec<_>>();
+            assert!(uses.len() >= 2);
+            assert!(
+                ruby_procedure_declares_name(procedure, source, *uses.last().unwrap()),
+                "{source}"
+            );
+        }
+        let source = "def f; x=1; binding.to_s; x=x; end";
+        let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+        let call = nodes(&tree, "call")[0];
+        let receiver = call.child_by_field_name("receiver").unwrap();
+        assert_eq!(&source[receiver.byte_range()], "binding");
+        assert!(ruby_identifier_value_position(receiver));
+        assert_eq!(
+            ruby_dynamic_scope_reason(nodes(&tree, "assignment")[0], source),
+            Some("dynamic_local_scope")
+        );
+        let source = "def f; x=1; eval('x = 2'); x=x; end";
+        let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+        let method = nodes(&tree, "call")[0]
+            .child_by_field_name("method")
+            .unwrap();
+        assert_eq!(&source[method.byte_range()], "eval");
+        assert_eq!(
+            ruby_dynamic_scope_reason(nodes(&tree, "assignment")[0], source),
+            Some("dynamic_local_scope")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: evaluated hash keys lost capture reads"
+    )]
+    fn ruby_closure_observations_include_evaluated_hash_keys() {
+        for expression in ["{x => 0}", "{0 => x}", "x.to_s"] {
+            let source = format!("def f; x=1; reader=-> {{ {expression} }}; x=2; reader.call; end");
+            let tree = parse(&source, tree_sitter_ruby::LANGUAGE.into());
+            let procedure = nodes(&tree, "method")[0];
+            let target = nodes(&tree, "assignment")[0]
+                .child_by_field_name("left")
+                .unwrap();
+            assert!(
+                ruby_nested_callable_observes_name(procedure, target, &source),
+                "{source}"
+            );
+        }
+        for expression in [
+            "def other; x; end",
+            "class Other; x; end",
+            "reader=-> { 0 }",
+        ] {
+            let source = format!("def f; x=1; {expression}; x=2; end");
+            let tree = parse(&source, tree_sitter_ruby::LANGUAGE.into());
+            let procedure = nodes(&tree, "method")[0];
+            let target = nodes(&tree, "assignment")[0]
+                .child_by_field_name("left")
+                .unwrap();
+            assert!(
+                !ruby_nested_callable_observes_name(procedure, target, &source),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_grammar_distinguishes_const_and_annotated_final_locals() {
+        for (source, accepted) in [
+            ("let a=1;", true),
+            ("var a=1;", true),
+            ("const a=1;", false),
+        ] {
+            let tree = parse(source, tree_sitter_javascript::LANGUAGE.into());
+            let name = nodes(&tree, "variable_declarator")[0]
+                .child_by_field_name("name")
+                .unwrap();
+            assert_eq!(
+                ordinary_local_declaration(
+                    name,
+                    source,
+                    Language::JavaScript,
+                    false,
+                    &HashSet::new()
+                )
+                .is_some(),
+                accepted,
+                "{source}"
+            );
+        }
+        for (modifier, is_final) in [
+            ("@Deprecated final", true),
+            ("@Deprecated", false),
+            ("final", true),
+            ("", false),
+        ] {
+            let source = format!("class C {{ void f() {{ {modifier} int a=1; }} }}");
+            let tree = parse(&source, tree_sitter_java::LANGUAGE.into());
+            let declaration = nodes(&tree, "local_variable_declaration")[0];
+            assert_eq!(java_declaration_is_final(declaration), is_final, "{source}");
+        }
+        let tree = parse(
+            "class C { void f() { class Local { int a=1; } } }",
+            tree_sitter_java::LANGUAGE.into(),
+        );
+        let class = nodes(&tree, "class_declaration")[1];
+        assert!(is_nested_body(class, Language::Java));
+        let mut visited = Vec::new();
+        assert!(for_each_procedure_node(
+            nodes(&tree, "method_declaration")[0],
+            None,
+            |n| is_nested_body(n, Language::Java),
+            |n| visited.push(n.kind())
+        ));
+        assert!(!visited.contains(&"variable_declarator"));
+    }
+
+    #[test]
+    fn assignment_adjacency_skips_only_inert_comment_nodes() {
+        let source = "def f(a,b); a=b; # inert\n b=a; c=0; a=b; end";
+        let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+        let writes = nodes(&tree, "assignment");
+        assert_eq!(next_statement(writes[0]), Some(writes[1]));
+        assert_eq!(next_statement(writes[1]), Some(writes[2]));
+        let source = "function f(a,b) { a=b; /* inert */ b=a; ping(); a=b; }";
+        let tree = parse(source, tree_sitter_javascript::LANGUAGE.into());
+        let writes = nodes(&tree, "assignment_expression");
+        assert_eq!(
+            next_assignment_start(writes[0], Language::JavaScript),
+            Some(writes[1].start_byte())
+        );
+        assert_eq!(next_assignment_start(writes[1], Language::JavaScript), None);
+    }
+
+    #[test]
+    fn php_dynamic_call_names_are_terminal_grammar_children() {
+        for spelling in [
+            "extract",
+            "\\extract",
+            "Tools\\extract",
+            "namespace\\extract",
+            "Tools\\ExTrAcT",
+        ] {
+            let source = format!("<?php function f() {{ {spelling}([]); }}");
+            let tree = parse(
+                &source,
+                crate::analyzer::parser_language_for(Language::Php).unwrap(),
+            );
+            let call = nodes(&tree, "function_call_expression")[0];
+            let function = call.child_by_field_name("function").unwrap();
+            if function.kind() != "name" {
+                let terminal =
+                    brokk_bifrost_core::analyzer::tree_walk::single_named_child_matching(
+                        function,
+                        |n| n.kind() == "name",
+                    )
+                    .unwrap();
+                assert!(source[terminal.byte_range()].eq_ignore_ascii_case("extract"));
+            }
+            assert!(
+                php_dynamic_function_call(call, &source, "extract"),
+                "{source}"
+            );
+            assert!(!php_dynamic_function_call(call, &source, "compact"));
+        }
+        let source = "<?php function f($extract) { $extract([]); }";
+        let tree = parse(
+            source,
+            crate::analyzer::parser_language_for(Language::Php).unwrap(),
+        );
+        assert!(!php_dynamic_function_call(
+            nodes(&tree, "function_call_expression")[0],
+            source,
+            "extract"
+        ));
+    }
+    #[test]
+    fn ruby_reexecution_belongs_to_its_lexical_procedure() {
+        for source in [
+            "def f; x=1; begin; x=2; rescue; retry; end; end",
+            "def f(flag); x=1; while flag; x=2; redo; end; end",
+        ] {
+            let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+            assert!(
+                ruby_procedure_reexecutes(nodes(&tree, "assignment")[0]),
+                "{source}"
+            );
+        }
+        let source = "def f; x=1; def g; begin; fail; rescue; retry; end; end; x=2; end";
+        let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+        assert!(!ruby_procedure_reexecutes(nodes(&tree, "assignment")[0]));
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: nested closures lost transitive capture reads"
+    )]
+    fn ruby_closure_observations_include_transitive_captures() {
+        let source = "def f; x=1; reader=-> { -> { x } }; x=2; reader.call.call; end";
+        let tree = parse(source, tree_sitter_ruby::LANGUAGE.into());
+        let procedure = nodes(&tree, "method")[0];
+        let target = nodes(&tree, "assignment")[0]
+            .child_by_field_name("left")
+            .unwrap();
+        assert!(ruby_nested_callable_observes_name(
+            procedure, target, source
+        ));
     }
 }

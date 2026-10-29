@@ -498,6 +498,8 @@ impl PackIdentity {
                 id: format!("declarations.{}", self.ecosystem),
                 activation: vec![self.activation.clone()],
                 payload: AuthoredPayload::DeclarationFacts {
+                    assembly_identity: None,
+                    type_forwards: Vec::new(),
                     types,
                     members,
                     relations: Vec::new(),

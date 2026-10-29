@@ -8,15 +8,16 @@
 //! implicit-entry-point predicate, which reads an `IAnalyzer`.
 
 #[cfg(test)]
+mod receiver_binding_scope_tests;
+#[cfg(test)]
 mod resolver_tests;
 mod shared;
 
 use brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
-use brokk_bifrost_analysis::analyzer::common::contains_java_visibility_modifier;
-
-use brokk_bifrost_analysis::analyzer::common::declaration_header;
+#[doc(hidden)]
+pub use brokk_bifrost_csharp::syntax::csharp_has_modifier;
 
 use brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range;
 
@@ -371,6 +372,23 @@ pub fn csharp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUni
     csharp_main_entry_point(analyzer, candidate) || csharp_test_entry_point(analyzer, candidate)
 }
 
+/// The entry-point classifier for a declaration in a caller-owned indexed
+/// syntax context. A dead-code request can reuse one tree for all candidates.
+#[doc(hidden)]
+pub fn csharp_implicit_entry_point_at_declaration(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    declaration: tree_sitter::Node<'_>,
+    source: &str,
+) -> bool {
+    candidate.is_function()
+        && (csharp_main_entry_point(analyzer, candidate)
+            || brokk_bifrost_csharp::test_detection::csharp_method_has_runnable_test_attribute(
+                declaration,
+                source,
+            ))
+}
+
 fn csharp_test_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return false;
@@ -380,18 +398,20 @@ fn csharp_test_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bo
     };
     analyzer.ranges_of(candidate).into_iter().any(|range| {
         node_for_exact_range(tree.root_node(), &range).is_some_and(|method| {
-            brokk_bifrost_csharp::test_detection::csharp_method_has_runnable_test_attribute(
-                method, &source,
-            )
+            csharp_implicit_entry_point_at_declaration(analyzer, candidate, method, &source)
         })
     })
 }
 
-fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+/// Metadata-only entry-point recognition for callers that own a syntax
+/// context. Static Main needs no source hydration or parse.
+#[doc(hidden)]
+pub fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
     if candidate.identifier() != "Main" {
         return false;
     }
-    let source = analyzer.get_source(candidate, true).unwrap_or_default();
-    let header = declaration_header(&source);
-    contains_java_visibility_modifier(header, "static")
+    analyzer
+        .signature_metadata(candidate)
+        .iter()
+        .any(|metadata| metadata.callable_modifiers_recorded() && metadata.callable_is_static())
 }

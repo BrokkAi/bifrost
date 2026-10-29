@@ -7,6 +7,7 @@
 use crate::graph::resolver::OrphanedNamespaceScopeIndex;
 use crate::graph::syntax::{MacroReplacementField, ObjectMacroReplacement};
 use crate::structural::{CPP_STRUCTURAL_SPEC, is_cpp_preprocessor_conditional};
+use crate::template_heads::cpp_out_of_line_owner_names;
 pub use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::common::{
     parse_source_ranges_with_cancellation, parse_source_region,
@@ -31,7 +32,7 @@ use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceImportId, SourceOccurrenceId,
     SourceOccurrenceProvenance,
 };
-use brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows;
+use brokk_bifrost_core::analyzer::statement_facts::StatementFactRows;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::node_range;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::materialization::{
@@ -451,6 +452,11 @@ pub struct ScopeInfo {
     /// recover it so the definition's indexed identity matches its header
     /// declaration's.
     visible_using_namespaces: Vec<String>,
+    /// The block scope a C++ function-local class is written directly in.
+    /// Only the local-type walk sets it, on the scope it hands one local
+    /// class; `class_unit` takes precedence, and the class's own body scope
+    /// clears it, so members and nested classes keep their ordinary owner.
+    local_block: Option<CppLocalBlock>,
     /// Every namespace-scope `using ns::Type;` declaration lexically visible
     /// at this point, threaded forward like `visible_using_namespaces`. Each
     /// scope clones this list for every sibling it visits while only a using
@@ -475,6 +481,33 @@ pub struct CppUsingDeclarationBinding {
     name: String,
     /// The `::`-joined namespace of the target.
     target_package: String,
+}
+
+/// The lexical identity of one block in a callable body: the callable's own
+/// identity plus a `block@line:column` segment at the block's opening brace.
+/// The coordinate is what separates same-named local classes in overloads
+/// (which share the callable's FqName) and in sibling blocks, without
+/// flattening the class into its enclosing namespace.
+#[derive(Clone)]
+struct CppLocalBlock {
+    callable: CodeUnit,
+    fq: FqName,
+    short_name: String,
+}
+
+impl CppLocalBlock {
+    fn new(callable: &CodeUnit, block: Node<'_>) -> Self {
+        let position = block.start_position();
+        let segment = format!("block@{}:{}", position.row + 1, position.column + 1);
+        Self {
+            fq: callable
+                .fq()
+                .clone()
+                .with_pushed(segment_interner().intern(&segment, SegmentKind::Nested)),
+            short_name: cpp_join_nested_short(callable.short_name(), &segment),
+            callable: callable.clone(),
+        }
+    }
 }
 
 struct CppContainer<'tree> {
@@ -4649,6 +4682,7 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
                     declarations_are_fields: false,
                     recovered_specialization_member_scope: false,
                     visible_using_namespaces: Vec::new(),
+                    local_block: None,
                     visible_using_declarations: Arc::default(),
                 },
             })]
@@ -4673,7 +4707,7 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
     let mut includes = Vec::new();
     let mut expressions = Vec::new();
     let named_record_sizes = crate::source_facts::named_record_size_index(root, source);
-    let mut statement_facts = CppStatementFactRows::default();
+    let mut statement_facts = StatementFactRows::default();
     let mut identifiers = HashSet::default();
     let mut entered = HashSet::default();
     let mut primary_ordinals = HashMap::default();
@@ -5766,6 +5800,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: false,
             recovered_specialization_member_scope: false,
             visible_using_namespaces,
+            local_block: None,
             visible_using_declarations,
         };
         // The work loop dispatches a container's children, never the container
@@ -5976,6 +6011,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: true,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
+            local_block: None,
             visible_using_declarations: scope.visible_using_declarations.clone(),
         };
         let reparsed_ancestry = self.recovery_ancestry(root);
@@ -6073,6 +6109,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: true,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
+            local_block: None,
             visible_using_declarations: scope.visible_using_declarations.clone(),
         };
         let Some(function) = extract_function_info(function_declarator, self.source, &member_scope)
@@ -6158,6 +6195,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: true,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
+            local_block: None,
             visible_using_declarations: scope.visible_using_declarations.clone(),
         };
         let mut root_cursor = root.walk();
@@ -6577,6 +6615,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 declarations_are_fields: true,
                 recovered_specialization_member_scope: false,
                 visible_using_namespaces: scope.visible_using_namespaces.clone(),
+                local_block: None,
                 visible_using_declarations: scope.visible_using_declarations.clone(),
             };
             let complete = outcome.is_some_and(|outcome| {
@@ -6674,6 +6713,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                             .child_by_field_name("name")
                             .is_some_and(|name| name.kind() == "template_type"),
                         visible_using_namespaces: template_scope.visible_using_namespaces.clone(),
+                        local_block: None,
                         visible_using_declarations: template_scope
                             .visible_using_declarations
                             .clone(),
@@ -6706,6 +6746,12 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                             | "field_declaration"
                             | "alias_declaration"
                             | "namespace_definition"
+                            // `template <class T> template <class U> void
+                            // Box<T>::take(U) {}`: an out-of-line member
+                            // template nests one head inside another. The
+                            // inner head is the member's own and replaces the
+                            // signature head when the nested node is visited.
+                            | "template_declaration"
                     ) {
                         let mut template_scope = scope.clone();
                         template_scope.template_signature =
@@ -7552,13 +7598,15 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         }
     }
 
-    /// Index only anonymous aggregate declarations from an ordinary
-    /// function body. Function bodies are otherwise outside the declaration
-    /// walk, but their anonymous aggregate owners must exist so structured
-    /// local binding inference can name their fields (#2994).
-    fn visit_anonymous_local_aggregates_in_function<'tree>(
+    /// Index the local types of an ordinary function body. Function bodies are
+    /// otherwise outside the declaration walk, but their anonymous aggregate
+    /// owners must exist so structured local binding inference can name their
+    /// fields (#2994), and a named C++ local class and its members are query
+    /// targets of their own (#6902).
+    fn visit_local_types_in_function<'tree>(
         &mut self,
         function: Node<'tree>,
+        callable: &CodeUnit,
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
         ancestry: &ParentIndex<'tree>,
@@ -7597,6 +7645,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 node.kind(),
                 "class_specifier" | "struct_specifier" | "union_specifier"
             ) {
+                self.visit_function_local_class(node, callable, scope, stack, ancestry);
                 continue;
             }
             let mut cursor = node.walk();
@@ -7604,6 +7653,46 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             children.reverse();
             pending.extend(children);
         }
+    }
+
+    /// Mint a named C++ class defined in a function body under the identity
+    /// of the block it is written in (see [`CppLocalBlock`]). Its members are
+    /// owned by the class through the ordinary class-body walk.
+    ///
+    /// C block-scope tags are a separate capability and keep their current
+    /// absence. A header is read both ways, so a minted local class is a
+    /// declaration whose existence differs between the two readings, which is
+    /// what the C-reading witness records.
+    fn visit_function_local_class<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        callable: &CodeUnit,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+        ancestry: &ParentIndex<'tree>,
+    ) {
+        if self.c_tag_semantics || cpp_body_node(node).is_none() {
+            return;
+        }
+        let Some(name) = class_like_name(node, self.source, ancestry) else {
+            return;
+        };
+        let block =
+            std::iter::successors(ancestry.parent(node), |current| ancestry.parent(*current))
+                .find(|ancestor| ancestor.kind() == "compound_statement")
+                .expect("a function-local class is written inside the function body");
+        self.c_tag_scope_witness = true;
+        let local_scope = ScopeInfo {
+            package_name: callable.package_name().to_string(),
+            class_unit: None,
+            template_signature: None,
+            template_metadata: None,
+            declarations_are_fields: false,
+            recovered_specialization_member_scope: false,
+            local_block: Some(CppLocalBlock::new(callable, block)),
+            ..scope.clone()
+        };
+        self.visit_named_class_like(node, name, &local_scope, stack, ancestry);
     }
 
     fn visit_error_swallowed_function_declaration<'tree>(
@@ -7906,6 +7995,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: false,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
+            local_block: None,
             visible_using_declarations: scope.visible_using_declarations.clone(),
         })
     }
@@ -7988,6 +8078,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: false,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
+            local_block: None,
             visible_using_declarations: scope.visible_using_declarations.clone(),
         };
         let container = cpp_body_node(node).unwrap_or(node);
@@ -8153,8 +8244,14 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         } else {
             &recovered_scope
         };
+        let local_block = scope
+            .local_block
+            .as_ref()
+            .filter(|_| scope.class_unit.is_none());
         let short_name = if let Some(parent) = &scope.class_unit {
             cpp_join_nested_short(parent.short_name(), &name)
+        } else if let Some(block) = local_block {
+            cpp_join_nested_short(&block.short_name, &name)
         } else {
             name.clone()
         };
@@ -8164,13 +8261,18 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         // segment per class so segment-pop owner navigation keeps working.
         // Every other leaf name stays opaque so a literal `$` in a source
         // identifier never crosses the split/join boundary (#2140).
-        let qualified_chain = if scope.class_unit.is_none() {
+        let qualified_chain = if scope.class_unit.is_none() && local_block.is_none() {
             qualified_class_name_chain(declaration_node, self.source, scope)
                 .filter(|chain| chain.join("$") == name)
         } else {
             None
         };
-        let fq = if let Some(chain) = qualified_chain {
+        let fq = if let Some(block) = local_block {
+            block
+                .fq
+                .clone()
+                .with_pushed(segment_interner().intern(&name, SegmentKind::Nested))
+        } else if let Some(chain) = qualified_chain {
             let mut fq = FqName::new();
             cpp_push_package(&mut fq, &scope.package_name);
             let mut first = true;
@@ -8303,6 +8405,9 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         }
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit.clone());
+        } else if let Some(block) = local_block {
+            self.parsed
+                .add_child(block.callable.clone(), code_unit.clone());
         } else if let Some(module) = &scope.module {
             self.parsed.add_child(module.clone(), code_unit.clone());
         }
@@ -8310,6 +8415,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         if let Some(body) = body {
             let mut nested_scope = scope.clone();
             nested_scope.class_unit = Some(code_unit.clone());
+            nested_scope.local_block = None;
             nested_scope.template_signature = scope.template_signature.clone();
             // Template metadata describes the class just created. It must not
             // leak into ordinary nested declarations in that class's body.
@@ -8689,6 +8795,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                         declarations_are_fields: true,
                         recovered_specialization_member_scope: false,
                         visible_using_namespaces: scope.visible_using_namespaces.clone(),
+                        local_block: None,
                         visible_using_declarations: scope.visible_using_declarations.clone(),
                     };
                     for candidate in cpp_following_named_siblings(node, self.source, ancestry) {
@@ -8894,11 +9001,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             .with_declaration_only(false),
         );
         if let Some(parent) = &scope.class_unit {
-            self.parsed.add_child(parent.clone(), code_unit);
+            self.parsed.add_child(parent.clone(), code_unit.clone());
         } else if let Some(module) = &scope.module {
-            self.parsed.add_child(module.clone(), code_unit);
+            self.parsed.add_child(module.clone(), code_unit.clone());
         }
-        self.visit_anonymous_local_aggregates_in_function(node, scope, stack, ancestry);
+        self.visit_local_types_in_function(node, &code_unit, scope, stack, ancestry);
     }
 
     /// Recover the namespace lost when tree-sitter promotes an export-macro
@@ -9226,6 +9333,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                     declarations_are_fields: true,
                     recovered_specialization_member_scope: false,
                     visible_using_namespaces: class_scope.visible_using_namespaces.clone(),
+                    local_block: None,
                     visible_using_declarations: class_scope.visible_using_declarations.clone(),
                 };
                 // The padded body reparse is its own tree, so it indexes itself.
@@ -9365,6 +9473,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: false,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
+            local_block: None,
             visible_using_declarations: scope.visible_using_declarations.clone(),
         };
         if let Some(fragmented) = cpp_sentinel_fragmented_class_tail(
@@ -9461,6 +9570,7 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             declarations_are_fields: true,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
+            local_block: None,
             visible_using_declarations: scope.visible_using_declarations.clone(),
         };
         for alias in aliases {
@@ -11975,7 +12085,7 @@ fn extract_function_info_from_name(
     let (owner, name, package_name) = if let Some(parts) = recovered_specialization_member {
         parts
     } else if let Some(parts) =
-        split_structured_templated_cpp_name(declarator_name_node, source, scope)
+        split_structured_templated_cpp_name(declarator, declarator_name_node, source, scope)
     {
         parts
     } else {
@@ -12842,6 +12952,7 @@ fn structured_cpp_qualified_components(
 }
 
 fn split_structured_templated_cpp_name(
+    declarator: Node<'_>,
     declarator_name: Node<'_>,
     source: &str,
     scope: &ScopeInfo,
@@ -12880,10 +12991,18 @@ fn split_structured_templated_cpp_name(
     } else {
         package_name
     };
-    let owner_chain = components[owner_start..]
-        .iter()
-        .map(|component| component.name.clone())
-        .collect::<Vec<_>>();
+    // A specialization member keeps its specialization owner (`Box<T*>`)
+    // rather than collapsing into the primary's; a qualifier the template
+    // levels cannot read keeps the bare names.
+    let owner_chain = match cpp_out_of_line_owner_names(declarator, source)
+        .filter(|names| names.len() == components.len())
+    {
+        Some(mut names) => names.split_off(owner_start),
+        None => components[owner_start..]
+            .iter()
+            .map(|component| component.name.clone())
+            .collect::<Vec<_>>(),
+    };
     if owner_chain.is_empty() || terminal.name.is_empty() {
         return None;
     }
@@ -15075,7 +15194,7 @@ enum CppCallableScope<'tree> {
 /// one, and a `compound_statement`, because a body opens a block scope and
 /// nothing declared in it is a member of the class the enclosing definition
 /// belongs to. That is the same rule
-/// `CppVisitor::visit_anonymous_local_aggregates_in_function` applies when it
+/// `CppVisitor::visit_local_types_in_function` applies when it
 /// drops the aggregate carrier, and it keeps this question off the O(depth)
 /// walk a deeply nested generated header would otherwise pay per callable.
 ///
@@ -16823,6 +16942,9 @@ fn cpp_parameter_declarator(parameter: Node<'_>) -> Option<Node<'_>> {
 pub(crate) fn cpp_declarator_adds_indirection(declarator: Node<'_>) -> bool {
     let mut current = Some(declarator);
     while let Some(node) = current {
+        if cpp_is_member_pointer_declarator(node) {
+            return true;
+        }
         if matches!(
             node.kind(),
             "pointer_declarator"
@@ -16880,9 +17002,43 @@ pub(crate) fn reference_declarator_is_rvalue(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "&&")
 }
 
+/// Whether `node` is a pointer-to-member declarator, `Left::*cb` or `Left::*`.
+/// brokk-tree-sitter-cpp 0.24.7 reads one as a `qualified_identifier` whose
+/// `name` is a pointer declarator, possibly behind further scopes
+/// (`A::B::*p`), with the owning class in `scope`.
+fn cpp_is_member_pointer_declarator(node: Node<'_>) -> bool {
+    let mut current = node;
+    while current.kind() == "qualified_identifier" {
+        let Some(name) = current.child_by_field_name("name") else {
+            return false;
+        };
+        if matches!(
+            name.kind(),
+            "pointer_declarator" | "abstract_pointer_declarator" | "pointer_type_declarator"
+        ) {
+            return true;
+        }
+        current = name;
+    }
+    false
+}
+
 fn cpp_declarator_suffix_without_name(node: Node<'_>, source: &str) -> String {
     match node.kind() {
         "identifier" | "field_identifier" => String::new(),
+        // `Left::*cb` keeps its owning class, so `void (Left::*)()` and
+        // `void (Right::*)()` stay distinct overloads (#6902 item 6).
+        "qualified_identifier" if cpp_is_member_pointer_declarator(node) => {
+            let scope = node
+                .child_by_field_name("scope")
+                .map(|scope| normalize_cpp_whitespace(node_text(scope, source)))
+                .unwrap_or_default();
+            let name = node
+                .child_by_field_name("name")
+                .map(|name| cpp_declarator_suffix_without_name(name, source))
+                .unwrap_or_default();
+            format!("{scope}::{name}")
+        }
         "pointer_declarator" | "abstract_pointer_declarator" => {
             let inner = cpp_nested_declarator(node)
                 .map(|child| cpp_declarator_suffix_without_name(child, source))
@@ -22178,23 +22334,38 @@ class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
 }
 "#
             .replace("VirtualBased", name);
-            let tree = crate::diagnostics::parse_cpp_tree(&source);
-            let mut candidate = None;
-            walk_named_tree_preorder(tree.root_node(), true, |node| {
-                let children = node.children(&mut node.walk()).collect::<Vec<_>>();
-                if let Some(recovered) =
-                    fragmented_export_macro_class_body(node, &children, &source)
-                {
-                    candidate = Some(recovered.name);
-                    return WalkControl::Break;
-                }
-                WalkControl::Continue
-            });
+            // Positional recovery once named this class. Since
+            // brokk-tree-sitter-cpp 0.24.7 the grammar reads the head, and an
+            // uppercase name must survive that reading too.
+            let tree = crate::grammar_test_support::tree(&source);
+            crate::grammar_test_support::assert_function_like_export_class_head(
+                &tree, &source, name,
+            );
+            let parsed = parse_cpp_declarations(&source, "virtual-base.hpp");
+            let explicit = parse_cpp_declarations(
+                &source.replace("PROJECT_PUBLIC_API(2, 0) ", ""),
+                "virtual-base.hpp",
+            );
             assert_eq!(
-                candidate.as_deref(),
-                Some(name),
-                "{source}: {}",
-                tree.root_node().to_sexp()
+                declaration_expansion_inventory(&parsed),
+                declaration_expansion_inventory(&explicit),
+                "{name}"
+            );
+            let declarations = parsed.declarations();
+            let class = declarations
+                .iter()
+                .find(|unit| unit.is_class() && unit.fq_name() == format!("api.{name}"))
+                .unwrap_or_else(|| panic!("{name}: missing class: {declarations:#?}"));
+            assert_eq!(
+                parsed.raw_supertypes.get(class),
+                Some(&vec!["BaseKey".to_string()]),
+                "{name}"
+            );
+            assert!(
+                declarations.iter().any(|unit| {
+                    unit.is_function() && unit.fq_name() == format!("api.{name}.algo_name")
+                }),
+                "{name}: the class must own its members: {declarations:#?}"
             );
         }
     }
@@ -22571,6 +22742,7 @@ namespace internal {
             declarations_are_fields: true,
             recovered_specialization_member_scope: true,
             visible_using_namespaces: Vec::new(),
+            local_block: None,
             visible_using_declarations: Arc::default(),
         };
         let collector = RefCell::new(PrimarySourceFactCollector::new(source));
@@ -23950,6 +24122,7 @@ namespace ::cwg311::X {}
             declarations_are_fields: false,
             recovered_specialization_member_scope: false,
             visible_using_namespaces: Vec::new(),
+            local_block: None,
             visible_using_declarations: Arc::default(),
         };
 
@@ -24978,9 +25151,12 @@ class ctx_t ZMQ_FINAL : public thread_ctx_t {
         "364341b21a48: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
     )]
     fn function_like_export_macro_classes_keep_names_and_base_edges() {
-        // Every sibling shape tree-sitter produces after the `class MACRO(2, 0)`
-        // error: a plain body, a single base, `final` without a base, `final`
-        // with one base, and `final` with a comma-separated base list.
+        // Every head shape after `class MACRO(2, 0)`: a plain body, a single
+        // base, `final` without a base, `final` with one base, and `final` with
+        // a comma-separated base list. Older grammars left each in its own
+        // error shape; brokk-tree-sitter-cpp 0.24.7 reads them all as
+        // `class_specifier`s, which publish an empty base list for a class
+        // without bases.
         let source = r#"
 namespace api {
 class PROJECT_PUBLIC_API(2, 0) Prelude {
@@ -25018,6 +25194,14 @@ class PROJECT_PUBLIC_API(2, 0) Woven : public Base, public Mixin {
 } // namespace api
 "#;
         let parsed = parse_cpp_declarations(source, "function-like-export.hpp");
+        let explicit = parse_cpp_declarations(
+            &source.replace("PROJECT_PUBLIC_API(2, 0) ", ""),
+            "function-like-export.hpp",
+        );
+        assert_eq!(
+            declaration_expansion_inventory(&parsed),
+            declaration_expansion_inventory(&explicit)
+        );
         let declarations = parsed.declarations();
         let class_named = |name: &str| {
             declarations
@@ -25039,9 +25223,17 @@ class PROJECT_PUBLIC_API(2, 0) Woven : public Base, public Mixin {
             parsed.raw_supertypes.get(class_named("api.Derived")),
             Some(&vec!["Base".to_string()])
         );
+        // The explicit expansion is the oracle for a class without bases: a
+        // parsed class publishes an empty base list where recovery published
+        // none.
+        let solo = parsed.raw_supertypes.get(class_named("api.Solo"));
         assert_eq!(
-            parsed.raw_supertypes.get(class_named("api.Solo")),
-            None,
+            solo,
+            explicit.raw_supertypes.get(class_named("api.Solo")),
+            "a final class without a base list must match its explicit expansion"
+        );
+        assert!(
+            solo.is_none_or(Vec::is_empty),
             "a final class without a base list must not invent a supertype"
         );
         assert_eq!(
@@ -25129,6 +25321,17 @@ class PROJECT_PUBLIC_API(2, 0) FIRST_MACRO SECOND_MACRO Layered final : public B
 } // namespace api
 "#;
         let parsed = parse_cpp_declarations(source, "positional-export.hpp");
+        let explicit = parse_cpp_declarations(
+            &source
+                .replace("PROJECT_PUBLIC_API(2, 0) ", "")
+                .replace("FIRST_MACRO SECOND_MACRO ", "")
+                .replace("OTHER_MACRO ", ""),
+            "positional-export.hpp",
+        );
+        assert_eq!(
+            declaration_expansion_inventory(&parsed),
+            declaration_expansion_inventory(&explicit)
+        );
         let declarations = parsed.declarations();
         let class_named = |name: &str| {
             declarations
@@ -25148,13 +25351,27 @@ class PROJECT_PUBLIC_API(2, 0) FIRST_MACRO SECOND_MACRO Layered final : public B
             ("api.Decorated", Some(vec!["Base"])),
             ("api.Layered", Some(vec!["Base", "Mixin"])),
         ] {
-            let expected =
-                bases.map(|bases| bases.into_iter().map(str::to_string).collect::<Vec<_>>());
-            assert_eq!(
-                parsed.raw_supertypes.get(class_named(name)),
-                expected.as_ref(),
-                "{name}"
-            );
+            let actual = parsed.raw_supertypes.get(class_named(name));
+            match bases {
+                Some(bases) => assert_eq!(
+                    actual,
+                    Some(&bases.into_iter().map(str::to_string).collect::<Vec<_>>()),
+                    "{name}"
+                ),
+                // `MACRO(2, 0) OTHER_MACRO Plain {` without a base still reaches
+                // recovery, which publishes no base list.
+                None if name == "api.Plain" => assert_eq!(actual, None, "{name}"),
+                // A head the grammar reads publishes the empty base list of
+                // its explicit expansion.
+                None => {
+                    assert_eq!(
+                        actual,
+                        explicit.raw_supertypes.get(class_named(name)),
+                        "{name} must match its explicit expansion"
+                    );
+                    assert!(actual.is_none_or(Vec::is_empty), "{name}");
+                }
+            }
         }
         assert!(
             declarations.iter().all(|unit| !matches!(
@@ -25340,39 +25557,30 @@ class PROJECT_PUBLIC_API(2, 0) {head} : public Exception {{
         "861f46399c96: C++ declaration recovery regressed for embedded function like export class is named by position not spelling"
     )]
     fn embedded_function_like_export_class_is_named_by_position_not_spelling() {
-        // The class embedded in a preceding malformed body follows the same
-        // rule (#2557): `X509_CA` is the class, `OTHER_MACRO` is decoration.
+        // The class after a preceding export class follows the same rule
+        // (#2557): `X509_CA` is the class, `OTHER_MACRO` is decoration. Older
+        // grammars embedded this head in the preceding class's error; since
+        // brokk-tree-sitter-cpp 0.24.7 the grammar reads both heads, and the
+        // class must still be named by position.
         for (head, name) in [("X509_CA", "X509_CA"), ("OTHER_MACRO Verdict", "Verdict")] {
             let source = function_like_export_class_fixture(head, name);
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_cpp::LANGUAGE.into())
-                .expect("set C++ grammar");
-            let tree = parser.parse(&source, None).expect("parse fixture");
-            let mut embedded = Vec::new();
-            let mut stack = vec![tree.root_node()];
-            while let Some(node) = stack.pop() {
-                embedded.extend(
-                    recover_embedded_function_like_export_classes(node, &source)
-                        .into_iter()
-                        .map(|recovered| (recovered.name, recovered.raw_supertypes)),
-                );
-                let mut cursor = node.walk();
-                stack.extend(node.named_children(&mut cursor));
-            }
-            assert!(
-                embedded.contains(&(name.to_string(), vec!["Exception".to_string()])),
-                "{head}: embedded recovery must name the class by position: {embedded:#?}\n{}",
-                tree.root_node().to_sexp()
-            );
-            assert!(
-                embedded
-                    .iter()
-                    .all(|(recovered, _)| recovered != "OTHER_MACRO"),
-                "{head}: the object-like macro is not a class: {embedded:#?}"
+            let tree = crate::grammar_test_support::tree(&source);
+            crate::grammar_test_support::assert_function_like_export_class_head(
+                &tree, &source, name,
             );
 
             let parsed = parse_cpp_declarations(&source, "embedded-positional-export.hpp");
+            let explicit = parse_cpp_declarations(
+                &source
+                    .replace("PROJECT_PUBLIC_API(2, 0) ", "")
+                    .replace("OTHER_MACRO ", ""),
+                "embedded-positional-export.hpp",
+            );
+            assert_eq!(
+                declaration_expansion_inventory(&parsed),
+                declaration_expansion_inventory(&explicit),
+                "{head}"
+            );
             let declarations = parsed.declarations();
             let class = declarations
                 .iter()
@@ -25508,31 +25716,39 @@ class PROJECT_PUBLIC_API(3, 6) EC_PublicKey final : public virtual Botan::TPM2::
         "1548bb89de04: C++ parser recovery previously lost declaration ownership, member scope, or source identity"
     )]
     fn function_like_export_class_survives_a_preceding_malformed_body() {
+        // Older grammars left the first class's body malformed and embedded the
+        // second class in its error. Since brokk-tree-sitter-cpp 0.24.7 both
+        // heads parse, so both classes are ordinary source declarations.
         let source = function_like_export_class_fixture("Invalid_Argument", "Invalid_Argument");
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("set C++ grammar");
-        let tree = parser.parse(&source, None).expect("parse fixture");
-        let mut stack = vec![tree.root_node()];
-        let mut saw_embedded_shape = false;
-        while let Some(node) = stack.pop() {
-            saw_embedded_shape |= recover_embedded_function_like_export_classes(node, &source)
-                .iter()
-                .any(|recovered| recovered.name == "Invalid_Argument");
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
+        let tree = crate::grammar_test_support::tree(&source);
+        for name in ["Exception", "Invalid_Argument"] {
+            crate::grammar_test_support::assert_function_like_export_class_head(
+                &tree, &source, name,
+            );
         }
-        assert!(
-            saw_embedded_shape,
-            "fixture must retain the embedded error geometry: {}",
-            tree.root_node().to_sexp()
-        );
 
         let parsed = parse_cpp_file(
             &ProjectFile::new(std::env::temp_dir(), "embedded-function-like-export.hpp"),
             &source,
             &tree,
+        );
+        let expanded = source.replace("PROJECT_PUBLIC_API(2, 0) ", "");
+        let explicit = parse_cpp_file(
+            &ProjectFile::new(std::env::temp_dir(), "embedded-function-like-export.hpp"),
+            &expanded,
+            &crate::grammar_test_support::tree(&expanded),
+        );
+        assert_eq!(
+            declaration_expansion_inventory(&parsed),
+            declaration_expansion_inventory(&explicit)
+        );
+        assert!(
+            !explicit
+                .materialization_records
+                .iter()
+                .any(|record| matches!(record, MaterializationRecord::RecoveredDeclaration { .. })),
+            "the explicit expansion needs no recovery: {:#?}",
+            explicit.materialization_records
         );
         let declarations = parsed.declarations();
         let exception = declarations
@@ -25553,12 +25769,12 @@ class PROJECT_PUBLIC_API(3, 6) EC_PublicKey final : public virtual Botan::TPM2::
             Some(&vec!["Exception".to_string()])
         );
         assert!(
-            parsed.materialization_records.iter().any(|record| matches!(
+            !parsed.materialization_records.iter().any(|record| matches!(
                 record,
                 MaterializationRecord::RecoveredDeclaration { unit, .. }
                     if unit == invalid
             )),
-            "the embedded class must retain recovery provenance: {:#?}",
+            "a parsed class must not claim recovery provenance: {:#?}",
             parsed.materialization_records
         );
     }
@@ -27494,18 +27710,19 @@ class ARCCache {
         );
     }
 
-    /// Pins today's treatment of a tag declared inside a function body: the
-    /// declaration walk does not descend into statement bodies, so no unit is
-    /// minted for it in either dialect. C block scope is out of scope for the
-    /// dialect change, and this test proves the change did not disturb it.
+    /// A tag declared inside a function body: the C reading mints nothing for
+    /// it (C block scope is a separate capability), while the C++ reading
+    /// mints the local class under its block identity and its nested class
+    /// under the local class (#6902). Neither reading flattens either tag into
+    /// file scope.
     #[test]
     #[hardwon(
         "9cce90a89128: C++ declaration recovery regressed for function local tags are unchanged in both dialects"
     )]
-    fn function_local_tags_are_unchanged_in_both_dialects() {
+    fn function_local_tags_keep_block_scope_in_both_dialects() {
         let source =
             "void run(void) {\n  struct localtag { struct deeper { int v; } d; } item;\n}\n";
-        for name in ["y.c", "y.cpp"] {
+        for (name, local) in [("y.c", false), ("y.cpp", true)] {
             let parsed = parse_cpp_declarations(source, name);
             let declarations = parsed.declarations();
             assert!(
@@ -27518,6 +27735,17 @@ class ARCCache {
                 assert!(
                     declarations.iter().all(|unit| unit.fq_name() != tag),
                     "{name} must not mint {tag}, got {declarations:?}"
+                );
+            }
+            for tag in [
+                "run$block@1:16$localtag",
+                "run$block@1:16$localtag$deeper",
+                "run$block@1:16$localtag.d",
+            ] {
+                assert_eq!(
+                    declarations.iter().any(|unit| unit.fq_name() == tag),
+                    local,
+                    "{name}: {tag} in {declarations:?}"
                 );
             }
         }
@@ -27864,12 +28092,15 @@ public:
         "1c7c8490fb76: C++ declaration recovery regressed for following named siblings cursor matches native traversal"
     )]
     fn following_named_siblings_cursor_matches_native_traversal() {
-        // The damaged #2924 shape scatters members across container siblings,
-        // and the anonymous punctuation forces the cursor to filter children
-        // exactly as Node::next_named_sibling does.
+        // A damaged export-class head scatters members across container
+        // siblings, and the anonymous punctuation forces the cursor to filter
+        // children exactly as Node::next_named_sibling does. The grammar reads
+        // a function-like export macro head since brokk-tree-sitter-cpp
+        // 0.24.7, so the fixture uses an object-like macro before a base
+        // clause, which still has no parse.
         let source = r#"
 namespace api {
-class PROJECT_API(2, 0) Widget : public virtual Base {
+class PROJECT_API Widget : public virtual Base {
   public:
     Widget() {}
     void first();
@@ -28786,18 +29017,7 @@ END_NS
     fn recovered_class_constructor_agrees_with_explicit_expansion() {
         let source = "class API(1) value { public: value(pn_data_t* d); int following(); };";
         let tree = crate::grammar_test_support::tree(source);
-        assert!(
-            crate::grammar_test_support::nodes(tree.root_node())
-                .iter()
-                .any(|node| node.kind() == "call_expression"
-                    && node
-                        .child_by_field_name("arguments")
-                        .is_some_and(|arguments| arguments
-                            .named_child(0)
-                            .is_some_and(|argument| argument.kind() == "binary_expression"))),
-            "{}",
-            tree.root_node().to_sexp()
-        );
+        crate::grammar_test_support::assert_function_like_export_class_head(&tree, source, "value");
         let actual = parse_cpp_declarations(source, "constructor.h");
         let explicit = parse_cpp_declarations(
             "class value { public: value(pn_data_t* d); int following(); };",
@@ -28839,10 +29059,10 @@ class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
 }
 "###;
         let tree = crate::grammar_test_support::tree(source);
-        assert!(
-            tree.root_node().has_error(),
-            "{}",
-            tree.root_node().to_sexp()
+        crate::grammar_test_support::assert_function_like_export_class_head(
+            &tree,
+            source,
+            "VirtualBased",
         );
         let expanded = source.replace("PROJECT_PUBLIC_API(2, 0) ", "");
         let actual = parse_cpp_declarations(source, "virtual-base.h");
@@ -28854,7 +29074,7 @@ class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
     }
 
     #[test]
-    #[ignore = "finds real bug (#6902): semicolon-free macro envelope hides records and restore"]
+    #[hardwon("#6902: a semicolon-free macro envelope hid the records and restore after it")]
     fn recovered_semicolon_free_macro_envelope_agrees_with_expansion() {
         let source = r###"struct Aggregate;
 
@@ -29165,16 +29385,16 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
-    #[ignore = "finds real bug (#6902): consecutive decorated classes lose most members"]
+    #[hardwon("#6902: consecutive decorated export classes lost most of their members")]
     fn recovered_consecutive_export_classes_agree_with_expansion() {
         let source =
             function_like_export_class_fixture("Invalid_Argument final", "Invalid_Argument");
         let tree = crate::grammar_test_support::tree(&source);
-        assert!(
-            tree.root_node().has_error(),
-            "{}",
-            tree.root_node().to_sexp()
-        );
+        for name in ["Exception", "Invalid_Argument"] {
+            crate::grammar_test_support::assert_function_like_export_class_head(
+                &tree, &source, name,
+            );
+        }
         let expanded = source.replace("PROJECT_PUBLIC_API(2, 0) ", "");
         let actual = parse_cpp_declarations(&source, "expansion.h");
         let explicit = parse_cpp_declarations(&expanded, "expansion.h");

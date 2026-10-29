@@ -325,7 +325,11 @@ pub(super) fn read_reverse_adjacency(
     cache: &mut PythonImportCycleCache,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Option<PersistedImportAdjacency> {
-    if !cache.read_scope_recorded && context.analyzer.read_ledger_attached() {
+    if !cache.read_scope_recorded
+        && (brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+            context.analyzer.read_ledger_attached()
+        }))
+    {
         let languages = context.analyzer.languages().into_iter().collect::<Vec<_>>();
         context
             .analyzer

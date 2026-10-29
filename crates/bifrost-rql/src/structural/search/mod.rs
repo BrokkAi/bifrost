@@ -77,6 +77,7 @@ use crate::structural::analysis_context::{
 };
 use crate::structural::capabilities::QueryFeature;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
+use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
 #[cfg(test)]
 use brokk_bifrost_analysis::native_resolution_test_support::SelectedReferenceInverseIndex;
 #[cfg(any(test, feature = "test-support"))]
@@ -158,7 +159,6 @@ mod literal_occurrences;
 mod loop_relations;
 mod materialization;
 mod member_family;
-mod modifier_relations;
 mod occurrences;
 mod pending_cleanup_flow;
 mod python_attribute_shadow;
@@ -277,6 +277,37 @@ pub(crate) mod test_support {
     }
 }
 
+impl QueryExecutionState<'_> {
+    fn diagnostic(
+        analyzer: &dyn IAnalyzer,
+        diagnostic: CodeQueryDiagnostic,
+        cause: Option<DerivationExecutionCause>,
+    ) -> CodeQueryDiagnostic {
+        if cause.is_some() || diagnostic.code.is_execution_state() {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause={} execution_cause={cause:?}",
+                    file!(),
+                    line!(),
+                    diagnostic.code.as_str()
+                )
+            });
+            analyzer.mark_execution_dependent();
+        }
+        diagnostic
+    }
+}
+
+/// Keep the first exact diagnostic value. Source, branch and related evidence
+/// are part of its identity, even when code and message are the same.
+fn normalize_query_diagnostics(diagnostics: Vec<CodeQueryDiagnostic>) -> Vec<CodeQueryDiagnostic> {
+    let mut seen = HashSet::default();
+    diagnostics
+        .into_iter()
+        .filter(|diagnostic| seen.insert(diagnostic.clone()))
+        .collect()
+}
+
 fn incomplete_diagnostic(
     code: CodeQueryDiagnosticCode,
     language: &'static str,
@@ -319,18 +350,40 @@ fn same_range(left: &Range, right: &Range) -> bool {
     left.start_byte == right.start_byte && left.end_byte == right.end_byte
 }
 
+/// Flow reuse resources for a query, optionally including one policy run's root memo.
+/// Converting a workspace state alone deliberately supplies no run memo.
 #[derive(Clone)]
-struct SemanticFlowResources {
-    value_flow_cache: brokk_bifrost_flow::value_flow::ValueFlowCache,
-    type_flow_summaries: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
+pub struct SemanticFlowResources {
+    state: brokk_bifrost_flow::FlowWorkspaceState,
+    root_memo: Option<TypeFlowRootMemo>,
 }
 
 impl SemanticFlowResources {
-    fn from_workspace_state(state: &brokk_bifrost_flow::FlowWorkspaceState) -> Self {
+    pub fn from_workspace_state(state: &brokk_bifrost_flow::FlowWorkspaceState) -> Self {
         Self {
-            value_flow_cache: state.value_flow_cache(),
-            type_flow_summaries: state.type_flow_summaries(),
+            state: state.clone(),
+            root_memo: None,
         }
+    }
+    pub fn with_root_memo(mut self, memo: Option<TypeFlowRootMemo>) -> Self {
+        self.root_memo = memo;
+        self
+    }
+}
+impl From<&brokk_bifrost_flow::FlowWorkspaceState> for SemanticFlowResources {
+    fn from(state: &brokk_bifrost_flow::FlowWorkspaceState) -> Self {
+        Self::from_workspace_state(state)
+    }
+}
+impl From<&SemanticFlowResources> for SemanticFlowResources {
+    fn from(resources: &SemanticFlowResources) -> Self {
+        resources.clone()
+    }
+}
+impl std::ops::Deref for SemanticFlowResources {
+    type Target = brokk_bifrost_flow::FlowWorkspaceState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
     }
 }
 
@@ -486,6 +539,9 @@ impl CodeQueryRowFamilySession {
 
 // `apply_pipeline_step` below (this engine's own per-step dispatch) reaches
 // into `expansions` for its three graph-traversal entry points.
+#[cfg(any(test, feature = "test-support"))]
+pub use effects::cancelled_modeled_call_coverages_for_test;
+
 use execution::*;
 use expansions::{
     call_declaration_expansions, inbound_reference_expansions, scan_outbound_reference_hits,
@@ -720,6 +776,7 @@ pub use results::{CodeQueryRelatedSource, CodeQuerySourceSpan};
 pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
 pub use results::{CodeQueryRustMarkerImpl, CodeQueryRustMarkerUse};
 pub use results::{MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES, render_exhausted_roots};
+pub use type_flow::{CodeQueryRootAllotment, TypeFlowRootMemo};
 
 /// Longest match/capture snippet reported inline; full content is always
 /// reachable via the returned line range.
@@ -1131,15 +1188,19 @@ struct CallShapeValue {
     /// shape came through the ordinary query pipeline. Match-only relations
     /// can project a proven semantic filter back to this source row.
     seed: Option<Arc<SeedMatch>>,
-    /// The exact structural-fact source snapshot that produced `report`.
-    /// Some semantic-only internal shapes have no retained source.
-    source: Option<Arc<str>>,
     /// The normalized facts that produced `report`, retained so relations can
     /// inspect selected literal/type facts without reparsing source text.
     facts: Option<Arc<FileFacts>>,
     /// Exact external identity from the language resolver, independent of
     /// call-binding or semantic-model coverage.
     resolved_external_callee: Option<String>,
+}
+
+impl CallShapeValue {
+    /// The exact source snapshot that produced the report, when retained.
+    fn source(&self) -> Option<&str> {
+        self.facts.as_deref().map(FileFacts::source)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3048,7 +3109,7 @@ struct QueryExecutionState<'a> {
     comparison_chain_operators: HashMap<ProjectFile, Arc<seeds::ComparisonChainOperators>>,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     /// Reused for the full lifetime of this CodeQuery, including later
-    /// receiver steps that resolve additional Go sites.
+    /// receiver steps that resolve additional selected native sites.
     receiver_service: Option<ReceiverQueryService<'a>>,
     semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -3769,6 +3830,7 @@ pub fn execute_code_query_detailed(
 /// use instead of deferring it to a later request.
 pub fn execute_code_query_detailed_eager_index(
     analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
 
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
@@ -3776,6 +3838,7 @@ pub fn execute_code_query_detailed_eager_index(
 ) -> DetailedCodeQueryResult {
     execute_code_query_detailed_eager_index_in_scope(
         analyzer,
+        flow_state,
         query,
         limits,
         cancellation,
@@ -3791,6 +3854,7 @@ pub fn execute_code_query_detailed_eager_index(
 /// dependency and provider lookups.
 pub fn execute_code_query_detailed_eager_index_in_scope(
     analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -3803,7 +3867,7 @@ pub fn execute_code_query_detailed_eager_index_in_scope(
         analyzer,
         token,
         None,
-        None,
+        Some(flow_state.into()),
         None,
         0,
         query,
@@ -3827,6 +3891,7 @@ pub fn execute_code_query_detailed_eager_index_in_scope(
 #[doc(hidden)]
 pub fn execute_code_query_detailed_eager_index_with_row_family_session(
     analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -3834,6 +3899,7 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session(
 ) -> DetailedCodeQueryResult {
     execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
         analyzer,
+        flow_state,
         query,
         limits,
         cancellation,
@@ -3847,6 +3913,7 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session(
 #[doc(hidden)]
 pub fn execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
     analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -3861,7 +3928,7 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
         analyzer,
         token,
         None,
-        None,
+        Some(flow_state.into()),
         None,
         0,
         query,
@@ -3992,6 +4059,7 @@ pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_s
 /// step reports `SemanticWorkspaceRequired` and the plan is invalid.
 pub fn execute_code_query_detailed_eager_index_workspace(
     workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
 
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
@@ -3999,6 +4067,7 @@ pub fn execute_code_query_detailed_eager_index_workspace(
 ) -> DetailedCodeQueryResult {
     execute_code_query_detailed_eager_index_workspace_in_scope(
         workspace,
+        flow_state,
         query,
         limits,
         cancellation,
@@ -4010,6 +4079,7 @@ pub fn execute_code_query_detailed_eager_index_workspace(
 /// execution scope.
 pub fn execute_code_query_detailed_eager_index_workspace_in_scope(
     workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -4022,7 +4092,7 @@ pub fn execute_code_query_detailed_eager_index_workspace_in_scope(
         workspace.analyzer(),
         token,
         Some(workspace),
-        None,
+        Some(flow_state.into()),
         None,
         0,
         query,
@@ -4115,8 +4185,10 @@ pub fn execute_code_query_expansion(
 #[allow(clippy::too_many_arguments)]
 pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
     workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
+    root_allotment: CodeQueryRootAllotment,
     cancellation: Option<&CancellationToken>,
     parent_semantic: &SemanticBudget,
     parent_execution: &SemanticExecutionBudget,
@@ -4125,8 +4197,10 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
 ) -> DetailedCodeQueryResult {
     execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
         workspace,
+        flow_state,
         query,
         limits,
+        root_allotment,
         cancellation,
         parent_semantic,
         parent_execution,
@@ -4143,8 +4217,10 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
 #[allow(clippy::too_many_arguments)]
 pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_and_row_family_session(
     workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
+    root_allotment: CodeQueryRootAllotment,
     cancellation: Option<&CancellationToken>,
     parent_semantic: &SemanticBudget,
     parent_execution: &SemanticExecutionBudget,
@@ -4154,8 +4230,10 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_a
 ) -> DetailedCodeQueryResult {
     execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
         workspace,
+        flow_state,
         query,
         limits,
+        root_allotment,
         cancellation,
         parent_semantic,
         parent_execution,
@@ -4168,8 +4246,10 @@ pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_a
 #[allow(clippy::too_many_arguments)]
 fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
     workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
+    root_allotment: CodeQueryRootAllotment,
     cancellation: Option<&CancellationToken>,
     parent_semantic: &SemanticBudget,
     parent_execution: &SemanticExecutionBudget,
@@ -4193,7 +4273,7 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
         workspace.analyzer(),
         token,
         Some(workspace),
-        None,
+        Some(flow_state.into()),
         None,
         0,
         query,
@@ -4209,6 +4289,7 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
         Some(SemanticQueryContinuation {
             parent_scope,
             child_semantic_limits: parent_semantic.remaining(),
+            root_allotment,
             execution_before,
             execution_child,
             artifact_leases,
@@ -4223,6 +4304,7 @@ fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_core(
 struct SemanticQueryContinuation {
     parent_scope: SemanticBudgetScopeSnapshot,
     child_semantic_limits: crate::analyzer::semantic::SemanticWork,
+    root_allotment: type_flow::CodeQueryRootAllotment,
     execution_before: SemanticExecutionBudgetSnapshot,
     execution_child: SemanticExecutionBudget,
     artifact_leases: SemanticArtifactLeaseSnapshot,
@@ -4574,10 +4656,10 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
 ) -> DetailedCodeQueryResult {
     let value_flow_cache = semantic_flow_resources
         .as_ref()
-        .map(|resources| resources.value_flow_cache.clone());
+        .map(|resources| resources.value_flow_cache());
     let type_flow_summaries = semantic_flow_resources
         .as_ref()
-        .map(|resources| resources.type_flow_summaries.clone());
+        .map(|resources| resources.type_flow_summaries());
     let active_semantic_model_snapshot = match row_family_stores.as_ref() {
         Some(stores) => stores.active_semantic_model_snapshot.clone(),
         None => analyzer.active_semantic_model_snapshot(),
@@ -4746,6 +4828,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     type_flow_summaries.clone(),
                     &continuation.parent_scope,
                     continuation.child_semantic_limits,
+                    continuation.root_allotment,
                     continuation.execution_before,
                     continuation.execution_child,
                     continuation.artifact_leases,
@@ -4762,6 +4845,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     active_semantic_model_snapshot,
                     value_flow_cache,
                     type_flow_summaries,
+                    CodeQueryRootAllotment::from_execution_limits(&limits),
                 ),
             }),
         import_graph: None,
@@ -4779,6 +4863,9 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         parallel_seed_budget: None,
         scheduler_workers,
     };
+    if let Some(semantic) = state.semantic.as_mut() {
+        semantic.set_root_memo(semantic_flow_resources.and_then(|resources| resources.root_memo));
+    }
     let python_gate_file = {
         let files = state
             .scope
@@ -4829,7 +4916,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         state
             .access_failure
             .get_or_insert_with(|| "workspace content changed before result rendering".to_string());
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -4839,7 +4926,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             message: "workspace content changed after structural posting selection; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }, Some(DerivationExecutionCause::Snapshot)));
     }
     if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
         profile.execution_ns = elapsed_ns(started);
@@ -4848,6 +4935,29 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         .semantic
         .as_ref()
         .map_or_else(CodeQuerySemanticWork::default, SemanticQueryContext::work);
+    // Observe sticky query-local execution state before dropping its ledgers.
+    if execution.cancelled
+        || execution.truncated
+        || state.access_failure.is_some()
+        || semantic_work.budget_exhausted
+        || state.call_cache.effects.truncated
+        || state.control_relation_cache.refusal_count() > 0
+    {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=query_boundary cancelled={} truncated={} provider={} semantic={} effect_coverage={} cfg={}",
+                file!(),
+                line!(),
+                execution.cancelled,
+                execution.truncated,
+                state.access_failure.is_some(),
+                semantic_work.budget_exhausted,
+                state.call_cache.effects.truncated,
+                state.control_relation_cache.refusal_count() > 0
+            )
+        });
+        state.analyzer.mark_execution_dependent();
+    }
     let execution_work_profile =
         capture_profile.then(|| execution_work_snapshot(state.budget, semantic_work));
     let rendering_started = capture_profile.then(Instant::now);
@@ -4943,7 +5053,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
                 && diagnostic.message.contains("structural posting")
         }) {
-            diagnostics.push(CodeQueryDiagnostic {
+            diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -4953,7 +5063,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 message: "source generation changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }, Some(DerivationExecutionCause::Snapshot)));
         }
     }
     if !cancelled && !structural_index_stale {
@@ -4971,6 +5081,21 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 );
             }
         }
+    }
+    // Rendering can itself exhaust provenance/output limits or observe a
+    // stale source after the plan has finished.
+    if cancelled || truncated || state.access_failure.is_some() {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=render_boundary cancelled={} truncated={} provider={}",
+                file!(),
+                line!(),
+                cancelled,
+                truncated,
+                state.access_failure.is_some()
+            )
+        });
+        state.analyzer.mark_execution_dependent();
     }
     let total_work = execution_work_snapshot(state.budget, semantic_work);
     let work = public_execution_work(total_work);
@@ -4997,7 +5122,12 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         results,
         truncated: truncated || cancelled,
         session_subset: session_subset(analyzer),
-        diagnostics,
+        diagnostics: normalize_query_diagnostics(
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| QueryExecutionState::diagnostic(analyzer, diagnostic, None))
+                .collect(),
+        ),
     };
     result.cap_flow_status_by_run();
     let detailed = DetailedCodeQueryResult {
@@ -6927,6 +7057,21 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
     }
 }
 
+/// The configuration fact a row carries, if any. A configuration fact holds
+/// the document source its byte offsets were ingested from, and that source
+/// is the only one its coordinates may be rendered against: configuration
+/// formats have no analyzer delegate, so `IAnalyzer::indexed_source` has no
+/// snapshot of them.
+macro_rules! held_configuration_fact {
+    ($value_type:ident, $value:expr) => {
+        match $value {
+            $value_type::ConfigurationFact(value) => Some(value),
+            $value_type::CrossDomain(value) => value.configuration(),
+            _ => None,
+        }
+    };
+}
+
 /// Retain every source that full-detail terminal and provenance rendering can
 /// consult, before rendering is sealed against untracked cache misses.
 fn retain_budgeted_pipeline_sources(
@@ -6942,6 +7087,7 @@ fn retain_budgeted_pipeline_sources(
     collect_pipeline_value_source_files(&row.value, &mut files);
     if let PipelineValue::StructuralMatch(seed) = &row.value {
         exhausted |= retain_held_source_snapshot(
+            analyzer,
             cache,
             &seed.file,
             seed.facts.source(),
@@ -6950,8 +7096,18 @@ fn retain_budgeted_pipeline_sources(
             diagnostics,
         );
     }
+    if let Some(configuration) = held_configuration_fact!(PipelineValue, &row.value) {
+        exhausted |= retain_held_configuration_snapshot(
+            analyzer,
+            cache,
+            configuration,
+            Vec::new(),
+            diagnostics,
+        );
+    }
     for trace in &row.traces {
         exhausted |= retain_held_source_snapshot(
+            analyzer,
             cache,
             &trace.seed.file,
             trace.seed.facts.source(),
@@ -6961,6 +7117,15 @@ fn retain_budgeted_pipeline_sources(
         );
         for step in &trace.steps {
             collect_trace_value_source_files(&step.value, &mut files);
+            if let Some(configuration) = held_configuration_fact!(PipelineTraceValue, &step.value) {
+                exhausted |= retain_held_configuration_snapshot(
+                    analyzer,
+                    cache,
+                    configuration,
+                    trace.branch.clone(),
+                    diagnostics,
+                );
+            }
             if let Some(via) = &step.via {
                 collect_via_source_files(via, &mut files);
             }
@@ -6974,7 +7139,26 @@ fn retain_budgeted_pipeline_sources(
     exhausted
 }
 
+fn retain_held_configuration_snapshot(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut PipelineRenderCache,
+    configuration: &ConfigurationFactValue,
+    branch: Vec<usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> bool {
+    retain_held_source_snapshot(
+        analyzer,
+        cache,
+        configuration.file(),
+        &configuration.source,
+        Language::None,
+        branch,
+        diagnostics,
+    )
+}
+
 fn retain_held_source_snapshot(
+    analyzer: &dyn IAnalyzer,
     cache: &mut PipelineRenderCache,
     file: &ProjectFile,
     source: &str,
@@ -6987,7 +7171,7 @@ fn retain_held_source_snapshot(
         return false;
     }
     if !conflict_before {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -7000,7 +7184,7 @@ fn retain_held_source_snapshot(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }, Some(DerivationExecutionCause::Snapshot)));
     }
     true
 }
@@ -7216,15 +7400,12 @@ macro_rules! collect_pipeline_source_files {
                 files.insert(value.file().clone());
             }
             $value_type::DependencyEvidence(_) => {}
-            $value_type::ConfigurationFact(value) => {
-                files.insert(value.file().clone());
-            }
+            // Configuration facts carry their held document source; see
+            // `held_configuration_fact`.
+            $value_type::ConfigurationFact(_) => {}
             $value_type::CrossDomain(value) => {
                 if let Some(code) = value.code() {
                     collect_pipeline_value_source_files(code, files);
-                }
-                if let Some(configuration) = value.configuration() {
-                    files.insert(configuration.file().clone());
                 }
             }
         }

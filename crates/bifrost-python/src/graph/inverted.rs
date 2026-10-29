@@ -44,6 +44,7 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::{
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile, Range};
+use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
@@ -108,6 +109,7 @@ impl<'a> PythonEdgeScan<'a> {
         python: &dyn PythonUsageSource,
         file: &ProjectFile,
         input: &FileEdgeScanInput<'_>,
+        cancellation: &CancellationToken,
     ) -> Result<PerFileEdges, ProjectFile> {
         let source = input.source;
         let canonical_imports = python.import_info_of(graph.token, file);
@@ -120,6 +122,9 @@ impl<'a> PythonEdgeScan<'a> {
         let mut named: HashMap<String, String> = HashMap::default();
         let mut namespace: HashMap<String, NamespaceBinding> = HashMap::default();
         for (local, binding) in &binder.bindings {
+            if cancellation.is_cancelled() {
+                return Err(file.clone());
+            }
             match binding.kind {
                 ImportKind::Named => {
                     if let Some(imported) = &binding.imported_name {
@@ -196,6 +201,7 @@ impl<'a> PythonEdgeScan<'a> {
         };
 
         let mut ctx = PyScan {
+            cancellation,
             graph,
             python,
             targets: self.targets,
@@ -214,6 +220,9 @@ impl<'a> PythonEdgeScan<'a> {
         };
         scan_tree(input.root(), &mut ctx);
         ctx.resolve_pending();
+        if cancellation.is_cancelled() {
+            return Err(file.clone());
+        }
         Ok(ctx.edges)
     }
 }
@@ -245,6 +254,7 @@ fn canonical_import_module_fqn(
 }
 
 struct PyScan<'a> {
+    cancellation: &'a CancellationToken,
     graph: &'a PythonGraphSource<'a>,
     python: &'a dyn PythonUsageSource,
     targets: Option<&'a HashSet<String>>,
@@ -528,6 +538,9 @@ impl PyScan<'_> {
         }
         let mut names = Vec::new();
         for item in &self.pending {
+            if self.cancellation.is_cancelled() {
+                return;
+            }
             match item {
                 PendingCallee::Direct { callee, .. } => names.push(callee.clone()),
                 PendingCallee::WithNamespaceFallback { direct, .. } => names.push(direct.clone()),
@@ -541,6 +554,9 @@ impl PyScan<'_> {
         }
         self.graph.index.prefetch_definitions(&names);
         for item in std::mem::take(&mut self.pending) {
+            if self.cancellation.is_cancelled() {
+                return;
+            }
             match item {
                 PendingCallee::Direct {
                     callee,
@@ -625,6 +641,9 @@ fn walk(
     let mut merged_facts = Vec::new();
     let mut stack = vec![WalkFrame::Enter { node, facts }];
     while let Some(frame) = stack.pop() {
+        if ctx.cancellation.is_cancelled() {
+            return;
+        }
         match frame {
             WalkFrame::Enter { node, facts } => match node.kind() {
                 "import_statement" | "import_from_statement" => {}

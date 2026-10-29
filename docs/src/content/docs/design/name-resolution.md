@@ -261,6 +261,16 @@ are not providers. Bifrost reports the tool's discovery error for an unresolved
 import, including the import path, rather than selecting a nearby source copy.
 This retires the legacy nearest-vendor guarantee (#5697).
 
+After a workspace update, native Go discovery includes unsaved Go source when
+an edit changes build constraints, the package clause, cgo use, or imports.
+Body-only edits reuse the existing package placement; body-only buffers are
+overlaid only when some buffer changed membership. When discovery runs for a
+disk-only reason, equal membership digests give the same `go list` answer from
+disk, so body-only buffers need no replacement bytes. Source overlays require
+Go 1.16 or newer when discovery needs their replacement bytes. Unsaved source
+deletions and unsaved changes to `go.mod` or `go.work` are unsupported until
+saved.
+
 Go is the only native language whose prefixes can resolve into a remote source
 environment: a package in the module cache or a vendor tree, prepared as an
 overlay. Rust reads dependency packs and rustdoc JSON, and the JVM languages
@@ -293,6 +303,33 @@ contains, and what it exports and imports. When a query selects a
 revision, its selected context compiles *bridges* from those rows: extra
 partial paths that connect import halves to export halves. A bridge belongs to
 the request. It is never added to any file's stored graph.
+
+### Shared import coordinates
+
+The shared import layer reads one exact route coordinate: the catalog or staged
+route kind and source site, whether it came from staging, and its identity
+digest. The selector is a separate coordinate with its own authority: its kind,
+source name, and local name do not derive from the route. A staged coordinate's
+presence overrides the catalog route and digest even when its route kind or
+digest is NULL. The route kind is a shape vocabulary shared by producers, not a
+language-specific interpretation:
+
+| Producer | Route kinds |
+| --- | --- |
+| Java | `single_type`, `type_on_demand`, `single_static`, `static_on_demand` |
+| Kotlin and Scala | `named` and `star`; Scala selectors retain their source and local names |
+| C# | `using N` writes `type_on_demand`; `using static T` writes `static_on_demand`; `using A = X` writes `named` with a named selector, as implemented in `crates/bifrost-csharp/src/resolution/imports.rs` |
+| Go | Dot imports do not write a shared route kind; their private import facts feed the Go dot-import path. |
+| Python | Does not use the shared import layers: its two-arm import-site crosswalk, its flow-sensitive reaching-import selection and its name-driven star imports fit none of them (see below). |
+
+Python does not use the shared import layers. Its import-site crosswalk has two
+private arms, from route reference to import site and from import demand to
+semantic reference. Its reaching-import selection follows flow-sensitive
+binding events and does not fit the shared scope and depth selection. Python
+star imports are name-driven: for each requested spelling they check the
+target's wildcard export-name surface and `wildcard_inventory_closed`, then
+publish a synthetic route binding with an absence proof. They do not enumerate
+export halves. Python already reads `resolution_import_selectors` directly.
 
 ### Three kinds of derived data
 
@@ -566,16 +603,25 @@ value contributes only its exact projected static type; an unresolved or
 ambiguous projection cannot supply a guessed import owner. Other relations
 close after their positioned reference inputs finish.
 
-JVM candidates carry a query-time rank derived from their binding origin. The
-shared engine compares that rank before its existing path ordering; equal ranks
-retain the existing nearest-scope and tie-break rules. Scala ranks local,
-inherited and same-compilation-unit package declarations first, then explicit
-imports, wildcard imports and package declarations from other files. Java ranks
-local declarations, explicit imports, package declarations and on-demand
-imports in that order. Kotlin ranks local declarations, explicit imports,
-same-package declarations and star imports. The language hook supplies these
-orders; the rank is neither persisted nor reconstructed from an import's own
-scope-choice step.
+Package pairing uses a shared plan builder that reads the chosen sources in
+order and keeps their member inventories and completeness evidence. Go uses a
+shared source-major driver: source, then reference, then matching member. C#
+will use that driver as its namespace support moves onto the shared engine.
+The JVM keeps reference-major emission because its default-import gaps, lookup
+filter and per-candidate access reads interleave with the join. Descriptor
+order reaches answers, so both orders stay intact (#7314).
+
+Lowering persists each route's precedence steps, including the JVM binding
+origin rank. A supplier-dependent package bridge appends its own origin step
+before the path reaches the engine. The engine compares the last origin step
+when both paths carry one, then the shared choice points in path order. Equal
+or unordered paths to distinct targets survive together as an ambiguous answer.
+Scala ranks local, inherited and same-compilation-unit package declarations
+first, then explicit imports, wildcard imports and package declarations from
+other files. Java ranks local declarations, explicit imports, package
+declarations and on-demand imports in that order. Kotlin ranks local
+declarations, explicit imports, same-package declarations and star imports.
+The shared precedence module supplies each language's ranks and lowering form.
 
 ### Typed member lookup
 
@@ -604,6 +650,22 @@ blanket trait implementation, a derive, a `Deref` target, or a trait from an
 unindexed crate can each supply a method. When a lookup's member surface is
 open in this way, the answer is an *open boundary*, not a proof that the member
 does not exist.
+
+Explicit receiver lookup searches ordered levels lazily. It first runs the
+ordinary member search over the original receiver alternatives. An alternative
+with no matching member may then ask its language for a derived receiver; the
+first level with a member wins for that alternative. Rust supplies a user
+`Deref` impl's associated `Target`, evaluated with the receiver's generic
+arguments under the calling site's selected configuration. Standard trait
+identity must be proved from selected routes, never its written name. An
+unproved step retains its candidate with incomplete evidence. A cycle, a
+non-singleton Target, or the eight-step limit stops that alternative with a
+named incomplete reason. A known active cfg impl wins over unknown alternatives,
+which only add incompleteness. Among the remaining alternatives, a common plain
+Target may continue unproved. If any remaining Target is a generic application,
+the step stops with an ambiguous-generic-Target reason, even when the written
+arguments look equal: nominal identity alone cannot prove instantiation equality.
+The levels and their visited sets live for one query.
 
 A member's logical name is stored separately from the declaration returned to
 the caller. Scala generated apply and extractor members can therefore match
@@ -663,6 +725,37 @@ Impl pattern arguments reuse ordinary written type-application argument rows on
 the impl relation's subject slot. This preserves nested positions and written
 pointer/reference deltas without a separate persisted argument family.
 
+### Rust wrapper identity
+
+Selected resolution decides whether a Rust type is a standard-library wrapper.
+It has the crate topology, imports, globs and prelude needed to prove that
+identity. The file-local producer cannot make that decision: an import such as
+`use std::boxed::Box as Heap` gives the same wrapper a different written name.
+It therefore preserves the written head and arguments of every generic declared
+type and emits a conditional payload transfer, without filtering by spelling.
+A local type named `Box`, `Option` or `Result` keeps its own identity.
+
+The shared evaluator asks the Rust language hook to classify the selected head.
+Standard wrapper identity does not require an installed semantic pack.
+Workspace aliases use the shared alias walk; an external alias such as
+`anyhow::Result` remains an unindexed external boundary until its target can be
+proved. Pack-declared aliases are separate work (#7101): a pack may supply an
+alias target, but that target must still pass the identity proof.
+
+A wrapper proof discharges only the boundary reasons for the proved standard
+item and its route. The payload keeps its own completion, together with any
+remaining uncertainty about the head. Without a proof, the analyzer does not
+guess the identity from the name. Incomplete candidates follow the general rule
+below.
+
+The semantic lowerer runs on one file before selected resolution, so it cannot
+use the query-time identity predicate. It uses shared lexical selection through
+`RustOwnershipIndex`, including `resolves_standard_path`. When that selection
+cannot prove a standard head, lowering keeps the general `?` residual flow,
+assigns no standard receiver model owner and makes no conditional `Option`
+Copy claim. This preserves uncertainty when a cross-file glob or another
+unresolved binding could change the type's identity.
+
 ### Reverse search
 
 Finding the references to a declaration works in two steps:
@@ -700,6 +793,12 @@ Otherwise it is *incomplete* and lists reasons, which include:
   candidates (Rust's error E0034 is an example); and
 - reasons that belong to the request, such as cancellation, an exhausted work
   budget, or a route out of a file that no build unit contains.
+
+An incomplete lookup can still supply candidates. Their values continue through
+type evaluation while the answer retains the unresolved reasons. One candidate
+does not make an incomplete lookup complete; multiple candidates are retained
+without preferring a standard-library type. Rust wrapper projection follows
+this same rule.
 
 Reasons that come from file content are stored with that file's rows. Reasons
 that come from the request are never stored, because they say nothing about
@@ -767,12 +866,11 @@ worktree that opens the cache.
 Migration proceeds by consumer family. Each migrated consumer has one
 resolution authority, without a hidden fallback to its previous resolver.
 Go definition and type lookup, call targets and evidence, rename, selected
-inverse references and target-directed usages use the native engine. Its
-rooted and whole-workspace usage graphs retain the incumbent backend,
-including deferred site disambiguation; `BIFROST_TRIAL_NATIVE_GO_GRAPH=1`
-selects the native graph for trial runs. Dead-code analysis also retains the
-incumbent strategy. The previous Go resolver can be removed after these
-remaining consumers move. Kotlin definition and type points use native
+inverse references, target-directed usages, and rooted and whole-workspace
+usage graphs use the native engine. Dead-code analysis retains the incumbent
+strategy because its package-variable initializer callers are not counted by
+the shared native dead-code consumer. The previous Go resolver can be removed
+after those remaining consumers move. Kotlin definition and type points use native
 resolution; its reference and workspace graph consumers retain the existing
 Kotlin edge pass. The incumbent Kotlin point resolver is removed, while
 graph-specific name and hierarchy support remains until those graph
@@ -784,7 +882,7 @@ consumer.
 | Rust | Current | Cargo targets, module trees, editions, `cfg` options, preludes |
 | Kotlin | Current for definition/type points; graph migration pending | Source roots, packages, dependencies; shared JVM ecosystem |
 | Java, Scala | Direction | Source roots, packages, dependencies; shared JVM ecosystem |
-| Go | Current for point, call, rename and target-directed reference consumers; graph rollout in progress | Modules, packages, imports, build constraints |
+| Go | Current for point, call, rename, target-directed references and workspace graphs | Modules, packages, imports, build constraints |
 | JavaScript, TypeScript | Direction | Module resolution and project configuration |
 | Python | Direction | Import roots and packages |
 | C# | Direction | Projects and their references |

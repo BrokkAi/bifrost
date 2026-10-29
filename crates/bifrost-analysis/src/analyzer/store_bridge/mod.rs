@@ -6,8 +6,11 @@ pub mod go_graph;
 pub(crate) mod graph_unit;
 mod graph_workers;
 pub mod jvm_graph;
+pub mod native_graph;
 #[doc(hidden)]
 pub mod parsed_blob;
+#[cfg(any(test, feature = "test-support"))]
+pub mod python_graph;
 pub mod rust_graph;
 pub use parsed_blob::{AnalyzerStoreEngineExt, prepare_parsed_blob_at_generations};
 

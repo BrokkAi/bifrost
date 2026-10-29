@@ -37,12 +37,12 @@ cp -R \
   "${input_dir}/phpstorm-stubs-748ab87d1625/"
 
 cd - >/dev/null
-cargo run --locked --release --features release-tooling \
+cargo run --locked --profile measure --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
   "${output_dir}" \
   semantic-packs/php/phpstorm-stubs-2026.8.29.json \
   "${input_dir}/phpstorm-stubs-748ab87d1625"
-cargo run --locked --release --features release-tooling \
+cargo run --locked --profile measure --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
   "${output_dir}"
 
@@ -56,7 +56,7 @@ if [[ -n "${cache_root}" ]]; then
   fi
   catalog_directory="semantic-pack-catalog.v${catalog_version}"
   mkdir -p "${cache_root}"
-  cargo run --locked --release --features release-tooling \
+  cargo run --locked --profile measure --features release-tooling \
     -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- install \
     "${output_dir}" "${cache_root}/${catalog_directory}"
 fi

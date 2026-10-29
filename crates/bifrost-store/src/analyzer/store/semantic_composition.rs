@@ -57,12 +57,15 @@ pub struct SemanticOverlayBuildIdentity(pub [u8; 32]);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComposedGroupCacheKey {
     pub build: SemanticOverlayBuildIdentity,
+    pub selection_digest: Option<[u8; 32]>,
     pub group: CompositionGroupKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CompositionLookup {
     RecordId(String),
+    SelectedId { language: String, id: String },
+    SelectedName { language: String, name: String },
     OwnerIdentity(CompositionGroupKey),
     Name(String),
     MembersOf(String),
@@ -73,6 +76,7 @@ pub enum CompositionLookup {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompositionDiscoveryCacheKey {
     pub build: SemanticOverlayBuildIdentity,
+    pub selection_digest: Option<[u8; 32]>,
     pub lookup: CompositionLookup,
 }
 
@@ -85,6 +89,12 @@ impl RetainedBytes for CompositionDiscoveryCacheKey {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of_val(self)
             + match &self.lookup {
+                CompositionLookup::SelectedId { language, id } => {
+                    language.capacity() + id.capacity()
+                }
+                CompositionLookup::SelectedName { language, name } => {
+                    language.capacity() + name.capacity()
+                }
                 CompositionLookup::OwnerIdentity(key) => group_owned_bytes(key),
                 CompositionLookup::RecordId(s)
                 | CompositionLookup::Name(s)
@@ -188,6 +198,9 @@ fn charge_provenance(p: &SemanticModelProvenance, heap: &mut RetainedHeap) {
     }
 }
 fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
+    if let Some(mark) = &s.promoted_from {
+        heap.add(mark.declaring_member_id.capacity());
+    }
     for v in [&s.id, &s.name, &s.qualified_name, &s.language] {
         heap.add(v.capacity());
     }

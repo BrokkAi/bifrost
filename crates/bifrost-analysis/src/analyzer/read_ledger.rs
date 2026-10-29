@@ -206,17 +206,170 @@ pub fn file_set_digest<'a>(files: impl IntoIterator<Item = &'a ProjectFile>) -> 
     StableDigest::from_array(hasher.finish())
 }
 
+/// Operational causes carried by producer-owned derivation reason values.
+/// These labels describe outcomes, never source syntax or rendered messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivationExecutionCause {
+    Cancelled,
+    Budget,
+    Snapshot,
+    Provider,
+}
+
+impl DerivationExecutionCause {
+    /// Unknown labels are operational until their producer's cause is audited.
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        reason::classify_known(reason).unwrap_or(Some(Self::Provider))
+    }
+
+    pub fn from_cfg_error<Node: std::fmt::Debug>(
+        error: &crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError<Node>,
+    ) -> Self {
+        use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError;
+        match error {
+            CfgAlgorithmError::Cancelled { .. } => Self::Cancelled,
+            CfgAlgorithmError::ExceededBudget(_) => Self::Budget,
+            CfgAlgorithmError::InvalidNode(node) => {
+                panic!("validated procedure has invalid CFG point {node:?}")
+            }
+        }
+    }
+}
+
+/// Producer-owned labels. One table also generates the regression inventory.
+pub mod reason {
+    use super::DerivationExecutionCause;
+    macro_rules! reasons {
+        ($($name:ident = $label:expr => $cause:expr),* $(,)?) => {
+            $(pub const $name: &str = $label;)*
+            pub fn classify_known(label: &str) -> Option<Option<DerivationExecutionCause>> {
+                match label {
+                    $($name => Some($cause),)*
+                    _ => None,
+                }
+            }
+            #[cfg(test)]
+            const ALL: &[(&str, Option<DerivationExecutionCause>)] = &[$(($name, $cause)),*];
+        };
+    }
+    reasons! {
+        PREPROCESSING_PRESENT = "preprocessing_present" => None,
+        MACRO_POSSIBLE = "macro_possible" => None,
+        CPP_ANALYZER_UNAVAILABLE = "cpp_analyzer_unavailable" => Some(DerivationExecutionCause::Provider),
+        NOT_CPP = "not_cpp" => None,
+        ANCHOR_SYNTAX_MISSING = "anchor_syntax_missing" => None,
+        RETURN_SEMANTICS_MISSING = "return_semantics_missing" => None,
+        ASSIGNMENT_SEMANTICS_MISSING = "assignment_semantics_missing" => None,
+        RESOLVED_CALL_IDENTITY_UNAVAILABLE = "resolved_call_identity_unavailable" => None,
+        CALL_FUNCTION_MISSING = "call_function_missing" => None,
+        RESOLVED_CALL_NAME_MISSING = "resolved_call_name_missing" => None,
+        RESOLVED_CALL_IDENTITY_MISMATCH = "resolved_call_identity_mismatch" => None,
+        CALL_SEMANTICS_MISSING = "call_semantics_missing" => None,
+        RESOLVED_CALL_HEADER_OWNER_MISSING = "resolved_call_header_owner_missing" => None,
+        CALL_ARGUMENTS_MISSING = "call_arguments_missing" => None,
+        CALL_ARGUMENT_MISSING = "call_argument_missing" => None,
+        CALL_ARGUMENT_UNREADABLE = "call_argument_unreadable" => None,
+        CALL_ARGUMENT_ALIAS_UNKNOWN = "call_argument_alias_unknown" => None,
+        // An external boundary depends on the selected external inventory, which
+        // is neither a unit-key dimension nor a ledgered read yet. Promote these
+        // reasons to content only when #7633 (and its per-language siblings) ledger it.
+        OPEN_BOUNDARY = "OpenBoundary" => Some(DerivationExecutionCause::Provider),
+        EXTERNAL_DECLARED_UNINDEXED = "external_declared_unindexed" => Some(DerivationExecutionCause::Provider),
+        OWNER_INVENTORY_OPEN = "OwnerInventoryOpen" => Some(DerivationExecutionCause::Provider),
+        AMBIGUOUS_MEMBER = "ambiguous_member" => None,
+        AMBIGUOUS_PROCEDURE = "ambiguous_procedure" => None,
+        AMBIGUOUS_STATEMENT_SPAN = "ambiguous_statement_span" => None,
+        ASSESSMENT_INCOMPLETE = "assessment_incomplete" => Some(DerivationExecutionCause::Provider),
+        BODY_FIELD_MISSING = "body_field_missing" => None,
+        CANCELLED = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CANCELLED => Some(DerivationExecutionCause::Cancelled),
+        CAUGHT_TYPE_UNRESOLVED = "caught_type_unresolved" => None,
+        CLEANUP_KIND_UNRECOGNIZED = "cleanup_kind_unrecognized" => None,
+        CLEANUP_OUTCOME_UNPROVEN = "cleanup_outcome_unproven" => None,
+        CLEANUP_SEMANTICS_UNPUBLISHED = "cleanup_semantics_unpublished" => None,
+        CLEANUP_SOURCE_MAPPING_MISSING = "cleanup_source_mapping_missing" => None,
+        COMPARISON_BUDGET = "comparison_budget" => Some(DerivationExecutionCause::Budget),
+        CONDITION_FIELD_MISSING = "condition_field_missing" => None,
+        CONTROL_BUDGET_EXHAUSTED = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CONTROL_BUDGET_EXHAUSTED => Some(DerivationExecutionCause::Budget),
+        CONTROL_EVIDENCE_INCOMPLETE = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CONTROL_EVIDENCE_INCOMPLETE => None,
+        CONTROL_FRONTIER_INCOMPLETE = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CONTROL_FRONTIER_INCOMPLETE => None,
+        DEFERRED_BODY = "deferred_body" => None,
+        EFFECTFUL_BODY = "effectful_body" => None,
+        EFFECTFUL_CONDITION = "effectful_condition" => None,
+        HANDLER_IDENTITY_UNPROVEN = "handler_identity_unproven" => None,
+        LEXICAL_BINDING_UNAVAILABLE = "lexical_binding_unavailable" => None,
+        LEXICAL_ENVIRONMENT_INCOMPLETE = "lexical_environment_incomplete" => None,
+        MEMBER_RESOLUTION_UNAVAILABLE = "member_resolution_unavailable" => None,
+        MISSING_BODY = "missing_body" => None,
+        MISSING_BRANCH_FIELD = "missing_branch_field" => None,
+        MISSING_STATEMENT_ENTRY = "missing_statement_entry" => None,
+        MISSING_TRY_BODY = "missing_try_body" => None,
+        NO_ENCLOSING_PROCEDURE = "no_enclosing_procedure" => None,
+        NON_LOCAL_REFERENCE = "non_local_reference" => None,
+        PARTIAL_PROCEDURE = "partial_procedure" => None,
+        PARTIAL_PRODUCER = "partial_producer" => None,
+        PENDING_CLEANUP_STATE_BUDGET_EXHAUSTED = "pending_cleanup_state_budget_exhausted" => Some(DerivationExecutionCause::Budget),
+        PREPARED_SYNTAX_UNAVAILABLE = "prepared_syntax_unavailable" => Some(DerivationExecutionCause::Provider),
+        PROCEDURE_MAPPING_INEXACT = "procedure_mapping_inexact" => None,
+        PROCEDURE_MAPPING_MISSING = "procedure_mapping_missing" => None,
+        PROCEDURE_SEMANTIC_QUALITY_INCOMPLETE = "procedure_semantic_quality_incomplete" => None,
+        PROCEDURE_SYNTAX_AMBIGUOUS = "procedure_syntax_ambiguous" => None,
+        PROCEDURE_SYNTAX_INEXACT = "procedure_syntax_inexact" => None,
+        PROCEDURE_SYNTAX_MISSING = "procedure_syntax_missing" => None,
+        PROCEDURE_SYNTAX_RECOVERY = "procedure_syntax_recovery" => None,
+        QUERY_INCOMPLETE = "query_incomplete" => Some(DerivationExecutionCause::Provider),
+        SNAPSHOT_MISMATCH = "snapshot_mismatch" => Some(DerivationExecutionCause::Snapshot),
+        SOURCE_BUDGET_EXHAUSTED = "source_budget_exhausted" => Some(DerivationExecutionCause::Budget),
+        SOURCE_IDENTITY_MISMATCH = "source_identity_mismatch" => Some(DerivationExecutionCause::Snapshot),
+        SOURCE_LIMIT = "source_limit" => Some(DerivationExecutionCause::Budget),
+        STALE_SOURCE = "stale_source" => Some(DerivationExecutionCause::Snapshot),
+        SYNTAX_RECOVERY = "syntax_recovery" => None,
+        SYNTAX_UNAVAILABLE = "syntax_unavailable" => Some(DerivationExecutionCause::Provider),
+        UNKNOWN = "unknown" => Some(DerivationExecutionCause::Provider),
+        UNPROVEN_ACTIVATION = "unproven_activation" => None,
+        UNSUPPORTED_CALLABLE_KIND = "unsupported_callable_kind" => None,
+        UNSUPPORTED_CASE_FACT = "unsupported_case_fact" => None,
+        UNSUPPORTED_CONDITION = "unsupported_condition" => None,
+        UNSUPPORTED_LANGUAGE = "unsupported_language" => None,
+        UNSUPPORTED_RELATION = "unsupported_relation" => None,
+        WORK_LIMIT = "work_limit" => Some(DerivationExecutionCause::Budget),
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7278: unrecognized operational reason labels defaulted to content"
+    )]
+    fn every_registered_reason_constant_is_classified_and_unknowns_fail_closed() {
+        // This inventories declared constants, not arbitrary future literals
+        // outside the table. Producer regressions must also exercise their
+        // emitted reasons, since their public result fields remain strings.
+        for &(label, expected) in ALL {
+            assert_eq!(classify_known(label), Some(expected), "{label}");
+            assert_eq!(
+                DerivationExecutionCause::from_reason(label),
+                expected,
+                "{label}"
+            );
+        }
+        assert_eq!(
+            DerivationExecutionCause::from_reason("future_execution_stop"),
+            Some(DerivationExecutionCause::Provider)
+        );
+    }
+}
+
 /// The set of inputs one request read, plus the crossings it could not name.
 ///
 /// Shared behind an `Arc` and written from every thread the analyzer spends the
 /// request's work on. A replayable funnel's nested capture shadows only its
-/// explicitly linked enclosing ledger; unrelated concurrent request ledgers
-/// still receive the read. Ordinary nested scopes carry no ledger and leave
+/// explicitly linked enclosing ledger. Reads follow request attribution carried
+/// to each helper task; explicit Broadcast records background inputs on all
+/// active ledgers. Ordinary nested scopes carry no ledger and leave
 /// their enclosing ledger visible.
 #[derive(Debug, Default)]
 pub struct ReadLedger {
     keys: Mutex<HashSet<ReadKey>>,
     unattributed_reads: AtomicUsize,
+    execution_dependences: AtomicUsize,
 }
 
 impl ReadLedger {
@@ -241,9 +394,20 @@ impl ReadLedger {
         self.unattributed_reads.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Execution depended on state that named content reads cannot reproduce.
+    /// Use the same admission rule as an unattributable read.
+    pub fn mark_execution_dependent(&self) {
+        self.execution_dependences.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Execution events survive resolver narrowing: they are not input reads.
+    pub fn execution_dependences(&self) -> usize {
+        self.execution_dependences.load(Ordering::Relaxed)
+    }
+
     /// Whether every read this ledger observed was named.
     pub fn is_bounded(&self) -> bool {
-        self.unattributed_reads() == 0
+        self.unattributed_reads() == 0 && self.execution_dependences() == 0
     }
 
     /// How many funnel crossings could not be attributed to a key.
@@ -431,6 +595,8 @@ mod tests {
             LookupQuestion::Declaration {
                 rel_path: Box::from("src/a.rs"),
                 fq_name: Box::from("f"),
+                kind: brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+                signature: None,
             },
             LookupQuestion::File {
                 rel_path: Box::from("src/a.rs"),
@@ -547,6 +713,8 @@ mod tests {
             LookupQuestion::Declaration {
                 rel_path: Box::from("src/a.rs"),
                 fq_name: Box::from("crate::a::f"),
+                kind: brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+                signature: None,
             },
             LookupQuestion::File {
                 rel_path: Box::from("src/a.rs"),

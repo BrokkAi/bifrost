@@ -26,7 +26,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 
 /// Increment when the rules derived from the same inputs change. Older sets
 /// stop satisfying the validity rule and the next publication replaces them.
-pub const DERIVATION_VERSION: i64 = 1;
+pub const DERIVATION_VERSION: i64 = 2;
 /// The storage language whose revisions publish compilation membership.
 pub const STORAGE_LANGUAGE: &str = "csharp";
 const MAX_CONFIGURATION_FILES: usize = 16 * 1024;
@@ -53,7 +53,7 @@ pub struct CSharpCompilationFacts {
     pub gaps: Vec<CSharpCompilationGap>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CSharpCompilationFact {
     /// Workspace-relative project path, `None` for the implicit compilation,
     /// which holds every selected source.
@@ -68,7 +68,23 @@ pub struct CSharpCompilationFact {
     /// Whether the project receives its references' references by the SDK
     /// default, so readers may walk its edges transitively.
     pub transitive_flow: bool,
+    pub metadata: CSharpCompilationMetadata,
 }
+
+/// Configuration facts read whole for one compilation, never retained as a workspace index.
+#[derive(Debug, Default, PartialEq)]
+pub struct CSharpCompilationMetadata {
+    /// None when configuration cannot establish an assembly name (including a loose compilation).
+    pub assembly_name: Option<String>,
+    pub global_usings: Vec<CSharpGlobalUsing>,
+    pub global_usings_complete: bool,
+    pub internals_visible_to: Vec<String>,
+    pub internals_visible_to_complete: bool,
+}
+
+/// SQL-readable positional [kind, segments, alias, origin] entry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CSharpGlobalUsing(pub String, pub Vec<String>, pub Option<String>, pub String);
 
 #[derive(Debug)]
 pub struct CSharpCompileItem {
@@ -109,6 +125,11 @@ pub struct CSharpCompilationGap {
     pub path: String,
     pub evidence: String,
 }
+
+pub(super) const COMPILATION_METADATA_SQL: &str =
+    "SELECT assembly_name, global_usings_complete, internals_visible_to_complete,
+                    json(global_usings), json(internals_visible_to)
+             FROM csharp_compilations WHERE set_id = ?1 AND project_path IS ?2";
 
 pub(super) const SELECTED_SET_SQL: &str =
     "SELECT sets.set_id, sets.membership_complete, sets.derivation_version
@@ -264,6 +285,11 @@ pub(super) fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> R
             };
             if !store_gaps.is_empty() {
                 facts.membership_complete = false;
+                for compilation in &mut facts.compilations {
+                    compilation.metadata.assembly_name = None;
+                    compilation.metadata.global_usings_complete = false;
+                    compilation.metadata.internals_visible_to_complete = false;
+                }
                 facts.gaps.append(&mut store_gaps);
             }
             insert_set(tx, snapshot, &input_digest, &facts)?
@@ -354,7 +380,7 @@ fn insert_set(
     input_digest: &[u8; 32],
     facts: &CSharpCompilationFacts,
 ) -> Result<i64> {
-    let mut output = CanonicalHasher::new(b"bifrost-csharp-compilation-rules:v1");
+    let mut output = CanonicalHasher::new(b"bifrost-csharp-compilation-rules:v2");
     output.field(
         "membership_complete",
         &[u8::from(facts.membership_complete)],
@@ -370,6 +396,27 @@ fn insert_set(
             &[u8::from(compilation.references_complete)],
         );
         output.field("transitive_flow", &[u8::from(compilation.transitive_flow)]);
+        let metadata = &compilation.metadata;
+        output.field(
+            "assembly_name",
+            &serde_json::to_vec(&metadata.assembly_name).expect("name serializes"),
+        );
+        output.field(
+            "global_usings",
+            &serde_json::to_vec(&metadata.global_usings).expect("usings serialize"),
+        );
+        output.field(
+            "global_usings_complete",
+            &[u8::from(metadata.global_usings_complete)],
+        );
+        output.field(
+            "internals_visible_to",
+            &serde_json::to_vec(&metadata.internals_visible_to).expect("friends serialize"),
+        );
+        output.field(
+            "internals_visible_to_complete",
+            &[u8::from(metadata.internals_visible_to_complete)],
+        );
         for item in &compilation.items {
             output.field(item.kind.label(), item.rel_path.as_bytes());
             for excluded in &item.excluded_trees {
@@ -417,8 +464,10 @@ fn insert_set(
     {
         let mut insert = tx.prepare_cached(
             "INSERT INTO csharp_compilations(
-               set_id, project_path, references_complete, transitive_flow
-             ) VALUES(?1, ?2, ?3, ?4)",
+               set_id, project_path, references_complete, transitive_flow,
+               assembly_name, global_usings_complete, internals_visible_to_complete,
+               global_usings, internals_visible_to
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9))",
         )?;
         let mut items = tx.prepare_cached(
             "INSERT INTO csharp_compilation_items(
@@ -430,7 +479,14 @@ fn insert_set(
                 set_id,
                 compilation.project_path,
                 compilation.references_complete,
-                compilation.transitive_flow
+                compilation.transitive_flow,
+                compilation.metadata.assembly_name,
+                compilation.metadata.global_usings_complete,
+                compilation.metadata.internals_visible_to_complete,
+                serde_json::to_string(&compilation.metadata.global_usings)
+                    .expect("usings serialize"),
+                serde_json::to_string(&compilation.metadata.internals_visible_to)
+                    .expect("friends serialize")
             ])?;
             let compilation_id = tx.last_insert_rowid();
             if let Some(path) = compilation.project_path.as_deref() {
@@ -517,6 +573,51 @@ impl AnalyzerStore {
 }
 
 impl SelectedCSharpCompilations<'_> {
+    /// Assembly and compilation-wide imports for one member of this selection.
+    pub fn metadata(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Option<CSharpCompilationMetadata>> {
+        let row = self
+            .conn
+            .query_row(
+                COMPILATION_METADATA_SQL,
+                params![self.set_id, project_path],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(
+                assembly_name,
+                global_usings_complete,
+                internals_visible_to_complete,
+                usings,
+                friends,
+            )| {
+                Ok(CSharpCompilationMetadata {
+                    assembly_name,
+                    global_usings_complete,
+                    internals_visible_to_complete,
+                    global_usings: serde_json::from_str(&usings).map_err(|error| {
+                        super::StoreError::corrupt(format!("invalid C# global usings: {error}"))
+                    })?,
+                    internals_visible_to: serde_json::from_str(&friends).map_err(|error| {
+                        super::StoreError::corrupt(format!("invalid C# friend assemblies: {error}"))
+                    })?,
+                })
+            },
+        )
+        .transpose()
+    }
+
     /// Whether the rules state all source membership.
     pub fn membership_complete(&self) -> bool {
         self.membership_complete
@@ -875,8 +976,9 @@ mod tests {
                 .then(|| format!("Proj{compilation_id}/Proj{compilation_id}.csproj"));
             conn.execute(
                 "INSERT INTO csharp_compilations(
-                   compilation_id, set_id, project_path, references_complete, transitive_flow
-                 ) VALUES(?1, ?2, ?3, 1, 1)",
+                   compilation_id, set_id, project_path, references_complete, transitive_flow,
+                   global_usings_complete, internals_visible_to_complete, global_usings, internals_visible_to
+                 ) VALUES(?1, ?2, ?3, 1, 1, 1, 1, jsonb('[]'), jsonb('[]'))",
                 params![compilation_id, SET_ID, project_path],
             )
             .unwrap();
@@ -927,7 +1029,11 @@ mod tests {
             }
         }
 
-        let cases: [(&str, Vec<Vec<&str>>); 9] = [
+        let cases: [(&str, Vec<Vec<&str>>); 10] = [
+            (
+                "csharp_compilation_metadata",
+                vec![vec!["sqlite_autoindex_csharp_compilations"]],
+            ),
             (
                 "csharp_selected_set",
                 vec![vec!["selections USING PRIMARY KEY"]],
@@ -1012,6 +1118,7 @@ mod tests {
                 references: Vec::new(),
                 references_complete: false,
                 transitive_flow: true,
+                metadata: CSharpCompilationMetadata::default(),
             }],
             membership_complete: true,
             gaps: vec![CSharpCompilationGap {

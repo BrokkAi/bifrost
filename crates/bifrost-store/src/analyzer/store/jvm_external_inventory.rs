@@ -17,10 +17,11 @@ impl AnalyzerStore {
         &self,
         shard: &ActiveSemanticModelShard,
     ) -> Result<()> {
-        if !matches!(
-            shard.manifest.language.as_str(),
-            "java" | "kotlin" | "scala"
-        ) {
+        if super::resolution_operation::nominal_rules::nominal_package_rules_for_storage(
+            &shard.manifest.language,
+        )
+        .is_none()
+        {
             return Ok(());
         }
         let Some((types, members, _relations)) = shard.decoded().payload().declaration_facts()
@@ -212,11 +213,20 @@ impl AnalyzerStore {
         let owner = member.owner.owner_fqn.to_string();
         let ordinal = member.ordinal;
         self.conn.execute(move |connection| {
-            let encoded: Option<Option<String>> = connection.query_row(
-                "SELECT json(return_type_jsonb) FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3 AND signature_present=1",
-                params![provider, owner, ordinal], |row| row.get(0),
-            ).optional()?;
-            encoded.flatten().map(|value| serde_json::from_str(&value).map_err(|error| StoreError::new(error.to_string()))).transpose()
+            let encoded: Option<Option<String>> = connection
+                .query_row(
+                    super::resolution_operation::nominal_rules::jvm_external_owner_relations()
+                        .member_return_type,
+                    params![provider, owner, ordinal],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            encoded
+                .flatten()
+                .map(|value| {
+                    serde_json::from_str(&value).map_err(|error| StoreError::new(error.to_string()))
+                })
+                .transpose()
         })
     }
 }

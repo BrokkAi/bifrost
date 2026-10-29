@@ -226,6 +226,74 @@ pub(crate) const RESOLUTION_IDENTITY_RECIPES_SQL: &str = "SELECT id, semantic_la
      FROM resolution_identities \
      WHERE id IN (SELECT value FROM json_each(?1))";
 
+// Only durable resolution_identities rows are memoized. Staged recipes remain
+// in the lexical reader, which still observes the current staging generation.
+// This raw-row layer records no ledger keys; caller attribution stays outside it.
+pub(crate) fn read_stored_lookup_recipes(
+    selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+    names: &[i64],
+    cancellation: &crate::CancellationToken,
+) -> crate::analyzer::store::Result<Option<HashMap<i64, ResolutionLookupSemanticRecipe>>> {
+    let mut missing = Vec::new();
+    let mut result = HashMap::default();
+    {
+        let memo = selection.identity_recipe_memo.borrow();
+        for name in names {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            match memo.get(name) {
+                Some(recipe) => {
+                    result.insert(*name, recipe.clone());
+                }
+                None => missing.push(*name),
+            }
+        }
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    if !missing.is_empty() {
+        let ids = super::super::resolution::json_array(missing.iter().copied());
+        let mut statement = selection
+            .connection()
+            .prepare_cached(RESOLUTION_IDENTITY_RECIPES_SQL)?;
+        let mut rows = statement.query([ids])?;
+        let mut found = HashMap::default();
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let id: i64 = row.get(0)?;
+            let recipe = row
+                .get::<_, Option<i64>>(1)?
+                .map(|language| {
+                    Ok::<_, rusqlite::Error>(decode_stored_lookup_recipe(
+                        language,
+                        row.get(2)?,
+                        &row.get::<_, String>(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .transpose()?;
+            found.insert(id, recipe);
+        }
+        let mut memo = selection.identity_recipe_memo.borrow_mut();
+        for name in missing {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            // A missing or NULL recipe is not kept: an in-request publication
+            // (a Rust macro capsule) can fill a NULL recipe through the
+            // resolution_identities UPSERT, so the next read asks SQL again.
+            if let Some(recipe) = found.remove(&name).flatten() {
+                assert!(memo.insert(name, recipe.clone()).is_none());
+                result.insert(name, recipe);
+            }
+        }
+    }
+    Ok(Some(result))
+}
+
 pub(crate) const fn import_route_kind_label(
     kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionImportRouteKind,
 ) -> &'static str {
@@ -825,7 +893,7 @@ pub(super) fn prepare_site_rows(
                 }),
                 unqualified: metadata.map(|metadata| i64::from(metadata.unqualified())),
                 owner,
-                receiver_origin: site.callable_receiver_origin().map(receiver_origin_code),
+                receiver_origin: site.receiver_origin().map(receiver_origin_code),
                 go_spelling_namespace: metadata
                     .and_then(|row| row.go_spelling_namespace())
                     .map(namespace_code),

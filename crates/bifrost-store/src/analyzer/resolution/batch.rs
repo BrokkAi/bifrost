@@ -165,21 +165,10 @@ impl FactReferenceSiteMetadata {
             "reference site range must be ordered"
         );
         assert!(
-            callable_receiver_origin.is_none() || namespace == ResolutionNamespace::Callable,
-            "callable receiver origin requires the callable namespace"
-        );
-        assert!(
-            callable_receiver_origin.is_none()
-                || matches!(
-                    site_kind,
-                    ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
-                ),
-            "callable receiver origin requires a terminal callable reference site"
-        );
-        assert!(
-            callable_receiver_origin
-                .is_none_or(|origin| { origin.is_reference_qualification_valid(unqualified) }),
-            "callable receiver origin must agree with reference qualification"
+            callable_receiver_origin.is_none_or(|origin| {
+                origin.is_reference_valid(namespace, site_kind, unqualified)
+            }),
+            "receiver origin requires a callable or field reference with matching qualification: {namespace:?}, {site_kind:?}, unqualified={unqualified}"
         );
         Self {
             site,
@@ -272,8 +261,23 @@ impl FactReferenceSiteMetadata {
         self.reference_owner
     }
 
-    pub const fn callable_receiver_origin(self) -> Option<ResolutionCallableReceiverOrigin> {
+    /// The producer's receiver identity for a callable or value member reference.
+    pub const fn receiver_origin(self) -> Option<ResolutionCallableReceiverOrigin> {
         self.callable_receiver_origin
+    }
+
+    /// Receiver identity only when this site is a terminal callable reference.
+    pub const fn callable_receiver_origin(self) -> Option<ResolutionCallableReceiverOrigin> {
+        if matches!(self.namespace, ResolutionNamespace::Callable)
+            && matches!(
+                self.site_kind,
+                ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
+            )
+        {
+            self.receiver_origin()
+        } else {
+            None
+        }
     }
 }
 
@@ -3793,6 +3797,7 @@ pub(super) struct SelectedContextOverlayFragmentSourceBlueprint {
     removed_reverse_candidate_gaps: Box<[ReverseCandidateGapIdentity]>,
     added_candidate_paths: Box<[(CandidatePathIdentity, PartialPath)]>,
     boundary_nodes: Box<[BindingNodeId]>,
+    external_definitions: HashMap<BindingNodeId, SemanticId>,
     callable_static_import_boundaries: Box<[BindingNodeId]>,
     shared_semantic_identities: Box<[ResolutionSemanticIdentity]>,
     added_forward: AddedCandidateIndex,
@@ -3801,6 +3806,21 @@ pub(super) struct SelectedContextOverlayFragmentSourceBlueprint {
 }
 
 impl SelectedContextOverlayFragmentSourceBlueprint {
+    /// Source-free external endpoints belong only to this query's replay paths.
+    pub(super) fn with_external_definitions(
+        mut self: Box<Self>,
+        definitions: &HashMap<BindingNodeId, SemanticId>,
+    ) -> Box<Self> {
+        for (_, path) in &self.added_candidate_paths {
+            let node = path.end().node();
+            if let Some(&definition) = definitions.get(&node) {
+                assert!(self.boundary_nodes.binary_search(&node).is_err());
+                self.external_definitions.insert(node, definition);
+            }
+        }
+        self
+    }
+
     fn retain_base_candidate(&self, candidate: CandidatePathIdentity) -> StoreResult<bool> {
         if self
             .added_candidate_paths
@@ -4073,6 +4093,7 @@ impl SelectedContextOverlayFragmentSourceBlueprint {
                 removed_reverse_candidate_gaps,
                 added_candidate_paths,
                 boundary_nodes,
+                external_definitions: HashMap::default(),
                 callable_static_import_boundaries,
                 shared_semantic_identities,
                 added_forward,
@@ -4957,7 +4978,12 @@ impl SelectedContextOverlayFragmentSource<'_> {
                     "endpoint classification requests duplicate node {node}"
                 )));
             }
-            if self.blueprint().boundary_nodes.binary_search(&node).is_ok() {
+            if let Some(&definition) = self.blueprint().external_definitions.get(&node) {
+                staged.insert(
+                    node,
+                    BatchEndpointClassification::new(node, None, Some(definition)),
+                );
+            } else if self.blueprint().boundary_nodes.binary_search(&node).is_ok() {
                 staged.insert(node, BatchEndpointClassification::new(node, None, None));
             } else {
                 delegated.push(node);

@@ -611,7 +611,7 @@ impl<'a> ReceiverQueryService<'a> {
         resolver: &'static dyn StructuralReceiverResolver,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
-        if language != Language::Go || !resolver.reuses_request_scoped_native_points() {
+        if !resolver.reuses_request_scoped_native_points() {
             return resolver.resolve_type_bounded(query);
         }
         {
@@ -635,7 +635,7 @@ impl<'a> ReceiverQueryService<'a> {
         resolver: &'static dyn StructuralReceiverResolver,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
-        if language != Language::Go || !resolver.reuses_request_scoped_native_points() {
+        if !resolver.reuses_request_scoped_native_points() {
             return resolver.resolve_definition_bounded(query);
         }
         {

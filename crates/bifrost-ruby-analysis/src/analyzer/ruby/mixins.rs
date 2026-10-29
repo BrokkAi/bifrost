@@ -22,7 +22,13 @@ use brokk_bifrost_ruby::mixins::{
 impl RubyAnalyzer {
     pub(crate) fn mixin_relations(&self) -> &[TypeRelation] {
         self.mixin_relations
-            .get_or_init(|| ruby_collect_mixin_relations(self))
+            .get_or_init(|| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "ruby.mixin_relations",
+                    || ruby_collect_mixin_relations(self),
+                )
+            })
             .as_slice()
     }
 

@@ -4,6 +4,96 @@ mod jvm_extraction_tests {
     use brokk_bifrost_core::analyzer::Language;
 
     #[test]
+    fn java_two_source_roots_require_exact_uniqueness_then_domain_agreement() {
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
+        use brokk_bifrost_analysis::test_support::token_range;
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+        use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+        use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
+        use brokk_bifrost_jvm_analysis::analyzer::java::native_points::resolve_java_definition_bounded;
+
+        const CALLER: &str = "src/main/nested/src/main/java/p/Caller.java";
+        const TARGET: &str = "src/main/nested/src/main/java/p/Target.java";
+        const SOURCE: &str = "package p; class Caller { Target target; }";
+        const POM: &str = "<project><groupId>test</groupId><artifactId>overlap</artifactId><version>1</version></project>";
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("pom.xml", POM)
+            .file("src/main/nested/pom.xml", POM)
+            .file(CALLER, SOURCE)
+            .file(TARGET, "package p; public class Target {}")
+            .build();
+        let project = fixture.project_dyn();
+        let context = ephemeral_store_context(project.as_ref()).unwrap();
+        let store = std::sync::Arc::clone(&context.store);
+        let analyzer = JavaAnalyzer::new_with_config_store_context(
+            project,
+            AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .unwrap();
+        store.conn.execute(|connection| {
+            let context: i64 = connection.query_row(
+                "SELECT context_id FROM jvm_context_revisions WHERE lang='java'",
+                [], |row| row.get(0),
+            ).unwrap();
+            for path in [CALLER, TARGET] {
+                let count: i64 = connection.query_row(
+                    "SELECT count(*) FROM jvm_selected_source_root_files WHERE context_id=?1 AND rel_path=?2",
+                    rusqlite::params![context, path], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(count, 2, "{path} must have two selected roots");
+            }
+            let access: String = connection.query_row(
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::SOURCE_ACCESS,
+                rusqlite::params![context, None::<i64>, CALLER, None::<i64>, TARGET],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(access, "unknown", "exact root ambiguity cannot authorize access");
+        });
+        // The product read must upgrade that unknown through conventional domain
+        // agreement. Removing the domain stage leaves this result incomplete.
+        let (start_byte, end_byte) = token_range(SOURCE, "Target target", "Target");
+        let site = ResolvedReferenceSite {
+            path: CALLER.into(),
+            text: "Target".into(),
+            focus_start_byte: start_byte,
+            focus_end_byte: end_byte,
+            range: brokk_bifrost_core::analyzer::model::Range {
+                start_byte,
+                end_byte,
+                start_line: 0,
+                end_line: 0,
+            },
+        };
+        let result = resolve_java_definition_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &fixture.file(CALLER),
+                source: SOURCE,
+                tree: None,
+                site: &site,
+                budget: Default::default(),
+                cancellation: None,
+            },
+            || {},
+        );
+        let BoundedResolution::Complete { value, .. } = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:?}");
+        let [target] = value.definitions.as_slice() else {
+            panic!("{value:?}");
+        };
+        assert_eq!(target.source(), &fixture.file(TARGET));
+        assert!(value.diagnostics.is_empty(), "{value:?}");
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "0242909d77ed: Java census G03 (2026-10-15): mismatched package paths retain targets without proving cross-file source access"
     )]

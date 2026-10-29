@@ -139,9 +139,7 @@ fn resolve_subjects(
     identities.sort();
     identities.dedup();
     if identities.is_empty() {
-        return Err(CompositionError::EmptyResolvedEndpointSet {
-            role: EndpointRole::Source,
-        });
+        return Err(CompositionError::EmptyResolvedEndpointSet { role: "Source" });
     }
     if identities.len() > limits.max_endpoints_per_role() {
         return Err(CompositionError::EndpointLimit {

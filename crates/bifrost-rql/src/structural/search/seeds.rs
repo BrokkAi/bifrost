@@ -396,7 +396,10 @@ pub(super) fn prepare_seed_access(
                         access.retained_bytes.saturating_add(index.retained_bytes());
                 }
             }
-            if state.analyzer.read_ledger_attached() && state.scope.seed_files().is_none() {
+            if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+                state.analyzer.read_ledger_attached()
+            }) && state.scope.seed_files().is_none()
+            {
                 // Recorded here and nowhere earlier for a whole-workspace
                 // execution: this is the one point at which the answer is
                 // drawn from the language's complete posting index. A
@@ -998,9 +1001,13 @@ pub(super) fn execute_path_seed(
         else {
             return cancelled_plan_execution();
         };
-        state
-            .path_cache
-            .report_completeness(&file, &result, PATH_QUERY_AXES, diagnostics);
+        state.path_cache.report_completeness(
+            state.analyzer,
+            &file,
+            &result,
+            PATH_QUERY_AXES,
+            diagnostics,
+        );
         let values: Vec<PipelineValue> = result
             .paths
             .iter()
@@ -1461,14 +1468,12 @@ pub(super) fn execute_seed(
     let language_rule = seed.root.language_rule;
     let body_state = seed.root.body_state;
     let body_owner = seed.root.body_owner;
-    let modifier = seed.root.modifier;
     let body_relation = body_state.is_some() || body_owner.is_some();
-    let has_custom_rule = language_rule.is_some() || body_relation || modifier.is_some();
+    let has_custom_rule = language_rule.is_some() || body_relation;
     let mut matcher_seed = seed.clone();
     matcher_seed.root.language_rule = None;
     matcher_seed.root.body_state = None;
     matcher_seed.root.body_owner = None;
-    matcher_seed.root.modifier = None;
     let plan = QueryPlan::for_query(&matcher_seed);
     let analyzer = state.analyzer;
     let mut providers = analyzer.structural_fact_providers();
@@ -1686,7 +1691,13 @@ pub(super) fn execute_seed(
             None
         };
         if source_index.requires_source() && !source_definitely_absent && source.is_none() {
-            push_seed_provider_omission(diagnostics, language, &file, "indexed source snapshot");
+            push_seed_provider_omission(
+                state.analyzer,
+                diagnostics,
+                language,
+                &file,
+                "indexed source snapshot",
+            );
             truncated = true;
             cache_complete = cache_complete.map(|_| false);
             continue;
@@ -1696,6 +1707,7 @@ pub(super) fn execute_seed(
             (None, Some(source)) => source.len(),
             (None, None) => {
                 push_seed_provider_omission(
+                    state.analyzer,
                     diagnostics,
                     language,
                     &file,
@@ -1778,6 +1790,7 @@ pub(super) fn execute_seed(
             let loaded = load_seed_facts(provider, &file, state.cache_profile.as_mut());
             let Some(loaded) = loaded else {
                 push_seed_provider_omission(
+                    state.analyzer,
                     diagnostics,
                     language,
                     &file,
@@ -1909,6 +1922,7 @@ pub(super) fn execute_seed(
                 let loaded = load_seed_facts(provider, &file, state.cache_profile.as_mut());
                 let Some(loaded) = loaded else {
                     push_seed_provider_omission(
+                        state.analyzer,
                         diagnostics,
                         language,
                         &file,
@@ -1932,6 +1946,7 @@ pub(super) fn execute_seed(
                         )
                     });
                     push_seed_provider_omission(
+                        state.analyzer,
                         diagnostics,
                         language,
                         &file,
@@ -2015,27 +2030,22 @@ pub(super) fn execute_seed(
                         _ => super::language_rules::LanguageRuleMatches::default(),
                     };
                     diagnostics.extend(result.diagnostics);
-                    result.ranges
+                    result.matches
                 })
         } else if let Some(state) = body_state {
             source
                 .as_deref()
                 .or(custom_source.as_deref())
                 .map(|relation_source| {
-                    body_relations::matches_for_file(
+                    let result = body_relations::matches_for_file(
                         &file,
                         relation_source,
                         language,
                         state,
                         body_owner,
-                    )
-                })
-        } else if let Some(modifier) = modifier {
-            source
-                .as_deref()
-                .or(custom_source.as_deref())
-                .map(|relation_source| {
-                    modifier_relations::matches_for_file(&file, relation_source, language, modifier)
+                    );
+                    diagnostics.extend(result.diagnostics);
+                    result.matches
                 })
         } else {
             None
@@ -2252,7 +2262,7 @@ pub(super) fn execute_seed(
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: "workspace",
-            message: "decoded string-value comparison is incomplete because at least one selected value is non-literal or has an unsupported Python escape form".to_string(),
+            message: "decoded string-value comparison is incomplete because at least one selected value is non-literal or uses an unsupported literal form".to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
         });
@@ -2280,7 +2290,7 @@ pub(super) fn execute_seed(
         state.access_failure.get_or_insert_with(|| {
             "workspace content changed during structural posting replay".to_string()
         });
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -2290,7 +2300,7 @@ pub(super) fn execute_seed(
             message: "workspace content changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }, Some(DerivationExecutionCause::Snapshot)));
     }
     if pending.len() > desired_rows {
         pending.truncate(desired_rows);
@@ -2360,20 +2370,22 @@ pub(super) fn execute_seed(
 fn language_rule_matches(
     facts: &FileFacts,
     matches: Vec<FactMatch>,
-    ranges: &[Range],
+    ranges: &[super::language_rules::LanguageRuleMatch],
 ) -> Vec<FactMatch> {
     ranges
         .iter()
         .filter_map(|range| {
             let mut fact_match = matches
                 .iter()
-                .filter(|fact_match| range_contains(facts.node(fact_match.node).range, *range))
+                .filter(|fact_match| {
+                    range_contains(facts.node(fact_match.node).range, range.select)
+                })
                 .min_by_key(|fact_match| {
                     let fact = facts.node(fact_match.node).range;
                     fact.end_byte.saturating_sub(fact.start_byte)
                 })
                 .cloned()?;
-            fact_match.reported_range = Some(*range);
+            fact_match.reported_range = Some(range.report);
             Some(fact_match)
         })
         .collect()

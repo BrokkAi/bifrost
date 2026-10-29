@@ -68,9 +68,9 @@ use super::typed_fact_lowering::{
     LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
     LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
     LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
-    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSupertypeProperty,
-    LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction, LoweredTypeTransfer,
-    LoweredTypedFrontier, LoweredUnderlyingType,
+    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSourceSupertypeProperty,
+    LoweredSupertypeProperty, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction,
+    LoweredTypeTransfer, LoweredTypedFrontier, LoweredUnderlyingType,
 };
 
 /// The token every splice walk runs under.
@@ -927,7 +927,8 @@ splice_lowered_row!(
     LoweredConstructionRequirementProperty,
     remount_construction_requirement
 );
-splice_lowered_row!(LoweredSupertypeProperty, remount_supertype);
+splice_lowered_row!(LoweredSourceSupertypeProperty, remount_supertype);
+
 splice_lowered_row!(
     LoweredDefinitionPropertyGap,
     remount_definition_property_gap
@@ -1724,6 +1725,16 @@ where
     spliced_batch!(namespace_definitions(definitions: &[SemanticId]) -> Vec<SemanticId>);
     spliced_batch!(module_definitions(definitions: &[SemanticId]) -> Vec<SemanticId>);
 
+    fn rust_receiver_impl_targets(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<SemanticId>> {
+        self.inner
+            .rust_receiver_impl_targets(self.argument(&owner), cancellation)
+            .map(|targets| self.results(&targets))
+    }
+
     fn rust_implemented_traits_nameable_at(
         &self,
         owner: SemanticId,
@@ -2449,7 +2460,7 @@ mod tests {
         assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        assert_eq!(typed.len(), 92, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 93, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

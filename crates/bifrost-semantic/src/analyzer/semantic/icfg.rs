@@ -130,16 +130,106 @@ pub const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // names inside the callee expression (#5019).
 // Native Kotlin points change call/definition answers consumed by persisted
 // field and class-set results, independently of graph backend authority.
+// Usage classification feeds incoming projection consumed by the field-slot
+// survey and incoming-actual discovery (#7289).
+// Go nested call result counts and resolver-proven static Go calls change call-binding and dispatch answers (#7150).
+// A Rust method call on a concrete receiver publishes call-local closed dispatch, so its override gap closes without a member-family proof (#7219).
+// An unproven member family no longer proves that a concrete callee has no
+// override, so those calls keep their dispatch gap open (#7183).
+// Incomplete member families carry their established edges, and dispatch
+// offers them as possible targets (#7179 step B).
+// C# incoming relations prove exact overload targets (#7464).
+// Go open member calls record receiver places and change member call, receiver flow and binding answers (#7150).
+// Go interface-dispatch edges to concrete targets are References, unproven while the dispatch is open (#7519, #7520).
+// #7471: Short-var redeclarations and receiver shadowing select the declared binding.
+// #7470: Case-local and variadic bindings change inferred receiver and call answers.
+// #7470: Labeled and statement-header declarations retain their own binding identity.
+// #7618: Java type-reference receiver classification changes native call binding.
 #[doc(hidden)]
+// Python deferred reads of a single writer have fixed identity, and loop reads
+// stay open only for writes of their own cell in that loop (#5658).
+// Deferred Python module reads use structural mutation receivers (#5658).
+// Python attribute-space reads count only structural owners' writes (#5658).
+// Python calls bind without demanding their arguments (#5658).
+// #7179: dispatch closure uses descendant completeness independently of ancestors.
+// A sole global or nonlocal writer in another execution fixes Python identity (#7514).
+// Rust Deref receiver steps change selected callees for unchanged source
+// bytes (#7226).
+// #7202: external result identity requires a classified summary transfer.
+// Results of calls into source-less Go packages stay unknown (#7616).
+// Unnamed Go composites publish direct type shapes (#7617).
+// #7518: native Go reverse keeps undecided-receiver candidates unproven, which
+// changes incoming answers that dynamic-store surveys consume.
+// #7578: branch-conditioned sanitizers install label-narrowed condition-edge kills.
+// CLR special member names split at the right dot, and semantic-model composition reads only its group's language, so C# modeled constructor calls and composed members change for unchanged source bytes (#7560).
+// #7516: Go constructor shadows no longer seed package receivers, so incoming
+// answers change.
+// #7578: requirement origins use definitions reaching the operand, including loop backedges.
+// #7619: inherited external JVM methods now publish selected callable targets.
+// #7620: Java wildcard sibling applicability changes query-time call proofs.
+// #7509 M3a: Go type answers at declaration names come from the declaration
+// value slot, so value-type barrier observations change for unchanged bytes.
+// #3494: closed Ruby member selections discharge their dispatch gaps.
+// #7789: imports of provider-indexed JVM types are no longer unindexed boundaries.
+// #7849: Java observed value types name selected external owners such as java.nio.file.Path.
+// #7509 M3a part 2: Go failure-handler binding proofs come from native
+// binder selection and declared slots, so handler shapes change for unchanged bytes.
 pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v30";
+    b"bifrost-icfg-provider/workspace-behavior/v100";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
 /// no read half can ever equal a full identity by accident.
+// #7202: rotate read-side reuse with the classified result identity contract.
+// #7518: rotate read-side reuse with the Go undecided-receiver incoming answers.
+// #7578: rotate read-side reuse with branch-conditioned sanitizer kills.
+// #7618: Rotate the ICFG read identity for Java native receiver binding.
+// #7516: rotate read-side reuse with the Go constructor-shadow answers.
 #[doc(hidden)]
+// #7578: rotate read-side reuse with requirement-writer reachability.
+// #7619: invalidate read-side reuse for inherited external call binding.
+// #7620: read identities also invalidate Java wildcard call proofs.
+// #7509 M3a: rotate read-side reuse with the Go declaration value types.
+// #3494: read identities also invalidate Ruby closed member selections.
+// #7789: read identities also invalidate JVM import destinations.
+// #7849: read identities also invalidate Java guard proofs over external-owner carriers.
+// #7509 M3a part 2: rotate read-side reuse with the native Go binding proofs.
 pub const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v29";
+    b"bifrost-icfg-provider/workspace-read-behavior/v99";
+
+#[cfg(test)]
+mod domain_tests {
+    use super::{
+        WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN, WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+    };
+
+    #[test]
+    fn workspace_icfg_provider_domains_rotate_together() {
+        let version = |domain: &[u8], prefix: &[u8]| {
+            assert!(domain.starts_with(prefix));
+            std::str::from_utf8(
+                domain
+                    .strip_prefix(prefix)
+                    .unwrap()
+                    .strip_prefix(b"/v")
+                    .unwrap(),
+            )
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+        };
+
+        let behavior = version(
+            WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN,
+            b"bifrost-icfg-provider/workspace-behavior",
+        );
+        let read = version(
+            WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+            b"bifrost-icfg-provider/workspace-read-behavior",
+        );
+        assert_eq!(behavior, read + 1);
+    }
+}
 
 /// Why one dispatch lookup could not be named by a replayable read key.
 ///

@@ -2124,6 +2124,10 @@ mod tests {
                             Null,
                             text("unbound"),
                             text("crate::elsewhere"),
+                            Null,
+                            Null,
+                            Null,
+                            text("crate"),
                         ],
                         "rust_crate_root_references_insert" => vec![
                             Integer(id),
@@ -4329,14 +4333,16 @@ mod outer {
             .unwrap();
         let expected_resolved_endpoint_count: usize = conn
             .query_row(
-                "SELECT count(*) * 2 FROM rust_crate_trait_impls WHERE topology_id=?1",
+                "SELECT (SELECT count(*) * 2 FROM rust_crate_trait_impls WHERE topology_id=?1)
+                      + (SELECT count(*) FROM rust_crate_unresolved_trait_impls
+                         WHERE topology_id=?1 AND side='subject' AND reason='resolved')",
                 [app],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
             resolved_endpoint_count, expected_resolved_endpoint_count,
-            "each resolved legacy trait relation publishes both endpoints once, including inline modules"
+            "each resolved legacy half publishes its endpoint once, including inline modules"
         );
         let inline_endpoint_count: usize = conn
             .query_row(
@@ -4361,14 +4367,15 @@ mod outer {
             .unwrap();
         let expected_unresolved_endpoint_count: usize = conn
             .query_row(
-                "SELECT count(*) FROM rust_crate_unresolved_trait_impls WHERE topology_id=?1",
+                "SELECT count(*) FROM rust_crate_unresolved_trait_impls
+                 WHERE topology_id=?1 AND (side='trait' OR reason!='resolved')",
                 [app],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
             unresolved_endpoint_count, expected_unresolved_endpoint_count,
-            "each unresolved trait impl half is attached to its owning summary exactly once"
+            "incomplete trait halves and subjects without declarations stay unresolved in their owning summary"
         );
         let expected_unresolved_files = conn
             .prepare(

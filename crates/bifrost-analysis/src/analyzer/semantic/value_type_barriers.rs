@@ -40,3 +40,56 @@ pub fn evaluate_value_type_barrier(
     };
     support.value_type_barrier(analyzer, observation, predicate, request)
 }
+
+use crate::analyzer::semantic::SemanticRequest;
+use ValueTypeBarrierReason::{BudgetExceeded, Cancelled, UnavailableObservation};
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::query_token::QueryScope;
+use brokk_bifrost_core::hash::HashMap;
+use std::sync::Arc;
+
+/// Retain only the source files this request demanded, under its byte budget.
+pub fn prepare_value_type_barrier_source<
+    A: crate::analyzer::tree_sitter_analyzer::LanguageAdapter,
+>(
+    inner: &crate::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer<A>,
+    syntax: &mut HashMap<ProjectFile, Arc<PreparedSyntaxTree>>,
+    file: &ProjectFile,
+    request: &mut SemanticRequest<'_>,
+) -> Result<Arc<PreparedSyntaxTree>, ValueTypeBarrierReason> {
+    if let Some(prepared) = syntax.get(file) {
+        return Ok(Arc::clone(prepared));
+    }
+    let scope = crate::analyzer::i_analyzer::AnalyzerQueryScope::new(inner);
+    let prepared = match inner.prepared_syntax_limited_cancellable(
+        scope.token(),
+        file,
+        request.budget.remaining().source_bytes,
+        Some(request.cancellation),
+    ) {
+        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Available(
+            _,
+            prepared,
+        ) => prepared,
+        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Cancelled => {
+            return Err(Cancelled);
+        }
+        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Exceeded(_) => {
+            return Err(BudgetExceeded);
+        }
+        crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Unavailable
+        | crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Refused(_) => {
+            return Err(UnavailableObservation);
+        }
+    };
+    if request
+        .budget
+        .admit_source(&prepared, prepared.source().len())
+        .is_err()
+    {
+        return Err(BudgetExceeded);
+    }
+    syntax.insert(file.clone(), Arc::clone(&prepared));
+    Ok(prepared)
+}

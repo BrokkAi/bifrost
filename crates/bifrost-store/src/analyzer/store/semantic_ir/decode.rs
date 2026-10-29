@@ -27,19 +27,19 @@ use crate::analyzer::semantic::{
     ArtifactCallableTarget, BackingStoreOffset, BasicBlock, BlockId, CallArgumentExpansion,
     CallReceiverTypeFact, CallSiteId, CallableReferenceKind, CallableTarget,
     CallableTargetResolution, CallableValue, CaptureBinding, CaptureId, CaptureMode, CaptureSource,
-    ControlContinuation, ControlEdge, DeclarationLocator, DeclarationSegment, DropBehavior,
-    DropFact, Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity, GoPredeclaredBuiltin,
-    GuardArm, GuardConditionDigest, GuardFactParts, GuardId, GuardPredicate, LoopSite,
-    MemoryLocation, MemoryLocationId, MemoryLocationKind, MemoryValueCopy, MoveOutFact,
-    PointerAccess, PointerAccessWidth, PointerAlias, PointerByteOffset, PointerInvalidation,
-    PointerInvalidationTarget, PointerOrigin, PointerOriginId, PointerOriginKind, ProcedureId,
-    ProcedureProperties, ProcedureSemanticsParts, ProgramPoint, ProgramPointId, ProofStatus,
-    ScopeEndAt, ScopeEndFact, SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite,
-    SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapId,
-    SemanticGapImpact, SemanticGapImpacts, SemanticGapSubject, SemanticIncompleteFact,
-    SemanticIncompleteReason, SemanticIncompleteSubject, SemanticLocator, SemanticPlace,
-    SemanticValue, SemanticValueKind, SignedIntegerMagnitude, SourceAnchor, SourceMapping,
-    SourceMappingId, SourcePosition, SourceSpan, StableDigest, StatementEntrySite,
+    ControlContinuation, ControlEdge, DeclarationLocator, DeclarationSegment,
+    DeferredMemberSelection, DropBehavior, DropFact, Evidence, EvidenceCompleteness, EvidenceId,
+    FormalMultiplicity, GoPredeclaredBuiltin, GuardArm, GuardConditionDigest, GuardFactParts,
+    GuardId, GuardPredicate, LoopSite, MemoryLocation, MemoryLocationId, MemoryLocationKind,
+    MemoryValueCopy, MoveOutFact, PointerAccess, PointerAccessWidth, PointerAlias,
+    PointerByteOffset, PointerInvalidation, PointerInvalidationTarget, PointerOrigin,
+    PointerOriginId, PointerOriginKind, ProcedureId, ProcedureProperties, ProcedureSemanticsParts,
+    ProgramPoint, ProgramPointId, ProofStatus, ScopeEndAt, ScopeEndFact, SemanticBudgetExceeded,
+    SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
+    SemanticGap, SemanticGapId, SemanticGapImpact, SemanticGapImpacts, SemanticGapSubject,
+    SemanticIncompleteFact, SemanticIncompleteReason, SemanticIncompleteSubject, SemanticLocator,
+    SemanticPlace, SemanticValue, SemanticValueKind, SignedIntegerMagnitude, SourceAnchor,
+    SourceMapping, SourceMappingId, SourcePosition, SourceSpan, StableDigest, StatementEntrySite,
     StructuralNodeIdentity, SwitchCaseFactParts, SwitchEdgeParts, SwitchFactId, SwitchFactParts,
     SynchronizationPayload, SynchronizationPayloadCopy, TransferKind, TransferOperation,
     ValueFlowKind, ValueId, ValueTransfer, WorkspaceRelativePath,
@@ -1286,6 +1286,19 @@ impl Decoder<'_> {
             let exceptional_target = cells.opt_id();
             let source = cells.id();
             let evidence = cells.id();
+            let member = cells.opt();
+            let place_kind = cells.opt_code::<PlaceTag>();
+            let place_locator = cells.opt();
+            let place_location = cells.opt_id();
+            let receiver_pointer_depth = cells.opt_u32();
+            let member_selection = member.map(|member| {
+                Box::new(DeferredMemberSelection {
+                    member: self.boxed_text(cells, member),
+                    receiver_place: place_kind
+                        .map(|_| self.place(cells, place_kind, place_locator, place_location)),
+                    receiver_pointer_depth,
+                })
+            });
             let candidates = self.group(cells, procedure, targets);
             self.parts[procedure as usize]
                 .call_sites
@@ -1296,6 +1309,7 @@ impl Decoder<'_> {
                     execution_timing,
                     callee,
                     receiver,
+                    member_selection,
                     arguments: Box::new([]),
                     normal_results: normal_results.into(),
                     result,

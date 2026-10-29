@@ -97,6 +97,7 @@ fn projected(items: &[CodeQueryResultItem]) -> Vec<UnitRowItem> {
 fn whole_execution(workspace: &WorkspaceAnalyzer, query: &CodeQuery) -> DetailedCodeQueryResult {
     execute_code_query_detailed_eager_index(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -113,6 +114,7 @@ fn units(
         .map(|file| {
             execute_code_query_unit(
                 workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
                 None,
                 query,
                 CodeQueryExecutionLimits::default(),
@@ -261,6 +263,7 @@ fn a_unit_still_expands_a_derived_value_over_the_whole_workspace() {
 
     let unit = execute_code_query_unit(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         None,
         &callers_query(),
         CodeQueryExecutionLimits::default(),
@@ -300,6 +303,7 @@ fn a_seed_scope_outside_the_query_scope_yields_no_rows() {
     let outside = project.file("src/mod3.ts");
     let unit = execute_code_query_unit(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         None,
         &query,
         CodeQueryExecutionLimits::default(),
@@ -514,6 +518,7 @@ fn unit_read_keys(
         );
         execute_code_query_unit(
             workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             None,
             query,
             CodeQueryExecutionLimits::default(),
@@ -780,6 +785,7 @@ fn an_execution_exports_the_budgeted_lanes_its_public_work_drops() {
 
     let unit = execute_code_query_unit(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         None,
         &query,
         CodeQueryExecutionLimits::default(),
@@ -904,10 +910,10 @@ fn python_format_nested_union_filters_preserve_whole_diagnostic_scope_and_aliase
                 (union {nested} {other}))"
         ))
         .expect("nested format union with source aliases");
-        assert_eq!(
+        assert!(matches!(
             crate::query::PlanPartitioning::classify(&query.plan),
-            crate::query::PlanPartitioning::Whole
-        );
+            crate::query::PlanPartitioning::Whole(_)
+        ));
         let whole = whole_execution(&workspace, &query);
         assert_eq!(
             whole.result.results.len(),
@@ -1084,10 +1090,10 @@ fn projected_set_collisions_keep_the_first_rows_native_field_mapping() {
             "(result-detail full (filter :where ((x is-null)) (union {first} {second})))"
         ))
         .expect("compatible projection counterexample");
-        assert_eq!(
+        assert!(matches!(
             crate::query::PlanPartitioning::classify(&query.plan),
-            crate::query::PlanPartitioning::Whole
-        );
+            crate::query::PlanPartitioning::Whole(_)
+        ));
         let whole = whole_execution(&workspace, &query);
         assert_eq!(
             whole.result.completion(),

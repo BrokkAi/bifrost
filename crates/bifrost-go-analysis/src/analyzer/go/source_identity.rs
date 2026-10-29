@@ -1599,13 +1599,8 @@ fn source_anchor(
     })
 }
 
-fn generic_receiver_base<'tree>(mut receiver: Node<'tree>) -> Option<Node<'tree>> {
-    while matches!(receiver.kind(), "pointer_type" | "parenthesized_type") {
-        receiver = receiver.named_child(0)?;
-    }
-    (receiver.kind() == "generic_type")
-        .then(|| receiver.child_by_field_name("type"))
-        .flatten()
+fn generic_receiver_base(receiver: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_go::declarations::go_generic_receiver_type(receiver)?.child_by_field_name("type")
 }
 
 fn is_go_type_parameter_reference(node: Node<'_>, source: &str, name: &str) -> bool {

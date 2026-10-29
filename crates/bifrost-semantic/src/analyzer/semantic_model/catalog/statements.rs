@@ -472,3 +472,78 @@ pub const RAW_STATEMENTS: &[(&str, &str)] = &[
     ("SUMMARIES_BY_LANGUAGE", SUMMARIES_BY_LANGUAGE),
     ("MEMBERS_BY_NAME_LANGUAGE", MEMBERS_BY_NAME_LANGUAGE),
 ];
+
+/// The provider's own AssemblyDef identity. Historical packs have no row.
+pub const ASSEMBLY_IDENTITY_BY_PROVIDER: &str = r#"SELECT DISTINCT name,version,culture,public_key_token
+FROM active_catalog_assembly_identities WHERE manifest_digest=:manifest AND shard_id=:shard;"#;
+
+pub const TYPE_FORWARDS_BY_PROVIDER_NAME: &str = r#"SELECT DISTINCT target_name,target_version,target_culture,target_public_key_token
+FROM active_catalog_type_forwards WHERE name=:name AND manifest_digest=:manifest AND shard_id=:shard;"#;
+
+/// Version unification uses four numeric CLI components in the request-local
+/// walker, never lexical string ordering. Only selected providers participate.
+/// A reference without a public key token matches any selected provider of
+/// that simple name and culture, as the compiler and runtime bind. A token,
+/// when present, must be equal (#7338 fourth amendment).
+pub const ASSEMBLIES_BY_REFERENCE: &str = r#"SELECT DISTINCT a.manifest_digest,a.shard_id,a.name,a.version,a.culture,a.public_key_token
+FROM active_catalog_assembly_identities a
+WHERE a.name=:name AND a.culture IS :culture
+  AND (:token IS NULL OR a.public_key_token=:token)
+  AND EXISTS(SELECT 1 FROM json_each(:providers) p
+    WHERE json_extract(p.value,'$.manifest_digest')=a.manifest_digest
+      AND json_extract(p.value,'$.shard_id')=a.shard_id);"#;
+
+// Materialize name hits before provider filtering so SQLite does not choose
+// a whole-shard name scan on catalogs that have not run ANALYZE.
+pub const ASSEMBLY_DEFINED_TYPES_BY_NAME: &str = r#"WITH names AS MATERIALIZED (
+  SELECT n.* FROM active_catalog_declaration_names n WHERE n.name=:name AND n.identity_name=1
+)
+SELECT COALESCE(json_extract(t.record_json,'$.visibility') IN ('public','protected','protected_internal'),0)
+FROM names n CROSS JOIN active_catalog_declaration_types t
+  ON t.source_db=n.source_db AND t.shard_key=n.shard_key AND t.record_key=n.record_key
+WHERE n.manifest_digest=:manifest AND n.shard_id=:shard
+  AND json_extract(t.record_json,'$.name')=:name;"#;
+
+pub const TYPE_FORWARD_PROVIDERS_BY_NAME: &str = r#"SELECT DISTINCT manifest_digest,shard_id
+FROM active_catalog_type_forwards WHERE name=:name;"#;
+
+/// Binary ordering selects namespace N and its descendants in [N, N + '/').
+/// '.' sorts immediately below '/', and no C# identifier character sorts
+/// below '.'. For N = "", this selects exactly the global namespace.
+/// Nested exports carry the root's structured namespace, so no outer filter
+/// is needed; UNION returns each forwarding assembly pair only once.
+// Keep the range-seek table first in each source branch. Flattening the
+// general active UNION view lets SQLite choose a whole-provider scan instead.
+pub const TYPE_FORWARD_PAIRS_BY_NAMESPACE: &str = r#"SELECT i.name,f.target_name
+FROM main.catalog_type_forwards f INDEXED BY catalog_type_forwards_namespace
+CROSS JOIN main.catalog_semantic_rows_indexed_shards s
+  ON s.manifest_digest=f.manifest_digest AND s.shard_id=f.shard_id
+CROSS JOIN temp.active_shards active
+  ON active.source_db='durable' AND active.shard_key=s.shard_key
+CROSS JOIN main.catalog_assembly_identities i
+  ON i.manifest_digest=f.manifest_digest AND i.shard_id=f.shard_id
+WHERE f.namespace >= :ns AND f.namespace < :ns_upper AND s.index_version=4
+UNION
+SELECT i.name,f.target_name
+FROM session.catalog_type_forwards f INDEXED BY catalog_type_forwards_namespace
+CROSS JOIN session.catalog_semantic_rows_indexed_shards s
+  ON s.manifest_digest=f.manifest_digest AND s.shard_id=f.shard_id
+CROSS JOIN temp.active_shards active
+  ON active.source_db='session' AND active.shard_key=s.shard_key
+CROSS JOIN session.catalog_assembly_identities i
+  ON i.manifest_digest=f.manifest_digest AND i.shard_id=f.shard_id
+WHERE f.namespace >= :ns AND f.namespace < :ns_upper AND s.index_version=4
+ORDER BY 1,2;"#;
+
+/// A complete miss needs the same forwarding assemblies as the retained index,
+/// not merely an activated reader that happens to contain other providers.
+pub const TYPE_FORWARD_SOURCES_COMPLETE: &str = r#"SELECT NOT EXISTS (
+  SELECT 1 FROM json_each(:identities) p
+  WHERE NOT EXISTS (
+    SELECT 1 FROM active_catalog_assembly_identities a
+    WHERE a.name=json_extract(p.value,'$.name')
+      AND a.version=json_extract(p.value,'$.version')
+      AND a.culture IS json_extract(p.value,'$.culture')
+      AND a.public_key_token IS json_extract(p.value,'$.public_key_token')
+  )
+);"#;

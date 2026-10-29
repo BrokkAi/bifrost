@@ -1,6 +1,8 @@
 use super::*;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 
 pub(super) fn field_write_value_expansions(
+    analyzer: &dyn IAnalyzer,
     analysis: &ReceiverAnalysisValue,
     filter: &FieldWriteValueTraversal,
     traces: &[PipelineTrace],
@@ -9,10 +11,19 @@ pub(super) fn field_write_value_expansions(
     let ReceiverQueryAnalysis::MemberTargets(outcome) = &analysis.report.analysis else {
         unreachable!("field_write_value accepts only member-target analyses");
     };
+    let incomplete_code = CodeQueryDiagnosticCode::SemanticResultsOmitted;
+    let incomplete_cause = match outcome {
+        ReceiverAnalysisOutcome::ExceededBudget { .. } => Some(DerivationExecutionCause::Budget),
+        _ if analysis.report.candidates_truncated => Some(DerivationExecutionCause::Budget),
+        _ => None,
+    };
     let [target] = outcome.values().unwrap_or_default() else {
         push_incomplete(
+            analyzer,
+            incomplete_cause,
             diagnostics,
             analysis.report.site.language,
+            incomplete_code,
             "field_write_value requires one precise static member target",
         );
         return Vec::new();
@@ -22,16 +33,22 @@ pub(super) fn field_write_value_expansions(
         || analysis.report.semantic_unsupported.is_some()
     {
         push_incomplete(
+            analyzer,
+            incomplete_cause,
             diagnostics,
             analysis.report.site.language,
+            incomplete_code,
             "field_write_value member-target coverage is incomplete",
         );
         return Vec::new();
     }
     if target.receiver_identity_id().is_none() {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             analysis.report.site.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value member target has no exact receiver identity",
         );
         return Vec::new();
@@ -48,8 +65,11 @@ pub(super) fn field_write_value_expansions(
     }
     let Some(member_range) = analysis.report.member_range else {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             analysis.report.site.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value member target has no exact member range",
         );
         return Vec::new();
@@ -57,12 +77,22 @@ pub(super) fn field_write_value_expansions(
 
     traces
         .iter()
-        .filter_map(|trace| project_trace(&trace.seed, analysis, target, member_range, diagnostics))
+        .filter_map(|trace| {
+            project_trace(
+                analyzer,
+                &trace.seed,
+                analysis,
+                target,
+                member_range,
+                diagnostics,
+            )
+        })
         .map(|value| pipeline_expansion(PipelineValue::FieldWriteValue(Box::new(value))))
         .collect()
 }
 
 fn project_trace(
+    analyzer: &dyn IAnalyzer,
     seed: &Arc<SeedMatch>,
     analysis: &ReceiverAnalysisValue,
     target: &ReceiverMemberTarget,
@@ -73,8 +103,11 @@ fn project_trace(
     let assignment_node = seed.fact_match.node;
     if facts.node(assignment_node).kind != NormalizedKind::Assignment {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value requires an assignment structural match",
         );
         return None;
@@ -85,8 +118,11 @@ fn project_trace(
         .collect::<Vec<_>>();
     if !matches!(operators.as_slice(), [operator] if operator.span.text(facts.source()) == "=") {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value supports only a simple assignment operator",
         );
         return None;
@@ -94,40 +130,55 @@ fn project_trace(
 
     let Some(left_node) = exactly_one_node(facts, assignment_node, Role::Left) else {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value assignment has no unique normalized left operand",
         );
         return None;
     };
     if facts.node(left_node).kind != NormalizedKind::FieldAccess {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value left operand is not a static field access",
         );
         return None;
     }
     let Some(receiver_node) = exactly_one_node(facts, left_node, Role::Object) else {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value field access has no unique normalized receiver",
         );
         return None;
     };
     let Some(member_node) = exactly_one_node(facts, left_node, Role::Field) else {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value field access has no unique static member node",
         );
         return None;
     };
     let Some(rhs_node) = exactly_one_node(facts, assignment_node, Role::Right) else {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value assignment has no unique normalized right operand",
         );
         return None;
@@ -138,16 +189,22 @@ fn project_trace(
         &analysis.report.site.range,
     ) {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value receiver node differs from the analyzed receiver site",
         );
         return None;
     }
     if !same_range(&facts.node(member_node).range, &member_range) {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value member node differs from the resolved member site",
         );
         return None;
@@ -160,8 +217,11 @@ fn project_trace(
         .map(|span| span.text(facts.source()));
     if member_name != Some(target.member_name()) {
         push_incomplete(
+            analyzer,
+            None,
             diagnostics,
             seed.language,
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
             "field_write_value member spelling differs from the resolved member identity",
         );
         return None;
@@ -188,20 +248,27 @@ fn exactly_one_node(facts: &FileFacts, source: u32, role: Role) -> Option<u32> {
 }
 
 fn push_incomplete(
+    analyzer: &dyn IAnalyzer,
+    cause: Option<DerivationExecutionCause>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     language: Language,
+    code: CodeQueryDiagnosticCode,
     message: &'static str,
 ) {
-    if diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
-            && diagnostic.message == message
-    }) {
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == code && diagnostic.message == message)
+    {
         return;
     }
-    diagnostics.push(incomplete_diagnostic(
-        CodeQueryDiagnosticCode::SemanticResultsOmitted,
-        language.config_label(),
-        message.to_string(),
-        Vec::new(),
+    diagnostics.push(QueryExecutionState::diagnostic(
+        analyzer,
+        incomplete_diagnostic(
+            code,
+            language.config_label(),
+            message.to_string(),
+            Vec::new(),
+        ),
+        cause,
     ));
 }

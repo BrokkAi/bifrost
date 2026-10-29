@@ -15,7 +15,6 @@ use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
 use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
-use crate::analyzer::QueryScope;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::{
@@ -23,12 +22,17 @@ use crate::analyzer::tree_sitter_analyzer::{
     StructuralSnapshotKey, TreeSitterAnalyzer,
 };
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
+use crate::analyzer::{IAnalyzer, QueryScope};
 use crate::cancellation::CancellationToken;
 use moka::sync::Cache;
 use rayon::prelude::*;
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::hash::Hasher;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::{self, ThreadId};
+use std::time::Duration;
 
 /// Opaque snapshot-local acceleration capability for built-in structural
 /// providers. This type is public only so external implementations of
@@ -374,8 +378,65 @@ pub enum StructuralSourceLimitedOutcome {
 /// (`src/analyzer/java/cache.rs`).
 pub struct StructuralFactsCache {
     cache: Cache<StructuralSnapshotKey, Arc<FileFacts>>,
+    live: Arc<Mutex<LiveFacts>>,
     extractions: AtomicU64,
     hydrations: AtomicU64,
+}
+
+// In-flight queries can keep facts alive after the byte-capped cache evicts
+// them. Share those allocations instead of hydrating another copy per query.
+// Last-drop registrations release weak entries with their live holders: the
+// heap-residency rule forbids dead entries outliving the queries holding them.
+#[derive(Debug, Default)]
+struct LiveFacts {
+    entries: HashMap<StructuralSnapshotKey, Weak<FileFacts>>,
+    building: HashMap<StructuralSnapshotKey, Arc<BuildSlot>>,
+}
+
+#[derive(Debug)]
+struct BuildSlot {
+    leader: ThreadId,
+    done: Mutex<bool>,
+    completed: Condvar,
+}
+
+// Dropping registered facts takes the live lock. Never drop a registered
+// Arc<FileFacts> or insert into moka (which can evict facts) under that lock.
+#[derive(Debug)]
+pub(crate) struct LiveRegistration {
+    registry: Weak<Mutex<LiveFacts>>,
+    key: StructuralSnapshotKey,
+}
+
+impl Drop for LiveRegistration {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        // A panic here during unwinding would abort the process; removing a
+        // dead entry is safe whatever left the lock poisoned.
+        let mut live = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if live
+            .entries
+            .get(&self.key)
+            .is_some_and(|facts| facts.strong_count() == 0)
+        {
+            live.entries.remove(&self.key);
+        }
+        if live.entries.capacity() > 64 && live.entries.len() * 4 < live.entries.capacity() {
+            live.entries.shrink_to_fit();
+        }
+    }
+}
+
+thread_local! {
+    // Build slots this thread currently leads. A leader must never wait for
+    // another key's build: two leaders waiting on each other's keys would
+    // deadlock. Building one file's facts never requests another file's
+    // facts, so this holds by construction; the wait path asserts it.
+    static HELD_BUILD_SLOTS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The cheap identity of one in-memory source string, which the analyzer's
@@ -398,6 +459,7 @@ impl StructuralFactsCache {
                 .max_capacity(budget_bytes.max(1))
                 .weigher(weigh_entry)
                 .build(),
+            live: Arc::new(Mutex::new(LiveFacts::default())),
             extractions: AtomicU64::new(0),
             hydrations: AtomicU64::new(0),
         }
@@ -409,6 +471,7 @@ impl StructuralFactsCache {
     pub(crate) fn sharing_entries(&self) -> Self {
         Self {
             cache: self.cache.clone(),
+            live: Arc::clone(&self.live),
             extractions: AtomicU64::new(0),
             hydrations: AtomicU64::new(0),
         }
@@ -431,30 +494,134 @@ impl StructuralFactsCache {
         load: impl FnOnce() -> Option<FileFacts>,
         extract: impl FnOnce() -> Option<FileFacts>,
     ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
-        let (facts, outcome) = if let Some(facts) = load() {
-            self.hydrations.fetch_add(1, Ordering::Relaxed);
-            (
-                Arc::new(facts),
-                StructuralFactsCacheOutcome::PersistedHydration,
-            )
-        } else {
-            self.extractions.fetch_add(1, Ordering::Relaxed);
-            let Some(facts) = extract() else {
-                return (None, StructuralFactsCacheOutcome::Unavailable);
-            };
-            (Arc::new(facts), StructuralFactsCacheOutcome::Extracted)
+        match self.reuse_or_build(
+            Some(key),
+            || false,
+            || {
+                if let Some(facts) = load() {
+                    self.record_hydration();
+                    Ok((
+                        Arc::new(facts),
+                        StructuralFactsCacheOutcome::PersistedHydration,
+                    ))
+                } else {
+                    self.record_extraction();
+                    let facts = extract().ok_or(StructuralFactsCacheOutcome::Unavailable)?;
+                    Ok((Arc::new(facts), StructuralFactsCacheOutcome::Extracted))
+                }
+            },
+        ) {
+            Ok((facts, outcome)) => (Some(facts), outcome),
+            Err(outcome) => (None, outcome),
+        }
+    }
+
+    // The caller already missed in moka. Do not cast a second admission vote.
+    // Waiters retry with their own build after failure or cancellation: a
+    // leader's error belongs to its request, not to requests waiting for facts.
+    fn reuse_or_build<E>(
+        &self,
+        key: Option<StructuralSnapshotKey>,
+        cancelled: impl Fn() -> bool,
+        build: impl FnOnce() -> Result<(Arc<FileFacts>, StructuralFactsCacheOutcome), E>,
+    ) -> Result<(Arc<FileFacts>, StructuralFactsCacheOutcome), E> {
+        let Some(key) = key else {
+            return build();
         };
-        self.insert(key, Arc::clone(&facts));
-        (Some(facts), outcome)
+        struct Building<'a> {
+            live: &'a Mutex<LiveFacts>,
+            key: StructuralSnapshotKey,
+            slot: Arc<BuildSlot>,
+        }
+
+        impl Drop for Building<'_> {
+            fn drop(&mut self) {
+                HELD_BUILD_SLOTS.with(|held| held.set(held.get() - 1));
+                self.live
+                    .lock()
+                    .expect("live facts lock poisoned")
+                    .building
+                    .remove(&self.key);
+                *self.slot.done.lock().expect("build slot lock poisoned") = true;
+                self.slot.completed.notify_all();
+            }
+        }
+
+        let _building = 'choose: loop {
+            let mut live = self.live.lock().expect("live facts lock poisoned");
+            if let Some(facts) = live.entries.get(&key).and_then(Weak::upgrade) {
+                drop(live);
+                self.cache.insert(key, Arc::clone(&facts));
+                return Ok((facts, StructuralFactsCacheOutcome::MemoryHit));
+            }
+            if let Some(slot) = live.building.get(&key) {
+                // A same-thread recursive request cannot wait for itself.
+                // Build without a slot and adopt its result normally below.
+                if slot.leader == thread::current().id() {
+                    break None;
+                }
+                let slot = Arc::clone(slot);
+                drop(live);
+                debug_assert_eq!(
+                    HELD_BUILD_SLOTS.with(Cell::get),
+                    0,
+                    "#7116: a structural facts build leader must not wait for another key's build"
+                );
+                let mut done = slot.done.lock().expect("build slot lock poisoned");
+                while !*done {
+                    // A cancelled request must run its own closure promptly,
+                    // without waiting for another request's build to finish.
+                    if cancelled() {
+                        break 'choose None;
+                    }
+                    done = slot
+                        .completed
+                        .wait_timeout(done, Duration::from_millis(25))
+                        .expect("build slot lock poisoned")
+                        .0;
+                }
+            } else {
+                let slot = Arc::new(BuildSlot {
+                    leader: thread::current().id(),
+                    done: Mutex::new(false),
+                    completed: Condvar::new(),
+                });
+                live.building.insert(key, Arc::clone(&slot));
+                HELD_BUILD_SLOTS.with(|held| held.set(held.get() + 1));
+                break Some(Building {
+                    live: &self.live,
+                    key,
+                    slot,
+                });
+            }
+        };
+        let (facts, outcome) = build()?;
+        let existing = {
+            let mut live = self.live.lock().expect("live facts lock poisoned");
+            // Re-entrant and cancelled no-slot builds can publish first.
+            if let Some(existing) = live.entries.get(&key).and_then(Weak::upgrade) {
+                Some(existing)
+            } else {
+                facts
+                    .live_registration
+                    .set(LiveRegistration {
+                        registry: Arc::downgrade(&self.live),
+                        key,
+                    })
+                    .expect("fresh facts must not already be registered");
+                live.entries.insert(key, Arc::downgrade(&facts));
+                None
+            }
+        };
+        // In particular, drop a losing allocation only after unlocking.
+        let facts = existing.unwrap_or(facts);
+        self.cache.insert(key, Arc::clone(&facts));
+        Ok((facts, outcome))
     }
 
     #[doc(hidden)]
     pub fn get(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
         self.cache.get(key)
-    }
-
-    pub(crate) fn insert(&self, key: StructuralSnapshotKey, facts: Arc<FileFacts>) {
-        self.cache.insert(key, facts);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -505,122 +672,132 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
             return (Some(facts), StructuralFactsCacheOutcome::MemoryHit);
         }
 
-        let read = if let Some(key) = snapshot_key.as_ref() {
-            match self.load_structural_facts_rows_limited(
-                key,
-                STRUCTURAL_FACTS_VERSION,
-                usize::MAX,
-                None,
-            ) {
-                Ok(read) => Some(read),
-                Err(error) => {
-                    self.record_store_error(error.context("loading canonical structural facts"));
-                    return (None, StructuralFactsCacheOutcome::Unavailable);
+        let build = || {
+            let read = if let Some(key) = snapshot_key.as_ref() {
+                match self.load_structural_facts_rows_limited(
+                    key,
+                    STRUCTURAL_FACTS_VERSION,
+                    usize::MAX,
+                    None,
+                ) {
+                    Ok(read) => Some(read),
+                    Err(error) => {
+                        self.record_store_error(
+                            error.context("loading canonical structural facts"),
+                        );
+                        return Err((None, StructuralFactsCacheOutcome::Unavailable));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
-        match read {
-            Some(crate::analyzer::store::StructuralFactRowsRead::Ready(rows)) => {
-                let facts = match FileFacts::from_persisted_rows(source.to_owned(), rows) {
-                    Ok(facts) => Arc::new(facts),
+            match read {
+                Some(crate::analyzer::store::StructuralFactRowsRead::Ready(rows)) => {
+                    let facts = match FileFacts::from_persisted_rows(source.to_owned(), rows) {
+                        Ok(facts) => Arc::new(facts),
+                        Err(error) => {
+                            self.record_store_error(StoreError::new(format!(
+                                "invalid canonical structural facts: {error}"
+                            )));
+                            return Err((None, StructuralFactsCacheOutcome::Unavailable));
+                        }
+                    };
+                    self.structural_cache().record_hydration();
+                    return Ok((facts, StructuralFactsCacheOutcome::PersistedHydration));
+                }
+                Some(crate::analyzer::store::StructuralFactRowsRead::Exceeded { .. }) => {
+                    unreachable!("unbounded canonical structural facts load exceeded")
+                }
+                Some(crate::analyzer::store::StructuralFactRowsRead::Cancelled) => {
+                    return Err((None, StructuralFactsCacheOutcome::Unavailable));
+                }
+                Some(crate::analyzer::store::StructuralFactRowsRead::Unavailable) | None => {}
+            }
+
+            if let Some(state) = self.cached_canonical_source_state(file, source) {
+                let source_facts = state.source_facts.as_ref().expect("canonical source state");
+                let facts = Arc::new(FileFacts::from_source_and_rows(
+                    source.to_owned(),
+                    source_facts.occurrences.clone(),
+                    source_facts.structural.clone(),
+                ));
+                return Ok((facts, StructuralFactsCacheOutcome::MemoryHit));
+            }
+
+            // New query source can enter ordinary primary analysis, but missing
+            // facts for an indexed source must not be repaired by a reader.
+            if crate::analyzer::CodeUnitIndex::indexed_source_matches(self, file, source) {
+                self.record_store_error(StoreError::new(format!(
+                    "required canonical structural source publication unavailable for {file:?}"
+                )));
+                return Err((None, StructuralFactsCacheOutcome::Unavailable));
+            }
+
+            let Some(source_facts) = self.prepare_canonical_source_facts(file, source.to_owned())
+            else {
+                return Err((None, StructuralFactsCacheOutcome::Unavailable));
+            };
+            self.structural_cache().record_extraction();
+            // Preparation publishes the parse. Read the published rows back so the
+            // recovered regions carry the store's containment answer (#3777). When
+            // publication failed the store has no rows, and the parse's own rows,
+            // whose regions have no answer, are the facts.
+            let published = snapshot_key.as_ref().and_then(|key| {
+                match self.load_structural_facts_rows_limited(
+                    key,
+                    STRUCTURAL_FACTS_VERSION,
+                    usize::MAX,
+                    None,
+                ) {
+                    Ok(crate::analyzer::store::StructuralFactRowsRead::Ready(rows)) => Some(rows),
+                    Ok(crate::analyzer::store::StructuralFactRowsRead::Unavailable) => None,
+                    Ok(
+                        crate::analyzer::store::StructuralFactRowsRead::Exceeded { .. }
+                        | crate::analyzer::store::StructuralFactRowsRead::Cancelled,
+                    ) => unreachable!("an unbounded, uncancellable read cannot stop early"),
+                    Err(error) => {
+                        self.record_store_error(
+                            error.context("reading back prepared canonical structural facts"),
+                        );
+                        self.mark_execution_dependent();
+                        None
+                    }
+                }
+            });
+            let retainable = published.is_some();
+            let facts = match published {
+                Some(rows) => match FileFacts::from_persisted_rows(source.to_owned(), rows) {
+                    Ok(facts) => facts,
                     Err(error) => {
                         self.record_store_error(StoreError::new(format!(
-                            "invalid canonical structural facts: {error}"
+                            "invalid prepared canonical structural facts: {error}"
                         )));
-                        return (None, StructuralFactsCacheOutcome::Unavailable);
+                        return Err((None, StructuralFactsCacheOutcome::Unavailable));
                     }
-                };
-                self.structural_cache().record_hydration();
-                if let Some(key) = snapshot_key {
-                    self.structural_cache().insert(key, Arc::clone(&facts));
-                }
-                return (Some(facts), StructuralFactsCacheOutcome::PersistedHydration);
+                },
+                None => FileFacts::from_source_and_rows(
+                    source.to_owned(),
+                    source_facts.occurrences,
+                    source_facts.structural,
+                ),
+            };
+            let facts = Arc::new(facts);
+            if retainable {
+                Ok((facts, StructuralFactsCacheOutcome::Extracted))
+            } else {
+                // The fallback lacks store containment answers (#7311). An
+                // owned refusal must bypass both moka and live-facts sharing.
+                Err((Some(facts), StructuralFactsCacheOutcome::Extracted))
             }
-            Some(crate::analyzer::store::StructuralFactRowsRead::Exceeded { .. }) => {
-                unreachable!("unbounded canonical structural facts load exceeded")
-            }
-            Some(crate::analyzer::store::StructuralFactRowsRead::Cancelled) => {
-                return (None, StructuralFactsCacheOutcome::Unavailable);
-            }
-            Some(crate::analyzer::store::StructuralFactRowsRead::Unavailable) | None => {}
-        }
-
-        if let Some(state) = self.cached_canonical_source_state(file, source) {
-            let source_facts = state.source_facts.as_ref().expect("canonical source state");
-            let facts = Arc::new(FileFacts::from_source_and_rows(
-                source.to_owned(),
-                source_facts.occurrences.clone(),
-                source_facts.structural.clone(),
-            ));
-            if let Some(key) = snapshot_key {
-                self.structural_cache().insert(key, Arc::clone(&facts));
-            }
-            return (Some(facts), StructuralFactsCacheOutcome::MemoryHit);
-        }
-
-        // New query source can enter ordinary primary analysis, but missing
-        // facts for an indexed source must not be repaired by a reader.
-        if crate::analyzer::CodeUnitIndex::indexed_source_matches(self, file, source) {
-            self.record_store_error(StoreError::new(format!(
-                "required canonical structural source publication unavailable for {file:?}"
-            )));
-            return (None, StructuralFactsCacheOutcome::Unavailable);
-        }
-
-        let Some(source_facts) = self.prepare_canonical_source_facts(file, source.to_owned())
-        else {
-            return (None, StructuralFactsCacheOutcome::Unavailable);
         };
-        self.structural_cache().record_extraction();
-        // Preparation publishes the parse. Read the published rows back so the
-        // recovered regions carry the store's containment answer (#3777). When
-        // publication failed the store has no rows, and the parse's own rows,
-        // whose regions have no answer, are the facts.
-        let published = snapshot_key.as_ref().and_then(|key| {
-            match self.load_structural_facts_rows_limited(
-                key,
-                STRUCTURAL_FACTS_VERSION,
-                usize::MAX,
-                None,
-            ) {
-                Ok(crate::analyzer::store::StructuralFactRowsRead::Ready(rows)) => Some(rows),
-                Ok(crate::analyzer::store::StructuralFactRowsRead::Unavailable) => None,
-                Ok(
-                    crate::analyzer::store::StructuralFactRowsRead::Exceeded { .. }
-                    | crate::analyzer::store::StructuralFactRowsRead::Cancelled,
-                ) => unreachable!("an unbounded, uncancellable read cannot stop early"),
-                Err(error) => {
-                    self.record_store_error(
-                        error.context("reading back prepared canonical structural facts"),
-                    );
-                    None
-                }
-            }
-        });
-        let facts = match published {
-            Some(rows) => match FileFacts::from_persisted_rows(source.to_owned(), rows) {
-                Ok(facts) => facts,
-                Err(error) => {
-                    self.record_store_error(StoreError::new(format!(
-                        "invalid prepared canonical structural facts: {error}"
-                    )));
-                    return (None, StructuralFactsCacheOutcome::Unavailable);
-                }
-            },
-            None => FileFacts::from_source_and_rows(
-                source.to_owned(),
-                source_facts.occurrences,
-                source_facts.structural,
-            ),
-        };
-        let facts = Arc::new(facts);
-        if let Some(key) = snapshot_key {
-            self.structural_cache().insert(key, Arc::clone(&facts));
+        match self
+            .structural_cache()
+            .reuse_or_build(snapshot_key, || false, build)
+        {
+            Ok((facts, outcome)) => (Some(facts), outcome),
+            Err(attempt) => attempt,
         }
-        (Some(facts), StructuralFactsCacheOutcome::Extracted)
     }
 
     fn cached_canonical_facts_limited(
@@ -645,9 +822,6 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
             source_facts.occurrences.clone(),
             source_facts.structural.clone(),
         ));
-        if let Some(key) = self.structural_snapshot_key(file, source) {
-            self.structural_cache().insert(key, Arc::clone(&facts));
-        }
         Some(StructuralFactsLimitedOutcome::Available {
             facts,
             cache_outcome: StructuralFactsCacheOutcome::MemoryHit,
@@ -938,109 +1112,135 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             };
         }
 
-        if self.adapter().produces_canonical_source_facts() {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return StructuralFactsLimitedOutcome::Cancelled;
+        let build = || {
+            if self.adapter().produces_canonical_source_facts() {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return StructuralFactsLimitedOutcome::Cancelled;
+                }
+                let Some(key) = self.structural_snapshot_key(file, source) else {
+                    return self
+                        .cached_canonical_facts_limited(file, source, max_fact_nodes)
+                        .unwrap_or(StructuralFactsLimitedOutcome::Unavailable);
+                };
+                let read = match self.load_structural_facts_rows_limited(
+                    &key,
+                    STRUCTURAL_FACTS_VERSION,
+                    max_fact_nodes,
+                    cancellation,
+                ) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        self.record_store_error(
+                            error.context("loading bounded canonical structural facts"),
+                        );
+                        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                            return StructuralFactsLimitedOutcome::Cancelled;
+                        }
+                        return self
+                            .cached_canonical_facts_limited(file, source, max_fact_nodes)
+                            .unwrap_or(StructuralFactsLimitedOutcome::Unavailable);
+                    }
+                };
+                let rows = match read {
+                    crate::analyzer::store::StructuralFactRowsRead::Ready(rows) => rows,
+                    crate::analyzer::store::StructuralFactRowsRead::Exceeded {
+                        minimum_work_items,
+                    } => {
+                        return StructuralFactsLimitedOutcome::Exceeded {
+                            minimum_fact_nodes: minimum_work_items,
+                        };
+                    }
+                    crate::analyzer::store::StructuralFactRowsRead::Cancelled => {
+                        return StructuralFactsLimitedOutcome::Cancelled;
+                    }
+                    crate::analyzer::store::StructuralFactRowsRead::Unavailable => {
+                        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                            return StructuralFactsLimitedOutcome::Cancelled;
+                        }
+                        return self
+                            .cached_canonical_facts_limited(file, source, max_fact_nodes)
+                            .unwrap_or(StructuralFactsLimitedOutcome::Unavailable);
+                    }
+                };
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return StructuralFactsLimitedOutcome::Cancelled;
+                }
+                let facts = match FileFacts::from_persisted_rows(source.to_owned(), rows) {
+                    Ok(facts) => Arc::new(facts),
+                    Err(error) => {
+                        self.record_store_error(StoreError::new(format!(
+                            "invalid canonical structural facts: {error}"
+                        )));
+                        return StructuralFactsLimitedOutcome::Unavailable;
+                    }
+                };
+                self.structural_cache().record_hydration();
+                return StructuralFactsLimitedOutcome::Available {
+                    facts,
+                    cache_outcome: StructuralFactsCacheOutcome::PersistedHydration,
+                };
             }
-            let Some(key) = self.structural_snapshot_key(file, source) else {
-                return self
-                    .cached_canonical_facts_limited(file, source, max_fact_nodes)
-                    .unwrap_or(StructuralFactsLimitedOutcome::Unavailable);
-            };
-            let read = match self.load_structural_facts_rows_limited(
-                &key,
-                STRUCTURAL_FACTS_VERSION,
+
+            self.structural_cache().record_extraction();
+            let grammar = self.adapter().parser_language_for_file(file);
+            let facts = match extract_file_facts_limited(
+                spec,
+                &grammar,
+                source,
                 max_fact_nodes,
                 cancellation,
             ) {
-                Ok(read) => read,
-                Err(error) => {
-                    self.record_store_error(
-                        error.context("loading bounded canonical structural facts"),
-                    );
-                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                        return StructuralFactsLimitedOutcome::Cancelled;
-                    }
-                    return self
-                        .cached_canonical_facts_limited(file, source, max_fact_nodes)
-                        .unwrap_or(StructuralFactsLimitedOutcome::Unavailable);
+                LimitedFileFacts::Complete(facts) => facts,
+                LimitedFileFacts::CompleteWithNodeIndex { facts, .. } => facts,
+                LimitedFileFacts::Exceeded { minimum_fact_nodes } => {
+                    return StructuralFactsLimitedOutcome::Exceeded { minimum_fact_nodes };
                 }
-            };
-            let rows = match read {
-                crate::analyzer::store::StructuralFactRowsRead::Ready(rows) => rows,
-                crate::analyzer::store::StructuralFactRowsRead::Exceeded { minimum_work_items } => {
-                    return StructuralFactsLimitedOutcome::Exceeded {
-                        minimum_fact_nodes: minimum_work_items,
-                    };
-                }
-                crate::analyzer::store::StructuralFactRowsRead::Cancelled => {
+                LimitedFileFacts::Cancelled => {
                     return StructuralFactsLimitedOutcome::Cancelled;
                 }
-                crate::analyzer::store::StructuralFactRowsRead::Unavailable => {
-                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                        return StructuralFactsLimitedOutcome::Cancelled;
-                    }
-                    return self
-                        .cached_canonical_facts_limited(file, source, max_fact_nodes)
-                        .unwrap_or(StructuralFactsLimitedOutcome::Unavailable);
+                LimitedFileFacts::Unavailable => {
+                    return StructuralFactsLimitedOutcome::Unavailable;
                 }
             };
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return StructuralFactsLimitedOutcome::Cancelled;
             }
-            let facts = match FileFacts::from_persisted_rows(source.to_owned(), rows) {
-                Ok(facts) => Arc::new(facts),
-                Err(error) => {
-                    self.record_store_error(StoreError::new(format!(
-                        "invalid canonical structural facts: {error}"
-                    )));
-                    return StructuralFactsLimitedOutcome::Unavailable;
-                }
-            };
-            self.structural_cache().record_hydration();
-            self.structural_cache().insert(key, Arc::clone(&facts));
-            return StructuralFactsLimitedOutcome::Available {
-                facts,
-                cache_outcome: StructuralFactsCacheOutcome::PersistedHydration,
-            };
-        }
 
-        self.structural_cache().record_extraction();
-        let grammar = self.adapter().parser_language_for_file(file);
-        let facts = match extract_file_facts_limited(
-            spec,
-            &grammar,
-            source,
-            max_fact_nodes,
-            cancellation,
-        ) {
-            LimitedFileFacts::Complete(facts) => facts,
-            LimitedFileFacts::CompleteWithNodeIndex { facts, .. } => facts,
-            LimitedFileFacts::Exceeded { minimum_fact_nodes } => {
-                return StructuralFactsLimitedOutcome::Exceeded { minimum_fact_nodes };
-            }
-            LimitedFileFacts::Cancelled => {
-                return StructuralFactsLimitedOutcome::Cancelled;
-            }
-            LimitedFileFacts::Unavailable => {
-                return StructuralFactsLimitedOutcome::Unavailable;
+            let facts = Arc::new(facts);
+            // The bounded query path must remain promptly cancellable. Durable row conversion
+            // clones every normalized node and role edge before insertion, so leave that optional
+            // optimization to the ordinary materialization path rather than performing an
+            // unmetered post-extraction traversal here.
+            StructuralFactsLimitedOutcome::Available {
+                facts,
+                cache_outcome: StructuralFactsCacheOutcome::Extracted,
             }
         };
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return StructuralFactsLimitedOutcome::Cancelled;
-        }
-
-        let facts = Arc::new(facts);
-        // The bounded query path must remain promptly cancellable. Durable row conversion
-        // clones every normalized node and role edge before insertion, so leave that optional
-        // optimization to the ordinary materialization path rather than performing an
-        // unmetered post-extraction traversal here.
-        if let Some(key) = key {
-            self.structural_cache().insert(key, Arc::clone(&facts));
-        }
-        StructuralFactsLimitedOutcome::Available {
-            facts,
-            cache_outcome: StructuralFactsCacheOutcome::Extracted,
+        match self.structural_cache().reuse_or_build(
+            key,
+            || cancellation.is_some_and(CancellationToken::is_cancelled),
+            || match build() {
+                StructuralFactsLimitedOutcome::Available {
+                    facts,
+                    cache_outcome,
+                } => Ok((facts, cache_outcome)),
+                other => Err(other),
+            },
+        ) {
+            Ok((facts, cache_outcome)) => {
+                let work_items = facts.work_item_count();
+                if work_items > max_fact_nodes {
+                    StructuralFactsLimitedOutcome::Exceeded {
+                        minimum_fact_nodes: work_items,
+                    }
+                } else {
+                    StructuralFactsLimitedOutcome::Available {
+                        facts,
+                        cache_outcome,
+                    }
+                }
+            }
+            Err(other) => other,
         }
     }
 
@@ -1157,6 +1357,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
 mod tests {
 
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     use crate::compact_graph::CompactRows;
 
@@ -1169,6 +1370,285 @@ mod tests {
             CompactRows::from_parts(vec![0], Vec::new()),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn source_identity_distinguishes_first_byte_edits() {
+        // Equal-length valid strings differ only in their first encoded byte.
+        // Blob identity is the independent content identity oracle used by the memo.
+        for sources in [["x=1", "y=1", "x=1"], ["\u{e9}=1", "\u{129}=1", "\u{e9}=1"]] {
+            let mut previous = None;
+            for source in sources {
+                let oid =
+                    git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap();
+                let hash = hash_source(source);
+                if let Some((old_oid, old_hash)) = previous {
+                    assert_ne!(oid, old_oid);
+                    assert_ne!(
+                        hash, old_hash,
+                        "different content must invalidate this memo entry"
+                    );
+                }
+                previous = Some((oid, hash));
+            }
+        }
+    }
+
+    #[test]
+    fn structural_facts_cache_reuses_live_allocations_after_eviction() {
+        let cache = StructuralFactsCache::new(1024 * 1024);
+        let shared = cache.sharing_entries();
+        let source = "live facts";
+        let key = StructuralSnapshotKey::for_test(source, "typescript");
+        let hydrate = |cache: &StructuralFactsCache| {
+            assert!(cache.get(&key).is_none());
+            cache.materialize(
+                key,
+                || Some(empty_facts(source)),
+                || panic!("unexpected extraction"),
+            )
+        };
+        let first = hydrate(&cache).0.unwrap();
+        cache.cache.invalidate(&key);
+        cache.cache.run_pending_tasks();
+        let (second, outcome) = hydrate(&shared);
+        let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(outcome, StructuralFactsCacheOutcome::MemoryHit);
+        assert_eq!(cache.hydration_count(), 1);
+        assert_eq!(shared.hydration_count(), 0);
+
+        let old = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        cache.cache.invalidate(&key);
+        cache.cache.run_pending_tasks();
+        assert!(old.upgrade().is_none());
+        let fresh = hydrate(&cache).0.unwrap();
+        assert_eq!(cache.hydration_count(), 2);
+        drop(fresh);
+        cache.cache.invalidate(&key);
+        cache.cache.run_pending_tasks();
+
+        assert!(cache.live.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    #[hardwon("#7445: dead live-facts registry entries outlived the query that held them")]
+    fn structural_facts_cache_releases_registrations_and_capacity() {
+        let cache = StructuralFactsCache::new(1024 * 1024);
+        let holders: Vec<_> = (0..128)
+            .map(|index| {
+                let source = format!("live facts {index}");
+                let key = StructuralSnapshotKey::for_test(&source, "typescript");
+                let facts = cache
+                    .materialize(key, || Some(empty_facts(&source)), || None)
+                    .0
+                    .unwrap();
+                cache.cache.invalidate(&key);
+                cache.cache.run_pending_tasks();
+                facts
+            })
+            .collect();
+        assert_eq!(cache.live.lock().unwrap().entries.len(), holders.len());
+        assert!(cache.live.lock().unwrap().entries.capacity() > 64);
+        drop(holders);
+        assert!(cache.live.lock().unwrap().entries.is_empty());
+        assert!(cache.live.lock().unwrap().entries.capacity() <= 64);
+
+        // Simulate an old allocation's delayed registration drop after its
+        // dead weak entry has been replaced by a newer live allocation.
+        let key = StructuralSnapshotKey::for_test("replacement", "typescript");
+        let late_drop = LiveRegistration {
+            registry: Arc::downgrade(&cache.live),
+            key,
+        };
+        cache.live.lock().unwrap().entries.insert(key, Weak::new());
+        let fresh = cache
+            .materialize(key, || Some(empty_facts("replacement")), || None)
+            .0
+            .unwrap();
+        drop(late_drop);
+        assert!(
+            cache
+                .live
+                .lock()
+                .unwrap()
+                .entries
+                .get(&key)
+                .unwrap()
+                .ptr_eq(&Arc::downgrade(&fresh))
+        );
+        cache.cache.invalidate(&key);
+        cache.cache.run_pending_tasks();
+        drop(fresh);
+        assert!(cache.live.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    #[hardwon("#7445: a cancelled waiter waited for an unrelated leader's build")]
+    fn structural_facts_cache_cancelled_waiter_leaves_blocked_leader() {
+        use std::sync::mpsc;
+
+        let cache = StructuralFactsCache::new(1024 * 1024);
+        let key = StructuralSnapshotKey::for_test("cancelled waiter", "typescript");
+        let cancellation = CancellationToken::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let cache = &cache;
+            let leader = scope.spawn(move || {
+                cache
+                    .reuse_or_build(
+                        Some(key),
+                        || false,
+                        || {
+                            started_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                            Ok::<_, ()>((
+                                Arc::new(empty_facts("cancelled waiter")),
+                                StructuralFactsCacheOutcome::Extracted,
+                            ))
+                        },
+                    )
+                    .unwrap()
+            });
+            started_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            let cancellation = &cancellation;
+            let waiter = scope.spawn(move || {
+                let result = cache.reuse_or_build(
+                    Some(key),
+                    || {
+                        waiting_tx.send(()).unwrap();
+                        cancellation.is_cancelled()
+                    },
+                    || {
+                        assert!(cancellation.is_cancelled());
+                        Err::<(Arc<FileFacts>, StructuralFactsCacheOutcome), _>(
+                            StructuralFactsLimitedOutcome::Cancelled,
+                        )
+                    },
+                );
+                returned_tx.send(result).unwrap();
+            });
+            waiting_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            cancellation.cancel();
+            assert!(matches!(
+                returned_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Err(StructuralFactsLimitedOutcome::Cancelled)
+            ));
+            assert!(!leader.is_finished());
+            assert!(cache.live.lock().unwrap().building.contains_key(&key));
+            release_tx.send(()).unwrap();
+            waiter.join().unwrap();
+            let _facts = leader.join().unwrap();
+            assert!(cache.live.lock().unwrap().building.is_empty());
+        });
+    }
+
+    #[test]
+    fn structural_facts_cache_waits_for_success_but_retries_failure() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        for fail_leader in [false, true] {
+            let cache = StructuralFactsCache::new(1024 * 1024);
+            let key = StructuralSnapshotKey::for_test("shared build", "typescript");
+            let builds = AtomicU64::new(0);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            thread::scope(|scope| {
+                assert!(cache.get(&key).is_none());
+                let cache = &cache;
+                let builds = &builds;
+                let leader = scope.spawn(move || {
+                    cache.reuse_or_build(
+                        Some(key),
+                        || false,
+                        || {
+                            builds.fetch_add(1, Ordering::Relaxed);
+                            started_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                            if fail_leader {
+                                Err("leader failed")
+                            } else {
+                                Ok((
+                                    Arc::new(empty_facts("shared build")),
+                                    StructuralFactsCacheOutcome::PersistedHydration,
+                                ))
+                            }
+                        },
+                    )
+                });
+                started_rx.recv().unwrap();
+                let slot = Arc::clone(cache.live.lock().unwrap().building.get(&key).unwrap());
+                let waiter = scope.spawn(move || {
+                    assert!(cache.get(&key).is_none());
+                    cache.reuse_or_build(
+                        Some(key),
+                        || false,
+                        || {
+                            builds.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, &str>((
+                                Arc::new(empty_facts("shared build")),
+                                StructuralFactsCacheOutcome::PersistedHydration,
+                            ))
+                        },
+                    )
+                });
+                // Registry, leader guard and this test own three references.
+                // A fourth proves the second request reached the wait path
+                // before releasing the leader, without timing-based sleeps.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while Arc::strong_count(&slot) < 4 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "waiter did not reach the build slot"
+                    );
+                    thread::yield_now();
+                }
+                release_tx.send(()).unwrap();
+                let leader = leader.join().unwrap();
+                let (waiter, outcome) = waiter.join().unwrap().unwrap();
+                if fail_leader {
+                    assert_eq!(leader.unwrap_err(), "leader failed");
+                    assert_eq!(outcome, StructuralFactsCacheOutcome::PersistedHydration);
+                    assert_eq!(builds.load(Ordering::Relaxed), 2);
+                } else {
+                    assert!(Arc::ptr_eq(&leader.unwrap().0, &waiter));
+                    assert_eq!(outcome, StructuralFactsCacheOutcome::MemoryHit);
+                    assert_eq!(builds.load(Ordering::Relaxed), 1);
+                }
+                assert!(cache.live.lock().unwrap().building.is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn structural_facts_cache_reentrant_build_adopts_inner_allocation() {
+        let cache = StructuralFactsCache::new(1024 * 1024);
+        let key = StructuralSnapshotKey::for_test("reentrant", "typescript");
+        let mut inner = None;
+        let (outer, _) = cache
+            .reuse_or_build(
+                Some(key),
+                || false,
+                || {
+                    inner = cache
+                        .materialize(key, || Some(empty_facts("reentrant")), || None)
+                        .0;
+                    assert!(cache.live.lock().unwrap().building.contains_key(&key));
+                    Ok::<_, ()>((
+                        Arc::new(empty_facts("reentrant")),
+                        StructuralFactsCacheOutcome::Extracted,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&outer, &inner.unwrap()));
+        assert!(cache.live.lock().unwrap().building.is_empty());
     }
 
     #[test]

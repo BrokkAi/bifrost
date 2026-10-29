@@ -493,6 +493,33 @@ mod tests {
     }
 
     #[test]
+    fn integrity_byte_limit_includes_the_exact_snapshot_boundary() {
+        let source = format!("example.com/lib v1.0.0 {HASH}\n");
+        for extra in [0, 1] {
+            let document = parse_go_sum(
+                &source,
+                &BuildFileLimits {
+                    max_bytes: source.len() + extra,
+                    ..Default::default()
+                },
+                || false,
+            );
+            assert!(document.complete(), "{document:?}");
+            assert_eq!(document.entries.len(), 1);
+        }
+        let document = parse_go_sum(
+            &source,
+            &BuildFileLimits {
+                max_bytes: source.len() - 1,
+                ..Default::default()
+            },
+            || false,
+        );
+        assert_eq!(document.issues[0].kind, BuildFileIssueKind::ByteLimit);
+        assert!(document.entries.is_empty());
+    }
+
+    #[test]
     fn integrity_readers_enforce_limits_and_cancellation() {
         let source = format!("example.com/lib v1.0.0 {HASH}\nexample.com/lib v1.1.0 {HASH}\n");
         let document = parse_go_sum(

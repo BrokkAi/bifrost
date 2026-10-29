@@ -10,7 +10,7 @@ use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, Sou
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, has_child_of_kind};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::structural::{PHP_KIND_TABLE, PHP_STRUCTURAL_SPEC};
@@ -675,6 +675,7 @@ impl<'a> PhpVisitor<'a> {
             return;
         };
         let modifiers = php_property_prefix(node, self.source);
+        let (is_static, is_readonly) = php_field_modifiers(node);
         let type_prefix = node
             .child_by_field_name("type")
             .map(|type_node| format!("{} ", php_node_text(type_node, self.source).trim()))
@@ -724,6 +725,7 @@ impl<'a> PhpVisitor<'a> {
                 code_unit,
                 child,
                 SignatureMetadata::new(signature, Vec::new())
+                    .with_field_modifiers(is_static, is_readonly)
                     .with_return_type_text(php_declared_type_text(node, self.source))
                     .with_return_type_identity(source_declared_type_identity(
                         &self.properties.declaration(child).declared_type,
@@ -856,6 +858,7 @@ impl<'a> PhpVisitor<'a> {
                 Some(parent.clone()),
                 None,
             );
+            let (is_static, is_readonly) = php_field_modifiers(parameter);
             let signature = format!(
                 "{};",
                 normalize_php_snippet(&php_node_text(parameter, self.source)).trim_end_matches(',')
@@ -864,6 +867,7 @@ impl<'a> PhpVisitor<'a> {
                 code_unit,
                 parameter,
                 SignatureMetadata::new(signature, Vec::new())
+                    .with_field_modifiers(is_static, is_readonly)
                     .with_return_type_text(php_declared_type_text(parameter, self.source))
                     .with_return_type_identity(source_declared_type_identity(
                         &self.properties.declaration(parameter).declared_type,
@@ -1013,31 +1017,22 @@ fn php_signature_metadata(signature: String, node: Node<'_>, source: &str) -> Si
 }
 
 /// The callable's parameter labels, positioned inside the rendered
-/// `signature`. Empty when the declaration carries no parameter list or the
-/// rendered header does not contain it.
+/// `signature`, mapped from grammar-selected name ranges through the same
+/// whitespace normalization as the header. Empty without a parameter list.
 fn php_parameter_metadata(signature: &str, node: Node<'_>, source: &str) -> Vec<ParameterMetadata> {
     let Some(parameters_node) = node.child_by_field_name("parameters") else {
         return Vec::new();
     };
-    let parameter_text = normalize_php_snippet(&php_node_text(parameters_node, source));
-    let Some(parameters_start) = signature.find(&parameter_text) else {
-        return Vec::new();
-    };
-    let parameters_end = parameters_start + parameter_text.len();
-    let mut search_start = parameters_start;
+    let declaration_start = php_declaration_range(node, source).start_byte;
     php_parameter_label_nodes(parameters_node)
         .into_iter()
-        .filter_map(|label_node| {
-            let label = normalize_php_snippet(&php_node_text(label_node, source));
-            if label.is_empty() || search_start > parameters_end {
-                return None;
-            }
-            let haystack = signature.get(search_start..parameters_end)?;
-            let relative_start = haystack.find(&label)?;
-            let start_byte = search_start + relative_start;
-            let end_byte = start_byte + label.len();
-            search_start = end_byte;
-            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        .map(|label_node| {
+            let label = php_node_text(label_node, source);
+            let end_byte =
+                normalize_php_snippet(&source[declaration_start..label_node.end_byte()]).len();
+            let start_byte = end_byte - label.len();
+            assert_eq!(signature.get(start_byte..end_byte), Some(label.as_str()));
+            ParameterMetadata::new(label, start_byte, end_byte)
         })
         .collect()
 }
@@ -1119,6 +1114,23 @@ fn php_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
     labels
 }
 
+// Shared field finality means a write-once value (like C# readonly), not
+// PHP's final override restriction. A readonly class makes all its properties
+// readonly, including constructor-promoted properties without that modifier.
+fn php_field_modifiers(node: Node<'_>) -> (bool, bool) {
+    let is_static = has_child_of_kind(node, "static_modifier");
+    let mut is_readonly = has_child_of_kind(node, "readonly_modifier");
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(parent.kind(), "class_declaration" | "anonymous_class") {
+            is_readonly |= has_child_of_kind(parent, "readonly_modifier");
+            break;
+        }
+        ancestor = parent.parent();
+    }
+    (is_static, is_readonly)
+}
+
 fn php_property_prefix(node: Node<'_>, source: &str) -> String {
     let parts = php_attribute_modifier_parts(node, source);
     if parts.is_empty() {
@@ -1151,21 +1163,10 @@ fn php_attribute_modifier_parts(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 fn php_attribute_lines(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut attributes = Vec::new();
-    let mut current = node;
-    while let Some(prev) = current.prev_named_sibling() {
-        if prev.kind() != "attribute_list" {
-            break;
-        }
-        let gap = &source[prev.end_byte()..current.start_byte()];
-        if !gap.trim().is_empty() {
-            break;
-        }
-        attributes.push(php_node_text(prev, source).trim().to_string());
-        current = prev;
-    }
-    attributes.reverse();
-    attributes
+    node.child_by_field_name("attributes")
+        .map(|attributes| normalize_php_snippet(&php_node_text(attributes, source)))
+        .into_iter()
+        .collect()
 }
 
 fn php_text_with_attributes(node: Node<'_>, source: &str) -> String {
@@ -1177,36 +1178,12 @@ fn php_raw_text_with_attributes(node: Node<'_>, source: &str) -> String {
     source[range.start_byte..range.end_byte].to_string()
 }
 
-/// One declaration node's range, extended back over the `attribute_list`
-/// siblings written directly above it.
-///
-/// Every declaration this walk records is registered with
-/// [`ParsedFile::add_code_unit_with_range`] under this range, which APPENDS an
-/// occurrence rather than replacing the list. PHP lets one name be declared
-/// more than once in a file -- a feature-detection stub writes the same class
-/// once per branch of an `if`/`elseif`/`else` and the branches' members merge
-/// into the one FQ name -- so a container that replaced its range with the
-/// last branch's node would no longer contain the members the earlier branches
-/// contributed (#3292).
-fn php_declaration_range(node: Node<'_>, source: &str) -> Range {
-    let mut start_byte = node.start_byte();
-    let mut start_point = node.start_position();
-    let mut current = node;
-    while let Some(prev) = current.prev_named_sibling() {
-        if prev.kind() != "attribute_list" {
-            break;
-        }
-        let gap = &source[prev.end_byte()..current.start_byte()];
-        if !gap.trim().is_empty() {
-            break;
-        }
-        start_byte = prev.start_byte();
-        start_point = prev.start_position();
-        current = prev;
-    }
+/// Declaration ranges include attributes: the grammar attaches the attribute
+/// list as a child of its declaration. Keep every conditional occurrence (#3292).
+fn php_declaration_range(node: Node<'_>, _source: &str) -> Range {
     php_range(
-        start_byte,
-        start_point,
+        node.start_byte(),
+        node.start_position(),
         node.end_byte(),
         node.end_position(),
     )
@@ -1732,6 +1709,244 @@ class Holder {
             // desync the two projections.
             assert_eq!(parsed.imports.len(), source_facts.imports.len());
             assert_eq!(parsed.imports.len(), source_facts.generic_imports.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod declaration_regression_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parsed(source: &str) -> ParsedFile {
+        let tree = crate::aliases::parse_php_tree(source).unwrap();
+        parse_php_file(
+            &ProjectFile::new(std::env::temp_dir(), "qs9-a.php"),
+            source,
+            &tree,
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: declaration child attributes were omitted from property signatures"
+    )]
+    fn attributes_are_declaration_children() {
+        let source =
+            "<?php class C { #[Marker] #[Other] public int $x; #[Marker] public const Y = 2; }";
+        let tree = crate::aliases::parse_php_tree(source).unwrap();
+        for kind in ["property_declaration", "const_declaration"] {
+            let node = php_find_named_descendant(tree.root_node(), kind).unwrap();
+            let attributes = node.child_by_field_name("attributes").unwrap();
+            assert_eq!(attributes.kind(), "attribute_list");
+            assert!(!php_attribute_lines(node, source).is_empty());
+        }
+        let parsed = parsed(source);
+        let signatures: Vec<_> = parsed
+            .signatures
+            .iter()
+            .flat_map(|(u, texts)| {
+                texts
+                    .iter()
+                    .map(move |text| (u.identifier().to_string(), text.clone()))
+            })
+            .collect();
+        assert!(
+            signatures
+                .iter()
+                .any(|(name, text)| name == "x" && text.contains("#[Marker] #[Other]")),
+            "{signatures:?}"
+        );
+        assert!(
+            signatures
+                .iter()
+                .any(|(name, text)| name == "Y" && text.contains("#[Marker]")),
+            "{signatures:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: parameter label spans matched earlier string defaults"
+    )]
+    fn parameter_ranges_follow_name_nodes() {
+        let source = "<?php function f($a = '$b', $b = null) {}";
+        let parsed = parsed(source);
+        let metadata = parsed
+            .signature_metadata
+            .values()
+            .next()
+            .unwrap()
+            .first()
+            .unwrap();
+        let b = &metadata.parameters()[1];
+        assert_eq!(b.label(), "$b");
+        assert_eq!(b.start_byte(), "function f($a = '$b', ".len());
+    }
+}
+
+#[cfg(test)]
+mod declaration_publication_tests {
+    use super::*;
+
+    // The parser/producer boundary must agree about declaration admission,
+    // namespaces, modifiers and dependency identities. Expected spellings are
+    // enumerated independently of resolver construction.
+    #[test]
+    fn grammar_declaration_publication_table() {
+        let source = r#"<?php
+namespace N;
+const X = 1;
+#[\Vendor\Marker]
+class C extends \Vendor\Base implements \Vendor\Contract {
+    use \Vendor\Mixin;
+    public readonly int $id;
+    public static int $count = 0;
+    public const Y = 2;
+}
+interface I {
+    public function render(
+        string $value
+    ): void;
+}
+enum Good { case A; }
+"#;
+        let tree = crate::aliases::parse_php_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        for (container, target) in [
+            ("base_clause", "\\Vendor\\Base"),
+            ("class_interface_clause", "\\Vendor\\Contract"),
+            ("use_declaration", "\\Vendor\\Mixin"),
+            ("attribute", "\\Vendor\\Marker"),
+        ] {
+            let node = php_find_named_descendant(tree.root_node(), container).unwrap();
+            let name = node.named_child(0).unwrap();
+            assert_eq!(name.kind(), "qualified_name", "{container}");
+            assert_eq!(php_node_text(name, source), target);
+        }
+        let constant = php_find_named_descendant(tree.root_node(), "const_element").unwrap();
+        let name = constant.named_child(0).unwrap();
+        assert_eq!(name.kind(), "name");
+        assert_eq!(php_node_text(name, source), "X");
+        for modifier in ["readonly_modifier", "static_modifier"] {
+            let node = php_find_named_descendant(tree.root_node(), modifier).unwrap();
+            assert_eq!(node.parent().unwrap().kind(), "property_declaration");
+        }
+        let file = ProjectFile::new(std::env::temp_dir(), "qs9-publication.php");
+        let parsed = parse_php_file(&file, source, &tree);
+        for dependency in [
+            "Vendor.Marker",
+            "Vendor.Base",
+            "Vendor.Contract",
+            "Vendor.Mixin",
+        ] {
+            assert!(
+                parsed.type_identifiers.contains(dependency),
+                "{dependency}: {:?}",
+                parsed.type_identifiers
+            );
+        }
+        for (fq, expected) in [
+            ("N._module_.X", "const X = 1;"),
+            ("N.C.Y", "public const Y = 2;"),
+            ("N.C.id", "public readonly int $id;"),
+            ("N.C.count", "public static int $count = 0;"),
+            (
+                "N.I.render",
+                "public function render(\nstring $value\n): void;",
+            ),
+        ] {
+            let signatures = parsed
+                .signatures
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq)
+                .unwrap_or_else(|| panic!("missing {fq}: {:?}", parsed.signatures));
+            assert_eq!(signatures.1, &[expected.to_string()], "{fq}");
+        }
+        for source in [
+            "<?php namespace A; class First {} namespace B; class Second {}",
+            "<?php namespace A { class First {} } namespace B { class Second {} }",
+        ] {
+            let tree = crate::aliases::parse_php_tree(source).unwrap();
+            let parsed = parse_php_file(&file, source, &tree);
+            assert_eq!(parsed.package_name, "");
+            let units: Vec<_> = parsed.ranges.keys().map(CodeUnit::fq_name).collect();
+            assert!(
+                units.contains(&"A.First".to_string()) && units.contains(&"B.Second".to_string()),
+                "{units:?}"
+            );
+        }
+        // Missing outer delimiters withhold the recovered enum; a complete
+        // control proves this is admission rather than missing enum support.
+        for (source, admitted) in [
+            ("<?php enum Good { case A; }", true),
+            ("<?php enum Broken { case A;", false),
+        ] {
+            let tree = crate::aliases::parse_php_tree(source).unwrap();
+            let parsed = parse_php_file(&file, source, &tree);
+            assert_eq!(
+                parsed.ranges.keys().any(CodeUnit::is_class),
+                admitted,
+                "{source}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod field_modifier_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: static property metadata was published as instance metadata"
+    )]
+    fn property_modifiers_have_ast_semantics() {
+        let source = r#"<?php
+class C {
+    public static ?C $shared = null;
+    public string $ordinary = 'static readonly';
+    public readonly C $once;
+    public function __construct(public C $promoted, public readonly C $promotedOnce) {}
+}
+readonly class R {
+    public C $implicit;
+    public function __construct(public C $promotedImplicit) {}
+}
+"#;
+        let tree = crate::aliases::parse_php_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let file = ProjectFile::new(std::env::temp_dir(), "qs9-field-modifiers.php");
+        let parsed = parse_php_file(&file, source, &tree);
+        let property = php_find_named_descendant(tree.root_node(), "property_declaration").unwrap();
+        assert!(
+            property
+                .named_children(&mut property.walk())
+                .any(|child| child.kind() == "static_modifier")
+        );
+        for (fq, expected) in [
+            ("C.shared", (true, false)),
+            ("C.ordinary", (false, false)),
+            ("C.once", (false, true)),
+            ("C.promoted", (false, false)),
+            ("C.promotedOnce", (false, true)),
+            ("R.implicit", (false, true)),
+            ("R.promotedImplicit", (false, true)),
+        ] {
+            let metadata = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.fq_name() == fq)
+                .unwrap()
+                .1
+                .first()
+                .unwrap();
+            assert_eq!(
+                (metadata.field_is_static(), metadata.field_is_final()),
+                expected,
+                "{fq}"
+            );
         }
     }
 }

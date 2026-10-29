@@ -239,6 +239,58 @@ impl TaintFinding {
     }
 }
 
+/// Query-local reconstruction work, including duplicate candidates and witnesses
+/// refused by the evidence-retention budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TaintAttributionWork {
+    pub attempts: usize,
+    pub steps: usize,
+    pub expansions: usize,
+    pub candidate_exhaustions: usize,
+    pub run_exhausted: bool,
+}
+
+impl TaintAttributionWork {
+    /// Work charged since an earlier snapshot of the same query ledger.
+    pub fn since(self, earlier: Self) -> Self {
+        assert!(
+            self.attempts >= earlier.attempts
+                && self.steps >= earlier.steps
+                && self.expansions >= earlier.expansions
+                && self.candidate_exhaustions >= earlier.candidate_exhaustions,
+            "attribution snapshots belong to one monotone query ledger"
+        );
+        Self {
+            attempts: self.attempts - earlier.attempts,
+            steps: self.steps - earlier.steps,
+            expansions: self.expansions - earlier.expansions,
+            candidate_exhaustions: self.candidate_exhaustions - earlier.candidate_exhaustions,
+            run_exhausted: self.run_exhausted && !earlier.run_exhausted,
+        }
+    }
+}
+
+/// One query's attribution allowance, shared across collections and charged
+/// at reconstruction, including when later projection or refinement fails.
+#[derive(Debug)]
+pub struct TaintAttributionBudget {
+    limits: (usize, usize),
+    work: TaintAttributionWork,
+}
+
+impl TaintAttributionBudget {
+    pub fn new(max_steps: usize, max_expansions: usize) -> Self {
+        Self {
+            limits: (max_steps, max_expansions),
+            work: TaintAttributionWork::default(),
+        }
+    }
+
+    pub const fn work(&self) -> TaintAttributionWork {
+        self.work
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintFindingReport {
     result: TaintSummaryResult,
@@ -249,6 +301,7 @@ pub struct TaintFindingReport {
     retained_witness_steps: usize,
     witness_expansions: usize,
     retained_witness_bytes: usize,
+    attribution: TaintAttributionWork,
 }
 
 impl TaintFindingReport {
@@ -282,6 +335,10 @@ impl TaintFindingReport {
 
     pub const fn omitted_findings_lower_bound(&self) -> usize {
         self.omitted_findings_lower_bound
+    }
+
+    pub const fn attribution_work(&self) -> TaintAttributionWork {
+        self.attribution
     }
 
     pub const fn retained_witnesses(&self) -> usize {
@@ -416,13 +473,114 @@ impl TaintFindingCollectionLimits {
 }
 
 #[derive(Debug)]
-struct CollectionBudget {
+struct CollectionBudget<'a> {
     limits: TaintFindingCollectionLimits,
     witnesses: usize,
     witness_steps: usize,
     witness_expansions: usize,
     retained_witness_bytes: usize,
     truncated: bool,
+    attribution: &'a mut TaintAttributionBudget,
+    attribution_start: TaintAttributionWork,
+}
+
+impl CollectionBudget<'_> {
+    fn attribution_limits(
+        &self,
+        candidate: &TaintAttributionWork,
+        limits: WitnessReconstructionLimits,
+    ) -> Option<WitnessReconstructionLimits> {
+        let steps = limits.max_steps().saturating_sub(candidate.steps).min(
+            self.attribution
+                .limits
+                .0
+                .saturating_sub(self.attribution.work.steps),
+        );
+        let expansions = limits
+            .max_expansions()
+            .saturating_sub(candidate.expansions)
+            .min(
+                self.attribution
+                    .limits
+                    .1
+                    .saturating_sub(self.attribution.work.expansions),
+            );
+        WitnessReconstructionLimits::new(steps, expansions).ok()
+    }
+
+    fn charge_attribution(
+        &mut self,
+        candidate: &mut TaintAttributionWork,
+        reconstructed: &Result<SummaryWitness, SummaryWitnessError>,
+        granted: WitnessReconstructionLimits,
+    ) {
+        let (steps, expansions) = match reconstructed {
+            Ok(witness) => (
+                witness.work().emitted_steps(),
+                witness.work().evidence_expansions().max(1),
+            ),
+            // These lookups return before reconstruction starts. Charge the
+            // attempt itself so disabled retention cannot evade the work bound.
+            Err(
+                SummaryWitnessError::RetentionDisabled | SummaryWitnessError::QualityNotRetained(_),
+            ) => (0, 1),
+            // Invalid evidence can fail after doing part of a walk. Its error
+            // carries no work receipt, so charge its entire grant rather than
+            // allow a failed batch to refund work before the next batch.
+            Err(_) => {
+                self.attribution.work.candidate_exhaustions += 1;
+                (granted.max_steps(), granted.max_expansions())
+            }
+        };
+        candidate.attempts += 1;
+        candidate.steps += steps;
+        candidate.expansions += expansions;
+        self.attribution.work.attempts += 1;
+        self.attribution.work.steps += steps;
+        self.attribution.work.expansions += expansions;
+        debug_assert!(
+            self.attribution.work.steps <= self.attribution.limits.0
+                && self.attribution.work.expansions <= self.attribution.limits.1
+        );
+        self.attribution.work.run_exhausted |= self.attribution.work.steps
+            == self.attribution.limits.0
+            || self.attribution.work.expansions == self.attribution.limits.1;
+    }
+
+    /// Attribution has already used the transient path. Only retained evidence
+    /// spends the collection's witness, step, expansion and byte allowance.
+    fn retain_witness(
+        &mut self,
+        witness: &SummaryWitness,
+        steps: usize,
+        expansions: usize,
+    ) -> bool {
+        if self.witnesses == self.limits.max_witnesses
+            || steps
+                > self
+                    .limits
+                    .max_witness_steps
+                    .saturating_sub(self.witness_steps)
+            || expansions
+                > self
+                    .limits
+                    .max_witness_expansions
+                    .saturating_sub(self.witness_expansions)
+            || witness.retained_bytes()
+                > self
+                    .limits
+                    .max_retained_witness_bytes
+                    .saturating_sub(self.retained_witness_bytes)
+        {
+            self.truncated = true;
+            return false;
+        }
+        self.witnesses += 1;
+        self.witness_steps += steps;
+        self.witness_expansions += expansions;
+        self.retained_witness_bytes += witness.retained_bytes();
+        true
+    }
 }
 
 /// Constructors for a report composed over partial flows instead of solved
@@ -535,6 +693,7 @@ impl TaintFindingReport {
         let mut report = Self::composed(result, findings);
         report.collection_truncated = self.collection_truncated || incomplete;
         report.omitted_findings_lower_bound = self.omitted_findings_lower_bound;
+        report.attribution = self.attribution;
         report
     }
 
@@ -548,6 +707,7 @@ impl TaintFindingReport {
         let mut report = Self::composed(self.result.without_observed_values(), findings);
         report.collection_truncated = self.collection_truncated || incomplete;
         report.omitted_findings_lower_bound = self.omitted_findings_lower_bound;
+        report.attribution = self.attribution;
         report
     }
 
@@ -565,6 +725,7 @@ impl TaintFindingReport {
             retained_witnesses: witnesses.len(),
             retained_witness_steps: witnesses.iter().map(|witness| witness.steps().len()).sum(),
             witness_expansions: 0,
+            attribution: TaintAttributionWork::default(),
             retained_witness_bytes: witnesses
                 .iter()
                 .map(|witness| witness.retained_bytes())
@@ -602,6 +763,32 @@ pub fn collect_taint_findings_with_limits(
     witness_limits: WitnessReconstructionLimits,
     collection_limits: TaintFindingCollectionLimits,
 ) -> Result<TaintFindingReport, TaintFindingError> {
+    let mut attribution = TaintAttributionBudget::new(
+        witness_limits
+            .max_steps()
+            .saturating_mul(collection_limits.max_findings),
+        witness_limits
+            .max_expansions()
+            .saturating_mul(collection_limits.max_findings),
+    );
+    collect_taint_findings_with_attribution_budget(
+        plan,
+        result,
+        max_origins_per_finding,
+        witness_limits,
+        collection_limits,
+        &mut attribution,
+    )
+}
+
+pub fn collect_taint_findings_with_attribution_budget(
+    plan: &TaintAnalysisPlan,
+    result: TaintSummaryResult,
+    max_origins_per_finding: usize,
+    witness_limits: WitnessReconstructionLimits,
+    collection_limits: TaintFindingCollectionLimits,
+    attribution: &mut TaintAttributionBudget,
+) -> Result<TaintFindingReport, TaintFindingError> {
     if max_origins_per_finding == 0 {
         return Err(TaintFindingError::InvalidOriginLimit);
     }
@@ -609,6 +796,7 @@ pub fn collect_taint_findings_with_limits(
         return Err(TaintFindingError::PlanMismatch);
     }
     let mut findings = Vec::new();
+    let attribution_start = attribution.work();
     let mut budget = CollectionBudget {
         limits: collection_limits,
         witnesses: 0,
@@ -616,6 +804,8 @@ pub fn collect_taint_findings_with_limits(
         witness_expansions: 0,
         retained_witness_bytes: 0,
         truncated: false,
+        attribution,
+        attribution_start,
     };
     let mut omitted_findings_lower_bound = 0usize;
     for point_value in result.point_values() {
@@ -740,13 +930,14 @@ pub fn collect_taint_findings_with_limits(
         retained_witness_steps: budget.witness_steps,
         witness_expansions: budget.witness_expansions,
         retained_witness_bytes: budget.retained_witness_bytes,
+        attribution: budget.attribution.work().since(budget.attribution_start),
     })
 }
 
 /// The most caller contexts one finding's origin reconstruction replays.
 ///
-/// The collection budget already bounds witnesses, steps, expansions, and
-/// bytes. This cap bounds the *search* itself, so a value entering a helper
+/// Attribution has aggregate candidate and request work bounds, independent
+/// of evidence retention. This additional cap bounds caller-context search, so a value entering a helper
 /// that thousands of procedures call cannot make one finding's origin walk
 /// scale with the call graph. Reaching it truncates the origin set, which the
 /// projected finding reports; it never invents an origin and never hides one
@@ -906,7 +1097,7 @@ fn reconstruct_origins(
     classes: &TaintClassSet,
     limit: usize,
     witness_limits: WitnessReconstructionLimits,
-    budget: &mut CollectionBudget,
+    budget: &mut CollectionBudget<'_>,
 ) -> Result<TaintOriginStatus, TaintFindingError> {
     let sink = result
         .fact_result()
@@ -936,6 +1127,7 @@ fn reconstruct_origins(
     let mut witness_truncated = false;
     let mut witness_truncation_cause = None::<TaintWitnessTruncationCause>;
     let mut pending_callers = Vec::<PendingCallerContext>::new();
+    let mut candidate = TaintAttributionWork::default();
     let problem = super::TaintFlowProblem::new(plan);
     for quality in point_value.path_qualities().iter() {
         // One reached fact is routinely derived along several paths, and two
@@ -947,58 +1139,26 @@ fn reconstruct_origins(
         // retention still runs exactly one pass.
         let derivations = reached.retained_derivations(quality).max(1);
         for derivation in 0..derivations {
-            let remaining_steps = budget
-                .limits
-                .max_witness_steps
-                .saturating_sub(budget.witness_steps);
-            let remaining_expansions = budget
-                .limits
-                .max_witness_expansions
-                .saturating_sub(budget.witness_expansions);
-            if budget.witnesses == budget.limits.max_witnesses
-                || remaining_steps == 0
-                || remaining_expansions == 0
-            {
+            let Some(bounded_limits) = budget.attribution_limits(&candidate, witness_limits) else {
+                origin_truncated = true;
                 witness_truncated = true;
                 witness_truncation_cause = witness_truncation_cause
                     .or(Some(TaintWitnessTruncationCause::CollectionBudget));
                 budget.truncated = true;
-                continue;
-            }
-            let bounded_limits = WitnessReconstructionLimits::new(
-                witness_limits.max_steps().min(remaining_steps),
-                witness_limits.max_expansions().min(remaining_expansions),
-            )
-            .expect("positive remaining witness limits were checked");
-            match result.fact_result().witness_for_reached_derivation(
+                budget.attribution.work.run_exhausted |= budget.attribution.work.steps
+                    == budget.attribution.limits.0
+                    || budget.attribution.work.expansions == budget.attribution.limits.1;
+                break;
+            };
+            let reconstructed = result.fact_result().witness_for_reached_derivation(
                 reached,
                 quality,
                 derivation,
                 bounded_limits,
-            ) {
+            );
+            budget.charge_attribution(&mut candidate, &reconstructed, bounded_limits);
+            match reconstructed {
                 Ok(witness) => {
-                    let retained_bytes = witness.retained_bytes();
-                    if retained_bytes
-                        > budget
-                            .limits
-                            .max_retained_witness_bytes
-                            .saturating_sub(budget.retained_witness_bytes)
-                    {
-                        witness_truncated = true;
-                        witness_truncation_cause = witness_truncation_cause
-                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
-                        budget.truncated = true;
-                        continue;
-                    }
-                    budget.witnesses = budget.witnesses.saturating_add(1);
-                    budget.witness_steps = budget
-                        .witness_steps
-                        .saturating_add(witness.work().emitted_steps());
-                    budget.witness_expansions = budget
-                        .witness_expansions
-                        .saturating_add(witness.work().evidence_expansions());
-                    budget.retained_witness_bytes =
-                        budget.retained_witness_bytes.saturating_add(retained_bytes);
                     let witness = Arc::new(witness);
                     // Sibling derivations the retention limit dropped are still not
                     // marked truncated: this witness's own steps are complete
@@ -1023,6 +1183,18 @@ fn reconstruct_origins(
                         &mut evidence,
                         &mut origin_truncated,
                     )?;
+                    if !budget.retain_witness(
+                        &witness,
+                        witness.work().emitted_steps(),
+                        witness.work().evidence_expansions(),
+                    ) {
+                        for (_, _, _, witnesses) in &mut evidence {
+                            witnesses.retain(|retained| !Arc::ptr_eq(retained, &witness));
+                        }
+                        witness_truncated = true;
+                        witness_truncation_cause = witness_truncation_cause
+                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                    }
                     // A path edge is relative to its entry, so a witness whose entry
                     // fact is not the distinguished zero fact begins mid-flow: the
                     // value was already tainted when the procedure was entered, and
@@ -1065,50 +1237,43 @@ fn reconstruct_origins(
                         origin_truncated = true;
                         break 'callers;
                     }
-                    let remaining_steps = budget
-                        .limits
-                        .max_witness_steps
-                        .saturating_sub(budget.witness_steps);
-                    let remaining_expansions = budget
-                        .limits
-                        .max_witness_expansions
-                        .saturating_sub(budget.witness_expansions);
-                    if budget.witnesses == budget.limits.max_witnesses
-                        || remaining_steps == 0
-                        || remaining_expansions == 0
-                    {
+                    let Some(bounded_limits) =
+                        budget.attribution_limits(&candidate, witness_limits)
+                    else {
+                        origin_truncated = true;
                         witness_truncated = true;
                         witness_truncation_cause = witness_truncation_cause
                             .or(Some(TaintWitnessTruncationCause::CollectionBudget));
                         budget.truncated = true;
+                        budget.attribution.work.run_exhausted |= budget.attribution.work.steps
+                            == budget.attribution.limits.0
+                            || budget.attribution.work.expansions == budget.attribution.limits.1;
                         break 'callers;
-                    }
-                    let bounded_limits = WitnessReconstructionLimits::new(
-                        witness_limits.max_steps().min(remaining_steps),
-                        witness_limits.max_expansions().min(remaining_expansions),
-                    )
-                    .expect("positive remaining witness limits were checked");
-                    let call_witness =
-                        match result.fact_result().witness_for_incoming_call_derivation(
-                            incoming,
-                            quality,
-                            derivation,
-                            bounded_limits,
-                        ) {
-                            Ok(call_witness) => call_witness,
-                            Err(SummaryWitnessError::RetentionDisabled) => {
-                                witness_unavailable = true;
-                                continue;
-                            }
-                            Err(SummaryWitnessError::QualityNotRetained(_)) => {
-                                witness_truncated = true;
-                                witness_truncation_cause = witness_truncation_cause
-                                    .or(Some(TaintWitnessTruncationCause::QualityNotRetained));
-                                continue;
-                            }
-                            Err(error) => return Err(TaintFindingError::Witness(error)),
-                        };
+                    };
+                    let reconstructed = result.fact_result().witness_for_incoming_call_derivation(
+                        incoming,
+                        quality,
+                        derivation,
+                        bounded_limits,
+                    );
+                    budget.charge_attribution(&mut candidate, &reconstructed, bounded_limits);
+                    let call_witness = match reconstructed {
+                        Ok(call_witness) => call_witness,
+                        Err(SummaryWitnessError::RetentionDisabled) => {
+                            witness_unavailable = true;
+                            continue;
+                        }
+                        Err(SummaryWitnessError::QualityNotRetained(_)) => {
+                            witness_truncated = true;
+                            witness_truncation_cause = witness_truncation_cause
+                                .or(Some(TaintWitnessTruncationCause::QualityNotRetained));
+                            continue;
+                        }
+                        Err(error) => return Err(TaintFindingError::Witness(error)),
+                    };
                     caller_expansions = caller_expansions.saturating_add(1);
+                    let retained_steps = call_witness.work().emitted_steps();
+                    let retained_expansions = call_witness.work().evidence_expansions();
                     let call_steps = call_witness.steps().len();
                     let Some(composed) =
                         call_witness.joined_at_call(&context.witness, witness_limits.max_steps())
@@ -1120,28 +1285,6 @@ fn reconstruct_origins(
                             .or(Some(TaintWitnessTruncationCause::CollectionBudget));
                         continue;
                     };
-                    if composed.retained_bytes()
-                        > budget
-                            .limits
-                            .max_retained_witness_bytes
-                            .saturating_sub(budget.retained_witness_bytes)
-                    {
-                        witness_truncated = true;
-                        witness_truncation_cause = witness_truncation_cause
-                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
-                        budget.truncated = true;
-                        continue;
-                    }
-                    budget.witnesses = budget.witnesses.saturating_add(1);
-                    budget.witness_steps = budget
-                        .witness_steps
-                        .saturating_add(call_witness.work().emitted_steps());
-                    budget.witness_expansions = budget
-                        .witness_expansions
-                        .saturating_add(call_witness.work().evidence_expansions());
-                    budget.retained_witness_bytes = budget
-                        .retained_witness_bytes
-                        .saturating_add(composed.retained_bytes());
                     witness_truncated |= composed.truncated();
                     witness_truncation_cause = witness_truncation_cause.or(composed
                         .truncation_cause()
@@ -1164,6 +1307,14 @@ fn reconstruct_origins(
                         &mut evidence,
                         &mut origin_truncated,
                     )?;
+                    if !budget.retain_witness(&composed, retained_steps, retained_expansions) {
+                        for (_, _, _, witnesses) in &mut evidence {
+                            witnesses.retain(|retained| !Arc::ptr_eq(retained, &composed));
+                        }
+                        witness_truncated = true;
+                        witness_truncation_cause = witness_truncation_cause
+                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                    }
                     if !entry_fact_is_zero(result, incoming.caller())? {
                         pending_callers.push(PendingCallerContext::extended(
                             &context,
@@ -1174,6 +1325,12 @@ fn reconstruct_origins(
                 }
             }
         }
+    }
+    if witness_truncated
+        && (candidate.steps == witness_limits.max_steps()
+            || candidate.expansions == witness_limits.max_expansions())
+    {
+        budget.attribution.work.candidate_exhaustions += 1;
     }
     evidence.sort_by(|left, right| left.0.cmp(&right.0));
     let evidence = evidence

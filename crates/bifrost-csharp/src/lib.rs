@@ -24,6 +24,7 @@
 
 pub mod adapter;
 pub mod clones;
+pub mod compilation;
 pub mod dead_code;
 pub mod declarations;
 pub mod diagnostics;
@@ -33,6 +34,7 @@ pub mod hierarchy;
 pub mod imports;
 pub mod preprocessor;
 pub mod queries;
+pub mod resolution;
 pub mod structural;
 pub mod syntax;
 pub mod test_detection;

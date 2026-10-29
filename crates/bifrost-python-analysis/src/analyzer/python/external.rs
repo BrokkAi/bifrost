@@ -273,6 +273,8 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                     id: "declarations.external".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -532,6 +534,8 @@ schema_version:
                     id: "declarations.external".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -703,6 +707,8 @@ schema_version:
                     id: "declarations.external".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),

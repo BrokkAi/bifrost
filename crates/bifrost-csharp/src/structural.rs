@@ -1,6 +1,8 @@
 //! C# structural spec for `query_code`.
 
-use crate::syntax::{csharp_conditional_member_access, csharp_member_name};
+use crate::syntax::{
+    csharp_conditional_member_access, csharp_is_irrefutable_pattern, csharp_member_name,
+};
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     CalleeSpineStep, attach_decorators_under, attach_role_with_derived_name,
     attach_terminal_callee, csharp_integer_literal_value, first_named_child, terminal_callee_leaf,
@@ -30,7 +32,7 @@ use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::node_range;
+use brokk_bifrost_core::analyzer::tree_walk::{named_children_iter, node_range};
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -50,7 +52,6 @@ pub fn csharp_call_result_use(call: Node<'_>, source: &str) -> CallResultUseSite
     let default = if call.kind() != "invocation_expression"
         || call.has_error()
         || has_recovery_ancestor(call)
-        || has_recovery_descendant(call)
     {
         CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
     } else if has_deferred_ancestor(call) {
@@ -114,23 +115,10 @@ pub fn csharp_call_result_use(call: Node<'_>, source: &str) -> CallResultUseSite
 
 fn has_recovery_ancestor(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
-        if parent.is_error() || parent.is_missing() {
+        if parent.is_error() {
             return true;
         }
         node = parent;
-    }
-    false
-}
-
-fn has_recovery_descendant(root: Node<'_>) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.id() != root.id() && (node.is_error() || node.is_missing()) {
-            return true;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            stack.push(node.named_child(index).expect("named child exists"));
-        }
     }
     false
 }
@@ -205,6 +193,27 @@ static CSHARP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSup
     .supported(OccurrenceRole::Binder);
 
 pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("binary_expression", NormalizedKind::BinaryExpression),
+    ("prefix_unary_expression", NormalizedKind::UnaryExpression),
+    ("postfix_unary_expression", NormalizedKind::UnaryExpression),
+    ("is_pattern_expression", NormalizedKind::InstanceOf),
+    ("conditional_expression", NormalizedKind::If),
+    ("switch_expression", NormalizedKind::Switch),
+    ("switch_section", NormalizedKind::Case),
+    ("switch_expression_arm", NormalizedKind::Case),
+    ("labeled_statement", NormalizedKind::Label),
+    ("goto_statement", NormalizedKind::Goto),
+    ("break_statement", NormalizedKind::Break),
+    ("continue_statement", NormalizedKind::Continue),
+    ("yield_statement", NormalizedKind::Yield),
+    (
+        "interpolated_string_expression",
+        NormalizedKind::StringLiteral,
+    ),
+    ("cast_expression", NormalizedKind::Cast),
+    ("as_expression", NormalizedKind::Cast),
+    ("is_expression", NormalizedKind::InstanceOf),
+    ("lock_statement", NormalizedKind::Lock),
     ("comment", NormalizedKind::Comment),
     ("invocation_expression", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
@@ -213,6 +222,8 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("element_access_expression", NormalizedKind::FieldAccess),
     ("await_expression", NormalizedKind::Await),
     ("method_declaration", NormalizedKind::Method),
+    ("operator_declaration", NormalizedKind::Method),
+    ("conversion_operator_declaration", NormalizedKind::Method),
     ("constructor_declaration", NormalizedKind::Constructor),
     ("local_function_statement", NormalizedKind::Function),
     ("lambda_expression", NormalizedKind::Lambda),
@@ -242,7 +253,6 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("verbatim_string_literal", NormalizedKind::StringLiteral),
     ("raw_string_literal", NormalizedKind::StringLiteral),
     ("character_literal", NormalizedKind::CharacterLiteral),
-    ("prefix_unary_expression", NormalizedKind::NumericLiteral),
     ("integer_literal", NormalizedKind::NumericLiteral),
     ("real_literal", NormalizedKind::NumericLiteral),
     ("boolean_literal", NormalizedKind::BooleanLiteral),
@@ -252,7 +262,7 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("throw_expression", NormalizedKind::Throw),
     ("catch_clause", NormalizedKind::Catch),
     ("if_statement", NormalizedKind::If),
-    ("switch_statement", NormalizedKind::If),
+    ("switch_statement", NormalizedKind::Switch),
     ("for_statement", NormalizedKind::Loop),
     ("foreach_statement", NormalizedKind::ForLoop),
     ("while_statement", NormalizedKind::WhileLoop),
@@ -315,6 +325,90 @@ fn is_signed_numeric_prefix(node: Node<'_>) -> bool {
         operator,
         is_numeric_literal_node,
     )
+}
+
+// These nodes have no operator field. Pointer forms are owned separately.
+fn unary_operator(node: Node<'_>) -> Option<Node<'_>> {
+    node.children(&mut node.walk()).find(|child| {
+        !child.is_named() && matches!(child.kind(), "++" | "--" | "+" | "-" | "!" | "~" | "^")
+    })
+}
+
+fn typed_pattern(node: Node<'_>) -> Option<Node<'_>> {
+    let pattern = node.child_by_field_name("pattern")?;
+    match pattern.kind() {
+        "type_pattern" | "declaration_pattern" | "recursive_pattern" => pattern
+            .child_by_field_name("type")
+            .filter(|ty| ty.kind() != "implicit_type")
+            .map(|_| pattern),
+        _ => None,
+    }
+}
+
+// Read label boundaries from grammar tokens, never from source spelling.
+// Unknown or recovered labels must not acquire the empty Test set of default.
+fn case_parts(node: Node<'_>) -> Option<(Vec<Node<'_>>, Vec<Node<'_>>)> {
+    if node.has_error() || node.is_missing() {
+        return None;
+    }
+    if node.kind() == "switch_expression_arm" {
+        let mut children = named_children_iter(node).filter(|child| !child.is_extra());
+        let pattern = children.next()?;
+        let guarded = named_children_iter(node).any(|child| child.kind() == "when_clause");
+        let body = children.find(|child| child.kind() != "when_clause")?;
+        let tests = if !guarded && csharp_is_irrefutable_pattern(pattern) {
+            Vec::new()
+        } else {
+            vec![pattern]
+        };
+        return Some((tests, vec![body]));
+    }
+    let mut tests = Vec::new();
+    let mut body = Vec::new();
+    let mut has_label = false;
+    let mut header = false;
+    let mut needs_test = false;
+    let mut label_test = None;
+    let mut guarded = false;
+    for child in node
+        .children(&mut node.walk())
+        .filter(|child| !child.is_extra())
+    {
+        match child.kind() {
+            "case" => {
+                has_label = true;
+                header = true;
+                needs_test = true;
+                label_test = None;
+                guarded = false;
+            }
+            "default" => {
+                has_label = true;
+                header = true;
+                label_test = None;
+                guarded = false;
+            }
+            ":" => {
+                if needs_test {
+                    return None;
+                }
+                if let Some(test) = label_test.take()
+                    && (guarded || !csharp_is_irrefutable_pattern(test))
+                {
+                    tests.push(test);
+                }
+                header = false;
+            }
+            _ if needs_test && child.is_named() => {
+                label_test = Some(child);
+                needs_test = false;
+            }
+            "when_clause" if header => guarded = true,
+            _ if child.is_named() && !header => body.push(child),
+            _ => return None,
+        }
+    }
+    (has_label && !header && !needs_test).then_some((tests, body))
 }
 
 fn csharp_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
@@ -449,9 +543,6 @@ fn csharp_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
             parent.child_by_field_name("name")?
         }
         "generic_name" => {
-            if parent.child_by_field_name("name") != Some(node) {
-                return None;
-            }
             let access = parent.parent()?;
             if !matches!(
                 access.kind(),
@@ -490,6 +581,36 @@ const CSHARP_PATTERN_BINDERS: &[&str] = &[
     "tuple_pattern",
     "parenthesized_variable_designation",
 ];
+
+/// The pattern declaring one identifier. Inspecting each token preserves
+/// repeated name fields in deconstruction designations and nested patterns.
+pub fn csharp_pattern_binding_declaration(name: Node<'_>) -> Option<Node<'_>> {
+    let declaration = name.parent()?;
+    (CSHARP_PATTERN_BINDERS.contains(&declaration.kind()) && csharp_is_binder(name))
+        .then_some(declaration)
+}
+
+/// Declaration spaces that need lexical lookup without an enclosing block.
+pub fn csharp_pattern_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "arrow_expression_clause"
+            | "lambda_expression"
+            | "switch_expression_arm"
+            | "switch_section"
+    )
+}
+
+/// C# pattern lookup uses declaration order within its declaration space.
+pub fn csharp_pattern_binding_visible(pattern: Node<'_>, focus: Node<'_>) -> Option<bool> {
+    Some(pattern.end_byte() <= focus.start_byte())
+}
+
+/// Expression bodies and switch arms confine their pattern declarations.
+pub fn csharp_pattern_bindings_may_escape_scope(kind: &str) -> bool {
+    debug_assert!(csharp_pattern_scope(kind));
+    false
+}
 
 /// The LINQ clauses that introduce a range variable.
 const CSHARP_QUERY_BINDERS: &[&str] = &[
@@ -666,14 +787,7 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
 }
 
 fn variable_declarator_value(node: Node<'_>) -> Option<Node<'_>> {
-    let name = node.child_by_field_name("name");
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| {
-            name.is_none_or(|name| child.id() != name.id())
-                && child.kind() != "bracketed_argument_list"
-        })
-        .map(expression_target_node)
+    crate::syntax::variable_declarator_initializer(node).map(expression_target_node)
 }
 
 fn using_type_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -706,6 +820,13 @@ fn attach_import_modules(sink: &mut RoleSink<'_>, node: Node<'_>) {
 }
 
 impl StructuralSpec for CSharpStructuralSpec {
+    fn statement_fact_syntax(
+        &self,
+    ) -> Option<&dyn brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax>
+    {
+        Some(self)
+    }
+
     fn language(&self) -> Language {
         Language::CSharp
     }
@@ -734,26 +855,97 @@ impl StructuralSpec for CSharpStructuralSpec {
         csharp_string_literal_value(node, source)
     }
 
+    fn conditional_regions(
+        &self,
+        _root: Node<'_>,
+        source: &str,
+    ) -> brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions {
+        crate::preprocessor::scan_preprocessor(source).conditional_regions(source)
+    }
+
     fn parser_included_ranges(&self, source: &str) -> Option<Vec<tree_sitter::Range>> {
         crate::preprocessor::csharp_included_ranges(source)
+    }
+
+    fn declaration_attributes(
+        &self,
+        node: Node<'_>,
+        source: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes> {
+        if !matches!(
+            node.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "class_declaration"
+                | "struct_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) {
+            return None;
+        }
+        Some(brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes {
+            modifiers: brokk_bifrost_core::analyzer::structural::adapter_helpers::declaration_modifier_words(node, source),
+            type_kind: None,
+        })
     }
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         CSHARP_KIND_TABLE
     }
 
+    fn supports_kind(&self, kind: NormalizedKind) -> bool {
+        brokk_bifrost_core::analyzer::structural::spec::supports_kind_from_table(
+            kind,
+            &[NormalizedKind::SyntaxError, NormalizedKind::Comparison],
+            self.kind_table(),
+        )
+    }
+
+    fn refine_kind(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        _enclosing: Option<NormalizedKind>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> NormalizedKind {
+        if kind == NormalizedKind::UnaryExpression && is_signed_numeric_prefix(node) {
+            return NormalizedKind::NumericLiteral;
+        }
+        if kind == NormalizedKind::BinaryExpression
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| {
+                    matches!(operator.kind(), "==" | "!=" | "<" | ">" | "<=" | ">=")
+                })
+        {
+            return NormalizedKind::Comparison;
+        }
+        kind
+    }
+
     fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
+        if kind == NormalizedKind::UnaryExpression {
+            return unary_operator(node).is_some_and(|operator| {
+                node.kind() != "postfix_unary_expression" || operator.kind() != "!"
+            });
+        }
+        if node.kind() == "is_pattern_expression" {
+            return typed_pattern(node).is_some();
+        }
+        if kind == NormalizedKind::Case {
+            return case_parts(node).is_some();
+        }
         if kind == NormalizedKind::FieldAccess && node.kind() == "conditional_access_expression" {
             return conditional_member_binding(node).is_some();
         }
 
-        if kind == NormalizedKind::NumericLiteral {
-            if node.kind() == "prefix_unary_expression" {
-                return is_signed_numeric_prefix(node);
-            }
-            if is_numeric_literal_node(node) && is_inside_signed_numeric_wrapper(node) {
-                return false;
-            }
+        if kind == NormalizedKind::NumericLiteral
+            && is_numeric_literal_node(node)
+            && is_inside_signed_numeric_wrapper(node)
+        {
+            return false;
         }
 
         kind != NormalizedKind::Assignment
@@ -821,6 +1013,146 @@ impl StructuralSpec for CSharpStructuralSpec {
         }
 
         match kind {
+            NormalizedKind::BinaryExpression | NormalizedKind::Comparison => {
+                brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles(
+                    sink,
+                    node,
+                    &[
+                        (Role::Left, "left"),
+                        (Role::Right, "right"),
+                        (Role::Operator, "operator"),
+                    ],
+                    expression_name_node,
+                );
+            }
+            NormalizedKind::UnaryExpression => {
+                if let Some(operator) = unary_operator(node) {
+                    sink.role_named(Role::Operator, operator, operator);
+                }
+                if let Some(operand) = named_children_iter(node).find(|child| !child.is_extra()) {
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Operand,
+                        operand,
+                        expression_name_node,
+                    );
+                }
+            }
+            NormalizedKind::InstanceOf if node.kind() == "is_pattern_expression" => {
+                let pattern = typed_pattern(node).expect("admitted typed pattern");
+                brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles(
+                    sink,
+                    node,
+                    &[(Role::Operand, "expression")],
+                    expression_name_node,
+                );
+                brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles(
+                    sink,
+                    pattern,
+                    &[(Role::Type, "type"), (Role::Binding, "name")],
+                    expression_name_node,
+                );
+                for designation in named_children_iter(pattern).filter(|child| {
+                    matches!(
+                        child.kind(),
+                        "discard" | "parenthesized_variable_designation"
+                    )
+                }) {
+                    sink.role(Role::Binding, designation);
+                }
+            }
+            NormalizedKind::If => {
+                brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles(
+                    sink,
+                    node,
+                    &[
+                        (Role::Test, "condition"),
+                        (Role::Consequence, "consequence"),
+                        (Role::Alternative, "alternative"),
+                    ],
+                    expression_name_node,
+                );
+            }
+            NormalizedKind::Switch => {
+                if node.kind() == "switch_statement" {
+                    brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles(
+                        sink,
+                        node,
+                        &[(Role::Test, "value"), (Role::Body, "body")],
+                        expression_name_node,
+                    );
+                } else if let Some(test) = named_children_iter(node).find(|child| !child.is_extra())
+                {
+                    sink.role(Role::Test, test);
+                }
+            }
+            NormalizedKind::Case => {
+                let (tests, body) = case_parts(node).expect("admitted case label");
+                for test in tests {
+                    sink.role(Role::Test, test);
+                }
+                for statement in body {
+                    sink.role(Role::Body, statement);
+                }
+            }
+            NormalizedKind::Label => {
+                let mut children = named_children_iter(node).filter(|child| !child.is_extra());
+                if let Some(label) = children.next() {
+                    sink.role_named(Role::Label, label, label);
+                }
+                if let Some(body) = children.next() {
+                    sink.role(Role::Body, body);
+                }
+            }
+            NormalizedKind::Return | NormalizedKind::Throw => {
+                if let Some(value) = named_children_iter(node).find(|child| !child.is_extra()) {
+                    attach_role_with_derived_name(sink, Role::Value, value, expression_name_node);
+                }
+            }
+            NormalizedKind::StringLiteral if node.kind() == "interpolated_string_expression" => {
+                for interpolation in
+                    named_children_iter(node).filter(|child| child.kind() == "interpolation")
+                {
+                    if let Some(expression) = named_children_iter(interpolation).find(|child| {
+                        !child.is_extra()
+                            && !matches!(
+                                child.kind(),
+                                "interpolation_brace"
+                                    | "interpolation_alignment_clause"
+                                    | "interpolation_format_clause"
+                            )
+                    }) {
+                        sink.role(Role::Part, expression);
+                    }
+                }
+            }
+            NormalizedKind::Lambda => attach_decorators(sink, node),
+            NormalizedKind::Cast | NormalizedKind::InstanceOf => {
+                let fields: &[(Role, &str)] = match node.kind() {
+                    "cast_expression" => &[(Role::Type, "type"), (Role::Value, "value")],
+                    "as_expression" => &[(Role::Value, "left"), (Role::Type, "right")],
+                    _ => &[(Role::Operand, "left"), (Role::Type, "right")],
+                };
+                brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles(
+                    sink,
+                    node,
+                    fields,
+                    expression_name_node,
+                );
+            }
+            NormalizedKind::Lock => {
+                let mut cursor = node.walk();
+                let mut children = node
+                    .named_children(&mut cursor)
+                    .filter(|child| !child.is_extra());
+                if let Some(value) = children.next() {
+                    sink.role(Role::Value, value);
+                }
+                if let Some(body) = children.next() {
+                    sink.role(Role::Body, body);
+                }
+            }
+
             NormalizedKind::Call => {
                 let function = if node.kind() == "object_creation_expression" {
                     node.child_by_field_name("type")
@@ -828,6 +1160,26 @@ impl StructuralSpec for CSharpStructuralSpec {
                     node.child_by_field_name("function")
                 };
                 if let Some(function) = function {
+                    if let Some(leaf) = terminal_callee_leaf(function, callee_spine_step) {
+                        let name = leaf
+                            .parent()
+                            .filter(|parent| parent.kind() == "generic_name")
+                            .unwrap_or(leaf);
+                        if let Some(arguments) =
+                            csharp_member_name(name).and_then(|name| name.type_arguments)
+                        {
+                            for argument in
+                                named_children_iter(arguments).filter(|child| !child.is_extra())
+                            {
+                                attach_role_with_derived_name(
+                                    sink,
+                                    Role::TypeArguments,
+                                    argument,
+                                    expression_name_node,
+                                );
+                            }
+                        }
+                    }
                     attach_terminal_callee(
                         sink,
                         function,
@@ -965,10 +1317,152 @@ impl StructuralSpec for CSharpStructuralSpec {
     }
 }
 
+impl brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax
+    for CSharpStructuralSpec
+{
+    fn supports_kind(
+        &self,
+        kind: brokk_bifrost_core::analyzer::statement_facts::StatementFactKind,
+    ) -> bool {
+        use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
+        !matches!(
+            kind,
+            StatementFactKind::MissingCaseInSwitch | StatementFactKind::AllocaInLoop
+        )
+    }
+
+    fn roles<'tree>(&self, node: Node<'tree>, role: Role) -> Vec<Node<'tree>> {
+        let target = match role {
+            Role::Test if matches!(node.kind(), "switch_section" | "switch_expression_arm") => {
+                return case_parts(node).map(|(tests, _)| tests).unwrap_or_default();
+            }
+            Role::Body if matches!(node.kind(), "switch_section" | "switch_expression_arm") => {
+                return case_parts(node).map(|(_, body)| body).unwrap_or_default();
+            }
+            Role::Test if node.kind() == "switch_statement" => node.child_by_field_name("value"),
+            Role::Test if node.kind() == "switch_expression" => {
+                named_children_iter(node).find(|child| !child.is_extra())
+            }
+            Role::Body if node.kind() == "switch_expression" => Some(node),
+            Role::Test => node.child_by_field_name("condition"),
+            Role::Consequence => node.child_by_field_name("consequence"),
+            Role::Alternative => node.child_by_field_name("alternative"),
+            Role::Body => node.child_by_field_name("body"),
+            Role::Left => node.child_by_field_name("left"),
+            Role::Right => node.child_by_field_name("right"),
+            Role::Operator => node.child_by_field_name("operator"),
+            Role::Label if node.kind() == "labeled_statement" => {
+                named_children_iter(node).find(|child| child.kind() == "identifier")
+            }
+            Role::Label if node.kind() == "goto_statement" => {
+                if node
+                    .children(&mut node.walk())
+                    .any(|child| matches!(child.kind(), "case" | "default"))
+                {
+                    return Vec::new();
+                }
+                named_children_iter(node).find(|child| child.kind() == "identifier")
+            }
+            _ => None,
+        };
+        target.into_iter().collect()
+    }
+
+    fn loop_variable(&self, node: Node<'_>, source: &str) -> Option<String> {
+        let name = match node.kind() {
+            "foreach_statement" => node.child_by_field_name("left")?,
+            "for_statement" => {
+                let initializers = self.loop_initializers(node);
+                // The tight-bound shortcut names one induction variable. Keep
+                // its single-initializer restriction local to this proof.
+                let &[initializer] = initializers.as_slice() else {
+                    return None;
+                };
+                match initializer.kind() {
+                    "variable_declaration" => named_children_iter(initializer)
+                        .find(|child| child.kind() == "variable_declarator")?
+                        .child_by_field_name("name")?,
+                    "assignment_expression" => initializer.child_by_field_name("left")?,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        (name.kind() == "identifier")
+            .then(|| name.utf8_text(source.as_bytes()).ok().map(str::to_owned))
+            .flatten()
+    }
+
+    fn is_counted_loop(&self, node: Node<'_>) -> bool {
+        node.kind() == "for_statement"
+    }
+
+    fn loop_initializers<'tree>(&self, node: Node<'tree>) -> Vec<Node<'tree>> {
+        let mut cursor = node.walk();
+        node.children_by_field_name("initializer", &mut cursor)
+            .filter(|child| child.is_named() && !child.is_extra())
+            .collect()
+    }
+
+    fn switch_enum<'tree>(&self, _node: Node<'tree>, _source: &str) -> Option<Node<'tree>> {
+        // Native C# operand typing has not supplied an enum binding proof.
+        None
+    }
+
+    fn enumeration(
+        &self,
+        node: Node<'_>,
+        source: &str,
+    ) -> Option<(
+        brokk_bifrost_core::analyzer::statement_facts::EnumFact,
+        Vec<brokk_bifrost_core::analyzer::statement_facts::EnumeratorFact>,
+    )> {
+        use brokk_bifrost_core::analyzer::statement_facts::{EnumFact, EnumeratorFact};
+        if node.kind() != "enum_declaration" {
+            return None;
+        }
+        let range = node_range(node);
+        let name = node
+            .child_by_field_name("name")?
+            .utf8_text(source.as_bytes())
+            .ok()?
+            .to_owned();
+        let enumerators = node
+            .child_by_field_name("body")
+            .into_iter()
+            .flat_map(named_children_iter)
+            .filter(|child| child.kind() == "enum_member_declaration")
+            .filter_map(|member| {
+                Some(EnumeratorFact {
+                    range: node_range(member),
+                    enum_range: range,
+                    name: member
+                        .child_by_field_name("name")?
+                        .utf8_text(source.as_bytes())
+                        .ok()?
+                        .to_owned(),
+                })
+            })
+            .collect();
+        Some((
+            EnumFact {
+                range,
+                name: Some(name),
+            },
+            enumerators,
+        ))
+    }
+
+    fn name<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        expression_name_node(node)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Tree;
 
     fn parse(source: &str) -> Tree {
@@ -1130,5 +1624,159 @@ mod tests {
             uses[3],
             CallResultUse::Open(CallResultUseOpenReason::UnsupportedSyntax)
         ));
+    }
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: generic member identifiers lost their occurrence role"
+    )]
+    fn generic_member_grammar_preserves_identifier_roles() {
+        let source = "class C { void M() { service.Build<int>(); service?.Build<string>(); Build<int>(); new Box<int>(); } }";
+        let tree = parse(source);
+        let mut pending = vec![tree.root_node()];
+        let mut generic_count = 0;
+        let mut member_count = 0;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "generic_name" {
+                generic_count += 1;
+                assert!(node.child_by_field_name("name").is_none());
+                let name = node.named_child(0).unwrap();
+                assert_eq!(name.kind(), "identifier");
+                assert_eq!(node.named_child(1).unwrap().kind(), "type_argument_list");
+                assert_eq!(expression_name_node(node), Some(name));
+                assert_eq!(terminal_callee_leaf(node, callee_spine_step), Some(name));
+                let is_member = matches!(
+                    node.parent().unwrap().kind(),
+                    "member_access_expression" | "member_binding_expression"
+                );
+                assert_eq!(
+                    csharp_member_position(name),
+                    is_member.then_some(OccurrenceRole::MemberPosition)
+                );
+                member_count += usize::from(is_member);
+                let argument = node.named_child(1).unwrap().named_child(0).unwrap();
+                assert_eq!(csharp_member_position(argument), None);
+            }
+            pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+        }
+        assert_eq!((generic_count, member_count), (4, 2));
+    }
+
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: tuple declarators published their pattern as the initializer"
+    )]
+    fn declarator_grammar_distinguishes_patterns_from_initializers() {
+        let source = "class C { void M() { var (x, y) = Pair(); var (a, (_, b)) = Nested(); int z = 1; int missing; var (c, d) /* note */ = /* value */ Pair(); } }";
+        let tree = parse(source);
+        let mut pending = vec![tree.root_node()];
+        let mut declarations = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "variable_declarator" {
+                declarations.push(node);
+            }
+            pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+        }
+        declarations.sort_by_key(|node| node.start_byte());
+        let expected = [
+            Some("Pair()"),
+            Some("Nested()"),
+            Some("1"),
+            None,
+            Some("Pair()"),
+        ];
+        assert_eq!(declarations.len(), expected.len());
+        for (node, expected) in declarations.into_iter().zip(expected) {
+            if node.child_by_field_name("name").is_none() {
+                assert_eq!(node.named_child(0).unwrap().kind(), "tuple_pattern");
+            }
+            assert_eq!(
+                variable_declarator_value(node)
+                    .map(|value| value.utf8_text(source.as_bytes()).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_result_use_follows_ancestor_grammar() {
+        for (statement, deferred) in [
+            ("Sink(value.Trim());", false),
+            ("Func<string> f = () => Sink(value.Trim());", true),
+            ("Action f = delegate { var x = value.Trim(); };", true),
+        ] {
+            let source = format!("class C {{ void M() {{ {statement} }} }}");
+            let tree = parse(&source);
+            let mut pending = vec![tree.root_node()];
+            let mut calls = 0;
+            while let Some(node) = pending.pop() {
+                if node.kind() == "invocation_expression"
+                    && node.child_by_field_name("function").unwrap().kind()
+                        == "member_access_expression"
+                {
+                    calls += 1;
+                    let mut ancestors = Vec::new();
+                    let mut ancestor = node.parent();
+                    while let Some(parent) = ancestor {
+                        ancestors.push(parent.kind());
+                        ancestor = parent.parent();
+                    }
+                    assert_eq!(
+                        ancestors.iter().any(|kind| matches!(
+                            *kind,
+                            "lambda_expression" | "anonymous_method_expression"
+                        )),
+                        deferred
+                    );
+                    let expected = if deferred {
+                        CallResultUse::Open(CallResultUseOpenReason::DeferredContext)
+                    } else {
+                        CallResultUse::Consumed
+                    };
+                    assert_eq!(
+                        csharp_call_result_use(node, &source).default_use(),
+                        expected
+                    );
+                }
+                pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+            }
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn literal_grammar_preserves_absent_and_decoded_values() {
+        for (literal, kind, expected) in [
+            (r#""""nonempty""""#, "raw_string_literal", None),
+            ("\"\"\"\n    text\n    \"\"\"", "raw_string_literal", None),
+            (r#""""#, "string_literal", Some("")),
+            (r#""\u0123""#, "string_literal", Some("\u{123}")),
+            (r#""\x123""#, "string_literal", Some("\u{123}")),
+            (r#""\u123""#, "string_literal", None),
+            (r#""\q""#, "string_literal", None),
+            (r#""\\q""#, "string_literal", Some("\\q")),
+            (r#"@"a""b""#, "verbatim_string_literal", Some("a\"b")),
+        ] {
+            let source = format!("class C {{ string value = {literal}; }}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            let mut pending = vec![tree.root_node()];
+            let mut literals = 0;
+            while let Some(node) = pending.pop() {
+                if node.kind() == kind {
+                    literals += 1;
+                    assert_eq!(node.utf8_text(source.as_bytes()).unwrap(), literal);
+                    assert_eq!(
+                        csharp_string_literal_value(node, &source).as_deref(),
+                        expected,
+                        "{literal}"
+                    );
+                    assert_eq!(
+                        CSHARP_STRUCTURAL_SPEC.string_literal_value_may_be_absent(node, &source),
+                        expected.is_none()
+                    );
+                }
+                pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+            }
+            assert_eq!(literals, 1, "{literal}: {}", tree.root_node().to_sexp());
+        }
     }
 }

@@ -253,7 +253,7 @@ pub trait CallApplicabilityAdapter: Sync {
         supertype: SemanticId,
         states: &StateMap,
     ) -> StoreResult<Option<bool>> {
-        evaluation.jvm_type_is_subtype(subtype, supertype, states)
+        evaluation.jvm_closed_type_is_subtype(subtype, supertype, states)
     }
 
     fn no_applicable_call_diagnostic(&self) -> Option<&'static str> {

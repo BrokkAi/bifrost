@@ -332,6 +332,7 @@ pub(crate) struct TaintOriginProjection {
     pub(crate) primary: PolicySourceLocation,
     pub(crate) scenario_id: SourceScenarioId,
     pub(crate) evidence_refs: Vec<EvidenceRef>,
+    pub(crate) certainty: FindingCertainty,
 }
 
 /// Analysis evidence for exactly one source endpoint at the aggregate sink
@@ -1352,6 +1353,7 @@ fn validate_taint_pair(
                 origin.primary,
                 origin.scenario_id,
                 origin.evidence_refs,
+                origin.certainty,
             )
             .map_err(ProjectionAuthorityError::InvalidProjectionFacts)?,
         );
@@ -2358,6 +2360,7 @@ mod tests {
                 primary: crate::test_support::policy_test_location("src/test.rs", 0, 1, 1),
                 scenario_id: scenario,
                 evidence_refs: vec![source_fact.evidence_ref.clone()],
+                certainty: crate::FindingCertainty::Definite,
             })
             .collect();
         TaintPairProjection {

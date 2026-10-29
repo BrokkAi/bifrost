@@ -22,7 +22,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as node_covers;
 use brokk_bifrost_core::analyzer::tree_walk::{
     child_by_field_or_named_child_of_kinds, first_named_child_of_kind, named_children_iter,
-    node_for_exact_range, push_named_children_reversed,
+    node_for_exact_range, push_named_children_reversed, single_named_child_matching,
 };
 pub(super) use brokk_bifrost_core::analyzer::usages::common::same_node;
 
@@ -328,6 +328,11 @@ fn walk_named_nodes_before(
             if current.start_byte() >= cutoff_start {
                 continue;
             }
+            // Only the path containing the reference contributes lexical bindings.
+            // In particular, a completed initializer's lambdas are sibling scopes.
+            if SCOPE_NODES.contains(&current.kind()) && cutoff_start >= current.end_byte() {
+                continue;
+            }
             match visit(current) {
                 NamedNodeWalk::Stop => return,
                 NamedNodeWalk::SkipChildren => continue,
@@ -355,6 +360,7 @@ const SCOPE_NODES: &[&str] = &[
     "accessor_declaration",
     "local_function_statement",
     "lambda_expression",
+    "anonymous_method_expression",
     "block",
     "for_statement",
     "for_each_statement",
@@ -376,35 +382,26 @@ fn seed_visible_bindings_inner(
     context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if node.start_byte() >= target.start_byte() {
-        return;
-    }
-
-    let enters_scope = SCOPE_NODES.contains(&node.kind());
-    if enters_scope && !node_covers(node, target) {
-        return;
-    }
-    if enters_scope {
-        bindings.enter_scope();
-    }
-
-    match node.kind() {
-        "parameter" => seed_usage_parameter(node, csharp, token, context, bindings),
-        "variable_declaration" => {
-            seed_usage_variable_declaration(node, csharp, token, context, bindings)
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= target.start_byte() {
-            break;
-        }
-        if SCOPE_NODES.contains(&child.kind()) && !node_covers(child, target) {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.start_byte() >= target.start_byte() {
             continue;
         }
-        seed_visible_bindings_inner(child, target, csharp, token, context, bindings);
+        let enters_scope = SCOPE_NODES.contains(&node.kind());
+        if enters_scope && !node_covers(node, target) {
+            continue;
+        }
+        if enters_scope {
+            bindings.enter_scope();
+        }
+        match node.kind() {
+            "parameter" => seed_usage_parameter(node, csharp, token, context, bindings),
+            "variable_declaration" => {
+                seed_usage_variable_declaration(node, csharp, token, context, bindings)
+            }
+            _ => {}
+        }
+        push_named_children_reversed(node, &mut pending);
     }
 }
 
@@ -644,6 +641,13 @@ fn expression_type_fq_name_inner<T: DeclaredTypeName>(
     bindings: &LocalInferenceEngine<T>,
     usage: bool,
 ) -> Option<String> {
+    let mut expression = expression;
+    while matches!(
+        expression.kind(),
+        "parenthesized_expression" | "checked_expression"
+    ) {
+        expression = single_named_child_matching(expression, |child| !child.is_extra())?;
+    }
     match expression.kind() {
         "identifier" => {
             let name = node_text(expression, context.source);
@@ -684,11 +688,6 @@ fn expression_type_fq_name_inner<T: DeclaredTypeName>(
         "invocation_expression" => invocation_expression_return_type_fq_name(
             expression, csharp, token, context, bindings, usage,
         ),
-        "parenthesized_expression" | "checked_expression" => {
-            expression.named_child(0).and_then(|inner| {
-                expression_type_fq_name_inner(inner, csharp, token, context, bindings, usage)
-            })
-        }
         "cast_expression" | "as_expression" => expression
             .child_by_field_name(if expression.kind() == "cast_expression" {
                 "type"
@@ -2201,7 +2200,7 @@ impl CSharpDeclaredType {
     /// workspace does not hold, so it stays a spelling for the consumer's own
     /// lookup -- workspace first, then the external index -- to settle. Every
     /// other success is a workspace fq name the seeder proved.
-    fn resolved(fqn: String) -> Self {
+    pub(crate) fn resolved(fqn: String) -> Self {
         if canonical_builtin_type_identity(&fqn).is_some() {
             Self::Spelling(fqn)
         } else {
@@ -2327,14 +2326,20 @@ fn explicit_object_created_type(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if candidate.kind() == "object_creation_expression" {
-            return explicit_object_created_type(candidate);
+    let mut expression = if node.kind() == "variable_declarator" {
+        variable_declarator_initializer(node)?
+    } else {
+        node
+    };
+    loop {
+        match expression.kind() {
+            "object_creation_expression" => return explicit_object_created_type(expression),
+            "parenthesized_expression" | "checked_expression" => {
+                expression = single_named_child_matching(expression, |child| !child.is_extra())?;
+            }
+            _ => return None,
         }
-        push_named_children_reversed(candidate, &mut stack);
     }
-    None
 }
 
 pub(super) fn resolves_to_target(
@@ -2463,6 +2468,252 @@ pub(super) fn resolve_arity_free_type_fq_name_at(
         &mut type_candidates,
     )?;
     graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name())
+}
+
+#[cfg(test)]
+mod initializer_grammar_and_metadata_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn creation_types_and_generic_call_names_follow_grammar_fields() {
+        // Grammar boundary: predefined types have a `type` field, but are not
+        // identifier children. Implicit creations have no explicit type.
+        for (creation, expected) in [
+            ("new Widget()", Some("Widget")),
+            ("new Box<int>()", Some("Box<int>")),
+            ("new global::N.Widget()", Some("global::N.Widget")),
+            ("new int()", Some("int")),
+            ("new string('x', 1)", Some("string")),
+            ("new()", None),
+        ] {
+            let source = format!("class C {{ void M() {{ var x = {creation}; }} }}");
+            let tree = crate::preprocessor::parse_csharp(&source).unwrap();
+            let mut pending = vec![tree.root_node()];
+            let declarator = loop {
+                let node = pending.pop().expect("variable declarator");
+                if node.kind() == "variable_declarator" {
+                    break node;
+                }
+                push_named_children_reversed(node, &mut pending);
+            };
+            let expression = variable_declarator_initializer(declarator).unwrap();
+            let grammar_type = expression.child_by_field_name("type");
+            assert_eq!(grammar_type.map(|node| node_text(node, &source)), expected);
+            assert_eq!(object_created_type(declarator), grammar_type, "{creation}");
+        }
+        for (creation, expected) in [
+            ("(/* leading */ new int())", "int"),
+            ("checked(/* leading */ new Widget())", "Widget"),
+            ("unchecked((new Box<int>()))", "Box<int>"),
+        ] {
+            let source = format!("class C {{ void M() {{ var x = {creation}; }} }}");
+            let tree = crate::preprocessor::parse_csharp(&source).unwrap();
+            let mut pending = vec![tree.root_node()];
+            let declarator = loop {
+                let node = pending.pop().expect("variable declarator");
+                if node.kind() == "variable_declarator" {
+                    break node;
+                }
+                push_named_children_reversed(node, &mut pending);
+            };
+            assert_eq!(
+                object_created_type(declarator).map(|node| node_text(node, &source)),
+                Some(expected),
+                "{creation}"
+            );
+        }
+        let source = "class C { void Accept<T>(Widget w) {} void M() { Accept<int>(new() { Value = 1 }); } }";
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        let mut pending = vec![tree.root_node()];
+        let mut seen = 0;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "invocation_expression" {
+                let function = node.child_by_field_name("function").unwrap();
+                assert_eq!(function.kind(), "generic_name");
+                let member =
+                    csharp_invocation_member(function, source).expect("generic invocation");
+                assert_eq!(node_text(member.name.identifier, source), "Accept");
+                assert_eq!(member.name.explicit_generic_arity, Some(1));
+                seen += 1;
+            }
+            push_named_children_reversed(node, &mut pending);
+        }
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: nested creations do not type their containing initializer"
+    )]
+    fn nested_creations_are_not_initializer_roots() {
+        for initializer in ["Factory(new Foo())", "() => new Foo()", "(Bar)new Foo()"] {
+            let source = format!("class C {{ void M() {{ var x = {initializer}; }} }}");
+            let tree = crate::preprocessor::parse_csharp(&source).unwrap();
+            let mut pending = vec![tree.root_node()];
+            let mut seen = 0;
+            while let Some(node) = pending.pop() {
+                if node.kind() == "variable_declarator" {
+                    assert!(object_created_type(node).is_none(), "{initializer}");
+                    seen += 1;
+                }
+                push_named_children_reversed(node, &mut pending);
+            }
+            assert_eq!(seen, 1);
+        }
+    }
+
+    #[test]
+    fn metadata_alternatives_agree_independently_of_order_and_multiplicity() {
+        // Parse actual signatures, then exhaust the finite product of published
+        // alternatives. The oracle is the cardinality of independently collected
+        // arity and return-identity sets, including absent return information.
+        let source =
+            "class C { Widget A<T>() => null; Widget B<T>() => null; Decoy D<T,U>() => null; }";
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "Metadata.cs");
+        let parsed = crate::declarations::parse_csharp_file(&file, source, &tree);
+        let rows: Vec<_> = ["A", "B", "D"]
+            .iter()
+            .map(|name| {
+                let unit = parsed
+                    .declarations()
+                    .iter()
+                    .find(|unit| unit.identifier() == *name)
+                    .unwrap();
+                assert_eq!(parsed.signature_metadata[unit].len(), 1);
+                parsed.signature_metadata[unit][0].clone()
+            })
+            .collect();
+        for first in &rows {
+            for second in &rows {
+                let alternatives = [first.clone(), second.clone()];
+                let arities: HashSet<_> = alternatives
+                    .iter()
+                    .map(|row| row.type_parameters().len())
+                    .collect();
+                let returns: HashSet<_> = alternatives
+                    .iter()
+                    .map(|row| row.return_type_text().unwrap().to_string())
+                    .collect();
+                let expected_arity = (arities.len() == 1).then(|| *arities.iter().next().unwrap());
+                let expected_return =
+                    (returns.len() == 1).then(|| returns.iter().next().unwrap().clone());
+                assert_eq!(
+                    unique_metadata_type_parameter_arity(&alternatives),
+                    expected_arity
+                );
+                assert_eq!(
+                    unique_metadata_return_type_text(&alternatives),
+                    expected_return
+                );
+                assert_eq!(
+                    unique_resolved_metadata_type(&alternatives, |row| {
+                        row.return_type_identity()?
+                            .nominal_name()
+                            .map(|name| name.path().join("."))
+                    }),
+                    expected_return
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forward_type_lookup_filters_exact_non_types_before_normalized_fallback() {
+        use brokk_bifrost_core::analyzer::model::CodeUnitType;
+        let file = ProjectFile::new(std::env::temp_dir(), "Types.cs");
+        let field = CodeUnit::new(file.clone(), CodeUnitType::Field, "", "Outer.Inner");
+        let ty = CodeUnit::new(file, CodeUnitType::Class, "Outer", "Inner");
+        let mut probes = Vec::new();
+        let result = forward_type_declarations_for_fq_name_with(|normalized| {
+            probes.push(normalized);
+            if normalized {
+                vec![ty.clone()]
+            } else {
+                vec![field.clone()]
+            }
+        });
+        assert_eq!(probes, [false, true]);
+        assert_eq!(result, [ty]);
+    }
+}
+
+#[cfg(test)]
+mod bounded_provider_contract_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+        ReceiverAnalysisBudget, ReceiverBudgetLimit,
+    };
+    use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use std::cell::Cell;
+
+    #[test]
+    fn provider_rows_and_summary_work_obey_independent_budgets_and_cancellation() {
+        let rows = ["Root", "Left", "Right"];
+        let calls = Cell::new(0);
+        let limited = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 2,
+                ..ReceiverAnalysisBudget::default()
+            },
+            None,
+        );
+        let result = resolution_query_rows(Some(&limited), || {
+            calls.set(calls.get() + 1);
+            rows.to_vec()
+        });
+        assert_eq!(calls.get(), 1, "the row-producing provider must run");
+        assert!(result.is_empty(), "partial rows cannot prove a receiver");
+        assert!(matches!(
+            limited.finish(result),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+
+        let limited = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_summary_expansions: 0,
+                ..ReceiverAnalysisBudget::default()
+            },
+            None,
+        );
+        let result = resolution_summary_rows(Some(&limited), || {
+            calls.set(calls.get() + 1);
+            rows.to_vec()
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "an exhausted summary budget stops before reading the provider"
+        );
+        assert!(result.is_empty());
+        assert!(matches!(
+            limited.finish(result),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::SummaryExpansions,
+                ..
+            }
+        ));
+
+        let cancellation = CancellationToken::new();
+        let session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
+        let result = resolution_query_rows(Some(&session), || {
+            calls.set(calls.get() + 1);
+            cancellation.cancel();
+            rows.to_vec()
+        });
+        assert_eq!(calls.get(), 2);
+        assert!(result.is_empty());
+        assert!(matches!(
+            session.finish(result),
+            BoundedResolution::Cancelled { .. }
+        ));
+    }
 }
 
 fn usage_visible_type_candidates_at_with_lookups<Candidates>(
@@ -2604,7 +2855,8 @@ fn resolve_declared_type_fq_name_at(
     node: Node<'_>,
     site: &CSharpTypeReferenceContext<'_>,
 ) -> Option<String> {
-    let normalized = normalize_type_text(reference);
+    let normalized = csharp_type_node_identity(node, site.source);
+    debug_assert_eq!(normalized, reference);
     if normalized.is_empty() || type_parameter_shadows_reference(node, site.source, &normalized) {
         return None;
     }
@@ -2641,7 +2893,8 @@ fn resolve_declared_type_fq_name_at_in_session(
     source: &str,
     session: &ResolutionSession,
 ) -> Option<String> {
-    let normalized = normalize_type_text(reference);
+    let normalized = csharp_type_node_identity(node, source);
+    debug_assert_eq!(normalized, reference);
     if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
         return None;
     }
@@ -2657,6 +2910,28 @@ fn resolve_declared_type_fq_name_at_in_session(
         session,
     )?;
     graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name())
+}
+
+/// Resolve the type a type node names where it is written: its enclosing
+/// types, then each enclosing namespace declaration with its own `using`
+/// directives, then the compilation unit. Unlike [`resolve_type_fq_name`],
+/// a type declared in a sibling namespace body of the same file is not
+/// visible unqualified (#7569).
+pub fn resolve_type_fq_name_of_node(
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<String> {
+    let type_node = reference_type_node(type_node);
+    let class_ranges = csharp.class_range_index(file);
+    let context = CSharpTypeReferenceContext {
+        file,
+        source,
+        class_ranges: &class_ranges,
+    };
+    let reference = csharp_type_node_identity(type_node, source);
+    resolve_declared_type_fq_name_at(csharp, &reference, type_node, &context)
 }
 
 pub fn resolve_type_fq_name(
@@ -2685,10 +2960,10 @@ fn resolve_usage_type_fq_name(
     if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
         return Some(canonical.to_string());
     }
-    if let Some(target) = resolve_usage_visible_type_fq_name(csharp, token, file, &normalized) {
-        return Some(target);
-    }
-    class_unit_for_fq_name(csharp, token, &normalized).map(|unit| unit.fq_name())
+    // Visible lookup can fail because imports are ambiguous or membership is
+    // unproven. Retrying the raw name would discard that evidence and could
+    // prove an unrelated global type.
+    resolve_usage_visible_type_fq_name(csharp, token, file, &normalized)
 }
 
 fn resolve_type_fq_name_for_scope(
@@ -4010,8 +4285,10 @@ fn extension_visibility_scopes(
         );
     }
 
+    let mut global_namespace = CSharpExtensionScope::default();
+    global_namespace.namespaces.insert(String::new());
+    scopes.push(global_namespace);
     let mut compilation_scope = CSharpExtensionScope::default();
-    compilation_scope.namespaces.insert(String::new());
     collect_scope_using_directives(
         csharp,
         token,
@@ -4085,8 +4362,12 @@ fn push_namespace_scopes(
         if !resolution_scope_step(session) {
             return;
         }
+        // C# tries extensions declared in the namespace before extensions
+        // imported by that namespace's using directives.
+        let mut namespace_scope = CSharpExtensionScope::default();
+        namespace_scope.namespaces.insert(current.clone());
+        scopes.push(namespace_scope);
         let mut scope = CSharpExtensionScope::default();
-        scope.namespaces.insert(current.clone());
         if include_usings && let Some(scope_node) = using_scope_node {
             collect_scope_using_directives(
                 csharp,
@@ -4101,7 +4382,9 @@ fn push_namespace_scopes(
                 session,
             );
         }
-        scopes.push(scope);
+        if !scope.namespaces.is_empty() || !scope.static_owner_fqns.is_empty() {
+            scopes.push(scope);
+        }
         include_usings = false;
         let Some(parent) = csharp_namespace_parent(&current) else {
             break;
@@ -4403,13 +4686,22 @@ pub(super) fn receiver_targets_owner(
 }
 
 fn receiver_type_fq_names(
-    receiver_node: Node<'_>,
+    mut receiver_node: Node<'_>,
     graph: &CSharpGraphSource<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
     context: &CSharpTypeReferenceContext<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
+    while matches!(
+        receiver_node.kind(),
+        "parenthesized_expression" | "checked_expression"
+    ) {
+        let Some(inner) = receiver_node.named_child(0) else {
+            return SymbolResolution::Unknown;
+        };
+        receiver_node = inner;
+    }
     match receiver_node.kind() {
         "identifier" => {
             let receiver = node_text(receiver_node, context.source);
@@ -4462,10 +4754,6 @@ fn receiver_type_fq_names(
                 )
             })
             .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
-            .unwrap_or(SymbolResolution::Unknown),
-        "parenthesized_expression" | "checked_expression" => receiver_node
-            .named_child(0)
-            .map(|inner| receiver_type_fq_names(inner, graph, csharp, token, context, bindings))
             .unwrap_or(SymbolResolution::Unknown),
         "cast_expression" | "as_expression" => receiver_node
             .child_by_field_name(if receiver_node.kind() == "cast_expression" {
@@ -5637,8 +5925,8 @@ fn expression_target_type(expression: Node<'_>) -> Option<Node<'_>> {
             "property_declaration" | "indexer_declaration" | "parameter" => {
                 return crate::declarations::csharp_declared_type_node(parent);
             }
-            "arrow_expression_clause" | "return_statement" => {
-                return enclosing_function_return_type(parent);
+            "lambda_expression" | "arrow_expression_clause" | "return_statement" => {
+                return enclosing_function_return_type(current);
             }
             "ERROR" => {
                 if let Some(type_node) = error_recovered_implicit_declarator_type(parent, current) {
@@ -5868,15 +6156,16 @@ fn same_file_member_collection_element_type_node<'tree>(
 /// The declared return type of the function whose body produces `node`.
 ///
 /// The walk refuses rather than guesses wherever the enclosing declaration does
-/// not state the type of this value: a lambda or anonymous method has its own
-/// return type, a constructor and a destructor declare none, and a `set`,
+/// not state the type of this value: an implicitly typed lambda or anonymous
+/// method does not write its return type, constructors and destructors declare
+/// none, and a `set`,
 /// `init`, `add` or `remove` accessor produces no value at all.
 fn enclosing_function_return_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node;
     while let Some(parent) = current.parent() {
         match parent.kind() {
-            "lambda_expression"
-            | "anonymous_method_expression"
+            "lambda_expression" => return crate::declarations::csharp_declared_type_node(parent),
+            "anonymous_method_expression"
             | "constructor_declaration"
             | "destructor_declaration" => return None,
             "accessor_declaration" => {
@@ -5936,4 +6225,207 @@ fn is_type_syntax_kind(kind: &str) -> bool {
         kind,
         "identifier" | "qualified_name" | "generic_name" | "nullable_type" | "array_type" | "type"
     )
+}
+
+#[cfg(test)]
+mod declarator_recovery_grammar_tests {
+    use super::error_recovered_implicit_declarator_type;
+    use crate::preprocessor::parse_csharp;
+
+    #[test]
+    fn recovered_declarator_keeps_its_structured_type_sibling() {
+        // Only the arrow recovery exposes the three siblings this helper
+        // consumes. The remaining shapes are negative grammar controls.
+        let variants = [
+            ("Widget value = ;", 0),
+            ("return Widget value = new Widget();", 0),
+            ("Widget value new Widget();", 0),
+            ("Widget value => new Widget();", 1),
+            ("Widget value = new Widget() => new Widget();", 0),
+            ("Widget value = (Widget x) => new Widget();", 0),
+            ("Widget value = (x) => new Widget();", 0),
+            ("Widget value Widget = new Widget();", 0),
+        ];
+        for (declaration, expected) in variants {
+            let source = format!("class C {{ void M() {{ {declaration} }} }}");
+            let tree = parse_csharp(&source).expect("C# parser");
+            let mut pending = vec![tree.root_node()];
+            let mut recovered = Vec::new();
+            while let Some(node) = pending.pop() {
+                if node.kind() == "ERROR" {
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        if let Some(type_node) =
+                            error_recovered_implicit_declarator_type(node, child)
+                        {
+                            recovered.push(type_node.utf8_text(source.as_bytes()).unwrap());
+                        }
+                    }
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(
+                recovered,
+                vec!["Widget"; expected],
+                "{declaration}: {}",
+                tree.root_node().to_sexp()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod return_target_grammar_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: explicit lambda return types were discarded"
+    )]
+    fn lambda_return_targets_follow_the_declared_type_field() {
+        // Released grammar lambda_expression.type carries an explicit return
+        // type. An implicit lambda must not borrow the enclosing method's type.
+        for (expression, expected) in [
+            (
+                "Widget () => { return new() { Label = 1 }; }",
+                Some("Widget"),
+            ),
+            ("() => { return new() { Label = 1 }; }", None),
+            ("Widget () => new() { Label = 1 }", Some("Widget")),
+            ("() => new() { Label = 1 }", None),
+            ("delegate() { return new() { Label = 1 }; }", None),
+        ] {
+            let source = format!("class C {{ Other M() {{ var f = {expression}; }} }}");
+            let tree = crate::preprocessor::parse_csharp(&source).unwrap();
+            let mut pending = vec![tree.root_node()];
+            let mut targets = Vec::new();
+            while let Some(node) = pending.pop() {
+                if node.kind() == "implicit_object_creation_expression" {
+                    targets.push(
+                        implicit_object_creation_target_type(node).map(|n| node_text(n, &source)),
+                    );
+                }
+                pending.extend(named_children_iter(node));
+            }
+            assert_eq!(
+                targets,
+                vec![expected],
+                "{expression}: {}",
+                tree.root_node().to_sexp()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod type_target_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn attributed_type_parameters_keep_the_identifier_name() {
+        for parameters in ["T", "[A] T", "[A, B] T"] {
+            for declaration in [
+                format!("class C {{ void M<{parameters}>() {{}} }}"),
+                format!("delegate void D<{parameters}>();"),
+            ] {
+                let tree = crate::preprocessor::parse_csharp(&declaration).unwrap();
+                assert!(!tree.root_node().has_error(), "{declaration}");
+                let mut pending = vec![tree.root_node()];
+                let mut names = Vec::new();
+                while let Some(node) = pending.pop() {
+                    if node.kind() == "type_parameter" {
+                        let name = node
+                            .child_by_field_name("name")
+                            .expect("grammar name field");
+                        assert_eq!(name.kind(), "identifier");
+                        names.push(type_parameter_name(node, &declaration));
+                    }
+                    pending.extend(named_children_iter(node));
+                }
+                assert_eq!(names, ["T"], "{declaration}");
+            }
+        }
+    }
+
+    #[test]
+    fn collection_element_targets_follow_the_declared_field_and_element() {
+        for (declarations, field, element) in [
+            ("List<Left> left; List<Right> right;", "left", "Left"),
+            ("List<Left> left; List<Right> right;", "right", "Right"),
+            ("Left[] left, other; Right[] right;", "other", "Left"),
+            ("Left[] left, other; Right[] right;", "right", "Right"),
+            (
+                "List<Left> Lefts { get; set; } Right[] Rights { get; set; }",
+                "Rights",
+                "Right",
+            ),
+        ] {
+            let source = format!(
+                "class C {{ {declarations} void M() {{ {field}[0] = new() {{ Label = 1 }}; }} }}"
+            );
+            let tree = crate::preprocessor::parse_csharp(&source).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let mut pending = vec![tree.root_node()];
+            let mut targets = Vec::new();
+            while let Some(node) = pending.pop() {
+                if node.kind() == "implicit_object_creation_expression" {
+                    targets.push(
+                        same_file_member_collection_element_type_node(node, field, &source)
+                            .map(|n| node_text(n, &source)),
+                    );
+                }
+                pending.extend(named_children_iter(node));
+            }
+            assert_eq!(targets, [Some(element)], "{source}");
+        }
+        for collection in ["Widget[]", "List<Widget>"] {
+            let source = format!(
+                "class C {{ void M() {{ {collection} values = [new() {{ Label = 1 }}]; }} }}"
+            );
+            let tree = crate::preprocessor::parse_csharp(&source).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let mut pending = vec![tree.root_node()];
+            let mut targets = Vec::new();
+            while let Some(node) = pending.pop() {
+                if node.kind() == "implicit_object_creation_expression" {
+                    targets.push(
+                        implicit_object_creation_target_type(node).map(|n| node_text(n, &source)),
+                    );
+                }
+                pending.extend(named_children_iter(node));
+            }
+            assert_eq!(targets, [Some("Widget")], "{source}");
+        }
+    }
+
+    #[test]
+    fn builtin_argument_evidence_stops_at_its_capacity() {
+        // A literal at each boundary and a reference argument next to the
+        // boundary distinguish absence of evidence from a shifted bit zero.
+        let arguments = (0..66)
+            .map(|index| if index == 62 { "new Ref()" } else { "1" })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!("class C {{ void M() {{ receiver.Extend({arguments}); }} }}");
+        let tree = crate::preprocessor::parse_csharp(&source).unwrap();
+        let mut pending = vec![tree.root_node()];
+        let mut sites = 0;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "identifier" && node_text(node, &source) == "Extend" {
+                sites += 1;
+                let evidence = CSharpBuiltinValueArguments::at_site(node, &source);
+                assert!(!evidence.is_empty());
+                for index in [0, 61, 63] {
+                    assert!(evidence.contains(index), "literal argument {index}");
+                }
+                for index in [62, 64, 65, usize::MAX] {
+                    assert!(!evidence.contains(index), "unproven argument {index}");
+                }
+            }
+            pending.extend(named_children_iter(node));
+        }
+        assert_eq!(sites, 1);
+    }
 }

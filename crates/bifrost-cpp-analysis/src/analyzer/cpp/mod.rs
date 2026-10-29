@@ -219,7 +219,7 @@ pub struct CppAnalyzer {
     /// memo budget.
     statement_facts_by_file: Cache<
         ProjectFile,
-        Arc<CachedFileRead<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>>,
+        Arc<CachedFileRead<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>>,
     >,
     /// C assignment syntax candidates are requested by more than one
     /// relation binding. Retain one completed answer per immutable procedure
@@ -437,29 +437,28 @@ impl CppAnalyzer {
         K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
         T: Default + Send + Sync + 'static,
     {
-        use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
-
         match cache.try_get_with_by_ref(key, || {
-            let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
-            let value = read();
-            let incompleteness = scope.captured_read_incompleteness();
-            if let Some(reason) = incompleteness.iter().find(|reason| match reason {
-                QueryReadIncomplete::StructureUnavailable(_) => false,
-                QueryReadIncomplete::Cancelled
-                | QueryReadIncomplete::SemanticEvidenceUnavailable(_)
-                | QueryReadIncomplete::StoreFailure(_) => true,
-            }) {
-                return Err(reason.clone());
-            }
-            Ok(Arc::new(CachedFileRead {
-                value: Arc::new(value),
-                incompleteness: incompleteness.into_boxed_slice(),
-            }))
+            brokk_bifrost_analysis::analyzer::common::replayable_query_cache_fill(self, || {
+                let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
+                let value = read();
+                Arc::new(CachedFileRead {
+                    value: Arc::new(value),
+                    incompleteness: scope.captured_read_incompleteness().into_boxed_slice(),
+                })
+            })
         }) {
             Ok(value) => value.replay(self),
-            Err(reason) => {
-                self.record_query_incomplete((*reason).clone());
-                Arc::default()
+            Err(value) => {
+                if let Some(reason) = value
+                    .incompleteness
+                    .iter()
+                    .find(|reason| reason.is_execution_dependent())
+                {
+                    self.record_query_incomplete(reason.clone());
+                    Arc::default()
+                } else {
+                    value.as_ref().replay(self)
+                }
             }
         }
     }
@@ -490,11 +489,13 @@ impl CppAnalyzer {
     ) -> Arc<expression_branch_facts::CAssignmentCandidates> {
         let key = (procedure.artifact().materialization_id(), procedure.id());
         self.cached_complete_read(&self.c_assignment_candidates_by_procedure, &key, || {
-            expression_branch_facts::build_c_assignment_candidates(
-                workspace,
-                procedure,
-                cancellation,
-            )
+            let value = expression_branch_facts::build_c_assignment_candidates(
+                workspace, procedure, cancellation,
+            );
+            if value.reason.is_some_and(|reason| brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some()) {
+                self.mark_execution_dependent();
+            }
+            value
         })
     }
 
@@ -508,26 +509,31 @@ impl CppAnalyzer {
         match self
             .cpp_overwritten_candidates_by_procedure
             .try_get_with_by_ref(&key, || {
-                let scope = AnalyzerQueryScope::new(self);
-                let value = expression_branch_facts::build_cpp_overwritten_local_candidates(
-                    workspace,
-                    procedure,
-                    cancellation,
-                );
-                scope.read_completion()?;
-                Ok::<_, brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete>(
-                    Arc::new(value),
-                )
+                let filled = brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                    let scope = AnalyzerQueryScope::new(self);
+                    let value = expression_branch_facts::build_cpp_overwritten_local_candidates(
+                        workspace, procedure, cancellation,
+                    );
+                    if value.reason.is_some_and(|reason| brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some()) {
+                        self.mark_execution_dependent();
+                    }
+                    scope.read_completion().map(|()| Arc::new(value))
+                });
+                match filled {
+                    Ok(value) => value.map_err(Err),
+                    Err(value) => Err(value),
+                }
             }) {
             Ok(value) => value,
-            Err(reason) => {
-                self.record_query_incomplete((*reason).clone());
-                Arc::new(OverwrittenLocalCandidates {
-                    rows: Vec::new(),
-                    complete: false,
-                    reason: Some("query_incomplete"),
-                })
-            }
+            Err(attempt) => match attempt.as_ref() {
+                Ok(value) => Arc::clone(value),
+                Err(reason) => {
+                    self.record_query_incomplete(reason.clone());
+                    Arc::new(OverwrittenLocalCandidates {
+                        rows: Vec::new(), complete: false, reason: Some(brokk_bifrost_analysis::analyzer::read_ledger::reason::QUERY_INCOMPLETE),
+                    })
+                }
+            },
         }
     }
 
@@ -559,7 +565,7 @@ impl CppAnalyzer {
         &self,
         file: &ProjectFile,
         source: &str,
-    ) -> Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows> {
+    ) -> Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows> {
         self.cached_complete_read(&self.statement_facts_by_file, file, || {
             brokk_bifrost_cpp::source_facts::parse_statement_fact_rows(source)
         })
@@ -1458,7 +1464,16 @@ impl CppAnalyzer {
 
     pub(crate) fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext] {
         self.compile_contexts
-            .get_or_init(|| CppCompileContexts::load(self.inner.project()))
+            .get_or_init(|| {
+                CppCompileContexts::load_with_io_error(self.inner.project(), |error| {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        self.record_degraded_persistent_fill(
+                            "cpp.compile_contexts",
+                            &format!("project_io:{error}"),
+                        );
+                    }
+                })
+            })
             .contexts_for(file)
     }
 
@@ -1470,7 +1485,16 @@ impl CppAnalyzer {
         quoted: bool,
     ) -> brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution {
         self.compile_contexts
-            .get_or_init(|| CppCompileContexts::load(self.inner.project()))
+            .get_or_init(|| {
+                CppCompileContexts::load_with_io_error(self.inner.project(), |error| {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        self.record_degraded_persistent_fill(
+                            "cpp.compile_contexts",
+                            &format!("project_io:{error}"),
+                        );
+                    }
+                })
+            })
             .resolve_external_include(file, including_file, include, quoted)
     }
 
@@ -1513,24 +1537,27 @@ impl CppAnalyzer {
         // memoization rather than reparsing (issue #2414 step 3).
         let scope = AnalyzerQueryScope::new(analyzer);
         let token = scope.token();
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         files
             .into_iter()
             .collect::<Vec<_>>()
             .into_par_iter()
             .filter(|file| {
-                if cancellation
-                    .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
-                {
-                    return true;
-                }
-                match self.prepared_syntax(token, file) {
-                    Some(prepared) => cpp_syntax_may_spell_member(
-                        prepared.tree().root_node(),
-                        prepared.source(),
-                        member,
-                    ),
-                    None => true,
-                }
+                context.run(|| {
+                    if cancellation.is_some_and(
+                        brokk_bifrost_core::cancellation::CancellationToken::is_cancelled,
+                    ) {
+                        return true;
+                    }
+                    match self.prepared_syntax(token, file) {
+                        Some(prepared) => cpp_syntax_may_spell_member(
+                            prepared.tree().root_node(),
+                            prepared.source(),
+                            member,
+                        ),
+                        None => true,
+                    }
+                })
             })
             .collect()
     }
@@ -2236,15 +2263,24 @@ impl CppSource for CppAnalyzer {
         reference_file: &ProjectFile,
         reaches: bool,
     ) {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-cpp-analysis/src/analyzer/cpp/mod.rs",
+            );
+
         let scope = AnalyzerQueryScope::new(self);
         if scope.read_completion().is_err() {
             return;
         }
 
-        self.unconditional_include_reachability.insert(
-            (first.clone(), donor_source.clone(), reference_file.clone()),
-            reaches,
-        );
+        {
+            let cache_key = (first.clone(), donor_source.clone(), reference_file.clone());
+            let cache_value = reaches;
+            persistent_fill_guard.installed("unconditional_include_reachability");
+            self.unconditional_include_reachability
+                .insert(cache_key, cache_value);
+        };
     }
 
     fn recovered_export_class_index(
@@ -2285,13 +2321,24 @@ impl CppSource for CppAnalyzer {
         candidate: &CodeUnit,
         strength: CppClassDeclarationStrength,
     ) {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-cpp-analysis/src/analyzer/cpp/mod.rs",
+            );
+
         let scope = AnalyzerQueryScope::new(self);
         if scope.read_completion().is_err() {
             return;
         }
 
-        self.class_declaration_strength
-            .insert(candidate.clone(), strength);
+        {
+            let cache_key = candidate.clone();
+            let cache_value = strength;
+            persistent_fill_guard.installed("class_declaration_strength");
+            self.class_declaration_strength
+                .insert(cache_key, cache_value);
+        };
     }
 
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -2749,10 +2796,10 @@ impl IAnalyzer for CppAnalyzer {
         ))
     }
 
-    fn cpp_statement_source_facts(
+    fn statement_source_facts(
         &self,
         file: &ProjectFile,
-    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>> {
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         let source = self.file_source(file)?;
         Some(self.statement_facts_for(file, &source))
     }

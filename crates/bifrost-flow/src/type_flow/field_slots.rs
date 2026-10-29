@@ -93,6 +93,9 @@ pub struct FieldSlotIndex {
     persistent_artifacts: Vec<ClassSetFieldSlotArtifactRow>,
     mounted_artifacts: Vec<MountedArtifactReplay>,
     persistable: bool,
+    /// The keyed inputs fully determine this value, including dynamic writes
+    /// and open bounds, without budget-dependent gaps and within the cache cap.
+    memory_shareable: bool,
     source_refusals: Vec<crate::analyzer::semantic::SemanticProviderError>,
 }
 
@@ -309,7 +312,12 @@ impl FieldSlotIndex {
 
     /// Load one exact complete index when possible, otherwise build it.
     ///
+    /// Dynamic writes and open bounds can be shared in memory when they are
+    /// determined by the key; budget-dependent gaps cannot. Persistence still
+    /// requires an index without dynamic writes or open bounds.
     /// Store failures and malformed/stale payloads are ordinary cache misses.
+    /// Operational store failures suppress memory publication for both
+    /// persistable indexes and indexes that are only memory-shareable.
     /// A persisted hit first reserves the semantic work recorded by the cold
     /// build; a caller whose budget cannot pay it receives a fresh bounded
     /// build instead of a free answer.
@@ -534,9 +542,10 @@ impl FieldSlotIndex {
                     if cancellation.is_cancelled() {
                         return Err(TypeFlowPlanError::Cancelled);
                     }
-                    if shared_publish_eligible {
-                        permit.publish_complete(Arc::clone(&index));
-                    }
+                }
+                if index.memory_shareable && shared_publish_eligible && !cancellation.is_cancelled()
+                {
+                    permit.publish_complete(Arc::clone(&index));
                 }
                 Ok(FieldSlotIndexAcquisition {
                     index,
@@ -793,12 +802,29 @@ impl FieldSlotIndex {
             collected.stores.remove(&key);
         }
         let store_survey = FieldStoreSurvey::from_collected(&collected);
-        let persistable = collected.source_refusals.is_empty()
-            && collected.dynamic_writes.is_empty()
+        // Every way the caller's budget can change this value leaves one of
+        // the flags below, so an index without them is a complete value of
+        // its memory key. `UnknownReason::Truncated` is admitted because its
+        // only budget-dependent producer, a refused execution-traversal
+        // charge during dispatch, cannot fire here: the build's requests
+        // carry no execution budget. If one is ever attached, `Truncated`
+        // joins the excluded reasons.
+        let memory_shareable = collected.source_refusals.is_empty()
             && !collected.globally_incomplete
             && !collected.transient_resolver_budget
-            && !collected.has_open_bound
-            && collected.semantic_budget_exhaustion.is_none();
+            && collected.semantic_budget_exhaustion.is_none()
+            && !collected.dynamic_effects.iter().any(|effect| {
+                matches!(
+                    effect.evidence.reason,
+                    Some(
+                        UnknownReason::SemanticBudget
+                            | UnknownReason::SolverBudget
+                            | UnknownReason::IncompleteRoot
+                    )
+                )
+            });
+        let persistable =
+            memory_shareable && collected.dynamic_writes.is_empty() && !collected.has_open_bound;
         let mut artifacts = collected
             .persistent_artifacts
             .into_iter()
@@ -979,9 +1005,13 @@ impl FieldSlotIndex {
             persistent_artifacts,
             mounted_artifacts,
             persistable,
+            memory_shareable,
             source_refusals: collected.source_refusals,
         };
-        index.persistable &= index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize;
+        let within_cache_cap = index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize;
+        index.persistable &= within_cache_cap;
+        index.memory_shareable &= within_cache_cap;
+        assert!(!index.persistable || index.memory_shareable);
         Ok(index)
     }
 
@@ -1196,6 +1226,7 @@ impl FieldSlotIndex {
             persistent_artifacts,
             mounted_artifacts: replay.mounted,
             persistable: true,
+            memory_shareable: true,
             source_refusals: Vec::new(),
         };
         (index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize)
@@ -3211,6 +3242,54 @@ mod tests {
                 metadata_visits
             );
         });
+    }
+
+    #[test]
+    #[hardwon(
+        "#2445: a dynamic attribute write made every policy query rebuild the field-slot index"
+    )]
+    fn dynamic_write_field_slots_are_shared_in_memory() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file(
+                "app.py",
+                concat!(
+                    "class Base:\n",
+                    "    @classmethod\n",
+                    "    def attach(cls, name, value):\n",
+                    "        setattr(cls, name, value)\n",
+                ),
+            )
+            .build();
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace builds");
+        let adapter = type_flow_adapter(Language::Python).expect("Python type-flow adapter");
+        let cache = FieldSlotIndexCache::default();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        let first = acquire(
+            &workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .expect("dynamic field slots build");
+        assert_eq!(first.kind, FieldSlotIndexAcquisitionKind::Built);
+        assert!(!first.index.persistable);
+        assert!(first.index.memory_shareable);
+        let second = acquire(
+            &workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .expect("dynamic field slots replay");
+        assert_eq!(second.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
+        assert!(Arc::ptr_eq(&first.index, &second.index));
     }
 
     #[test]

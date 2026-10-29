@@ -162,6 +162,14 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         aliases: Arc<AliasResolver>,
         syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     ) -> Self {
+        let imports = if imports.lexical_bindings().is_some() {
+            imports
+        } else {
+            imports.with_lexical_bindings(
+                root,
+                crate::syntax::JsTsLexicalBindingIndex::build(root, source),
+            )
+        };
         Self {
             host,
             support,
@@ -284,10 +292,16 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     .iter()
                     .flat_map(|value| self.member_targets_for_value(value, member))
                     .collect::<Vec<_>>();
-                if targets.is_empty() {
-                    ReceiverAnalysisOutcome::Ambiguous(Vec::new())
-                } else {
-                    ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget)
+                let bounded = ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget);
+                match bounded {
+                    ReceiverAnalysisOutcome::Precise(targets)
+                    | ReceiverAnalysisOutcome::Ambiguous(targets) => {
+                        ReceiverAnalysisOutcome::Ambiguous(targets)
+                    }
+                    ReceiverAnalysisOutcome::Unknown => {
+                        ReceiverAnalysisOutcome::Ambiguous(Vec::new())
+                    }
+                    other => other,
                 }
             }
             ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
@@ -1072,6 +1086,27 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let bindings = self
+            .imports
+            .lexical_bindings()
+            .expect("receiver provider has lexical scopes");
+        let function = enclosing_function_scope(receiver_node).map(|node| node.id());
+        for byte in bindings.binding_write_sites_at(receiver, receiver_node.start_byte()) {
+            if let Err(limit) = tracker.record_scope_node() {
+                return limit.exceeded();
+            }
+            let write = self
+                .root
+                .named_descendant_for_byte_range(byte, byte + 1)
+                .expect("a lexical write site names a source node");
+            if enclosing_function_scope(write).map(|node| node.id()) != function {
+                // Source ordering across callables is not execution ordering.
+                // A captured write can run before this read even when its
+                // declaration appears later; a type annotation cannot prove
+                // one runtime owner in that case.
+                return ReceiverAnalysisOutcome::Ambiguous(Vec::new());
+            }
+        }
         let before_byte = receiver_node.start_byte();
         let mut current = receiver_node;
         loop {
@@ -1091,6 +1126,10 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 break;
             };
             current = parent;
+        }
+        let class = self.resolve_static_object_expression(receiver_node, before_byte, budget);
+        if !matches!(class, ReceiverAnalysisOutcome::Unknown) {
+            return class;
         }
         self.imported_module_receiver_outcome(receiver, budget)
             .unwrap_or(ReceiverAnalysisOutcome::Unknown)
@@ -1211,18 +1250,23 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 *latest = Some(outcome);
             }
         };
-        let mut stack = vec![scope];
-        while let Some(node) = stack.pop() {
+        // Each entry carries whether the node's nearest enclosing scope
+        // boundary is `scope`, the answer `declaration_scope_id` gives.
+        // Climbing `Node::parent` per node made this walk quadratic, because
+        // tree-sitter finds a parent by descending from the root (#7724).
+        let mut stack = vec![(scope, false)];
+        while let Some((node, same_scope)) = stack.pop() {
             if let Err(limit) = tracker.record_scope_node() {
                 return Some(limit.exceeded());
             }
             if node.start_byte() >= before_byte {
                 continue;
             }
-            if node.id() != scope.id() && is_scope_boundary(node.kind()) {
+            if node.id() != scope.id() && is_declaration_boundary(node.kind()) {
                 continue;
             }
-            if self.language == Language::TypeScript
+            if same_scope
+                && self.language == Language::TypeScript
                 && matches!(node.kind(), "required_parameter" | "optional_parameter")
                 && node
                     .child_by_field_name("name")
@@ -1234,9 +1278,10 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     &mut latest,
                     self.type_annotation_receiver_outcome(type_node, budget),
                 );
-            } else if binding_node_shadows_receiver(node, self.source, receiver) {
+            } else if same_scope && binding_node_shadows_receiver(node, self.source, receiver) {
                 record(&mut latest, ReceiverAnalysisOutcome::Unknown);
-            } else if node.kind() == "variable_declarator"
+            } else if same_scope
+                && node.kind() == "variable_declarator"
                 && let Some(name) = node.child_by_field_name("name")
                 && node_text_matches(name, self.source, receiver)
             {
@@ -1244,13 +1289,33 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     &mut latest,
                     self.resolve_variable_declarator_binding(node, depth, budget, tracker),
                 );
-            } else if node.kind() == "assignment_expression"
-                && let Some(left) = node.child_by_field_name("left")
+            } else if matches!(
+                node.kind(),
+                "assignment_expression" | "augmented_assignment_expression"
+            ) && let Some(left) = node.child_by_field_name("left")
                 && matches!(left.kind(), "identifier" | "type_identifier")
                 && node_text_matches(left, self.source, receiver)
             {
-                if assignment_has_nonlinear_control_ancestor(node, scope) {
+                // A block-local declaration shadows the outer binding even
+                // before its initializer (the lexical binding's TDZ).
+                if lexical_scopes_for_node(node)
+                    .into_iter()
+                    .take_while(|s| s.id() != scope.id())
+                    .any(|block| {
+                        !component_bindings_in_scope(block, receiver, self.source).is_empty()
+                    })
+                {
+                    continue;
+                }
+                if assignment_has_nonlinear_control_ancestor(node, scope, self.source)
+                    || node.kind() == "augmented_assignment_expression"
+                        && node.child_by_field_name("operator").is_some_and(|op| {
+                            matches!(slice(op, self.source), "&&=" | "||=" | "??=")
+                        })
+                {
                     record(&mut latest, ReceiverAnalysisOutcome::Ambiguous(Vec::new()));
+                } else if node.kind() == "augmented_assignment_expression" {
+                    record(&mut latest, ReceiverAnalysisOutcome::Unknown);
                 } else {
                     record(
                         &mut latest,
@@ -1261,9 +1326,14 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 }
             }
 
+            let children_same_scope = if is_scope_boundary(node.kind()) {
+                node.id() == scope.id()
+            } else {
+                same_scope
+            };
             for index in (0..node.named_child_count()).rev() {
                 if let Some(child) = node.named_child(index) {
-                    stack.push(child);
+                    stack.push((child, children_same_scope));
                 }
             }
         }
@@ -1411,9 +1481,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         if let Err(limit) = tracker.record_summary_expansion() {
             return limit.exceeded();
         }
-        let Some(function) = call.child_by_field_name("function") else {
-            return ReceiverAnalysisOutcome::Unknown;
-        };
+        let function = call
+            .child_by_field_name("function")
+            .expect("call expressions have a function field");
         match function.kind() {
             "identifier" | "type_identifier" => {
                 let name = slice(function, self.source);
@@ -1513,7 +1583,17 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 tree.root_node(),
                 imports,
             );
-            for node in ts_nodes_for_code_unit(self.host, &function, tree.root_node()) {
+            let nodes = ts_nodes_for_code_unit(self.host, &function, tree.root_node());
+            let implementation = crate::model::last_hoisted_function_implementation(&nodes);
+            if nodes.len() > 1 && implementation.is_none() {
+                // Redeclarations are not one binding snapshot. Equal declared
+                // return types cannot turn their uncertainty into proof.
+                outcomes.push(ReceiverAnalysisOutcome::Unknown);
+            }
+            for node in implementation
+                .into_iter()
+                .chain(nodes.into_iter().filter(|_| implementation.is_none()))
+            {
                 // The index holds the DECLARATION; `const f = () => ...` binds
                 // its callable one level down, and the return type and returns
                 // this summary reads both live on the callable.
@@ -1764,6 +1844,8 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 let mut cursor = node.walk();
                 if let Some(value) = node.named_children(&mut cursor).next() {
                     outcomes.push(self.resolve_expression(value, depth + 1, budget, tracker));
+                } else {
+                    outcomes.push(ReceiverAnalysisOutcome::Unknown);
                 }
                 continue;
             }
@@ -1777,15 +1859,46 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     fn class_units_named(&self, name: &str, site: Node<'tree>) -> Vec<CodeUnit> {
-        if self.visible_class_declaration_nodes(name, site).is_empty() {
+        let bindings = self
+            .imports
+            .lexical_bindings()
+            .expect("receiver provider has lexical scopes");
+        let ranges = bindings.binding_identifier_ranges_at(name, site.start_byte());
+        let visible: Vec<_> = self
+            .visible_class_declaration_nodes(name, site)
+            .into_iter()
+            .filter(|class| {
+                class.child_by_field_name("name").is_some_and(|binder| {
+                    ranges.iter().any(|range| {
+                        range.start_byte == binder.start_byte()
+                            && range.end_byte == binder.end_byte()
+                    })
+                })
+            })
+            .collect();
+        let Some(scope) = lexical_scopes_for_node(site).into_iter().find(|scope| {
+            visible
+                .iter()
+                .any(|node| declaration_scope_id(*node) == Some(scope.id()))
+        }) else {
             return Vec::new();
-        }
+        };
+        let visible: Vec<_> = visible
+            .into_iter()
+            .filter(|node| declaration_scope_id(*node) == Some(scope.id()))
+            .collect();
         let mut units = self
             .host
             .declarations(self.file)
             .into_iter()
             .filter(|unit| {
                 unit.is_class()
+                    && self.host.ranges(unit).iter().any(|range| {
+                        visible.iter().any(|node| {
+                            range.start_byte <= node.start_byte()
+                                && node.end_byte() <= range.end_byte
+                        })
+                    })
                     && unit.identifier() == name
                     && brokk_bifrost_core::analyzer::common::language_for_file(unit.source())
                         == self.language
@@ -2200,21 +2313,10 @@ fn source_component_wrapper_argument(
                 {
                     return arguments.first().copied();
                 }
-                pending.extend(arguments.iter().rev().copied());
-                pending.push(*base);
             }
-            JsTsTypeShape::Wrapped(child)
-            | JsTsTypeShape::Query(child)
-            | JsTsTypeShape::Array(child) => pending.push(*child),
-            JsTsTypeShape::Union(children)
-            | JsTsTypeShape::Intersection(children)
-            | JsTsTypeShape::Tuple(children) => pending.extend(children.iter().rev().copied()),
-            JsTsTypeShape::Function { parameters, result } => {
-                pending.extend(result.iter().copied());
-                pending.extend(parameters.iter().rev().flatten().copied());
-            }
-            JsTsTypeShape::Object(members) => {
-                pending.extend(members.iter().rev().map(|(_, id)| *id))
+            JsTsTypeShape::Wrapped(child) => pending.push(*child),
+            JsTsTypeShape::Union(children) | JsTsTypeShape::Intersection(children) => {
+                pending.extend(children.iter().rev().copied());
             }
             _ => {}
         }
@@ -2319,11 +2421,11 @@ fn component_bindings_in_scope<'tree>(
     let mut bindings = Vec::new();
     let mut stack = vec![scope];
     while let Some(node) = stack.pop() {
-        if node.id() != scope.id() && is_scope_boundary(node.kind()) {
-            continue;
-        }
         if let Some(binding) = binding_node_for_name(node, name, source) {
             bindings.push(binding);
+            continue;
+        }
+        if node.id() != scope.id() && is_scope_boundary(node.kind()) {
             continue;
         }
         for index in (0..node.named_child_count()).rev() {
@@ -2436,9 +2538,14 @@ fn function_component_wrapper_argument<'tree>(
                     .and_then(|arguments| arguments.named_child(0));
             }
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
+        if matches!(
+            node.kind(),
+            "type_annotation" | "parenthesized_type" | "union_type" | "intersection_type"
+        ) {
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
             }
         }
     }
@@ -2468,7 +2575,9 @@ fn class_component_props_argument<'tree>(class: Node<'tree>, source: &str) -> Op
 
 fn type_reference_terminal<'a>(mut node: Node<'_>, source: &'a str) -> Option<&'a str> {
     loop {
-        if let Some(name) = node.child_by_field_name("name")
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"))
             && name.id() != node.id()
         {
             node = name;
@@ -2681,13 +2790,27 @@ fn declaration_scope_id(node: Node<'_>) -> Option<usize> {
     }
 }
 
-fn assignment_has_nonlinear_control_ancestor(assignment: Node<'_>, scope: Node<'_>) -> bool {
+fn assignment_has_nonlinear_control_ancestor(
+    assignment: Node<'_>,
+    scope: Node<'_>,
+    source: &str,
+) -> bool {
     let mut current = assignment.parent();
     while let Some(node) = current {
-        if node.id() == scope.id() || is_scope_boundary(node.kind()) {
+        if node.id() == scope.id() || is_declaration_boundary(node.kind()) {
             return false;
         }
-        if is_nonlinear_control_boundary(node.kind()) {
+        if is_nonlinear_control_boundary(node.kind())
+            || matches!(
+                node.kind(),
+                "binary_expression" | "augmented_assignment_expression"
+            ) && node.child_by_field_name("operator").is_some_and(|op| {
+                matches!(
+                    slice(op, source),
+                    "&&" | "||" | "??" | "&&=" | "||=" | "??="
+                )
+            })
+        {
             return true;
         }
         current = node.parent();
@@ -2698,7 +2821,8 @@ fn assignment_has_nonlinear_control_ancestor(assignment: Node<'_>, scope: Node<'
 fn is_nonlinear_control_boundary(kind: &str) -> bool {
     matches!(
         kind,
-        "if_statement"
+        "ternary_expression"
+            | "if_statement"
             | "else_clause"
             | "switch_statement"
             | "switch_case"
@@ -2723,6 +2847,8 @@ fn is_declaration_boundary(kind: &str) -> bool {
     matches!(
         kind,
         "function_declaration"
+            | "generator_function_declaration"
+            | "generator_function"
             | "function_expression"
             | "arrow_function"
             | "method_definition"
@@ -2848,9 +2974,17 @@ fn sort_units(units: &mut [CodeUnit]) {
 
 #[cfg(test)]
 mod tests {
-    use super::binding_pattern_contains_name;
+    use super::*;
     use crate::test_support::parse_javascript;
+    use brokk_bifrost_core::analyzer::CodeUnitIndex;
+    use brokk_bifrost_core::analyzer::capabilities::{
+        ImportAnalysisProvider, TypeHierarchyProvider,
+    };
+    use brokk_bifrost_core::analyzer::model::ImportInfo;
+    use brokk_bifrost_core::analyzer::project::{Project, TestProject};
+    use brokk_bifrost_core::analyzer::query_token::QueryToken;
     use brokk_bifrost_test_macros::hardwon;
+    use std::collections::BTreeSet;
 
     #[test]
     #[hardwon("#4271: a default-value reference was mistaken for a destructuring binder")]
@@ -2870,5 +3004,1251 @@ mod tests {
 
         let pattern = pattern.expect("destructuring pattern");
         assert!(!binding_pattern_contains_name(pattern, source, "b"));
+    }
+    struct FakeJsTsSource {
+        project: Arc<TestProject>,
+        aliases: Arc<AliasResolver>,
+        file: ProjectFile,
+        language: Language,
+        declarations: Vec<(CodeUnit, Range)>,
+        source_facts: Arc<JsTsFileSourceFacts>,
+        additional_facts: HashMap<ProjectFile, Arc<JsTsFileSourceFacts>>,
+        supertypes: HashMap<CodeUnit, Vec<String>>,
+    }
+
+    impl FakeJsTsSource {
+        fn new_in(root: &std::path::Path, path: &str, source: &str) -> Self {
+            let file = ProjectFile::new(root, path);
+            std::fs::write(file.abs_path(), source).expect("write fixture");
+            let language = brokk_bifrost_core::analyzer::common::language_for_file(&file);
+            let project = Arc::new(TestProject::new(root, language));
+            let aliases = Arc::new(AliasResolver::new(project.clone() as Arc<dyn Project>));
+
+            let tree = parse_js_ts_tree(&file, source, language).expect("parse");
+            let parsed = match language {
+                Language::JavaScript => {
+                    crate::javascript::parse_javascript_file(&file, source, &tree)
+                }
+                Language::TypeScript => {
+                    crate::typescript::parse_typescript_file(&file, source, &tree)
+                }
+                _ => unreachable!("JS/TS fixture"),
+            };
+            let declarations = parsed
+                .ranges
+                .iter()
+                .flat_map(|(unit, ranges)| ranges.iter().map(|range| (unit.clone(), *range)))
+                .collect();
+            let mut declaration_units: HashMap<_, Vec<_>> = HashMap::default();
+            for (declaration, unit) in parsed.source_declaration_units {
+                declaration_units.entry(declaration).or_default().push(unit);
+            }
+            let publication = parsed.source_facts.expect("primary source publication");
+            let source_facts = Arc::new(JsTsFileSourceFacts {
+                source: publication.occurrences,
+                imports: publication.imports,
+                facts: publication.js_ts.expect("JS/TS source family"),
+                declaration_units,
+            });
+            Self {
+                project,
+                aliases,
+                file,
+                language,
+                declarations,
+                source_facts,
+                additional_facts: HashMap::default(),
+                supertypes: parsed.raw_supertypes,
+            }
+        }
+    }
+
+    impl CodeUnitIndex for FakeJsTsSource {
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+            self.declarations
+                .iter()
+                .filter(|(u, _)| u.source() == file)
+                .map(|(u, _)| u.clone())
+                .collect()
+        }
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+            self.declarations(file).into_iter().collect()
+        }
+        fn definitions(&self, fqn: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            let fqn = fqn.to_owned();
+            Box::new(
+                self.declarations
+                    .iter()
+                    .filter(move |(u, _)| u.fq_name() == fqn)
+                    .map(|(u, _)| u.clone()),
+            )
+        }
+        fn project(&self) -> &dyn Project {
+            self.project.as_ref()
+        }
+
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([self.language])
+        }
+
+        fn analyzed_files(&self) -> Vec<ProjectFile> {
+            self.all_files()
+        }
+
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(self.declarations.iter().map(|(unit, _)| unit.clone()))
+        }
+
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+            self.declarations
+                .iter()
+                .filter(|(unit, _)| unit == code_unit)
+                .map(|(_, range)| *range)
+                .collect()
+        }
+
+        // These surfaces are outside the parser/publication/receiver boundary
+        // exercised here; fail if a test unexpectedly reaches one.
+        fn search_definitions(&self, _pattern: &str, _case_sensitive: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+
+        fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _file: &ProjectFile,
+            _start_line: usize,
+            _end_line: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+
+        fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+
+        fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+
+        fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+            unimplemented!()
+        }
+
+        fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+
+    impl ImportAnalysisProvider for FakeJsTsSource {
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::hash::HashSet<CodeUnit>> {
+            Arc::new(brokk_bifrost_core::hash::HashSet::default())
+        }
+
+        fn referencing_files_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> brokk_bifrost_core::hash::HashSet<ProjectFile> {
+            brokk_bifrost_core::hash::HashSet::default()
+        }
+    }
+
+    impl TypeHierarchyProvider for FakeJsTsSource {
+        fn get_direct_ancestors(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+
+        fn get_direct_descendants(
+            &self,
+            _code_unit: &CodeUnit,
+        ) -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
+            brokk_bifrost_core::hash::HashSet::default()
+        }
+    }
+
+    impl JsTsSource for FakeJsTsSource {
+        fn source_file_inventory(
+            &self,
+        ) -> brokk_bifrost_core::analyzer::query_batch::QueryBatch<ProjectFile> {
+            let files = self.all_files();
+            let count = files.len();
+            brokk_bifrost_core::analyzer::query_batch::QueryBatch::complete(files, count)
+        }
+
+        fn source_facts(&self, file: &ProjectFile) -> Option<Arc<JsTsFileSourceFacts>> {
+            if file == &self.file {
+                Some(self.source_facts.clone())
+            } else {
+                self.additional_facts.get(file).cloned()
+            }
+        }
+        fn alias_resolver(&self) -> &Arc<AliasResolver> {
+            &self.aliases
+        }
+
+        fn language(&self) -> Language {
+            self.language
+        }
+
+        fn all_files(&self) -> Vec<ProjectFile> {
+            std::iter::once(self.file.clone())
+                .chain(self.additional_facts.keys().cloned())
+                .collect()
+        }
+
+        fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn bulk_import_infos(
+            &self,
+            _files: &[ProjectFile],
+        ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+            HashMap::default()
+        }
+
+        fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+            self.supertypes.get(code_unit).cloned().unwrap_or_default()
+        }
+
+        fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+            self.source_facts.facts.declarations.iter().any(|d| {
+                d.alias_type.is_some()
+                    && self
+                        .source_facts
+                        .declaration_units
+                        .get(&d.declaration)
+                        .is_some_and(|units| units.contains(code_unit))
+            })
+        }
+
+        fn raw_signatures(&self, _code_unit: &CodeUnit) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn with_usage_definitions(
+            &self,
+            _token: QueryToken<'_>,
+            read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+        ) {
+            read(self);
+        }
+
+        fn usage_index(
+            &self,
+            _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        ) -> Option<Arc<crate::graph::resolver::JsTsUsageIndex>> {
+            crate::graph::resolver::build_jsts_usage_index(
+                self,
+                &self.aliases,
+                self.language,
+                false,
+            )
+            .map(Arc::new)
+        }
+    }
+
+    impl BoundedDefinitionLookup for FakeJsTsSource {
+        fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+            self.declarations
+                .iter()
+                .filter(|(unit, _)| unit.fq_name() == fqn)
+                .map(|(unit, _)| unit.clone())
+                .collect()
+        }
+
+        fn fqn_in_language(&self, fqn: &str, _language: Language) -> Vec<CodeUnit> {
+            self.fqn(fqn)
+        }
+
+        fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+            self.declarations
+                .iter()
+                .filter(|(unit, _)| unit.source() == file && unit.identifier() == ident)
+                .map(|(unit, _)| unit.clone())
+                .collect()
+        }
+
+        fn package_exists(&self, _package: &str) -> bool {
+            false
+        }
+
+        fn package_exists_in_language(&self, _package: &str, _language: Language) -> bool {
+            false
+        }
+
+        fn fqn_prefix_exists(&self, _prefix: &str) -> bool {
+            false
+        }
+
+        fn fqn_direct_children(&self, _fqn: &str) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+    }
+
+    fn with_provider<R>(
+        source: &str,
+        run: impl FnOnce(&JsTsReceiverFactProvider<'_, '_>) -> R,
+    ) -> R {
+        with_workspace(source, &[], run)
+    }
+    fn with_workspace<R>(
+        source: &str,
+        modules: &[(&str, &str)],
+        run: impl FnOnce(&JsTsReceiverFactProvider<'_, '_>) -> R,
+    ) -> R {
+        with_sources("receiver.tsx", source, modules, run)
+    }
+    fn with_sources<R>(
+        path: &str,
+        source: &str,
+        modules: &[(&str, &str)],
+        run: impl FnOnce(&JsTsReceiverFactProvider<'_, '_>) -> R,
+    ) -> R {
+        let root = tempfile::tempdir().expect("fixture root");
+        let mut host = FakeJsTsSource::new_in(root.path(), path, source);
+        for (path, text) in modules {
+            let module = FakeJsTsSource::new_in(root.path(), path, text);
+            host.declarations.extend(module.declarations);
+            host.supertypes.extend(module.supertypes);
+            host.additional_facts
+                .insert(module.file, module.source_facts);
+        }
+        let tree = parse_js_ts_tree(&host.file, source, host.language).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let imports = crate::syntax::compute_import_binder(source, &tree);
+        let provider = JsTsReceiverFactProvider::new(
+            &host,
+            &host,
+            host.language,
+            &host.file,
+            source,
+            tree.root_node(),
+            imports,
+        );
+        run(&provider)
+    }
+
+    fn nodes<'t>(root: Node<'t>, kind: &str) -> Vec<Node<'t>> {
+        let mut found = Vec::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.kind() == kind {
+                found.push(node);
+            }
+            for i in (0..node.named_child_count()).rev() {
+                pending.push(node.named_child(i).unwrap());
+            }
+        }
+        found
+    }
+
+    #[test]
+    #[hardwon("#7218: review: bare return did not add factory uncertainty")]
+    fn bare_factory_return_stays_uncertain() {
+        with_provider(
+            "class A {m(){}} function make() {if (flag) return; return new A();} make().m();",
+            |p| {
+                let member = nodes(p.root, "member_expression")[0];
+                let result = p.resolve_receiver_node(
+                    member.child_by_field_name("object").unwrap(),
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert!(
+                    matches!(result, ReceiverAnalysisOutcome::Ambiguous(_)),
+                    "{result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon("#7218: review: constructor lookup ignored nearer value binder")]
+    fn constructor_respects_value_shadow() {
+        for binding in [
+            "function f(C) {new C().m();}",
+            "function f() {const C = external; new C().m();}",
+        ] {
+            let source = format!("class C {{m(){{}}}} {binding}");
+            with_provider(&source, |p| {
+                let new = nodes(p.root, "new_expression")[0];
+                let result = p.resolve_receiver_node(new, ReceiverAnalysisBudget::default());
+                assert!(
+                    !matches!(result, ReceiverAnalysisOutcome::Precise(_)),
+                    "{binding}: {result:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[hardwon("#7218: review: generator body treated as caller scope write")]
+    fn generator_write_cannot_prove_receiver() {
+        with_provider(
+            "class A {m(){}} class B {m(){}} let x = new A(); function* later() {x = new B();} x.m();",
+            |p| {
+                let member = nodes(p.root, "member_expression")[0];
+                let result = p.resolve_receiver_node(
+                    member.child_by_field_name("object").unwrap(),
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert!(
+                    !matches!(result, ReceiverAnalysisOutcome::Precise(ref v) if v[0].owner().identifier() == "B"),
+                    "{result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon("#7218: review: redeclared variable factory selected last value after export")]
+    fn redeclared_factory_is_ambiguous() {
+        with_sources(
+            "receiver.cjs",
+            "const {make} = require('./factory'); make().m();",
+            &[(
+                "factory.cjs",
+                "class A {m(){}} class B {m(){}} var make = () => {return new A();}; exports.make = make; var make = () => {return new B();};",
+            )],
+            |p| {
+                let functions = p
+                    .host
+                    .all_declarations()
+                    .filter(|u| u.identifier() == "make")
+                    .collect();
+                let budget = ReceiverAnalysisBudget::default();
+                let result = p
+                    .summarize_external_functions(
+                        functions,
+                        0,
+                        budget,
+                        &mut ReceiverAnalysisBudgetTracker::new(budget),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(result, ReceiverAnalysisOutcome::Ambiguous(_)),
+                    "{result:?}"
+                );
+            },
+        );
+    }
+
+    // Overload signatures share the implementation's binding and have no
+    // body, so they must not turn the one implementation into a redeclaration.
+    #[test]
+    fn overloaded_factory_uses_its_implementation() {
+        with_sources(
+            "receiver.ts",
+            "import {make} from './factory'; make('a').m();",
+            &[(
+                "factory.ts",
+                "export class A {m(){}} export function make(x: string): A; export function make(x: number): A; export function make(x: any): A {return new A();}",
+            )],
+            |p| {
+                let functions = p
+                    .host
+                    .all_declarations()
+                    .filter(|u| u.identifier() == "make")
+                    .collect();
+                let budget = ReceiverAnalysisBudget::default();
+                let result = p
+                    .summarize_external_functions(
+                        functions,
+                        0,
+                        budget,
+                        &mut ReceiverAnalysisBudgetTracker::new(budget),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(result, ReceiverAnalysisOutcome::Precise(_)),
+                    "{result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon("#7218: review: equal return annotations erased variable redeclaration ambiguity")]
+    fn redeclared_typed_factory_is_ambiguous() {
+        with_sources(
+            "receiver.ts",
+            "import {make} from './factory'; make().m();",
+            &[(
+                "factory.ts",
+                "class A {m(){}} var make = (): A => {return new A();}; export {make}; var make = (): A => {return new A();};",
+            )],
+            |p| {
+                let functions = p
+                    .host
+                    .all_declarations()
+                    .filter(|u| u.identifier() == "make")
+                    .collect();
+                let budget = ReceiverAnalysisBudget::default();
+                let result = p
+                    .summarize_external_functions(
+                        functions,
+                        0,
+                        budget,
+                        &mut ReceiverAnalysisBudgetTracker::new(budget),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(result, ReceiverAnalysisOutcome::Ambiguous(_)),
+                    "{result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon("#7218: review: conditional expression and augmented writes retained exact proof")]
+    fn expression_writes_invalidate_receiver() {
+        for control in [
+            "false ? x = new B() : 0;",
+            "false && (x = new B());",
+            "true || (x = new B());",
+            "x ?? (x = new B());",
+            "x &&= new B();",
+            "x ||= new B();",
+            "x ??= new B();",
+            "x += 1;",
+        ] {
+            let source = format!(
+                "class A {{m(){{}}}} class B {{m(){{}}}} let x = new A(); {control} x.m();"
+            );
+            with_provider(&source, |p| {
+                let member = nodes(p.root, "member_expression")[0];
+                let result = p.resolve_receiver_node(
+                    member.child_by_field_name("object").unwrap(),
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert!(
+                    !matches!(result, ReceiverAnalysisOutcome::Precise(_)),
+                    "{control}: {result:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[hardwon("#7218: review: heritage qualifier ignored enclosing namespace")]
+    fn heritage_resolves_in_enclosing_namespace() {
+        with_provider(
+            "namespace M {export class Base {outer(){}}} namespace N {export namespace M {export class Base {inner(){}}} class Child extends M.Base {} new Child().inner();}",
+            |p| {
+                let child = p
+                    .host
+                    .declarations(p.file)
+                    .into_iter()
+                    .find(|u| u.fq_name() == "N.Child")
+                    .unwrap();
+                let ancestors = crate::hierarchy::resolve_direct_ancestors(
+                    p.host,
+                    &crate::graph::resolver::JsTsUsageIndex::default(),
+                    p.language,
+                    &p.aliases,
+                    &child,
+                    &["M.Base".to_string()],
+                );
+                assert_eq!(
+                    ancestors.iter().map(|u| u.fq_name()).collect::<Vec<_>>(),
+                    ["N.M.Base"]
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: nested component containers are not components"
+    )]
+    fn component_container_annotations_do_not_prove_props() {
+        for annotation in [
+            "Holder<FC<A>, FC<B>>",
+            "FC<A>[]",
+            "(callback: FC<A>) => void",
+            "{ panel: FC<A> }",
+        ] {
+            let source = format!(
+                "interface A {{ a: string }} interface B {{ b: string }} type Holder<T,U> = {{ left:T; right:U }}; type Bad = {annotation}; let Panel: Bad; let Direct: {annotation}; <Panel a='x' />; <Direct a='x' />;"
+            );
+            with_provider(&source, |provider| {
+                let attributes = nodes(provider.root, "jsx_attribute");
+                assert_eq!(attributes.len(), 2);
+                for attribute in attributes {
+                    assert!(
+                        provider
+                            .resolve_jsx_attribute_targets(
+                                attribute,
+                                ReceiverAnalysisBudget::default()
+                            )
+                            .unwrap()
+                            .is_empty(),
+                        "{annotation}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: class receiver ignores lexical shadowing"
+    )]
+    fn class_receivers_obey_lexical_scope() {
+        with_provider(
+            "class C { outer() {} } namespace N { export class C { inner() {} } new C().inner(); } new C().outer();",
+            |p| {
+                for (node, expected) in nodes(p.root, "new_expression")
+                    .into_iter()
+                    .zip(["N.C", "C"])
+                {
+                    let result = p.resolve_receiver_node(node, ReceiverAnalysisBudget::default());
+                    let ReceiverAnalysisOutcome::Precise(values) = result else {
+                        panic!("{result:?}")
+                    };
+                    assert_eq!(
+                        values
+                            .iter()
+                            .map(|v| v.owner().fq_name())
+                            .collect::<Vec<_>>(),
+                        [expected]
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: unknown factory branches cannot prove a member target"
+    )]
+    fn uncertain_factory_member_stays_uncertain() {
+        with_provider(
+            "class A { m() {} } function make() { return flag ? new A() : unknownValue; } make().m();",
+            |p| {
+                let member = nodes(p.root, "member_expression")[0];
+                let receiver = member.child_by_field_name("object").unwrap();
+                let outcome = p.resolve_member_targets(
+                    receiver,
+                    "m",
+                    member.start_byte(),
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert!(
+                    matches!(outcome, ReceiverAnalysisOutcome::Ambiguous(ref v) if v.len() == 1),
+                    "{outcome:?}"
+                );
+                let missing = p.resolve_member_targets(
+                    receiver,
+                    "missing",
+                    member.start_byte(),
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert!(
+                    matches!(missing, ReceiverAnalysisOutcome::Ambiguous(ref v) if v.is_empty()),
+                    "{missing:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: writes in conditional blocks were skipped"
+    )]
+    fn conditional_writes_cannot_prove_an_exact_receiver() {
+        for control in [
+            "if (flag) x = new B();",
+            "if (flag) { x = new B(); }",
+            "while (flag) { x = new B(); }",
+            "{ x = new B(); }",
+        ] {
+            let source = format!(
+                "class A {{ m() {{}} }} class B {{ m() {{}} }} let x = new A(); {control} x.m();"
+            );
+            with_provider(&source, |p| {
+                let member = nodes(p.root, "member_expression")[0];
+                let receiver = member.child_by_field_name("object").unwrap();
+                let result = p.resolve_receiver_node(receiver, ReceiverAnalysisBudget::default());
+                if control.starts_with('{') {
+                    assert!(
+                        matches!(result, ReceiverAnalysisOutcome::Precise(ref v) if v[0].owner().identifier() == "B"),
+                        "{control}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, ReceiverAnalysisOutcome::Ambiguous(_)),
+                        "{control}: {result:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: imported duplicate declarations bind the last implementation"
+    )]
+    fn duplicate_factory_uses_last_implementation() {
+        with_sources(
+            "receiver.cjs",
+            "const {make} = require('./factory'); make().b();",
+            &[(
+                "factory.cjs",
+                "class A { a() {} } class B { b() {} } function make() { return new A(); } function make() { return new B(); } exports.make = make;",
+            )],
+            |p| {
+                let member = nodes(p.root, "member_expression")[0];
+                let receiver = member.child_by_field_name("object").unwrap();
+                let result = p.resolve_receiver_node(receiver, ReceiverAnalysisBudget::default());
+                let ReceiverAnalysisOutcome::Precise(values) = result else {
+                    panic!("{result:?}")
+                };
+                assert_eq!(
+                    values
+                        .iter()
+                        .map(|v| v.owner().identifier())
+                        .collect::<Vec<_>>(),
+                    ["B"]
+                );
+                let targets = p.resolve_member_targets(
+                    receiver,
+                    "b",
+                    member.start_byte(),
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert!(
+                    matches!(targets, ReceiverAnalysisOutcome::Precise(ref v) if v.len() == 1 && v[0].fq_name() == "B.b"),
+                    "{targets:?}"
+                );
+            },
+        );
+    }
+
+    // Grammar boundary: binders use the value of a renamed property and the
+    // key still supplies the property path. Defaults are expressions, not names.
+    #[test]
+    fn binding_and_focus_grammar_matrix() {
+        for (pattern, bound, absent) in [
+            ("{service, other}", "service", "missing"),
+            ("{Box: Renamed, Renamed: Other}", "Renamed", "Box"),
+            ("{a = fallback}", "a", "fallback"),
+            ("{}", "missing", "service"),
+        ] {
+            let source = format!("const {pattern} = value;");
+            let tree = parse_javascript(&source);
+            let pattern_node = nodes(tree.root_node(), "object_pattern")[0];
+            assert_eq!(
+                binding_pattern_contains_name(pattern_node, &source, bound),
+                pattern != "{}"
+            );
+            assert!(!binding_pattern_contains_name(
+                pattern_node,
+                &source,
+                absent
+            ));
+            if pattern.contains("Box:") {
+                let entry = destructured_pattern_entry(pattern_node, "Renamed", &source).unwrap();
+                assert_eq!(
+                    destructured_member_name(entry, &source),
+                    Some("Box".to_owned())
+                );
+            }
+        }
+        for source in ["value.member;", "value['member'];", "((value)).member;"] {
+            let tree = parse_javascript(source);
+            let receiver = nodes(tree.root_node(), "identifier")[0];
+            let enclosing = member_expression_at_site(receiver).expect(source);
+            let (_, member) = static_member_property(enclosing, source).unwrap();
+            assert_eq!(member, "member");
+            assert_eq!(enclosing.start_byte(), 0);
+            assert_eq!(enclosing.end_byte(), source.len() - 1);
+        }
+    }
+
+    // Grammar-to-publication contract: every component annotation uses the first
+    // argument as props, in both the AST and the canonical source fact route.
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: lexical walks skipped local class components"
+    )]
+    fn component_annotation_grammar_matrix() {
+        let source = "interface Props { label: string; count: number } interface State { decoy: boolean }\n\
+            type Kind = FlowComponent<Props, State>; const Kind = 0;\n\
+            const Panel: FlowComponent<Props, State> = impl;\n\
+            let Alias: Kind;\n\
+            class ClassPanel extends React.Component<Props, State> {}\n\
+            class PurePanel extends React.PureComponent<Props> {}\n\
+            function render(Parameter: FC<Props>, Optional?: FlowComponent<Props>) {\n\
+                return <><Parameter label='x' /><Optional label='x' /><Panel label='x' count={1}/><Panel label='y'/><Alias label='x'/><ClassPanel label='x'/><PurePanel label='x'/></>; }";
+        with_provider(source, |p| {
+            for class in nodes(p.root, "class_declaration") {
+                assert!(
+                    class_component_props_argument(class, source).is_some(),
+                    "{}",
+                    class.to_sexp()
+                );
+            }
+            for attribute in nodes(p.root, "jsx_attribute") {
+                let name = slice(attribute.named_child(0).unwrap(), source);
+                let targets = p
+                    .resolve_jsx_attribute_targets(attribute, ReceiverAnalysisBudget::default())
+                    .unwrap();
+                assert_eq!(
+                    targets.iter().map(|u| u.fq_name()).collect::<Vec<_>>(),
+                    [format!("Props.{name}")],
+                    "{}",
+                    slice(attribute.parent().unwrap(), source)
+                );
+            }
+            let facts = p.host.source_facts(p.file).unwrap();
+            let alias = facts
+                .facts
+                .declarations
+                .iter()
+                .find_map(|d| d.alias_type)
+                .unwrap();
+            let props = source_component_wrapper_argument(&facts, alias).unwrap();
+            assert!(
+                matches!(&facts.facts.types[props.index()].shape, JsTsTypeShape::Named(path) if path == &["Props"])
+            );
+            for class in nodes(p.root, "class_declaration") {
+                assert_eq!(
+                    slice(
+                        class_component_props_argument(class, source).unwrap(),
+                        source
+                    ),
+                    "Props"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn contextual_object_key_grammar_matrix() {
+        with_provider(
+            "interface P { first: number; second: number } interface Q { first: string; second: string } const p: P = { first: 1, second: 2 }; function make(): P { return { first: 3, second: 4 }; }",
+            |p| {
+                let keys = nodes(p.root, "pair");
+                assert_eq!(keys.len(), 4);
+                for pair in keys {
+                    let key = pair.child_by_field_name("key").unwrap();
+                    let targets = p.resolve_contextual_object_literal_key_targets(
+                        key,
+                        ReceiverAnalysisBudget::default(),
+                    );
+                    assert_eq!(
+                        targets.iter().map(|u| u.fq_name()).collect::<Vec<_>>(),
+                        [format!("P.{}", slice(key, p.source))]
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn receiver_expression_budget_boundary() {
+        for parentheses in [7, 8, 9] {
+            let source = format!(
+                "class C {{}} {}new C(){};",
+                "(".repeat(parentheses),
+                ")".repeat(parentheses)
+            );
+            with_provider(&source, |p| {
+                let expression = nodes(p.root, "expression_statement")[0]
+                    .named_child(0)
+                    .unwrap();
+                let result = p.resolve_receiver_node(expression, ReceiverAnalysisBudget::default());
+                if parentheses <= 8 {
+                    assert!(
+                        matches!(result, ReceiverAnalysisOutcome::Precise(_)),
+                        "{parentheses}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, ReceiverAnalysisOutcome::ExceededBudget { .. }),
+                        "{result:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn imported_component_and_factory_matrix() {
+        let modules = [
+            (
+                "panel.tsx",
+                "export interface Props { label: string } interface State { unused: number } export class Panel extends React.Component<Props, State> {} export default function DefaultPanel(props: Props) { return null; }",
+            ),
+            (
+                "deferred.tsx",
+                "export const Deferred = lazy(() => import('./panel'));",
+            ),
+            (
+                "factory.ts",
+                "export interface make { decoy: number } class Result { m() {} } export function make() { return new Result(); }",
+            ),
+        ];
+        with_workspace(
+            "import {Panel} from './panel'; import {Deferred} from './deferred'; import {make} from './factory'; import * as ns from './factory'; <Panel label='x'/>; <Deferred label='x'/>; make().m(); ns.make().m();",
+            &modules,
+            |p| {
+                for attribute in nodes(p.root, "jsx_attribute") {
+                    let targets = p
+                        .resolve_jsx_attribute_targets(attribute, ReceiverAnalysisBudget::default())
+                        .unwrap();
+                    assert_eq!(
+                        targets.iter().map(|u| u.fq_name()).collect::<Vec<_>>(),
+                        ["Props.label"],
+                        "{}; candidates {:?}; facts {:?}",
+                        slice(attribute.parent().unwrap(), p.source),
+                        p.jsx_component_candidates("Panel"),
+                        p.host
+                            .all_declarations()
+                            .map(|u| (u.fq_name(), u.source().rel_path().to_owned()))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                for member in nodes(p.root, "member_expression").into_iter().filter(|n| {
+                    static_member_property(*n, p.source).is_some_and(|(_, name)| name == "m")
+                }) {
+                    let receiver = member.child_by_field_name("object").unwrap();
+                    let result = p.resolve_member_targets(
+                        receiver,
+                        "m",
+                        member.start_byte(),
+                        ReceiverAnalysisBudget::default(),
+                    );
+                    assert!(
+                        matches!(result, ReceiverAnalysisOutcome::Precise(ref v) if v.len() == 1 && v[0].fq_name() == "Result.m"),
+                        "{}: {result:?}",
+                        slice(member, p.source)
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn jsx_module_hop_budget_matrix() {
+        let modules = [
+            (
+                "one.tsx",
+                "export default function Panel(props: Props) { return null; } export interface Props { label: string }",
+            ),
+            (
+                "two.tsx",
+                "const Panel = lazy(() => import('./one')); export default Panel;",
+            ),
+            (
+                "three.tsx",
+                "const Panel = lazy(() => import('./two')); export default Panel;",
+            ),
+            (
+                "four.tsx",
+                "const Panel = lazy(() => import('./three')); export default Panel;",
+            ),
+            (
+                "cycle.tsx",
+                "const Panel = lazy(() => import('./cycle')); export default Panel;",
+            ),
+        ];
+        with_workspace(
+            "const One = lazy(() => import('./one')); const Three = lazy(() => import('./three')); const Four = lazy(() => import('./four')); const Cycle = lazy(() => import('./cycle')); <One label='x'/>; <Three label='x'/>; <Four label='x'/>; <Cycle label='x'/>;",
+            &modules,
+            |p| {
+                let attributes = nodes(p.root, "jsx_attribute");
+                for (attribute, expected) in attributes.into_iter().zip([true, true, false, false])
+                {
+                    let targets = p
+                        .resolve_jsx_attribute_targets(attribute, ReceiverAnalysisBudget::default())
+                        .unwrap();
+                    assert_eq!(
+                        !targets.is_empty(),
+                        expected,
+                        "{}: {targets:?}",
+                        slice(attribute.parent().unwrap(), p.source)
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn destructured_component_grammar_matrix() {
+        for depth in [1, 3, 4, 5] {
+            let annotation = format!(
+                "{}Box: FlowComponent<Props, Decoy>{}",
+                "nested: { ".repeat(depth - 1),
+                " }".repeat(depth - 1)
+            );
+            let annotation = format!("{{ {annotation} }}");
+            let pattern = format!(
+                "{}Box: Renamed{}",
+                "nested: { ".repeat(depth - 1),
+                " }".repeat(depth - 1)
+            );
+            let pattern = format!("{{ {pattern} }}");
+            // The binding's annotation selects a named, nested container.
+            let source = format!(
+                "interface Props {{ label: string }} interface Decoy {{ decoy: string }} type Components = {annotation}; function render({pattern}: Components) {{ return <Renamed label='x'/>; }}"
+            );
+            with_provider(&source, |p| {
+                let attribute = nodes(p.root, "jsx_attribute")[0];
+                let targets = p
+                    .resolve_jsx_attribute_targets(attribute, ReceiverAnalysisBudget::default())
+                    .unwrap();
+                assert_eq!(
+                    !targets.is_empty(),
+                    depth <= 4,
+                    "depth {depth}: {targets:?}"
+                );
+                if depth <= 4 {
+                    assert_eq!(targets[0].fq_name(), "Props.label");
+                }
+            });
+        }
+        with_provider(
+            "interface Props { label: string } interface Decoy { decoy: string } type Container = { Box: FlowComponent<Props, Decoy> };",
+            |p| {
+                let facts = p.host.source_facts(p.file).unwrap();
+                let container = facts
+                    .facts
+                    .declarations
+                    .iter()
+                    .find_map(|d| d.alias_type)
+                    .unwrap();
+                let props =
+                    source_type_member_component_argument(&facts, container, &["Box".to_owned()])
+                        .unwrap();
+                assert!(
+                    matches!(&facts.facts.types[props.index()].shape, JsTsTypeShape::Named(path) if path == &["Props"])
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn receiver_type_and_factory_budget_grammar_matrix() {
+        with_provider(
+            "interface P { m(): void } function render(p: P) { p.m(); } function factory(): P { return unknownValue; }",
+            |p| {
+                let annotation = nodes(p.root, "required_parameter")[0]
+                    .child_by_field_name("type")
+                    .unwrap();
+                // A declared return type can resolve at the last admitted
+                // factory depth without expanding a return expression.
+                let outcome = p.type_annotation_receiver_outcome(
+                    annotation,
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert!(
+                    !matches!(outcome, ReceiverAnalysisOutcome::Unknown),
+                    "{outcome:?}"
+                );
+                let function = nodes(p.root, "function_declaration")[1];
+                let unit = p
+                    .host
+                    .declarations(p.file)
+                    .into_iter()
+                    .find(|u| u.identifier() == "factory")
+                    .unwrap();
+                for depth in [8, 9] {
+                    let mut tracker =
+                        ReceiverAnalysisBudgetTracker::new(ReceiverAnalysisBudget::default());
+                    let result = p.summarize_function_body(
+                        function,
+                        &unit,
+                        depth,
+                        ReceiverAnalysisBudget::default(),
+                        &mut tracker,
+                    );
+                    assert_eq!(
+                        matches!(result, ReceiverAnalysisOutcome::ExceededBudget { .. }),
+                        depth == 9,
+                        "{result:?}"
+                    );
+                }
+            },
+        );
+    }
+    #[test]
+    fn inherited_receiver_member_matrix() {
+        with_provider(
+            "class Grand { m() {} } class Parent extends Grand {} class Child extends Parent {} class Override extends Child { m() {} } class Decoy { m() {} } new Child().m(); new Override().m();",
+            |p| {
+                for (member, target) in nodes(p.root, "member_expression")
+                    .into_iter()
+                    .zip(["Grand.m", "Override.m"])
+                {
+                    let result = p.resolve_member_targets(
+                        member.child_by_field_name("object").unwrap(),
+                        "m",
+                        member.start_byte(),
+                        ReceiverAnalysisBudget::default(),
+                    );
+                    assert!(
+                        matches!(result, ReceiverAnalysisOutcome::Precise(ref v) if v.len() == 1 && v[0].fq_name() == target),
+                        "{target}: {result:?}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn receiver_type_depth_boundary_matrix() {
+        for depth in [5, 6, 7] {
+            let source = format!(
+                "interface P {{ m(): void }} function render(p: {}P{}) {{ p.m(); }}",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            with_provider(&source, |p| {
+                let annotation = nodes(p.root, "required_parameter")[0]
+                    .child_by_field_name("type")
+                    .unwrap();
+                let result = p.type_annotation_receiver_outcome(
+                    annotation,
+                    ReceiverAnalysisBudget::default(),
+                );
+                assert_eq!(
+                    matches!(result, ReceiverAnalysisOutcome::Precise(_)),
+                    depth <= 6,
+                    "depth {depth}: {result:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn component_union_intersection_storage_boundary() {
+        with_provider(
+            "interface P { p: string } interface Q { q: string } type Either = FC<P> | FC<Q>; type Both = FC<P> & FC<Q>;",
+            |p| {
+                assert_eq!(nodes(p.root, "union_type").len(), 1);
+                assert_eq!(nodes(p.root, "intersection_type").len(), 1);
+                let facts = p.host.source_facts(p.file).unwrap();
+                let shapes = facts
+                    .facts
+                    .declarations
+                    .iter()
+                    .filter_map(|d| d.alias_type)
+                    .map(|id| &facts.facts.types[id.index()].shape)
+                    .collect::<Vec<_>>();
+                assert_eq!(shapes.len(), 2);
+                assert!(
+                    shapes.iter().any(
+                        |s| matches!(s, JsTsTypeShape::Union(children) if children.len() == 2)
+                    )
+                );
+                assert!(shapes.iter().any(
+                    |s| matches!(s, JsTsTypeShape::Intersection(children) if children.len() == 2)
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn receiver_recursion_budget_includes_its_boundary() {
+        for (depth, precise) in [(8, true), (9, false)] {
+            let source = format!(
+                "class A {{}} const value = {}new A(){};",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            with_provider(&source, |provider| {
+                let expression = nodes(provider.root, "parenthesized_expression")
+                    .into_iter()
+                    .max_by_key(|node| node.end_byte() - node.start_byte())
+                    .expect("outer expression");
+                let outcome =
+                    provider.resolve_receiver_node(expression, ReceiverAnalysisBudget::default());
+                if precise {
+                    assert!(
+                        matches!(outcome, ReceiverAnalysisOutcome::Precise(ref values) if values.len() == 1 && values[0].owner().identifier() == "A"),
+                        "{outcome:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            outcome,
+                            ReceiverAnalysisOutcome::ExceededBudget {
+                                limit: "receiver_recursion"
+                            }
+                        ),
+                        "{outcome:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn factory_member_call_grammar_matrix() {
+        for callee in ["makers.make", "makers['make']", "makers[\"make\"]"] {
+            let source = format!("const makers = require('./factory'); {callee}().m();");
+            with_sources(
+                "receiver.cjs",
+                &source,
+                &[(
+                    "factory.cjs",
+                    "class A { m() {} } function make() { return new A(); } exports.make = make;",
+                )],
+                |provider| {
+                    let call = nodes(provider.root, "call_expression")
+                        .into_iter()
+                        .find(|node| slice(*node, provider.source) == format!("{callee}()"))
+                        .expect("factory call");
+                    let outcome = provider.resolve_member_targets(
+                        call,
+                        "m",
+                        call.end_byte(),
+                        ReceiverAnalysisBudget::default(),
+                    );
+                    assert!(
+                        matches!(outcome, ReceiverAnalysisOutcome::Precise(ref values) if values.len() == 1 && values[0].identifier() == "m"),
+                        "{callee}: {outcome:?}"
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn call_grammar_always_supplies_function_field() {
+        for parse in [
+            crate::test_support::parse_javascript,
+            crate::test_support::parse_typescript,
+        ] {
+            for source in ["f()", "f?.()", "(f)()", "object['f']()", "f(", "f(,"] {
+                let tree = parse(source);
+                let calls = nodes(tree.root_node(), "call_expression");
+                // Recovery may produce ERROR instead of a call; a real call
+                // still has its grammar-required function field.
+                if !tree.root_node().has_error() {
+                    assert!(!calls.is_empty(), "{source}");
+                }
+                for call in calls {
+                    assert!(
+                        call.child_by_field_name("function").is_some(),
+                        "{source}: {}",
+                        tree.root_node().to_sexp()
+                    );
+                }
+            }
+        }
     }
 }

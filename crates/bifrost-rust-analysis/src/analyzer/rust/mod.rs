@@ -77,7 +77,376 @@ pub(crate) fn rust_call_reference_candidate(node: tree_sitter::Node<'_>) -> bool
     false
 }
 
+/// One identity predicate for selected evaluation and analysis owner proofs.
+pub(crate) struct SelectedTypeHeadEvidence<'a> {
+    prelude_item: Option<(&'a str, &'a str, &'a str)>,
+    external_path: &'a [String],
+}
+
+/// Owned selected inputs, so the bounded source is free for subsequent reads.
+struct SelectedTypeHeadInputs {
+    prelude_item: Option<(String, String, String)>,
+    import_paths: Vec<Vec<String>>,
+    // Only cached routes can supply a proven wrapper path. A fallback route
+    // remains evidence to classify, not a new canonical proof.
+    cached_path_count: usize,
+}
+
+fn read_selected_type_head(
+    semantic: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+    source: &mut dyn brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeHeadSource,
+) -> brokk_bifrost_analysis::analyzer::store::Result<Option<SelectedTypeHeadInputs>> {
+    let named = source.named_reason(semantic);
+    let prelude = named
+        .as_ref()
+        .filter(|(name, _)| *name == "rust_prelude_item")
+        .map(|(_, json)| {
+            serde_json::from_str::<serde_json::Value>(json)
+                .expect("selected prelude evidence is JSON")
+        });
+    let prelude_item = prelude.as_ref().and_then(|item| {
+        Some((
+            item["crate"].as_str()?.to_owned(),
+            item["name"].as_str()?.to_owned(),
+            item["namespace"].as_str()?.to_owned(),
+        ))
+    });
+    let mut import_paths = source.cached_external_type_import_paths(semantic);
+    let cached_path_count = import_paths.len();
+    if import_paths.is_empty() {
+        let Some(path) = source.external_type_import_path(semantic)? else {
+            return Ok(None);
+        };
+        if !path.is_empty() {
+            import_paths.push(path);
+        }
+    }
+    Ok(Some(SelectedTypeHeadInputs {
+        prelude_item,
+        import_paths,
+        cached_path_count,
+    }))
+}
+
+fn standard_wrapper_payload(
+    evidence: &SelectedTypeHeadEvidence<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::store::language_support::WrapperPayloadProjection> {
+    use brokk_bifrost_analysis::analyzer::store::language_support::WrapperPayloadProjection;
+    let delta = if let Some((root, name, namespace)) = evidence.prelude_item {
+        if !matches!(root, "std" | "core" | "alloc") || namespace != "type" {
+            return None;
+        }
+        match name {
+            "Box" | "Arc" | "Rc" => 0,
+            "Option" | "Result" => 1,
+            _ => return None,
+        }
+    } else {
+        let [root, module, name] = evidence.external_path else {
+            return None;
+        };
+        if !matches!(root.as_str(), "std" | "core" | "alloc") {
+            return None;
+        }
+        match (module.as_str(), name.as_str()) {
+            ("boxed", "Box") | ("sync", "Arc") | ("rc", "Rc") => 0,
+            ("option", "Option") | ("result", "Result") => 1,
+            ("io" | "thread", "Result") if root == "std" => 1,
+            _ => return None,
+        }
+    };
+    Some(WrapperPayloadProjection {
+        ordinal: 0,
+        indirection_delta: delta,
+    })
+}
+
+/// Classify selected identity evidence, never the impl header's spelling.
+fn standard_deref_trait(evidence: &SelectedTypeHeadEvidence<'_>) -> bool {
+    if let Some((root, name, namespace)) = evidence.prelude_item {
+        return matches!(root, "core" | "std") && name == "Deref" && namespace == "type";
+    }
+    matches!(evidence.external_path, [root, module, name]
+        if matches!(root.as_str(), "core" | "std") && module == "ops" && name == "Deref")
+}
+
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSupport {
+    fn selected_receiver_step(
+        &self,
+        request: brokk_bifrost_analysis::analyzer::store::language_support::SelectedReceiverStepRequest<'_>,
+        source: &mut dyn brokk_bifrost_analysis::analyzer::store::language_support::SelectedReceiverStepSource,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::store::language_support::SelectedReceiverStepRead,
+    > {
+        use brokk_bifrost_analysis::analyzer::resolution::fact_source::DeclarationAccessDecision;
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            LoweringGapOrigin, ResolutionCompletion, ResolutionIncompleteReason,
+            ResolutionSlotValue,
+        };
+        use brokk_bifrost_analysis::analyzer::store::language_support::{
+            SelectedReceiverSlotRead, SelectedReceiverStep, SelectedReceiverStepRead,
+        };
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+        if source.poll_cancelled() {
+            return Ok(SelectedReceiverStepRead::Cancelled);
+        }
+        // Rust autoderef applies to value receivers with ordinary references.
+        let ty = request.value.ty();
+        if !matches!(request.value, ResolutionSlotValue::Runtime { .. })
+            || ty.indirection() != ty.reference_indirection()
+        {
+            return Ok(SelectedReceiverStepRead::ReadyNone);
+        }
+        let mut active = Vec::new();
+        let mut unknown = Vec::new();
+        for target in source.rust_impl_targets(request.value.ty().identity())? {
+            let activation = source.activation(request.reference, target)?;
+            if activation == DeclarationAccessDecision::InactiveActivation {
+                continue;
+            }
+            let Some(owner) = source.impl_owner(target)? else {
+                continue;
+            };
+            let Some(applicability) = source.applicability(owner, &request)? else {
+                continue;
+            };
+            let Some(trait_slot) = owner.hierarchy_frontier() else {
+                continue;
+            };
+            let state = match source.slot(trait_slot)? {
+                SelectedReceiverSlotRead::Ready(state) => state,
+                SelectedReceiverSlotRead::Pending => return Ok(SelectedReceiverStepRead::Pending),
+                SelectedReceiverSlotRead::Cancelled => {
+                    return Ok(SelectedReceiverStepRead::Cancelled);
+                }
+            };
+            let mut identities = state
+                .possible_values()
+                .iter()
+                .map(|value| value.ty().identity())
+                .collect::<Vec<_>>();
+            if let ResolutionCompletion::Incomplete(reasons) = state.completion() {
+                identities.extend(reasons.iter().filter_map(|reason| match reason {
+                    ResolutionIncompleteReason::OpenBoundary { semantic, .. } => Some(*semantic),
+                    _ => None,
+                }));
+            }
+            identities.sort_unstable();
+            identities.dedup();
+            let mut paths = Vec::new();
+            let mut missing = identities.is_empty();
+            for identity in identities {
+                let Some(head) = read_selected_type_head(identity, source.type_head_source())?
+                else {
+                    return Ok(SelectedReceiverStepRead::Cancelled);
+                };
+                let prelude_item = head.prelude_item.as_ref().map(|(root, name, namespace)| {
+                    (root.as_str(), name.as_str(), namespace.as_str())
+                });
+                let mut identity_paths = head.import_paths;
+                if standard_deref_trait(&SelectedTypeHeadEvidence {
+                    prelude_item,
+                    external_path: &[],
+                }) {
+                    identity_paths.push(vec![
+                        prelude_item.unwrap().0.to_owned(),
+                        "ops".to_owned(),
+                        "Deref".to_owned(),
+                    ]);
+                }
+                missing |= identity_paths.is_empty()
+                    || (prelude_item.is_some()
+                        && !standard_deref_trait(&SelectedTypeHeadEvidence {
+                            prelude_item,
+                            external_path: &[],
+                        }));
+                paths.extend(identity_paths);
+            }
+            // A qualified route can retain both its prefix boundary and its
+            // terminal boundary. Only a proved canonical terminal discharges
+            // those prefixes; an unrelated external route remains uncertain.
+            let canonical = paths
+                .iter()
+                .filter(|path| {
+                    standard_deref_trait(&SelectedTypeHeadEvidence {
+                        prelude_item: None,
+                        external_path: path,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut proved = applicability == ResolutionCompletion::Complete
+                && !missing
+                && !canonical.is_empty()
+                && paths
+                    .iter()
+                    .all(|path| canonical.iter().any(|terminal| terminal.starts_with(path)));
+            if proved && let ResolutionCompletion::Incomplete(reasons) = state.completion() {
+                proved &= reasons.iter().all(|reason| {
+                    matches!(
+                        reason,
+                        ResolutionIncompleteReason::OpenBoundary { .. }
+                            | ResolutionIncompleteReason::UnsupportedSemantic(_)
+                    )
+                });
+                let unsupported = reasons
+                    .iter()
+                    .filter_map(|reason| match reason {
+                        ResolutionIncompleteReason::UnsupportedSemantic(reason) => Some(*reason),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if proved && !unsupported.is_empty() {
+                    let Some(origins) = source.gap_origins(&unsupported)? else {
+                        return Ok(SelectedReceiverStepRead::Cancelled);
+                    };
+                    // The producer leaves trait inventory open even when its
+                    // standard identity is known. Other unresolved obligations
+                    // cannot be discharged by the canonical spelling route.
+                    proved &= unsupported.iter().all(|reason| {
+                        origins.iter().any(|origin| {
+                            origin.reason() == *reason
+                                && origin.origin()
+                                    == LoweringGapOrigin::Extracted(
+                                        ResolutionGapKind::UnsupportedHierarchyTraversal,
+                                    )
+                        })
+                    });
+                }
+            }
+            let candidate = (target, proved, state.completion().clone());
+            if matches!(
+                activation,
+                DeclarationAccessDecision::Allowed | DeclarationAccessDecision::Denied
+            ) {
+                active.push(candidate);
+            } else {
+                unknown.push(candidate);
+            }
+        }
+        // Coherence permits at most one Deref impl in a valid configuration.
+        // An impl known active under this call's premise therefore wins over
+        // unknown alternatives, which only add incompleteness. Target equality
+        // and generic ambiguity checks apply to the alternatives that remain.
+        let uncertain = !unknown.is_empty() || active.len() > 1;
+        let candidates = if active.is_empty() { &unknown } else { &active };
+        if candidates.is_empty() {
+            return Ok(SelectedReceiverStepRead::ReadyNone);
+        }
+        let mut values = Vec::new();
+        let mut completion = ResolutionCompletion::Complete;
+        let mut instantiation = request.instantiation.clone();
+        let mut generic_target = false;
+        for (target, proved, trait_completion) in candidates {
+            let target = *target;
+            let proved = *proved;
+            let state = match source.target(target, &request)? {
+                SelectedReceiverSlotRead::Ready(state) => state,
+                SelectedReceiverSlotRead::Pending => return Ok(SelectedReceiverStepRead::Pending),
+                SelectedReceiverSlotRead::Cancelled => {
+                    return Ok(SelectedReceiverStepRead::Cancelled);
+                }
+            };
+            if candidates.len() > 1
+                && let [value] = state.possible_values()
+            {
+                let Some(has_arguments) =
+                    source.has_type_arguments(state.slot(), value.ty().identity())?
+                else {
+                    return Ok(SelectedReceiverStepRead::Cancelled);
+                };
+                generic_target |= has_arguments;
+            }
+            instantiation.application_slot = state.slot();
+            completion = completion.combine(state.completion());
+            if !proved {
+                completion = completion.combine(trait_completion);
+            }
+            if uncertain || !proved {
+                completion = completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(target),
+                ]));
+            }
+            values.extend(
+                state
+                    .possible_values()
+                    .iter()
+                    .map(|value| ResolutionSlotValue::runtime(value.ty(), true)),
+            );
+        }
+        values.sort_unstable();
+        values.dedup();
+        // Nominal dedup cannot prove equality between generic applications.
+        // Even identical written arguments must not silently select one slot.
+        let stop_reason = (values.len() == 1 && generic_target)
+            .then_some("receiver-step-ambiguous-generic-target");
+        Ok(SelectedReceiverStepRead::ReadyStep(SelectedReceiverStep {
+            values,
+            instantiation,
+            completion,
+            stop_reason,
+        }))
+    }
+
+    fn callable_results_instantiate_nested_generic_projections(&self) -> bool {
+        true
+    }
+
+    fn selected_wrapper_payload(
+        &self,
+        boundaries: &[brokk_bifrost_analysis::analyzer::resolution::SemanticId],
+        source: &mut dyn brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeHeadSource,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Option<
+            Vec<brokk_bifrost_analysis::analyzer::store::language_support::SelectedWrapperBoundary>,
+        >,
+    > {
+        use brokk_bifrost_analysis::analyzer::store::language_support::{
+            SelectedWrapperBoundary, SelectedWrapperPath,
+        };
+        let mut evidence = Vec::new();
+        for &semantic in boundaries {
+            let Some(head) = read_selected_type_head(semantic, source)? else {
+                return Ok(None);
+            };
+            let prelude_item = head
+                .prelude_item
+                .as_ref()
+                .map(|(root, name, namespace)| (root.as_str(), name.as_str(), namespace.as_str()));
+            let mut paths = head.import_paths;
+            let canonical_proven_paths = paths
+                .iter()
+                .take(head.cached_path_count)
+                .filter(|path| {
+                    standard_wrapper_payload(&SelectedTypeHeadEvidence {
+                        prelude_item: None,
+                        external_path: path,
+                    })
+                    .is_some()
+                })
+                .cloned()
+                .collect();
+            if paths.is_empty() {
+                paths.push(Vec::new());
+            }
+            let paths = paths
+                .into_iter()
+                .map(|path| {
+                    let projection = standard_wrapper_payload(&SelectedTypeHeadEvidence {
+                        prelude_item,
+                        external_path: &path,
+                    });
+                    SelectedWrapperPath { path, projection }
+                })
+                .collect();
+            evidence.push(SelectedWrapperBoundary {
+                semantic,
+                canonical_proven_paths,
+                paths,
+            });
+        }
+        Ok(Some(evidence))
+    }
+
     fn module_definition_provider(
         &self,
     ) -> Option<brokk_bifrost_analysis::analyzer::store::language_support::ModuleDefinitionProvider>
@@ -165,7 +534,7 @@ pub use crate::analyzer::rust::std_types::rust_native_result_obligation;
 mod module_export_resolution_tests;
 mod structural;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 mod usage_queries_tests;
 #[cfg(test)]
@@ -529,6 +898,12 @@ impl RustAnalyzer {
         &self,
         oid: git2::Oid,
     ) -> Result<Arc<RustUsageFacts>, RustCargoRouteError> {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-rust-analysis/src/analyzer/rust/mod.rs",
+            );
+
         let key: RustFactCacheKey = (self.inner.language_generation("rust"), oid);
         if let Some(cached) = self.rust_usage_facts.get(&key) {
             return Ok(cached);
@@ -556,7 +931,12 @@ impl RustAnalyzer {
             return Err(RustCargoRouteError::Unavailable);
         }
         let facts = Arc::new(facts);
-        self.rust_usage_facts.insert(key, Arc::clone(&facts));
+        {
+            let cache_key = key;
+            let cache_value = Arc::clone(&facts);
+            persistent_fill_guard.installed("rust_usage_facts");
+            self.rust_usage_facts.insert(cache_key, cache_value);
+        };
         Ok(facts)
     }
 
@@ -569,6 +949,11 @@ impl RustAnalyzer {
         if let Some(cached) = self.declaration_facts.get(file) {
             return Ok(cached);
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-rust-analysis/src/analyzer/rust/mod.rs",
+            );
         let facts = Arc::new(
             brokk_bifrost_rust::usage_queries::rust_declaration_facts(
                 self,
@@ -578,8 +963,12 @@ impl RustAnalyzer {
             )?
             .expect("uninterrupted Rust declaration-fact derivation"),
         );
-        self.declaration_facts
-            .insert(file.clone(), Arc::clone(&facts));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&facts);
+            persistent_fill_guard.installed("declaration_facts");
+            self.declaration_facts.insert(cache_key, cache_value);
+        };
         Ok(facts)
     }
 
@@ -638,6 +1027,12 @@ impl RustAnalyzer {
         file: &ProjectFile,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Arc<RustDeclarationSourceProperties>, RustCargoRouteError> {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-rust-analysis/src/analyzer/rust/mod.rs",
+            );
+
         let (generation, oid) = self.selected_rust_source_while(file, keep_going)?;
         let key = (generation, oid, file.clone());
         if let Some(cached) = self.declaration_source_properties.get(&key) {
@@ -682,8 +1077,13 @@ impl RustAnalyzer {
             return Err(RustCargoRouteError::Cancelled);
         }
         let properties = Arc::new(properties);
-        self.declaration_source_properties
-            .insert(key, Arc::clone(&properties));
+        {
+            let cache_key = key;
+            let cache_value = Arc::clone(&properties);
+            persistent_fill_guard.installed("declaration_source_properties");
+            self.declaration_source_properties
+                .insert(cache_key, cache_value);
+        };
         Ok(properties)
     }
 
@@ -2417,32 +2817,34 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
     std_types::completed_proof(None, || {
         let site = site?;
         let callee = external_calls::call_path(site.tree, site.callee_start_byte)?;
-        if callee.kind() != "field_expression" {
-            let call_site = ResolvedReferenceSite {
-                path: String::new(),
-                text: String::new(),
-                range: Range {
-                    start_byte: callee.start_byte(),
-                    end_byte: callee.end_byte(),
-                    start_line: callee.start_position().row + 1,
-                    end_line: callee.end_position().row + 1,
-                },
-                focus_start_byte: callee.start_byte(),
-                focus_end_byte: callee.end_byte(),
-            };
-            if let Some((proof, identity)) =
-                external_calls::exact_rust_external_type_call_with_operation(
-                    analyzer,
-                    file,
-                    site.source,
-                    site.tree,
-                    &call_site,
-                    operation_factory,
-                    operation.as_deref_mut(),
-                )
-            {
-                return Some(ImportedExternalCallee::proven(proof, identity));
-            }
+        // The definition resolver owns receiver-call proofs.
+        if callee.kind() == "field_expression" {
+            return None;
+        }
+        let call_site = ResolvedReferenceSite {
+            path: String::new(),
+            text: String::new(),
+            range: Range {
+                start_byte: callee.start_byte(),
+                end_byte: callee.end_byte(),
+                start_line: callee.start_position().row + 1,
+                end_line: callee.end_position().row + 1,
+            },
+            focus_start_byte: callee.start_byte(),
+            focus_end_byte: callee.end_byte(),
+        };
+        if let Some((proof, identity)) =
+            external_calls::exact_rust_external_type_call_with_operation(
+                analyzer,
+                file,
+                site.source,
+                site.tree,
+                &call_site,
+                operation_factory,
+                operation.as_deref_mut(),
+            )
+        {
+            return Some(ImportedExternalCallee::proven(proof, identity));
         }
         let mut expanded: Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> =
             None;
@@ -2521,43 +2923,7 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
         // carries that callable's exact proof and owner/member identity into the
         // common dispatch path rather than a spelling a later stage has to
         // re-interpret (#3484).
-        if let Some((proof, identity)) = expanded {
-            return Some(ImportedExternalCallee::proven(proof, identity));
-        }
-        // A field call's receiver may be a parameter or local initialized from an
-        // imported associated constructor. It has no import binder named after the
-        // receiver expression, so the static-import route above cannot prove it.
-        // Reuse the same structured receiver proof used by exact definition lookup;
-        // this keeps call dispatch, modeled return-owner inference, and navigation
-        // on one external owner identity.
-        let function = callee;
-        if function.kind() != "field_expression" {
-            return None;
-        }
-        let field = function.child_by_field_name("field")?;
-        let member = brokk_bifrost_rust::declarations::rust_node_text(field, site.source);
-        let method_site = ResolvedReferenceSite {
-            path: member.to_owned(),
-            text: member.to_owned(),
-            range: Range {
-                start_byte: field.start_byte(),
-                end_byte: field.end_byte(),
-                start_line: field.start_position().row + 1,
-                end_line: field.end_position().row + 1,
-            },
-            focus_start_byte: field.start_byte(),
-            focus_end_byte: field.end_byte(),
-        };
-        let (proof, identity) = external_calls::exact_rust_external_method_call_with_operation(
-            analyzer,
-            file,
-            site.source,
-            &method_site,
-            None,
-            operation_factory,
-            operation,
-        )?;
-        Some(ImportedExternalCallee::proven(proof, identity))
+        expanded.map(|(proof, identity)| ImportedExternalCallee::proven(proof, identity))
     })
 }
 
@@ -2582,6 +2948,44 @@ fn rust_import_binder_visible_at_byte(path: &StructuredImportPath, call_start_by
 }
 
 impl LanguageSupport for RustSupport {
+    fn lexical_definitions_are_authoritative(&self) -> bool {
+        false
+    }
+
+    fn branch_body_reference_site(
+        &self,
+        node: tree_sitter::Node<'_>,
+        _source: &str,
+    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite>
+    {
+        use brokk_bifrost_analysis::analyzer::structural::branch_relations::{
+            BranchReferenceKind, BranchReferenceSite,
+        };
+        if node.kind() != "identifier"
+            || node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "scoped_identifier" | "scoped_type_identifier"
+                )
+            })
+        {
+            return None;
+        }
+        let (focus, kind) = (node, BranchReferenceKind::Field);
+        Some(BranchReferenceSite {
+            range: (focus.start_byte(), focus.end_byte()),
+            kind,
+        })
+    }
+
+    fn supports_selected_resolution_overlays(&self) -> bool {
+        true
+    }
+
+    fn closed_receiver_summary_closes_external_body(&self) -> bool {
+        true
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn probe_assignment_value(
         &self,
@@ -3219,6 +3623,25 @@ impl LanguageSupport for RustSupport {
             ));
         };
         context.classify(observation, predicate, request)
+    }
+    fn observed_value_type(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        observation: &brokk_bifrost_analysis::analyzer::semantic::BarrierObservation,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::semantic::ObservedValueType,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            ObservedValueType, ValueTypeBarrierReason,
+        };
+        let Some(context) = request.value_type_barrier_context() else {
+            return Ok(ObservedValueType::Undecided(
+                ValueTypeBarrierReason::UnavailableObservation,
+            ));
+        };
+        context.observed_type(observation, request)
     }
 }
 

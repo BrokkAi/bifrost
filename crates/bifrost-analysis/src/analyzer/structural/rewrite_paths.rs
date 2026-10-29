@@ -197,15 +197,24 @@ impl LineIndex {
 }
 
 #[test]
-fn a_line_index_numbers_offsets_from_one() {
-    let index = LineIndex::build("use a::b as c;\nuse c::d as a;\n");
-    assert_eq!(index.line_of(0), 1);
-    assert_eq!(index.line_of(13), 1);
-    assert_eq!(index.line_of(15), 2);
-    let range = index.range(15, 18);
-    assert_eq!(range.start_line, 2);
-    assert_eq!(range.end_line, 2);
-    assert_eq!(range.start_byte, 15);
+fn line_ranges_preserve_byte_coordinates_across_newlines() {
+    for source in ["", "a\nb\n", "caf\u{e9}\r\n\u{3b2}\nlast", "a\r\nb"] {
+        let index = LineIndex::build(source);
+        for start in 0..=source.len() {
+            for end in start..=source.len() {
+                let range = index.range(start, end);
+                let line = |offset| {
+                    source.as_bytes()[..offset]
+                        .iter()
+                        .filter(|&&byte| byte == b'\n')
+                        .count()
+                        + 1
+                };
+                assert_eq!((range.start_byte, range.end_byte), (start, end));
+                assert_eq!((range.start_line, range.end_line), (line(start), line(end)));
+            }
+        }
+    }
 }
 
 #[test]
@@ -221,4 +230,49 @@ fn completeness_covers_a_domain_no_reason_blocks() {
     let cancelled =
         RewritePathCompleteness::from_reasons(vec![RewritePathIncompleteReason::Cancelled]);
     assert!(!cancelled.covers(RewriteDomainKind::RustImportAlias));
+}
+
+#[test]
+fn rewrite_completeness_preserves_every_supplied_cause() {
+    let causes = [
+        RewritePathIncompleteReason::Cancelled,
+        RewritePathIncompleteReason::NoIndexedSource,
+        RewritePathIncompleteReason::NoDomainAnalyzer(RewriteDomainKind::RustImportAlias),
+    ];
+    for mask in 0..8 {
+        let reasons: Vec<_> = causes
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| mask & (1 << id) != 0)
+            .map(|(_, cause)| cause.clone())
+            .collect();
+        for rotation in 0..reasons.len().max(1) {
+            let mut ordered = reasons.clone();
+            if !ordered.is_empty() {
+                ordered.rotate_left(rotation);
+            }
+            let completeness = RewritePathCompleteness::from_reasons(ordered.clone());
+            assert_eq!(completeness.reasons(), ordered);
+            assert_eq!(
+                completeness.covers(RewriteDomainKind::RustImportAlias),
+                reasons.is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn files_without_rewrite_domains_are_complete_without_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let analyzer = super::identity_routes::tests::MetadataAnalyzer::new(temp.path());
+    let _hooks = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+        crate::analyzer::Language::Java,
+    ]);
+    for path in ["unknown.unregistered_extension", "Example.java"] {
+        let file = ProjectFile::new(temp.path(), path);
+        let token = CancellationToken::default();
+        let answer = rewrite_paths_for_file(&analyzer, &file, &mut RewritePathRequest::new(&token));
+        assert!(answer.paths.is_empty());
+        assert_eq!(answer.completeness, RewritePathCompleteness::Complete);
+    }
 }

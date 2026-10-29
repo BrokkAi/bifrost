@@ -16,7 +16,8 @@ use brokk_bifrost_core::hash::HashMap;
 /// The visitor already renders supertype names into the internal `$`-joined
 /// key form, so a fully-qualified reference resolves directly. Relative
 /// references (e.g. `Comparable` named inside a namespace) fall back to
-/// matching the trailing identifier across all declared types.
+/// a unique declared owner with that identifier. Qualified paths never
+/// discard an unresolved namespace.
 pub fn ruby_resolve_supertype(ruby: &dyn RubySource, raw: &str) -> Option<CodeUnit> {
     let cleaned = raw.trim();
     if cleaned.is_empty() {
@@ -27,11 +28,17 @@ pub fn ruby_resolve_supertype(ruby: &dyn RubySource, raw: &str) -> Option<CodeUn
         return Some(found.clone());
     }
 
-    let last_segment = cleaned.rsplit('$').next().unwrap_or(cleaned); // fqname-M4: leaf of a `$`-joined ruby type-name string used as a by-identifier index key; no fq threaded here
-    ruby.types_by_identifier()
-        .get(last_segment)
-        .and_then(|types| types.first())
-        .cloned()
+    // A qualified name has already selected its namespace. Dropping it can
+    // invent an ancestor when Ruby would raise NameError.
+    if cleaned.contains('$') {
+        return None;
+    }
+    let types = ruby.types_by_identifier().get(cleaned)?;
+    let first = types.first()?;
+    types
+        .iter()
+        .all(|unit| unit.fq_name() == first.fq_name())
+        .then(|| first.clone())
 }
 
 /// Indexes class/module declarations by trailing identifier so the

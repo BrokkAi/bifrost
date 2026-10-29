@@ -691,6 +691,8 @@ impl TypeScriptDeclarationPackProducer {
             id: "declarations.typescript.external".to_owned(),
             activation: request.activation.clone(),
             payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
                 types,
                 members,
                 relations: Vec::new(),
@@ -1022,6 +1024,8 @@ impl TypeScriptDeclarationPackProducer {
                 id: format!("declarations.typescript.lib.{library_name}"),
                 activation,
                 payload: AuthoredPayload::DeclarationFacts {
+                    assembly_identity: None,
+                    type_forwards: Vec::new(),
                     types,
                     members,
                     relations: Vec::new(),
@@ -2535,6 +2539,8 @@ fn finish_typescript_production(
         id: "declarations.typescript.external".to_owned(),
         activation: request.activation.clone(),
         payload: AuthoredPayload::DeclarationFacts {
+            assembly_identity: None,
+            type_forwards: Vec::new(),
             types,
             members,
             relations: Vec::new(),

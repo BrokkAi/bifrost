@@ -107,6 +107,11 @@ impl BindingOriginIndex {
         self.binding_locations.get(&binding).copied()
     }
 
+    /// Structured predecessors for nomination; this alone does not prove a reaching definition.
+    pub fn value_predecessors(&self, value: ValueId) -> impl Iterator<Item = ValueId> + '_ {
+        self.predecessors.get(&value).into_iter().flatten().copied()
+    }
+
     pub fn unique_binding_origin(&self, subject: ValueId) -> Option<ValueId> {
         let mut pending = vec![subject];
         let mut visited = HashSet::new();

@@ -303,6 +303,7 @@ proptest! {
         for (label, query) in partitioned_plans() {
             let whole = execute_code_query_detailed_eager_index(
                 workspace.analyzer(),
+    &brokk_bifrost_flow::FlowWorkspaceState::default(),
                 &query,
                 limits,
                 None,
@@ -314,6 +315,7 @@ proptest! {
                 .map(|file| {
                     execute_code_query_unit(
                         workspace.analyzer(),
+    &brokk_bifrost_flow::FlowWorkspaceState::default(),
                         None,
                         &query,
                         limits,

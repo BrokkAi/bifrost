@@ -1,0 +1,11 @@
+# Test-only constructor rows for #7550. These synthetic rows pin constructor
+# translation behavior and are not upstream CodeQL content.
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: summaryModel
+    data:
+      - ["test", "Ctor", False, "Ctor", "(java.lang.String)", "", "Argument[0]", "Argument[this]", "taint", "test-only"]
+      - ["test", "Ctor", False, "Ctor", "(java.lang.String)", "", "Argument[0]", "Argument[this]", "value", "test-only"]
+      - ["test", "Ctor", False, "Ctor", "(int)", "", "Argument[this]", "Argument[0]", "taint", "test-only"]
+      - ["test", "BaseCtor", True, "BaseCtor", "(java.lang.String)", "", "Argument[0]", "Argument[this]", "taint", "test-only"]

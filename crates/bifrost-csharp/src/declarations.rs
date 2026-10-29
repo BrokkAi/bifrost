@@ -68,6 +68,37 @@ fn csharp_package_fq(package_name: &str) -> FqName {
 }
 
 pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    parse_csharp_file_with_step(file, source, tree, |_, _| Default::default())
+}
+
+/// Coordinated declaration and lexical-fact extraction for the native trial.
+pub fn parse_csharp_file_with_native_facts(
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+) -> ParsedFile {
+    parse_csharp_file_with_step(file, source, tree, |parsed, collector| {
+        let mut bridges = crate::resolution::SourceBridges::default();
+        parsed.resolution_facts = crate::resolution::produce(
+            tree,
+            source,
+            &crate::preprocessor::scan_preprocessor(source),
+            collector,
+            &mut bridges,
+        );
+        bridges
+    })
+}
+
+fn parse_csharp_file_with_step<'s>(
+    file: &ProjectFile,
+    source: &'s str,
+    tree: &Tree,
+    native_step: impl FnOnce(
+        &mut ParsedFile,
+        &mut PrimarySourceFactCollector<'s>,
+    ) -> crate::resolution::SourceBridges,
+) -> ParsedFile {
     let mut parsed = ParsedFile::new(String::new());
     parsed.contains_tests = Some(false);
     let root = tree.root_node();
@@ -187,6 +218,7 @@ pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         pending.is_empty(),
         "C# declaration events must belong to the primary tree"
     );
+    let bridges = native_step(visitor.parsed, &mut visitor.source_facts);
     let occurrences = visitor.source_facts.finish();
     let imports = visitor.source_imports;
     parsed.imports = imports
@@ -207,8 +239,8 @@ pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         structural: structural
             .finish(root)
             .expect("complete C# structural facts"),
-        native_site_occurrences: Vec::new(),
-        native_declaration_sources: Vec::new(),
+        native_site_occurrences: bridges.occurrences,
+        native_declaration_sources: bridges.declarations,
         declaration_visibilities: None,
         rust_declaration_properties: Vec::new(),
         rust_modules: None,
@@ -296,8 +328,7 @@ impl CSharpDeclarationProperties {
         let return_type_text = type_node
             .map(|ty| csharp_type_node_identity(ty, source))
             .filter(|text| !text.is_empty());
-        let display_type_text =
-            type_node.map(|ty| normalize_cs_whitespace(cs_node_text(ty, source)));
+        let display_type_text = type_node.map(|ty| csharp_render_node(ty, source));
         let return_type_identity =
             type_node.and_then(|ty| csharp_structured_type_identity(ty, source, lexical_scope));
         let semantic_type_spelling = type_node.and_then(|ty| {
@@ -315,18 +346,18 @@ impl CSharpDeclarationProperties {
     }
 }
 
-struct CSharpVisitor<'context, 'tree> {
+struct CSharpVisitor<'context, 'source, 'tree> {
     file: &'context ProjectFile,
-    source: &'context str,
+    source: &'source str,
     ancestry: ParentIndex<'tree>,
     parsed: &'context mut ParsedFile,
-    source_facts: PrimarySourceFactCollector<'context>,
+    source_facts: PrimarySourceFactCollector<'source>,
     source_imports: Vec<SourceImportFact>,
     current_is_test_method: bool,
     current_properties: CSharpDeclarationProperties,
 }
 
-impl CSharpVisitor<'_, '_> {
+impl CSharpVisitor<'_, '_, '_> {
     fn capture_semantic_declaration(&mut self, node: Node<'_>) {
         let kind = match node.kind() {
             "method_declaration" if self.current_properties.is_static => {
@@ -1054,7 +1085,7 @@ impl CSharpVisitor<'_, '_> {
             Some(parent.clone()),
             None,
         );
-        let signature = normalize_cs_whitespace(cs_node_text(node, self.source));
+        let signature = csharp_render_node(node, self.source);
         self.add_source_signature(
             node,
             code_unit,
@@ -1138,7 +1169,7 @@ fn csharp_type_code_unit(
     ))
 }
 
-fn count_type_parameters(node: Node<'_>) -> usize {
+pub(crate) fn count_type_parameters(node: Node<'_>) -> usize {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == "type_parameter")
@@ -1171,31 +1202,50 @@ fn collect_csharp_type_identifier(node: Node<'_>, source: &str, identifiers: &mu
     }
 }
 
-/// A declaration's own name, with the verbatim-identifier `@` escape normalized
-/// off (`class @Wrapper` -> `Wrapper`).
-///
-/// C# lets any identifier be written with a leading `@`; the escape only stops
-/// the lexer from reading a keyword, so `@Wrapper` and `Wrapper` denote the same
-/// declaration. Every reference surface already canonicalizes the escape away
-/// (`graph::resolver::node_text`, `csharp_type_node_segments`), so an identity
-/// built from the raw spelling could never be matched by a reference (#2064).
-/// Use this for anything that becomes a short name, an fq segment, or a
-/// type-parameter identity; rendered signature text keeps the source spelling.
-fn normalize_cs_whitespace(value: &str) -> String {
-    let mut result = String::new();
-    let mut prev_space = false;
-    for ch in value.chars() {
-        if ch.is_whitespace() {
-            if !prev_space {
-                result.push(' ');
-            }
-            prev_space = true;
-        } else {
-            result.push(ch);
-            prev_space = false;
+// Normalize trivia without changing the contents of literal tokens. The
+// tree supplies literal extents, including verbatim/raw/interpolated strings.
+fn csharp_render_range(node: Node<'_>, source: &str, range: std::ops::Range<usize>) -> String {
+    let mut literals = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.end_byte() <= range.start || current.start_byte() >= range.end {
+            continue;
+        }
+        if current.kind().ends_with("_literal")
+            || current.kind() == "interpolated_string_expression"
+        {
+            literals.push(current.byte_range());
+            continue;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            stack.push(current.named_child(index).expect("named child"));
         }
     }
-    result.trim().to_string()
+    let mut result = String::new();
+    let mut position = range.start;
+    for literal in literals
+        .into_iter()
+        .chain(std::iter::once(range.end..range.end))
+    {
+        for ch in source[position..literal.start].chars() {
+            if ch.is_whitespace() {
+                if !result.ends_with(' ') {
+                    result.push(' ');
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result.push_str(&source[literal.clone()]);
+        position = literal.end;
+    }
+    result
+}
+
+fn csharp_render_node(node: Node<'_>, source: &str) -> String {
+    csharp_render_range(node, source, node.byte_range())
+        .trim()
+        .to_string()
 }
 
 fn cs_namespace_body(node: Node<'_>) -> Option<Node<'_>> {
@@ -1208,9 +1258,9 @@ fn cs_type_body(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn csharp_type_signature(node: Node<'_>, source: &str) -> String {
-    let text = normalize_cs_whitespace(cs_node_text(node, source));
-    let head = text.split('{').next().unwrap_or(text.as_str()).trim();
-    format!("{head} {{")
+    let end = cs_type_body(node).map_or(node.end_byte(), |body| body.start_byte());
+    let head = csharp_render_range(node, source, node.start_byte()..end);
+    format!("{} {{", head.trim())
 }
 
 fn extract_csharp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
@@ -1229,9 +1279,19 @@ fn extract_csharp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 fn csharp_method_skeleton(node: Node<'_>, source: &str) -> String {
-    let text = normalize_cs_whitespace(cs_node_text(node, source));
-    let head = text.split('{').next().unwrap_or(text.as_str()).trim();
-    format!("{} {{ … }}", head.trim_end_matches(';').trim())
+    let end = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .or_else(|| {
+            (0..node.child_count())
+                .rev()
+                .filter_map(|index| node.child(index))
+                .find(|child| child.kind() == ";")
+                .map(|semicolon| semicolon.start_byte())
+        })
+        .unwrap_or(node.end_byte());
+    let head = csharp_render_range(node, source, node.start_byte()..end);
+    format!("{} {{ \u{2026} }}", head.trim())
 }
 
 fn csharp_method_signature_key(node: Node<'_>, source: &str) -> String {
@@ -1281,7 +1341,7 @@ fn csharp_dispatch_signature_metadata<'tree>(
 /// none. C# defaults differ by position -- a class member is private, a
 /// top-level type is internal -- so the caller states the default for its own
 /// position rather than this helper guessing one.
-fn csharp_declared_visibility(
+pub(crate) fn csharp_declared_visibility(
     node: Node<'_>,
     source: &str,
     default: DeclaredVisibility,
@@ -1356,54 +1416,48 @@ fn csharp_signature_metadata<'tree>(
                 && !csharp_method_type_parameter_has_constraints(node, source, receiver)
         });
     let parameter_types = csharp_callable_parameter_types(node, source);
-    let parameter_text = csharp_rendered_parameter_text(node, source);
-    let metadata = if let Some(parameters_start) = signature.find(&parameter_text) {
-        let parameters_end = parameters_start + parameter_text.len();
-        let mut search_start = parameters_start;
-        let parameters = csharp_parameter_label_nodes(node)
+    let parameters = csharp_parameter_list_node(node).map_or_else(Vec::new, |parameter_list| {
+        // Primary constructors render as Name(parameters); ordinary callables
+        // retain the normalized source header, including attributes/modifiers.
+        let parameters_start = if matches!(
+            node.kind(),
+            "class_declaration" | "struct_declaration" | "record_declaration"
+        ) {
+            cs_ident_text(node.child_by_field_name("name").expect("type name"), source).len()
+        } else {
+            csharp_render_range(node, source, node.start_byte()..parameter_list.start_byte())
+                .trim_start()
+                .len()
+        };
+        csharp_parameter_label_nodes(node)
             .into_iter()
-            .filter_map(|label_node| {
-                let label = normalize_cs_whitespace(cs_node_text(label_node, source));
-                if label.is_empty() || search_start > parameters_end {
-                    return None;
-                }
-                let haystack = signature.get(search_start..parameters_end)?;
-                let relative_start = haystack.find(&label)?;
-                let start_byte = search_start + relative_start;
-                let end_byte = start_byte + label.len();
-                search_start = end_byte;
-                Some(
-                    ParameterMetadata::new(label, start_byte, end_byte)
-                        .with_name(cs_ident_text(label_node, source)),
-                )
+            .map(|name| {
+                let label = cs_node_text(name, source);
+                let start = parameters_start
+                    + csharp_render_range(
+                        parameter_list,
+                        source,
+                        parameter_list.start_byte()..name.start_byte(),
+                    )
+                    .len();
+                let end = start + label.len();
+                debug_assert_eq!(&signature[start..end], label);
+                ParameterMetadata::new(label, start, end).with_name(cs_ident_text(name, source))
             })
-            .collect();
-        SignatureMetadata::new(signature, parameters)
-            .with_callable_arity(callable_arity)
-            .with_callable_parameter_types(parameter_types)
-            .with_type_parameters(type_parameters)
-            .with_return_type_text(return_type_text)
-            .with_return_type_identity(return_type_identity)
-            .with_bare_return_type_parameter(bare_return_type_parameter)
-            .with_extension_receiver_type(extension_receiver_type)
-            .with_extension_receiver_type_identity(extension_receiver_type_identity)
-            .with_extension_receiver_is_unconstrained_type_parameter(
-                extension_receiver_is_unconstrained_type_parameter,
-            )
-    } else {
-        SignatureMetadata::new(signature, Vec::new())
-            .with_callable_arity(callable_arity)
-            .with_callable_parameter_types(parameter_types)
-            .with_type_parameters(type_parameters)
-            .with_return_type_text(return_type_text)
-            .with_return_type_identity(return_type_identity)
-            .with_bare_return_type_parameter(bare_return_type_parameter)
-            .with_extension_receiver_type(extension_receiver_type)
-            .with_extension_receiver_type_identity(extension_receiver_type_identity)
-            .with_extension_receiver_is_unconstrained_type_parameter(
-                extension_receiver_is_unconstrained_type_parameter,
-            )
-    };
+            .collect()
+    });
+    let metadata = SignatureMetadata::new(signature, parameters)
+        .with_callable_arity(callable_arity)
+        .with_callable_parameter_types(parameter_types)
+        .with_type_parameters(type_parameters)
+        .with_return_type_text(return_type_text)
+        .with_return_type_identity(return_type_identity)
+        .with_bare_return_type_parameter(bare_return_type_parameter)
+        .with_extension_receiver_type(extension_receiver_type)
+        .with_extension_receiver_type_identity(extension_receiver_type_identity)
+        .with_extension_receiver_is_unconstrained_type_parameter(
+            extension_receiver_is_unconstrained_type_parameter,
+        );
     metadata
         .with_callable_override_modifier(csharp_override_modifier(source, node))
         .with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
@@ -1784,7 +1838,7 @@ fn csharp_parameter_list_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
 
 fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
     csharp_parameter_list_node(node)
-        .map(|parameters| normalize_cs_whitespace(cs_node_text(parameters, source)))
+        .map(|parameters| csharp_render_node(parameters, source))
         .unwrap_or_else(|| "()".to_string())
 }
 
@@ -1865,7 +1919,7 @@ fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn csharp_property_signature(node: Node<'_>, source: &str) -> String {
-    normalize_cs_whitespace(cs_node_text(node, source))
+    csharp_render_node(node, source)
 }
 
 fn csharp_parameter_key(node: Node<'_>, source: &str) -> String {
@@ -1880,14 +1934,14 @@ fn csharp_parameter_key(node: Node<'_>, source: &str) -> String {
         }
         let part = child
             .child_by_field_name("type")
-            .map(|type_node| normalize_cs_whitespace(cs_node_text(type_node, source)))
-            .unwrap_or_else(|| normalize_cs_whitespace(cs_node_text(child, source)));
+            .map(|type_node| csharp_render_node(type_node, source))
+            .unwrap_or_else(|| csharp_render_node(child, source));
         parts.push(part);
     }
     if csharp_parameter_list_has_params(parameters)
         && let Some(type_node) = parameters.child_by_field_name("type")
     {
-        parts.push(normalize_cs_whitespace(cs_node_text(type_node, source)));
+        parts.push(csharp_render_node(type_node, source));
     }
     format!("({})", parts.join(", "))
 }
@@ -1929,7 +1983,6 @@ fn csharp_field_signature(
     } else {
         format!("{prefix} {type_text} {name}")
     };
-    let base = normalize_cs_whitespace(&base);
     if let Some(initializer) = initializer {
         format!("{base} = {initializer};")
     } else {
@@ -1944,18 +1997,20 @@ fn csharp_literal_initializer(node: Node<'_>, source: &str) -> Option<String> {
             .filter_map(|index| node.child(index))
             .any(|child| !child.is_named() && matches!(child.kind(), "+" | "-"));
         return (has_sign && matches!(value.kind(), "integer_literal" | "real_literal"))
-            .then(|| normalize_cs_whitespace(cs_node_text(node, source)));
+            .then(|| csharp_render_node(node, source));
     }
     if matches!(
         node.kind(),
         "integer_literal"
             | "real_literal"
             | "string_literal"
+            | "verbatim_string_literal"
+            | "raw_string_literal"
             | "character_literal"
             | "boolean_literal"
             | "null_literal"
     ) {
-        return Some(normalize_cs_whitespace(cs_node_text(node, source)));
+        return Some(csharp_render_node(node, source));
     }
     None
 }
@@ -2333,5 +2388,196 @@ mod recovered_dispatch_tests {
                 .all(|row| row.dispatch_extensibility() == Some(DispatchExtensibility::Open)),
             "a recovered virtual member remains open: {metadata:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod signature_rendering_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: parameter labels selected type and default substrings"
+    )]
+    fn parameter_labels_follow_name_tokens() {
+        let source = r#"class C { void M(int i, string s = "i", string @name = "s") {} }"#;
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "Labels.cs");
+        let parsed = parse_csharp_file(&file, source, &tree);
+        let method = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.identifier() == "M")
+            .unwrap();
+        let metadata = &parsed.signature_metadata[method][0];
+        let labels: Vec<_> = metadata
+            .parameters()
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter.label(),
+                    parameter.start_byte(),
+                    parameter.end_byte(),
+                    parameter.name(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("i", 11, 12, Some("i")),
+                ("s", 21, 22, Some("s")),
+                ("@name", 37, 42, Some("name"))
+            ]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: signatures split literal braces and collapsed literal whitespace"
+    )]
+    fn signatures_preserve_literal_values_and_structural_bodies() {
+        let source = r#"[A("{")] class C { string Value = "a  b"; object Empty = null; [A("{")] void M(string value = "{  }") {} char Tab = '	'; string Verbatim = @"a  b"; string Raw = """a  b"""; string Expr() => "{"; }"#;
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        let class = tree.root_node().named_child(0).unwrap();
+        let method = cs_type_body(class).unwrap().named_child(2).unwrap();
+        assert_eq!(
+            csharp_type_signature(class, source),
+            r#"[A("{")] class C {"#
+        );
+        assert_eq!(
+            csharp_method_skeleton(method, source),
+            "[A(\"{\")] void M(string value = \"{  }\") { \u{2026} }"
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "Literals.cs");
+        let parsed = parse_csharp_file(&file, source, &tree);
+        let labels: Vec<_> = parsed
+            .signature_metadata
+            .values()
+            .flatten()
+            .map(SignatureMetadata::label)
+            .collect();
+        assert!(labels.contains(&r#"string Value = "a  b";"#), "{labels:?}");
+        assert!(labels.contains(&"object Empty = null;"), "{labels:?}");
+        assert!(labels.contains(&"char Tab = '\t';"), "{labels:?}");
+        assert!(
+            labels.contains(&r#"string Verbatim = @"a  b";"#),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&r#"string Raw = """a  b""";"#),
+            "{labels:?}"
+        );
+        assert!(labels.contains(&"string Expr() { \u{2026} }"), "{labels:?}");
+    }
+}
+
+#[cfg(test)]
+mod declaration_boundary_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::model::StructuredTypeNodeView;
+
+    #[test]
+    fn declaration_names_modifiers_ranges_and_type_shapes_follow_grammar() {
+        let source = "namespace Outer { namespace Inner { class C(int count) { public static int Value { get; } public int Instance { get; } int Number() => 0; string[] Text() => null; Box<int> Items() => null; global::N.Item Global() => null; } } }";
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "Shapes.cs");
+        let parsed = parse_csharp_file(&file, source, &tree);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        for link in &parsed.source_declaration_metadata {
+            let declaration = facts.occurrences.declaration(link.declaration);
+            let name = facts.occurrences.occurrence(
+                declaration
+                    .name
+                    .expect("display declaration must link to its grammar name"),
+            );
+            let occurrence = facts.occurrences.occurrence(declaration.occurrence);
+            let syntax_node = tree
+                .root_node()
+                .descendant_for_byte_range(occurrence.range.start_byte, occurrence.range.end_byte)
+                .unwrap();
+            let grammar_name = syntax_node
+                .child_by_field_name("name")
+                .expect("declaration name field");
+            assert_eq!(name.range.start_byte, grammar_name.start_byte());
+            assert_eq!(name.range.end_byte, grammar_name.end_byte());
+            let metadata = &parsed.signature_metadata[&link.unit][link.metadata_ordinal];
+            match link.unit.identifier() {
+                "Value" => assert!(metadata.field_is_static()),
+                "Instance" => assert!(!metadata.field_is_static()),
+                "Number" | "Text" | "Items" | "Global" => {
+                    let identity = metadata
+                        .return_type_identity()
+                        .expect("structured return type");
+                    if link.unit.identifier() == "Text" {
+                        assert!(identity.is_array());
+                    } else {
+                        let name = identity.nominal_name().unwrap();
+                        assert_eq!(name.lexical_scope(), ["Outer", "Inner", "C"]);
+                        match link.unit.identifier() {
+                            "Number" => assert_eq!(name.path(), ["int"]),
+                            "Global" => {
+                                assert_eq!(name.path(), ["N", "Item"]);
+                                assert!(name.is_absolute());
+                            }
+                            "Items" => {
+                                assert_eq!(name.path(), ["Box`1"]);
+                                let StructuredTypeNodeView::Generic { arguments, .. } =
+                                    identity.view(identity.root_id()).unwrap()
+                                else {
+                                    panic!("generic shape");
+                                };
+                                let StructuredTypeNodeView::Named(argument) =
+                                    identity.view(arguments[0]).unwrap()
+                                else {
+                                    panic!("nominal argument");
+                                };
+                                assert_eq!(argument.path(), ["int"]);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                "C" if link.unit.is_function() => {
+                    let parameter_list = csharp_parameter_list_node(syntax_node).unwrap();
+                    let ranges = &parsed.ranges[&link.unit];
+                    assert_eq!(ranges.len(), 1);
+                    assert_eq!(ranges[0].end_byte, parameter_list.end_byte());
+                    assert_eq!(ranges[0].end_line, parameter_list.end_position().row + 1);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(parsed.source_declaration_metadata.len(), 8);
+    }
+
+    #[test]
+    fn recovered_members_only_admit_direct_local_functions() {
+        let source = "class C { void Broken( }\nvoid Kept() {}\nint detached;\nif (true) { void Nested() {} }";
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        assert!(tree.root_node().has_error());
+        let mut found = Vec::new();
+        let mut cursor = tree.root_node().walk();
+        for statement in tree
+            .root_node()
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "global_statement")
+        {
+            if let Some(member) = csharp_recovered_type_member(statement) {
+                assert_eq!(member.kind(), "local_function_statement");
+                assert_eq!(member.parent(), Some(statement));
+                found.push(cs_node_text(
+                    member.child_by_field_name("name").unwrap(),
+                    source,
+                ));
+            }
+        }
+        assert_eq!(found, ["Kept"], "{}", tree.root_node().to_sexp());
     }
 }

@@ -138,7 +138,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
 use brokk_bifrost_analysis::analyzer::semantic::topology::DependencyScope;
 
-use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, IAnalyzer};
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
@@ -150,7 +150,7 @@ use brokk_bifrost_core::analyzer::model::{
     CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterKind, CppTemplateTerm,
     StructuredTypeIdentity, StructuredTypeNodeId, StructuredTypeNodeView,
 };
-use brokk_bifrost_core::analyzer::project::decode_source_bytes;
+use brokk_bifrost_core::analyzer::project::{BinarySourceRejection, decode_source_bytes};
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_cpp::compile_context::CppCompileContexts;
 use brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution;
@@ -828,12 +828,12 @@ fn directly_reached_external_headers_while(
 ) -> Option<Arc<ReachedExternalHeaders>> {
     let cell = analyzer.external_header_closure_cell(file);
     match cell.get_or_try_build_pool_independent_while(keep_going, || {
-        Ok::<_, std::convert::Infallible>(build_directly_reached_external_headers(
-            analyzer, file, keep_going,
-        ))
+        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
+            build_directly_reached_external_headers(analyzer, file, keep_going)
+        })
     }) {
         Ok(outcome) => outcome,
-        Err(never) => match never {},
+        Err(value) => value.map(Arc::new),
     }
 }
 
@@ -843,6 +843,7 @@ fn build_directly_reached_external_headers(
     keep_going: &impl Fn() -> bool,
 ) -> Option<ReachedExternalHeaders> {
     if !keep_going() {
+        analyzer.mark_execution_dependent();
         return None;
     }
     analyzer.record_external_header_closure_build();
@@ -863,6 +864,7 @@ fn build_directly_reached_external_headers(
     let mut bytes_read = 0usize;
     while let Some((including_file, include, quoted)) = pending.pop() {
         if !keep_going() {
+            analyzer.mark_execution_dependent();
             return None;
         }
         match analyzer.resolve_external_include(file, &including_file, &include, quoted) {
@@ -871,6 +873,14 @@ fn build_directly_reached_external_headers(
                     continue;
                 }
                 if visited.len() > MAX_CLOSURE_HEADERS {
+                    brokk_bifrost_core::profiling::note_with(|| {
+                        format!(
+                            "policy.units unbounded origin={}:{} cause=budget:external_header_count",
+                            file!(),
+                            line!()
+                        )
+                    });
+                    analyzer.mark_execution_dependent();
                     return Some(ReachedExternalHeaders::Unavailable);
                 }
                 let Ok(relative_path) = header.strip_prefix(&root) else {
@@ -880,11 +890,30 @@ fn build_directly_reached_external_headers(
                     dependency_name: root_dependency_name(&root),
                     relative_path: relative_path.to_path_buf(),
                 });
-                let Ok((header_source, raw_bytes)) = read_external_header(&header) else {
-                    return Some(ReachedExternalHeaders::Unavailable);
+                let (header_source, raw_bytes) = match read_external_header(&header) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=provider:external_header_io detail={error}",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        analyzer.mark_execution_dependent();
+                        return Some(ReachedExternalHeaders::Unavailable);
+                    }
                 };
                 bytes_read = bytes_read.saturating_add(raw_bytes);
                 if bytes_read > MAX_CLOSURE_BYTES {
+                    brokk_bifrost_core::profiling::note_with(|| {
+                        format!(
+                            "policy.units unbounded origin={}:{} cause=budget:external_header_bytes",
+                            file!(),
+                            line!()
+                        )
+                    });
+                    analyzer.mark_execution_dependent();
                     return Some(ReachedExternalHeaders::Unavailable);
                 }
                 analyzer.record_external_header_parse();
@@ -1748,6 +1777,8 @@ schema_version:
                         artifact_sha256: Some(artifact.sha256().to_owned()),
                     }],
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -1939,7 +1970,10 @@ fn discover_reachable_header_sets(
             )
         });
         for file in compiled_sources {
-            let source = match project.read_source(&file) {
+            let source = match project
+                .read_source(&file)
+                .and_then(|source| reject_nul_source(source.as_bytes()).map(|()| source))
+            {
                 Ok(source) => source,
                 Err(error) => {
                     diagnostics.push(header_discovery_failed(
@@ -2031,7 +2065,20 @@ fn discover_reachable_header_sets(
 fn read_external_header(path: &Path) -> std::io::Result<(String, usize)> {
     let bytes = std::fs::read(path)?;
     let raw_bytes = bytes.len();
+    reject_nul_source(&bytes)?;
     decode_source_bytes(bytes).map(|source| (source, raw_bytes))
+}
+
+/// C++ declares no NUL payload kinds, so no source admission can prove a
+/// NUL-bearing named source or header is text; discovery treats it as binary.
+fn reject_nul_source(bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            BinarySourceRejection,
+        ));
+    }
+    Ok(())
 }
 
 fn header_discovery_failed(

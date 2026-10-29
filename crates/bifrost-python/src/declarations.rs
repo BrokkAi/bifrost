@@ -55,6 +55,16 @@ fn python_module_components(project: &dyn Project, file: &ProjectFile) -> Vec<St
     python_module_components_from_root(file, &python_import_root(project, file))
 }
 
+/// Restore a published module identity without probing packaging inputs.
+/// Match whole path components so a hidden directory's leading dot stays inside
+/// its segment. The stored rendered name is a value, not source syntax.
+pub fn python_module_components_from_name(file: &ProjectFile, name: &str) -> Option<Vec<String>> {
+    let components = python_project_module_components(file);
+    (0..components.len()).find_map(|start| {
+        (components[start..].join(".") == name).then(|| components[start..].to_vec())
+    })
+}
+
 /// The module-name components `file`'s path yields when it is named from the
 /// project root, which is the longest name the workspace can give it:
 /// `dependency/core/lib/common/__init__.py` is
@@ -157,6 +167,10 @@ fn python_package_components_for_file(file: &ProjectFile, import_root_rel: &Path
         .expect("a Python import root is a prefix of the paths it names modules for");
     path_components(relative_package)
 }
+
+/// Packaging inputs retained by the analyzer and selected by environment staging.
+pub const PYTHON_CONFIGURATION_INPUT_NAMES: [&str; 3] =
+    ["pyproject.toml", "setup.py", "__init__.py"];
 
 /// Find the nearest setuptools import root that contains this source file.
 ///
@@ -1774,6 +1788,13 @@ pub use brokk_bifrost_core::analyzer::common::node_source_text as py_node_text;
 
 pub fn python_module_name(project: &dyn Project, file: &ProjectFile) -> String {
     python_module_components(project, file).join(".")
+}
+
+/// Hydrate a module unit using its already published identity.
+pub fn module_code_unit_from_name(file: &ProjectFile, name: &str) -> Option<CodeUnit> {
+    let components = python_module_components_from_name(file, name)?;
+    let fq = FqName::from_package_components(&components);
+    module_code_unit_from_fq(file, &components, fq)
 }
 
 pub fn module_code_unit(project: &dyn Project, file: &ProjectFile) -> Option<CodeUnit> {

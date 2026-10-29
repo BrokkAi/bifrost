@@ -52,6 +52,7 @@ impl PythonFactDiagnostics {
 
     fn record_rule_fact(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         expansion: &PipelineExpansion,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
@@ -77,7 +78,8 @@ impl PythonFactDiagnostics {
                 .unwrap_or("Python rule fact is incomplete")
         );
         self.record_site(
-            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            analyzer,
+            (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
             value.row.language,
             message,
             source,
@@ -109,7 +111,15 @@ impl PythonFactDiagnostics {
             end_byte: range.end_byte,
         };
         self.record_site(
-            CodeQueryDiagnosticCode::PythonHierarchyDerivationIncomplete,
+            analyzer,
+            (
+                CodeQueryDiagnosticCode::PythonHierarchyDerivationIncomplete,
+                match value.reason {
+                    Some("cancelled") => Some(DerivationExecutionCause::Cancelled),
+                    Some("visit_limit") => Some(DerivationExecutionCause::Budget),
+                    _ => None,
+                },
+            ),
             "python",
             format!(
                 "Python class hierarchy is open: {}",
@@ -122,7 +132,8 @@ impl PythonFactDiagnostics {
 
     fn record_site(
         &mut self,
-        code: CodeQueryDiagnosticCode,
+        analyzer: &dyn IAnalyzer,
+        (code, cause): (CodeQueryDiagnosticCode, Option<DerivationExecutionCause>),
         language: &'static str,
         message: String,
         source: CodeQuerySourceSpan,
@@ -132,17 +143,21 @@ impl PythonFactDiagnostics {
             .sites
             .insert((code, language, message.clone(), source.clone()))
         {
-            diagnostics.push(CodeQueryDiagnostic {
-                related: Vec::new(),
-                source: Some(source),
-                code,
-                impact: CodeQueryDiagnosticImpact::Incomplete,
-                branch: Vec::new(),
-                language,
-                message,
-                exhausted_roots: Vec::new(),
-                withheld_rows_path: None,
-            });
+            diagnostics.push(super::QueryExecutionState::diagnostic(
+                analyzer,
+                CodeQueryDiagnostic {
+                    related: Vec::new(),
+                    source: Some(source),
+                    code,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language,
+                    message,
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                },
+                cause,
+            ));
         }
     }
 }
@@ -422,7 +437,9 @@ fn resolved_call_filter_matches(value: &CallBindingValue, filter: &ResolvedCallF
     }
 }
 
-fn call_argument_filter_matches(value: &CallBindingValue, selector: &CallArgumentSelector) -> bool {
+/// Whether this row binds one written actual exactly at a site whose bindings
+/// are exhaustive, which is what `call-argument` selects among.
+fn call_argument_row_bound(value: &CallBindingValue) -> bool {
     let row = value.row();
     matches!(
         row.mapping,
@@ -432,10 +449,47 @@ fn call_argument_filter_matches(value: &CallBindingValue, selector: &CallArgumen
         crate::analyzer::usages::call_binding::CallBindingCoverage::Exhaustive
     ) && !row.terminal
         && row.argument_id.is_some()
+}
+
+fn call_argument_filter_matches(value: &CallBindingValue, selector: &CallArgumentSelector) -> bool {
+    let row = value.row();
+    call_argument_row_bound(value)
         && match selector {
             CallArgumentSelector::FormalName(name) => row.formal_name.as_ref() == Some(name),
             CallArgumentSelector::FormalIndex(index) => row.formal_index == Some(*index),
         }
+}
+
+/// The diagnostic for a bound actual whose formal has no recorded name, so a
+/// `:formal-name` selector can neither select nor reject it (#7473). A class
+/// jar without a sources jar or `MethodParameters` records no parameter names,
+/// and silently dropping the row would read as "this call is not the source".
+fn formal_name_unrecorded_diagnostic(value: &CallBindingValue, name: &str) -> CodeQueryDiagnostic {
+    let report = &value.site.report;
+    let path = rel_path_string(&report.file);
+    CodeQueryDiagnostic {
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: crate::analyzer::common::language_for_file(&report.file).config_label(),
+        message: format!(
+            "call_argument :formal-name {name:?} is undecided at a call in {path}: formal {} of {} has no recorded parameter name (its declaring artifact publishes none); select it by :formal-index",
+            value
+                .row()
+                .formal_index
+                .expect("an exactly bound actual has a formal index"),
+            value
+                .site
+                .model_callable_id
+                .as_deref()
+                .or(value.site.semantic_target_id.as_deref())
+                .unwrap_or("the resolved callee"),
+        ),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: Some(path),
+    }
 }
 
 fn row_literal_matches(actual: CodeQueryRowScalarRef<'_>, literal: &QueryRowLiteral) -> bool {
@@ -723,7 +777,9 @@ pub(super) fn apply_plan_step(
             seeds.sort_by_key(rel_path_string);
             seeds.dedup();
             if !seeds.is_empty() {
-                if state.analyzer.read_ledger_attached() {
+                if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+                    state.analyzer.read_ledger_attached()
+                }) {
                     let languages = state.analyzer.languages().into_iter().collect::<Vec<_>>();
                     state
                         .analyzer
@@ -1115,18 +1171,6 @@ pub(super) fn apply_plan_step(
                     max_edges,
                     state.cancellation,
                 );
-                if !exhausted
-                    && let Err(error) = graph.publish_persisted_import_graph(state.analyzer)
-                {
-                    crate::profiling::note(format!(
-                        "query_code persistent import graph publication failed; using the complete request graph: {error}"
-                    ));
-                    if state.access_mode == StructuralAccessMode::IndexedRequired {
-                        state.access_failure.get_or_insert_with(|| {
-                            format!("publishing persistent import graph failed: {error}")
-                        });
-                    }
-                }
                 state.budget.import_files_resolved = state
                     .budget
                     .import_files_resolved
@@ -1392,7 +1436,7 @@ pub(super) fn apply_plan_step(
         state.direct_import_layer_content = None;
         state.import_graph = None;
         state.import_graph_content = None;
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(state.analyzer, CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -1402,7 +1446,7 @@ pub(super) fn apply_plan_step(
             message: "workspace content changed during direct import relation replay; retry the query for a coherent snapshot".to_string(),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }, Some(DerivationExecutionCause::Snapshot)));
         if state.access_mode == StructuralAccessMode::IndexedRequired {
             state.access_failure.get_or_insert_with(|| {
                 "direct import topology became stale during replay".to_string()
@@ -1618,7 +1662,7 @@ pub(super) fn cancelled_query_result(session_subset: Option<SubsetCoverage>) -> 
         results: Vec::new(),
         truncated: true,
         session_subset,
-        diagnostics,
+        diagnostics: normalize_query_diagnostics(diagnostics),
     }
 }
 
@@ -1630,7 +1674,7 @@ pub(super) fn invalid_plan_result(
         results: Vec::new(),
         truncated: false,
         session_subset,
-        diagnostics: vec![CodeQueryDiagnostic {
+        diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
@@ -1640,7 +1684,7 @@ pub(super) fn invalid_plan_result(
             message: error.to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }],
+        }]),
     }
 }
 
@@ -1893,7 +1937,7 @@ pub(super) fn query_analysis_context_error_result(
         results: Vec::new(),
         truncated: true,
         session_subset,
-        diagnostics: vec![CodeQueryDiagnostic {
+        diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code,
@@ -1903,7 +1947,7 @@ pub(super) fn query_analysis_context_error_result(
             message: error.to_string(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }],
+        }]),
     }
 }
 
@@ -4215,12 +4259,19 @@ fn apply_pipeline_step_general<'a>(
                 receiver::points_to_candidate_expansions(value, semantic_identity)
             }
             (PipelineValue::MemberTargetAnalysis(value), QueryStep::FieldWriteValue(filter)) => {
-                field_write::field_write_value_expansions(value, filter, &row.traces, diagnostics)
+                field_write::field_write_value_expansions(
+                    analyzer,
+                    value,
+                    filter,
+                    &row.traces,
+                    diagnostics,
+                )
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::CallShape) => {
                 let fact_range = seed.facts.node(seed.fact_match.node).range;
                 call_shape::call_shape_expansions_for_input(
                     analyzer,
+                    semantic.as_mut(),
                     &row.traces,
                     &seed.file,
                     fact_range,
@@ -4334,6 +4385,15 @@ fn apply_pipeline_step_general<'a>(
                             && filter.imported_name.as_deref().is_none_or(|imported_name| {
                                 value.row.imported_name.as_deref() == Some(imported_name)
                             })
+                            // An annotation whose type is unproven may be the
+                            // requested one: keep its incomplete row so the
+                            // selection stays incomplete instead of empty.
+                            && filter.annotation_type.as_deref().is_none_or(|annotation_type| {
+                                value.row.annotation_fq_name.as_deref() == Some(annotation_type)
+                                    || value.row.annotation_status.is_some_and(|status| {
+                                        status != crate::analyzer::JavaAnnotationTypeStatus::Resolved
+                                    })
+                            })
                     }
                     _ => true,
                 })
@@ -4367,6 +4427,7 @@ fn apply_pipeline_step_general<'a>(
             (PipelineValue::CallSite(site), QueryStep::CallShape) => {
                 call_shape::call_shape_expansions_for_input(
                     analyzer,
+                    semantic.as_mut(),
                     &row.traces,
                     &site.0.file,
                     site.0.range,
@@ -4386,6 +4447,7 @@ fn apply_pipeline_step_general<'a>(
             (PipelineValue::Occurrence(value), QueryStep::CallShape) => {
                 call_shape::call_shape_expansions_for_input(
                     analyzer,
+                    semantic.as_mut(),
                     &row.traces,
                     value.file(),
                     value.row.range,
@@ -4741,6 +4803,12 @@ fn apply_pipeline_step_general<'a>(
                         value.clone(),
                     ))]
                 } else {
+                    if let CallArgumentSelector::FormalName(name) = selector
+                        && call_argument_row_bound(value)
+                        && value.row().formal_name.is_none()
+                    {
+                        diagnostics.push(formal_name_unrecorded_diagnostic(value, name));
+                    }
                     Vec::new()
                 }
             }
@@ -5186,6 +5254,7 @@ fn apply_pipeline_step_general<'a>(
                 declaration,
                 cancellation,
                 matches!(step, QueryStep::FamilyEdges),
+                diagnostics,
             ),
             (PipelineValue::Declaration(declaration), QueryStep::PythonOverrideSignatures) => {
                 python_class_hierarchy::python_override_signature_expansions_for_declaration(
@@ -5467,7 +5536,7 @@ fn apply_pipeline_step_general<'a>(
                 diagnostics,
             ),
             (PipelineValue::StateEvent(value), QueryStep::FlowRelationsOf(filter)) => {
-                flow_relations_of_event(value, filter, flow_state_cache, diagnostics)
+                flow_relations_of_event(analyzer, value, filter, flow_state_cache, diagnostics)
             }
             (PipelineValue::StateEvent(value), QueryStep::BindingInitializerCallsOf) => {
                 row_relations::binding_initializer_call_expansions(
@@ -5482,6 +5551,7 @@ fn apply_pipeline_step_general<'a>(
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::ControlRelations(filter),
             ) => control_relation_expansions(
+                analyzer,
                 control_relation_cache,
                 procedure,
                 analyzer.project().analysis_generation(),
@@ -5577,6 +5647,7 @@ fn apply_pipeline_step_general<'a>(
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::PendingCleanupFlows,
             ) => pending_cleanup_flow::pending_cleanup_flow_expansions(
+                analyzer,
                 procedure,
                 cancellation,
                 diagnostics,
@@ -5592,7 +5663,7 @@ fn apply_pipeline_step_general<'a>(
                 source_set_expansions(topology_cache, analyzer, file, diagnostics)
             }
             (PipelineValue::BuildTarget(target), QueryStep::TopologyEdgesOf) => {
-                topology_edge_expansions(topology_cache, target, diagnostics)
+                topology_edge_expansions(analyzer, topology_cache, target, diagnostics)
             }
             (PipelineValue::File(file), QueryStep::RewritePathsOf(filter)) => {
                 rewrite_path_expansions(
@@ -5865,7 +5936,7 @@ fn apply_pipeline_step_general<'a>(
                     // and an empty expansion list adds nothing meanwhile.
                     continue;
                 };
-                path_cache.report_completeness(&value.file, &result, axes, diagnostics);
+                path_cache.report_completeness(analyzer, &value.file, &result, axes, diagnostics);
                 let terminal = value.row().terminal_node;
                 result
                     .segments
@@ -5896,6 +5967,7 @@ fn apply_pipeline_step_general<'a>(
                     match path_cache.paths_for(analyzer, &value.file, true, cancellation) {
                         Some(result) => {
                             path_cache.report_completeness(
+                                analyzer,
                                 &value.file,
                                 &result,
                                 RESOLVED_PATH_QUERY_AXES,
@@ -6001,7 +6073,7 @@ fn apply_pipeline_step_general<'a>(
                     continue;
                 }
             }
-            python_fact_diagnostics.record_rule_fact(expansion, diagnostics);
+            python_fact_diagnostics.record_rule_fact(analyzer, expansion, diagnostics);
         }
         let expansions = project_direct_receiver_terminal(step, expansions);
         // The base and summary result-contract projections are total relations. The base step
@@ -6217,34 +6289,30 @@ fn apply_pipeline_step_general<'a>(
         }
     }
     append_semantic_omission_diagnostics(diagnostics, step, semantic_omissions);
-    for ((code, language, operation, reason), count) in receiver_diagnostics {
+    // Each input owns its diagnostic. Shared step counts change with slicing.
+    for (code, language, operation, reason, cause) in receiver_diagnostics {
         let message = if reason == RECEIVER_PIPELINE_OUTPUT_CAP_REASON {
-            format!(
-                "{operation} omitted {count} receiver analysis input{} at the pipeline output cap",
-                if count == 1 { "" } else { "s" }
-            )
+            format!("{operation} omitted receiver analysis inputs at the pipeline output cap")
         } else if code == CodeQueryDiagnosticCode::ReceiverAnalysisFailed {
-            format!(
-                "{operation} failed for {count} analysis input{}: {reason}",
-                if count == 1 { "" } else { "s" }
-            )
+            format!("{operation} receiver analysis failed: {reason}")
         } else {
-            format!(
-                "{operation} returned {count} analysis row{} with {reason}",
-                if count == 1 { "" } else { "s" }
-            )
+            format!("{operation} receiver analysis is incomplete: {reason}")
         };
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: language.config_label(),
-            message,
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        });
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            analyzer,
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: None,
+                code,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: language.config_label(),
+                message,
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+            cause,
+        ));
     }
     if let Some(instrumentation) = instrumentation {
         let index_bytes = indexes.capacity().saturating_mul(

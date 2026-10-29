@@ -208,10 +208,6 @@ impl RubyCallResultUseIndex {
     ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
         self.inner.at_span(start_byte, end_byte)
     }
-
-    pub fn sites(&self) -> &[CallResultUseSite] {
-        self.inner.sites()
-    }
 }
 
 pub const RUBY_KIND_TABLE: &[(&str, NormalizedKind)] = &[
@@ -345,10 +341,64 @@ pub fn ruby_unconditional_loop_body<'tree>(node: Node<'tree>, source: &str) -> O
         return None;
     }
     let method = node.child_by_field_name("method")?;
-    (node_text(method, source) == "loop")
-        .then(|| node.child_by_field_name("block"))
-        .flatten()
-        .map(|block| block.child_by_field_name("body").unwrap_or(block))
+    if node_text(method, source) != "loop" {
+        return None;
+    }
+    // A source-local best effort: a declared method can shadow Kernel#loop.
+    // Cross-file reopenings and runtime metaprogramming remain unresolved.
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let owner = ruby_lexical_namespace(node, source);
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "method" | "singleton_method")
+            && current
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, source) == "loop")
+        {
+            let declaration_owner = ruby_lexical_namespace(current, source);
+            // A top-level instance method belongs to Object, so it shadows
+            // Kernel#loop for every lexical owner. A singleton method on main
+            // stays local to the top-level namespace.
+            if declaration_owner == owner
+                || (current.kind() == "method" && declaration_owner.is_empty())
+            {
+                return None;
+            }
+        }
+        for index in (0..current.named_child_count()).rev() {
+            stack.push(current.named_child(index).expect("named child exists"));
+        }
+    }
+    let block = node
+        .child_by_field_name("block")
+        .expect("block was checked");
+    Some(block.child_by_field_name("body").unwrap_or(block))
+}
+
+// The same namespace can have several class/module bodies in a file. Compare
+// structured owner paths so an unrelated namespace cannot shadow Kernel#loop.
+fn ruby_lexical_namespace(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut namespaces = Vec::new();
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if matches!(current.kind(), "class" | "module")
+            && let Some(name) = current.child_by_field_name("name")
+        {
+            namespaces.push(crate::declarations::extract_name_path(name, source));
+        }
+        ancestor = current.parent();
+    }
+    let mut segments = Vec::new();
+    for path in namespaces.into_iter().rev() {
+        if path.absolute {
+            segments.clear();
+        }
+        segments.extend(path.segments);
+    }
+    segments
 }
 
 /// Whether an identifier at this grammatical position is a value read: a
@@ -406,6 +456,8 @@ pub(crate) fn is_value_read_position(node: Node<'_>) -> bool {
         "pair" => is_field("value"),
         "assignment" | "operator_assignment" => is_field("right"),
         "call" => is_field("receiver"),
+        // The iterable of a for-loop is wrapped in its own `in` node.
+        "in" => true,
         _ => false,
     }
 }
@@ -559,20 +611,53 @@ fn ruby_escape_value(escape: &str, quote: char) -> Option<Option<char>> {
     Some(Some(character))
 }
 
-fn ruby_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() != "string" {
+pub(crate) fn ruby_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "string" | "delimited_symbol") {
         return None;
     }
     let spelling = node_text(node, source);
+    let spelling = if node.kind() == "delimited_symbol" {
+        spelling.strip_prefix(':')?
+    } else {
+        spelling
+    };
     let quote = spelling.chars().next()?;
     if !matches!(quote, '\'' | '"') {
         return None;
     }
     let mut value = String::new();
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
+    let mut children = node.named_children(&mut cursor);
+    while let Some(child) = children.next() {
         match child.kind() {
+            "string_content" if quote == '\'' => {
+                // The Ruby grammar keeps single-quoted escapes in content,
+                // rather than producing escape_sequence nodes. Only escaped
+                // backslashes and apostrophes lose their leading backslash.
+                let mut characters = node_text(child, source).chars().peekable();
+                while let Some(character) = characters.next() {
+                    if character == '\\'
+                        && characters
+                            .peek()
+                            .is_some_and(|next| matches!(next, '\\' | '\''))
+                    {
+                        value.push(characters.next().expect("peeked escape character"));
+                    } else {
+                        value.push(character);
+                    }
+                }
+            }
             "string_content" => value.push_str(node_text(child, source)),
+            "escape_sequence" if quote == '"' && node_text(child, source) == "\\\r" => {
+                // The grammar's single-character escape token stops at CR.
+                // Its following LF belongs to the next content node; Ruby
+                // treats that pair as one discarded line continuation.
+                let content = children.next()?;
+                if content.kind() != "string_content" {
+                    return None;
+                }
+                value.push_str(node_text(content, source).strip_prefix('\n')?);
+            }
             "escape_sequence" => {
                 if let Some(character) = ruby_escape_value(node_text(child, source), quote)? {
                     value.push(character);
@@ -1091,8 +1176,380 @@ mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: a declared loop method is not Kernel loop"
+    )]
+    fn loop_dispatch_grammar_and_shadowing() {
+        for (source, expected) in [
+            ("loop { break 1 }", true),
+            ("loop do; next; end", true),
+            ("once { 1 }", false),
+            ("receiver.loop { 1 }", false),
+            ("loop(1) { 1 }", false),
+            (
+                "class C; def loop; yield; :done; end; def run; loop { 1 }; :after; end; end",
+                false,
+            ),
+            ("def loop; yield; end; loop { 1 }", false),
+            ("def loop; yield; end; class A; loop { 1 }; end", false),
+            ("def self.loop; yield; end; class A; loop { 1 }; end", true),
+            (
+                "class A; def loop; end; end; class B; def run; loop { 1 }; end; end",
+                true,
+            ),
+            (
+                "class A; def self.loop; end; end; class B; loop { 1 }; end",
+                true,
+            ),
+            ("class A; def loop; end; end; loop { 1 }", true),
+            (
+                "class A; def loop; end; end; class A; loop { 1 }; end",
+                false,
+            ),
+            (
+                "module N; class A; def loop; end; end; end; class N::A; loop { 1 }; end",
+                false,
+            ),
+            (
+                "class A; loop { 1 }; end; class A; def self.loop; end; end",
+                false,
+            ),
+        ] {
+            let tree = parse(source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let mut stack = vec![tree.root_node()];
+            let mut found = 0;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "call" && node.child_by_field_name("block").is_some() {
+                    found += 1;
+                    assert_eq!(
+                        ruby_unconditional_loop_body(node, source).is_some(),
+                        expected,
+                        "{source}"
+                    );
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(index).unwrap());
+                }
+            }
+            assert_eq!(found, 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn recovery_and_symbol_grammar_boundaries() {
+        for source in [
+            "def broken(\n \"x\".strip\n",
+            "def broken(\n sink(\"x\".strip)\n",
+        ] {
+            let tree = parse(source);
+            assert!(tree.root_node().has_error());
+            let mut stack = vec![tree.root_node()];
+            let mut calls = 0;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "call" {
+                    calls += 1;
+                    assert!(has_recovery_ancestor(node));
+                    assert!(!has_recovery_descendant(node));
+                    assert_eq!(
+                        ruby_call_result_use(node, source).default_use(),
+                        CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+                    );
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(index).unwrap());
+                }
+            }
+            assert!(calls > 0);
+        }
+        assert_eq!(
+            result_use_calls("value = \"x\".strip")[0].1,
+            CallResultUse::Consumed
+        );
+        assert!(RUBY_STRUCTURAL_SPEC.supports_kind(NormalizedKind::SyntaxError));
+        for source in [":token", ":\"quoted\"", ":\"\""] {
+            let tree = parse(source);
+            let symbol = tree.root_node().named_child(0).unwrap();
+            assert!(matches!(
+                symbol.kind(),
+                "simple_symbol" | "delimited_symbol"
+            ));
+            let name = symbol_name_node(symbol).expect("symbol role name");
+            assert_eq!(
+                name.kind(),
+                if symbol.named_child_count() == 0 {
+                    symbol.kind()
+                } else {
+                    "string_content"
+                }
+            );
+        }
+    }
+
     fn parse(source: &str) -> tree_sitter::Tree {
         crate::declarations::parse_ruby_tree(source).expect("source parses")
+    }
+
+    /// Ruby 2.7 `eval(literal)` supplies the static values below. Unknown
+    /// cases are deliberate adapter boundaries, never partial decoded values.
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: single-quoted escapes and CRLF continuations were not decoded"
+    )]
+    fn ruby_literal_grammar_and_values() {
+        let cases = [
+            (r"'plain'", Some("plain")),
+            (r"'it\'s \\ fine'", Some("it's \\ fine")),
+            (r"'\n\t\x41\101'", Some(r"\n\t\x41\101")),
+            ("'a\\\nb'", Some("a\\\nb")),
+            (
+                r#""a\n\t\r\s\a\b\e\f\v""#,
+                Some("a\n\t\r \u{7}\u{8}\u{1b}\u{c}\u{b}"),
+            ),
+            (r#""\"\\\'""#, Some("\"\\'")),
+            (r#""\x41\101\x4""#, Some("AA\u{4}")),
+            ("\"a\\\nb\"", Some("ab")),
+            ("\"a\\\r\nb\"", Some("ab")),
+            ("\"caf\u{e9}\"", Some("caf\u{e9}")),
+            (r#""""#, Some("")),
+            // Unicode/control escapes and percent delimiters are unsupported.
+            (r#""\u{41 42}""#, None),
+            (r#""\C-a""#, None),
+            (r#"%q(literal\n)"#, None),
+            (r#"%Q(value #{dynamic})"#, None),
+            (r#""prefix #{dynamic} suffix""#, None),
+        ];
+        for (source, expected) in cases {
+            let tree = parse(source);
+            assert!(!tree.root_node().has_error(), "{source:?}");
+            let node = tree.root_node().named_child(0).unwrap();
+            assert_eq!(node.kind(), "string", "{source:?}");
+            assert_eq!(node.byte_range(), 0..source.len());
+            if source == "\"a\\\r\nb\"" {
+                assert_eq!(
+                    node.named_children(&mut node.walk())
+                        .map(|child| (child.kind(), node_text(child, source)))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("string_content", "a"),
+                        ("escape_sequence", "\\\r"),
+                        ("string_content", "\nb")
+                    ]
+                );
+            }
+            assert_eq!(
+                RUBY_STRUCTURAL_SPEC
+                    .string_literal_value(node, source)
+                    .as_deref(),
+                expected,
+                "{source:?}: {:?}",
+                node.named_children(&mut node.walk())
+                    .map(|child| (child.kind(), node_text(child, source)))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                RUBY_STRUCTURAL_SPEC.string_literal_value_may_be_absent(node, source),
+                expected.is_none(),
+                "{source:?}"
+            );
+            let file =
+                brokk_bifrost_core::analyzer::ProjectFile::new(std::env::temp_dir(), "literal.rb");
+            let parsed = crate::adapter::parse_ruby_file(&file, source, &tree);
+            let facts = parsed.source_facts.expect("primary Ruby facts");
+            let literal = facts
+                .structural
+                .nodes()
+                .iter()
+                .find(|fact| {
+                    fact.kind == NormalizedKind::StringLiteral
+                        && facts
+                            .occurrences
+                            .occurrence(fact.occurrence)
+                            .range
+                            .start_byte
+                            == 0
+                })
+                .expect("root string literal fact");
+            assert_eq!(
+                literal.string_value.as_deref(),
+                expected,
+                "primary value for {source:?}"
+            );
+        }
+        let source = "<<~TEXT\n  hello #{dynamic}\nTEXT\n";
+        let tree = parse(source);
+        assert!(!tree.root_node().has_error());
+        let beginning = tree.root_node().named_child(0).unwrap();
+        assert_eq!(beginning.kind(), "heredoc_beginning");
+        assert_eq!(
+            RUBY_STRUCTURAL_SPEC.string_literal_value(beginning, source),
+            None
+        );
+    }
+
+    /// Pin every field occurrence of the grammar's as-pattern, including a
+    /// nested as-pattern and a pin, before checking the binding interpretation.
+    #[test]
+    fn ruby_as_pattern_grammar_and_bindings() {
+        let source = "pin = 1\ncase subject\nin [head, *tail] => whole\n  head; tail; whole\nin [(inner => nested), ^pin] => outer\n  inner; nested; outer; pin\nend\n";
+        let tree = parse(source);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut patterns = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "as_pattern" {
+                let values: Vec<_> = node
+                    .children_by_field_name("value", &mut node.walk())
+                    .collect();
+                assert_eq!(values.len(), 1, "{}", node.to_sexp());
+                let name = node.child_by_field_name("name").unwrap();
+                assert_eq!(name.kind(), "identifier");
+                patterns.push((
+                    node_text(name, source),
+                    name.byte_range(),
+                    values[0].kind(),
+                    values[0].byte_range(),
+                    node_text(values[0], source),
+                ));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).unwrap());
+            }
+        }
+        assert_eq!(
+            patterns,
+            [
+                ("whole", 41..46, "array_pattern", 24..37, "[head, *tail]"),
+                (
+                    "outer",
+                    99..104,
+                    "array_pattern",
+                    70..95,
+                    "[(inner => nested), ^pin]"
+                ),
+                ("nested", 81..87, "identifier", 72..77, "inner"),
+            ]
+        );
+        let bindings = collect_local_bindings(
+            source,
+            tree.root_node(),
+            tree.root_node(),
+            None,
+            &mut UnboundedLocalBindingBudget,
+        )
+        .unwrap()
+        .timeline;
+        let mut names = bindings.active_names_at(source.len());
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["head", "inner", "nested", "outer", "pin", "tail", "whole"]
+        );
+        // The subject is the only bare call. Pattern names and every subsequent
+        // read are locals, including the pinned name (which creates no binding).
+        let calls = bare_call_starts(source);
+        assert_eq!(calls, HashSet::from_iter([source.find("subject").unwrap()]));
+    }
+
+    /// Ripper.sexp classifies these expression statements as vcall/var_ref.
+    /// Tree-sitter uses identifiers for both, so pin that grammar boundary
+    /// before comparing the public structural call context and primary facts.
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: for-loop iterable bare calls were missing"
+    )]
+    fn ruby_bare_call_grammar_and_lexical_scopes() {
+        let source = "def run(param)\n  before\n  before = 1\n  before\n  param\n  items.each do |param; shadow|\n    before\n    param\n    shadow\n    fresh\n  end\n  shadow\n  for loop_local in items\n    loop_local\n  end\n  loop_local\n  begin\n    work\n  rescue => error\n    error\n  end\n  error\n  ready?\n  save!\n  class << self\n    before\n  end\nend\n";
+        let tree = parse(source);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let context = RUBY_STRUCTURAL_SPEC.call_site_context(tree.root_node(), source);
+        let expected = [
+            (2, "before", "identifier", true),
+            (4, "before", "identifier", false),
+            (5, "param", "identifier", false),
+            (6, "items", "identifier", true),
+            (7, "before", "identifier", false),
+            (8, "param", "identifier", false),
+            (9, "shadow", "identifier", false),
+            (10, "fresh", "identifier", true),
+            (12, "shadow", "identifier", true),
+            (13, "items", "identifier", true),
+            (14, "loop_local", "identifier", false),
+            (16, "loop_local", "identifier", false),
+            (18, "work", "identifier", true),
+            (20, "error", "identifier", false),
+            (22, "error", "identifier", false),
+            (23, "ready?", "call", true),
+            (24, "save!", "call", true),
+            (26, "before", "identifier", true),
+        ];
+        let starts = bare_call_starts(source);
+        let mut expected_bare_starts = HashSet::default();
+        for (line, name, grammar, is_call) in expected {
+            let mut stack = vec![tree.root_node()];
+            let mut matches = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.start_position().row + 1 == line
+                    && node.kind() == grammar
+                    && node_text(node, source) == name
+                {
+                    matches.push(node);
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(index).unwrap());
+                }
+            }
+            assert_eq!(matches.len(), 1, "line {line}: {name}");
+            let node = matches[0];
+            if line == 13 {
+                let wrapper = node.parent().unwrap();
+                assert_eq!(wrapper.kind(), "in");
+                assert_eq!(wrapper.parent().unwrap().kind(), "for");
+                assert_eq!(
+                    wrapper
+                        .parent()
+                        .unwrap()
+                        .child_by_field_name("value")
+                        .unwrap(),
+                    wrapper
+                );
+            }
+            let kind = if grammar == "call" {
+                NormalizedKind::Call
+            } else {
+                NormalizedKind::Identifier
+            };
+            assert_eq!(
+                RUBY_STRUCTURAL_SPEC.refine_kind(node, kind, None, source, &context)
+                    == NormalizedKind::Call,
+                is_call,
+                "line {line}: {name}: {}",
+                node.parent().unwrap().to_sexp()
+            );
+            if grammar == "identifier" {
+                if is_call {
+                    expected_bare_starts.insert(node.start_byte());
+                }
+                assert_eq!(
+                    starts.contains(&node.start_byte()),
+                    is_call,
+                    "line {line}: {name}"
+                );
+            }
+        }
+        assert_eq!(
+            starts, expected_bare_starts,
+            "every bare call in the fixture is accounted for"
+        );
     }
 
     /// The start byte of the `occurrence`-th (0-based) appearance of `needle`
@@ -1135,7 +1592,7 @@ mod tests {
                 let range = facts.occurrences.occurrence(node.occurrence).range;
                 tree.root_node()
                     .descendant_for_byte_range(range.start_byte, range.end_byte)
-                    .filter(|node| node.kind() == "identifier")
+                    .filter(|node| node.kind() == "identifier" && is_value_read_position(*node))
                     .map(|_| range.start_byte)
             })
             .collect();

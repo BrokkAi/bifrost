@@ -27,6 +27,7 @@
 
 use git2::Oid;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind, InvalidationReason};
@@ -418,11 +419,6 @@ impl ChangedFacts {
         self.paths.values().map(HashSet::len).sum()
     }
 
-    /// How many distinct index keys the changed blobs contribute.
-    pub fn changed_key_count(&self) -> usize {
-        self.keys.len()
-    }
-
     fn record_changed_blob(
         &mut self,
         language: Language,
@@ -544,6 +540,7 @@ impl SummaryAnswers for NoSummaryAnswers {
 #[derive(Debug, Default)]
 pub struct LookupMemo {
     answers: HashMap<(LookupKind, LookupQuestion), Option<StableDigest>>,
+    replay_elapsed: Duration,
 }
 
 impl LookupMemo {
@@ -560,6 +557,11 @@ impl LookupMemo {
         self.answers.is_empty()
     }
 
+    /// Time spent executing distinct lookup replays against the workspace.
+    pub fn replay_elapsed(&self) -> Duration {
+        self.replay_elapsed
+    }
+
     /// The head's answer to one question, replaying it at most once.
     pub fn answer(
         &mut self,
@@ -572,7 +574,9 @@ impl LookupMemo {
         if let Some(answer) = self.answers.get(&(kind, question.clone())) {
             return *answer;
         }
+        let started = Instant::now();
         let answer = replay_lookup(head, kind, question, limits, summaries);
+        self.replay_elapsed += started.elapsed();
         self.answers.insert((kind, question.clone()), answer);
         answer
     }
@@ -761,15 +765,20 @@ pub fn replay_lookup(
 ///
 /// Resolved through the head's own declaration lookup for the file the
 /// question names, never by re-parsing or by matching text: the question is a
-/// workspace-relative path and a qualified name, and the analyzer is the only
+/// workspace-relative path and declaration identity, and the analyzer is the only
 /// thing that knows which declarations a file has.
 ///
-/// Two overloads that share a file and a qualified name are one question with
-/// two recorded answers. Replay answers one of them, so at least one recorded
-/// digest disagrees and the unit is recomputed. That is the sound direction:
-/// the conflation can cost reuse, never grant it.
+/// Declarations still sharing all these fields (for example equal signatures in
+/// two Rust impls) use the first source location. A different recorded answer
+/// still disagrees and safely recomputes rather than granting reuse.
 fn replayed_declaration(analyzer: &dyn IAnalyzer, question: &LookupQuestion) -> Option<CodeUnit> {
-    let LookupQuestion::Declaration { rel_path, fq_name } = question else {
+    let LookupQuestion::Declaration {
+        rel_path,
+        fq_name,
+        kind,
+        signature,
+    } = question
+    else {
         debug_assert!(
             false,
             "a declaration-shaped lookup recorded a {} question: {question:?}",
@@ -781,7 +790,22 @@ fn replayed_declaration(analyzer: &dyn IAnalyzer, question: &LookupQuestion) -> 
     analyzer
         .get_declarations(&file)
         .into_iter()
-        .find(|unit| unit.fq_name() == **fq_name)
+        .filter(|unit| {
+            unit.fq_name() == **fq_name
+                && unit.kind() == *kind
+                && unit.signature() == signature.as_deref()
+        })
+        .min_by(|left, right| {
+            let first_byte = |unit: &CodeUnit| {
+                analyzer
+                    .ranges(unit)
+                    .iter()
+                    .map(|range| range.start_byte)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            };
+            first_byte(left).cmp(&first_byte(right))
+        })
 }
 
 /// The head's file for a file question.
@@ -1449,5 +1473,236 @@ fn blob_identity(blob: Option<Oid>) -> StableDigest {
     match blob {
         Some(blob) => StableDigest::sha256(blob.as_bytes()),
         None => StableDigest::sha256(b"bifrost-read-ledger:absent-blob:v1"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    type IndexKeys = Vec<(IndexFamily, Box<[u8]>)>;
+
+    #[derive(Clone)]
+    struct FactIndex {
+        file: ProjectFile,
+        blob: Oid,
+        rows: Vec<(Oid, IndexKeys)>,
+    }
+    impl WorkspaceFactIndex for FactIndex {
+        fn fact_index_language(&self) -> Language {
+            Language::Python
+        }
+        fn declaration_facts_digest(&self, _: &CodeUnit) -> StableDigest {
+            unimplemented!()
+        }
+        fn signature_metadata_digest(&self, _: &CodeUnit) -> StableDigest {
+            unimplemented!()
+        }
+        fn definition_answer_digest(&self, _: &str) -> StableDigest {
+            unimplemented!()
+        }
+        fn identifier_candidate_answer_digest(&self, _: &str) -> StableDigest {
+            unimplemented!()
+        }
+        fn short_name_candidate_answer_digest(&self, _: &str) -> StableDigest {
+            unimplemented!()
+        }
+        fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)> {
+            vec![(self.file.clone(), self.blob)]
+        }
+        fn blob_index_keys(
+            &self,
+            _: &ProjectFile,
+            blob: Oid,
+        ) -> Option<Vec<(IndexFamily, Box<[u8]>)>> {
+            self.rows
+                .iter()
+                .find(|(id, _)| *id == blob)
+                .map(|(_, keys)| keys.clone())
+        }
+        fn stored_blob_index_keys(
+            &self,
+            file: &ProjectFile,
+            blob: Oid,
+            _: &str,
+        ) -> Option<Vec<(IndexFamily, Box<[u8]>)>> {
+            self.blob_index_keys(file, blob)
+        }
+    }
+    fn fixture_index(root: &Path, source: &str) -> FactIndex {
+        let blob = |text: &str| Oid::hash_object(git2::ObjectType::Blob, text.as_bytes()).unwrap();
+        let file = ProjectFile::new(root.to_path_buf(), "app.py");
+        file.write(source).unwrap();
+        FactIndex {
+            file,
+            blob: blob(source),
+            // An independent, handwritten fact-store oracle. No parsing or
+            // fact production is under test at this replay boundary.
+            rows: vec![
+                (
+                    blob("def before():\n    pass\n"),
+                    vec![(
+                        IndexFamily::DefinitionExact,
+                        Box::from(b"before".as_slice()),
+                    )],
+                ),
+                (
+                    blob("def after():\n    pass\n"),
+                    vec![(IndexFamily::DefinitionExact, Box::from(b"after".as_slice()))],
+                ),
+            ],
+        }
+    }
+    fn workspace(root: &Path, index: Option<FactIndex>) -> WorkspaceAnalyzer {
+        use crate::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+        let analyzer = crate::analyzer::packs_document::tests::CatalogWorkspace {
+            project: std::sync::Arc::new(crate::TestProject::new(root, Language::Python)),
+            language: Language::Python,
+            index: index
+                .map(|index| std::sync::Arc::new(index) as std::sync::Arc<dyn WorkspaceFactIndex>),
+        };
+        WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(
+            std::collections::BTreeMap::from([(Language::Python, AnalyzerDelegate::new(analyzer))]),
+        )))
+    }
+    fn workspace_fixture(source: &str) -> (tempfile::TempDir, WorkspaceAnalyzer) {
+        let root = tempfile::tempdir().unwrap();
+        let index = fixture_index(root.path(), source);
+        let head = workspace(root.path(), Some(index));
+        (root, head)
+    }
+
+    fn inputs() -> HeadInputs {
+        let digest = StableDigest::sha256(b"test non-source inputs");
+        HeadInputs {
+            models: digest,
+            policy_semantic_hash: digest,
+            policy_source: digest,
+            configuration: digest,
+            epoch: digest,
+        }
+    }
+
+    #[test]
+    fn summary_read_replay_is_independent_of_unit_order_and_multiplicity() {
+        struct Answers(StableDigest);
+        impl SummaryAnswers for Answers {
+            fn summary_content(&self, _identity: StableDigest) -> Option<StableDigest> {
+                Some(self.0)
+            }
+        }
+        let (_base_root, base) = workspace_fixture("def target():\n    return 1\n");
+        let recorded = StableDigest::sha256(b"return 1");
+        for (source, current) in [
+            ("def target():\n    return 1\n", recorded),
+            (
+                "def target():\n    return 2\n",
+                StableDigest::sha256(b"return 2"),
+            ),
+        ] {
+            let (_root, head) = workspace_fixture(source);
+            let changed = ChangedFacts::between(&base, &head);
+            let answers = Answers(current);
+            for order in [[0, 0, 1], [0, 1, 0], [1, 0, 0]] {
+                let mut shared = LookupMemo::new();
+                for identity in order {
+                    let keys = [ReadKey::Lookup {
+                        kind: LookupKind::ProcedureSummary,
+                        question: LookupQuestion::Summary {
+                            identity: StableDigest::sha256([identity]),
+                        },
+                        digest: recorded,
+                    }];
+                    let replay = |memo: &mut LookupMemo| {
+                        verify_read_set(
+                            &head,
+                            &changed,
+                            &inputs(),
+                            &keys,
+                            LookupReplayLimits::default(),
+                            &answers,
+                            memo,
+                        )
+                    };
+                    let independent = replay(&mut LookupMemo::new());
+                    assert_eq!(independent.is_unchanged(), current == recorded);
+                    assert_eq!(replay(&mut shared), independent, "unit order {order:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_replay_requires_both_evidence_channels_for_changed_and_unchanged_heads() {
+        let (base_root, base) = workspace_fixture("def before():\n    pass\n");
+        let base_blobs = fact_indexes_by_language(&base)[&Language::Python]
+            .analyzed_blobs()
+            .into_iter()
+            .map(|(file, blob)| {
+                (
+                    Box::<str>::from(crate::path_utils::rel_path_string(&file)),
+                    blob,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (source, unchanged) in [
+            ("def before():\n    pass\n", true),
+            ("def after():\n    pass\n", false),
+        ] {
+            let (root, head) = workspace_fixture(source);
+            let keys = [ReadKey::index(IndexFamily::DefinitionExact, b"before")];
+            let replay = |facts: &ChangedFacts| {
+                verify_read_set(
+                    &head,
+                    facts,
+                    &inputs(),
+                    &keys,
+                    LookupReplayLimits::default(),
+                    &NoSummaryAnswers,
+                    &mut LookupMemo::new(),
+                )
+            };
+            let facts = ChangedFacts::between(&base, &head);
+            assert_eq!(replay(&facts).is_unchanged(), unchanged);
+            let committed = ChangedFacts::from_committed_tree(&head, &base_blobs, &|_| {
+                Some(std::fs::read_to_string(base_root.path().join("app.py")).unwrap())
+            });
+            assert_eq!(replay(&committed), replay(&facts));
+            // A negative probe cannot be licensed by either partial channel,
+            // even when every available store row omits the requested name.
+            let negative = [ReadKey::index(
+                IndexFamily::DefinitionExact,
+                b"not_yet_defined",
+            )];
+            let missing_language = workspace(root.path(), None);
+            let mut missing_blob_index = fixture_index(root.path(), source);
+            missing_blob_index.rows.clear();
+            let missing_blob = workspace(root.path(), Some(missing_blob_index));
+            for (incomplete_head, expected) in
+                [(&missing_language, false), (&missing_blob, unchanged)]
+            {
+                let facts = ChangedFacts::between(&base, incomplete_head);
+                let verdict = verify_read_set(
+                    incomplete_head,
+                    &facts,
+                    &inputs(),
+                    &negative,
+                    LookupReplayLimits::default(),
+                    &NoSummaryAnswers,
+                    &mut LookupMemo::new(),
+                );
+                // Byte-identical blobs need no enumeration. A missing index
+                // cannot prove even the file inventory, so it still widens.
+                assert_eq!(verdict.is_unchanged(), expected, "{verdict:?}; {facts:?}");
+                if !expected {
+                    assert!(
+                        matches!(
+                            verdict.changed().map(|read| &read.reason),
+                            Some(InvalidationReason::ContentIdentityEvidenceMissing { .. })
+                        ),
+                        "{verdict:?}"
+                    );
+                }
+            }
+        }
     }
 }

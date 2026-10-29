@@ -776,10 +776,9 @@ impl<T> ResolvedTaintAuxiliary<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ResolvedTaintSanitizerDefinition {
-    pub input: PolicyPort,
-    pub output: PolicyPort,
+    pub kind: TaintSanitizerKind,
     pub removes: Vec<TaintLabel>,
 }
 
@@ -2005,8 +2004,8 @@ fn validate_resolved_taint(
             .ok_or(LoadedModelError::InvalidResolvedModel {
                 reason: "authored local sanitizer is absent from the resolved sanitizer set",
             })?;
-        if resolved_entry.definition.input != authored_entry.input
-            || resolved_entry.definition.output != authored_entry.output
+        if crate::canonical::sanitizer_kind_to_json(&resolved_entry.definition.kind)
+            != crate::canonical::sanitizer_kind_to_json(&authored_entry.kind)
             || !same_set(&resolved_entry.definition.removes, &authored_entry.removes)
         {
             return invalid("resolved local sanitizer differs from its authored definition");
@@ -2173,16 +2172,21 @@ fn validate_resolved_taint(
         .chain(authored.transforms.include_sets.iter())
         .chain(authored.external_models.include_sets.iter())
     {
+        let CatalogRef::Named {
+            name,
+            version,
+            sha256,
+        } = reference
+        else {
+            continue;
+        };
         let catalog = catalogs
             .iter()
-            .find(|catalog| catalog.name == reference.name && catalog.version == reference.version);
+            .find(|catalog| &catalog.name == name && &catalog.version == version);
         let Some(catalog) = catalog else {
             return invalid("authored catalog reference is absent from the resolved catalog set");
         };
-        if reference
-            .sha256
-            .is_some_and(|pin| pin != catalog.semantic_hash)
-        {
+        if sha256.is_some_and(|pin| pin != catalog.semantic_hash) {
             return invalid("authored catalog hash pin differs from the resolved catalog");
         }
     }
@@ -2941,6 +2945,14 @@ fn validate_authored_policy_selectors(
                     &sanitizer.selector,
                     selectors,
                 )?;
+                let base = taint_entry_selector_path(segments.sanitizers, sanitizer.id.as_str());
+                for (index, selector) in sanitizer.kind.requirement_selectors() {
+                    validate_authored_selector_at(
+                        &sanitizer_requirement_selector_path(&base, index),
+                        selector,
+                        selectors,
+                    )?;
+                }
             }
             for transform in &spec.transforms.entries {
                 validate_authored_selector_at(
@@ -3354,6 +3366,14 @@ fn validate_selector_closure(
                 .iter()
                 .map(|entry| entry.selector_path.clone()),
         );
+        for entry in &spec.sanitizers {
+            for (index, _) in entry.definition.kind.requirement_selectors() {
+                expected.push(selector_path(&sanitizer_requirement_selector_path(
+                    entry.selector_path.as_str(),
+                    index,
+                ))?);
+            }
+        }
         expected.extend(
             spec.transforms
                 .iter()
@@ -3440,6 +3460,14 @@ fn expected_selector_paths(
             extend_taint_paths(&mut paths, segments.sources, &spec.sources.entries)?;
             extend_taint_paths(&mut paths, segments.sinks, &spec.sinks.entries)?;
             extend_taint_paths(&mut paths, segments.sanitizers, &spec.sanitizers.entries)?;
+            for entry in &spec.sanitizers.entries {
+                let base = taint_entry_selector_path(segments.sanitizers, entry.id.as_str());
+                for (index, _) in entry.kind.requirement_selectors() {
+                    paths.push(selector_path(&sanitizer_requirement_selector_path(
+                        &base, index,
+                    ))?);
+                }
+            }
             extend_taint_paths(&mut paths, segments.transforms, &spec.transforms.entries)?;
             extend_taint_paths(
                 &mut paths,
@@ -3712,8 +3740,10 @@ mod tests {
             identity,
             selector_path,
             ResolvedTaintSanitizerDefinition {
-                input: PolicyPort::ArgumentIndex { index: 0 },
-                output: PolicyPort::ReturnValue,
+                kind: TaintSanitizerKind::Transfer {
+                    input: PolicyPort::ArgumentIndex { index: 0 },
+                    output: PolicyPort::ReturnValue,
+                },
                 removes: vec![TaintLabel::new("unsafe").unwrap()],
             },
             origins,

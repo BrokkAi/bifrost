@@ -1,8 +1,13 @@
 //! Ordered implicit receivers over source lexical paths and shared hierarchy selection.
 //! Everything retained here belongs to one query and one typed evaluation round.
+use super::super::LoweredQualifiedSeededRoute;
 use super::super::fact_source::language_uses_enclosing_companion_members;
 use super::call_applicability::{ImplicitReceiverLookup, ImplicitReceiverScopeKind};
 use super::*;
+use crate::analyzer::store::language_support::{
+    SelectedReceiverInstantiation, SelectedReceiverSlotRead, SelectedReceiverStepRead,
+    SelectedReceiverStepRequest, SelectedReceiverStepSource, SelectedTypeHeadSource,
+};
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind;
 
 #[derive(Debug, Clone, Copy)]
@@ -192,11 +197,46 @@ pub(super) fn implicit_receiver_call(call: &LoweredCallApplicabilityObligation) 
             .is_some()
 }
 
+enum ReceiverLevelOrigin {
+    Lexical {
+        scope: usize,
+    },
+    Explicit {
+        frontier: Vec<ExplicitReceiverContext>,
+    },
+}
+
+impl ReceiverLevelOrigin {
+    fn lexical_scope(&self) -> usize {
+        let Self::Lexical { scope } = self else {
+            unreachable!("lexical setup and bridges require a lexical level");
+        };
+        *scope
+    }
+}
+
+#[derive(Clone)]
+struct ExplicitReceiverContext {
+    receiver_slot: SemanticId,
+    value: ResolutionSlotValue,
+    instantiation: SelectedReceiverInstantiation,
+    completion: ResolutionCompletion,
+}
+
+// A fully evaluated level retains witnesses as well as its selected targets.
+// Lexical inventories are populated eagerly; their answer arrives after bridge
+// replay. Explicit inventories are populated by the qualified continuation.
+struct ReceiverLevelResult {
+    answer: ResolutionAnswer,
+    matched_receivers: HashSet<ResolutionSlotValue>,
+}
+
 struct ReceiverLevel {
-    scope: usize,
+    origin: ReceiverLevelOrigin,
     ty: Option<ResolutionTypeRef>,
     completion: ResolutionCompletion,
     members: HashSet<SemanticId>,
+    result: Option<ReceiverLevelResult>,
     additions: Vec<(CandidatePathIdentity, PartialPath)>,
     removals: Vec<CandidatePathIdentity>,
 }
@@ -336,10 +376,11 @@ impl DemandImplicitReceiverFrame {
             );
             for ty in receivers {
                 levels.push(ReceiverLevel {
-                    scope,
+                    origin: ReceiverLevelOrigin::Lexical { scope },
                     ty,
                     completion: completion.clone(),
                     members: HashSet::default(),
+                    result: None,
                     additions: Vec::new(),
                     removals: Vec::new(),
                 });
@@ -479,7 +520,7 @@ impl DemandImplicitReceiverFrame {
                 return Ok(Ready(None));
             };
             let shape = self.shapes[self.shape];
-            let owner = self.chain[self.levels[self.level].scope]
+            let owner = self.chain[self.levels[self.level].origin.lexical_scope()]
                 .owner
                 .as_ref()
                 .unwrap();
@@ -589,7 +630,9 @@ impl DemandImplicitReceiverFrame {
             )?;
             match construction {
                 SelectedContextOverlayFragmentSourceBlueprintConstruction::Ready(overlay) => {
-                    self.overlay = Some(overlay)
+                    self.overlay = Some(overlay.with_external_definitions(
+                        &evaluation.hierarchy.external_lexical_definitions,
+                    ))
                 }
                 SelectedContextOverlayFragmentSourceBlueprintConstruction::Cancelled {
                     cancellation_completion,
@@ -645,7 +688,7 @@ impl DemandImplicitReceiverFrame {
     }
 
     fn finish(
-        &self,
+        &mut self,
         evaluation: &mut FactEvaluation<'_, '_>,
         batch: super::super::batch::ReferenceBatchAnswer,
     ) -> StoreResult<DemandQualifiedPoll> {
@@ -659,11 +702,25 @@ impl DemandImplicitReceiverFrame {
         let (reference, answer) = answer.into_parts();
         assert_eq!(reference, self.seed.reference());
         let (targets, witnesses, completion) = answer.into_parts();
-        Ok(DemandQualifiedPoll::Ready(Some(ResolutionAnswer::new(
-            targets,
-            witnesses,
-            completion.combine(&self.completion),
-        ))))
+        let answer =
+            ResolutionAnswer::new(targets, witnesses, completion.combine(&self.completion));
+        for level in &mut self.levels {
+            if answer
+                .targets()
+                .iter()
+                .any(|target| level.members.contains(target))
+            {
+                level.result = Some(ReceiverLevelResult {
+                    answer: answer.clone(),
+                    matched_receivers: level
+                        .ty
+                        .into_iter()
+                        .map(|ty| ResolutionSlotValue::runtime(ty, false))
+                        .collect(),
+                });
+            }
+        }
+        Ok(DemandQualifiedPoll::Ready(Some(answer)))
     }
 
     fn retain_members(
@@ -673,7 +730,7 @@ impl DemandImplicitReceiverFrame {
     ) -> StoreResult<()> {
         let shape = self.shapes[self.shape];
         let level = &mut self.levels[self.level];
-        let scope = &self.chain[level.scope];
+        let scope = &self.chain[level.origin.lexical_scope()];
         let ty = level.ty.expect("a searched receiver has a type");
         let Some(mut completion) =
             evaluation
@@ -868,11 +925,12 @@ impl DemandImplicitReceiverFrame {
             }
         }
 
-        let mut blocked = ResolutionCompletion::Complete;
+        let mut selection = ReceiverLevelSelection::new(ResolutionCompletion::Complete);
         for index in 0..self.levels.len() {
             let level = &self.levels[index];
             let Some(ty) = level.ty else {
-                blocked = blocked
+                selection.completion = selection
+                    .completion
                     .combine(&self.blocked_completion(evaluation)?)
                     .combine(&level.completion);
                 continue;
@@ -887,7 +945,8 @@ impl DemandImplicitReceiverFrame {
                 dispatch: Some(ty),
             };
             if self.rule == ImplicitReceiverLookup::FirstMemberName && !members.is_empty() {
-                self.completion = blocked.combine(&level.completion);
+                selection.select_level(&level.completion, &ResolutionCompletion::Complete, true);
+                self.completion = selection.completion;
                 self.cut_outer(index);
                 return Ok(Some(members));
             }
@@ -895,19 +954,18 @@ impl DemandImplicitReceiverFrame {
             else {
                 return Ok(None);
             };
-            if !probe.allowed.is_empty() {
-                self.completion = blocked
-                    .combine(&self.levels[index].completion)
-                    .combine(&probe.completion);
+            if selection.select_level(
+                &self.levels[index].completion,
+                &probe.completion,
+                !probe.allowed.is_empty(),
+            ) {
+                self.completion = selection.completion;
                 self.install_proofs(evaluation, probe.proofs);
                 self.cut_outer(index);
                 return Ok(Some(probe.allowed));
             }
             // Retain outer candidates as best-effort answers, carrying every
             // unexamined inner frontier so none can become a proven answer.
-            blocked = blocked
-                .combine(&self.levels[index].completion)
-                .combine(&probe.completion);
             if self.rule == ImplicitReceiverLookup::FirstMemberName {
                 continue;
             }
@@ -948,12 +1006,15 @@ impl DemandImplicitReceiverFrame {
                     proofs.extend(probe.proofs);
                 }
             }
-            if !allowed.is_empty() {
-                self.completion = blocked.combine(&extension_inventory);
+            if selection.select_level(
+                &extension_inventory,
+                &ResolutionCompletion::Complete,
+                !allowed.is_empty(),
+            ) {
+                self.completion = selection.completion;
                 self.install_proofs(evaluation, proofs);
                 return Ok(Some(allowed));
             }
-            blocked = blocked.combine(&extension_inventory);
         }
         // No receiver claims the name: resume the original lexical/import
         // precedence after excluding the examined member and extension routes.
@@ -967,12 +1028,15 @@ impl DemandImplicitReceiverFrame {
         }
         // This root lookup can be an unresolved placement boundary. Keep its
         // original evidence; no synthetic successful answer is fabricated.
-        self.completion = self.completion.combine(&blocked);
+        self.completion = self.completion.combine(&selection.completion);
         Ok(Some(candidates))
     }
 
     fn cut_outer(&mut self, level: usize) {
-        if let Some((identity, _)) = &self.chain[self.levels[level].scope].outward {
+        let ReceiverLevelOrigin::Lexical { scope } = self.levels[level].origin else {
+            return;
+        };
+        if let Some((identity, _)) = &self.chain[scope].outward {
             self.levels[level].removals.push(*identity);
         }
     }
@@ -1286,5 +1350,653 @@ impl FactEvaluation<'_, '_> {
                 DemandQualifiedPoll::Ready(answer) => return Ok(answer),
             }
         }
+    }
+}
+
+// rustc rejects recursive receiver expansion. Real receiver chains are short;
+// eight derived steps bound work even when every step changes generic arguments.
+const MAX_EXPLICIT_RECEIVER_STEPS: usize = 8;
+
+/// Ordered selection is independent of how a level obtains its members. Empty
+/// inner levels retain their completion in the first successful outer answer.
+struct ReceiverLevelSelection {
+    completion: ResolutionCompletion,
+    selected: bool,
+}
+
+impl ReceiverLevelSelection {
+    fn new(completion: ResolutionCompletion) -> Self {
+        Self {
+            completion,
+            selected: false,
+        }
+    }
+
+    fn select_level(
+        &mut self,
+        level: &ResolutionCompletion,
+        applicability: &ResolutionCompletion,
+        has_members: bool,
+    ) -> bool {
+        assert!(
+            !self.selected,
+            "a successful receiver stops its ordered search"
+        );
+        self.completion = self.completion.combine(level).combine(applicability);
+        self.selected = has_members;
+        self.selected
+    }
+}
+
+struct ExplicitReceiverCursor {
+    context: ExplicitReceiverContext,
+    selection: ReceiverLevelSelection,
+    visited: HashSet<(ResolutionTypeRef, SelectedReceiverInstantiation)>,
+    steps: usize,
+}
+
+/// The first continuation searches the original frontier as one unit. Subsequent
+/// continuations search one derived receiver at a time. Alternative receivers
+/// are unioned; only levels of the same alternative have first-success order.
+/// All retained state dies with this query.
+pub(super) struct DemandQualifiedFrame {
+    frame: Option<QualifiedReceiverFrame>,
+    template: PreparedQualifiedSeed,
+    literal_struct_field: bool,
+    call: Option<InternedFactRow<SelectedTypedRow<LoweredCallApplicabilityObligation>>>,
+    level: ReceiverLevel,
+    cursors: VecDeque<ExplicitReceiverCursor>,
+    cursor: Option<ExplicitReceiverCursor>,
+    states: Option<StateMap>,
+    answer: Option<ResolutionAnswer>,
+    advanced: bool,
+    closed: bool,
+}
+
+impl DemandQualifiedFrame {
+    pub(super) fn new(frame: QualifiedReceiverFrame, states: &StateMap) -> Self {
+        let template = frame
+            .prepared
+            .as_ref()
+            .expect("initial qualified seed")
+            .clone();
+        let mut seen = HashSet::default();
+        let mut frontier = Vec::new();
+        for route in &template.routes {
+            let slot = route.row().qualifier_slot();
+            if let Some(state) = states.get(&slot) {
+                for &value in state.possible_values() {
+                    if seen.insert((slot, value)) {
+                        frontier.push(ExplicitReceiverContext {
+                            receiver_slot: slot,
+                            value,
+                            instantiation: SelectedReceiverInstantiation {
+                                application_slot: slot,
+                                substitutions: Vec::new(),
+                            },
+                            completion: state.completion().clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Self {
+            template,
+            literal_struct_field: frame.literal_struct_field,
+            call: frame.call,
+            frame: Some(frame),
+            level: ReceiverLevel {
+                origin: ReceiverLevelOrigin::Explicit { frontier },
+                ty: None,
+                completion: ResolutionCompletion::Complete,
+                members: HashSet::default(),
+                result: None,
+                additions: Vec::new(),
+                removals: Vec::new(),
+            },
+            cursors: VecDeque::new(),
+            cursor: None,
+            states: None,
+            answer: None,
+            advanced: false,
+            closed: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn receiver_frame(&self) -> Option<&QualifiedReceiverFrame> {
+        self.frame.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn receiver_frame_mut(&mut self) -> Option<&mut QualifiedReceiverFrame> {
+        self.frame.as_mut()
+    }
+
+    pub(super) fn pending_requests(&self) -> &[BatchCandidateRequest] {
+        self.frame
+            .as_ref()
+            .map_or(&[], QualifiedReceiverFrame::pending_requests)
+    }
+
+    pub(super) fn active_forward_frame(&mut self) -> Option<&mut DemandForwardBatchFrame> {
+        self.frame.as_mut()?.active_forward_frame()
+    }
+
+    pub(super) fn cancel(self, evaluation: &mut FactEvaluation<'_, '_>) {
+        if let Some(frame) = self.frame {
+            frame.cancel(evaluation);
+        }
+        if let Some(answer) = self.answer {
+            evaluation.observe_resolution_answer_cancellation_evidence(&answer);
+        }
+        if let Some(result) = self.level.result {
+            evaluation.observe_resolution_answer_cancellation_evidence(&result.answer);
+        }
+        for cursor in self.cursors.into_iter().chain(self.cursor) {
+            evaluation.observe_cancellation_completion(&cursor.selection.completion);
+        }
+    }
+
+    pub(super) fn poll(
+        &mut self,
+        reference: SemanticId,
+        evaluation: &mut FactEvaluation<'_, '_>,
+        previous_states: &StateMap,
+        readiness: &mut impl FnMut(&[BatchCandidateRequest]) -> StoreResult<DemandForwardReadiness>,
+    ) -> StoreResult<DemandQualifiedPoll> {
+        use DemandQualifiedPoll::{Continue, Ready};
+        loop {
+            if let Some(frame) = &mut self.frame {
+                let result = frame.poll(
+                    reference,
+                    evaluation,
+                    self.states.as_ref().unwrap_or(previous_states),
+                    readiness,
+                )?;
+                let Ready(Some(answer)) = result else {
+                    return Ok(result);
+                };
+                self.frame = None;
+                let matched_receivers = answer
+                    .targets()
+                    .iter()
+                    .flat_map(|target| {
+                        evaluation
+                            .receiver_level_matches
+                            .get(&(reference, *target))
+                            .into_iter()
+                            .flat_map(|values| values.iter().copied())
+                    })
+                    .collect();
+                self.level.result = Some(ReceiverLevelResult {
+                    answer,
+                    matched_receivers,
+                });
+                let result = self.level.result.as_ref().unwrap();
+                if let Some(cursor) = &mut self.cursor {
+                    let success = cursor.selection.select_level(
+                        result.answer.completion(),
+                        &ResolutionCompletion::Complete,
+                        !result.answer.targets().is_empty(),
+                    );
+                    if success {
+                        let cursor = self.cursor.take().unwrap();
+                        let result = self.level.result.take().unwrap();
+                        self.closed &= result.answer.completion()
+                            == &ResolutionCompletion::Complete
+                            && cursor.context.completion == ResolutionCompletion::Complete;
+                        self.states = None;
+                        let (targets, witnesses, _) = result.answer.into_parts();
+                        let answer =
+                            ResolutionAnswer::new(targets, witnesses, cursor.selection.completion);
+                        let Some(answer) =
+                            evaluation.merge_qualified_answers(self.answer.take().unwrap(), answer)
+                        else {
+                            return Ok(Ready(None));
+                        };
+                        self.answer = Some(answer);
+                    }
+                } else {
+                    let ReceiverLevelOrigin::Explicit { frontier } = &self.level.origin else {
+                        unreachable!("qualified search has explicit receivers");
+                    };
+                    for context in frontier {
+                        if !result.matched_receivers.contains(&context.value) {
+                            self.cursors.push_back(ExplicitReceiverCursor {
+                                context: context.clone(),
+                                selection: ReceiverLevelSelection::new(
+                                    result.answer.completion().clone(),
+                                ),
+                                visited: std::iter::once((
+                                    context.value.ty(),
+                                    context.instantiation.clone(),
+                                ))
+                                .collect(),
+                                steps: 0,
+                            });
+                        }
+                    }
+                    // Preserve the exact step-zero bytes when no hook advances.
+                    self.answer = Some(self.level.result.take().unwrap().answer);
+                }
+            }
+            if self.cursor.is_none() {
+                self.cursor = self.cursors.pop_front();
+            }
+            let Some(cursor) = &mut self.cursor else {
+                let answer = self.answer.take().expect("step-zero answer");
+                return Ok(Ready(if self.advanced && self.closed {
+                    evaluation
+                        .refine_direct_qualified_binding(&answer, &self.template.route_gap_reasons)
+                } else {
+                    Some(answer)
+                }));
+            };
+            let language = self
+                .template
+                .routes
+                .first()
+                .expect("qualified routes")
+                .language();
+            let Some(support) = crate::analyzer::store::store_language_support(language) else {
+                self.finish_cursor();
+                continue;
+            };
+            let call = self
+                .call
+                .map(|call| call.get(evaluation.session).row().call());
+            let request = SelectedReceiverStepRequest {
+                reference,
+                call,
+                qualifier_slot: cursor.context.receiver_slot,
+                value: cursor.context.value,
+                instantiation: &cursor.context.instantiation,
+            };
+            let step = support.selected_receiver_step(
+                request,
+                &mut ReceiverStepReads {
+                    evaluation,
+                    states: self.states.as_ref().unwrap_or(previous_states),
+                },
+            )?;
+            let step = match step {
+                SelectedReceiverStepRead::Pending => return Ok(Ready(None)),
+                SelectedReceiverStepRead::Cancelled => {
+                    evaluation.cancellation_observed = true;
+                    return Ok(Ready(None));
+                }
+                SelectedReceiverStepRead::ReadyNone => {
+                    self.finish_cursor();
+                    continue;
+                }
+                SelectedReceiverStepRead::ReadyStep(step) => step,
+            };
+            if evaluation.poll_cancelled() {
+                return Ok(Ready(None));
+            }
+            cursor.selection.completion = cursor.selection.completion.combine(&step.completion);
+            let reason: Option<&'static [u8]> = if let Some(reason) = step.stop_reason {
+                Some(reason.as_bytes())
+            } else if step.values.len() != 1 {
+                Some(b"receiver-step-target-not-singleton".as_slice())
+            } else if cursor.steps == MAX_EXPLICIT_RECEIVER_STEPS {
+                Some(b"receiver-step-budget-exhausted".as_slice())
+            } else if !cursor
+                .visited
+                .insert((step.values[0].ty(), step.instantiation.clone()))
+            {
+                Some(b"receiver-step-cycle".as_slice())
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let reason = if let Some(identities) = &evaluation.session.context_identities {
+                    let mut hash = CanonicalHasher::new(b"bifrost-explicit-receiver-stop:v1");
+                    hash.field("kind", reason);
+                    hash.identity_field("reference", reference, |key| {
+                        evaluation
+                            .session
+                            .identity_digest(evaluation.hierarchy, key)
+                    })?;
+                    let name = std::str::from_utf8(reason).expect("receiver stop names are ASCII");
+                    identities.named_semantic(hash.finish(), name, name)
+                } else {
+                    canonical_service_reason(
+                        evaluation.session,
+                        evaluation.hierarchy,
+                        reason,
+                        &[CanonicalIdentityPart::identity(reference)],
+                    )?
+                };
+                cursor.selection.completion =
+                    cursor
+                        .selection
+                        .completion
+                        .combine(&ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                        ]));
+                self.finish_cursor();
+                continue;
+            }
+            self.advanced = true;
+            cursor.steps += 1;
+            cursor.context.value = step.values[0];
+            cursor.context.instantiation = step.instantiation;
+            cursor.context.completion = cursor.context.completion.combine(&step.completion);
+            let mut states = previous_states.clone();
+            for &(formal, actual) in &cursor.context.instantiation.substitutions {
+                if let Some(state) = previous_states.get(&actual) {
+                    states.insert(
+                        formal,
+                        Arc::new(TypedFrontierState::new(
+                            formal,
+                            state.possible_values().to_vec(),
+                            state.completion().clone(),
+                        )),
+                    );
+                }
+            }
+            let application = cursor.context.instantiation.application_slot;
+            for slot in [cursor.context.receiver_slot, application] {
+                states.insert(
+                    slot,
+                    Arc::new(TypedFrontierState::new(
+                        slot,
+                        vec![cursor.context.value],
+                        cursor.context.completion.clone(),
+                    )),
+                );
+            }
+            let mut prepared = self.template.clone();
+            prepared
+                .routes
+                .retain(|route| route.row().qualifier_slot() == cursor.context.receiver_slot);
+            for route in &mut prepared.routes {
+                let row = route.row();
+                let replacement = LoweredQualifiedSeededRoute::new_with_source_lookup(
+                    row.reference(),
+                    application,
+                    row.lookup(),
+                    row.namespace(),
+                    row.source_lookup(),
+                    row.precedence_ordinal(),
+                    row.projection_output_slot(),
+                    row.projection_kind(),
+                    row.coarse_gap_reason(),
+                    row.open_member_surface(),
+                );
+                *route = SourceSelectedQualifiedRoute::new(
+                    route.fragment(),
+                    route.reference_node(),
+                    replacement,
+                )
+                .with_language(route.language());
+            }
+            self.level = ReceiverLevel {
+                origin: ReceiverLevelOrigin::Explicit {
+                    frontier: vec![cursor.context.clone()],
+                },
+                ty: Some(cursor.context.value.ty()),
+                completion: cursor.context.completion.clone(),
+                members: HashSet::default(),
+                result: None,
+                additions: Vec::new(),
+                removals: Vec::new(),
+            };
+            self.frame = Some(QualifiedReceiverFrame {
+                literal_struct_field: self.literal_struct_field,
+                call: self.call,
+                suffix_request: None,
+                direct: Some(Arc::new(ResolutionAnswer::new(
+                    Vec::new(),
+                    Vec::new(),
+                    prepared.route_seed.completion().clone(),
+                ))),
+                prepared: Some(prepared),
+                replay: None,
+                active: None,
+                members: None,
+                origins: None,
+                hierarchy_group: None,
+                supertraits: None,
+                member_closure: None,
+            });
+            self.states = Some(states);
+            return Ok(Continue);
+        }
+    }
+
+    fn finish_cursor(&mut self) {
+        let cursor = self.cursor.take().expect("one active receiver cursor");
+        self.states = None;
+        self.closed = false;
+        if cursor.steps == 0
+            && self.answer.as_ref().expect("step-zero answer").completion()
+                == &cursor.selection.completion
+        {
+            return;
+        }
+        let answer = self.answer.take().expect("step-zero answer");
+        let (targets, witnesses, completion) = answer.into_parts();
+        self.answer = Some(ResolutionAnswer::new(
+            targets,
+            witnesses,
+            completion.combine(&cursor.selection.completion),
+        ));
+    }
+}
+
+struct ReceiverStepReads<'evaluation, 'resources, 'source> {
+    evaluation: &'evaluation mut FactEvaluation<'resources, 'source>,
+    states: &'evaluation StateMap,
+}
+
+impl SelectedReceiverStepSource for ReceiverStepReads<'_, '_, '_> {
+    fn rust_impl_targets(&mut self, owner: SemanticId) -> StoreResult<Vec<SemanticId>> {
+        let session = &mut self.evaluation.session;
+        if let Some(targets) = session.rust_receiver_impl_targets.get(&owner) {
+            return Ok(targets.clone());
+        }
+        let targets = session
+            .typed_source
+            .rust_receiver_impl_targets(owner, self.evaluation.cancellation)?;
+        if !self.evaluation.cancellation.is_cancelled() {
+            session
+                .rust_receiver_impl_targets
+                .insert(owner, targets.clone());
+        }
+        Ok(targets)
+    }
+
+    fn impl_owner(
+        &mut self,
+        target: SemanticId,
+    ) -> StoreResult<Option<LoweredDeferredMemberOwner>> {
+        let read = self
+            .evaluation
+            .session
+            .deferred_member_owners_for_definitions(&[target])?;
+        Ok(self.evaluation.accept_session_read(read).and_then(|rows| {
+            assert!(rows.len() <= 1, "one associated type has one impl owner");
+            rows.first()
+                .map(|row| *row.get(self.evaluation.session).row())
+        }))
+    }
+
+    fn applicability(
+        &mut self,
+        owner: LoweredDeferredMemberOwner,
+        request: &SelectedReceiverStepRequest<'_>,
+    ) -> StoreResult<Option<ResolutionCompletion>> {
+        let evaluation = &mut self.evaluation;
+        let answers = Arc::clone(&evaluation.member_applicability_answers);
+        Ok(evaluation
+            .impl_subject_selection(
+                owner.owner_frontier(),
+                request.instantiation.application_slot,
+                owner.definition(),
+                &answers,
+                self.states,
+            )?
+            .and_then(|selection| match selection.applicability {
+                ImplSubjectApplicability::Applies => Some(ResolutionCompletion::Complete),
+                ImplSubjectApplicability::Unknown => Some(incomplete(owner.definition())),
+                ImplSubjectApplicability::DoesNotApply => None,
+            }))
+    }
+
+    fn activation(
+        &mut self,
+        reference: SemanticId,
+        target: SemanticId,
+    ) -> StoreResult<DeclarationAccessDecision> {
+        let session = &mut self.evaluation.session;
+        let Some(policy) = session.declaration_access_source else {
+            return Ok(DeclarationAccessDecision::UnknownActivation);
+        };
+        let request = DeclarationAccessRequest {
+            reference,
+            definition: target,
+        };
+        let loaded = FactEvaluation::ensure_declaration_access_rows(
+            policy,
+            session.typed_source,
+            session.resolution_session,
+            session.cancellation,
+            &mut session.declaration_access,
+            &[request],
+            |_| {},
+        )?;
+        if !loaded {
+            self.evaluation.cancellation_observed = true;
+            return Ok(DeclarationAccessDecision::UnknownActivation);
+        }
+        Ok(session.declaration_access[&request].decision)
+    }
+
+    fn target(
+        &mut self,
+        target: SemanticId,
+        request: &SelectedReceiverStepRequest<'_>,
+    ) -> StoreResult<SelectedReceiverSlotRead> {
+        let Some(properties) = self.declared_types(target)? else {
+            return Ok(SelectedReceiverSlotRead::Cancelled);
+        };
+        let Some(property) = properties
+            .iter()
+            .find(|property| property.role() == DeclarationTypeRole::Identity)
+        else {
+            return Ok(SelectedReceiverSlotRead::Ready(TypedFrontierState::new(
+                target,
+                Vec::new(),
+                incomplete(target),
+            )));
+        };
+        let slot = property.slot();
+        let Some(owner) = self.impl_owner(target)? else {
+            return self.slot(slot);
+        };
+        let evaluation = &mut self.evaluation;
+        let answers = Arc::clone(&evaluation.member_applicability_answers);
+        let Some(selection) = evaluation.impl_subject_selection(
+            owner.owner_frontier(),
+            request.instantiation.application_slot,
+            target,
+            &answers,
+            self.states,
+        )?
+        else {
+            return Ok(SelectedReceiverSlotRead::Cancelled);
+        };
+        let substitution = CallTypeSubstitution {
+            parameters: selection.substitutions.keys().copied().collect(),
+            replacements: selection
+                .substitutions
+                .into_iter()
+                .map(|(formal, (actual, _))| (formal, actual))
+                .collect(),
+        };
+        let Some(instantiated) =
+            evaluation.instantiated_bare_formal(slot, &substitution, &answers, self.states)?
+        else {
+            return Ok(SelectedReceiverSlotRead::Cancelled);
+        };
+        if let Some((actual, _)) = instantiated {
+            return Ok(SelectedReceiverSlotRead::Ready(TypedFrontierState::new(
+                slot,
+                [ResolutionSlotValue::type_object(actual)],
+                ResolutionCompletion::Complete,
+            )));
+        }
+        self.slot(slot)
+    }
+
+    fn has_type_arguments(
+        &mut self,
+        application: SemanticId,
+        nominal: SemanticId,
+    ) -> StoreResult<Option<bool>> {
+        let answers = Arc::clone(&self.evaluation.member_applicability_answers);
+        Ok(self
+            .evaluation
+            .sparse_type_arguments_from_value(application, nominal, &answers, self.states)?
+            .map(|selection| match selection {
+                SparseReceiverOwnerTypeArguments::Known { arguments, .. } => !arguments.is_empty(),
+                // An unknown application cannot prove that choosing either
+                // Target's application slot would preserve its arguments.
+                SparseReceiverOwnerTypeArguments::Unknown => true,
+            }))
+    }
+
+    fn type_head_source(&mut self) -> &mut dyn SelectedTypeHeadSource {
+        self.evaluation.session
+    }
+
+    fn poll_cancelled(&mut self) -> bool {
+        self.evaluation.poll_cancelled()
+    }
+
+    fn slot(&mut self, slot: SemanticId) -> StoreResult<SelectedReceiverSlotRead> {
+        if self.evaluation.poll_cancelled() {
+            return Ok(SelectedReceiverSlotRead::Cancelled);
+        }
+        self.evaluation.demand_slot(slot);
+        Ok(self
+            .states
+            .get(&slot)
+            .map_or(SelectedReceiverSlotRead::Pending, |state| {
+                SelectedReceiverSlotRead::Ready((**state).clone())
+            }))
+    }
+
+    fn gap_origins(
+        &mut self,
+        reasons: &[SemanticId],
+    ) -> StoreResult<Option<Vec<super::super::SelectedGapReasonProvenance>>> {
+        let read = self
+            .evaluation
+            .session
+            .gap_reason_provenance_for_reasons(reasons)?;
+        Ok(self.evaluation.accept_session_read(read).map(|rows| {
+            rows.into_iter()
+                .map(|row| *row.get(self.evaluation.session))
+                .collect()
+        }))
+    }
+
+    fn declared_types(
+        &mut self,
+        definition: SemanticId,
+    ) -> StoreResult<Option<Vec<LoweredDeclarationTypeProperty>>> {
+        let read = self
+            .evaluation
+            .session
+            .declaration_types_for_definitions(&[definition])?;
+        Ok(self.evaluation.accept_session_read(read).map(|rows| {
+            rows.into_iter()
+                .map(|row| *row.get(self.evaluation.session).row())
+                .collect()
+        }))
     }
 }

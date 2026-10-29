@@ -1,6 +1,6 @@
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, external_usage_hit_count, insert_unproven_hit,
-    reclassify_self_receiver_hit_at, usage_hit,
+    SNIPPET_CONTEXT_LINES, classify_recursive_hit, external_usage_hit_count, insert_unproven_hit,
+    usage_hit,
 };
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
@@ -36,14 +36,12 @@ impl<'a> HitRecorder<'a> {
         hits: &mut BTreeSet<UsageHit>,
         max_usages: usize,
         limit_exceeded: &mut bool,
-        start: usize,
-        end: usize,
+        node: tree_sitter::Node<'_>,
         enclosing: CodeUnit,
+        knowledge: &dyn brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge,
     ) {
-        if enclosing == *self.target && !self.target.is_function() && !self.target.is_class() {
-            return;
-        }
-        let recursive = enclosing == *self.target && self.target.is_function();
+        let start = node.start_byte();
+        let end = node.end_byte();
         let line_idx = find_line_index_for_offset(self.line_starts, start);
         let hit = usage_hit(
             self.file,
@@ -58,9 +56,13 @@ impl<'a> HitRecorder<'a> {
                 SNIPPET_CONTEXT_LINES,
             ),
         );
-        hits.insert(hit);
-        if recursive {
-            reclassify_self_receiver_hit_at(hits, self.file, start, end);
+        let hit = if self.target.is_class() {
+            Some(hit)
+        } else {
+            classify_recursive_hit(hit, self.target, Some(node), knowledge)
+        };
+        if let Some(hit) = hit {
+            hits.insert(hit);
         }
         refresh_usage_limit(hits, max_usages, limit_exceeded);
     }

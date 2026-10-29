@@ -465,31 +465,43 @@ impl ScalaAnalyzer {
 
     fn importable_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
         self.importable_declarations_by_package.get_or_init(|| {
-            let mut declarations: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-            for unit in self.inner.all_declarations() {
-                if is_scala_importable_top_level(&unit) {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "scala.importable_declarations_by_package",
+                || {
+                    let mut declarations: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+                    for unit in self.inner.all_declarations() {
+                        if is_scala_importable_top_level(&unit) {
+                            declarations
+                                .entry(unit.package_name().to_string())
+                                .or_default()
+                                .push(unit.clone());
+                        }
+                    }
                     declarations
-                        .entry(unit.package_name().to_string())
-                        .or_default()
-                        .push(unit.clone());
-                }
-            }
-            declarations
-                .into_iter()
-                .map(|(package, units)| (package, Arc::new(units)))
-                .collect()
+                        .into_iter()
+                        .map(|(package, units)| (package, Arc::new(units)))
+                        .collect()
+                },
+            )
         })
     }
 
     fn package_namespaces(&self) -> &[String] {
         self.package_namespaces.get_or_init(|| {
-            let mut packages = self
-                .importable_declarations_by_package()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            packages.sort_unstable();
-            packages
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "scala.package_namespaces",
+                || {
+                    let mut packages = self
+                        .importable_declarations_by_package()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    packages.sort_unstable();
+                    packages
+                },
+            )
         })
     }
 
@@ -524,8 +536,20 @@ impl ScalaAnalyzer {
 
     fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.same_package_reference_index.get_or_build(
-            || self.compute_same_package_reference_index(true),
-            || self.compute_same_package_reference_index(false),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "scala.same_package_reference_index",
+                    || self.compute_same_package_reference_index(true),
+                )
+            },
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "scala.same_package_reference_index",
+                    || self.compute_same_package_reference_index(false),
+                )
+            },
         )
     }
 
@@ -582,6 +606,11 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/scala/imports.rs",
+            );
         if file_language(file) != Language::Scala {
             return Arc::new(HashSet::default());
         }
@@ -596,8 +625,12 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
             }
         }
         let imported = Arc::new(imported);
-        self.imported_code_units
-            .insert(file.clone(), Arc::clone(&imported));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&imported);
+            persistent_fill_guard.installed("imported_code_units");
+            self.imported_code_units.insert(cache_key, cache_value);
+        };
         imported
     }
 
@@ -605,14 +638,31 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/scala/imports.rs",
+            );
         if file_language(file) != Language::Scala {
             return HashSet::default();
         }
         let reverse_index =
             brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
                 &self.reverse_import_index,
-                || self.inner.all_files(),
-                |candidate| self.imported_code_units_of(candidate),
+                || {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "scala.reverse_file_index",
+                        || self.inner.all_files(),
+                    )
+                },
+                |candidate| {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "scala.reverse_file_index",
+                        || self.imported_code_units_of(candidate),
+                    )
+                },
             );
         let mut result = reverse_index
             .get(file)
@@ -622,8 +672,12 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
             result.extend(files.iter().cloned());
         }
 
-        self.referencing_files
-            .insert(file.clone(), Arc::new(result.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(result.clone());
+            persistent_fill_guard.installed("referencing_files");
+            self.referencing_files.insert(cache_key, cache_value);
+        };
         result
     }
 
@@ -661,7 +715,12 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) {
         if self.file_dependency_index.get().is_none()
-            && let Some(index) = ScalaFileDependencyIndex::build(self, files, cancellation)
+            && let Some(index) =
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                    ScalaFileDependencyIndex::build(self, files, cancellation)
+                })
+                .ok()
+                .flatten()
         {
             let _ = self.file_dependency_index.set(index);
         }

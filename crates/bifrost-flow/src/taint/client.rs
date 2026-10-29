@@ -844,7 +844,10 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                     let Some(source) = self.plan.source(*source_id) else {
                         continue;
                     };
-                    killed.union_with(source.classes());
+                    match &kill.labels {
+                        Some(labels) => killed.union_with(&source.classes().intersection(labels)),
+                        None => killed.union_with(source.classes()),
+                    }
                 }
             }
             if !killed.is_empty() {
@@ -1221,7 +1224,11 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                         for kill in kills.iter().filter(|kill| kill.carrier == flow.carrier) {
                             for source in self.plan.value_flow().source_list(kill.sources) {
                                 if let Some(source) = self.plan.source(*source) {
-                                    killed.union_with(source.classes());
+                                    match &kill.labels {
+                                        Some(labels) => killed
+                                            .union_with(&source.classes().intersection(labels)),
+                                        None => killed.union_with(source.classes()),
+                                    }
                                 }
                             }
                         }

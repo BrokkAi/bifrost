@@ -733,23 +733,17 @@ fn declaration_has_direct_const_qualifier(node: Node<'_>, source: &str) -> bool 
 
 /// Parse the bounded C++ statement rows used by the statement-fact RQL
 /// relation. This is query-lifetime data; it owns no cross-file state.
-pub fn parse_statement_fact_rows(source: &str) -> CppStatementFactRows {
+pub fn parse_statement_fact_rows(source: &str) -> StatementFactRows {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .expect("the linked tree-sitter-cpp grammar matches this tree-sitter version");
     let tree = parser.parse(source, None).expect("uncancelled C++ parse");
-    let mut rows = CppStatementFactRows::default();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.is_named() {
-            crate::structural::capture_statement_fact_rows(node, source, &mut rows);
-        }
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        stack.extend(children.into_iter().rev());
-    }
-    rows
+    brokk_bifrost_core::analyzer::statement_facts::producer::capture_statement_facts(
+        &crate::structural::CPP_STRUCTURAL_SPEC,
+        tree.root_node(),
+        source,
+    )
 }
 
 /// Parse one source snapshot into the class and exception projection used by
@@ -938,6 +932,19 @@ pub(crate) fn capture_declaration(
     owners.reverse();
     owners.push(unit.identifier().to_owned());
     fact.lexical_path = owners;
+    // A function-local class and its members are scoped by their callable
+    // and block, which the written class chain alone cannot spell: it would
+    // give a local `Widget` the path of a global one. Their structured
+    // identity is that scope, so the path follows it.
+    if crate::graph::resolver::is_function_local_unit(unit) {
+        let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
+        fact.lexical_path = unit
+            .fq()
+            .segments()
+            .iter()
+            .map(|&segment| interner.resolve(segment).0.to_owned())
+            .collect();
+    }
     if matches!(
         node.kind(),
         "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"

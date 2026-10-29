@@ -29,12 +29,13 @@ use crate::declarations::{
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::{
-    BareCallTargetResolution, LexicalScopeResolution, enclosing_lexical_scope_components,
-    has_persisted_global_field_identity, initialized_ordinary_type_imports,
-    ordinary_using_declaration_type_node, resolve_bare_call_target,
-    resolve_ordinary_using_declaration_owner, resolve_type_components_in_authoritative_scope,
-    resolve_type_components_lexically_at, resolve_type_node_lexically,
-    resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
+    BareCallTargetResolution, LexicalScopeResolution, QualifierOwnerSelection,
+    enclosing_lexical_scope_components, has_persisted_global_field_identity,
+    initialized_ordinary_type_imports, ordinary_using_declaration_type_node,
+    resolve_bare_call_target, resolve_ordinary_using_declaration_owner,
+    resolve_type_components_in_authoritative_scope, resolve_type_components_lexically_at,
+    resolve_type_node_lexically, resolve_using_enum_declaration_owner, select_qualifier_owner,
+    using_enum_declaration_type_node,
 };
 use crate::graph::resolver::field_declared_binding;
 use crate::graph::resolver::{
@@ -45,8 +46,9 @@ use crate::graph::resolver::{
     cast_expression_type_node, constructor_style_local_declaration, cpp_binding_parts,
     cpp_callable_arity, cpp_field_expression_receiver, cpp_template_reference_arguments,
     cpp_type_name_components, declaration_declarator, declarator_name_node,
-    designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
-    has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type,
+    designated_initializer_owner, extract_variable_name, first_type_child,
+    function_local_type_resolution, function_terminal_node, has_ancestor_kind,
+    infer_cpp_initializer_binding, infer_cpp_initializer_type,
     initialized_type_declaration_with_cast, is_c_offsetof_member_node,
     is_c_sizeof_expression_type_candidate, is_cpp_template_argument_type_leaf, is_declaration_name,
     is_globally_qualified_cpp_name, is_nested_type_node,
@@ -863,6 +865,21 @@ fn recovered_sentinel_type_resolution(
     let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
     let components = cpp_type_name_components(node, ctx.source)?;
     let global = is_globally_qualified_cpp_name(node);
+    // The qualifier's template arguments select the owner here exactly as
+    // they do for the ordinary lexical resolution.
+    let (components, global) = match select_qualifier_owner(
+        node,
+        global,
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
+        QualifierOwnerSelection::Unchanged => (components, global),
+        QualifierOwnerSelection::Selected(components) => (components, true),
+        QualifierOwnerSelection::Ambiguous => return Some(LexicalTypeResolution::Ambiguous),
+    };
     Some(resolve_type_components_in_authoritative_scope(
         node,
         &components,
@@ -1720,13 +1737,25 @@ fn seed_binding(
     let declared_type =
         type_node.filter(|node| normalize_type_text(node_text(*node, ctx.source)) != "auto");
     let resolved = match declared_type {
-        Some(node) => resolve_type_node_with_recovered_scope(node, ctx).or_else(|| {
-            match ctx.resolve_type_node_result(node) {
-                Ok(Some(unit)) => Some(unit),
-                Ok(None) => ctx.resolve_type(node_text(node, ctx.source)),
-                Err(_) => None,
-            }
-        }),
+        Some(node) => match function_local_type_resolution(
+            &ctx.analyzer,
+            ctx.file,
+            node,
+            &cpp_type_name_components(node, ctx.source).unwrap_or_default(),
+            ctx.source,
+        )
+        .filter(|_| !is_globally_qualified_cpp_name(node))
+        {
+            Some(LexicalTypeResolution::Resolved { unit, .. }) => Some(unit),
+            Some(LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing) => None,
+            None => resolve_type_node_with_recovered_scope(node, ctx).or_else(|| {
+                match ctx.resolve_type_node_result(node) {
+                    Ok(Some(unit)) => Some(unit),
+                    Ok(None) => ctx.resolve_type(node_text(node, ctx.source)),
+                    Err(_) => None,
+                }
+            }),
+        },
         None => value.and_then(|value| infer_type_from_value(value, ctx)),
     };
     bindings.seed_or_shadow(name.to_string(), resolved);

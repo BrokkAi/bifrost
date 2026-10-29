@@ -92,6 +92,7 @@ pub trait PythonSource:
     fn visit_file_facts(
         &self,
         files: &[ProjectFile],
+        keep_going: &dyn Fn() -> bool,
         visit: &mut dyn FnMut(&ProjectFile, Option<&dyn IndexedFileFacts>),
     );
 }
@@ -100,6 +101,12 @@ pub trait PythonSource:
 /// the export/importer walks needs it; the index build itself must not.
 pub trait PythonUsageSource: PythonSource {
     fn usage_index(&self) -> Arc<PythonUsageIndex>;
+
+    /// A cancelled initialization publishes no partial index.
+    fn usage_index_with_cancellation(
+        &self,
+        cancellation: &brokk_bifrost_core::CancellationToken,
+    ) -> Option<Arc<PythonUsageIndex>>;
 }
 
 /// Keep only the candidates an absolute import written in `importer` can mean.

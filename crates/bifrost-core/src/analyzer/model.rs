@@ -2244,6 +2244,11 @@ impl StructuredTypeIdentity {
         Some(self)
     }
 
+    pub fn wrap_slice(mut self) -> Option<Self> {
+        self.root = self.push_node(StructuredTypeNode::Slice(self.root))?;
+        Some(self)
+    }
+
     fn push_node(&mut self, node: StructuredTypeNode) -> Option<StructuredTypeNodeId> {
         push_structured_type_node(
             &mut self.nodes,
@@ -3475,6 +3480,22 @@ impl fmt::Display for DeclarationSiteId {
 }
 
 impl CodeUnit {
+    /// Conservative allocation census, charging shared declaration storage in full.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<CodeUnitInner>())
+            .saturating_add(
+                self.0
+                    .source
+                    .retained_bytes()
+                    .saturating_sub(std::mem::size_of::<ProjectFile>()),
+            )
+            .saturating_add(self.0.signature.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.0.fq.retained_heap_bytes())
+            .saturating_add(self.0.rendered_name.display.capacity())
+    }
+
     /// Compute this declaration's versioned, process-independent identity.
     pub fn declaration_id(&self) -> DeclarationId {
         let mut hasher = CanonicalHasher::new(b"bifrost.declaration.v1");
@@ -4589,6 +4610,9 @@ pub enum SemanticDiagnosticIncompleteReason {
     PackExtractionGap {
         pack_id: String,
         declaration: String,
+    },
+    TypeForwardBoundary {
+        detail: String,
     },
 }
 

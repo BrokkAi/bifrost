@@ -1293,6 +1293,13 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "default": true,
                         "description": "When true, full and diff scans reuse policy units from this repository's analyzer cache only after verifying their inputs, and publish the complete units they recompute. When false, evaluate every policy in full without policy-unit cache access. Canonical findings and exit status are the same either way."
                     },
+                    "policy_cost_hints": {
+                        "type": "object",
+                        "maxProperties": crate::policy::PolicyBatchBudget::default().max_policies(),
+                        "propertyNames": { "minLength": 1 },
+                        "additionalProperties": { "type": "integer", "minimum": 0 },
+                        "description": "Optional policy id to expected evaluation milliseconds. Parallel batches start unknown policies first, then hinted policies by descending cost. Advisory only; never changes the report."
+                    },
                     "include_stage_timings": {
                         "type": "boolean",
                         "default": false,

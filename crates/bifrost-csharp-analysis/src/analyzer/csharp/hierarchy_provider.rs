@@ -35,11 +35,21 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-csharp-analysis/src/analyzer/csharp/hierarchy_provider.rs",
+            );
 
         let ancestors = logical_direct_ancestors(self, token, code_unit, false);
-        self.memo_caches
-            .direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        {
+            let cache_key = code_unit.clone();
+            let cache_value = Arc::new(ancestors.clone());
+            persistent_fill_guard.installed("direct_ancestors");
+            self.memo_caches
+                .direct_ancestors
+                .insert(cache_key, cache_value);
+        };
         ancestors
     }
 
@@ -60,7 +70,13 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
             &self.memo_caches.direct_descendant_index,
             scope,
             code_unit,
-            || build_direct_descendant_index(self, self, scope),
+            || {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                    build_direct_descendant_index(self, self, scope)
+                })
+                .ok()
+                .flatten()
+            },
         )
     }
 }

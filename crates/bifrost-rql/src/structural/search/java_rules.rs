@@ -17,7 +17,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::query::JavaRule;
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    DeclaredVisibility, MemberFamilyOutcome, MethodFamilyRelation,
+    DeclaredVisibility, MethodFamilyRelation,
 };
 use brokk_bifrost_jvm::java::graph::return_type::java_type_name_components;
 use brokk_bifrost_jvm::java::javadoc::{
@@ -26,8 +26,8 @@ use brokk_bifrost_jvm::java::javadoc::{
 use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
-use super::field_metadata::{field_sites, FieldSite};
-use super::language_rules::{LanguageRuleMatches, UndecidedSite};
+use super::field_metadata::{FieldSite, field_sites};
+use super::language_rules::{LanguageRuleMatch, LanguageRuleMatches, UndecidedSite};
 
 const KNOWN_CHECKED_JDK_TYPES: &[&str] = &[
     "ClassNotFoundException",
@@ -87,7 +87,6 @@ const KNOWN_UNCHECKED_TYPES: &[&str] = &[
     "WrongMethodTypeException",
 ];
 
-
 /// Return the exact structural spans selected by one closed Java relation.
 pub(super) fn matches_for_file(
     analyzer: &dyn IAnalyzer,
@@ -103,10 +102,26 @@ pub(super) fn matches_for_file(
     };
     let fields = field_sites(analyzer, file);
     let mut undecided = Vec::new();
+    if matches!(
+        rule,
+        JavaRule::InconsistentJavadocThrows
+            | JavaRule::UnknownJavadocParameter
+            | JavaRule::UndocumentedException
+            | JavaRule::UndocumentedFunction
+            | JavaRule::UndocumentedParameter
+            | JavaRule::UndocumentedReturnValue
+            | JavaRule::UndocumentedType
+    ) {
+        return LanguageRuleMatches::decided(
+            javadoc_matches(analyzer, file, source, &tree, rule, &mut undecided),
+            undecided,
+            Language::Java.config_label(),
+            rule.label(),
+            file,
+        );
+    }
     let ranges = match rule {
-        JavaRule::NonFinalImmutableField => {
-            non_final_immutable_fields(&tree, source, &fields)
-        }
+        JavaRule::NonFinalImmutableField => non_final_immutable_fields(&tree, source, &fields),
         JavaRule::NonPrivateField => non_private_fields(&tree, source, &fields),
         JavaRule::MisnamedConstant => misnamed_constants(&tree, source, &fields),
         JavaRule::MisnamedVariable => misnamed_variables(&tree, source, &fields),
@@ -116,9 +131,7 @@ pub(super) fn matches_for_file(
         JavaRule::RawConstructorInvocation => {
             raw_constructor_invocations(analyzer, file, source, &tree, &mut undecided)
         }
-        JavaRule::RawReturnType => {
-            raw_return_types(analyzer, file, source, &tree, &mut undecided)
-        }
+        JavaRule::RawReturnType => raw_return_types(analyzer, file, source, &tree, &mut undecided),
         JavaRule::RawVariable => raw_variables(analyzer, file, source, &tree, &mut undecided),
         JavaRule::TypeBoundExtendsFinal => {
             type_bounds_extending_final(analyzer, file, source, &tree, &mut undecided)
@@ -126,18 +139,10 @@ pub(super) fn matches_for_file(
         JavaRule::TypeVariableHidesType => {
             type_variables_hiding_types(analyzer, file, source, &tree, &mut undecided)
         }
-        JavaRule::InconsistentJavadocThrows
-        | JavaRule::UnknownJavadocParameter
-        | JavaRule::UndocumentedException
-        | JavaRule::UndocumentedFunction
-        | JavaRule::UndocumentedParameter
-        | JavaRule::UndocumentedReturnValue
-        | JavaRule::UndocumentedType => {
-            javadoc_matches(analyzer, file, source, &tree, rule, &mut undecided)
-        }
+        _ => unreachable!("Java Javadoc rules returned above"),
     };
     LanguageRuleMatches::decided(
-        ranges,
+        ranges.into_iter().map(LanguageRuleMatch::from).collect(),
         undecided,
         Language::Java.config_label(),
         rule.label(),
@@ -194,21 +199,27 @@ fn javadoc_matches(
     tree: &Tree,
     rule: JavaRule,
     undecided: &mut Vec<UndecidedSite>,
-) -> Vec<Range> {
+) -> Vec<LanguageRuleMatch> {
     let sites = declaration_sites(analyzer, file);
     let source: Arc<str> = Arc::from(source.to_owned());
     let mut ranges = Vec::new();
+    let mut tag_matches = Vec::new();
     for node in descendants(tree.root_node()) {
         match rule {
             JavaRule::UndocumentedType if is_type_declaration(node) => {
                 if undocumented_type(analyzer, &sites, node, &source) {
-                    ranges.push(node_range(node));
+                    tag_matches.push(LanguageRuleMatch::from(node_range(node)));
                 }
             }
             JavaRule::UnknownJavadocParameter if is_type_declaration(node) => {
-                if unknown_type_parameter_tag(&sites, node, &source) {
-                    ranges.push(node_range(node));
-                }
+                tag_matches.extend(
+                    unknown_type_parameter_tag(&sites, node, &source)
+                        .into_iter()
+                        .map(|report| LanguageRuleMatch {
+                            select: node_range(node),
+                            report,
+                        }),
+                );
             }
             JavaRule::UndocumentedParameter if is_parameter(node) => record_decision(
                 undocumented_parameter(analyzer, &sites, node, &source),
@@ -223,17 +234,38 @@ fn javadoc_matches(
             | JavaRule::InconsistentJavadocThrows
                 if is_callable(node) =>
             {
-                record_decision(
-                    callable_rule_matches(analyzer, &sites, node, &source, rule),
-                    node_range(node),
-                    &mut ranges,
-                    undecided,
-                );
+                let select = node_range(node);
+                match rule {
+                    JavaRule::UnknownJavadocParameter => {
+                        tag_matches.extend(
+                            callable_unknown_parameter_tags(&sites, node, &source)
+                                .into_iter()
+                                .map(|report| LanguageRuleMatch { select, report }),
+                        );
+                    }
+                    JavaRule::InconsistentJavadocThrows => {
+                        let reports = callable_inconsistent_throws(
+                            analyzer, &sites, node, &source, undecided,
+                        );
+                        tag_matches.extend(
+                            reports
+                                .into_iter()
+                                .map(|report| LanguageRuleMatch { select, report }),
+                        );
+                    }
+                    _ => record_decision(
+                        callable_rule_matches(analyzer, &sites, node, &source, rule),
+                        select,
+                        &mut ranges,
+                        undecided,
+                    ),
+                }
             }
             _ => {}
         }
     }
-    ranges
+    tag_matches.extend(ranges.into_iter().map(LanguageRuleMatch::from));
+    tag_matches
 }
 
 #[derive(Clone)]
@@ -321,49 +353,34 @@ fn non_final_immutable_fields(
         .collect()
 }
 
-fn non_private_fields(
-    tree: &Tree,
-    source: &str,
-    metadata_sites: &[FieldSite],
-) -> Vec<Range> {
+fn non_private_fields(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -> Vec<Range> {
     java_field_sites(tree, metadata_sites)
         .into_iter()
         .filter(|field| !field.enum_constant)
         .filter(|field| {
             field.metadata.callable_declared_visibility() != Some(DeclaredVisibility::Private)
         })
-        .filter(|field| {
-            !(field.metadata.field_is_static() && field.metadata.field_is_final())
-        })
+        .filter(|field| !(field.metadata.field_is_static() && field.metadata.field_is_final()))
         .filter(|field| !has_external_access(field, tree.root_node(), source))
         .map(|field| node_range(field.name))
         .collect()
 }
 
-fn misnamed_constants(
-    tree: &Tree,
-    source: &str,
-    metadata_sites: &[FieldSite],
-) -> Vec<Range> {
+fn misnamed_constants(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -> Vec<Range> {
     java_field_sites(tree, metadata_sites)
         .into_iter()
         .filter(|field| field.metadata.field_is_static() && field.metadata.field_is_final())
         .filter(|field| is_immutable_type(&field.metadata))
         .filter(|field| node_text(source, field.name) != Some("serialVersionUID"))
         .filter(|field| {
-            node_text(source, field.name).is_some_and(|name| {
-                name.chars().any(|character| character.is_ascii_lowercase())
-            })
+            node_text(source, field.name)
+                .is_some_and(|name| name.chars().any(|character| character.is_ascii_lowercase()))
         })
         .map(|field| node_range(field.name))
         .collect()
 }
 
-fn misnamed_variables(
-    tree: &Tree,
-    source: &str,
-    metadata_sites: &[FieldSite],
-) -> Vec<Range> {
+fn misnamed_variables(tree: &Tree, source: &str, metadata_sites: &[FieldSite]) -> Vec<Range> {
     let mut ranges = Vec::new();
     for field in java_field_sites(tree, metadata_sites) {
         if field.metadata.field_is_static() && field.metadata.field_is_final() {
@@ -411,9 +428,10 @@ fn named_declarations(tree: &Tree, source: &str, wanted: &str) -> Vec<Range> {
         .into_iter()
         .filter(|node| node.kind() == "package_declaration")
     {
-        for node in descendants(package).into_iter().filter(|node| {
-            matches!(node.kind(), "identifier" | "type_identifier")
-        }) {
+        for node in descendants(package)
+            .into_iter()
+            .filter(|node| matches!(node.kind(), "identifier" | "type_identifier"))
+        {
             if node_text(source, node) == Some(wanted) {
                 ranges.push(node_range(node));
             }
@@ -529,11 +547,7 @@ fn is_immutable_type(metadata: &SignatureMetadata) -> bool {
     )
 }
 
-fn writes_are_initialization_only(
-    field: &JavaFieldSite<'_>,
-    root: Node<'_>,
-    source: &str,
-) -> bool {
+fn writes_are_initialization_only(field: &JavaFieldSite<'_>, root: Node<'_>, source: &str) -> bool {
     let Some(field_name) = node_text(source, field.name) else {
         return false;
     };
@@ -568,13 +582,19 @@ fn is_initialization_context(node: Node<'_>, owner: Node<'_>) -> bool {
             return false;
         }
         match ancestor.kind() {
-            "constructor_declaration" | "compact_constructor_declaration" | "static_initializer" => {
+            "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "static_initializer" => {
                 return true;
             }
             "lambda_expression" | "method_declaration" => return false,
-            "block" if ancestor
-                .parent()
-                .is_some_and(|parent| parent.kind() == "class_body") => return true,
+            "block"
+                if ancestor
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "class_body") =>
+            {
+                return true;
+            }
             _ => {}
         }
         current = ancestor.parent();
@@ -701,8 +721,7 @@ fn raw_variables(
     for node in descendants(tree.root_node()) {
         match node.kind() {
             "formal_parameter" | "spread_parameter" => {
-                let Some(named) = node.child_by_field_name("type").and_then(raw_named_type)
-                else {
+                let Some(named) = node.child_by_field_name("type").and_then(raw_named_type) else {
                     continue;
                 };
                 record_decision(
@@ -713,8 +732,7 @@ fn raw_variables(
                 );
             }
             "field_declaration" | "local_variable_declaration" => {
-                let Some(named) = node.child_by_field_name("type").and_then(raw_named_type)
-                else {
+                let Some(named) = node.child_by_field_name("type").and_then(raw_named_type) else {
                     continue;
                 };
                 // Java's normalized structural surface currently emits a
@@ -834,9 +852,9 @@ fn is_generic_declaration(
         return Decision::Fails;
     }
     match resolve_type_declaration(analyzer, file, source, tree, type_node) {
-        TypeResolution::Known(TypeDeclaration { arity: Some(arity), .. }) => {
-            Decision::from_bool(arity > 0)
-        }
+        TypeResolution::Known(TypeDeclaration {
+            arity: Some(arity), ..
+        }) => Decision::from_bool(arity > 0),
         TypeResolution::Known(TypeDeclaration { arity: None, .. }) => {
             Decision::Undecided("the type parameters of the declared type are not recorded")
         }
@@ -861,13 +879,16 @@ fn bound_is_final(
         return Decision::Fails;
     }
     match resolve_type_declaration(analyzer, file, source, tree, bound) {
-        TypeResolution::Known(TypeDeclaration { finality: Some(finality), .. }) => {
-            Decision::from_bool(finality)
-        }
+        TypeResolution::Known(TypeDeclaration {
+            finality: Some(finality),
+            ..
+        }) => Decision::from_bool(finality),
         TypeResolution::Known(TypeDeclaration { finality: None, .. }) => {
             Decision::Undecided("the finality of the bound type is not recorded")
         }
-        TypeResolution::Absent => Decision::Undecided("no declaration of the bound type is visible"),
+        TypeResolution::Absent => {
+            Decision::Undecided("no declaration of the bound type is visible")
+        }
         TypeResolution::NotIndexed(reason) | TypeResolution::Unknown(reason) => {
             Decision::Undecided(reason)
         }
@@ -914,7 +935,8 @@ fn resolve_type_declaration(
     let Some(type_node) = nominal_type_node(type_node) else {
         return TypeResolution::Unknown("the type has no nominal name");
     };
-    let Some(components) = type_name_components(type_node, source).filter(|parts| !parts.is_empty())
+    let Some(components) =
+        type_name_components(type_node, source).filter(|parts| !parts.is_empty())
     else {
         return TypeResolution::Unknown("the type name has no identifier components");
     };
@@ -928,14 +950,22 @@ fn resolve_type_declaration(
     match source_candidates.as_slice() {
         [] => {}
         [unit] => {
-            return TypeResolution::Known(source_declaration_fact(analyzer, file, tree, source, unit));
+            return TypeResolution::Known(source_declaration_fact(
+                analyzer, file, tree, source, unit,
+            ));
         }
-        _ => return TypeResolution::Unknown("more than one declaration in the file matches the type"),
+        _ => {
+            return TypeResolution::Unknown(
+                "more than one declaration in the file matches the type",
+            );
+        }
     }
 
     if components.len() > 1 {
         return match lookup_qualified_type(analyzer, file, tree, source, &components.join(".")) {
-            TypeResolution::Absent => TypeResolution::NotIndexed("the qualified type is not indexed"),
+            TypeResolution::Absent => {
+                TypeResolution::NotIndexed("the qualified type is not indexed")
+            }
             resolved => resolved,
         };
     }
@@ -948,7 +978,9 @@ fn resolve_type_declaration(
         .collect::<Vec<_>>();
     if !single_type.is_empty() {
         return match lookup_type_group(analyzer, file, tree, source, &single_type) {
-            TypeResolution::Absent => TypeResolution::NotIndexed("the imported type is not indexed"),
+            TypeResolution::Absent => {
+                TypeResolution::NotIndexed("the imported type is not indexed")
+            }
             resolved => resolved,
         };
     }
@@ -1019,7 +1051,9 @@ fn lookup_qualified_type(
     match definitions.as_slice() {
         [] => {}
         [unit] => {
-            return TypeResolution::Known(source_declaration_fact(analyzer, file, tree, source, unit));
+            return TypeResolution::Known(source_declaration_fact(
+                analyzer, file, tree, source, unit,
+            ));
         }
         _ => return TypeResolution::Unknown("more than one indexed declaration matches the type"),
     }
@@ -1083,9 +1117,13 @@ fn source_declaration_fact(
         parse_tree_for_language(declaring, Language::Java, declaring_source)
     });
     match (declaring_source.as_deref(), declaring_tree.as_ref()) {
-        (Some(declaring_source), Some(declaring_tree)) => {
-            declaration_fact_in_tree(declaring_tree, declaring_source, unit, &ranges, metadata_arity)
-        }
+        (Some(declaring_source), Some(declaring_tree)) => declaration_fact_in_tree(
+            declaring_tree,
+            declaring_source,
+            unit,
+            &ranges,
+            metadata_arity,
+        ),
         _ => TypeDeclaration {
             arity: metadata_arity,
             finality: None,
@@ -1128,9 +1166,7 @@ fn declaration_fact_in_tree(
 fn raw_named_type(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "generic_type" => None,
-        "array_type" => node
-            .child_by_field_name("element")
-            .and_then(raw_named_type),
+        "array_type" => node.child_by_field_name("element").and_then(raw_named_type),
         "annotated_type" => last_named_child(node).and_then(raw_named_type),
         "type_identifier" | "identifier" | "scoped_type_identifier" | "scoped_identifier" => {
             Some(node)
@@ -1174,10 +1210,7 @@ fn type_name_components(node: Node<'_>, source: &str) -> Option<Vec<String>> {
                 let scope = children
                     .iter()
                     .find(|child| {
-                        matches!(
-                            child.kind(),
-                            "scoped_identifier" | "scoped_type_identifier"
-                        )
+                        matches!(child.kind(), "scoped_identifier" | "scoped_type_identifier")
                     })
                     .copied();
                 if let Some(name) = name {
@@ -1214,7 +1247,10 @@ fn java_imports(tree: &Tree, source: &str) -> Vec<JavaImport> {
             let path = tokens.iter().copied().find(|child| {
                 matches!(
                     child.kind(),
-                    "identifier" | "type_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                    "identifier"
+                        | "type_identifier"
+                        | "scoped_identifier"
+                        | "scoped_type_identifier"
                 )
             })?;
             Some(JavaImport {
@@ -1231,9 +1267,9 @@ fn package_name(tree: &Tree, source: &str) -> String {
         .into_iter()
         .find(|node| node.kind() == "package_declaration")
         .and_then(|node| {
-            named_children(node).into_iter().find_map(|child| {
-                type_name_components(child, source).map(|parts| parts.join("."))
-            })
+            named_children(node)
+                .into_iter()
+                .find_map(|child| type_name_components(child, source).map(|parts| parts.join(".")))
         })
         .unwrap_or_default()
 }
@@ -1247,7 +1283,8 @@ fn type_parameter_bounds(node: Node<'_>) -> Vec<Node<'_>> {
 
 fn has_extends_operator(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
-    node.children(&mut cursor).any(|child| child.kind() == "extends")
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "extends")
 }
 
 fn parameter_name_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -1268,7 +1305,10 @@ fn direct_variable_declarators(node: Node<'_>) -> Vec<Node<'_>> {
                 if parent.id() == node.id() {
                     return true;
                 }
-                if matches!(parent.kind(), "field_declaration" | "local_variable_declaration") {
+                if matches!(
+                    parent.kind(),
+                    "field_declaration" | "local_variable_declaration"
+                ) {
                     return false;
                 }
                 current = parent.parent();
@@ -1317,16 +1357,13 @@ fn declaration_is_final(node: Node<'_>, source: &str) -> bool {
     })
 }
 
-
 fn java_owned_text(node: Node<'_>, source: &str) -> Option<String> {
     node.utf8_text(source.as_bytes()).ok().map(str::to_owned)
 }
 
-
 fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     named_children(node).into_iter().last()
 }
-
 
 fn node_text<'a>(source: &'a str, node: Node<'_>) -> Option<&'a str> {
     source.get(node.start_byte()..node.end_byte())
@@ -1415,14 +1452,6 @@ fn callable_rule_matches(
     let Some(site) = site_for(sites, callable) else {
         return Decision::Fails;
     };
-    if rule == JavaRule::UnknownJavadocParameter {
-        if site.unit.is_synthetic() {
-            return Decision::Fails;
-        }
-        return Decision::from_bool(documentation(callable, source).is_some_and(|documentation| {
-            documentation.complete && unknown_parameter_tag(callable, &documentation, source)
-        }));
-    }
     let documented = match documentation(callable, source) {
         None => Decision::from_bool(rule == JavaRule::UndocumentedFunction),
         Some(documentation) if !documentation.complete => Decision::Fails,
@@ -1430,15 +1459,13 @@ fn callable_rule_matches(
             JavaRule::UndocumentedFunction => Decision::from_bool(!documentation.acceptable_text),
             JavaRule::UndocumentedReturnValue => Decision::from_bool(
                 is_non_void_method(callable)
-                    && !documentation.tags.iter().any(|tag| {
-                        tag.kind == JavadocTagKind::Return && tag.acceptable
-                    }),
+                    && !documentation
+                        .tags
+                        .iter()
+                        .any(|tag| tag.kind == JavadocTagKind::Return && tag.acceptable),
             ),
             JavaRule::UndocumentedException => {
                 undocumented_exception(analyzer, site, callable, &documentation, source)
-            }
-            JavaRule::InconsistentJavadocThrows => {
-                inconsistent_throws(analyzer, site, callable, &documentation, source)
             }
             _ => Decision::Fails,
         },
@@ -1477,55 +1504,96 @@ fn undocumented_parameter(
     .and(|| callable_is_eligible(analyzer, site, callable, source))
 }
 
-fn unknown_parameter_tag(
+fn callable_unknown_parameter_tags(
+    sites: &[DeclarationSite],
     callable: Node<'_>,
-    documentation: &JavadocBlockFacts,
     source: &str,
-) -> bool {
+) -> Vec<Range> {
+    let Some(site) = site_for(sites, callable) else {
+        return Vec::new();
+    };
+    if site.unit.is_synthetic() {
+        return Vec::new();
+    }
+    let Some(documentation) = documentation(callable, source) else {
+        return Vec::new();
+    };
+    if !documentation.complete {
+        return Vec::new();
+    }
     let actual_parameters = parameter_names(callable, source);
     let type_parameters = type_parameter_names(callable, source);
-    documentation.tags.iter().any(|tag| {
-        if tag.kind != JavadocTagKind::Param {
-            return false;
-        }
-        let Some(name) = tag.name.as_deref() else {
-            return true;
-        };
-        !actual_parameters.iter().any(|actual| actual == name)
-            && !type_parameters.iter().any(|actual| actual == name)
-    })
+    documentation
+        .tags
+        .iter()
+        .filter(|tag| {
+            tag.kind == JavadocTagKind::Param
+                && tag.name.as_deref().is_none_or(|name| {
+                    !actual_parameters.iter().any(|actual| actual == name)
+                        && !type_parameters.iter().any(|actual| actual == name)
+                })
+        })
+        .map(|tag| javadoc_tag_range(callable, source, tag))
+        .collect()
 }
 
 fn unknown_type_parameter_tag(
     sites: &[DeclarationSite],
     declaration: Node<'_>,
     source: &str,
-) -> bool {
+) -> Vec<Range> {
     let Some(site) = site_for(sites, declaration) else {
-        return false;
+        return Vec::new();
     };
     if site.unit.is_synthetic() {
-        return false;
+        return Vec::new();
     }
     let Some(documentation) = documentation(declaration, source) else {
-        return false;
+        return Vec::new();
     };
     if !documentation.complete {
-        return false;
+        return Vec::new();
     }
     let mut valid = type_parameter_names(declaration, source);
     if declaration.kind() == "record_declaration" {
         valid.extend(parameter_names_from_field(declaration, source));
     }
-    documentation.tags.iter().any(|tag| {
-        if tag.kind != JavadocTagKind::Param {
-            return false;
-        }
-        let Some(name) = tag.name.as_deref() else {
-            return true;
-        };
-        !valid.iter().any(|actual| actual == name)
-    })
+    documentation
+        .tags
+        .iter()
+        .filter(|tag| {
+            tag.kind == JavadocTagKind::Param
+                && tag
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| !valid.iter().any(|actual| actual == name))
+        })
+        .map(|tag| javadoc_tag_range(declaration, source, tag))
+        .collect()
+}
+
+fn javadoc_tag_range(
+    declaration: Node<'_>,
+    source: &str,
+    tag: &brokk_bifrost_jvm::java::javadoc::JavadocTagFact,
+) -> Range {
+    let comment = preceding_javadoc_comment(declaration, source)
+        .expect("documentation tags belong to a preceding Javadoc comment");
+    let offset = comment.start_byte();
+    let start_byte = offset + tag.start_byte;
+    let end_byte = offset + tag.end_byte;
+    let line_at = |offset: usize| {
+        comment.start_position().row + 1 + source[comment.start_byte()..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+    };
+    Range {
+        start_byte,
+        end_byte,
+        start_line: line_at(start_byte),
+        end_line: line_at(end_byte),
+    }
 }
 
 fn undocumented_exception(
@@ -1552,9 +1620,57 @@ fn undocumented_exception(
         }
     }
     if unclassified {
-        Decision::Undecided("an undocumented declared exception is not classified as checked or unchecked")
+        Decision::Undecided(
+            "an undocumented declared exception is not classified as checked or unchecked",
+        )
     } else {
         Decision::Fails
+    }
+}
+
+fn callable_inconsistent_throws(
+    analyzer: &dyn IAnalyzer,
+    sites: &[DeclarationSite],
+    callable: Node<'_>,
+    source: &str,
+    undecided: &mut Vec<UndecidedSite>,
+) -> Vec<Range> {
+    let Some(site) = site_for(sites, callable) else {
+        return Vec::new();
+    };
+    let Some(documentation) = documentation(callable, source) else {
+        return Vec::new();
+    };
+    if !documentation.complete {
+        return Vec::new();
+    }
+    let mut unresolved = None;
+    let reported = inconsistent_throws(
+        analyzer,
+        site,
+        callable,
+        &documentation,
+        source,
+        &mut unresolved,
+    );
+    if reported.is_empty() && unresolved.is_none() {
+        return Vec::new();
+    }
+    match callable_is_eligible(analyzer, site, callable, source) {
+        Decision::Holds => {
+            if let Some(reason) = unresolved {
+                undecided.push(UndecidedSite::at(node_range(callable), reason));
+            }
+            reported
+        }
+        Decision::Fails => Vec::new(),
+        Decision::Undecided(reason) => {
+            undecided.push(UndecidedSite::at(
+                node_range(callable),
+                unresolved.unwrap_or(reason),
+            ));
+            Vec::new()
+        }
     }
 }
 
@@ -1564,7 +1680,8 @@ fn inconsistent_throws(
     callable: Node<'_>,
     documentation: &JavadocBlockFacts,
     source: &str,
-) -> Decision {
+    undecided: &mut Option<&'static str>,
+) -> Vec<Range> {
     let declared = declared_throws(callable, source);
     let statuses = declared
         .iter()
@@ -1579,7 +1696,7 @@ fn inconsistent_throws(
     let declares_unclassified = statuses
         .iter()
         .any(|(_, status)| *status == ExceptionStatus::Unknown);
-    let mut outcome = Decision::Fails;
+    let mut reported = Vec::new();
     for tag in &documentation.tags {
         if tag.kind != JavadocTagKind::Throws {
             continue;
@@ -1594,9 +1711,8 @@ fn inconsistent_throws(
             // The tagged type is neither a known JDK type nor comparable to
             // a declared checked exception, so its own classification
             // decides the relation and nothing here supplies it.
-            outcome = Decision::Undecided(
-                "a documented exception is not classified as checked or unchecked",
-            );
+            undecided
+                .get_or_insert("a documented exception is not classified as checked or unchecked");
             continue;
         }
         let consistent = statuses.iter().any(|(declared_name, status)| {
@@ -1606,14 +1722,13 @@ fn inconsistent_throws(
             continue;
         }
         if declares_unclassified {
-            outcome = Decision::Undecided(
-                "a declared exception is not classified as checked or unchecked",
-            );
+            undecided
+                .get_or_insert("a declared exception is not classified as checked or unchecked");
             continue;
         }
-        return Decision::Holds;
+        reported.push(javadoc_tag_range(callable, source, tag));
     }
-    outcome
+    reported
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1654,8 +1769,7 @@ fn exception_status(
         Arc::clone(&source),
     )
     .into_iter()
-    .next()
-    else {
+    .next() else {
         return ExceptionStatus::Unknown;
     };
     if outcome.status != DefinitionLookupStatus::Resolved || outcome.definitions.len() != 1 {
@@ -1719,11 +1833,10 @@ fn callable_is_eligible(
         return Decision::Undecided("no method-family provider can rule out an override");
     };
     let family = provider.member_family(&site.unit, None);
-    if !matches!(
-        family.outcome,
-        MemberFamilyOutcome::Proven | MemberFamilyOutcome::NoFamily
-    ) {
-        return Decision::Undecided("the method family is not proven, so an override is not ruled out");
+    if !family.ancestors.is_proven() {
+        return Decision::Undecided(
+            "the method family is not proven, so an override is not ruled out",
+        );
     }
     Decision::from_bool(!family.edges.iter().any(|edge| {
         matches!(
@@ -1741,21 +1854,22 @@ fn is_public(site: &DeclarationSite) -> bool {
 }
 
 fn is_generated(site: &DeclarationSite, node: Node<'_>, source: &str) -> bool {
-    site.unit.is_synthetic() || descendants(node).into_iter().any(|candidate| {
-        candidate.kind() == "annotation"
-            && candidate
-                .child_by_field_name("name")
-                .and_then(|name| source.get(name.byte_range()))
-                .is_some_and(|name| {
-                    matches!(
-                        name.trim(),
-                        "Generated"
-                            | "javax.annotation.Generated"
-                            | "javax.annotation.processing.Generated"
-                            | "lombok.Generated"
-                    )
-                })
-    })
+    site.unit.is_synthetic()
+        || descendants(node).into_iter().any(|candidate| {
+            candidate.kind() == "annotation"
+                && candidate
+                    .child_by_field_name("name")
+                    .and_then(|name| source.get(name.byte_range()))
+                    .is_some_and(|name| {
+                        matches!(
+                            name.trim(),
+                            "Generated"
+                                | "javax.annotation.Generated"
+                                | "javax.annotation.processing.Generated"
+                                | "lombok.Generated"
+                        )
+                    })
+        })
 }
 
 fn is_getter_or_setter(callable: Node<'_>, source: &str) -> bool {
@@ -1795,10 +1909,7 @@ fn is_non_void_method(node: Node<'_>) -> bool {
             .is_some_and(|return_type| return_type.kind() != "void_type")
 }
 
-fn declared_throws<'tree>(
-    callable: Node<'tree>,
-    source: &str,
-) -> Vec<(Node<'tree>, String)> {
+fn declared_throws<'tree>(callable: Node<'tree>, source: &str) -> Vec<(Node<'tree>, String)> {
     let mut result = Vec::new();
     let mut cursor = callable.walk();
     for child in callable.named_children(&mut cursor) {
@@ -1816,8 +1927,7 @@ fn declared_throws<'tree>(
 }
 
 fn java_type_name(node: Node<'_>, source: &str) -> Option<String> {
-    java_type_name_components(node, source)
-        .and_then(|components| components.last().cloned())
+    java_type_name_components(node, source).and_then(|components| components.last().cloned())
 }
 
 fn parameter_names(callable: Node<'_>, source: &str) -> Vec<String> {
@@ -1842,6 +1952,16 @@ fn parameter_names_from_field(declaration: Node<'_>, source: &str) -> Vec<String
 fn parameter_name(parameter: Node<'_>, source: &str) -> Option<String> {
     parameter
         .child_by_field_name("name")
+        .or_else(|| {
+            (parameter.kind() == "spread_parameter")
+                .then(|| {
+                    named_children(parameter)
+                        .into_iter()
+                        .find(|child| child.kind() == "variable_declarator")
+                        .and_then(|declarator| declarator.child_by_field_name("name"))
+                })
+                .flatten()
+        })
         .and_then(|name| source.get(name.byte_range()))
         .map(str::trim)
         .filter(|name| !name.is_empty())
@@ -1851,7 +1971,12 @@ fn parameter_name(parameter: Node<'_>, source: &str) -> Option<String> {
 fn parameter_nodes(callable: Node<'_>) -> Vec<Node<'_>> {
     let parameters = callable.child_by_field_name("parameters").or_else(|| {
         (callable.kind() == "compact_constructor_declaration")
-            .then(|| callable.parent()?.parent()?.child_by_field_name("parameters"))
+            .then(|| {
+                callable
+                    .parent()?
+                    .parent()?
+                    .child_by_field_name("parameters")
+            })
             .flatten()
     });
     parameters
@@ -1860,7 +1985,9 @@ fn parameter_nodes(callable: Node<'_>) -> Vec<Node<'_>> {
             let mut cursor = parameters.walk();
             parameters
                 .named_children(&mut cursor)
-                .filter(|parameter| matches!(parameter.kind(), "formal_parameter" | "spread_parameter"))
+                .filter(|parameter| {
+                    matches!(parameter.kind(), "formal_parameter" | "spread_parameter")
+                })
                 .collect::<Vec<_>>()
         })
         .collect()

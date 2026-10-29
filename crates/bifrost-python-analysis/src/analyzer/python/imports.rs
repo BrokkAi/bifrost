@@ -53,14 +53,23 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-python-analysis/src/analyzer/python/imports.rs",
+            );
 
         let resolved = Arc::new(
             resolve_import_bindings(self, token, file)
                 .into_values()
                 .collect(),
         );
-        self.imported_code_units
-            .insert(file.clone(), Arc::clone(&resolved));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&resolved);
+            persistent_fill_guard.installed("imported_code_units");
+            self.imported_code_units.insert(cache_key, cache_value);
+        };
         resolved
     }
 
@@ -68,14 +77,23 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-python-analysis/src/analyzer/python/imports.rs",
+            );
 
         let referencing = self
             .build_reverse_import_index()
             .get(file)
             .map(|files| (**files).clone())
             .unwrap_or_default();
-        self.referencing_files
-            .insert(file.clone(), Arc::new(referencing.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(referencing.clone());
+            persistent_fill_guard.installed("referencing_files");
+            self.referencing_files.insert(cache_key, cache_value);
+        };
         referencing
     }
 

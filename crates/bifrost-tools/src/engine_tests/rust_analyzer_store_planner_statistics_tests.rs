@@ -317,7 +317,14 @@ DELETE FROM temp.selected_resolution_transient_placements;
                 ),
                 (
                     "rust_scope_closure_mounts",
-                    vec![Value::Blob(key.clone())],
+                    vec![Value::Text(
+                        serde_json::to_string(&vec![
+                            brokk_bifrost_analysis::analyzer::store::resolution_lexical::hex_digest(
+                                key.clone().try_into().unwrap(),
+                            ),
+                        ])
+                        .unwrap(),
+                    )],
                     "selected_rust_unit_closure_summary",
                 ),
                 (

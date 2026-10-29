@@ -90,24 +90,30 @@ pub(super) fn result_ref(value: &LoopRelationValue) -> CodeQueryResultRef {
 }
 
 fn report_open(
+    analyzer: &dyn IAnalyzer,
     procedure: &semantic::SemanticProcedureValue,
     reason: impl std::fmt::Debug,
+    cause: Option<DerivationExecutionCause>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    let mut diagnostic = super::incomplete_diagnostic(
-        CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
-        procedure
-            .handle
-            .artifact()
-            .key()
-            .language()
-            .language()
-            .config_label(),
-        format!(
-            "{} has open loop relation evidence: {reason:?}",
-            procedure.wire_id()
+    let mut diagnostic = super::QueryExecutionState::diagnostic(
+        analyzer,
+        super::incomplete_diagnostic(
+            CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete,
+            procedure
+                .handle
+                .artifact()
+                .key()
+                .language()
+                .language()
+                .config_label(),
+            format!(
+                "{} has open loop relation evidence: {reason:?}",
+                procedure.wire_id()
+            ),
+            Vec::new(),
         ),
-        Vec::new(),
+        cause,
     );
     diagnostic.source = procedure.diagnostic_source();
     diagnostics.push(diagnostic);
@@ -124,19 +130,39 @@ pub(super) fn loop_relation_expansions(
     let candidates = match loop_candidates(workspace, &procedure.handle, cancellation) {
         Ok(candidates) => candidates,
         Err(reason) => {
-            report_open(procedure, reason, diagnostics);
+            let cause = match &reason {
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled => Some(DerivationExecutionCause::Cancelled),
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(_)
+                | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(_) => Some(DerivationExecutionCause::Provider),
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(_) => None,
+            };
+            report_open(workspace.analyzer(), procedure, reason, cause, diagnostics);
             return Vec::new();
         }
     };
     if !candidates.complete {
-        report_open(procedure, candidates.reason, diagnostics);
+        report_open(
+            workspace.analyzer(),
+            procedure,
+            candidates.reason,
+            candidates
+                .reason
+                .and_then(DerivationExecutionCause::from_reason),
+            diagnostics,
+        );
         return Vec::new();
     }
     if candidates.rows.is_empty() {
         return Vec::new();
     }
     let Some(outcome) = semantic.materialized_outcome(procedure.file()) else {
-        report_open(procedure, "semantic_artifact_unavailable", diagnostics);
+        report_open(
+            workspace.analyzer(),
+            procedure,
+            "semantic_artifact_unavailable",
+            Some(DerivationExecutionCause::Provider),
+            diagnostics,
+        );
         return candidates
             .rows
             .into_iter()
@@ -165,7 +191,13 @@ pub(super) fn loop_relation_expansions(
         .iter()
         .find(|derived| derived.procedure == procedure.handle.id())
     else {
-        report_open(procedure, "flow_state_unavailable", diagnostics);
+        report_open(
+            workspace.analyzer(),
+            procedure,
+            "flow_state_unavailable",
+            Some(DerivationExecutionCause::Provider),
+            diagnostics,
+        );
         return candidates
             .rows
             .into_iter()
@@ -183,6 +215,7 @@ pub(super) fn loop_relation_expansions(
             .collect();
     };
     flow_state_cache.report_completeness(
+        workspace.analyzer(),
         &procedure.wire_id(),
         Some(procedure),
         procedure.handle.artifact().key().language().language(),
@@ -199,7 +232,7 @@ pub(super) fn loop_relation_expansions(
         .into_iter()
         .map(|candidate| {
             if let Some(reason) = candidate.reason {
-                report_open(procedure, reason, diagnostics);
+                report_open(workspace.analyzer(), procedure, reason, None, diagnostics);
                 return row(
                     procedure,
                     candidate,
@@ -258,7 +291,15 @@ pub(super) fn loop_relation_expansions(
                     None,
                 ),
                 LoopRepeatAnswer::Open { reasons } => {
-                    report_open(procedure, &reasons, diagnostics);
+                    let cause = reasons.iter().find_map(|reason| match reason {
+                        LoopRepeatIncompleteReason::Flow(reason) => match reason {
+                            brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::Cancelled => Some(DerivationExecutionCause::Cancelled),
+                            brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::BudgetExhausted { .. } => Some(DerivationExecutionCause::Budget),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                    report_open(workspace.analyzer(), procedure, &reasons, cause, diagnostics);
                     let flow_reasons = reasons
                         .iter()
                         .filter_map(|reason| match reason {
@@ -407,8 +448,10 @@ mod tests {
         // being misclassified as a query-read error.
         let mut diagnostics = Vec::new();
         report_open(
+            workspace.analyzer(),
             procedure,
             Some("procedure_syntax_recovery"),
+            None,
             &mut diagnostics,
         );
         assert!(diagnostics[0].message.contains("procedure_syntax_recovery"));

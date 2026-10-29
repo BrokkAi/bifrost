@@ -2,6 +2,7 @@
 //! Candidate rows are provisional; each selected file-scoped JVM forward
 //! operation confirms every returned reference.
 
+use super::nominal_rules::nominal_language_rules;
 use super::reverse::*;
 use super::*;
 use crate::analyzer::resolution::{
@@ -78,7 +79,7 @@ impl TargetFamilies {
     }
 }
 
-pub trait JvmReverseTargetRules {
+pub trait JvmReverseTargetRules: Sync {
     fn target_families(
         &self,
         target: &JvmReverseTarget<'_>,
@@ -92,9 +93,9 @@ pub trait JvmReverseTargetRules {
     }
 }
 
-struct JavaReverseTargetRules;
-struct KotlinReverseTargetRules;
-struct ScalaReverseTargetRules;
+pub(super) struct JavaReverseTargetRules;
+pub(super) struct KotlinReverseTargetRules;
+pub(super) struct ScalaReverseTargetRules;
 
 impl JvmReverseTargetRules for JavaReverseTargetRules {
     fn target_families(
@@ -521,12 +522,9 @@ impl SelectedResolutionOperation<'_, '_> {
             visibility,
             boundary,
         };
-        let rules: &dyn JvmReverseTargetRules = match *target_storage_language {
-            "java" => &JavaReverseTargetRules,
-            "kotlin" => &KotlinReverseTargetRules,
-            "scala" => &ScalaReverseTargetRules,
-            _ => unreachable!("target language checked above"),
-        };
+        let rules = nominal_language_rules(language_for_target(target))
+            .expect("target language checked above")
+            .reverse_target_rules();
         let mut families =
             rules.target_families(&descriptor, &self.ready.typed_source(), cancellation)?;
         if cancellation.is_cancelled() {
@@ -896,7 +894,9 @@ impl SelectedResolutionOperation<'_, '_> {
             // authority; a source-mount filter cannot prove template access.
             let include = match &peer_naming {
                 PeerNaming::Closed => {
-                    storage_language == "scala"
+                    Language::from_config_label(&storage_language)
+                        .and_then(nominal_language_rules)
+                        .is_some_and(|rules| rules.has_reverse_lexical_access())
                         || (storage_language == descriptor.storage_language
                             && path == relative_path)
                 }
@@ -905,7 +905,9 @@ impl SelectedResolutionOperation<'_, '_> {
                         || subclass_paths.contains(&(storage_language.clone(), path.clone()))
                 }
                 PeerNaming::Open if hierarchy_route.is_some() => {
-                    storage_language == "scala"
+                    Language::from_config_label(&storage_language)
+                        .and_then(nominal_language_rules)
+                        .is_some_and(|rules| rules.has_reverse_lexical_access())
                         || package.is_none()
                         || package == Some(target_package)
                         || subclass_paths.contains(&(storage_language.clone(), path.clone()))
@@ -935,7 +937,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 ]),
             );
         }
-        let completion = jvm_reverse_completion(&evidence);
+        let completion = jvm_reverse_completion(&evidence, cancellation);
         #[cfg(test)]
         if std::env::var_os("BIFROST_REVERSE_EVIDENCE").is_some() {
             let mut physical = result.iter().map(|row| &row.locator).collect::<Vec<_>>();
@@ -1508,7 +1510,8 @@ impl SelectedResolutionOperation<'_, '_> {
         // access evidence on the exact definition's reverse frontier. Read
         // that frontier before interpreting an absent qualifier as private.
         // Java keeps its existing read shape and exact-work contract.
-        if language_for_target(target_unit) == Language::Scala
+        if nominal_language_rules(language_for_target(target_unit))
+            .is_some_and(|rules| rules.has_reverse_lexical_access())
             && boundary.is_none()
             && matches!(
                 visibility,
@@ -1634,7 +1637,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 cancelled_completion(),
             ));
         }
-        let completion = jvm_reverse_completion(&evidence);
+        let completion = jvm_reverse_completion(&evidence, cancellation);
         let references = reducer.references;
         self.ready.finish(
             JvmReverseConfirmed {
@@ -1916,14 +1919,25 @@ impl ReverseScopedLifecycle for JvmReverseScoped<'_, '_, '_> {
 // The public JVM result already reports peer-language absence through its
 // inventory-boundary flag. Keep the obligation, but preserve that projection
 // instead of adding a second resolution-incomplete diagnostic for the boundary.
-fn jvm_reverse_completion(evidence: &ReverseEvidence) -> ResolutionCompletion {
-    evidence
-        .enumeration
-        .completion_for(|obligation| {
-            !matches!(obligation.origin, ReverseEvidenceOrigin::InventoryBoundary)
-        })
-        .combine(&evidence.binding.completion())
-        .combine(&evidence.metadata.completion())
+fn jvm_reverse_completion(
+    evidence: &ReverseEvidence,
+    cancellation: &CancellationToken,
+) -> ResolutionCompletion {
+    let mut cancelled = || cancellation.is_cancelled();
+    let Some(enumeration) = evidence.enumeration.completion_for_with_poll(
+        |obligation| !matches!(obligation.origin, ReverseEvidenceOrigin::InventoryBoundary),
+        &mut cancelled,
+    ) else {
+        return cancelled_completion();
+    };
+    let Some(binding) = evidence.binding.completion_with_poll(&mut cancelled) else {
+        return cancelled_completion();
+    };
+    let Some(metadata) = evidence.metadata.completion_with_poll(&mut cancelled) else {
+        return cancelled_completion();
+    };
+    ResolutionCompletion::combine_all_with_poll([&enumeration, &binding, &metadata], &mut cancelled)
+        .unwrap_or_else(cancelled_completion)
 }
 
 fn jvm_reverse_target_relation(

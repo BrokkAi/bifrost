@@ -176,3 +176,31 @@ pub fn ruby_semantic_identifier_range(node: Node<'_>, source: &str) -> Range {
         _ => node_range(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argument_comment_extras_do_not_occupy_runtime_positions() {
+        let source = "sink(\n# before\n source(),\n# between\n value\n)";
+        let tree = crate::declarations::parse_ruby_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let call = tree.root_node().named_child(0).unwrap();
+        let arguments = call.child_by_field_name("arguments").unwrap();
+        let children = arguments
+            .named_children(&mut arguments.walk())
+            .map(|n| n.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(children, ["comment", "call", "comment", "identifier"]);
+        let actual = ruby_call_arguments(call);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|node| &source[node.byte_range()])
+                .collect::<Vec<_>>(),
+            ["source()", "value"]
+        );
+        assert_eq!(ruby_first_call_argument(call), Some(actual[0]));
+    }
+}

@@ -20,14 +20,15 @@ use super::super::qualified_paths::{
     qualified_paths_for_file,
 };
 use super::super::routes::IdentityAxis;
+use super::DerivationExecutionCause;
 use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryPathSegment,
     CodeQueryQualifiedPath, CodeQueryRange,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
-use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashMap;
 use std::sync::Arc;
 
 /// Domain separator for a qualified-path row's stable id.
@@ -35,15 +36,12 @@ const PATH_ID_DOMAIN: &[u8] = b"bifrost.code_query.qualified_path.v1";
 /// Domain separator for a path-segment row's stable id.
 const SEGMENT_ID_DOMAIN: &[u8] = b"bifrost.code_query.path_segment.v1";
 
-/// Per-request memo of derived path rows plus the diagnostics already
-/// reported, so one file is derived once per variant and one axis gap is
-/// reported once.
+/// Pure per-request value memo. Each invocation emits its own diagnostics;
+/// policy normalization deduplicates repeated observations.
 #[derive(Default)]
 pub(super) struct PathTraversalCache {
     rows_only: HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>,
     resolved: HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>,
-    reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
-    reported_axes: HashSet<(Language, IdentityAxis)>,
 }
 
 impl PathTraversalCache {
@@ -71,7 +69,29 @@ impl PathTraversalCache {
         } else {
             QualifiedPathDerivationOptions::ROWS_ONLY
         };
-        let derived = Arc::new(qualified_paths_for_file(analyzer, file, options, &token).ok()?);
+        let derived = Arc::new(
+            qualified_paths_for_file(analyzer, file, options, &token)
+                .inspect_err(|error| { brokk_bifrost_core::profiling::note_with(|| format!("policy.units unbounded origin={}:{} cause=qualified_paths_error detail={error:?}", file!(), line!())); analyzer.mark_execution_dependent(); })
+                .ok()?,
+        );
+        if let QualifiedPathCompleteness::Incomplete { reasons, .. } = &derived.completeness
+            && reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    QualifiedPathIncompleteReason::FactsUnavailable
+                        | QualifiedPathIncompleteReason::ResolutionCancelled
+                )
+            })
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=qualified_paths_incomplete detail={reasons:?}",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
+        }
         let cache = if resolved {
             &mut self.resolved
         } else {
@@ -85,6 +105,7 @@ impl PathTraversalCache {
     /// axes the query actually depends on.
     pub(super) fn report_completeness(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         result: &QualifiedPathsFileResult,
         required: &[IdentityAxis],
@@ -103,10 +124,7 @@ impl PathTraversalCache {
             });
             if unsupported {
                 // An unsupported axis is a property of the adapter, so it is
-                // reported once per language rather than once per file.
-                if !self.reported_axes.insert((language, *axis)) {
-                    continue;
-                }
+                // repeated identically for every item and normalized later.
                 diagnostics.push(CodeQueryDiagnostic {
                     related: Vec::new(),
                     source: None,
@@ -124,14 +142,23 @@ impl PathTraversalCache {
                 });
                 continue;
             }
-            let code = CodeQueryDiagnosticCode::PathDerivationIncomplete;
-            if !self.reported.insert((file.clone(), code)) {
-                continue;
-            }
-            diagnostics.push(CodeQueryDiagnostic {
+            let cause = if reasons
+                .iter()
+                .any(|reason| matches!(reason, QualifiedPathIncompleteReason::ResolutionCancelled))
+            {
+                Some(DerivationExecutionCause::Cancelled)
+            } else if reasons
+                .iter()
+                .any(|reason| matches!(reason, QualifiedPathIncompleteReason::FactsUnavailable))
+            {
+                Some(DerivationExecutionCause::Provider)
+            } else {
+                None
+            };
+            diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
                 related: Vec::new(),
                 source: None,
-                code,
+                code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
                 language: language.config_label(),
@@ -147,7 +174,7 @@ impl PathTraversalCache {
                 ),
                 exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
-            });
+            }, cause));
         }
     }
 }

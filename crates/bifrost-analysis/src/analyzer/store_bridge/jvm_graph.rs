@@ -6,8 +6,6 @@ use super::graph_unit::{
 };
 use crate::CancellationToken;
 use crate::analyzer::resolution::fact_resolution::SelectedFactOperationBlueprint;
-use crate::analyzer::resolution::local_identity::ResolutionIdentityTranslation;
-use crate::analyzer::resolution::worker_transport::WorkerAnswer;
 use crate::analyzer::resolution::*;
 use crate::analyzer::store::resolution_operation::graph_stage::*;
 use crate::analyzer::store::resolution_operation::jvm_context::{
@@ -26,19 +24,7 @@ use std::collections::BTreeMap;
 type JvmBatchStager<'a> =
     dyn FnMut(&FactReferenceBatchAnswer, &FactReferenceEdgeBatch) -> Result<()> + 'a;
 
-struct JvmGraphBatch {
-    source: FactReferenceBatchAnswer,
-    edges: FactReferenceEdgeBatch,
-}
-
-impl WorkerAnswer for JvmGraphBatch {
-    fn translate(self, translation: &impl ResolutionIdentityTranslation) -> Self {
-        Self {
-            source: self.source.translate(translation),
-            edges: self.edges.translate(translation),
-        }
-    }
-}
+use super::native_graph::NativeGraphBatch as JvmGraphBatch;
 
 struct JvmGraphStageAdapter<'a> {
     analyzer: &'a dyn IAnalyzer,

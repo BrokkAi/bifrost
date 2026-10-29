@@ -5,7 +5,7 @@
 //! surface. Run the optimized benchmark with:
 //!
 //! ```text
-//!   cargo test --release --lib code_query_execution_profile_measurement \
+//!   cargo test --profile measure --lib code_query_execution_profile_measurement \
 //!   -- --ignored --nocapture
 //! ```
 //!

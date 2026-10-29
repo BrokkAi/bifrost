@@ -67,8 +67,7 @@ pub(crate) fn compose_taint_policy(
         &mut resolved_catalogs,
         |catalog| &catalog.sanitizers,
         |entry| ResolvedTaintSanitizerDefinition {
-            input: entry.input.clone(),
-            output: entry.output.clone(),
+            kind: entry.kind.clone(),
             removes: entry.removes.clone(),
         },
     )?;
@@ -259,22 +258,41 @@ fn select_sources(
         identities.push(identity);
     }
     for reference in &set.include_sets {
-        let catalog = catalogs.resolve(reference)?;
-        let catalog_identity = resolved_catalog_identity(catalogs, reference)?;
-        resolved_catalogs.push(catalog_identity.clone());
-        for entry in &catalog.definition().sources {
-            let identity = ResolvedEndpointIdentity::Catalog {
-                catalog: catalog_identity.clone(),
-                entry_id: entry.id.clone(),
-            };
-            let dependency = universe.get(&identity).ok_or_else(|| {
-                CompositionError::MissingCatalogEndpointDependency {
-                    identity: identity.clone(),
+        let mut matched = false;
+        for catalog in catalogs.select(reference)? {
+            let catalog_identity = ResolvedCatalogIdentity::from_catalog(catalog)
+                .map_err(|error| CompositionError::LoadedModel(error.to_string()))?;
+            let mut catalog_matched = matches!(reference, CatalogRef::Named { .. });
+            if catalog_matched {
+                resolved_catalogs.push(catalog_identity.clone());
+            }
+            for entry in catalog
+                .definition()
+                .sources
+                .iter()
+                .filter(|entry| reference.includes_categories(&entry.categories))
+            {
+                matched = true;
+                if !catalog_matched {
+                    resolved_catalogs.push(catalog_identity.clone());
+                    catalog_matched = true;
                 }
-            })?;
-            universe.validate_role_and_taint(&identity, EndpointRole::Source, true)?;
-            validate_source_model(entry, dependency)?;
-            identities.push(identity);
+                let identity = ResolvedEndpointIdentity::Catalog {
+                    catalog: catalog_identity.clone(),
+                    entry_id: entry.id.clone(),
+                };
+                let dependency = universe.get(&identity).ok_or_else(|| {
+                    CompositionError::MissingCatalogEndpointDependency {
+                        identity: identity.clone(),
+                    }
+                })?;
+                universe.validate_role_and_taint(&identity, EndpointRole::Source, true)?;
+                validate_source_model(entry, dependency)?;
+                identities.push(identity);
+            }
+        }
+        if matches!(reference, CatalogRef::AnyRegistered { .. }) && !matched {
+            return Err(CompositionError::EmptyResolvedEndpointSet { role: "Source" });
         }
     }
     for set in &set.include_matches {
@@ -285,9 +303,7 @@ fn select_sources(
     identities.sort();
     identities.dedup();
     if identities.is_empty() && !deferred_imports {
-        return Err(CompositionError::EmptyResolvedEndpointSet {
-            role: EndpointRole::Source,
-        });
+        return Err(CompositionError::EmptyResolvedEndpointSet { role: "Source" });
     }
     if identities.len() > limits.max_endpoints_per_role() {
         return Err(CompositionError::EndpointLimit {
@@ -335,22 +351,41 @@ fn select_sinks(
         identities.push(identity);
     }
     for reference in &set.include_sets {
-        let catalog = catalogs.resolve(reference)?;
-        let catalog_identity = resolved_catalog_identity(catalogs, reference)?;
-        resolved_catalogs.push(catalog_identity.clone());
-        for entry in &catalog.definition().sinks {
-            let identity = ResolvedEndpointIdentity::Catalog {
-                catalog: catalog_identity.clone(),
-                entry_id: entry.id.clone(),
-            };
-            let dependency = universe.get(&identity).ok_or_else(|| {
-                CompositionError::MissingCatalogEndpointDependency {
-                    identity: identity.clone(),
+        let mut matched = false;
+        for catalog in catalogs.select(reference)? {
+            let catalog_identity = ResolvedCatalogIdentity::from_catalog(catalog)
+                .map_err(|error| CompositionError::LoadedModel(error.to_string()))?;
+            let mut catalog_matched = matches!(reference, CatalogRef::Named { .. });
+            if catalog_matched {
+                resolved_catalogs.push(catalog_identity.clone());
+            }
+            for entry in catalog
+                .definition()
+                .sinks
+                .iter()
+                .filter(|entry| reference.includes_categories(&entry.categories))
+            {
+                matched = true;
+                if !catalog_matched {
+                    resolved_catalogs.push(catalog_identity.clone());
+                    catalog_matched = true;
                 }
-            })?;
-            universe.validate_role_and_taint(&identity, EndpointRole::Sink, true)?;
-            validate_sink_model(entry, dependency)?;
-            identities.push(identity);
+                let identity = ResolvedEndpointIdentity::Catalog {
+                    catalog: catalog_identity.clone(),
+                    entry_id: entry.id.clone(),
+                };
+                let dependency = universe.get(&identity).ok_or_else(|| {
+                    CompositionError::MissingCatalogEndpointDependency {
+                        identity: identity.clone(),
+                    }
+                })?;
+                universe.validate_role_and_taint(&identity, EndpointRole::Sink, true)?;
+                validate_sink_model(entry, dependency)?;
+                identities.push(identity);
+            }
+        }
+        if matches!(reference, CatalogRef::AnyRegistered { .. }) && !matched {
+            return Err(CompositionError::EmptyResolvedEndpointSet { role: "Sink" });
         }
     }
     for set in &set.include_matches {
@@ -361,9 +396,7 @@ fn select_sinks(
     identities.sort();
     identities.dedup();
     if identities.is_empty() && !deferred_imports {
-        return Err(CompositionError::EmptyResolvedEndpointSet {
-            role: EndpointRole::Sink,
-        });
+        return Err(CompositionError::EmptyResolvedEndpointSet { role: "Sink" });
     }
     if identities.len() > limits.max_endpoints_per_role() {
         return Err(CompositionError::EndpointLimit {
@@ -541,35 +574,52 @@ where
         .map(|entry| entry.identity.clone())
         .collect::<HashSet<_>>();
     for reference in &set.include_sets {
-        let catalog = catalogs.resolve(reference)?;
-        let catalog_identity = resolved_catalog_identity(catalogs, reference)?;
-        resolved_catalogs.push(catalog_identity.clone());
-        for entry in entries(catalog.definition()) {
-            let identity = ResolvedEndpointIdentity::Catalog {
-                catalog: catalog_identity.clone(),
-                entry_id: entry.entry_id().clone(),
-            };
-            // Repeating the same immutable catalog reference is idempotent.
-            // Equal bare IDs in different catalogs remain distinct because
-            // the stable identity includes the resolved catalog identity.
-            if !identities.insert(identity.clone()) {
-                continue;
+        let mut matched = false;
+        for catalog in catalogs.select(reference)? {
+            let catalog_identity = ResolvedCatalogIdentity::from_catalog(catalog)
+                .map_err(|error| CompositionError::LoadedModel(error.to_string()))?;
+            let mut catalog_matched = matches!(reference, CatalogRef::Named { .. });
+            if catalog_matched {
+                resolved_catalogs.push(catalog_identity.clone());
             }
-            let path = format!(
-                "/dependencies/catalogs/{}@{}/{}/selector",
-                json_pointer_segment(catalog_identity.name.as_str()),
-                catalog_identity.version,
-                json_pointer_segment(entry.entry_id().as_str())
-            );
-            result.push(ResolvedTaintAuxiliary::new(
-                identity,
-                PolicySelectorPath::new(path)
-                    .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
-                definition(entry),
-                vec![EndpointOrigin::Catalog {
+            for entry in entries(catalog.definition())
+                .iter()
+                .filter(|entry| reference.includes_categories(entry.categories()))
+            {
+                matched = true;
+                if !catalog_matched {
+                    resolved_catalogs.push(catalog_identity.clone());
+                    catalog_matched = true;
+                }
+                let identity = ResolvedEndpointIdentity::Catalog {
                     catalog: catalog_identity.clone(),
-                }],
-            ));
+                    entry_id: entry.entry_id().clone(),
+                };
+                // Repeating the same immutable catalog reference is idempotent.
+                // Equal bare IDs in different catalogs remain distinct because
+                // the stable identity includes the resolved catalog identity.
+                if !identities.insert(identity.clone()) {
+                    continue;
+                }
+                let path = format!(
+                    "/dependencies/catalogs/{}@{}/{}/selector",
+                    json_pointer_segment(catalog_identity.name.as_str()),
+                    catalog_identity.version,
+                    json_pointer_segment(entry.entry_id().as_str())
+                );
+                result.push(ResolvedTaintAuxiliary::new(
+                    identity,
+                    PolicySelectorPath::new(path)
+                        .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
+                    definition(entry),
+                    vec![EndpointOrigin::Catalog {
+                        catalog: catalog_identity.clone(),
+                    }],
+                ));
+            }
+        }
+        if matches!(reference, CatalogRef::AnyRegistered { .. }) && !matched {
+            return Err(CompositionError::EmptyResolvedEndpointSet { role: kind });
         }
     }
     result.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -657,6 +707,9 @@ fn select_entry_points(
 
 trait TaintEntry {
     fn entry_id(&self) -> &TaintEntryId;
+    fn categories(&self) -> &[PolicyCategoryId] {
+        &[]
+    }
 }
 
 macro_rules! impl_taint_entry {
@@ -666,6 +719,7 @@ macro_rules! impl_taint_entry {
                 fn entry_id(&self) -> &TaintEntryId {
                     &self.id
                 }
+                fn categories(&self) -> &[PolicyCategoryId] { &self.categories }
             }
         )+
     };
@@ -675,8 +729,6 @@ impl_taint_entry!(
     TaintSanitizerSpec,
     TaintTransformSpec,
     TaintExternalModelSpec,
-    TaintStoreWriteSpec,
-    TaintStoreReadSpec,
 );
 
 #[derive(Debug)]
@@ -866,6 +918,17 @@ fn merge_manifests(
     let mut result: Vec<_> = by_path.into_values().collect();
     result.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(result)
+}
+
+impl TaintEntry for TaintStoreWriteSpec {
+    fn entry_id(&self) -> &TaintEntryId {
+        &self.id
+    }
+}
+impl TaintEntry for TaintStoreReadSpec {
+    fn entry_id(&self) -> &TaintEntryId {
+        &self.id
+    }
 }
 
 #[cfg(test)]
@@ -1077,16 +1140,23 @@ mod tests {
         let mut catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());
         catalogs
             .register(TaintCatalogDefinition {
+                categories: ["input.user", "sink.data", "data.sensitive"]
+                    .into_iter()
+                    .map(|category| PolicyCategoryId::new(category).unwrap())
+                    .collect(),
                 schema_version: 1,
                 name: catalog_name,
                 version: 1,
                 sources: Vec::new(),
                 sinks: Vec::new(),
                 sanitizers: vec![TaintSanitizerSpec {
+                    categories: Vec::new(),
                     id: TaintEntryId::new("clean").unwrap(),
                     selector: selector("clean"),
-                    input: PolicyPort::ArgumentIndex { index: 0 },
-                    output: PolicyPort::ReturnValue,
+                    kind: crate::definition::TaintSanitizerKind::Transfer {
+                        input: PolicyPort::ArgumentIndex { index: 0 },
+                        output: PolicyPort::ReturnValue,
+                    },
                     removes: vec![TaintLabel::new("user-controlled").unwrap()],
                 }],
                 transforms: Vec::new(),

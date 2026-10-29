@@ -257,6 +257,17 @@ impl CodeQueryResultValue {
                     other => panic!("unknown callable metrics coverage {other:?}"),
                 },
             }),
+            Self::MemberFamily { value } => {
+                Some(member_family_row_coverage(&value.member_id, value.outcome))
+            }
+            Self::MemberFamilyEdge { value } => Some(member_family_row_coverage(
+                &value.member_id,
+                match value.coverage {
+                    "exhaustive" => "proven",
+                    "open" => "incomplete",
+                    other => panic!("unknown member family coverage {other:?}"),
+                },
+            )),
             // Every other family answers a structural or lexical question and
             // runs no solver of its own: there is no partition for it to be
             // exhaustive over, and the executed query's envelope already states
@@ -309,8 +320,6 @@ impl CodeQueryResultValue {
             | Self::MemberSelection { .. }
             | Self::DispatchOutcome { .. }
             | Self::DispatchTarget { .. }
-            | Self::MemberFamily { .. }
-            | Self::MemberFamilyEdge { .. }
             | Self::PythonHierarchyFact { .. }
             | Self::Occurrence { .. }
             | Self::LexicalScope { .. }
@@ -380,4 +389,21 @@ fn flow_status_extent(status: CodeQueryFlowStatus) -> CodeQueryRowCoverageExtent
         | CodeQueryFlowStatus::QueryCancelled => CodeQueryDiagnosticCode::Cancelled,
     };
     CodeQueryRowCoverageExtent::Incomplete { codes: vec![code] }
+}
+
+/// Family partitions are the queried member, including on each retained edge.
+fn member_family_row_coverage(member_id: &str, outcome: &str) -> CodeQueryRowCoverage {
+    CodeQueryRowCoverage {
+        partition: Box::from(member_id),
+        extent: match outcome {
+            "proven" | "no_family" => CodeQueryRowCoverageExtent::Exhaustive,
+            "incomplete" => CodeQueryRowCoverageExtent::incomplete(vec![
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            ]),
+            "unsupported" => CodeQueryRowCoverageExtent::Unsupported {
+                capability: Box::from("member-family"),
+            },
+            other => panic!("unknown member family outcome {other:?}"),
+        },
+    }
 }

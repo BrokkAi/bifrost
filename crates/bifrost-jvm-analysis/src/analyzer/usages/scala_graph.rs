@@ -259,6 +259,7 @@ mod tests {
         let mut longest = 0;
         let mut declarations = FileDeclarations {
             enclosers: Vec::new(),
+            enclosing_units: HashMap::default(),
             definitions: HashMap::default(),
         };
         brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
@@ -316,13 +317,29 @@ mod tests {
                 .stack_size(128 * 1024)
                 .spawn_scoped(scope, || {
                     let query = AnalyzerQueryScope::new(&analyzer);
+                    let terminal_catalog =
+                        brokk_bifrost_core::analyzer::usages::inverted_edges::terminal_index(
+                            brokk_bifrost_analysis::analyzer::languages::language_knowledge(
+                                Language::Scala,
+                            )
+                            .unwrap(),
+                            &nodes,
+                            |_| vec![brokk_bifrost_core::analyzer::model::CodeUnitType::Function],
+                        );
                     let input = FileEdgeScanInput::new(
-                        &tree,
-                        &source,
-                        &line_starts,
-                        Language::Scala,
-                        &nodes,
+                        brokk_bifrost_core::analyzer::usages::inverted_edges::FileEdgeSyntax {
+                            tree: &tree,
+                            source: &source,
+                            line_starts: &line_starts,
+                        },
+                        brokk_bifrost_analysis::analyzer::languages::language_knowledge(
+                            Language::Scala,
+                        )
+                        .unwrap(),
+                        Some(&nodes),
+                        Some(&nodes),
                         &declarations,
+                        &terminal_catalog,
                     );
                     let edges = scan_edge_file(
                         &analyzer,

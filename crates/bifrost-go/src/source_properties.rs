@@ -691,7 +691,7 @@ fn type_children(node: Node<'_>) -> Vec<Node<'_>> {
         "pointer_type" | "slice_type" | "implicit_length_array_type" => node
             .child_by_field_name("type")
             .or_else(|| node.child_by_field_name("element"))
-            .or_else(|| node.named_child(0))
+            .or_else(|| crate::syntax::first_named_child(node))
             .into_iter()
             .collect(),
         "array_type" => node.child_by_field_name("element").into_iter().collect(),
@@ -841,4 +841,159 @@ fn parameter_facts(
         }
     }
     facts
+}
+
+#[cfg(test)]
+mod grammar_boundary_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: pointer comments hid the source type child"
+    )]
+    fn source_type_occurrences_preserve_grammar_children_and_signature_slots() {
+        let source = concat!(
+            "package p\n",
+            "type S struct { A,B int }\n",
+            "type P (int)\n",
+            "type Box[A any] struct{}\n",
+            "type U Box[int]\n",
+            "type C interface { interface { M() } }\n",
+            "type F = func(interface{ N() }) interface{ R() }\n",
+            "var pointer * /* type note */ int\n",
+            "var channels struct { Both chan int; Send chan<- int; Receive <-chan int }\n",
+            "func Single() int { return 0 }\n",
+            "func Multiple(xs ...int) (int,int) { return 0,0 }\n",
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut occurrences = PrimarySourceFactCollector::new(source);
+        let mut collector = GoSourcePropertyCollector::new(source);
+        let mut nodes = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            collector.capture_node(node, &mut occurrences);
+            nodes.push(node);
+            stack.extend(named_children(node).into_iter().rev());
+        }
+        let mut counts = [0; 6];
+        for node in nodes {
+            let text = go_node_text(node, source);
+            match node.kind() {
+                "parenthesized_type" | "type_elem" if text == "(int)" || text == "int" => {
+                    counts[0] += 1;
+                    let id = collector.type_id_for_node(node).unwrap();
+                    assert!(collector.identity_for_type(id).is_some(), "{text}");
+                }
+                "field_declaration" if text == "A,B int" => {
+                    counts[1] += 1;
+                    let id = collector
+                        .type_id_for_node(node.child_by_field_name("type").unwrap())
+                        .unwrap();
+                    let first = collector.identity_for_type(id).unwrap();
+                    assert_eq!(collector.identity_for_type(id), Some(first));
+                }
+                "function_type" => {
+                    counts[2] += 1;
+                    for field in ["parameters", "result"] {
+                        let root = node.child_by_field_name(field).unwrap();
+                        let ty = if field == "parameters" {
+                            root.named_child(0)
+                                .unwrap()
+                                .child_by_field_name("type")
+                                .unwrap()
+                        } else {
+                            root
+                        };
+                        let id = collector.type_id_for_node(ty).unwrap();
+                        match collector.type_shape(id) {
+                            GoSourceTypeShape::Interface { text, .. } => {
+                                assert_eq!(text.as_deref(), Some(go_node_text(ty, source)))
+                            }
+                            other => panic!("{other:?}"),
+                        }
+                    }
+                }
+                "type_elem" if text == "interface { M() }" => {
+                    counts[3] += 1;
+                    let id = collector.type_id_for_node(node).unwrap();
+                    match collector.type_shape(id) {
+                        GoSourceTypeShape::Compound { children, .. } => {
+                            assert_eq!(children.len(), 1);
+                            assert!(matches!(
+                                collector.type_shape(children[0]),
+                                GoSourceTypeShape::Interface { .. }
+                            ));
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+                "pointer_type" => {
+                    counts[5] += 1;
+                    let id = collector.type_id_for_node(node).unwrap();
+                    let GoSourceTypeShape::Pointer(inner) = collector.type_shape(id) else {
+                        panic!("pointer grammar must publish a pointer shape");
+                    };
+                    assert!(
+                        matches!(collector.type_shape(*inner), GoSourceTypeShape::Named(_)),
+                        "pointer child: {:?}",
+                        collector.type_shape(*inner)
+                    );
+                    let occurrence = collector.facts.types[inner.index()].occurrence;
+                    let range = occurrences.occurrence(occurrence).range;
+                    assert_eq!(&source[range.start_byte..range.end_byte], "int");
+                }
+                "channel_type" => {
+                    counts[4] += 1;
+                    let id = collector.type_id_for_node(node).unwrap();
+                    let expected = match text {
+                        "chan int" => GoChannelDirection::Both,
+                        "chan<- int" => GoChannelDirection::Send,
+                        "<-chan int" => GoChannelDirection::Receive,
+                        _ => panic!("{text}"),
+                    };
+                    assert!(
+                        matches!(collector.type_shape(id), GoSourceTypeShape::Channel { direction, .. } if *direction == expected)
+                    );
+                }
+                "function_declaration" => {
+                    let (results, _) =
+                        result_parameters(node, source, &mut occurrences, &collector);
+                    assert!(!results.is_empty());
+                    assert!(
+                        results
+                            .iter()
+                            .all(|result| !result.variadic && result.ty.is_some())
+                    );
+                    if node
+                        .child_by_field_name("name")
+                        .is_some_and(|name| go_node_text(name, source) == "Multiple")
+                    {
+                        let inputs =
+                            callable_parameters(node, source, &mut occurrences, &collector)
+                                .unwrap();
+                        assert_eq!(inputs.len(), 1);
+                        assert!(inputs[0].variadic);
+                        assert_eq!(results.len(), 2);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(counts, [2, 1, 1, 1, 3, 1]);
+        let facts = collector.finish();
+        assert_eq!(
+            facts
+                .fields
+                .iter()
+                .filter(|field| field.name == "A" || field.name == "B")
+                .count(),
+            2
+        );
+    }
 }

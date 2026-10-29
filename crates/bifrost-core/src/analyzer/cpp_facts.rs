@@ -392,7 +392,7 @@ pub struct CppSourceFacts {
     pub using_namespaces: Vec<(SourceOccurrenceId, String)>,
     pub namespace_aliases: Vec<CppNamespaceAliasFact>,
     pub expressions: Vec<CppExpressionFact>,
-    pub statement_facts: CppStatementFactRows,
+    pub statement_facts: StatementFactRows,
 }
 
 impl CppSourceFacts {

@@ -7,6 +7,7 @@
 
 pub mod canonical_hash;
 pub mod capabilities;
+pub mod carried_context;
 pub mod code_unit_index;
 pub mod cognitive_complexity;
 pub mod common;

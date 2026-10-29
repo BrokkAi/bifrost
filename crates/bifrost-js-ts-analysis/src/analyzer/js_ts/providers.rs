@@ -73,6 +73,7 @@ pub(crate) trait JsTsMemoSource: JsTsSource {
 }
 
 fn memoized_set<K, T>(
+    analyzer: &dyn IAnalyzer,
     cache: &Cache<K, Arc<HashSet<T>>>,
     key: &K,
     build: impl FnOnce() -> HashSet<T>,
@@ -84,9 +85,14 @@ where
     if let Some(cached) = cache.get(key) {
         return cached;
     }
-    let value = Arc::new(build());
-    cache.insert(key.clone(), Arc::clone(&value));
-    value
+    match cache.try_get_with_by_ref(key, || {
+        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
+            Arc::new(build())
+        })
+    }) {
+        Ok(value) => value,
+        Err(value) => Arc::clone(value.as_ref()),
+    }
 }
 
 /// The one downcast from the framework's `&dyn IAnalyzer` to the JS/TS source
@@ -126,9 +132,12 @@ pub(crate) fn imported_code_units_of(
     token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> Arc<HashSet<CodeUnit>> {
-    memoized_set(&host.memo_caches().imported_code_units, file, || {
-        resolve_imported_code_units(host, file, host.import_info_of(token, file))
-    })
+    memoized_set(
+        host.analyzer(),
+        &host.memo_caches().imported_code_units,
+        file,
+        || resolve_imported_code_units(host, file, host.import_info_of(token, file)),
+    )
 }
 
 /// `imports` is intentionally unused: `imported_code_units_of`'s cache is keyed by `file` alone and,
@@ -149,6 +158,11 @@ pub(crate) fn referencing_files_of(
     token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> HashSet<ProjectFile> {
+    let persistent_fill_guard = brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+        host.analyzer(),
+        "js_ts.referencing_files_of",
+    );
+
     let caches = host.memo_caches();
     if let Some(cached) = caches.referencing_files.get(file) {
         return (*cached).clone();
@@ -156,17 +170,30 @@ pub(crate) fn referencing_files_of(
 
     let reverse_index = memoized_reverse_import_index(
         &caches.reverse_import_index,
-        || host.all_files(),
-        |candidate| imported_code_units_of(host, token, candidate),
+        || {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                host.analyzer(),
+                "js_ts.reverse_file_index",
+                || host.all_files(),
+            )
+        },
+        |candidate| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                host.analyzer(),
+                "js_ts.reverse_file_index",
+                || imported_code_units_of(host, token, candidate),
+            )
+        },
     );
     let referencing = reverse_index
         .get(file)
         .map(|files| (**files).clone())
         .unwrap_or_default();
 
-    caches
-        .referencing_files
-        .insert(file.clone(), Arc::new(referencing.clone()));
+    let cache_key = file.clone();
+    let cache_value = Arc::new(referencing.clone());
+    persistent_fill_guard.installed("referencing_files_of");
+    caches.referencing_files.insert(cache_key, cache_value);
     referencing
 }
 
@@ -190,9 +217,12 @@ pub(crate) fn relevant_imports_for(
     token: QueryToken<'_>,
     code_unit: &CodeUnit,
 ) -> HashSet<String> {
-    (*memoized_set(&host.memo_caches().relevant_imports, code_unit, || {
-        compute_relevant_imports(host, token, code_unit)
-    }))
+    (*memoized_set(
+        host.analyzer(),
+        &host.memo_caches().relevant_imports,
+        code_unit,
+        || compute_relevant_imports(host, token, code_unit),
+    ))
     .clone()
 }
 
@@ -225,6 +255,7 @@ fn resolved_import_target_files(
 ) -> Arc<HashSet<ProjectFile>> {
     let caches = host.memo_caches();
     brokk_bifrost_analysis::analyzer::common::import_target_files_from_cache(
+        host.analyzer(),
         &caches.imported_target_files,
         file,
         || resolve_import_target_files(host, token, file),
@@ -246,15 +277,21 @@ pub(crate) fn get_direct_ancestors(
     host: &dyn JsTsMemoSource,
     code_unit: &CodeUnit,
 ) -> Vec<CodeUnit> {
+    let persistent_fill_guard = brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+        host.analyzer(),
+        "js_ts.get_direct_ancestors",
+    );
+
     let caches = host.memo_caches();
     if let Some(cached) = caches.direct_ancestors.get(code_unit) {
         return (*cached).clone();
     }
 
     let ancestors = compute_direct_ancestors(host, code_unit);
-    caches
-        .direct_ancestors
-        .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+    let cache_key = code_unit.clone();
+    let cache_value = Arc::new(ancestors.clone());
+    persistent_fill_guard.installed("get_direct_ancestors");
+    caches.direct_ancestors.insert(cache_key, cache_value);
     ancestors
 }
 
@@ -279,7 +316,14 @@ pub(crate) fn get_direct_descendants_within(
         &host.memo_caches().direct_descendant_index,
         scope,
         code_unit,
-        || build_direct_descendant_index_by_unit(host, host, scope),
+        || {
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                host.analyzer(),
+                || build_direct_descendant_index_by_unit(host, host, scope),
+            )
+            .ok()
+            .flatten()
+        },
     )
 }
 
@@ -287,7 +331,9 @@ pub(crate) fn get_direct_descendants_within(
 
 fn record_usage_index_scope(host: &dyn JsTsMemoSource) {
     let analyzer = host.analyzer();
-    if analyzer.read_ledger_attached() {
+    if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        analyzer.read_ledger_attached()
+    }) {
         analyzer.record_read(analyzer.workspace_scope_read_key(&[host.language()]));
     }
 }

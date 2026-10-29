@@ -289,6 +289,8 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                     id: "declarations.php.external".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -496,6 +498,8 @@ schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                     id: "declarations.php.external".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -768,6 +772,8 @@ schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                     id: "declarations.php.builtin".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -1010,9 +1016,33 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
 
+    use brokk_bifrost_analysis::analyzer::semantic_model::MemberKind;
+
     use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_discovered_dependency_semantic_packs;
+
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: projected mixed-case PHP constructors were classified as methods"
+    )]
+    fn composer_projection_classifies_mixed_case_constructor_names() {
+        let projection = crate::analyzer::php::source_artifact::project_php_source(
+            "artifact",
+            "src/Thing.php",
+            "<?php namespace Vendor\\Thing; class Thing { public function __Construct() {} }",
+            crate::analyzer::php::source_artifact::PhpAutoloadRule::Classmap,
+            crate::analyzer::php::source_artifact::PhpProjectionOrigin::composer(),
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+
+        assert_eq!(projection.members.len(), 1);
+        assert_eq!(projection.members[0].name, "__Construct");
+        assert_eq!(projection.members[0].member_kind, MemberKind::Constructor);
+    }
 
     #[test]
     fn composer_discovery_binds_lockfile_vendor_roots_and_autoload_rules() {

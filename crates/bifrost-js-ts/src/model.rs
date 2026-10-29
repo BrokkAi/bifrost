@@ -6,7 +6,7 @@ use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::materialization::{
     ExportForm, MaterializationRecord,
 };
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, node_range, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::tree_walk::node_range;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::Node;
 
@@ -347,6 +347,24 @@ pub fn property_name_text(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
+/// A declaration's header before its own initializer assignment token. An
+/// arrow in a type and defaults nested inside a binding are different nodes.
+pub(crate) fn declaration_initializer_header<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> &'source str {
+    let assignment = node
+        .children(&mut node.walk())
+        .find(|child| child.kind() == "=");
+    debug_assert!(
+        node.child_by_field_name("value").is_none() || assignment.is_some(),
+        "initialized declaration has an assignment token: {}",
+        node.to_sexp()
+    );
+    let end = assignment.map_or(node.end_byte(), |operator| operator.start_byte());
+    &source[node.start_byte()..end]
+}
+
 /// Renders the `<keyword> <left-hand-side>` header of a variable declarator
 /// (e.g. `const foo`), stripping any `= value` initializer text.
 pub fn variable_header(
@@ -359,12 +377,7 @@ pub fn variable_header(
         .child(0)
         .map(|node| node_text(node, source).trim().to_string())
         .unwrap_or_else(|| "const".to_string());
-    let declarator_text = trim_statement(node_text(declarator, source));
-    let left = declarator_text
-        .split('=')
-        .next()
-        .map(trim_statement)
-        .unwrap_or(declarator_text);
+    let left = trim_statement(declaration_initializer_header(declarator, source));
     let export_prefix = if exported { "export " } else { "" };
     format!("{export_prefix}{keyword} {left}")
 }
@@ -484,40 +497,114 @@ pub fn module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
     code_unit.short_name().starts_with(&format!("{file_name}."))
 }
 
-/// Collects every function-declaration or function-valued variable-declarator
-/// named `function_name` reachable from `node`, without descending into a
-/// matched function's own body (each match is a separate candidate source).
-pub fn collect_function_nodes<'tree>(
-    node: Node<'tree>,
+/// Classify only functions bound at this source location. The lexical index and
+/// its declaration-token ranges live for this single lookup, never a workspace.
+pub(crate) fn source_function_shape_preservation(
+    anchor: Node<'_>,
     source: &str,
-    function_name: &str,
-    out: &mut Vec<Node<'tree>>,
-) {
-    walk_named_tree_preorder(node, true, |node| {
-        if node.kind() == "function_declaration"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source).trim() == function_name)
-        {
-            out.push(node);
-            return WalkControl::SkipChildren;
+    name: &str,
+    mut preserves: impl FnMut(Node<'_>) -> bool,
+) -> ShapePreservation {
+    let root = root_node(anchor);
+    let bindings = crate::syntax::JsTsLexicalBindingIndex::build(root, source);
+    let ranges = bindings.binding_identifier_ranges_at(name, anchor.start_byte());
+    if ranges.is_empty() {
+        return ShapePreservation::Unknown;
+    }
+    if bindings.is_binding_reassigned_before_at(name, anchor.start_byte()) {
+        return ShapePreservation::Unknown;
+    }
+    let declarations: Vec<_> = ranges
+        .into_iter()
+        .map(|range| {
+            root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                .expect("indexed declaration token is in the source tree")
+                .parent()
+                .expect("declaration binder has a parent")
+        })
+        .collect();
+    let implementation = last_hoisted_function_implementation(&declarations);
+    let mut functions = Vec::new();
+    for declaration in implementation.into_iter().chain(
+        declarations
+            .into_iter()
+            .filter(|_| implementation.is_none()),
+    ) {
+        match declaration.kind() {
+            "function_declaration" => functions.push(declaration),
+            "variable_declarator" => match declaration.child_by_field_name("value") {
+                Some(value) if matches!(value.kind(), "arrow_function" | "function_expression") => {
+                    functions.push(value)
+                }
+                _ => return ShapePreservation::DoesNotPreserve,
+            },
+            "class_declaration" | "abstract_class_declaration" => {
+                return ShapePreservation::DoesNotPreserve;
+            }
+            // Imports and externally supplied values have no local body.
+            _ => return ShapePreservation::Unknown,
         }
-        if node.kind() == "variable_declarator"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source).trim() == function_name)
-            && let Some(value) = node.child_by_field_name("value")
-            && matches!(value.kind(), "arrow_function" | "function_expression")
-        {
-            out.push(value);
-            return WalkControl::SkipChildren;
-        }
-        WalkControl::Continue
-    });
+    }
+    let preserving = functions.into_iter().all(&mut preserves);
+    if preserving {
+        ShapePreservation::Preserves
+    } else {
+        ShapePreservation::DoesNotPreserve
+    }
 }
 
-/// The callee's bare or member-property name, if the call target is a simple
-/// identifier or `a.b(...)`-shaped member access (not a computed/dynamic call).
+/// Hoisting selects the last function declaration in one scope. Variable
+/// declarations and assignments do not obey this rule, even when callable.
+/// TypeScript overload signatures belong to the same binding and have no body.
+pub(crate) fn last_hoisted_function_implementation<'tree>(
+    nodes: &[Node<'tree>],
+) -> Option<Node<'tree>> {
+    fn scope(node: Node<'_>) -> Option<usize> {
+        let parent = node.parent()?;
+        if parent.kind() == "export_statement" {
+            parent.parent().map(|n| n.id())
+        } else {
+            Some(parent.id())
+        }
+    }
+    let first = *nodes.first()?;
+    if nodes.iter().any(|node| {
+        !matches!(node.kind(), "function_declaration" | "function_signature")
+            || scope(*node) != scope(first)
+    }) {
+        return None;
+    }
+    nodes
+        .iter()
+        .copied()
+        .filter(|node| node.child_by_field_name("body").is_some())
+        .max_by_key(Node::start_byte)
+}
+
+/// The header ends at the grammar's body field, even when a parameter or a
+/// heritage expression itself contains braces. Keep an export wrapper's prefix.
+pub(crate) fn declaration_header<'source>(node: Node<'_>, source: &'source str) -> &'source str {
+    let definition = if node.kind() == "export_statement" {
+        node.child_by_field_name("declaration")
+            .or_else(|| node.child_by_field_name("value"))
+            .expect("declaration export has a declaration or value")
+    } else {
+        node
+    };
+    let end = definition
+        .child_by_field_name("body")
+        .map_or(definition.end_byte(), |body| body.start_byte());
+    &source[node.start_byte()..end]
+}
+
+pub(crate) fn is_async_callable(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "async")
+}
+
+/// The callee's bare identifier name. Member calls require receiver resolution
+/// and must not be inferred from a property spelling alone.
 pub fn call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     matches!(function.kind(), "identifier" | "property_identifier")
@@ -594,5 +681,237 @@ pub(crate) fn surface_call_preserves_object_argument_shape(
         ShapePreservation::Preserves => true,
         ShapePreservation::DoesNotPreserve => false,
         ShapePreservation::Unknown => call_has_likely_surface_factory_name(call, source),
+    }
+}
+
+#[cfg(test)]
+mod signature_regression_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: function type arrows truncated variable signatures"
+    )]
+    fn variable_header_uses_grammar_initializer_boundary() {
+        let source = "const fn: (x:number)=>number = external;";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let statement = tree.root_node().named_child(0).unwrap();
+        let declaration = statement.named_child(0).unwrap();
+        assert_eq!(
+            variable_header(statement, declaration, source, false),
+            "const fn: (x:number)=>number"
+        );
+    }
+}
+
+#[cfg(test)]
+mod export_boundary_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parse(source: &str, language: brokk_bifrost_core::analyzer::Language) -> ParsedFile {
+        let file = ProjectFile::new(
+            std::env::temp_dir(),
+            if language == brokk_bifrost_core::analyzer::Language::JavaScript {
+                "exports.js"
+            } else {
+                "exports.ts"
+            },
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::parse::tree_sitter_language_for(language).unwrap())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        if language == brokk_bifrost_core::analyzer::Language::JavaScript {
+            crate::javascript::parse_javascript_file(&file, source, &tree)
+        } else {
+            crate::typescript::parse_typescript_file(&file, source, &tree)
+        }
+    }
+
+    #[test]
+    fn export_entries_agree_with_bound_names_and_default_declaration_identity() {
+        for language in [
+            brokk_bifrost_core::analyzer::Language::JavaScript,
+            brokk_bifrost_core::analyzer::Language::TypeScript,
+        ] {
+            for (source, names, form, segment) in [
+                (
+                    "export const {x:renamed, y}=source;",
+                    vec!["renamed", "y"],
+                    ExportForm::Named,
+                    None,
+                ),
+                (
+                    "const owner={member:1}; export default owner.member;",
+                    vec!["default"],
+                    ExportForm::DefaultNamed,
+                    None,
+                ),
+                (
+                    "export default {run(){}};",
+                    vec!["default"],
+                    ExportForm::DefaultAnonymous,
+                    Some(SegmentKind::Member),
+                ),
+                (
+                    "export default ()=>1;",
+                    vec!["default"],
+                    ExportForm::DefaultAnonymous,
+                    Some(SegmentKind::Member),
+                ),
+                (
+                    "export default class {};",
+                    vec!["default"],
+                    ExportForm::DefaultAnonymous,
+                    Some(SegmentKind::Type),
+                ),
+            ] {
+                let parsed = parse(source, language);
+                let exports: Vec<_> = parsed
+                    .materialization_records
+                    .iter()
+                    .filter_map(|record| match record {
+                        MaterializationRecord::Export {
+                            form,
+                            exported_name,
+                            ..
+                        } => Some((*form, exported_name.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    exports,
+                    names.iter().map(|name| (form, *name)).collect::<Vec<_>>(),
+                    "{source}"
+                );
+                let default = parsed
+                    .ranges
+                    .keys()
+                    .find(|unit| unit.identifier() == "default");
+                assert_eq!(
+                    default.map(|unit| unit.fq().resolved_segments().last().unwrap().1),
+                    segment,
+                    "{source}"
+                );
+            }
+            let parsed = parse(
+                "import {defineConfig} from 'external'; export const api=defineConfig({run(){return 1;}}); const owner={member:1}; export const alias=owner.member;",
+                language,
+            );
+            assert!(
+                parsed.ranges.keys().any(
+                    |unit| unit.identifier() == "run" && unit.owner_identifier() == Some("api")
+                )
+            );
+            assert!(
+                parsed
+                    .signatures
+                    .values()
+                    .flatten()
+                    .any(|signature| signature.contains("alias = owner.member"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_module_path_keeps_the_documented_fallback_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let file = ProjectFile::new(
+            std::env::temp_dir(),
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![
+                b'm', 0xff, b'.', b'j', b's',
+            ])),
+        );
+        let unit = module_code_unit(&file);
+        assert_eq!(unit.short_name(), "module");
+        assert_eq!(unit.fq().resolved_segments().last().unwrap().0, "module");
+    }
+    #[test]
+    #[hardwon("#7218: review: known non-callable factory binding invented object members")]
+    fn non_callable_factory_has_no_surface() {
+        for binding in ["class defineConfig {}", "const defineConfig = 0;"] {
+            let source = format!("{binding} export const api = defineConfig({{ghost() {{}}}});");
+            let parsed = parse(&source, brokk_bifrost_core::analyzer::Language::TypeScript);
+            assert!(
+                !parsed
+                    .ranges
+                    .keys()
+                    .any(|unit| unit.identifier() == "ghost"
+                        && unit.owner_identifier() == Some("api")),
+                "{binding}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#7218: review: duplicate hoisted factory used all bodies instead of last")]
+    fn hoisted_factory_uses_last_body() {
+        let parsed = parse(
+            "function defineConfig(x) {return 0;} function defineConfig(x) {return x;} export const api = defineConfig({ghost() {}});",
+            brokk_bifrost_core::analyzer::Language::JavaScript,
+        );
+        assert!(
+            parsed
+                .ranges
+                .keys()
+                .any(|unit| unit.identifier() == "ghost" && unit.owner_identifier() == Some("api"))
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: unrelated nested identity created a fictitious factory surface"
+    )]
+    fn unrelated_nested_identity_does_not_preserve_a_nonpreserving_factory() {
+        let source = "function identity(value){return 0;} function elsewhere(){function identity(value){return value;}} export const api=identity({run(){return 1;}});";
+        for language in [
+            brokk_bifrost_core::analyzer::Language::JavaScript,
+            brokk_bifrost_core::analyzer::Language::TypeScript,
+        ] {
+            let parsed = parse(source, language);
+            assert!(
+                !parsed.ranges.keys().any(
+                    |unit| unit.identifier() == "run" && unit.owner_identifier() == Some("api")
+                ),
+                "{language:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: class field function type signature was truncated at its arrow"
+    )]
+    fn class_field_function_type_keeps_its_arrow() {
+        let parsed = parse(
+            "class C { field: (x:number)=>number = ()=>1; }",
+            brokk_bifrost_core::analyzer::Language::TypeScript,
+        );
+        let signatures: Vec<_> = parsed
+            .signatures
+            .iter()
+            .filter(|(unit, _)| unit.identifier() == "field")
+            .flat_map(|(_, signatures)| signatures)
+            .collect();
+        assert!(!signatures.is_empty());
+        assert!(
+            signatures
+                .iter()
+                .all(|signature| signature.contains("=>number")),
+            "{signatures:?}"
+        );
     }
 }

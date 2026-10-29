@@ -11,12 +11,13 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 publish = true
+exclude = ["tests/**"]
 
 [lib]
 name = "brokk_bifrost_php"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3" }
 mago-allocator = "=1.43.0"
 mago-database = "=1.43.0"
 mago-phpdoc-syntax = "=1.43.0"
@@ -28,6 +29,7 @@ tree-sitter = "0.25.10"
 # exporting two language constants; every site here names `LANGUAGE_PHP` (the
 # HTML-embedding dialect), never `LANGUAGE_PHP_ONLY`.
 tree-sitter-php = { package = "brokk-tree-sitter-php", version = "=0.24.4" }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }

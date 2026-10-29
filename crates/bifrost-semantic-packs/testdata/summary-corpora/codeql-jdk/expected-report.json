@@ -1,0 +1,63 @@
+{
+  "rows_by_extensible_and_kind": {
+    "neutralModel": {
+      "sink": 1,
+      "summary": 2
+    },
+    "sinkModel": {
+      "command-injection": 1
+    },
+    "sourceModel": {
+      "environment": 1
+    },
+    "summaryModel": {
+      "taint": 12,
+      "value": 10
+    }
+  },
+  "translated_rows": 19,
+  "expanded_targets": 16,
+  "targets_with_neutral_and_flow": 1,
+  "skipped_by_reason": {
+    "callback_path": 2,
+    "constructor_receiver_input": 1,
+    "extensible_out_of_scope": 2,
+    "neutral_not_summary": 1,
+    "output_port_unsupported": 1,
+    "unmatched_declaration": 1
+  },
+  "collapsed_by_content_kind": {
+    "ArrayElement": 2,
+    "Element": 3,
+    "MapKey": 1,
+    "MapValue": 2,
+    "SyntheticField": 1
+  },
+  "value_rows_demoted": 6,
+  "unmatched_declarations": [
+    {
+      "file": "jdk21.model.yml",
+      "row": 7,
+      "cells": [
+        "java.lang",
+        "String",
+        "false",
+        "substring",
+        "",
+        "",
+        "Argument[this]",
+        "ReturnValue",
+        "taint",
+        "manual"
+      ]
+    }
+  ],
+  "skips": [
+    {
+      "file": "excerpt.model.yml",
+      "row": 7,
+      "reason": "output_port_unsupported",
+      "detail": "the authored IR has no parameter output for `Argument[2]`"
+    }
+  ]
+}

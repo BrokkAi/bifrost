@@ -976,6 +976,7 @@ fn execute_rung(
         (PrefixExecution::PreferWorkspace, Some(workspace)) => {
             execute_code_query_detailed_eager_index_workspace(
                 workspace,
+                context.flow_resources(),
                 &query,
                 budget.query_limits(),
                 context.cancellation,
@@ -983,6 +984,7 @@ fn execute_rung(
         }
         _ => execute_code_query_detailed_eager_index(
             context.analyzer,
+            context.flow_resources(),
             &query,
             budget.query_limits(),
             context.cancellation,

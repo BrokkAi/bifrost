@@ -1,3 +1,6 @@
+use super::placement_access::{
+    PlacementKey, PlacementRead, certified_predecessor_or_selected_mount, read_placements,
+};
 use super::rust_privacy::complete_access_source_read;
 use super::*;
 use crate::analyzer::resolution::{
@@ -518,7 +521,7 @@ type CrateMembership = (i64, BTreeSet<String>, String);
 pub(crate) struct CrateAccessMemo {
     placements: super::placement_access::PlacementMemo<CratePlacement>,
     reference_placements: super::placement_access::PlacementMemo<CratePlacement>,
-    memberships: super::placement_access::MembershipMemo<CrateMembership>,
+    memberships: super::placement_access::PlacementMemo<CrateMembership>,
     /// Whether a definition, by mount ordinal and semantic key, declares a
     /// module (`rust_crate_rows::MODULE_DEFINITIONS`). Every projection round
     /// asks it again for the same targets: on the whole tract graph the
@@ -579,27 +582,43 @@ fn placement_rows(
         &mut CrateAccessMemo,
     ) -> &mut super::placement_access::PlacementMemo<CratePlacement>,
 ) -> Result<Vec<CratePlacement>> {
-    super::placement_access::selected_placements(
+    let Some(subject) = certified_predecessor_or_selected_mount(selection, base_blobs, fragment)?
+    else {
+        return Ok(Vec::new());
+    };
+    let key = PlacementKey {
+        language: Language::Rust,
+        unit_digest: crate_key,
+        subject,
+        declaration: declaration.map(SourceDeclarationId::get),
+    };
+    read_placements(
         selection,
-        crate_key,
-        base_blobs,
-        fragment,
-        declaration,
-        sql,
+        &key,
+        PlacementRead {
+            sql,
+            bind: |key: &PlacementKey| {
+                vec![
+                    key.unit_digest.to_vec().into(),
+                    key.subject.blob.into(),
+                    key.declaration.map(i64::from).into(),
+                ]
+            },
+            decode: |row: &rusqlite::Row<'_>| {
+                let atoms: String = row.get(2)?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    serde_json::from_str(&atoms)
+                        .map_err(|error| StoreError::corrupt(error.to_string()))?,
+                ))
+            },
+        },
         selection
             .crate_access_memo()
             .borrow_mut()
             .as_mut()
             .map(memo_rows),
-        |row| {
-            let atoms: String = row.get(2)?;
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                serde_json::from_str(&atoms)
-                    .map_err(|error| StoreError::corrupt(error.to_string()))?,
-            ))
-        },
     )
 }
 
@@ -725,26 +744,40 @@ pub(crate) fn set_access(
     use brokk_bifrost_rust::selected_context::RustSelectedActivation;
     let conn = selection.connection();
     let memberships = |fragment| {
-        super::placement_access::selected_memberships(
+        let Some(subject) =
+            certified_predecessor_or_selected_mount(selection, base_blobs, fragment)?
+        else {
+            return Ok(Vec::new());
+        };
+        let key = PlacementKey {
+            language: Language::Rust,
+            unit_digest: crate_key,
+            subject,
+            declaration: None,
+        };
+        read_placements(
             selection,
-            crate_key,
-            base_blobs,
-            fragment,
-            MEMBERSHIPS,
+            &key,
+            PlacementRead {
+                sql: MEMBERSHIPS,
+                bind: |key: &PlacementKey| {
+                    vec![key.unit_digest.to_vec().into(), key.subject.blob.into()]
+                },
+                decode: |row: &rusqlite::Row<'_>| {
+                    let atoms: String = row.get(1)?;
+                    Ok((
+                        row.get(0)?,
+                        serde_json::from_str(&atoms)
+                            .map_err(|error| StoreError::corrupt(error.to_string()))?,
+                        row.get(2)?,
+                    ))
+                },
+            },
             selection
                 .crate_access_memo()
                 .borrow_mut()
                 .as_mut()
                 .map(|memo| &mut memo.memberships),
-            |row| {
-                let atoms: String = row.get(1)?;
-                Ok((
-                    row.get(0)?,
-                    serde_json::from_str(&atoms)
-                        .map_err(|error| StoreError::corrupt(error.to_string()))?,
-                    row.get(2)?,
-                ))
-            },
         )
     };
     let references = reference

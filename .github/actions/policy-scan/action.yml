@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.14.2
+    default: v0.14.3
   packs-source:
     description: >-
       Trusted JSON source selection with repository, exact rules_version and
@@ -248,7 +248,8 @@ runs:
         BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
         PACK_SOURCE: ${{ inputs.packs-source }}
         # scripts/release-dry-run.sh requires the engine this action installs
-        # to admit this pin (pack-admission phase).
+        # to admit and acquire this pin, and check-open-pack-selection.sh to
+        # accept the result (pack-admission phase).
         DEFAULT_PACK_SOURCE: '{"repository":"https://github.com/BrokkAi/bifrost-packs","rules_version":"0.5.1","manifest_sha256":"e607e5c360889805bf614ab05f96feda199f6ad3009d00f49158cd9f507ada6b","semantic_manifest_sha256":"dd8888f763f13732ede1f05a34c2bd205dad25705b3da967e9df949c14842570"}'
         POLICY_ROOT: ${{ env.BIFROST_OPEN_POLICY_PACK_ROOT }}
         SEMANTIC_ROOT: ${{ env.BIFROST_OPEN_SEMANTIC_PACK_BUNDLE }}
@@ -339,8 +340,13 @@ runs:
             || echo '::error::Open-pack acquisition failed without a readable receipt.'
           exit 1
         fi
-        jq -e 'type == "object" and .status == "selected" and (.selection.selection_id | type == "string" and length > 0) and (.selection.cache_reused | type == "boolean") and .selection.receipt.status == "qualified"' "${receipt}" >/dev/null
-        jq -e 'type == "object" and ((keys | sort) == ["BIFROST_OPEN_POLICY_PACK_ROOT", "BIFROST_SEMANTIC_PACK_CACHE_ROOT"] or (keys | sort) == ["BIFROST_OPEN_POLICY_PACK_ROOT", "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE", "BIFROST_SEMANTIC_PACK_CACHE_ROOT"]) and all(.[]; type == "string" and length > 0)' "${env_file}" >/dev/null
+        # Accepts a qualified or compatible receipt whose releases all have
+        # verified integrity, names each rejection, and reports the
+        # qualification level in the job summary. The release dry run runs the
+        # same check on DEFAULT_PACK_SOURCE (#7497).
+        qualification="${STATE_PATH}/qualification.json"
+        bash "${GITHUB_ACTION_PATH}/check-open-pack-selection.sh" "${receipt}" "${env_file}" "${qualification}"
+        echo "qualification=$(jq -c . "${qualification}")" >> "${GITHUB_OUTPUT}"
         echo "selection-id=$(jq -er '.selection.selection_id' "${receipt}")" >> "${GITHUB_OUTPUT}"
         echo "cache-reused=$(jq -er '.selection.cache_reused' "${receipt}")" >> "${GITHUB_OUTPUT}"
         echo "policy-root=$(jq -er '.BIFROST_OPEN_POLICY_PACK_ROOT' "${env_file}")" >> "${GITHUB_OUTPUT}"
@@ -610,10 +616,14 @@ runs:
         GH_TOKEN: ${{ github.token }}
         SARIF_PATH: ${{ steps.run.outputs.sarif-file }}
         CATEGORY: ${{ inputs.category }}
+        PACK_QUALIFICATION: ${{ steps.packs.outputs.qualification }}
       run: |
         set -euo pipefail
         categorized="${RUNNER_TEMP}/bifrost-categorized.sarif"
-        jq --arg category "${CATEGORY}" '
+        # The uploaded runs record the acquired content's qualification, so a
+        # code-scanning consumer can tell a compatible selection from a fully
+        # qualified one. Caller-prepared content has no receipt to record.
+        jq --arg category "${CATEGORY}" --arg qualification "${PACK_QUALIFICATION}" '
           .runs |= map(
             if (.automationDetails // {} | has("id") | not)
             then .automationDetails = ((.automationDetails // {}) + {
@@ -621,6 +631,9 @@ runs:
             })
             else .
             end
+            | if $qualification == "" then .
+              else .properties["bifrost.packSelection"] = ($qualification | fromjson)
+              end
           )
         ' "${SARIF_PATH}" > "${categorized}"
         # The payload can exceed the kernel argv limit, so it travels as a

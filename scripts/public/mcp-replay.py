@@ -7,7 +7,7 @@ It replays reproductions from the open latency issues (#1423 #1419 #1411
 roots-change, and per-tool coverage scenarios.
 
 Usage:
-  scripts/public/mcp-replay.py --binary target/release/bifrost --workspace . \
+  scripts/public/mcp-replay.py --binary target/measure/bifrost --workspace . \
       [--scenario NAME ...] [--warm] \
       [--budget-secs N] [--no-roots] [--mode 'symbol|extended']
 

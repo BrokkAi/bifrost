@@ -225,6 +225,11 @@ fn quoted_atom(
     cancelled: &impl Fn() -> bool,
 ) -> Result<GoModToken, BuildFileIssue> {
     let start = *offset;
+    // go.mod/go.work use interpreted quoted strings, not Go raw literals.
+    if contents.as_bytes()[start] != b'"' {
+        return Err(issue(BuildFileIssueKind::Malformed, start..start + 1));
+    }
+
     let value = quoted_bytes(contents, offset, cancelled)?;
     String::from_utf8(value)
         .map(GoModToken::String)
@@ -824,5 +829,131 @@ mod tests {
         }
         let document = parse_go_work(source, &BuildFileLimits::default(), || true);
         assert_eq!(document.issues[0].kind, BuildFileIssueKind::Cancelled);
+    }
+    #[test]
+    fn build_document_inclusive_bounds() {
+        let source = "module example.com/app";
+        let limits = BuildFileLimits {
+            max_bytes: source.len(),
+            max_tokens: 2,
+            ..Default::default()
+        };
+        let at = parse_go_mod(source, &limits, || false);
+        assert!(at.complete(), "{at:?}");
+        assert_eq!(at.entries.len(), 1);
+        assert!(
+            matches!(&at.entries[0].directive, GoDirective::Module(path) if path.value == "example.com/app" && path.range == (7..22))
+        );
+        let above = parse_go_mod(&format!("{source} "), &limits, || false);
+        assert_eq!(above.issues[0], issue(BuildFileIssueKind::ByteLimit, 0..23));
+        for suffix in ["\n", " // comment"] {
+            let text = format!("{source}{suffix}");
+            let limits = BuildFileLimits {
+                max_tokens: 2,
+                ..Default::default()
+            };
+            let above = parse_go_mod(&text, &limits, || false);
+            assert!(!above.complete(), "{above:?}");
+            let range = if suffix == "\n" {
+                22..23
+            } else {
+                text.len()..text.len()
+            };
+            assert_eq!(
+                above.issues[0],
+                issue(BuildFileIssueKind::TokenLimit, range)
+            );
+        }
+        let checksum = "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let source: String = (0..1001)
+            .map(|i| format!("example.com/lib{i} v1.0.0 {checksum}\n"))
+            .collect();
+        let result = parse_go_sum(&source, &BuildFileLimits::default(), || false);
+        assert!(result.complete(), "{result:?}");
+        assert_eq!(result.entries.len(), 1001);
+        for (i, entry) in result.entries.iter().enumerate() {
+            assert_eq!(entry.module.value, format!("example.com/lib{i}"));
+            assert_eq!(entry.version.value, "v1.0.0");
+            assert_eq!(entry.checksum.value, checksum);
+            assert_eq!(&source[entry.module.range.clone()], entry.module.value);
+        }
+    }
+
+    #[test]
+    fn build_directive_grammar_oracle_table() {
+        // Acceptance checked with Go's modfile parser (go mod edit -json).
+        for (directive, complete) in [
+            ("go 1.23", true),
+            ("go 1.2x", false),
+            ("toolchain go1.23.1", true),
+            ("require example.com/lib v1.2.3", true),
+            ("require example.com/lib v1x.2.3", false),
+            ("exclude example.com/lib v1.02.3", false),
+            ("replace example.com/lib => example.com/fork v1x.2.3", false),
+            (
+                "require example.com/lib v0.0.0-20260102030405-abcdef123456",
+                true,
+            ),
+            ("replace example.com/lib => ./foo", true),
+            ("replace example.com/lib => ../foo", true),
+            ("replace example.com/lib => .", true),
+            ("replace example.com/lib => ..", true),
+            ("replace example.com/lib => /foo", true),
+            ("replace example.com/lib => ..foo", false),
+        ] {
+            let source = format!("module example.com/app\n{directive}\n");
+            let result = module(&source);
+            assert_eq!(result.complete(), complete, "{source}: {result:?}");
+            if complete {
+                assert_eq!(result.entries.len(), 2);
+                assert_eq!(
+                    &source[result.entries[1].keyword_range.clone()],
+                    directive.split_whitespace().next().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_literal_escape_values_match_specification() {
+        // Go specification string-literal table, also checked by strconv.Unquote.
+        // The raw decoder remains usable for AST-selected tags, while modfile
+        // quoted atoms admit interpreted strings only.
+        for (literal, expected) in [
+            (
+                r#""\a\b\f\n\r\t\v\\\"""#,
+                b"\x07\x08\x0c\n\r\t\x0b\\\"".as_slice(),
+            ),
+            (r#""\101\x42\u0043\U00000044""#, b"ABCD".as_slice()),
+            ("`raw\r\nvalue`", b"raw\nvalue".as_slice()),
+        ] {
+            assert_eq!(
+                go_string_literal_bytes(literal).as_deref(),
+                Some(expected),
+                "{literal}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: go.mod accepted raw quoted strings"
+    )]
+    fn build_files_reject_raw_quotes() {
+        for source in [
+            "module `example.com/app`",
+            "module example.com/app\nreplace example.com/lib => `../foo`",
+        ] {
+            let result = module(source);
+            assert!(!result.complete(), "{result:?}");
+            assert!(
+                result
+                    .issues
+                    .iter()
+                    .any(|i| i.kind == BuildFileIssueKind::Malformed)
+            );
+        }
+        let result = parse_go_work("use `./foo`", &BuildFileLimits::default(), || false);
+        assert!(!result.complete(), "{result:?}");
     }
 }

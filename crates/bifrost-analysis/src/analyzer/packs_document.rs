@@ -182,6 +182,8 @@ const REVIEWED_NODE_RUNTIME_PROFILE_DIGEST: &str =
 /// route mints one evidence row per present JavaScript/TypeScript language. A
 /// workspace that declares another revision, or nothing, mints no row and the
 /// pack's selector stays unsatisfied with a reason naming what is missing.
+/// All exact declarations must agree; conflicts emit a diagnostic and mint no
+/// reviewed runtime evidence.
 pub fn node_runtime_evidence(
     workspace: &WorkspaceAnalyzer,
 ) -> Vec<SemanticModelActivationEvidence> {
@@ -274,42 +276,59 @@ pub fn imported_node_builtin_modules(
 /// The exact Node revision the workspace declares, when it declares one.
 ///
 /// `package.json` `engines.node` and `volta.node` are read as JSON fields, and
-/// the two conventional version documents as one line of text. An absent,
+/// the two conventional version documents as one line of text. Every exact
+/// declaration must agree; conflicting revisions name no reviewed runtime.
+/// An absent,
 /// unreadable, or unparsable declaration names no revision: a workspace still
 /// has to say which runtime it runs.
 fn workspace_declared_node_version(workspace_root: &Path) -> Option<String> {
     let root = WorkspaceRoot::open(workspace_root).ok()?;
-    package_manifest_node_version(&root).or_else(|| {
-        NODE_RUNTIME_DECLARATION_DOCUMENTS
-            .iter()
-            .find_map(|document| node_version_document(&root, Path::new(document)))
-    })
+    let versions: BTreeSet<_> = package_manifest_node_versions(&root)
+        .into_iter()
+        .chain(
+            NODE_RUNTIME_DECLARATION_DOCUMENTS
+                .iter()
+                .filter_map(|document| node_version_document(&root, Path::new(document))),
+        )
+        .collect();
+    if versions.len() > 1 {
+        eprintln!(
+            "bifrost: conflicting exact Node runtime declarations in {}: {versions:?}; no reviewed runtime evidence",
+            workspace_root.display()
+        );
+        return None;
+    }
+    versions.into_iter().next()
 }
 
 /// `engines.node` and `volta.node` from the workspace's root `package.json`.
-fn package_manifest_node_version(root: &WorkspaceRoot) -> Option<String> {
+fn package_manifest_node_versions(root: &WorkspaceRoot) -> Vec<String> {
     // An absent, unreadable, malformed, or oversized manifest declares no
     // revision, which is the same answer as a manifest without a Node pin: the
     // pack stays incompatible and the report names the evidence that is
     // missing. Only a declaration can change the decision, so a read failure
     // cannot silently activate anything.
-    let document = read_workspace_document(
+    let Ok(document) = read_workspace_document(
         root,
         Path::new("package.json"),
         &["json"],
         MAX_NODE_RUNTIME_DECLARATION_BYTES,
-    )
-    .ok()?;
-    let manifest: serde_json::Value = serde_json::from_str(document.source()).ok()?;
+    ) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(document.source()) else {
+        return Vec::new();
+    };
     [["engines", "node"], ["volta", "node"]]
         .into_iter()
-        .find_map(|[container, member]| {
+        .filter_map(|[container, member]| {
             manifest
                 .get(container)?
                 .get(member)?
                 .as_str()
                 .and_then(exact_node_version)
         })
+        .collect()
 }
 
 /// The revision one `.nvmrc` or `.node-version` document names.
@@ -976,8 +995,6 @@ fn workspace_activation_prelude(
         evidence.extend(node_runtime_evidence(workspace));
         evidence.extend(python_process_input_evidence(workspace));
     }
-    evidence.sort();
-    evidence.dedup();
     Ok(Some(WorkspaceActivationPrelude {
         ecosystems,
         workspace_models: registration.models,
@@ -1131,12 +1148,378 @@ impl fmt::Display for WorkspacePacksValidationError {
 impl std::error::Error for WorkspacePacksValidationError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
     use std::fs;
 
     use tempfile::TempDir;
+
+    // The analysis-only test binary deliberately links no language adapters.
+    // This fake supplies only the languages/configuration the pack boundary reads.
+    #[derive(Clone)]
+    pub(crate) struct CatalogWorkspace {
+        pub(crate) project: std::sync::Arc<dyn crate::Project>,
+        pub(crate) language: Language,
+        pub(crate) index:
+            Option<std::sync::Arc<dyn crate::analyzer::read_verification::WorkspaceFactIndex>>,
+    }
+    impl crate::analyzer::CodeUnitIndex for CatalogWorkspace {
+        fn project(&self) -> &dyn crate::Project {
+            self.project.as_ref()
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([self.language])
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::CodeUnit> + '_> {
+            Box::new(std::iter::empty())
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<crate::CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(
+            &self,
+            _: &crate::ProjectFile,
+            _: &crate::Range,
+        ) -> Option<crate::CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &crate::ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<crate::CodeUnit> {
+            unimplemented!()
+        }
+        fn get_skeleton(&self, _: &crate::CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &crate::CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &crate::CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+    impl crate::analyzer::IAnalyzer for CatalogWorkspace {
+        fn workspace_fact_indexes(
+            &self,
+        ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
+            self.index.iter().map(|index| index.as_ref()).collect()
+        }
+        fn update(&self, _: &BTreeSet<crate::ProjectFile>) -> Self {
+            unimplemented!()
+        }
+        fn update_all(&self) -> Self {
+            unimplemented!()
+        }
+        fn is_access_expression(&self, _: &crate::ProjectFile, _: usize, _: usize) -> bool {
+            unimplemented!()
+        }
+        fn find_nearest_declaration(
+            &self,
+            _: &crate::ProjectFile,
+            _: usize,
+            _: usize,
+            _: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo> {
+            unimplemented!()
+        }
+    }
+    impl crate::analyzer::semantic::ProgramSemanticsProvider for CatalogWorkspace {
+        fn current_artifact_source(
+            &self,
+            _: &crate::ProjectFile,
+            _: usize,
+        ) -> Result<
+            Option<crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+            crate::analyzer::semantic::SemanticProviderError,
+        > {
+            unimplemented!()
+        }
+        fn materialize(
+            &self,
+            _: &crate::ProjectFile,
+            _: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        ) -> Result<
+            crate::analyzer::semantic::SemanticOutcome<
+                std::sync::Arc<crate::analyzer::semantic::SemanticArtifact>,
+            >,
+            crate::analyzer::semantic::SemanticProviderError,
+        > {
+            unimplemented!()
+        }
+    }
+    impl crate::analyzer::multi_analyzer::LanguageAnalyzer for CatalogWorkspace {
+        fn analyzer(&self) -> &dyn crate::analyzer::IAnalyzer {
+            self
+        }
+        fn program_semantics_provider(
+            &self,
+        ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
+            self
+        }
+        fn clone_with_project(
+            &self,
+            _: std::sync::Arc<dyn crate::Project>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn clone_for_index_warm(
+            &self,
+            _: std::sync::Arc<dyn crate::Project>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn import_analysis_provider(&self) -> Option<&dyn crate::analyzer::ImportAnalysisProvider> {
+            None
+        }
+        fn type_hierarchy_provider(&self) -> Option<&dyn crate::analyzer::TypeHierarchyProvider> {
+            None
+        }
+        fn type_alias_provider(&self) -> Option<&dyn crate::analyzer::TypeAliasProvider> {
+            None
+        }
+        fn test_detection_provider(&self) -> Option<&dyn crate::analyzer::TestDetectionProvider> {
+            None
+        }
+        fn update(
+            &self,
+            _: &BTreeSet<crate::ProjectFile>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn update_all_with_progress(
+            &self,
+            _: Option<crate::analyzer::BuildProgress>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_box(&self) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            Box::new(self.clone())
+        }
+    }
+    fn workspace_at(root: &Path, config: AnalyzerConfig) -> WorkspaceAnalyzer {
+        use crate::analyzer::multi_analyzer::{
+            AnalyzerDelegate, MultiAnalyzer, WorkspaceBuildContext,
+        };
+        let project: std::sync::Arc<dyn crate::Project> = std::sync::Arc::new(
+            crate::TestProject::from_root_with_inferred_languages(root).unwrap(),
+        );
+        let delegates = project
+            .analyzer_languages()
+            .into_iter()
+            .map(|language| {
+                (
+                    language,
+                    AnalyzerDelegate::new(CatalogWorkspace {
+                        project: project.clone(),
+                        language,
+                        index: None,
+                    }),
+                )
+            })
+            .collect();
+        let store =
+            crate::analyzer::tree_sitter_analyzer::ephemeral_store_context(project.as_ref())
+                .unwrap();
+        let context = std::sync::Arc::new(WorkspaceBuildContext::new(project, config, store, None));
+        WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new_for_workspace(
+            delegates, context,
+        )))
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: conflicting Node pins claimed a reviewed runtime"
+    )]
+    fn node_runtime_declarations_must_agree_across_all_documents() {
+        for (engines, volta, nvmrc, node_version, expected) in [
+            (Some("22.11.0"), Some("20.11.0"), None, None, false),
+            (Some("20.11.0"), Some("22.11.0"), None, None, false),
+            (Some("22.11.0"), None, Some("20.11.0"), None, false),
+            (None, None, Some("22.11.0"), Some("20.11.0"), false),
+            (
+                Some("22.11.0"),
+                Some("v22.11.0"),
+                Some("22.11.0"),
+                Some("v22.11.0"),
+                true,
+            ),
+            (None, None, None, Some("22.11.0"), true),
+        ] {
+            let temp = TempDir::new().unwrap();
+            fs::write(temp.path().join("app.js"), "const value = 1;").unwrap();
+            fs::write(temp.path().join("app.ts"), "const value: number = 1;").unwrap();
+            fs::write(
+                temp.path().join("package.json"),
+                serde_json::json!({
+                    "engines": {"node": engines}, "volta": {"node": volta}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            for (path, version) in [(".nvmrc", nvmrc), (".node-version", node_version)] {
+                if let Some(version) = version {
+                    fs::write(temp.path().join(path), version).unwrap();
+                }
+            }
+            let workspace = workspace_at(temp.path(), AnalyzerConfig::default());
+            let evidence = node_runtime_evidence(&workspace);
+            assert_eq!(
+                evidence
+                    .iter()
+                    .map(|row| row.language.as_str())
+                    .collect::<BTreeSet<_>>(),
+                if expected {
+                    BTreeSet::from(["javascript", "typescript"])
+                } else {
+                    BTreeSet::new()
+                },
+                "engines={engines:?}, volta={volta:?}, nvmrc={nvmrc:?}, node-version={node_version:?}"
+            );
+        }
+    }
+
+    // Synthetic engine-only catalog fixtures, not product pack content.
+    fn bootstrap_intrinsic_fixtures(catalog: &SemanticPackCatalog) -> Result<(), String> {
+        use crate::analyzer::semantic_model::dependency::test_support::{
+            compiled_pack, install_fixture_pack,
+        };
+        for (language, ecosystem) in [("rust", "cargo"), ("python", "pypi")] {
+            let source = serde_json::json!({
+                "schema_version": 2,
+                "pack_id": format!("test.intrinsic-{language}"), "version": "1.0.0",
+                "producer": {"name": "engine-test", "version": "1.0.0"},
+                "language": language, "ecosystem": ecosystem,
+                "compatibility": {"bifrost": ">=0.8.0, <1.0.0"},
+                "provenance": {"source": "synthetic engine integration fixture"},
+                "license": "Apache-2.0", "completeness": "complete",
+                "safety": {"generated_code_only": false, "review_required": false},
+                "shards": [{"id": "declarations", "activation": [{}], "payload": {
+                    "kind": "declaration_facts", "types": [{
+                        "id": "test.type", "name": "IntrinsicFixture", "type_kind": "class",
+                        "visibility": "public", "type_parameters": [], "hierarchy": [],
+                        "aliases": [], "extension_surfaces": [],
+                        "locator": {"kind": "artifact", "path": "fixture", "symbol": "IntrinsicFixture"}
+                    }], "members": [], "relations": []
+                }}]
+            });
+            install_fixture_pack(catalog, &compiled_pack(&source.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn intrinsic_catalog_selection_is_multilingual_and_document_route_is_opt_in() {
+        use crate::analyzer::semantic_model::{
+            SemanticModelActivationStatus, SemanticModelRuntimeOutcome,
+        };
+        install_semantic_model_catalog_bootstrap(bootstrap_intrinsic_fixtures).unwrap();
+        let config =
+            parse_workspace_packs_config(r#"{"schema_version":1,"ecosystems":[]}"#).unwrap();
+        for files in [
+            [("app.rs", "fn main() {}"), ("app.py", "pass")],
+            [("app.py", "pass"), ("app.rs", "fn main() {}")],
+        ] {
+            let temp = TempDir::new().unwrap();
+            for (path, source) in files {
+                fs::write(temp.path().join(path), source).unwrap();
+            }
+            let workspace = workspace_at(temp.path(), AnalyzerConfig::default());
+            let cancellation = crate::CancellationToken::new();
+            assert!(
+                activate_workspace_packs(
+                    &workspace,
+                    &AnalyzerConfig::default(),
+                    temp.path(),
+                    &config,
+                    &cancellation
+                )
+                .unwrap()
+                .is_none()
+            );
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let result = activate_workspace_semantic_sources_in_catalog(
+                &workspace,
+                &AnalyzerConfig::default(),
+                &catalog,
+                WorkspaceActivationSources {
+                    catalog_root: temp.path(),
+                    workspace_model_root: None,
+                    config: Some(&config),
+                    intrinsic_shipped_models: true,
+                },
+                &[],
+                &cancellation,
+            )
+            .unwrap()
+            .unwrap();
+            let Some(SemanticModelRuntimeOutcome::Ready { active, .. }) = result.outcome.runtime
+            else {
+                panic!("{result:?}");
+            };
+            let selected = active
+                .activation_report()
+                .explanations
+                .iter()
+                .filter(|entry| entry.status == SemanticModelActivationStatus::Active)
+                .filter_map(|entry| entry.pack_id.as_deref())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                selected,
+                BTreeSet::from(["test.intrinsic-python", "test.intrinsic-rust"])
+            );
+        }
+    }
+
+    #[test]
+    fn source_toolchain_activation_preserves_partially_premerged_bindings() {
+        use brokk_bifrost_core::analyzer::config::JvmSourceToolchainBinding;
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("App.java"), "class App {}").unwrap();
+        let bindings = [
+            JvmSourceToolchainBinding::new(PathBuf::from("old"), PathBuf::from("jdk21")),
+            JvmSourceToolchainBinding::new(PathBuf::from("new"), PathBuf::from("jdk22")),
+        ];
+        for bindings in [bindings.to_vec(), bindings.into_iter().rev().collect()] {
+            let mut full = AnalyzerConfig::default();
+            full.jvm.standard_library_discovery.source_toolchains = bindings;
+            let workspace = workspace_at(temp.path(), full.clone());
+            let mut partial = full.clone();
+            partial
+                .jvm
+                .standard_library_discovery
+                .source_toolchains
+                .truncate(1);
+            let merged = activation_config_with_source_toolchains(&workspace, &partial, None);
+            // Independent source selection is the consumer of the preserved
+            // bindings; either source tree must still select its own JDK.
+            for (path, expected) in [("old/App.java", "jdk21"), ("new/App.java", "jdk22")] {
+                let file = crate::ProjectFile::new(temp.path().to_path_buf(), path);
+                assert_eq!(
+                    merged
+                        .jvm
+                        .standard_library_discovery
+                        .selected_jdk_home_for_file(&file),
+                    Ok(Path::new(expected))
+                );
+                assert_eq!(
+                    merged
+                        .jvm
+                        .standard_library_discovery
+                        .selected_jdk_home_for_file(&file),
+                    full.jvm
+                        .standard_library_discovery
+                        .selected_jdk_home_for_file(&file)
+                );
+            }
+        }
+    }
 
     #[test]
     fn python_runtime_scopes_accept_root_and_reject_portable_path_escapes() {
@@ -1157,22 +1540,37 @@ mod tests {
         );
         for scope in [
             "../outside",
+            "./../outside",
             "/absolute",
             "C:outside",
             "C:\\outside",
             "\\server\\share",
             "",
         ] {
+            let error = parse_workspace_packs_config(&source(scope)).unwrap_err();
             assert!(
-                parse_workspace_packs_config(&source(scope)).is_err(),
-                "{scope:?}"
+                matches!(error, WorkspacePacksDocumentError::Validation(
+                WorkspacePacksValidationError::InvalidPythonRuntimePath { ref path, .. }
+            ) if path == Path::new(scope)),
+                "{error:?}"
             );
         }
-        let config = parse_workspace_packs_config(&source("src/./application")).unwrap();
-        assert_eq!(
-            config.python_runtime_environments()[0].source_root,
-            PathBuf::from("src/application")
-        );
+        for (scope, expected) in [
+            ("src/./application", "src/application"),
+            ("./src", "src"),
+            ("./src/./application", "src/application"),
+        ] {
+            let config = parse_workspace_packs_config(&source(scope)).unwrap();
+            let canonical = parse_workspace_packs_config(&source(expected)).unwrap();
+            assert_eq!(
+                config.python_runtime_environments()[0].source_root,
+                PathBuf::from(expected)
+            );
+            assert_eq!(
+                config.python_runtime_environments(),
+                canonical.python_runtime_environments()
+            );
+        }
     }
 
     #[test]
@@ -1264,10 +1662,17 @@ mod tests {
 
     #[test]
     fn malformed_documents_report_typed_errors() {
-        assert!(matches!(
-            parse_workspace_packs_config("{ not json"),
-            Err(WorkspacePacksDocumentError::JsonDecode { .. })
-        ));
+        for (source, expected_line, expected_column) in [
+            ("{ not json", 1, 3),
+            ("{\n\"schema_version\":1,\n\"ecosystems\": ?\n}", 3, 15),
+        ] {
+            let error = parse_workspace_packs_config(source).unwrap_err();
+            assert!(
+                matches!(error, WorkspacePacksDocumentError::JsonDecode {line, column, ..}
+                if (line, column) == (expected_line, expected_column)),
+                "{error:?}"
+            );
+        }
         assert!(matches!(
             parse_workspace_packs_config(r#"{ "schema_version": 2, "ecosystems": ["jvm"] }"#),
             Err(WorkspacePacksDocumentError::Validation(

@@ -7,6 +7,7 @@
 
 use crate::analyzer::semantic::lexical_definitions::FormalVariadicKind;
 
+use brokk_bifrost_core::analyzer::language_knowledge::GuardConditionSyntax;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, try_walk_named_tree_preorder};
 use brokk_bifrost_core::hash::HashMap;
 use std::hash::Hash;
@@ -45,6 +46,8 @@ use crate::analyzer::semantic::CallContinuationKind;
 use crate::analyzer::semantic::CallInvocationMode;
 
 use crate::analyzer::semantic::CallSiteId;
+
+use crate::analyzer::semantic::DeferredMemberSelection;
 
 use crate::analyzer::semantic::CallableTargetResolution;
 
@@ -176,6 +179,99 @@ use crate::analyzer::semantic::ValueFlowKind;
 
 use crate::analyzer::semantic::ValueId;
 
+/// A condition predicate and the arm on which it holds.
+#[derive(Debug)]
+pub struct NormalizedConditionGuard {
+    pub predicate: GuardPredicate,
+    pub subject: Option<ValueId>,
+    pub holds_on_false_arm: bool,
+}
+
+impl NormalizedConditionGuard {
+    /// The predicate already states the condition's own polarity.
+    pub const fn folded(predicate: GuardPredicate, subject: Option<ValueId>) -> Self {
+        Self {
+            predicate,
+            subject,
+            holds_on_false_arm: false,
+        }
+    }
+
+    /// Select the successors where the normalized predicate holds and fails.
+    pub fn arms<T>(&self, when_true: T, when_false: T) -> (T, T) {
+        if self.holds_on_false_arm {
+            (when_false, when_true)
+        } else {
+            (when_true, when_false)
+        }
+    }
+}
+
+/// A malformed transparent wrapper; callers retain their own diagnostics.
+#[derive(Debug)]
+pub struct MissingGuardOperand<'tree> {
+    pub node: Node<'tree>,
+    pub field: &'static str,
+}
+
+/// Peel transparent parentheses and logical negation without recursion.
+pub fn peel_guard_condition<'tree>(
+    mut node: Node<'tree>,
+    syntax: &GuardConditionSyntax,
+) -> Result<(Node<'tree>, bool), MissingGuardOperand<'tree>> {
+    let mut negated = false;
+    loop {
+        if syntax.parenthesis_kinds.contains(&node.kind()) {
+            let inner = match syntax.parenthesis_field {
+                Some(field) => node.child_by_field_name(field),
+                None => brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(
+                    node,
+                    |child| !brokk_bifrost_core::analyzer::tree_walk::is_comment_kind(child.kind()),
+                ),
+            };
+            node = inner.ok_or(MissingGuardOperand {
+                node,
+                field: syntax.parenthesis_field.unwrap_or("value"),
+            })?;
+        } else if syntax.negation_kinds.contains(&node.kind())
+            && node
+                .child_by_field_name(syntax.operator_field)
+                .is_some_and(|operator| operator.kind() == syntax.negation_operator)
+        {
+            node = node
+                .child_by_field_name(syntax.operand_field)
+                .ok_or(MissingGuardOperand {
+                    node,
+                    field: syntax.operand_field,
+                })?;
+            negated = !negated;
+        } else {
+            return Ok((node, negated));
+        }
+    }
+}
+
+/// A direct call condition tests that call's result; negation swaps its arms.
+/// Other terminal kinds, including comparisons, are outside this rule.
+pub fn normalize_direct_call_guard<'tree, E>(
+    node: Node<'tree>,
+    syntax: &GuardConditionSyntax,
+    mut expression_value: impl FnMut(Node<'tree>) -> Result<ValueId, E>,
+) -> Result<Option<NormalizedConditionGuard>, E> {
+    let Ok((call, negated)) = peel_guard_condition(node, syntax) else {
+        return Ok(None);
+    };
+    if !syntax.call_kinds.contains(&call.kind()) {
+        return Ok(None);
+    }
+    let value = expression_value(call)?;
+    Ok(Some(NormalizedConditionGuard {
+        predicate: GuardPredicate::Truthy { value },
+        subject: Some(value),
+        holds_on_false_arm: negated,
+    }))
+}
+
 #[doc(hidden)]
 pub fn required_field_or_else<'tree, E>(
     node: Node<'tree>,
@@ -243,6 +339,56 @@ where
     V: Clone,
 {
     map.get(key)?.clone()
+}
+
+/// Language-owned operator mapping. Context holds the already-resolved operand
+/// type and language rules such as the enclosing checked arithmetic context.
+#[derive(Debug)]
+pub struct CompoundAssignmentOperator<C> {
+    pub compound: &'static str,
+    pub can_throw: fn(C) -> bool,
+}
+
+/// A target selected structurally by the language adapter.
+#[derive(Debug, Clone, Copy)]
+pub enum CompoundAssignmentTarget {
+    Binding {
+        value: ValueId,
+        flow: ValueFlowKind,
+    },
+    Memory {
+        location: MemoryLocationId,
+        kind: MemoryAccessKind,
+    },
+}
+
+/// The adapter evaluates the old target and the right operand before
+/// `operation`, in the language's evaluation order (C#: left, right, then
+/// operation). For a Memory target, `old` is a load the adapter emits itself.
+/// The operation and write points are distinct so exceptions cannot commit
+/// the write. All state belongs to the procedure currently being lowered.
+#[derive(Debug, Clone, Copy)]
+pub struct CompoundAssignment {
+    pub operation: ProgramPointId,
+    pub write: ProgramPointId,
+    pub old: ValueId,
+    pub right: ValueId,
+    pub result: ValueId,
+    pub target: CompoundAssignmentTarget,
+}
+
+/// Default compound computation: preserve both operand dependencies without
+/// claiming an exact scalar result. Languages may supply a computation hook
+/// with a more precise transfer for an operation they can prove exact.
+pub fn compute_language_defined_compound_assignment(
+    session: &ProcedureLoweringSession<'_>,
+    builder: &mut ProcedureCfgBuilder,
+    operation: ProgramPointId,
+    old: ValueId,
+    right: ValueId,
+    result: ValueId,
+) -> Result<(), ProcedureLoweringError> {
+    session.append_language_defined_value_flows(builder, operation, [old, right], result)
 }
 
 /// Common operational failures produced while lowering one procedure.
@@ -681,6 +827,56 @@ pub struct PointMetadata {
     pub source: SourceMappingId,
     #[doc(hidden)]
     pub evidence: EvidenceId,
+}
+
+/// Intern a stack-place origin in first-observation order. Languages supply
+/// the place, extent and exact emission provenance.
+pub fn intern_stack_pointer_origin(
+    origins: &mut Vec<crate::analyzer::semantic::PointerOrigin>,
+    by_place: &mut HashMap<
+        crate::analyzer::semantic::SemanticPlace,
+        crate::analyzer::semantic::PointerOriginId,
+    >,
+    place: crate::analyzer::semantic::SemanticPlace,
+    byte_extent: Option<u128>,
+    point: ProgramPointId,
+    metadata: PointMetadata,
+) -> crate::analyzer::semantic::PointerOriginId {
+    use crate::analyzer::semantic::{PointerOrigin, PointerOriginId, PointerOriginKind};
+    *by_place.entry(place.clone()).or_insert_with(|| {
+        let id = PointerOriginId::try_from_index(origins.len())
+            .expect("pointer origin IDs fit the validated dense-ID domain");
+        origins.push(PointerOrigin {
+            id,
+            point,
+            kind: PointerOriginKind::StackPlace { place },
+            byte_extent,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        });
+        id
+    })
+}
+
+/// Emit one already-admitted alias, after any language-owned deduplication.
+pub fn append_pointer_alias(
+    aliases: &mut Vec<crate::analyzer::semantic::PointerAlias>,
+    point: ProgramPointId,
+    pointer: ValueId,
+    origin: crate::analyzer::semantic::PointerOriginId,
+    byte_offset: crate::analyzer::semantic::PointerByteOffset,
+    strength: crate::analyzer::semantic::PointerRelationStrength,
+    metadata: PointMetadata,
+) {
+    aliases.push(crate::analyzer::semantic::PointerAlias {
+        point,
+        pointer,
+        origin,
+        byte_offset,
+        strength,
+        source: metadata.source,
+        evidence: metadata.evidence,
+    });
 }
 
 /// One already-classified control-flow destination.
@@ -1418,6 +1614,8 @@ pub struct CallSiteScaffold {
     #[doc(hidden)]
     pub receiver: Option<ValueId>,
     #[doc(hidden)]
+    pub member_selection: Option<Box<DeferredMemberSelection>>,
+    #[doc(hidden)]
     pub arguments: Box<[SemanticCallArgument]>,
     #[doc(hidden)]
     pub normal_results: Box<[ValueId]>,
@@ -1445,6 +1643,8 @@ pub struct DivergingCallSiteScaffold {
     #[doc(hidden)]
     pub receiver: Option<ValueId>,
     #[doc(hidden)]
+    pub member_selection: Option<Box<DeferredMemberSelection>>,
+    #[doc(hidden)]
     pub arguments: Box<[SemanticCallArgument]>,
     #[doc(hidden)]
     pub result: Option<ValueId>,
@@ -1467,6 +1667,8 @@ pub struct SpawnedCallSiteScaffold {
     pub callee: ValueId,
     #[doc(hidden)]
     pub receiver: Option<ValueId>,
+    #[doc(hidden)]
+    pub member_selection: Option<Box<DeferredMemberSelection>>,
     #[doc(hidden)]
     pub arguments: Box<[SemanticCallArgument]>,
     #[doc(hidden)]
@@ -2377,6 +2579,84 @@ impl<'a> ProcedureLoweringSession<'a> {
         Ok(())
     }
 
+    /// Emit the shared read/compute/write shape. Adapters evaluate the old
+    /// target and right operand before `operation` in the language's evaluation
+    /// order (C#: left, right, then operation). For a Memory target the adapter
+    /// emits the old-value load itself. The computation hook produces `result`
+    /// from `old` and `right` at `operation`; the public default emits opaque
+    /// language-defined flows, and languages may supply a precise transfer.
+    /// Adapters route any exception from `operation` when the table entry
+    /// returns true. Only its normal edge reaches `write`; callers connect
+    /// that point to their next continuation. The default computation is
+    /// deliberately opaque to scalar solvers while retaining both operand
+    /// dependencies for value-flow clients.
+    #[doc(hidden)]
+    pub fn append_compound_assignment<C: Copy>(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        operators: &[CompoundAssignmentOperator<C>],
+        compound: &str,
+        context: C,
+        update: CompoundAssignment,
+        compute: impl FnOnce(
+            &Self,
+            &mut ProcedureCfgBuilder,
+            ProgramPointId,
+            ValueId,
+            ValueId,
+            ValueId,
+        ) -> Result<(), ProcedureLoweringError>,
+    ) -> Result<bool, ProcedureLoweringError> {
+        let operator = operators
+            .iter()
+            .find(|operator| operator.compound == compound)
+            .expect("compound assignment dispatch selected a known operator");
+        compute(
+            self,
+            builder,
+            update.operation,
+            update.old,
+            update.right,
+            update.result,
+        )?;
+        match update.target {
+            CompoundAssignmentTarget::Binding { value, flow } => {
+                self.append_effect(
+                    builder,
+                    update.write,
+                    SemanticEffect::Assignment {
+                        target: value,
+                        value: update.result,
+                    },
+                )?;
+                self.append_value_flow_if_distinct(
+                    builder,
+                    update.write,
+                    flow,
+                    update.result,
+                    value,
+                )?;
+            }
+            CompoundAssignmentTarget::Memory { location, kind } => {
+                self.append_effect(
+                    builder,
+                    update.write,
+                    SemanticEffect::MemoryStore {
+                        location,
+                        kind,
+                        value: update.result,
+                    },
+                )?;
+            }
+        }
+        self.add_target_edge(
+            builder,
+            update.operation,
+            ControlTarget::normal(update.write),
+        )?;
+        Ok((operator.can_throw)(context))
+    }
+
     #[doc(hidden)]
     pub fn add_gap(
         &mut self,
@@ -2899,6 +3179,7 @@ impl<'a> ProcedureLoweringSession<'a> {
                 execution_timing,
                 callee: call.callee,
                 receiver: call.receiver,
+                member_selection: call.member_selection,
                 arguments: call.arguments,
                 normal_results: call.normal_results,
                 result: call.result,
@@ -2941,6 +3222,7 @@ impl<'a> ProcedureLoweringSession<'a> {
                 execution_timing: ExecutionTiming::SameEvaluation,
                 callee: call.callee,
                 receiver: call.receiver,
+                member_selection: call.member_selection,
                 arguments: call.arguments,
                 normal_results: Box::new([]),
                 result: call.result,
@@ -2981,6 +3263,7 @@ impl<'a> ProcedureLoweringSession<'a> {
                 execution_timing: ExecutionTiming::DifferentTask,
                 callee: call.callee,
                 receiver: call.receiver,
+                member_selection: call.member_selection,
                 arguments: call.arguments,
                 normal_results: Box::new([]),
                 result: None,

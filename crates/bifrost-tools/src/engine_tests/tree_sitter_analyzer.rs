@@ -3985,7 +3985,7 @@ mod tests {
         assert_eq!(python.storage_content_qualifier(&python_unit, ""), "");
         assert_eq!(python.storage_file_content_qualifier("pkg.service"), "");
         assert_eq!(
-            python.hydrate_content_qualifier("", &python_file),
+            python.hydrate_content_qualifier("", &python_file).unwrap(),
             "pkg.service"
         );
 
@@ -3993,7 +3993,10 @@ mod tests {
         let rust = RustAdapter;
         let rust_unit = CodeUnit::new(rust_file.clone(), CodeUnitType::Class, "net", "Client");
         assert_eq!(rust.storage_content_qualifier(&rust_unit, ""), "");
-        assert_eq!(rust.hydrate_content_qualifier("", &rust_file), "net");
+        assert_eq!(
+            rust.hydrate_content_qualifier("", &rust_file).unwrap(),
+            "net"
+        );
         let rust_impl_member = CodeUnit::with_signature(
             rust_file.clone(),
             CodeUnitType::Function,
@@ -4005,7 +4008,10 @@ mod tests {
         // Rust names are persisted as an anchor plus a content-stable tail, so
         // no unit — however it is qualified — bakes package text into its row.
         assert_eq!(rust.storage_content_qualifier(&rust_impl_member, "net"), "");
-        assert_eq!(rust.hydrate_content_qualifier("model", &rust_file), "model");
+        assert_eq!(
+            rust.hydrate_content_qualifier("model", &rust_file).unwrap(),
+            "model"
+        );
         let file_package = rust
             .resolve_package_anchor(PackageAnchor::OwnModule { pop: 0 }, "", &rust_file)
             .expect("Rust resolves its own-module anchor");
@@ -4042,7 +4048,7 @@ mod tests {
         );
         assert_eq!(go.storage_content_qualifier(&go_unit, "service"), "service");
         assert_eq!(
-            go.hydrate_content_qualifier("", &go_file),
+            go.hydrate_content_qualifier("", &go_file).unwrap(),
             "example.com/demo/internal/service"
         );
     }
@@ -4081,7 +4087,9 @@ mod tests {
         assert!(adapter.storage_contains_tests(&state));
         assert!(adapter.hydrate_contains_tests(false, &tsx_file, ""));
 
-        adapter.synthesize_hydrated_units(&tsx_file, source, &mut state);
+        adapter
+            .synthesize_hydrated_units(&tsx_file, source, &mut state)
+            .unwrap();
         let module = state
             .top_level_declarations
             .iter()
@@ -4096,7 +4104,9 @@ mod tests {
         assert!(javascript.hydrate_contains_tests(false, &js_file, ""));
         let mut js_state = empty_file_state(source, true);
         js_state.imports = state.imports.clone();
-        javascript.synthesize_hydrated_units(&js_file, source, &mut js_state);
+        javascript
+            .synthesize_hydrated_units(&js_file, source, &mut js_state)
+            .unwrap();
         let js_module = js_state
             .top_level_declarations
             .iter()
@@ -5522,7 +5532,9 @@ mod tests {
 
     #[test]
     fn js_ts_unparseable_source_is_a_structured_incomplete_read() {
-        let source = "const sentinel = \"\0\";\n";
+        // A NUL inside a string is grammar-proven payload (#4479); one inside
+        // an identifier is not, so the file stays refused as binary.
+        let source = "const senti\0nel = 1;\n";
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::JavaScript)
             .file("unsafe.js", source)
             .build();

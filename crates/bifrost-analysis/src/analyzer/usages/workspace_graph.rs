@@ -966,7 +966,16 @@ pub fn build_workspace_usage_graph_with_passes(
         }
         #[cfg(any(test, feature = "test-support"))]
         resolved_ecosystems.push(entry.ecosystem);
+        let declaration_kinds =
+            brokk_bifrost_core::analyzer::usages::inverted_edges::declaration_kind_index(
+                catalog
+                    .nodes
+                    .iter()
+                    .filter(|node| node.key.ecosystem == entry.ecosystem)
+                    .map(|node| &node.primary),
+            );
         let ctx = EdgeWeightScanCtx {
+            declaration_kinds: &declaration_kinds,
             analyzer,
             fqns: &fqns,
             scoped_nodes: &scoped_nodes,

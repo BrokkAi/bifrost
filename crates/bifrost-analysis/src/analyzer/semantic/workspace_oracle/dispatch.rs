@@ -1149,6 +1149,16 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let PreparedCallDispatch { lookup } = prepared;
         let go_interface_receiver = lookup.go_interface_receiver;
         let go_selector_member = lookup.go_selector_member.clone();
+        let member_field_anchor = semantic_call
+            .member_selection
+            .as_ref()
+            .filter(|_| !lookup.truncated && !lookup.cancelled && !lookup.budget_exhausted)
+            .and(lookup.member_field_anchor);
+        let member_receiver_preparation = semantic_call
+            .member_selection
+            .as_ref()
+            .filter(|_| !lookup.truncated && !lookup.cancelled && !lookup.budget_exhausted)
+            .and(lookup.member_receiver_preparation);
         debug_assert!(lookup.work.scanned_files <= 1);
         debug_assert!(
             lookup.status.is_none()
@@ -1213,10 +1223,15 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             && !lookup.truncated
             && !lookup.cancelled
             && !lookup.budget_exhausted;
-        // This is call-local proof: a super invocation is nonvirtual even
-        // when its selected source method remains overridable elsewhere.
-        let java_nonvirtual_receiver = call_language == SemanticLanguage::Standard(Language::Java)
-            && lookup.status == Some(DefinitionLookupStatus::Resolved)
+        // This is call-local proof: Java super invocations are nonvirtual,
+        // Rust concrete receivers select one impl or trait-default body, and a
+        // Ruby member call on an exact receiver with a closed method table
+        // selects the one body the resolver found (#3494). None needs an
+        // override-family proof for the selected body.
+        let nonvirtual_receiver = matches!(
+            call_language,
+            SemanticLanguage::Standard(Language::Java | Language::Rust | Language::Ruby)
+        ) && lookup.status == Some(DefinitionLookupStatus::Resolved)
             && lookup.call_application == CallApplicationKind::BoundReceiver
             && lookup.dispatch_extensibility == Some(DispatchExtensibility::Closed)
             && matches!(lookup.targets.as_slice(), [target]
@@ -1270,6 +1285,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     call_language,
                     Some(semantic_call),
                     lookup.exact_external_call.as_ref(),
+                    &lookup.diagnostic_kinds,
                 )
             })
             .collect::<Vec<_>>();
@@ -1636,6 +1652,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         // target, so it is sound to trust regardless of that flag.
         let mut concrete_overrides_proven_absent = true;
         let mut matched_concrete_groups = false;
+        let mut unproven_member_family_reasons = Vec::new();
         let lookup_truncated_by_unique_python_receiver =
             python_exact_external_receiver && !lookup.budget_exhausted;
         let mut materialized_files: HashMap<ProjectFile, SemanticOutcome<Arc<SemanticArtifact>>> =
@@ -2049,21 +2066,33 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 if complete_materialization
                     && !group.receiver_hint
                     && !type_selected_method
-                    && !java_nonvirtual_receiver
+                    && !nonvirtual_receiver
                 {
                     if staged_request.charge_execution_traversal(1) {
                         matched_concrete_groups = true;
-                        match virtual_dispatch_implementor_targets(
+                        let implementor_targets = virtual_dispatch_implementor_targets(
                             self.workspace.analyzer(),
                             &group.representative,
                             request.cancellation,
-                        ) {
-                            Some(overrides) if overrides.is_empty() => {
+                        );
+                        if let ImplementorTargets::Unproven {
+                            reason: Some(reason),
+                            ..
+                        } = &implementor_targets
+                        {
+                            unproven_member_family_reasons.push(reason.label());
+                        }
+                        match implementor_targets {
+                            ImplementorTargets::Proven(overrides) if overrides.is_empty() => {
                                 // Proven: no workspace declaration overrides
                                 // this member. `concrete_overrides_proven_absent`
                                 // stays true.
                             }
-                            Some(overrides) => {
+                            ImplementorTargets::Proven(overrides)
+                            | ImplementorTargets::Unproven {
+                                established: overrides,
+                                ..
+                            } => {
                                 concrete_overrides_proven_absent = false;
                                 if self.hierarchy_expansion().concrete_overrides {
                                     for overriding in overrides {
@@ -2084,10 +2113,9 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                                     }
                                 }
                             }
-                            None => {
-                                // The question does not apply or the member
-                                // family is unproven: the override set is not
-                                // established either way.
+                            ImplementorTargets::NotApplicable => {
+                                // No applicable member-family proof establishes
+                                // whether overrides exist.
                                 concrete_overrides_proven_absent = false;
                             }
                         }
@@ -2150,10 +2178,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 if complete_materialization
                     && !group.receiver_hint
                     && !type_selected_method
-                    && !java_nonvirtual_receiver
+                    && !nonvirtual_receiver
                 {
                     if staged_request.charge_execution_traversal(1) {
-                        if let Some(implementors) = virtual_dispatch_implementor_targets(
+                        if let ImplementorTargets::Proven(implementors)
+                        | ImplementorTargets::Unproven {
+                            established: implementors,
+                            ..
+                        } = virtual_dispatch_implementor_targets(
                             self.workspace.analyzer(),
                             &group.representative,
                             request.cancellation,
@@ -2340,25 +2372,25 @@ impl<'a> WorkspaceSemanticOracle<'a> {
 
         let resolver_proven_external_static =
             resolver_proven_external_static_boundary(lookup.status, &candidates, &boundaries);
-        // Rust's exact model-bound receiver proof names one inherent method on
-        // one complete nominal type. That closes the target set because Rust
-        // does not permit another crate to add inherent methods to the type.
+        // An exact closed receiver proof names one method on
+        // one concrete nominal type. Rust inherent methods and Go concrete
+        // method sets cannot acquire overrides.
         // A unique complete procedure summary additionally closes the external
         // body boundary; without one, effects remain partial. Trait, ambiguous,
         // incomplete, or merely name-matched receivers never receive this
         // resolver proof and keep the generic gap below.
-        let rust_proven_bound_receiver = resolver_proven_rust_bound_receiver_boundary(
+        let proven_bound_receiver = resolver_proven_closed_bound_receiver_boundary(
             call_language,
             lookup.status,
             lookup.exact_external_call.as_ref(),
             &candidates,
             &boundaries,
         );
-        let rust_proven_bound_receiver_dispatch = rust_proven_bound_receiver.is_some();
-        let rust_modeled_bound_receiver_closure = rust_proven_bound_receiver
-            .filter(|target| active_unique_complete_rust_summary(self, target))
+        let proven_bound_receiver_dispatch = proven_bound_receiver.is_some();
+        let modeled_bound_receiver_closure = proven_bound_receiver
+            .filter(|target| active_unique_complete_receiver_summary(self, target))
             .cloned();
-        if let Some(target) = &rust_modeled_bound_receiver_closure {
+        if let Some(target) = &modeled_bound_receiver_closure {
             for boundary in &mut boundaries {
                 if boundary.unmaterialized_external_target() == Some(target) {
                     boundary.completeness = EvidenceCompleteness::Complete;
@@ -2499,7 +2531,9 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         materialization_quality,
                         match call_language {
                             SemanticLanguage::Standard(Language::Cpp) => cpp_target_dispatch_closed,
-                            SemanticLanguage::Standard(Language::Java) => java_nonvirtual_receiver,
+                            SemanticLanguage::Standard(
+                                Language::Java | Language::Rust | Language::Ruby,
+                            ) => nonvirtual_receiver,
                             _ => false,
                         },
                         gap,
@@ -2522,7 +2556,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         resolver_proven_external_static || resolver_proven_java_final,
                         gap,
                     )
-                    && !(rust_proven_bound_receiver_dispatch
+                    && !(proven_bound_receiver_dispatch
                         && matches!(
                             gap.capability,
                             SemanticCapability::Calls | SemanticCapability::DynamicDispatch
@@ -2571,7 +2605,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         }) {
             materialization_quality = merge_dispatch_quality(
                 materialization_quality,
-                apply_dynamic_dispatch_gap(gap, &mut boundaries),
+                apply_dynamic_dispatch_gap(gap, &unproven_member_family_reasons, &mut boundaries),
             );
         }
         if let Some(gap) = procedure_call_gap {
@@ -2719,6 +2753,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 "workspace dispatch produced invalid relation provenance: {error}"
             ))
         })?;
+        result.mark_member_receiver_preparation(member_receiver_preparation);
+        result.mark_member_field_anchor(member_field_anchor);
         if resolver_proved_no_callee {
             result.mark_resolver_proved_no_callee();
         }
@@ -2769,7 +2805,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let status_quality = if declared_targets_ambiguous {
             DispatchQuality::Ambiguous
         } else if anonymous_receiver_refined
-            || rust_proven_bound_receiver_dispatch
+            || proven_bound_receiver_dispatch
             || go_interface_receiver_refined
             || resolver_proven_external_static
             || resolver_proven_java_final
@@ -3084,7 +3120,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         else {
             return Ok((false, work, None));
         };
-        let Some(compatible_methods) = virtual_dispatch_implementor_targets(
+        let ImplementorTargets::Proven(compatible_methods) = virtual_dispatch_implementor_targets(
             self.workspace.analyzer(),
             interface_member,
             request.cancellation,
@@ -3603,6 +3639,18 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
     }
 }
 
+/// Proof state of the workspace implementor set for one declaration.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum ImplementorTargets {
+    NotApplicable,
+    Unproven {
+        established: Vec<CodeUnit>,
+        reason: Option<crate::analyzer::structural::resolution::MemberFamilyReason>,
+    },
+    Proven(Vec<CodeUnit>),
+}
+
 /// The workspace members that implement or override a body-less callee
 /// declaration: class-hierarchy analysis for virtual dispatch (#2205).
 ///
@@ -3629,7 +3677,8 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
 /// The second is the concrete case: the file did publish a body, and the
 /// question is whether a subclass override could run instead (#2277). That
 /// strictly widens a candidate set which already names analyzable code, so this
-/// caller asks only when the workspace's
+/// caller always asks to establish whether the override set is empty, but
+/// expands nonempty targets only when the workspace's
 /// [`crate::analyzer::DispatchHierarchyExpansion::concrete_overrides`] is on.
 ///
 /// A `native` method is excluded from both: its body is outside every source
@@ -3641,9 +3690,9 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
 /// `implemented_by` and `overridden_by` by bounded inversion over the same
 /// forward `implements`/`overrides` relation an analyzer proves from a
 /// declaration and its owner's hierarchy. Nothing is matched by fully-qualified
-/// name or by rendered signature text. An answer that is not `proven` yields no
-/// targets at all, so an inheritance cycle, an unrecorded modifier, or an
-/// unresolved overload set leaves the call exactly as unresolved as it was.
+/// name or by rendered signature text. Callers expand only a proven family; an
+/// inheritance cycle, an unrecorded modifier, or an unresolved overload set
+/// leaves the dispatch gap open.
 ///
 /// It is *bounded*. The family walk carries its own shared visit budget and the
 /// caller's cancellation token, and the caller charges the expansion against the
@@ -3655,8 +3704,11 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
 /// still surfaces as its own honest diagnostic beside any flow that completes
 /// through a sibling implementor.
 ///
-/// `None` means the question does not apply to this declaration or the language
-/// states no member family; it is not an empty answer about the hierarchy.
+/// `Proven` contains the targets of a proven family, possibly empty. Only a
+/// proven empty set establishes the absence of implementors. `Unproven` carries
+/// the targets an unproven family did establish and its reason; callers must
+/// not treat that set as exhaustive. `NotApplicable` means the question does not
+/// apply to this declaration or the language states no member-family capability.
 ///
 /// Set `BIFROST_DEBUG_CHA=1` to print one line per expansion, which is how the
 /// resolution was measured at corpus scale.
@@ -3665,70 +3717,73 @@ pub fn virtual_dispatch_implementor_targets(
     analyzer: &dyn IAnalyzer,
     declaration: &CodeUnit,
     cancellation: &CancellationToken,
-) -> Option<Vec<CodeUnit>> {
+) -> ImplementorTargets {
     if !declaration.is_function() {
-        return None;
+        return ImplementorTargets::NotApplicable;
     }
     let metadata = analyzer.signature_metadata(declaration);
     if metadata
         .iter()
         .any(|entry| entry.callable_modifiers_recorded() && entry.callable_is_native())
     {
-        return None;
+        return ImplementorTargets::NotApplicable;
     }
-    let provider = analyzer.member_family_provider()?;
+    let Some(provider) = analyzer.member_family_provider() else {
+        return ImplementorTargets::NotApplicable;
+    };
     // A provider that exists for the workspace as a whole may still state no
     // family for *this* member's language (Kotlin publishes the external-root
-    // half only, for example). That is the documented `None`: the language
+    // half only, for example). That is `NotApplicable`: the language
     // states no member family, which is not an empty answer about the
     // hierarchy and must never read as one.
     if provider.member_family_capability(declaration)
         == crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported
     {
-        return None;
+        return ImplementorTargets::NotApplicable;
     }
     let answer = provider.member_family(declaration, Some(cancellation));
-    // An unproven family answers nothing about the hierarchy, so it contributes
-    // no target: the call stays exactly as unresolved as it already was.
-    let targets = if answer.is_proven() {
-        answer
-            .edges
-            .iter()
-            .filter(|edge| {
-                matches!(
-                    edge.relation,
-                    MethodFamilyRelation::ImplementedBy | MethodFamilyRelation::OverriddenBy
+    let targets = answer
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.relation,
+                MethodFamilyRelation::ImplementedBy | MethodFamilyRelation::OverriddenBy
+            )
+        })
+        .filter(|edge| {
+            language_support_for_hook(
+                declaration.source().language(),
+                "virtual_dispatch_target_is_applicable",
+            )
+            .is_none_or(|support| {
+                support.virtual_dispatch_target_is_applicable(
+                    analyzer,
+                    declaration,
+                    edge.owner.source(),
                 )
             })
-            .filter(|edge| {
-                language_support_for_hook(
-                    declaration.source().language(),
-                    "virtual_dispatch_target_is_applicable",
-                )
-                .is_none_or(|support| {
-                    support.virtual_dispatch_target_is_applicable(
-                        analyzer,
-                        declaration,
-                        edge.owner.source(),
-                    )
-                })
-            })
-            .map(|edge| edge.target.clone())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+        })
+        .map(|edge| edge.target.clone())
+        .collect::<Vec<_>>();
     if debug_cha_enabled() {
         eprintln!(
             "virtual_dispatch_implementor_targets {} proven={} outcome={:?} reason={:?} implemented_by={}",
             declaration.fq_name(),
-            answer.is_proven(),
+            answer.descendants.is_proven(),
             answer.outcome,
             answer.reason,
             targets.len()
         );
     }
-    Some(targets)
+    if answer.descendants.is_proven() {
+        ImplementorTargets::Proven(targets)
+    } else {
+        ImplementorTargets::Unproven {
+            established: targets,
+            reason: answer.descendants.reason,
+        }
+    }
 }
 
 pub(crate) fn jvm_external_member_identity(
@@ -4052,17 +4107,21 @@ pub fn resolver_proven_external_static_boundary(
         )
 }
 
-/// The exact Rust bound-receiver shape whose external inherent method has a
+/// The exact bound-receiver shape whose external method has a
 /// closed target set. The resolver publishes this proof only for one complete
 /// nominal receiver and one unique active-model method declaration.
-pub(crate) fn resolver_proven_rust_bound_receiver_boundary<'a>(
+pub(crate) fn resolver_proven_closed_bound_receiver_boundary<'a>(
     language: SemanticLanguage,
     status: Option<DefinitionLookupStatus>,
     proof: Option<&ExactExternalCallProof>,
     candidates: &[DispatchCandidate],
     boundaries: &'a [DispatchBoundary],
 ) -> Option<&'a UnmaterializedExternalTarget> {
-    if language != SemanticLanguage::Standard(Language::Rust)
+    if !language_support_for_hook(
+        language.language(),
+        "closed_receiver_summary_closes_external_body",
+    )?
+    .closed_receiver_summary_closes_external_body()
         || status != Some(DefinitionLookupStatus::UnresolvableImportBoundary)
         || !candidates.is_empty()
     {
@@ -4072,8 +4131,13 @@ pub(crate) fn resolver_proven_rust_bound_receiver_boundary<'a>(
         proof.call_application() == CallApplicationKind::BoundReceiver
             && proof.dispatch_extensibility() == Some(DispatchExtensibility::Closed)
     })?;
-    let (expected_owner, expected_member) =
-        split_canonical_qualified_callee(proof.canonical_callee(), Language::Rust)?;
+    let (expected_owner, expected_member) = split_canonical_qualified_callee(
+        proof.canonical_callee(),
+        match language {
+            SemanticLanguage::Standard(language) => language,
+            _ => return None,
+        },
+    )?;
     let [boundary] = boundaries else {
         return None;
     };
@@ -4083,7 +4147,7 @@ pub(crate) fn resolver_proven_rust_bound_receiver_boundary<'a>(
         return None;
     }
     boundary.unmaterialized_external_target().filter(|target| {
-        target.language() == SemanticLanguage::Standard(Language::Rust)
+        target.language() == language
             && target.owner_fqn() == expected_owner
             && target.member() == expected_member
             && target.has_receiver()
@@ -4091,13 +4155,21 @@ pub(crate) fn resolver_proven_rust_bound_receiver_boundary<'a>(
     })
 }
 
-/// Rust has no inherent-method override set: only one unambiguous complete
+/// Closed concrete method sets have no override set: one unambiguous complete
 /// summary for the exact proven receiver method may replace the absent body.
-pub(crate) fn active_unique_complete_rust_summary(
+pub(crate) fn active_unique_complete_receiver_summary(
     oracle: &WorkspaceSemanticOracle<'_>,
     target: &UnmaterializedExternalTarget,
 ) -> bool {
-    if target.language() != SemanticLanguage::Standard(Language::Rust) || !target.has_receiver() {
+    debug_assert!(
+        language_support_for_hook(
+            target.language().language(),
+            "closed_receiver_summary_closes_external_body"
+        )
+        .is_some_and(|support| support.closed_receiver_summary_closes_external_body()),
+        "closed-receiver summary requires language admission: {target:?}",
+    );
+    if !target.has_receiver() {
         return false;
     }
     let Some(active) = oracle.active_semantic_models() else {
@@ -4172,10 +4244,13 @@ pub(crate) fn kotlin_external_declared_callee_discharges_gap(
 /// resolved, every retained candidate proven and complete, no boundary, no
 /// truncation). The second situation is decided per receiver route: only the
 /// routes whose receiver identity the source itself fixes -- a receiverless
-/// call, a Go concrete method set, a Ruby constant path -- accept a clean
-/// result, because only there is the resolver's candidate list the whole
-/// selectable set. `Unsupported`, `Ambiguous`, and `ExceededBudget` gaps keep
-/// standing: they assert something a proven target set does not answer.
+/// call, a Go concrete method set -- accept a clean result, because only there
+/// is the resolver's candidate list the whole selectable set. A Ruby member
+/// call needs more than its written receiver (#3494): the resolver proves the
+/// receiver exact and its method table closed, and the call discharges through
+/// [`exact_nonvirtual_member_dispatch_discharges_gap`] instead. `Unsupported`,
+/// `Ambiguous`, and `ExceededBudget` gaps keep standing: they assert something
+/// a proven target set does not answer.
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn proven_static_target_discharges_gap(
@@ -4224,22 +4299,12 @@ pub fn proven_static_target_discharges_gap(
     ) && candidates
         .iter()
         .all(|candidate| candidate.target().semantics().kind() == ProcedureKind::Method);
-    // Ruby is the other receiver-call exception. `Net::HTTP.get(uri)` writes
-    // its owner as a constant path, and the adapter lowers that path as one
-    // `SemanticValueKind::Constant` value which is also the call's receiver.
-    // The written path names the receiver object itself, so the singleton
-    // method set the resolver enumerated for that exact owner is the whole set
-    // this call can select; a receiver whose class is only known at run time
-    // stays open here (#3459). Ruby reopens classes at run time, so this
-    // answers the target-set question over the resolver's own proof only: a
-    // resolved, boundary-free, complete candidate set is still required.
-    let ruby_constant_receiver = ruby_constant_receiver_selection(caller, gap);
     // Selecting a function through a type does not dispatch on the explicit
     // receiver actual's dynamic class. The resolver already chose the body.
     let type_selected_method = matches!(gap.subject, SemanticGapSubject::CallSite(id)
         if matches!(caller.semantics().proven_caller_receiver_binding(id),
             Some(CallerReceiverBinding::TypeQualified(_))));
-    (receiverless || go_concrete_method || ruby_constant_receiver)
+    (receiverless || go_concrete_method)
         && lookup_resolved
         && boundaries.is_empty()
         && materialization_quality == DispatchQuality::Complete
@@ -4247,7 +4312,6 @@ pub fn proven_static_target_discharges_gap(
             proven_complete(candidate)
                 && (go_concrete_method
                     || type_selected_method
-                    || ruby_constant_receiver
                     || candidate_has_free_target(candidate))
         })
 }
@@ -4620,6 +4684,7 @@ pub fn cancelled_lookup_outcome(
                 cancelled_language,
                 cancelled_semantic_call,
                 exact_external_call,
+                &[],
             )
         })
         .collect::<Vec<_>>();
@@ -5177,6 +5242,7 @@ pub fn low_level_boundary(
     language: SemanticLanguage,
     semantic_call: Option<&SemanticCallSite>,
     exact_external_call: Option<&ExactExternalCallProof>,
+    lookup_diagnostic_kinds: &[Box<str>],
 ) -> DispatchBoundary {
     match boundary {
         // #1978: when the resolver retained a fully-qualified callee text for an
@@ -5273,7 +5339,9 @@ pub fn low_level_boundary(
                 },
             }
         }
-        CallDispatchBoundaryKind::Unresolved(status) => unresolved_dispatch_boundary(*status),
+        CallDispatchBoundaryKind::Unresolved(status) => {
+            unresolved_dispatch_boundary(*status, lookup_diagnostic_kinds)
+        }
         CallDispatchBoundaryKind::UnresolvedReason(reason) => DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
             external_callee_identity: None,
@@ -5322,7 +5390,7 @@ pub fn low_level_boundary(
                     ),
                     provenance: Box::new([]),
                 },
-                None => unresolved_dispatch_boundary(*status),
+                None => unresolved_dispatch_boundary(*status, lookup_diagnostic_kinds),
             }
         }
         CallDispatchBoundaryKind::UnprovenTargetIdentity => DispatchBoundary {
@@ -6166,15 +6234,27 @@ pub fn heuristic_external_boundary_without_resolver_authority(boundary: &Dispatc
     )
 }
 
-pub(crate) fn unresolved_dispatch_boundary(status: DefinitionLookupStatus) -> DispatchBoundary {
+/// The proof names the definition-lookup diagnostic kinds behind `status`, so
+/// an incomplete consumer can say which lookup outcome left the call unresolved
+/// (#4823).
+pub(crate) fn unresolved_dispatch_boundary(
+    status: DefinitionLookupStatus,
+    lookup_diagnostic_kinds: &[Box<str>],
+) -> DispatchBoundary {
+    let proof = if lookup_diagnostic_kinds.is_empty() {
+        format!("exact dispatch status is {}", status.as_str())
+    } else {
+        format!(
+            "exact dispatch status is {}; definition lookup diagnostics: {lookup_diagnostic_kinds:?}",
+            status.as_str()
+        )
+    };
     DispatchBoundary {
         kind: DispatchBoundaryKind::Unresolved,
         external_callee_identity: None,
         exact_external_target: None,
         unmaterialized_external_target: None,
-        proof: ProofStatus::Unproven(
-            format!("exact dispatch status is {}", status.as_str()).into(),
-        ),
+        proof: ProofStatus::Unproven(proof.into()),
         completeness: EvidenceCompleteness::Partial(
             "no materialized workspace target is available".into(),
         ),
@@ -6323,7 +6403,10 @@ pub fn synthetic_unmaterialized_external(
             locator,
         )
     };
-    let target = target.with_call_arguments(&semantic_call.arguments);
+    let mut target = target.with_call_arguments(&semantic_call.arguments);
+    target.selected_external_descriptor = exact_external_call
+        .and_then(ExactExternalCallProof::external_member_identity)
+        .cloned();
     if let Some(proof) =
         exact_external_call.filter(|proof| proof.python_runtime_artifact().is_some())
     {
@@ -6491,13 +6574,18 @@ pub(crate) fn rust_builtin_macro_identity_is_intrinsic(
 #[doc(hidden)]
 pub fn apply_dynamic_dispatch_gap(
     gap: &SemanticGap,
+    member_family_reasons: &[&str],
     boundaries: &mut Vec<DispatchBoundary>,
 ) -> DispatchQuality {
-    let proof_reason = format!(
+    let mut proof_reason = format!(
         "{} dynamic-dispatch evidence does not prove the complete target set: {}",
         gap.kind.label(),
         gap.detail
     );
+    for family_reason in member_family_reasons {
+        proof_reason.push_str("; member family unproven: ");
+        proof_reason.push_str(family_reason);
+    }
     let completeness_reason = format!(
         "dynamic-dispatch target coverage is incomplete: {}",
         gap.detail

@@ -339,6 +339,12 @@ impl ProjectCoverage {
 pub trait Project: Send + Sync {
     fn root(&self) -> &Path;
 
+    /// Published module identity for this project's exact selected revision.
+    /// Raw projects return None while building the initial file projection.
+    fn selected_module_name(&self, _file: &ProjectFile) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// How much of the workspace under [`Project::root`] this project exposes.
     ///
     /// A project built over an explicitly named set of files answers
@@ -448,8 +454,8 @@ pub trait Project: Send + Sync {
         false
     }
 
-    /// Read the source text of `file`. Default reads from disk and admits
-    /// legacy non-UTF-8 text lossily while rejecting NUL-bearing binary data.
+    /// Read the source text of `file`. Default reads from disk and decodes it
+    /// with [`decode_source_bytes`].
     /// The LSP server overrides this via `OverlayProject` to serve unsaved
     /// buffer content pushed in by `textDocument/did{Open,Change}`
     /// notifications.
@@ -562,32 +568,26 @@ impl std::fmt::Display for BinarySourceRejection {
 impl std::error::Error for BinarySourceRejection {}
 
 /// Decode source bytes the way every disk-backed [`Project`] does: legacy
-/// non-UTF-8 text is admitted lossily and NUL-bearing binary data is rejected.
-///
-/// `BIFROST_ADMIT_NUL_BYTES=1` opts out of the rejection: each NUL byte
-/// decodes as one space, so byte offsets still address the original blob,
-/// whose identity callers hash from the raw bytes. Benchmark harnesses use it
-/// for real repositories that embed a raw NUL inside a string literal.
+/// non-UTF-8 text is admitted lossily, and UTF-8 text is kept exactly,
+/// including any raw NUL byte. Whether a NUL-bearing file may be analyzed is
+/// the analyzer's source-admission decision, which needs the exact bytes to
+/// prove from the grammar that every NUL is string, comment or text payload.
+/// NUL-bearing bytes that are not UTF-8 are rejected as binary: their lossy
+/// decoding no longer addresses the original blob, so no proof could hold.
 ///
 /// Public because a project can obtain a file's bytes from somewhere other than
 /// the filesystem -- an immutable revision image reads them out of the Git
 /// object database -- and the two readings of one file must not decode
 /// differently.
-pub fn decode_source_bytes(mut bytes: Vec<u8>) -> io::Result<String> {
-    if bytes.contains(&0) {
-        if std::env::var("BIFROST_ADMIT_NUL_BYTES").as_deref() != Ok("1") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                BinarySourceRejection,
-            ));
-        }
-        for byte in &mut bytes {
-            if *byte == 0 {
-                *byte = b' ';
-            }
-        }
+pub fn decode_source_bytes(bytes: Vec<u8>) -> io::Result<String> {
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) if error.as_bytes().contains(&0) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            BinarySourceRejection,
+        )),
+        Err(error) => Ok(String::from_utf8_lossy(error.as_bytes()).into_owned()),
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[derive(Debug, Clone)]

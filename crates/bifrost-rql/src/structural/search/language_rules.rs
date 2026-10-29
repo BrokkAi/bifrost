@@ -9,8 +9,25 @@ use crate::analyzer::{ProjectFile, Range};
 /// empty selection.
 #[derive(Default)]
 pub(super) struct LanguageRuleMatches {
-    pub(super) ranges: Vec<Range>,
+    pub(super) matches: Vec<LanguageRuleMatch>,
     pub(super) diagnostics: Vec<CodeQueryDiagnostic>,
+}
+
+/// The fact range used to select a language-rule match and its displayed
+/// source range. Most rules use the same range for both.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LanguageRuleMatch {
+    pub(super) select: Range,
+    pub(super) report: Range,
+}
+
+impl From<Range> for LanguageRuleMatch {
+    fn from(range: Range) -> Self {
+        Self {
+            select: range,
+            report: range,
+        }
+    }
 }
 
 /// One place where a language rule could not decide its relation: an
@@ -41,16 +58,20 @@ impl UndecidedSite {
 }
 
 impl LanguageRuleMatches {
-    pub(super) fn from_ranges(ranges: Vec<Range>) -> Self {
+    pub(super) fn from_ranges<T: Into<LanguageRuleMatch>>(ranges: Vec<T>) -> Self {
         Self {
-            ranges,
+            matches: ranges.into_iter().map(Into::into).collect(),
             diagnostics: Vec::new(),
         }
     }
 
-    pub(super) fn incomplete(ranges: Vec<Range>, language: &'static str, message: String) -> Self {
+    pub(super) fn incomplete<T: Into<LanguageRuleMatch>>(
+        ranges: Vec<T>,
+        language: &'static str,
+        message: String,
+    ) -> Self {
         Self {
-            ranges,
+            matches: ranges.into_iter().map(Into::into).collect(),
             diagnostics: vec![CodeQueryDiagnostic {
                 related: Vec::new(),
                 source: None,
@@ -71,17 +92,21 @@ impl LanguageRuleMatches {
     /// it: once a capability is advertised, an empty selection reads as
     /// "proven absent". Any undecided site therefore makes the whole file
     /// result incomplete, while the proven ranges still flow through.
-    pub(super) fn decided(
-        mut ranges: Vec<Range>,
+    pub(super) fn decided<T: Into<LanguageRuleMatch>>(
+        ranges: Vec<T>,
         undecided: Vec<UndecidedSite>,
         language: &'static str,
         rule: &'static str,
         file: &ProjectFile,
     ) -> Self {
-        ranges.sort_unstable();
-        ranges.dedup();
+        let mut matches = ranges.into_iter().map(Into::into).collect::<Vec<_>>();
+        matches.sort_unstable_by_key(|matched| (matched.select, matched.report));
+        matches.dedup_by_key(|matched| (matched.select, matched.report));
         if undecided.is_empty() {
-            return Self::from_ranges(ranges);
+            return Self {
+                matches,
+                diagnostics: Vec::new(),
+            };
         }
         let sites = undecided
             .iter()
@@ -91,6 +116,6 @@ impl LanguageRuleMatches {
             "{rule} is incomplete for {}: the relation could not be decided at {sites:?}",
             super::rel_path_string(file),
         );
-        Self::incomplete(ranges, language, message)
+        Self::incomplete(matches, language, message)
     }
 }

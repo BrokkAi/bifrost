@@ -461,16 +461,21 @@ pub(super) fn member_rows(
     }
     receivers.sort_unstable();
     receivers.dedup();
-    // Unlike the spelling-specific mutation path, closure is about the whole
-    // attribute space. Retain a prerequisite row even when no declaration has
-    // the requested name.
+    // Each MRO owner contributes mutations for the requested name. Retain a
+    // prerequisite row even on a dictionary miss: an owned write may add that
+    // name and shadow a later ancestor's declaration.
     let mut attribute_rows = Vec::new();
-    let mutations = half.rules.attribute_mutations.borrow().get(&owner).cloned();
+    let mutations = half
+        .rules
+        .attribute_mutations
+        .borrow()
+        .get(&(owner, lookup))
+        .cloned();
     let operations = if let Some(mutations) = &mutations {
         dictionary_completion = dictionary_completion.combine(mutations);
         Vec::new()
     } else {
-        match operations::attribute_rows(half, owner)? {
+        match operations::attribute_rows(half, owner, route.lookup.spelling())? {
             Read::Ready { value, completion } => {
                 dictionary_completion = dictionary_completion.combine(&completion);
                 value
@@ -494,7 +499,7 @@ pub(super) fn member_rows(
         .rules
         .attribute_metaclasses
         .borrow()
-        .get(&owner)
+        .get(&(owner, lookup))
         .cloned();
     let metaclass = if class_object {
         if let Some(cached) = &cached_metaclass {
@@ -523,7 +528,7 @@ pub(super) fn member_rows(
         half.rules
             .attribute_metaclasses
             .borrow_mut()
-            .insert(owner, ResolutionCompletion::Complete);
+            .insert((owner, lookup), ResolutionCompletion::Complete);
     }
     if metaclass == Some(None) {
         let completion =
@@ -533,14 +538,14 @@ pub(super) fn member_rows(
         half.rules
             .attribute_metaclasses
             .borrow_mut()
-            .insert(owner, completion.clone());
+            .insert((owner, lookup), completion.clone());
         dictionary_completion = dictionary_completion.combine(&completion);
     }
     if operations.is_empty() && mutations.is_none() {
         half.rules
             .attribute_mutations
             .borrow_mut()
-            .insert(owner, ResolutionCompletion::Complete);
+            .insert((owner, lookup), ResolutionCompletion::Complete);
     }
     if !operations.is_empty() || metaclass.flatten().is_some() {
         attribute_rows.push(PythonMemberRow::AttributeSpace {
@@ -603,9 +608,26 @@ pub(super) fn member_rows(
             .ready
             .inventory
             .mount_record_by_ordinal(ordinal)?;
-        let metadata:Option<(u32,Option<u32>,u32)> = half.rules.ready.inventory.connection().query_row(
+        let role_key = (
+            mount.blob_id(),
+            definition.local_key().expect("authored member key"),
+        );
+        let cached = half.rules.member_role_rows.borrow().get(&role_key).copied();
+        let metadata = if let Some(metadata) = cached {
+            metadata
+        } else {
+            let metadata:Option<(u32,Option<u32>,u32)> = half.rules.ready.inventory.connection().query_row(
             "SELECT role.kind,param.semantic_key,role.member FROM resolution_semantic_sites semantic JOIN python_member_member_roles role ON role.blob_id=semantic.blob_id AND role.member=semantic.source_site LEFT JOIN resolution_semantic_sites param ON param.blob_id=role.blob_id AND param.source_site=role.receiver_parameter AND param.semantic_role='definition' WHERE semantic.blob_id=?1 AND semantic.semantic_key=?2 AND semantic.semantic_role='definition'",
             rusqlite::params![mount.blob_id(),definition.local_key().expect("authored member key")],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))) .optional()?;
+            assert!(
+                half.rules
+                    .member_role_rows
+                    .borrow_mut()
+                    .insert(role_key, metadata)
+                    .is_none()
+            );
+            metadata
+        };
         let (kind, parameter, site) = metadata.unwrap_or((6, None, 0));
         // Value properties identify authored writes, not every write to the
         // same dictionary slot. An older initializer must not survive rebinding.
@@ -780,10 +802,16 @@ impl PythonMemberContext<'_, '_, '_> {
     fn attribute_mutations(
         &self,
         owner: SemanticId,
+        lookup: SemanticId,
         operations: &[operations::OperationRow],
         answers: &[(DemandReferenceKey, &FactResolutionAnswer)],
     ) -> Result<std::ops::ControlFlow<DemandReferenceKey, ResolutionCompletion>> {
-        if let Some(cached) = self.rules.attribute_mutations.borrow().get(&owner) {
+        if let Some(cached) = self
+            .rules
+            .attribute_mutations
+            .borrow()
+            .get(&(owner, lookup))
+        {
             return Ok(std::ops::ControlFlow::Continue(cached.clone()));
         }
         let mut completion = ResolutionCompletion::Complete;
@@ -809,7 +837,7 @@ impl PythonMemberContext<'_, '_, '_> {
         self.rules
             .attribute_mutations
             .borrow_mut()
-            .insert(owner, completion.clone());
+            .insert((owner, lookup), completion.clone());
         Ok(std::ops::ControlFlow::Continue(completion))
     }
 
@@ -826,12 +854,18 @@ impl PythonMemberContext<'_, '_, '_> {
             AccessRowInput::Replies(replies) => replies,
         };
         let answers = operations::replies(AccessRowInput::Replies(replies));
-        let mut completion = match self.attribute_mutations(owner, operations, &answers)? {
-            std::ops::ControlFlow::Break(key) => return Ok(AccessRowPoll::Reference(key)),
-            std::ops::ControlFlow::Continue(completion) => completion,
-        };
+        let mut completion =
+            match self.attribute_mutations(owner, context.lookup, operations, &answers)? {
+                std::ops::ControlFlow::Break(key) => return Ok(AccessRowPoll::Reference(key)),
+                std::ops::ControlFlow::Continue(completion) => completion,
+            };
         if let Some(reference) = metaclass {
-            if let Some(cached) = self.rules.attribute_metaclasses.borrow().get(&owner) {
+            if let Some(cached) = self
+                .rules
+                .attribute_metaclasses
+                .borrow()
+                .get(&(owner, context.lookup))
+            {
                 return Ok(AccessRowPoll::Observed(completion.combine(cached)));
             }
             let Some((_, answer)) = answers.iter().find(|(key, _)| key.reference == reference)
@@ -906,12 +940,16 @@ impl PythonMemberContext<'_, '_, '_> {
                     .rules
                     .attribute_mutations
                     .borrow()
-                    .get(meta_owner)
+                    .get(&(*meta_owner, context.lookup))
                     .cloned();
                 let mutations = if let Some(cached) = cached {
                     cached
                 } else {
-                    let operations = match operations::attribute_rows(self, *meta_owner)? {
+                    let operations = match operations::attribute_rows(
+                        self,
+                        *meta_owner,
+                        &operations::lookup_spelling(self.rules, context.lookup)?,
+                    )? {
                         Read::Ready {
                             value,
                             completion: read_completion,
@@ -934,7 +972,12 @@ impl PythonMemberContext<'_, '_, '_> {
                             }));
                         }
                     };
-                    match self.attribute_mutations(*meta_owner, &operations, &answers)? {
+                    match self.attribute_mutations(
+                        *meta_owner,
+                        context.lookup,
+                        &operations,
+                        &answers,
+                    )? {
                         std::ops::ControlFlow::Break(key) => {
                             return Ok(AccessRowPoll::Reference(key));
                         }
@@ -946,7 +989,7 @@ impl PythonMemberContext<'_, '_, '_> {
             self.rules
                 .attribute_metaclasses
                 .borrow_mut()
-                .insert(owner, completion.clone());
+                .insert((owner, context.lookup), completion.clone());
         }
         Ok(AccessRowPoll::Observed(completion))
     }

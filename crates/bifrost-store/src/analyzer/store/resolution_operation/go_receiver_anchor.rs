@@ -916,16 +916,36 @@ impl SelectedResolutionOperation<'_, '_> {
         if rows.next()?.is_some() || cancellation.is_cancelled() {
             return Ok(None);
         }
+        let definition = SemanticId::local(
+            mount.get(),
+            u32::try_from(definition_key)
+                .expect("a Go callable anchor has a nonnegative definition key"),
+        );
+        // A package spelling is only a candidate. The call's positioned lexical
+        // path must select this declaration or reach package scope without a
+        // local binding; parameters and earlier variable specs take precedence.
+        let Some(evidence) = self
+            .ready
+            .lexical_source()
+            .reference_local_path_evidence(reference, cancellation)?
+        else {
+            return Ok(None);
+        };
+        if !evidence.local_bindings_certified()
+            || match evidence.local_definitions() {
+                [] => !evidence.reaches_package_root_scope(),
+                [target] => *target != definition,
+                _ => true,
+            }
+        {
+            return Ok(None);
+        }
         Ok(Some((
             package_id,
             source_role,
             GoReceiverTypeAnchor {
                 mount,
-                definition: SemanticId::local(
-                    mount.get(),
-                    u32::try_from(definition_key)
-                        .expect("a Go callable anchor has a nonnegative definition key"),
-                ),
+                definition,
                 role: GoReceiverAnchorRole::CallableResult,
                 member_name: String::new(),
             },

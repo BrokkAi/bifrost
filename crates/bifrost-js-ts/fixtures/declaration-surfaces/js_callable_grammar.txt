@@ -1,0 +1,11 @@
+SOURCE export const identity=value=>value; export class Worker {async run(input){return input;} static runStatic(input){return input;} constructor(input){this.input=input;}}
+Class [("Type", "Worker")] lookup=false signatures=["export class Worker {"] labels=[] supers=[]
+Field [("Type", "Worker"), ("Member", "input")] lookup=false signatures=["this.input=input"] labels=[] supers=[]
+Function [("Member", "identity")] lookup=false signatures=["export identity(value) => ..."] labels=[(["value"], true, false)] supers=[]
+Function [("Type", "Worker"), ("Member", "constructor")] lookup=false signatures=["function constructor(input) ..."] labels=[(["input"], false, true)] supers=[]
+Function [("Type", "Worker"), ("Member", "run")] lookup=false signatures=["function run(input) ..."] labels=[(["input"], false, false)] supers=[]
+Function [("Type", "Worker"), ("Member", "runStatic")] lookup=false signatures=["function runStatic(input) ..."] labels=[(["input"], true, false)] supers=[]
+export Some("Worker") Local { local_name: "Worker" }
+export Some("identity") Local { local_name: "identity" }
+materialized Named "Worker" target=None
+materialized Named "identity" target=None

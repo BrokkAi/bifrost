@@ -42,24 +42,12 @@ pub fn is_string_line_data(
     node: tree_sitter::Node<'_>,
     should_stop: &mut dyn FnMut() -> bool,
 ) -> std::ops::ControlFlow<(), bool> {
-    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_tree_preorder};
-    use std::ops::ControlFlow;
-    if !matches!(node.kind(), "string" | "concatenated_string") {
-        return ControlFlow::Continue(false);
-    }
-    let mut result = ControlFlow::Continue(true);
-    walk_tree_preorder(node, true, |current| {
-        if should_stop() {
-            result = ControlFlow::Break(());
-            WalkControl::Break
-        } else if current.is_error() || current.is_missing() || current.kind() == "interpolation" {
-            result = ControlFlow::Continue(false);
-            WalkControl::Break
-        } else {
-            WalkControl::Continue
-        }
-    });
-    result
+    brokk_bifrost_core::analyzer::tree_walk::is_uninterpolated_literal(
+        node,
+        &["string", "concatenated_string"],
+        &["interpolation"],
+        should_stop,
+    )
 }
 
 #[cfg(test)]

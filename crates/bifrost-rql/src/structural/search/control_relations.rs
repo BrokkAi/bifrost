@@ -40,6 +40,7 @@ use super::results::{
     CodeQueryDiagnosticImpact, CodeQueryResultRef, DetailedCodeQueryKey,
 };
 use super::semantic::SemanticProcedureValue;
+use super::{DerivationExecutionCause, IAnalyzer};
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, CfgAlgorithmWork,
@@ -497,6 +498,10 @@ impl Default for ControlRelationTraversalCache {
 }
 
 impl ControlRelationTraversalCache {
+    pub(super) fn refusal_count(&self) -> usize {
+        self.budget.refusal_count()
+    }
+
     /// Release procedure relations for a completed artifact-independent file
     /// window. The request-wide algorithm budget and diagnostic deduplication
     /// remain cumulative.
@@ -542,32 +547,37 @@ impl ControlRelationTraversalCache {
     /// the response. `subject` is the procedure's own wire id.
     pub(super) fn report_completeness(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         subject: &str,
         language: Language,
         relations: &ProcedureControlRelations,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
         for reason in relations.completeness.reasons() {
-            let (code, detail) = classify_reason(reason);
+            let (code, detail, cause) = classify_reason(reason);
             if !self.reported.insert((subject.to_string(), detail)) {
                 continue;
             }
-            diagnostics.push(CodeQueryDiagnostic {
-                related: Vec::new(),
-                source: None,
-                code,
-                impact: CodeQueryDiagnosticImpact::Incomplete,
-                branch: Vec::new(),
-                language: language.config_label(),
-                message: format!(
-                    "procedure {subject} has an incomplete control-relation derivation in \
+            diagnostics.push(super::QueryExecutionState::diagnostic(
+                analyzer,
+                CodeQueryDiagnostic {
+                    related: Vec::new(),
+                    source: None,
+                    code,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: language.config_label(),
+                    message: format!(
+                        "procedure {subject} has an incomplete control-relation derivation in \
                      generation {} ({detail}); uncovered relations: [{}]",
-                    relations.generation,
-                    uncovered_relations(&relations.completeness).join(", ")
-                ),
-                exhausted_roots: Vec::new(),
-                withheld_rows_path: None,
-            });
+                        relations.generation,
+                        uncovered_relations(&relations.completeness).join(", ")
+                    ),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                },
+                cause,
+            ));
         }
     }
 }
@@ -578,24 +588,32 @@ impl ControlRelationTraversalCache {
 /// here deliberately rather than defaulting into a generic message.
 fn classify_reason(
     reason: &ControlRelationIncompleteReason,
-) -> (CodeQueryDiagnosticCode, &'static str) {
+) -> (
+    CodeQueryDiagnosticCode,
+    &'static str,
+    Option<DerivationExecutionCause>,
+) {
     match reason {
         ControlRelationIncompleteReason::BudgetExhausted { .. } => (
             CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete,
             "a control-flow algorithm exhausted its budget, so its relation emitted no rows",
+            Some(DerivationExecutionCause::Budget),
         ),
         ControlRelationIncompleteReason::Cancelled => (
             CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete,
             "the derivation was cancelled",
+            Some(DerivationExecutionCause::Cancelled),
         ),
         ControlRelationIncompleteReason::NonExitingRegion { .. } => (
             CodeQueryDiagnosticCode::ControlRelationExitPartitionPartial,
             "the procedure has a live region with no path to either exit, so a backward claim \
              covers terminating executions only",
+            None,
         ),
         ControlRelationIncompleteReason::LoopWithoutEntry { .. } => (
             CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete,
             "a cyclic region has no entry edge, so its membership has no header to hang off",
+            None,
         ),
     }
 }
@@ -817,6 +835,13 @@ mod tests {
 
     #[test]
     fn an_incomplete_derivation_reports_every_reason_once_per_procedure() {
+        let directory = tempfile::tempdir().unwrap();
+        let analyzer =
+            crate::analyzer::JavascriptAnalyzer::from_project(crate::analyzer::TestProject::new(
+                directory.path().to_path_buf(),
+                crate::analyzer::Language::JavaScript,
+            ));
+
         let mut cache = ControlRelationTraversalCache::default();
         let relations = ProcedureControlRelations {
             rows: Vec::new(),
@@ -832,10 +857,22 @@ mod tests {
             generation: 7,
         };
         let mut diagnostics = Vec::new();
-        cache.report_completeness("procedure-1", Language::Java, &relations, &mut diagnostics);
+        cache.report_completeness(
+            &analyzer,
+            "procedure-1",
+            Language::Java,
+            &relations,
+            &mut diagnostics,
+        );
         crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
         // The second call adds nothing: one reason is reported once per subject.
-        cache.report_completeness("procedure-1", Language::Java, &relations, &mut diagnostics);
+        cache.report_completeness(
+            &analyzer,
+            "procedure-1",
+            Language::Java,
+            &relations,
+            &mut diagnostics,
+        );
         crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 2);
     }
 }

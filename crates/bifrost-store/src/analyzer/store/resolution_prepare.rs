@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    BindingProjectionKind, ResolutionGapKind, ResolutionNamespace, ResolutionSiteKind,
-    ResolutionTypeSlotRole, ResolutionTypeTransferKind,
+    BindingProjectionKind, ResolutionGapKind, ResolutionNamespace, ResolutionTypeSlotRole,
+    ResolutionTypeTransferKind,
 };
 use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 use brokk_bifrost_core::analyzer::structural::resolution::{
@@ -26,8 +26,8 @@ use crate::analyzer::resolution::{
     LoweredDeclarationVisibilityProperty, LoweredDeferredMemberOwner, LoweredDefinitionPropertyGap,
     LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
     LoweredResolutionFactsWithIdentityCatalog, LoweredSemanticRole, LoweredSemanticSite,
-    LoweredSupertypeProperty, LoweredTypedFrontier, LoweringCoverageFrontier, LoweringGapOrigin,
-    PartialPath, PartialPathId, ResolutionCompletion, ResolutionIdentityCatalog,
+    LoweredSourceSupertypeProperty, LoweredTypedFrontier, LoweringCoverageFrontier,
+    LoweringGapOrigin, PartialPath, PartialPathId, ResolutionCompletion, ResolutionIdentityCatalog,
     ResolutionIncompleteReason, ResolutionSemanticIdentitySpace, SemanticId, SharedNameId,
     TypeTransferValueTransform, language_identity_domain, validate_type_identity_transfer,
 };
@@ -1294,20 +1294,18 @@ fn prepare_lexical_rows(
                         site.site(),
                         "a reference site's metadata must name its own source site"
                     );
-                    // The callable-receiver origin was validated by a
+                    // The member-receiver origin was validated by a
                     // publication trigger over the reference-site rows; it is
                     // a property of one lowered site and belongs here.
                     assert!(
-                        metadata.callable_receiver_origin().is_none_or(|origin| {
-                            metadata.namespace() == ResolutionNamespace::Callable
-                                && matches!(
-                                    metadata.site_kind(),
-                                    ResolutionSiteKind::CallableReference
-                                        | ResolutionSiteKind::MemberReference
-                                )
-                                && origin.is_reference_qualification_valid(metadata.unqualified())
+                        metadata.receiver_origin().is_none_or(|origin| {
+                            origin.is_reference_valid(
+                                metadata.namespace(),
+                                metadata.site_kind(),
+                                metadata.unqualified(),
+                            )
                         }),
-                        "a callable receiver origin needs a callable reference site: {metadata:?}"
+                        "a receiver origin needs a callable or field reference site: {metadata:?}"
                     );
                     // `resolution_fragment_interiors_validate_reference_owners`
                     // proved that a known reference owner is a declaration of
@@ -2732,7 +2730,7 @@ fn assert_typed_semantic_ownership(
             typed
                 .supertypes()
                 .iter()
-                .map(LoweredSupertypeProperty::reference),
+                .map(LoweredSourceSupertypeProperty::reference),
         )
         .chain(
             typed
@@ -2770,7 +2768,7 @@ fn assert_typed_semantic_ownership(
             typed
                 .supertypes()
                 .iter()
-                .map(LoweredSupertypeProperty::definition),
+                .map(LoweredSourceSupertypeProperty::definition),
         )
         .chain(
             typed

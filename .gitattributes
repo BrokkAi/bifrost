@@ -12,6 +12,10 @@ tests/fixtures/py16-commented-out-code/*.py text eol=lf
 # them with LF-joined output, so a CRLF checkout must not rewrite these bytes.
 tests/fixtures/issue-5044-escape-boundaries/** text eol=lf
 
+# The Python resolution-baseline suite embeds this probe with include_str!, so a
+# CRLF checkout must not rewrite the source it analyzes.
+tests/fixtures/python-native-callee-internal/probe.py text eol=lf
+
 # Typestate canonical contracts are compared byte for byte.
 tests/fixtures/typestate/*.canonical*.json text eol=lf
 
@@ -22,13 +26,20 @@ schemas/semantic-model-pack-v4.schema.json text eol=lf
 schemas/semantic-model-pack-v5.schema.json text eol=lf
 schemas/semantic-model-pack-v18.schema.json text eol=lf
 schemas/semantic-model-pack-v19.schema.json text eol=lf
+schemas/semantic-model-pack-v20.schema.json text eol=lf
 schemas/semantic-model-compiled-manifest-v19.schema.json text eol=lf
+schemas/semantic-model-compiled-manifest-v20.schema.json text eol=lf
 crates/bifrost-semantic/tests/fixtures/extraction-contract.json text eol=lf
 crates/bifrost-semantic/src/analyzer/semantic_model/csmi/profiles/runtime-values.fixture.json text eol=lf
 tests/fixtures/semantic-model-packs/*.json text eol=lf
 tests/fixtures/semantic-model-packs/*.yaml text eol=lf
 tests/fixtures/semantic-model-packs/*.deflate binary
+tests/fixtures/csharp-external/*.dll binary
 docs/src/content/docs/semantic-model-packs.md text eol=lf
+
+# Stack-graph differential manifests are pinned by the SHA-256 digests in
+# their provenance files, so a CRLF checkout must not change their bytes.
+tests/fixtures/stack-graph-differential/** text eol=lf
 
 # This reviewed upstream artifact is verified by its exact SHA-256 digest.
 tests/fixtures/sarif/sarif-schema-2.1.0.json text eol=lf
@@ -36,6 +47,10 @@ tests/fixtures/sarif/sarif-schema-2.1.0.json text eol=lf
 # The #3387 PHP and C++ models are embedded with include_str! and compared as exact bytes.
 tests/fixtures/network-effect-boundary/models/bifrost.web-network-php.json text eol=lf
 tests/fixtures/network-effect-boundary/cpp/bifrost.web-network-cpp.json text eol=lf
+
+# The CQ09 builder-state semantic-model fixtures are embedded with include_str!
+# and installed as pack bytes, so a CRLF checkout must not change them.
+tests/suite_bench_policy/fixtures/builder-state/*.json text eol=lf
 
 # The #5224 call-binding suite embeds this C# XML model with include_str! and
 # compiles it as a session pack, so a CRLF checkout must not change its bytes.
@@ -117,6 +132,11 @@ tests/fixtures/rust-codeql-parity/**/*.rs text eol=lf
 # against rows joined by "\n", so a CRLF checkout must not change its bytes.
 crates/bifrost-rust/tests/fixtures/cargo-matrix/expected.txt text eol=lf
 
+# The C# compilation-metadata golden is read with fs::read_to_string and
+# compared exactly with output joined by "\n"; its MSBuild inputs are pinned
+# with it so the analyzed project bytes match on every checkout.
+crates/bifrost-csharp-analysis/tests/fixtures/compilation-metadata/** text eol=lf
+
 # The generated JVM intrinsic inventory is hashed into the JVM language epochs
 # with include_str!, so a CRLF checkout must not change its bytes.
 crates/bifrost-jvm/src/intrinsic_inventory_data.rs text eol=lf
@@ -125,13 +145,33 @@ crates/bifrost-jvm/src/intrinsic_inventory_data.rs text eol=lf
 # documented analyzer ranges and output identities.
 docs/src/content/docs/code-query-tutorials/*.md text eol=lf
 
-# Archived license CRLF and unified-diff context markers are fixture data.
+# Archived license CRLF is fixture data.
 tests/fixtures/policy-oracle/boltons-loop-invariant-sort/LICENSE.upstream whitespace=cr-at-eol
-tests/fixtures/policy-oracle/boltons-loop-invariant-sort/prefix-sort.patch whitespace=-blank-at-eol
-tests/fixtures/policy-oracle/boltons-loop-invariant-sort/reestablished-prefix-sort.patch whitespace=-blank-at-eol
+# Oracle patch context lines reproduce pinned upstream bytes, including their
+# trailing spaces and tab indentation, so no whitespace check applies to them.
+tests/fixtures/policy-oracle/*/*.patch -whitespace
 
 # Carrier witness identities include source byte offsets.
 tests/fixtures/golden/kotlin-syntax-values/carriers/Carriers.kt text eol=lf
 
+# Wrapper identity golden source coordinates must be stable across hosts.
+tests/fixtures/golden/rust-trait-reference-receivers/wrapper-identity/src/*.rs text eol=lf
+tests/fixtures/golden/rust-trait-reference-receivers/wrapper-identity/queries.json text eol=lf
 # Python declaration golden ranges are byte-exact on every platform.
 tests/fixtures/golden/python-declaration-shapes/**/*.py text eol=lf
+
+# Configuration-fact coordinate goldens pin byte offsets of LF, CRLF, and
+# non-ASCII documents, so no checkout may rewrite their line endings.
+tests/fixtures/golden/rql-configuration-fact-coordinates/** -text
+
+# PHP graph boundary goldens use exact source and expected bytes.
+crates/bifrost-php/tests/fixtures/golden/** text eol=lf
+
+# The policy crate embeds the generated M7 catalog test golden.
+crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-jdk-catalogs/expected.txt text eol=lf
+
+# Hakari compares the generated manifest byte for byte on every platform.
+crates/workspace-hack/Cargo.toml text eol=lf
+
+# Native failure-handler diagnostics retain exact source byte offsets.
+tests/fixtures/golden/rql-control-analysis/failure-handler-identities/branches.* text eol=lf

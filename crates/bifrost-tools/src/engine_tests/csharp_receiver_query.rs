@@ -502,7 +502,8 @@ namespace Demo {
 class Service { public void Run() {} }
 class Caller {
     void Call(bool flag) {
-        var service = flag ? new Service() : new Service();
+        var service = new Service();
+        if (flag) { service = new Service(); }
         service.Run();
     }
 }

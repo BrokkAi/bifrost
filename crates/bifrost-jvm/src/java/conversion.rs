@@ -21,6 +21,8 @@ pub trait JavaConversionTypes {
     fn element(&self, ty: Self::Type) -> Option<Self::Type>;
     fn name(&self, ty: Self::Type) -> Option<&str>;
     fn named(&self, ty: Self::Type) -> bool;
+    /// Some(false) requires conclusive incompatibility, not an exhausted
+    /// search over absent or incomplete hierarchy rows. Missing proof is None.
     fn nominal_widening(
         &mut self,
         source: Self::Type,
@@ -70,6 +72,40 @@ pub fn classify<T: JavaConversionTypes>(
         || (types.primitive(actual).is_some() && types.element(formal).is_some())
     {
         return Ok(Inapplicable);
+    }
+    // #7620: known erased shapes can decide a conversion even when nested
+    // arguments are not ground. An unknown outer kind supplies no such proof.
+    match (types.element(actual), types.element(formal)) {
+        (Some(_), None)
+            if types.name(formal).is_some_and(|name| {
+                !matches!(
+                    name,
+                    "java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable"
+                )
+            }) =>
+        {
+            return Ok(Inapplicable);
+        }
+        (None, Some(_)) if types.name(actual).is_some_and(|name| name != "<null>") => {
+            return Ok(Inapplicable);
+        }
+        (None, None)
+            if types.primitive(actual).is_none()
+                && types.primitive(formal).is_none()
+                && types.name(actual).is_some_and(|name| name != "<null>")
+                && types.name(formal).is_some_and(|name| name != "<null>") =>
+        {
+            match types.nominal_widening(actual, formal)? {
+                Some(false) => return Ok(Inapplicable),
+                // Positive generic containment awaits structured argument
+                // transport. Preserve only the existing ground conversions.
+                Some(true) if types.ground(actual) && types.ground(formal) => {
+                    return Ok(Strict);
+                }
+                Some(true) | None => {}
+            }
+        }
+        _ => {}
     }
     if !types.ground(actual) || !types.ground(formal) {
         return Ok(Unknown);

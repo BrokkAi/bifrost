@@ -19,18 +19,16 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
-    let start = node.start_byte();
     let Some(enclosing) = enclosing_context(node, ctx).enclosing else {
         return;
     };
-    let end = node.end_byte();
     HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_proven(
         ctx.hits,
         ctx.max_usages,
         ctx.limit_exceeded,
-        start,
-        end,
+        node,
         enclosing,
+        &crate::JavaKnowledge,
     );
 }
 

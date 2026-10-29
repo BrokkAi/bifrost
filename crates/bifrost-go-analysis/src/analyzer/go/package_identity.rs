@@ -707,22 +707,30 @@ impl<'a> GoOverlayPackages<'a> {
             })
     }
 
-    /// The exact result type selected from one positive modeled Go callable.
-    ///
-    /// A partial package may still prove a member it publishes. Selection
-    /// therefore rejects conflicts, ambiguous records, missing structure, and
-    /// inapplicable signatures without interpreting absence from the package
-    /// as a negative fact. The returned reference remains tied to the retained
-    /// overlay and preserves every structured wrapper for identity consumers.
-    #[doc(hidden)]
-    pub fn callable_result_type_ref(
+    /// Exact result arity of a uniquely selected external callable signature.
+    pub(crate) fn callable_result_count(
         &self,
         owner_fqn: &str,
         member: &str,
         has_receiver: bool,
         parameter_count: usize,
-        result_ordinal: usize,
-    ) -> Option<TypeRef> {
+    ) -> Option<usize> {
+        let callable =
+            self.applicable_callable(owner_fqn, member, has_receiver, parameter_count)?;
+        Some(match callable.structured_signature()?.returns.as_ref() {
+            None => 0,
+            Some(TypeRef::Tuple { elements }) => elements.len(),
+            Some(_) => 1,
+        })
+    }
+
+    fn applicable_callable(
+        &self,
+        owner_fqn: &str,
+        member: &str,
+        has_receiver: bool,
+        parameter_count: usize,
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let owner = self.unique_symbol(owner_fqn)?;
         if owner.language != "go"
             || owner.owner_id.is_some()
@@ -749,6 +757,27 @@ impl<'a> GoOverlayPackages<'a> {
         {
             return None;
         }
+        Some(callable)
+    }
+
+    /// The exact result type selected from one positive modeled Go callable.
+    ///
+    /// A partial package may still prove a member it publishes. Selection
+    /// therefore rejects conflicts, ambiguous records, missing structure, and
+    /// inapplicable signatures without interpreting absence from the package
+    /// as a negative fact. The returned reference remains tied to the retained
+    /// overlay and preserves every structured wrapper for identity consumers.
+    #[doc(hidden)]
+    pub fn callable_result_type_ref(
+        &self,
+        owner_fqn: &str,
+        member: &str,
+        has_receiver: bool,
+        parameter_count: usize,
+        result_ordinal: usize,
+    ) -> Option<TypeRef> {
+        let callable =
+            self.applicable_callable(owner_fqn, member, has_receiver, parameter_count)?;
         let signature = callable.structured_signature()?;
         Some(
             match signature.returns.as_ref()? {

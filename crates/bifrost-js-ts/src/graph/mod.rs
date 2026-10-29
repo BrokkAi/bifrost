@@ -22,6 +22,42 @@ fn is_name_shadowed_in_scopes(scopes: &[HashSet<String>], name: &str) -> bool {
     scopes.iter().rev().any(|scope| scope.contains(name))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QualifiedTypePart {
+    Owner,
+    Member,
+}
+
+fn qualified_type_part(node: tree_sitter::Node<'_>) -> Option<QualifiedTypePart> {
+    let (owner, member) = crate::syntax::nested_type_identifier_parts(node.parent()?)?;
+    if node.id() == owner.id() {
+        Some(QualifiedTypePart::Owner)
+    } else if node.id() == member.id() {
+        Some(QualifiedTypePart::Member)
+    } else {
+        None
+    }
+}
+
+fn for_each_type_parameter_name(
+    owner: tree_sitter::Node<'_>,
+    source: &str,
+    mut visit: impl FnMut(&str),
+) {
+    let Some(parameters) = owner.child_by_field_name("type_parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if let Some(name) = parameter.child_by_field_name("name") {
+            let name = crate::syntax::slice(name, source);
+            if !name.is_empty() {
+                visit(name);
+            }
+        }
+    }
+}
+
 use crate::graph::extractor::scan_files_for_seeds;
 use crate::graph::resolver::{JsTsUsageIndex, is_static_member, member_name};
 use crate::graph::source::declaration_ids_for_unit;
@@ -29,7 +65,6 @@ use crate::providers::JsTsSource;
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::js_ts_facts::JsTsReceiverBinding;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::usages::common::classify_recursive_hit;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, UsageHit, UsageProof};
 use brokk_bifrost_core::analyzer::usages::outcome::CandidateUsageHits;
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
@@ -139,16 +174,12 @@ pub fn scan_js_ts_target_usages(
             scan_scope.cancellation(),
         )
     };
-    // A proven hit inside the target itself is a recursive call (#1638): kept,
-    // classified `SelfReceiver`, so editor find-references lists it while the
-    // external usage surface omits it. An unproven one is still dropped -- an
-    // unproven recursive call is not evidence of anything.
+    // Proven hits were classified after recording while syntax was available.
+    // An unproven self site is still excluded: it proves neither recursion
+    // nor a field-initializer read.
     let (hits, unproven_hits): (BTreeSet<UsageHit>, BTreeSet<UsageHit>) = scan_hits
         .into_iter()
-        .filter_map(|hit| match hit.proof {
-            UsageProof::Proven => classify_recursive_hit(hit, target),
-            UsageProof::Unproven => (&hit.enclosing != target).then_some(hit),
-        })
+        .filter(|hit| hit.proof == UsageProof::Proven || &hit.enclosing != target)
         .partition(|hit| hit.proof == UsageProof::Proven);
 
     CandidateUsageHits {

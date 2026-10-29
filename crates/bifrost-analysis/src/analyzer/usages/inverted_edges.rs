@@ -29,11 +29,15 @@
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, JsTsScopedUsageEdges, NodeKey,
-    PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts,
+    PerFileEdges, UnprovenCallSite, UsageEdgeWeights, UsageEdges, UsageNodeKey,
+    UsageReferenceCounts,
 };
 
+use brokk_bifrost_core::analyzer::model::CodeUnitType;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{TerminalCatalog, terminal_index};
+
 use crate::analyzer::common::declaration_language_for_file;
-use crate::analyzer::tree_sitter_analyzer::FileState;
+use crate::analyzer::tree_sitter_analyzer::{FileState, enclosing_code_unit_order};
 use crate::analyzer::usages::parsed_tree::{
     ParseSpec, ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
 };
@@ -87,6 +91,7 @@ pub const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
 #[doc(hidden)]
 pub enum EdgeNodeDomain<'a, K = String> {
     Closed(&'a HashSet<K>),
+    ClosedWithCatalog(&'a HashSet<K>, &'a TerminalCatalog<'a, K>),
     Rooted(&'a HashSet<K>),
     Inbound(&'a HashSet<K>),
 }
@@ -103,7 +108,7 @@ impl<'a, K> EdgeNodeDomain<'a, K> {
     #[doc(hidden)]
     pub fn callers(self) -> &'a HashSet<K> {
         match self {
-            Self::Closed(nodes) | Self::Rooted(nodes) => nodes,
+            Self::Closed(nodes) | Self::ClosedWithCatalog(nodes, _) | Self::Rooted(nodes) => nodes,
             Self::Inbound(_) => unreachable!("inbound domains do not enumerate callers"),
         }
     }
@@ -211,7 +216,28 @@ pub fn weight_usage_edge_contents(key_bytes: usize, edges: &UsageEdges) -> u32 {
         .chain(edges.unproven_inbound.keys())
         .map(|name| size_of::<String>() + name.len() + size_of::<usize>())
         .sum::<usize>();
-    (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
+    let unresolved_bytes = edges
+        .unproven_sites
+        .iter()
+        .map(|((caller, name), sites)| {
+            caller.as_deref().map_or(0, str::len)
+                + name.len()
+                + sites
+                    .iter()
+                    .map(|site| {
+                        size_of::<UnprovenCallSite>()
+                            + site.path.len()
+                            // Charge shared identities conservatively per site.
+                            + site.enclosing.as_ref().map_or(0, |unit| {
+                                unit.fq_name_str().len()
+                                    + unit.signature().map_or(0, str::len)
+                                    + unit.source().retained_bytes()
+                            })
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    (key_bytes + edge_bytes + summary_bytes + unresolved_bytes).clamp(1, u32::MAX as usize) as u32
 }
 
 /// Cache a dead-code bulk graph only when its builder explicitly reports that
@@ -334,6 +360,7 @@ pub fn build_file_declarations_with_file_scope<K: NodeKey>(
     include_file_scope: bool,
 ) -> FileDeclarations<K> {
     let mut enclosers = Vec::new();
+    let mut enclosing_units = HashMap::default();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
     for unit in analyzer
         .declarations(file)
@@ -341,15 +368,28 @@ pub fn build_file_declarations_with_file_scope<K: NodeKey>(
         .filter(|unit| include_file_scope || !unit.is_file_scope())
     {
         let ranges = analyzer.ranges(&unit);
-        append_file_declaration_ranges(&unit, &ranges, &mut enclosers, &mut definitions);
+        append_file_declaration_ranges(
+            &unit,
+            &ranges,
+            &mut enclosers,
+            &mut enclosing_units,
+            &mut definitions,
+        );
     }
     if include_file_scope {
         let file_scope = CodeUnit::file_scope(file.clone());
         let ranges = analyzer.ranges(&file_scope);
-        append_file_declaration_ranges(&file_scope, &ranges, &mut enclosers, &mut definitions);
+        append_file_declaration_ranges(
+            &file_scope,
+            &ranges,
+            &mut enclosers,
+            &mut enclosing_units,
+            &mut definitions,
+        );
     }
     FileDeclarations {
         enclosers,
+        enclosing_units,
         definitions,
     }
 }
@@ -358,6 +398,7 @@ fn append_file_declaration_ranges<K: NodeKey>(
     unit: &CodeUnit,
     ranges: &[crate::analyzer::Range],
     enclosers: &mut Vec<(usize, usize, K)>,
+    enclosing_units: &mut HashMap<(usize, usize, K), CodeUnit>,
     definitions: &mut HashMap<K, Vec<(usize, usize)>>,
 ) {
     let key = K::from_unit(unit);
@@ -370,7 +411,28 @@ fn append_file_declaration_ranges<K: NodeKey>(
             && unit.is_function()
             && declaration_language_for_file(unit.source()) == crate::analyzer::Language::Scala;
         if !synthetic_scala_constructor {
-            enclosers.push((span.0, span.1, key.clone()));
+            let entry = (span.0, span.1, key.clone());
+            match enclosing_units.entry(entry.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(unit.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    // A Java record component declares its field and implicit
+                    // accessor over one range and name. Keep the declaration
+                    // `enclosing_code_unit` selects for that span, whatever
+                    // order the declarations arrive in.
+                    let order = enclosing_code_unit_order((range, unit), (range, slot.get()));
+                    debug_assert!(
+                        order.is_ne() || slot.get() == unit,
+                        "conflicting enclosing declarations: previous={:?}, incoming={unit:?}",
+                        slot.get()
+                    );
+                    if order.is_lt() {
+                        slot.insert(unit.clone());
+                    }
+                }
+            }
+            enclosers.push(entry);
         }
         definitions.entry(key.clone()).or_default().push(span);
     }
@@ -429,6 +491,7 @@ fn build_file_declarations_from_declaration_ranges_with_filter<K: NodeKey>(
     include: impl Fn(&CodeUnit) -> bool,
 ) -> FileDeclarations<K> {
     let mut enclosers = Vec::new();
+    let mut enclosing_units = HashMap::default();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
     for unit in declarations
         .iter()
@@ -436,10 +499,17 @@ fn build_file_declarations_from_declaration_ranges_with_filter<K: NodeKey>(
         .filter(|unit| include(unit))
     {
         let unit_ranges = ranges.get(unit).map(Vec::as_slice).unwrap_or(&[]);
-        append_file_declaration_ranges(unit, unit_ranges, &mut enclosers, &mut definitions);
+        append_file_declaration_ranges(
+            unit,
+            unit_ranges,
+            &mut enclosers,
+            &mut enclosing_units,
+            &mut definitions,
+        );
     }
     FileDeclarations {
         enclosers,
+        enclosing_units,
         definitions,
     }
 }
@@ -492,12 +562,13 @@ where
     // collecting every file's edges and merging at the end. Peak memory then
     // tracks the merged result plus one partial per rayon worker, instead of the
     // whole workspace at once.
+    let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     let partial = files
         .par_iter()
-        .filter(|file| keep_file(file))
+        .filter(|file| context.run(|| keep_file(file)))
         // Borrow `scan` rather than move it: it's `Sync` but not necessarily `Send`,
         // and rayon shares one mapper across worker threads.
-        .filter_map(|file| scan(file))
+        .filter_map(|file| context.run(|| scan(file)))
         .fold(Output::Partial::default, |mut partial, per_file| {
             Output::absorb(&mut partial, per_file);
             partial
@@ -527,10 +598,11 @@ where
     // Streamed for the same reason as `build_edge_output`: the omitted-file
     // identities are small and must be kept, but the per-file edge maps are not
     // and must not accumulate.
+    let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     let (partial, mut omitted_files) = files
         .par_iter()
-        .filter(|file| keep_file(file))
-        .map(|file| scan(file).map_or_else(|| Err(file.clone()), Ok))
+        .filter(|file| context.run(|| keep_file(file)))
+        .map(|file| context.run(|| scan(file).map_or_else(|| Err(file.clone()), Ok)))
         .fold(
             || (Output::Partial::default(), Vec::new()),
             |(mut partial, mut omitted), result| {
@@ -621,31 +693,36 @@ where
     // rules that rendered it. One edge build covers one language, so the
     // scanned file answers for its callees (#3033).
     let language = declaration_language_for_file(file);
-    let input = match domain {
-        EdgeNodeDomain::Closed(nodes) => FileEdgeScanInput::new(
-            &parsed.tree,
-            parsed.source.as_str(),
-            &parsed.line_starts,
-            language,
-            nodes,
-            &declarations,
-        ),
-        EdgeNodeDomain::Rooted(callers) => FileEdgeScanInput::new_rooted(
-            &parsed.tree,
-            parsed.source.as_str(),
-            &parsed.line_starts,
-            callers,
-            &declarations,
-        ),
-        EdgeNodeDomain::Inbound(callees) => FileEdgeScanInput::new_inbound(
-            &parsed.tree,
-            parsed.source.as_str(),
-            &parsed.line_starts,
-            language,
-            callees,
-            &declarations,
-        ),
+    let knowledge = crate::analyzer::languages::language_knowledge(language)
+        .expect("edge scans require registered language knowledge");
+    let default_catalog;
+    let (callers, callees, catalog) = match domain {
+        EdgeNodeDomain::Closed(nodes) => {
+            default_catalog = terminal_index(knowledge, nodes, |_| vec![CodeUnitType::Function]);
+            (Some(nodes), Some(nodes), &default_catalog)
+        }
+        EdgeNodeDomain::ClosedWithCatalog(nodes, catalog) => (Some(nodes), Some(nodes), catalog),
+        EdgeNodeDomain::Rooted(callers) => {
+            default_catalog = HashMap::default();
+            (Some(callers), None, &default_catalog)
+        }
+        EdgeNodeDomain::Inbound(callees) => {
+            default_catalog = terminal_index(knowledge, callees, |_| vec![CodeUnitType::Function]);
+            (None, Some(callees), &default_catalog)
+        }
     };
+    let input = FileEdgeScanInput::new(
+        brokk_bifrost_core::analyzer::usages::inverted_edges::FileEdgeSyntax {
+            tree: &parsed.tree,
+            source: parsed.source.as_str(),
+            line_starts: &parsed.line_starts,
+        },
+        knowledge,
+        callers,
+        callees,
+        &declarations,
+        catalog,
+    );
     let mut out = scan(&input);
     out.path = crate::path_utils::rel_path_string(file);
     out
@@ -742,6 +819,7 @@ pub struct EdgeSitesPartial<K: NodeKey> {
     edge_sites: BTreeMap<(K, K), Vec<CallSite>>,
     callsites: BTreeMap<K, usize>,
     unproven_inbound: BTreeMap<K, usize>,
+    unproven_sites: BTreeMap<(Option<K>, String), Vec<UnprovenCallSite>>,
 }
 
 impl<K: NodeKey> Default for EdgeSitesPartial<K> {
@@ -750,6 +828,7 @@ impl<K: NodeKey> Default for EdgeSitesPartial<K> {
             edge_sites: BTreeMap::new(),
             callsites: BTreeMap::new(),
             unproven_inbound: BTreeMap::new(),
+            unproven_sites: BTreeMap::new(),
         }
     }
 }
@@ -768,6 +847,22 @@ impl<K: NodeKey> EdgeSitesPartial<K> {
                 }
             }));
         }
+        let unproven_path: Arc<str> = file.path.into();
+        for (key, ranges) in file.unproven_sites {
+            self.unproven_sites
+                .entry(key)
+                .or_default()
+                .extend(
+                    ranges
+                        .into_iter()
+                        .map(|(range, evidence)| UnprovenCallSite {
+                            name: evidence.name,
+                            path: Arc::clone(&unproven_path),
+                            range,
+                            enclosing: evidence.enclosing,
+                        }),
+                );
+        }
         accumulate_site_counts(&mut self.callsites, file.callsites, |sites| sites.len());
         accumulate_site_counts(&mut self.unproven_inbound, file.unproven_inbound, |sites| {
             sites.len()
@@ -775,6 +870,9 @@ impl<K: NodeKey> EdgeSitesPartial<K> {
     }
 
     fn combine(&mut self, other: Self) {
+        for (key, sites) in other.unproven_sites {
+            self.unproven_sites.entry(key).or_default().extend(sites);
+        }
         for (key, sites) in other.edge_sites {
             self.edge_sites.entry(key).or_default().extend(sites);
         }
@@ -787,7 +885,12 @@ impl<K: NodeKey> EdgeSitesPartial<K> {
     }
 
     fn finish(self) -> UsageEdges<K> {
-        cap_edge_sites(self.edge_sites, self.callsites, self.unproven_inbound)
+        cap_edge_sites(
+            self.edge_sites,
+            self.callsites,
+            self.unproven_inbound,
+            self.unproven_sites,
+        )
     }
 }
 
@@ -804,6 +907,7 @@ fn cap_edge_sites<K: NodeKey>(
     edge_sites: BTreeMap<(K, K), Vec<CallSite>>,
     callsites: BTreeMap<K, usize>,
     unproven_inbound: BTreeMap<K, usize>,
+    mut unproven_sites: BTreeMap<(Option<K>, String), Vec<UnprovenCallSite>>,
 ) -> UsageEdges<K> {
     let truncated = truncated_call_sites(callsites);
     let edges: BTreeMap<(K, K), Vec<CallSite>> = edge_sites
@@ -816,10 +920,22 @@ fn cap_edge_sites<K: NodeKey>(
         })
         .collect();
 
+    let mut unproven_sites_complete = true;
+    unproven_sites.retain(|_, sites| {
+        sites.sort_unstable();
+        sites.dedup();
+        if sites.len() > MAX_CALLSITES {
+            unproven_sites_complete = false;
+            return false;
+        }
+        true
+    });
     UsageEdges {
         edges,
         truncated,
         unproven_inbound,
+        unproven_sites,
+        unproven_sites_complete,
     }
 }
 
@@ -1236,15 +1352,25 @@ mod tests {
         let declarations: FileDeclarations<UsageNodeKey> = FileDeclarations {
             enclosers: vec![(0, 100, caller.clone())],
             definitions: HashMap::default(),
+            enclosing_units: HashMap::default(),
         };
 
-        let input = FileEdgeScanInput::new(
-            &tree,
-            "",
-            &line_starts,
-            Language::TypeScript,
+        let terminal_catalog = brokk_bifrost_core::analyzer::usages::inverted_edges::terminal_index(
+            crate::analyzer::languages::language_knowledge(Language::TypeScript).unwrap(),
             &nodes,
+            |_| vec![brokk_bifrost_core::analyzer::model::CodeUnitType::Function],
+        );
+        let input = FileEdgeScanInput::new(
+            brokk_bifrost_core::analyzer::usages::inverted_edges::FileEdgeSyntax {
+                tree: &tree,
+                source: "",
+                line_starts: &line_starts,
+            },
+            crate::analyzer::languages::language_knowledge(Language::TypeScript).unwrap(),
+            Some(&nodes),
+            Some(&nodes),
             &declarations,
+            &terminal_catalog,
         );
         let mut per_file: PerFileEdges<UsageNodeKey> = PerFileEdges::default();
         per_file.record_kind(
@@ -1284,20 +1410,42 @@ mod tests {
         let declarations = FileDeclarations {
             enclosers: vec![(0, source.len(), caller.clone())],
             definitions: HashMap::default(),
+            enclosing_units: HashMap::default(),
         };
-        let input = FileEdgeScanInput::new_inbound(
-            &tree,
-            source,
-            &[0],
-            Language::TypeScript,
+        let terminal_catalog = brokk_bifrost_core::analyzer::usages::inverted_edges::terminal_index(
+            crate::analyzer::languages::language_knowledge(Language::TypeScript).unwrap(),
             &callees,
+            |_| vec![brokk_bifrost_core::analyzer::model::CodeUnitType::Function],
+        );
+        let input = FileEdgeScanInput::new(
+            brokk_bifrost_core::analyzer::usages::inverted_edges::FileEdgeSyntax {
+                tree: &tree,
+                source,
+                line_starts: &[0],
+            },
+            crate::analyzer::languages::language_knowledge(Language::TypeScript).unwrap(),
+            None,
+            Some(&callees),
             &declarations,
+            &terminal_catalog,
         );
         assert!(input.may_match_terminal("target"));
         assert!(!input.may_match_terminal("unknown"));
 
         let callers = HashSet::from_iter([caller.clone()]);
-        let rooted = FileEdgeScanInput::new_rooted(&tree, source, &[0], &callers, &declarations);
+        let terminal_catalog = Default::default();
+        let rooted = FileEdgeScanInput::new(
+            brokk_bifrost_core::analyzer::usages::inverted_edges::FileEdgeSyntax {
+                tree: &tree,
+                source,
+                line_starts: &[0],
+            },
+            crate::analyzer::languages::language_knowledge(Language::TypeScript).unwrap(),
+            Some(&callers),
+            None,
+            &declarations,
+            &terminal_catalog,
+        );
         assert!(rooted.may_match_terminal("unknown"));
         let mut file = PerFileEdges::default();
 
@@ -1345,14 +1493,24 @@ mod tests {
         let declarations = FileDeclarations {
             enclosers: vec![(0, source.len(), "scalaz.Uses".to_string())],
             definitions: HashMap::default(),
+            enclosing_units: HashMap::default(),
         };
-        let input = FileEdgeScanInput::new_inbound(
-            &tree,
-            source,
-            &[0],
-            Language::Scala,
+        let terminal_catalog = brokk_bifrost_core::analyzer::usages::inverted_edges::terminal_index(
+            crate::analyzer::languages::language_knowledge(Language::Scala).unwrap(),
             &callees,
+            |_| vec![brokk_bifrost_core::analyzer::model::CodeUnitType::Function],
+        );
+        let input = FileEdgeScanInput::new(
+            brokk_bifrost_core::analyzer::usages::inverted_edges::FileEdgeSyntax {
+                tree: &tree,
+                source,
+                line_starts: &[0],
+            },
+            crate::analyzer::languages::language_knowledge(Language::Scala).unwrap(),
+            None,
+            Some(&callees),
             &declarations,
+            &terminal_catalog,
         );
 
         assert!(
@@ -1399,6 +1557,7 @@ mod tests {
             )]),
             truncated: BTreeMap::from([("busy".to_string(), 12)]),
             unproven_inbound: BTreeMap::from([("uncertain".to_string(), 2)]),
+            ..Default::default()
         }
     }
 

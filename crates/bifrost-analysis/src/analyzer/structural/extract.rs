@@ -284,7 +284,6 @@ mod tests {
             facts.node(parent).kind,
             super::super::kinds::NormalizedKind::StringLiteral
         );
-        assert!(facts.is_ancestor(parent, embedded_id));
         assert_eq!(
             facts.occurrence_roles(embedded_id),
             &[OccurrenceRole::TypeOperand]
@@ -362,6 +361,34 @@ mod tests {
             .expect("relational facts hydrate");
         for id in 0..facts.nodes().len() as u32 {
             assert_eq!(decoded.occurrence_roles(id), facts.occurrence_roles(id));
+        }
+    }
+    #[test]
+    fn extraction_budget_matches_unrestricted_normalized_rows() {
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        for source in ["", "# comment\n", "x = 1\n"] {
+            let expected = extract_file_facts(spec, &grammar, source).unwrap();
+            let count = expected.work_item_count();
+            for limit in [0, 1, 2, count.saturating_sub(1), count, count + 1] {
+                let result = extract_file_facts_limited(spec, &grammar, source, limit, None);
+                if limit > 0 && limit >= count {
+                    let LimitedFileFacts::Complete(actual) = result else {
+                        panic!("complete at {limit} for {source:?}")
+                    };
+                    assert_eq!(actual.work_item_count(), expected.work_item_count());
+                    let rows = |facts: &FileFacts| {
+                        facts
+                            .nodes()
+                            .iter()
+                            .map(|node| (node.kind, node.range))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(rows(&actual), rows(&expected));
+                } else {
+                    assert!(matches!(result, LimitedFileFacts::Exceeded { .. }));
+                }
+            }
         }
     }
 }

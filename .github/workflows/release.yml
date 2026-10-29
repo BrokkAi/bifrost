@@ -1045,7 +1045,7 @@ jobs:
 
   publish-crate-policy:
     name: publish policy crate
-    needs: [release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs, publish-crate-tools, publish-crate-rust-analysis]
+    needs: [release-context, promote-qualification, publish-crate-rql, publish-crate-tools, publish-crate-rust-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1077,7 +1077,7 @@ jobs:
 
   publish-crate-semantic-packs:
     name: publish semantic packs crate
-    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis, publish-crate-jvm-analysis]
+    needs: [release-context, promote-qualification, publish-crate-policy, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis, publish-crate-jvm-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1109,7 +1109,7 @@ jobs:
 
   publish-crate-facade:
     name: publish facade crate
-    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis, publish-crate-jvm-analysis]
+    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-semantic-packs, publish-crate-tools, publish-crate-rust-analysis, publish-crate-jvm-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

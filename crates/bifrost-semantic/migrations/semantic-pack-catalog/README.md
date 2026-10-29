@@ -1,8 +1,8 @@
 # Semantic-pack catalog migrations
 
 The semantic-pack catalog is a rebuildable, cross-workspace database stored
-beside immutable digest-addressed shard objects. It is independent from the
-workspace-local unified cache migrations under `migrations/cache/`.
+beside immutable digest-addressed manifest and shard objects. It is independent
+from the workspace-local unified cache migrations under `migrations/cache/`.
 
 Append new forward-only migrations and increment the catalog version in
 `analyzer/semantic_model/catalog/db.rs`. An older binary must reject a newer
@@ -83,3 +83,17 @@ Current history:
   with exact callable-values payload presence and adds indexed, generated
   procedure-summary IDs for shard-local dependency queries. Existing artifacts
   and validation certificates survive; reconciliation rebuilds the derived rows.
+
+- `0027-pack-manifest-objects.sql`: removes the manifest BLOB from `catalog_packs`
+  and links a raw `catalog_objects` file through `manifest_object_digest`. The
+  named Rust migration publishes each original manifest with `storage::publish`,
+  one row at a time, before rebuilding the table, generated-production view and
+  mutation triggers. The link, object metadata, foreign-key check and schema
+  version publish in one immediate transaction. A failed migration leaves
+  version 26 intact; retry reuses already published files. Production keys and
+  `GENERATED_PRODUCTION_CACHE_VERSION` are unchanged.
+
+- `0028-assembly-type-forwards.sql`: admits schema 20, stores explicit assembly
+  identities and nested type-forward rows, and widens the payload-family CHECK
+  without invalidating old publications. Historical packs have no identity row.
+  Target matching is restricted to the caller's selected providers.

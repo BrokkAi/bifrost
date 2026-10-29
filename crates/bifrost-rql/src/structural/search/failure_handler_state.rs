@@ -1,4 +1,4 @@
-//! Exact native failure-handler body state over prepared syntax.
+//! Native failure-handler identity and body state over prepared syntax.
 
 use super::super::provider::StructuralSyntaxLimitedOutcome;
 use super::results::{
@@ -7,26 +7,42 @@ use super::results::{
 };
 use super::*;
 use crate::analyzer::semantic::{ContentIdentity, StableDigest};
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_analysis::analyzer::structural::failure_handlers::{
-    HandlerBodyShape, HandlerBodyState, NativeFailureBranch, ScalaCatchBodyShape,
-    cpp_catch_body_shape, java_catch_body_shape, js_ts_catch_body_shape, kotlin_catch_body_shape,
-    php_catch_body_shape, python_except_body_shape, ruby_rescue_body_shape,
-    scala_catch_body_shapes,
+    HandlerBodyShape, HandlerBodyState, HandlerIdentityProof, NativeFailureBranch,
+    ScalaCatchBodyShape, cpp_catch_body_shape, java_catch_body_shape, js_ts_catch_body_shape,
+    kotlin_catch_body_shape, php_catch_body_shape, python_except_body_shape,
+    ruby_rescue_body_shape, scala_catch_body_shapes,
 };
 use brokk_bifrost_analysis::analyzer::{WorkspaceAnalyzer, resolve_analyzer};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_csharp_analysis::{CSharpAnalyzer, csharp_catch_facts};
-use brokk_bifrost_go_analysis::go_failure_handler_body_shapes;
+use brokk_bifrost_go_analysis::{
+    go_failure_handler_body_shapes, go_failure_handler_file_body_shapes,
+};
 use brokk_bifrost_rust_analysis::analyzer::rust_failure_handler_body_shapes;
 
 const MAX_HANDLER_SOURCE_BYTES: usize = 1024 * 1024;
 
-type NativeFailureHook =
-    fn(&WorkspaceAnalyzer, &ProjectFile, &PreparedSyntaxTree, Range) -> Vec<NativeFailureBranch>;
+type NativeFailureHook = fn(
+    &WorkspaceAnalyzer,
+    &ProjectFile,
+    &PreparedSyntaxTree,
+    Range,
+    &CancellationToken,
+) -> Vec<NativeFailureBranch>;
 
 #[derive(Default)]
 pub(super) struct FailureHandlerStateCache {
+    // Compatibility executions with no caller token share this query-owned
+    // token; supplied cancellation is always forwarded instead.
+    uncancelled: CancellationToken,
     syntax: HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
+    go_branches: HashMap<ProjectFile, HashMap<Range, Vec<NativeFailureBranch>>>,
+    regions: HashMap<
+        ProjectFile,
+        brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions,
+    >,
     reported: HashSet<(String, &'static str)>,
 }
 
@@ -86,6 +102,10 @@ fn make_value(
         "failure_handler_state:{}:{catch_ast_id}",
         rel_path_string(&seed.file)
     );
+    // An identity gap cannot affect the nonempty verdict. Keep its inexact
+    // handler proof, but do not publish it as an unfinished body search.
+    let incomplete =
+        reason.is_some() && !(verdict == "nonempty" && reason == HandlerIdentityProof::Open.gap());
     FailureHandlerStateValue {
         row: CodeQueryFailureHandlerState {
             id,
@@ -96,7 +116,7 @@ fn make_value(
             body_range: body.map(|body| super::render::public_range(&seed.facts, body)),
             verdict,
             proof: if reason.is_some() { "unknown" } else { "exact" },
-            coverage: if reason.is_some() {
+            coverage: if incomplete {
                 "incomplete"
             } else {
                 "exhaustive"
@@ -113,6 +133,7 @@ fn make_value(
 }
 
 fn expansion(
+    analyzer: &dyn IAnalyzer,
     cache: &mut FailureHandlerStateCache,
     seed: &SeedMatch,
     body: Option<Range>,
@@ -126,6 +147,7 @@ fn expansion(
         seed.fact_match.node,
     );
     expansion_at(
+        analyzer,
         cache,
         seed,
         ExpansionSpec {
@@ -141,6 +163,7 @@ fn expansion(
 }
 
 fn expansion_at(
+    analyzer: &dyn IAnalyzer,
     cache: &mut FailureHandlerStateCache,
     seed: &SeedMatch,
     spec: ExpansionSpec,
@@ -155,23 +178,32 @@ fn expansion_at(
         spec.reason,
         spec.csharp_facts.as_ref(),
     );
-    if let Some(reason) = spec.reason
+    if value.row.coverage == "incomplete"
+        && let Some(reason) = spec.reason
         && cache.reported.insert((value.row.id.clone(), reason))
     {
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code: CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: seed.language.config_label(),
-            message: format!(
-                "failure handler {} in {} is incomplete: {reason}",
-                value.row.catch_ast_id, value.row.path
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        });
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            analyzer,
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: seed.language.config_label(),
+                message: format!(
+                    "failure handler {} in {} is incomplete: {reason}",
+                    value.row.catch_ast_id, value.row.path
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+            CodeQueryDiagnosticCode::from_execution_reason(
+                CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete,
+                reason,
+            )
+            .1,
+        ));
     }
     vec![pipeline_expansion(PipelineValue::FailureHandlerState(
         Box::new(value),
@@ -188,7 +220,9 @@ pub(super) fn failure_handler_state_expansions(
 ) -> Vec<PipelineExpansion> {
     let seed_kind = seed.facts.node(seed.fact_match.node).kind;
     let native_hook: Option<NativeFailureHook> = match seed.language {
-        Language::Rust => Some(rust_failure_handler_body_shapes),
+        Language::Rust => Some(|workspace, file, syntax, range, _cancellation| {
+            rust_failure_handler_body_shapes(workspace, file, syntax, range)
+        }),
         Language::Go => Some(go_failure_handler_body_shapes),
         _ => None,
     };
@@ -217,18 +251,27 @@ pub(super) fn failure_handler_state_expansions(
             Language::Scala => None,
             _ => {
                 return expansion(
+                    analyzer,
                     cache,
                     seed,
                     None,
                     "unknown",
-                    Some("unsupported_language"),
+                    Some(derivation_reason::UNSUPPORTED_LANGUAGE),
                     diagnostics,
                 );
             }
         }
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return expansion(cache, seed, None, "unknown", Some("cancelled"), diagnostics);
+        return expansion(
+            analyzer,
+            cache,
+            seed,
+            None,
+            "unknown",
+            Some(derivation_reason::CANCELLED),
+            diagnostics,
+        );
     }
     if !cache.syntax.contains_key(&seed.file) {
         let outcome = analyzer
@@ -251,11 +294,12 @@ pub(super) fn failure_handler_state_expansions(
             ));
             if actual != seed.facts.source_identity() {
                 return expansion(
+                    analyzer,
                     cache,
                     seed,
                     None,
                     "unknown",
-                    Some("snapshot_mismatch"),
+                    Some(derivation_reason::SNAPSHOT_MISMATCH),
                     diagnostics,
                 );
             }
@@ -263,24 +307,34 @@ pub(super) fn failure_handler_state_expansions(
         }
         StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
             return expansion(
+                analyzer,
                 cache,
                 seed,
                 None,
                 "unknown",
-                Some("source_limit"),
+                Some(derivation_reason::SOURCE_LIMIT),
                 diagnostics,
             );
         }
         StructuralSyntaxLimitedOutcome::Cancelled => {
-            return expansion(cache, seed, None, "unknown", Some("cancelled"), diagnostics);
-        }
-        StructuralSyntaxLimitedOutcome::Unavailable => {
             return expansion(
+                analyzer,
                 cache,
                 seed,
                 None,
                 "unknown",
-                Some("syntax_unavailable"),
+                Some(derivation_reason::CANCELLED),
+                diagnostics,
+            );
+        }
+        StructuralSyntaxLimitedOutcome::Unavailable => {
+            return expansion(
+                analyzer,
+                cache,
+                seed,
+                None,
+                "unknown",
+                Some(derivation_reason::SYNTAX_UNAVAILABLE),
                 diagnostics,
             );
         }
@@ -288,12 +342,31 @@ pub(super) fn failure_handler_state_expansions(
     let handler_seed = seed.facts.node(seed.fact_match.node).range;
     if native_seed {
         let workspace = workspace.expect("native failure-handler hooks require a workspace");
-        let branches = native_hook.expect("native hook exists for native seed")(
-            workspace,
-            &seed.file,
-            &syntax,
-            handler_seed,
-        );
+        let cancellation = cancellation.unwrap_or(&cache.uncancelled);
+        let branches = if seed.language == Language::Go {
+            cache
+                .go_branches
+                .entry(seed.file.clone())
+                .or_insert_with(|| {
+                    go_failure_handler_file_body_shapes(
+                        workspace,
+                        &seed.file,
+                        &syntax,
+                        cancellation,
+                    )
+                })
+                .get(&handler_seed)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            native_hook.expect("native hook exists for native seed")(
+                workspace,
+                &seed.file,
+                &syntax,
+                handler_seed,
+                cancellation,
+            )
+        };
         let callable_ast_id = crate::analyzer::structural::occurrence_rows::ast_id(
             seed.facts.source_identity(),
             seed.fact_match.node,
@@ -301,15 +374,19 @@ pub(super) fn failure_handler_state_expansions(
         let mut expansions = Vec::with_capacity(branches.len());
         for branch in branches {
             let (verdict, reason) = match branch.shape.state {
-                HandlerBodyState::Open(gap) => ("unknown", Some(gap.label())),
-                HandlerBodyState::Nonempty => ("nonempty", None),
-                HandlerBodyState::Empty => ("empty", None),
+                HandlerBodyState::Open(gap) => ("unknown", Some(handler_gap_label(analyzer, gap))),
+                HandlerBodyState::Nonempty => ("nonempty", branch.identity.gap()),
+                HandlerBodyState::Empty => match branch.identity.gap() {
+                    Some(reason) => ("unknown", Some(reason)),
+                    None => ("empty", None),
+                },
             };
             let catch_ast_id = format!(
                 "{callable_ast_id}:native_failure:{:x}",
                 branch.handler.start_byte
             );
             expansions.extend(expansion_at(
+                analyzer,
                 cache,
                 seed,
                 ExpansionSpec {
@@ -338,11 +415,12 @@ pub(super) fn failure_handler_state_expansions(
                 .map(|(id, _)| id as u32);
             let Some(node_id) = node_id else {
                 expansions.extend(expansion(
+                    analyzer,
                     cache,
                     seed,
                     shape.body,
                     "unknown",
-                    Some("unsupported_case_fact"),
+                    Some(derivation_reason::UNSUPPORTED_CASE_FACT),
                     diagnostics,
                 ));
                 continue;
@@ -352,11 +430,12 @@ pub(super) fn failure_handler_state_expansions(
                 node_id,
             );
             let (verdict, reason) = match shape.state {
-                HandlerBodyState::Open(gap) => ("unknown", Some(gap.label())),
+                HandlerBodyState::Open(gap) => ("unknown", Some(handler_gap_label(analyzer, gap))),
                 HandlerBodyState::Nonempty => ("nonempty", None),
                 HandlerBodyState::Empty => ("empty", None),
             };
             expansions.extend(expansion_at(
+                analyzer,
                 cache,
                 seed,
                 ExpansionSpec {
@@ -375,11 +454,12 @@ pub(super) fn failure_handler_state_expansions(
     if seed.language == Language::CSharp {
         let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
             return expansion(
+                analyzer,
                 cache,
                 seed,
                 None,
                 "unknown",
-                Some("caught_type_unresolved"),
+                Some(derivation_reason::CAUGHT_TYPE_UNRESOLVED),
                 diagnostics,
             );
         };
@@ -388,9 +468,22 @@ pub(super) fn failure_handler_state_expansions(
                 csharp,
                 analyzer.semantic_model_overlay(),
             );
-        let facts = csharp_catch_facts(csharp, scope.token(), &seed.file, &syntax, handler_seed);
+        let regions = cache.regions.entry(seed.file.clone()).or_insert_with(|| {
+            brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
+                .expect("handler language is registered")
+                .structural_spec()
+                .conditional_regions(syntax.tree().root_node(), syntax.source())
+        });
+        let facts = csharp_catch_facts(
+            csharp,
+            scope.token(),
+            &seed.file,
+            &syntax,
+            handler_seed,
+            regions,
+        );
         let (verdict, body_reason) = match facts.body.state {
-            HandlerBodyState::Open(gap) => ("unknown", Some(gap.label())),
+            HandlerBodyState::Open(gap) => ("unknown", Some(handler_gap_label(analyzer, gap))),
             HandlerBodyState::Nonempty => ("nonempty", None),
             HandlerBodyState::Empty => ("empty", None),
         };
@@ -401,6 +494,7 @@ pub(super) fn failure_handler_state_expansions(
             seed.fact_match.node,
         );
         return expansion_at(
+            analyzer,
             cache,
             seed,
             ExpansionSpec {
@@ -417,17 +511,32 @@ pub(super) fn failure_handler_state_expansions(
     let shape = classify.expect("catch language has a classifier")(&syntax, handler_seed);
     match shape.state {
         HandlerBodyState::Open(gap) => expansion(
+            analyzer,
             cache,
             seed,
             shape.body,
             "unknown",
-            Some(gap.label()),
+            Some(handler_gap_label(analyzer, gap)),
             diagnostics,
         ),
-        HandlerBodyState::Nonempty => {
-            expansion(cache, seed, shape.body, "nonempty", None, diagnostics)
-        }
-        HandlerBodyState::Empty => expansion(cache, seed, shape.body, "empty", None, diagnostics),
+        HandlerBodyState::Nonempty => expansion(
+            analyzer,
+            cache,
+            seed,
+            shape.body,
+            "nonempty",
+            None,
+            diagnostics,
+        ),
+        HandlerBodyState::Empty => expansion(
+            analyzer,
+            cache,
+            seed,
+            shape.body,
+            "empty",
+            None,
+            diagnostics,
+        ),
     }
 }
 
@@ -447,4 +556,14 @@ pub(super) fn result_ref(value: &FailureHandlerStateValue) -> CodeQueryResultRef
         catch_ast_id: value.row.catch_ast_id.clone(),
         verdict: value.row.verdict,
     }
+}
+
+fn handler_gap_label(
+    analyzer: &dyn IAnalyzer,
+    gap: brokk_bifrost_analysis::analyzer::structural::failure_handlers::HandlerBodyGap,
+) -> &'static str {
+    if gap.execution_cause().is_some() {
+        analyzer.mark_execution_dependent();
+    }
+    gap.label()
 }

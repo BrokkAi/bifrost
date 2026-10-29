@@ -37,23 +37,66 @@ enum CompiledInputsFingerprint {
 
 // Keep the command outcomes separate so each caller can preserve its fallback
 // behavior for unavailable Git operations.
+//
+// The fingerprint depends on the worktree alone, never on what is staged:
+// build.rs does not rerun when the index changes (every `git status` rewrites
+// it), so staging must not change the result. `git diff HEAD` covers modified
+// and deleted inputs. A new input is staged-added or untracked, and `git diff`
+// shows only the first kind, so both kinds are hashed the same way from their
+// worktree contents instead. Renames are split into a deletion and an addition
+// for the same reason.
 fn compiled_inputs_fingerprint_at(
     repo_root: &std::path::Path,
 ) -> CompiledInputsFingerprint {
-    let diff = match std::process::Command::new("git")
-        .args(
-            ["diff", "--binary", "HEAD", "--"]
-                .iter()
-                .copied()
-                .chain(COMPILED_INPUTS.iter().copied()),
-        )
-        .current_dir(repo_root)
-        .output()
-    {
+    let git = |leading: &[&str]| {
+        std::process::Command::new("git")
+            .args(leading.iter().copied().chain(COMPILED_INPUTS.iter().copied()))
+            .current_dir(repo_root)
+            .output()
+    };
+    let diff = match git(&["diff", "--binary", "--no-renames", "--diff-filter=a", "HEAD", "--"]) {
         Ok(diff) => diff,
         Err(_) => return CompiledInputsFingerprint::DiffCommandUnavailable,
     };
-    if !diff.status.success() || diff.stdout.is_empty() {
+    if !diff.status.success() {
+        return CompiledInputsFingerprint::NoUsableDiff;
+    }
+    let mut new_inputs = Vec::new();
+    for listing in [
+        &["diff", "-z", "--name-only", "--no-renames", "--diff-filter=A", "HEAD", "--"][..],
+        &["ls-files", "-z", "--others", "--exclude-standard", "--"][..],
+    ] {
+        match git(listing) {
+            Ok(output) if output.status.success() => new_inputs.extend(
+                output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .map(<[u8]>::to_vec),
+            ),
+            _ => return CompiledInputsFingerprint::DiffCommandUnavailable,
+        }
+    }
+    new_inputs.sort();
+    new_inputs.dedup();
+
+    let mut fingerprinted = diff.stdout;
+    for path in &new_inputs {
+        let Ok(relative) = std::str::from_utf8(path) else {
+            return CompiledInputsFingerprint::DiffCommandUnavailable;
+        };
+        // A staged addition that was then deleted from the worktree is not
+        // part of the worktree.
+        let Ok(contents) = std::fs::read(repo_root.join(relative)) else {
+            continue;
+        };
+        fingerprinted.extend_from_slice(b"\0new\0");
+        fingerprinted.extend_from_slice(path);
+        fingerprinted.push(0);
+        fingerprinted.extend_from_slice(&(contents.len() as u64).to_le_bytes());
+        fingerprinted.extend_from_slice(&contents);
+    }
+    if fingerprinted.is_empty() {
         return CompiledInputsFingerprint::NoUsableDiff;
     }
 
@@ -70,7 +113,7 @@ fn compiled_inputs_fingerprint_at(
     let Some(mut stdin) = hasher.stdin.take() else {
         return CompiledInputsFingerprint::HashCommandUnavailable;
     };
-    if std::io::Write::write_all(&mut stdin, &diff.stdout).is_err() {
+    if std::io::Write::write_all(&mut stdin, &fingerprinted).is_err() {
         return CompiledInputsFingerprint::HashCommandUnavailable;
     }
     drop(stdin);

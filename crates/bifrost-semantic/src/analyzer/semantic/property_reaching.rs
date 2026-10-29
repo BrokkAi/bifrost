@@ -948,9 +948,13 @@ pub fn control_reaching_field_stores(
     let entry_reachable = forward_reachability(graph, graph.entry_point(), &mut request)?;
     let mut reads = Vec::new();
     let mut stores = Vec::new();
+    let receiver_preparations = graph.implicit_receiver_preparation_memory_events();
     for point in graph.points() {
         for (index, event) in point.events.iter().enumerate() {
             request.visit_pair::<ProgramPointId>()?;
+            if receiver_preparations.contains(&(point.id, index)) {
+                continue;
+            }
             let mapping = graph
                 .source_mapping(event.source)
                 .expect("validated event source");
@@ -1537,12 +1541,18 @@ where
 }
 
 fn property_read_event_indices(procedure: &ProcedureHandle, point: ProgramPointId) -> Vec<u32> {
+    let receiver_preparations = procedure
+        .semantics()
+        .implicit_receiver_preparation_memory_events();
     procedure
         .semantics()
         .point(point)
         .into_iter()
         .flat_map(|point| point.events.iter().enumerate())
         .filter_map(|(index, event)| {
+            if receiver_preparations.contains(&(point, index)) {
+                return None;
+            }
             matches!(
                 event.effect,
                 SemanticEffect::MemoryLoad {

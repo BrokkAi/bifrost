@@ -201,8 +201,13 @@ impl RubyVisitor<'_> {
             if matches!(node.kind(), "class" | "module")
                 && let Some(name) = node.child_by_field_name("name")
             {
-                let mut segments = lexical_scopes[lexical_scope].clone();
-                segments.extend(extract_name_segments(name, self.source));
+                let path = extract_name_path(name, self.source);
+                let mut segments = if path.absolute {
+                    Vec::new()
+                } else {
+                    lexical_scopes[lexical_scope].clone()
+                };
+                segments.extend(path.segments);
                 lexical_scope = lexical_scopes.len();
                 lexical_scopes.push(segments);
             }
@@ -218,7 +223,14 @@ impl RubyVisitor<'_> {
                                 (spec.raw_target, encoded)
                             }),
                     );
-                    mixin = None;
+                    if namespace_call_block(node, self.source).is_some() {
+                        let child = self.mixin_containers.len();
+                        self.mixin_containers.push(RubyMixinContainer::default());
+                        self.mixin_containers[container].children.push(child);
+                        mixin = Some(child);
+                    } else {
+                        mixin = None;
+                    }
                 } else if is_descendable_container(node.kind()) {
                     let child = self.mixin_containers.len();
                     self.mixin_containers.push(RubyMixinContainer::default());
@@ -253,7 +265,7 @@ impl RubyVisitor<'_> {
                 };
                 if let Some(names) = names {
                     let facts = self.module_functions.entry(owner).or_default();
-                    if names.is_empty() {
+                    if names.is_empty() && crate::syntax::ruby_first_call_argument(node).is_none() {
                         facts.bare_start = Some(
                             facts
                                 .bare_start
@@ -510,7 +522,12 @@ impl RubyVisitor<'_> {
             "assignment" | "operator_assignment" => {
                 self.visit_assignment(node, segments, parent, None)
             }
-            "call" => self.visit_call(node, segments, parent),
+            "call" => {
+                self.visit_call(node, segments, parent);
+                if let Some(block) = namespace_call_block(node, self.source) {
+                    push_named_children(block, segments, parent, stack);
+                }
+            }
             kind if is_descendable_container(kind) => {
                 push_named_children(node, segments, parent, stack);
             }
@@ -529,13 +546,18 @@ impl RubyVisitor<'_> {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let name_segments = extract_name_segments(name_node, self.source);
-        if name_segments.is_empty() {
+        let name_path = extract_name_path(name_node, self.source);
+        if name_path.segments.is_empty() {
             return;
         }
 
-        let mut new_segments = segments.to_vec();
-        new_segments.extend(name_segments);
+        let parent = if name_path.absolute { None } else { parent };
+        let mut new_segments = if name_path.absolute {
+            Vec::new()
+        } else {
+            segments.to_vec()
+        };
+        new_segments.extend(name_path.segments);
         let short_name = new_segments.join("$");
 
         let kind = if is_module {
@@ -663,15 +685,52 @@ impl RubyVisitor<'_> {
         if name_path.segments.is_empty() {
             return;
         }
-        let short_name = assignment_constant_short_name(segments, &name_path);
+        // Resolve a qualified head against namespaces already declared in this
+        // file, before appending the remaining structured path. In particular,
+        // a root A and a lexical N::A must remain distinct.
+        // When the head is not declared locally, retain the legacy projection.
+        // Binding an owner introduced by another file needs resolver evidence.
+        let mut assignment_scope = if name_path.segments.len() > 2 {
+            &segments[..0]
+        } else {
+            segments
+        };
+        if !name_path.absolute && name_path.segments.len() > 1 {
+            for depth in (0..=segments.len()).rev() {
+                let mut candidate = segments[..depth].to_vec();
+                candidate.push(name_path.segments[0].clone());
+                let candidate = candidate.join("$");
+                if self.parsed.ranges.keys().any(|unit| {
+                    (unit.is_class() || unit.is_module()) && unit.short_name() == candidate
+                }) {
+                    assignment_scope = &segments[..depth];
+                    break;
+                }
+            }
+        }
+        let (name, owner_segments) = assignment_constant_owner(assignment_scope, &name_path)
+            .expect("nonempty constant path has a terminal name");
+        let owner_name = owner_segments.join("$");
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
             String::new(),
-            short_name,
-            assignment_constant_fq(segments, &name_path),
+            member_short_name(&owner_segments, name),
+            ruby_member_fq(&owner_segments, name),
         );
-        self.record_assignment_declaration(node, left, code_unit, parent);
+        let parent = parent
+            .filter(|unit| unit.short_name() == owner_name)
+            .cloned()
+            .or_else(|| {
+                self.parsed
+                    .ranges
+                    .keys()
+                    .find(|unit| {
+                        (unit.is_class() || unit.is_module()) && unit.short_name() == owner_name
+                    })
+                    .cloned()
+            });
+        self.record_assignment_declaration(node, left, code_unit, parent.as_ref());
     }
 
     fn visit_variable_field_assignment(
@@ -1047,34 +1106,15 @@ fn module_function_names<'a>(node: Node<'_>, source: &'a str) -> impl Iterator<I
     names.into_iter()
 }
 
-fn assignment_constant_short_name(lexical_segments: &[String], name_path: &RubyNamePath) -> String {
-    let Some((name, owner_segments)) = assignment_constant_owner(lexical_segments, name_path)
-    else {
-        return String::new();
-    };
-    member_short_name(owner_segments.as_ref(), name)
-}
-
-/// The structured counterpart of [`assignment_constant_short_name`]. The owner
-/// comes from the constant reference's own AST-derived name path, which may
-/// name a different (re-opened) namespace than the lexical parent.
-fn assignment_constant_fq(lexical_segments: &[String], name_path: &RubyNamePath) -> FqName {
-    let Some((name, owner_segments)) = assignment_constant_owner(lexical_segments, name_path)
-    else {
-        return FqName::new();
-    };
-    ruby_member_fq(owner_segments.as_ref(), name)
-}
-
 fn assignment_constant_owner<'a>(
     lexical_segments: &'a [String],
     name_path: &'a RubyNamePath,
 ) -> Option<(&'a str, Cow<'a, [String]>)> {
     let (name, owner_segments) = name_path.segments.split_last()?;
-    let resolved_owner = if owner_segments.is_empty() {
-        Cow::Borrowed(lexical_segments)
-    } else if name_path.absolute || owner_segments.len() > 1 || lexical_segments.is_empty() {
+    let resolved_owner = if name_path.absolute || lexical_segments.is_empty() {
         Cow::Borrowed(owner_segments)
+    } else if owner_segments.is_empty() {
+        Cow::Borrowed(lexical_segments)
     } else {
         let mut resolved = Vec::with_capacity(lexical_segments.len() + owner_segments.len());
         resolved.extend_from_slice(lexical_segments);
@@ -1150,15 +1190,13 @@ fn extract_ruby_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 /// Extracts the bare name from a literal `attr_*`/`alias_method` argument,
 /// which is usually a symbol (`:name`) or string (`"name"`).
 fn literal_symbol_or_string_name(node: Node<'_>, source: &str) -> Option<String> {
-    if !matches!(node.kind(), "simple_symbol" | "string") {
-        return None;
+    match node.kind() {
+        "simple_symbol" => crate::imports::ruby_symbol_name(node, source),
+        "string" => RUBY_STRUCTURAL_SPEC
+            .string_literal_value(node, source)
+            .filter(|name| !name.is_empty()),
+        _ => None,
     }
-    let text = ruby_node_text(node, source).trim();
-    let stripped = text
-        .strip_prefix(':')
-        .unwrap_or(text)
-        .trim_matches(['"', '\'']);
-    (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
 /// First non-blank line of a node's source, used as a one-line signature.
@@ -1222,6 +1260,48 @@ fn ruby_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+// These bodies either run later as a callable or execute with a different
+// self. Their declarations and mixins do not belong to the lexical namespace.
+fn namespace_call_block<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let block = node.child_by_field_name("block")?;
+    let method = node.child_by_field_name("method")?;
+    let method = ruby_node_text(method, source);
+    // ActiveSupport::Concern's included, class_methods, prepended and
+    // concerning DSL blocks evaluate their bodies on the including class, so
+    // their defs have no lexical owner here. This is a closed list in the
+    // engine: packs cannot express declaration ownership.
+    if matches!(
+        method,
+        "included"
+            | "class_methods"
+            | "prepended"
+            | "concerning"
+            | "define_method"
+            | "define_singleton_method"
+            | "proc"
+            | "lambda"
+            | "class_eval"
+            | "module_eval"
+            | "instance_eval"
+            | "class_exec"
+            | "module_exec"
+            | "instance_exec"
+    ) {
+        return None;
+    }
+    if method == "new"
+        && let Some(receiver) = node.child_by_field_name("receiver")
+        && matches!(receiver.kind(), "constant" | "scope_resolution")
+    {
+        let path = extract_name_path(receiver, source);
+        if matches!(path.segments.as_slice(), [name] if matches!(name.as_str(), "Class" | "Module"))
+        {
+            return None;
+        }
+    }
+    Some(block)
+}
+
 /// Container node kinds the visitor recurses through to find conditionally
 /// declared symbols (e.g. a `def` inside an `if`). Excludes `method`/
 /// `singleton_method`, whose bodies are treated as leaves.
@@ -1243,6 +1323,7 @@ pub fn is_descendable_container(kind: &str) -> bool {
             | "do"
             | "do_block"
             | "block"
+            | "block_body"
             | "then"
             | "ensure"
             | "rescue"
@@ -1250,14 +1331,6 @@ pub fn is_descendable_container(kind: &str) -> bool {
             | "begin_block"
             | "end_block"
     )
-}
-pub fn collect_ruby_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
-    brokk_bifrost_core::analyzer::tree_walk::collect_trimmed_node_texts(
-        node,
-        source,
-        identifiers,
-        |node| matches!(node.kind(), "identifier" | "constant"),
-    );
 }
 
 #[cfg(test)]
@@ -1312,5 +1385,103 @@ mod callable_modifier_tests {
         assert_eq!(modifiers("Widget.render"), (false, false, 1));
         assert_eq!(modifiers("Widget.measure"), (true, false, 1));
         assert_eq!(modifiers("Helpers.helper"), (false, false, 0));
+    }
+}
+
+#[cfg(test)]
+mod declaration_boundary_tests {
+    use super::*;
+    use crate::adapter::parse_ruby_file;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: absolute and nested relative declarations had wrong owners"
+    )]
+    fn ruby_declaration_ownership() {
+        let source = "module Global; end\nmodule N\n Global::EXTERNAL = 3\n ::ROOT = 1\n module A\n module B; end\n end\n A::B::LEAF = 2\n class ::Top; end\nend\n";
+        let tree = parse_ruby_tree(source).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "ownership.rb");
+        let parsed = parse_ruby_file(&file, source, &tree);
+        let mut names = parsed
+            .source_declaration_units
+            .iter()
+            .map(|(_, unit)| unit.short_name().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "Global",
+                "Global.EXTERNAL",
+                "N",
+                "N$A",
+                "N$A$B",
+                "N$A$B.LEAF",
+                "ROOT",
+                "Top"
+            ]
+        );
+        assert!(
+            parsed
+                .top_level_declarations
+                .iter()
+                .any(|unit| unit.short_name() == "ROOT")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: executing blocks lost declarations and interpolated accessor names were fabricated"
+    )]
+    fn ruby_executing_blocks_and_dynamic_names() {
+        let source = r##"module BlockReview
+  1.times { def made_in_block; end; attr_writer :block_value }
+  module_function "#{ENV.fetch('FUNCTION')}"
+  def stays_instance; end
+  proc { def deferred; end }
+  define_method(:lazy) { def deferred_method_body; end }
+  Class.new { def anonymous; end }
+  Module.new.module_eval { def different_self; end }
+  attr_reader "#{ENV.fetch('FIELD')}"
+  alias_method "#{ENV.fetch('ALIAS')}", :made_in_block
+end
+"##;
+        let tree = parse_ruby_tree(source).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "blocks.rb");
+        let parsed = parse_ruby_file(&file, source, &tree);
+        let mut names = parsed
+            .source_declaration_units
+            .iter()
+            .map(|(_, unit)| unit.short_name().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "BlockReview",
+                "BlockReview.@block_value",
+                "BlockReview.block_value=",
+                "BlockReview.made_in_block",
+                "BlockReview.stays_instance"
+            ]
+        );
+        let (_, mode) = parsed
+            .ruby_method_dispatch_modes
+            .iter()
+            .find(|(unit, _)| unit.short_name() == "BlockReview.stays_instance")
+            .unwrap();
+        assert_eq!(*mode, RubyMethodDispatchMode::Instance);
+        assert_eq!(
+            parsed
+                .materialization_records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    MaterializationRecord::DynamicGenerationSite { .. }
+                ))
+                .count(),
+            2
+        );
     }
 }

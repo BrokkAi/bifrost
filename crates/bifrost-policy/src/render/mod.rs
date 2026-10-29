@@ -399,6 +399,7 @@ mod tests {
                     analyzer: &analyzer,
                     workspace: None,
                     flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                    root_memo: None,
                     cancellation,
                     cvss_overlays: &[],
                     organizational_risk: &[],

@@ -3,6 +3,7 @@
 use super::call_binding::CallBindingValue;
 use super::results::{CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact};
 use super::*;
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 
 use brokk_bifrost_core::analyzer::cpp_facts::{CppProvenanceFact, CppProvenanceRule};
 use brokk_bifrost_rql::CppProvenanceFilter;
@@ -107,17 +108,21 @@ fn provenance_expansions_with_model_key(
     for procedure in procedures {
         for rule in rules.iter().copied() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                diagnostics.push(CodeQueryDiagnostic {
-                    related: Vec::new(),
-                    source: None,
-                    code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
-                    impact: CodeQueryDiagnosticImpact::Incomplete,
-                    branch: Vec::new(),
-                    language: seed.language.config_label(),
-                    message: "C/C++ provenance selection was cancelled".to_string(),
-                    exhausted_roots: Vec::new(),
-                    withheld_rows_path: None,
-                });
+                diagnostics.push(super::QueryExecutionState::diagnostic(
+                    workspace.analyzer(),
+                    CodeQueryDiagnostic {
+                        related: Vec::new(),
+                        source: None,
+                        code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: seed.language.config_label(),
+                        message: "C/C++ provenance selection was cancelled".to_string(),
+                        exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
+                    },
+                    Some(DerivationExecutionCause::Cancelled),
+                ));
                 return Vec::new();
             }
             let outcome = if let Some(modeled_key) = modeled_key {
@@ -133,7 +138,13 @@ fn provenance_expansions_with_model_key(
                 cpp_provenance_for_anchor(workspace, &procedure.handle, anchor, rule, cancellation)
             };
             if !outcome.complete {
-                report_incomplete(diagnostics, seed, rule, outcome.reason);
+                report_incomplete(
+                    workspace.analyzer(),
+                    diagnostics,
+                    seed,
+                    rule,
+                    outcome.reason,
+                );
             }
             if outcome
                 .fact
@@ -154,27 +165,36 @@ fn fact_matches_rule(fact: &CppProvenanceFact, rule: CppProvenanceRule) -> bool 
 }
 
 fn report_incomplete(
+    analyzer: &dyn IAnalyzer,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     seed: &SeedMatch,
     rule: CppProvenanceRule,
     reason: Option<&'static str>,
 ) {
-    diagnostics.push(CodeQueryDiagnostic {
-        related: Vec::new(),
-        source: None,
-        code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: seed.language.config_label(),
-        message: format!(
-            "C/C++ provenance rule {} is incomplete for {}: {}",
-            rule.label(),
-            rel_path_string(&seed.file),
-            reason.unwrap_or("unknown")
-        ),
-        exhausted_roots: Vec::new(),
-        withheld_rows_path: None,
-    });
+    diagnostics.push(super::QueryExecutionState::diagnostic(
+        analyzer,
+        CodeQueryDiagnostic {
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: seed.language.config_label(),
+            message: format!(
+                "C/C++ provenance rule {} is incomplete for {}: {}",
+                rule.label(),
+                rel_path_string(&seed.file),
+                reason.unwrap_or(derivation_reason::UNKNOWN)
+            ),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        },
+        CodeQueryDiagnosticCode::from_execution_reason(
+            CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+            reason.unwrap_or(derivation_reason::UNKNOWN),
+        )
+        .1,
+    ));
 }
 
 use brokk_bifrost_cpp_analysis::analyzer::cpp_provenance_for_anchor;

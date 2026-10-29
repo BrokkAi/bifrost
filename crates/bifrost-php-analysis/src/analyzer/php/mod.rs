@@ -446,6 +446,11 @@ impl TypeHierarchyProvider for PhpAnalyzer {
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-php-analysis/src/analyzer/php/mod.rs",
+            );
 
         let ancestors: Vec<_> = self
             .inner
@@ -453,8 +458,12 @@ impl TypeHierarchyProvider for PhpAnalyzer {
             .iter()
             .filter_map(|raw| php_resolve_declared_supertype(self, code_unit, raw))
             .collect();
-        self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        {
+            let cache_key = code_unit.clone();
+            let cache_value = Arc::new(ancestors.clone());
+            persistent_fill_guard.installed("direct_ancestors");
+            self.direct_ancestors.insert(cache_key, cache_value);
+        };
         ancestors
     }
 
@@ -470,7 +479,11 @@ impl TypeHierarchyProvider for PhpAnalyzer {
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
         descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
-            build_direct_descendant_index(self, self, scope)
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                build_direct_descendant_index(self, self, scope)
+            })
+            .ok()
+            .flatten()
         })
     }
 }
@@ -1094,7 +1107,7 @@ impl LanguageEdgePass for PhpEdgePass {
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        build_php_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+        build_php_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.declaration_kinds, ctx.keep_file)
             .map(LanguageEdgeWeights::Fqn)
     }
 }
@@ -1154,9 +1167,12 @@ impl DeadCodeBulkProof for PhpDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        build_fqn_bulk_edges(analyzer, Language::Php, candidates, |analyzer, nodes| {
-            build_php_usage_edges(analyzer, nodes, |_| true)
-        })
+        build_fqn_bulk_edges(
+            analyzer,
+            Language::Php,
+            candidates,
+            |analyzer, nodes, kinds| build_php_usage_edges(analyzer, nodes, kinds, |_| true),
+        )
     }
 }
 

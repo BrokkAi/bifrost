@@ -69,7 +69,12 @@ fn main() {
     for input in COMPILED_INPUTS {
         rerun_if_exists(input);
     }
-    for git_path in ["HEAD", "logs/HEAD", "index", "packed-refs"] {
+    // Not the index: any `git status` rewrites it, so a test run that called
+    // one reran this script and recompiled every target of this package on
+    // the next Cargo command. The identity depends only on the worktree
+    // (see compiled_inputs_fingerprint_at), which the COMPILED_INPUTS
+    // watches cover.
+    for git_path in ["HEAD", "logs/HEAD", "packed-refs"] {
         if let Some(path) = git_output(&["rev-parse", "--git-path", git_path]) {
             rerun_if_exists(&path);
         }

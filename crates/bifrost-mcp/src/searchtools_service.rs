@@ -57,8 +57,8 @@ use crate::{
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
-        MostRelevantFilesParams, RefreshParams, SymbolLookupParams, SymbolSourcesResult,
-        classify_test_files, get_declarations_by_location_with_cancellation,
+        MostRelevantFilesParams, RefreshParams, SemanticModelOverlayStatus, SymbolLookupParams,
+        SymbolSourcesResult, classify_test_files, get_declarations_by_location_with_cancellation,
         get_definitions_by_location_with_cancellation,
         get_definitions_by_reference_with_cancellation, get_summaries_with_cancellation,
         get_symbol_ancestors, get_symbol_locations_with_cancellation,
@@ -244,11 +244,86 @@ struct WorkspacePackActivationState {
     config: Option<Arc<WorkspacePacksConfig>>,
     ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
     failure: Option<String>,
+    overlay: SemanticModelOverlayStatus,
     /// Dependencies whose exact acquisition the expensive stage of the warm
     /// still owes. Non-empty only on an interim, installed-stage state, so a
     /// query holding it can say which packs its answer could still gain
     /// (issue #3401). A settled state always has this empty.
     pending_acquisitions: Vec<crate::analyzer::semantic_model::PendingDependencyPackAcquisition>,
+}
+
+impl WorkspacePackActivationState {
+    fn unavailable(
+        config: Option<Arc<WorkspacePacksConfig>>,
+        ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
+        reason: String,
+    ) -> Self {
+        Self {
+            config,
+            ecosystems,
+            failure: Some(reason.clone()),
+            overlay: SemanticModelOverlayStatus::Unavailable {
+                reason,
+                budget: None,
+            },
+            pending_acquisitions: Vec::new(),
+        }
+    }
+
+    fn set_runtime_outcome(&mut self, outcome: Option<&SemanticModelRuntimeOutcome>) {
+        self.failure = None;
+        self.overlay = match outcome {
+            None => SemanticModelOverlayStatus::NoModels,
+            Some(SemanticModelRuntimeOutcome::Ready { active, .. }) => {
+                if active.shards().is_empty() {
+                    SemanticModelOverlayStatus::NoModels
+                } else {
+                    SemanticModelOverlayStatus::Ready
+                }
+            }
+            Some(SemanticModelRuntimeOutcome::Incomplete {
+                usable: Some(_),
+                report,
+            }) => {
+                use crate::analyzer::semantic_model::SemanticModelActivationStatus;
+                let reasons = report
+                    .explanations
+                    .iter()
+                    .filter(|explanation| {
+                        explanation.status == SemanticModelActivationStatus::Unavailable
+                    })
+                    .map(|explanation| explanation.reason.clone())
+                    .collect();
+                SemanticModelOverlayStatus::Partial { reasons }
+            }
+            Some(SemanticModelRuntimeOutcome::Unavailable(report))
+            | Some(SemanticModelRuntimeOutcome::Cancelled(report))
+            | Some(SemanticModelRuntimeOutcome::Incomplete {
+                usable: None,
+                report,
+            }) => {
+                use crate::analyzer::semantic_model::SemanticModelActivationStatus;
+                let reasons: Vec<_> = report
+                    .explanations
+                    .iter()
+                    .filter(|explanation| {
+                        explanation.status == SemanticModelActivationStatus::Unavailable
+                    })
+                    .map(|explanation| explanation.reason.as_str())
+                    .collect();
+                let reason = if reasons.is_empty() {
+                    "semantic-model activation did not publish a complete overlay".to_owned()
+                } else {
+                    reasons.join("; ")
+                };
+                self.failure = Some(reason.clone());
+                SemanticModelOverlayStatus::Unavailable {
+                    reason,
+                    budget: report.overlay_budget_exceeded,
+                }
+            }
+        };
+    }
 }
 
 /// The installed-pack stage's answer for one session: either the final
@@ -286,13 +361,13 @@ fn activate_configured_semantic_models(
         additional_evidence,
     } = match open_session_pack_catalog(workspace_root, workspace, &configured, &packs_config) {
         Ok(prelude) => prelude,
-        Err(failure_state) => return Ok(failure_state),
+        Err(failure_state) => return Ok(*failure_state),
     };
     // The activation publishes its models onto the session analyzer, which is
     // what the session's tools read. Policy evaluation activates its own
     // workspace (#3735), so nothing reads the transaction's own record.
     let activation_config = workspace_activation_config(workspace);
-    let failure = activate_workspace_semantic_sources_in_catalog(
+    let activation = activate_workspace_semantic_sources_in_catalog(
         workspace,
         &activation_config,
         &catalog,
@@ -305,14 +380,28 @@ fn activate_configured_semantic_models(
         &additional_evidence,
         &CancellationToken::default(),
     )
-    .err()
-    .map(|error| format!("workspace semantic-pack activation failed: {error}"));
-    Ok(WorkspacePackActivationState {
+    .map_err(|error| format!("workspace semantic-pack activation failed: {error}"));
+    let mut state = WorkspacePackActivationState {
         config: packs_config,
         ecosystems,
-        failure,
+        failure: activation.as_ref().err().cloned(),
+        overlay: SemanticModelOverlayStatus::NoModels,
         pending_acquisitions: Vec::new(),
-    })
+    };
+    match activation {
+        Ok(activation) => state.set_runtime_outcome(
+            activation
+                .as_ref()
+                .and_then(|activation| activation.outcome.runtime.as_ref()),
+        ),
+        Err(reason) => {
+            state.overlay = SemanticModelOverlayStatus::Unavailable {
+                reason,
+                budget: None,
+            }
+        }
+    }
+    Ok(state)
 }
 
 /// The installed-pack stage of [`activate_configured_semantic_models`]: the
@@ -349,7 +438,7 @@ fn activate_configured_semantic_models_installed_stage(
         additional_evidence,
     } = match open_session_pack_catalog(workspace_root, workspace, &configured, &packs_config) {
         Ok(prelude) => prelude,
-        Err(failure_state) => return Ok(InstalledPackStageOutcome::Settled(failure_state)),
+        Err(failure_state) => return Ok(InstalledPackStageOutcome::Settled(*failure_state)),
     };
     let activation_config = workspace_activation_config(workspace);
     match activate_installed_workspace_semantic_sources_in_catalog(
@@ -366,12 +455,14 @@ fn activate_configured_semantic_models_installed_stage(
         &CancellationToken::default(),
     ) {
         Ok(Some(installed)) => {
-            let state = WorkspacePackActivationState {
+            let mut state = WorkspacePackActivationState {
                 config: packs_config,
                 ecosystems,
                 failure: None,
+                overlay: SemanticModelOverlayStatus::NoModels,
                 pending_acquisitions: installed.pending,
             };
+            state.set_runtime_outcome(installed.activation.outcome.runtime.as_ref());
             if state.pending_acquisitions.is_empty() {
                 Ok(InstalledPackStageOutcome::Settled(state))
             } else {
@@ -383,18 +474,16 @@ fn activate_configured_semantic_models_installed_stage(
                 config: packs_config,
                 ecosystems,
                 failure: None,
+                overlay: SemanticModelOverlayStatus::NoModels,
                 pending_acquisitions: Vec::new(),
             },
         )),
         Err(error) => Ok(InstalledPackStageOutcome::Settled(
-            WorkspacePackActivationState {
-                config: packs_config,
+            WorkspacePackActivationState::unavailable(
+                packs_config,
                 ecosystems,
-                failure: Some(format!(
-                    "workspace semantic-pack activation failed: {error}"
-                )),
-                pending_acquisitions: Vec::new(),
-            },
+                format!("workspace semantic-pack activation failed: {error}"),
+            ),
         )),
     }
 }
@@ -430,7 +519,7 @@ fn open_session_pack_catalog(
     workspace: &WorkspaceAnalyzer,
     configured: &Option<ConfiguredSemanticModels>,
     packs_config: &Option<Arc<WorkspacePacksConfig>>,
-) -> Result<SessionPackCatalogPrelude, WorkspacePackActivationState> {
+) -> Result<SessionPackCatalogPrelude, Box<WorkspacePackActivationState>> {
     let workspace_models = configured
         .as_ref()
         .is_some_and(|configured| configured.workspace_models);
@@ -448,14 +537,11 @@ fn open_session_pack_catalog(
             ) {
                 Ok(catalog) => catalog,
                 Err(error) => {
-                    return Err(WorkspacePackActivationState {
-                        config: packs_config.clone(),
+                    return Err(Box::new(WorkspacePackActivationState::unavailable(
+                        packs_config.clone(),
                         ecosystems,
-                        failure: Some(format!(
-                            "failed to open workspace semantic-pack catalog: {error}"
-                        )),
-                        pending_acquisitions: Vec::new(),
-                    });
+                        format!("failed to open workspace semantic-pack catalog: {error}"),
+                    )));
                 }
             },
             None => match open_ambient_semantic_pack_catalog(
@@ -465,14 +551,11 @@ fn open_session_pack_catalog(
             ) {
                 Ok(catalog) => catalog,
                 Err(error) => {
-                    return Err(WorkspacePackActivationState {
-                        config: packs_config.clone(),
+                    return Err(Box::new(WorkspacePackActivationState::unavailable(
+                        packs_config.clone(),
                         ecosystems,
-                        failure: Some(format!(
-                            "failed to open generated semantic-pack catalog: {error}"
-                        )),
-                        pending_acquisitions: Vec::new(),
-                    });
+                        format!("failed to open generated semantic-pack catalog: {error}"),
+                    )));
                 }
             },
         }
@@ -484,14 +567,11 @@ fn open_session_pack_catalog(
         }
         Ok(false) => {}
         Err(error) => {
-            return Err(WorkspacePackActivationState {
-                config: packs_config.clone(),
+            return Err(Box::new(WorkspacePackActivationState::unavailable(
+                packs_config.clone(),
                 ecosystems,
-                failure: Some(format!(
-                    "failed to register the MCP semantic-pack catalog bootstrap: {error}"
-                )),
-                pending_acquisitions: Vec::new(),
-            });
+                format!("failed to register the MCP semantic-pack catalog bootstrap: {error}"),
+            )));
         }
     }
     Ok(SessionPackCatalogPrelude {
@@ -517,17 +597,28 @@ fn activate_legacy_configured_semantic_models(
     configured: Option<ConfiguredSemanticModels>,
     packs_config: Option<Arc<WorkspacePacksConfig>>,
 ) -> Result<WorkspacePackActivationState, String> {
+    activate_legacy_configured_semantic_models_with_limits(
+        workspace_root,
+        workspace,
+        configured,
+        packs_config,
+        SemanticModelRuntimeLimits::default(),
+    )
+}
+
+fn activate_legacy_configured_semantic_models_with_limits(
+    workspace_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+    configured: Option<ConfiguredSemanticModels>,
+    packs_config: Option<Arc<WorkspacePacksConfig>>,
+    limits: SemanticModelRuntimeLimits,
+) -> Result<WorkspacePackActivationState, String> {
     if packs_config.is_some() {
         let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
-        return Ok(WorkspacePackActivationState {
-            config: packs_config,
-                ecosystems,
-            failure: Some(
-                "workspace packs document cannot be combined with legacy semantic-pack environment configuration"
-                    .to_owned(),
-            ),
-            pending_acquisitions: Vec::new(),
-        });
+        return Ok(WorkspacePackActivationState::unavailable(
+            packs_config, ecosystems,
+            "workspace packs document cannot be combined with legacy semantic-pack environment configuration".to_owned(),
+        ));
     }
     let configured = configured.unwrap_or(ConfiguredSemanticModels {
         catalog_root: None,
@@ -592,7 +683,7 @@ fn activate_legacy_configured_semantic_models(
             .expect("crate version must be valid semver"),
         evidence,
         controls: Vec::new(),
-        limits: SemanticModelRuntimeLimits::default(),
+        limits,
     };
     let outcome = {
         let _scope = profiling::scope("semantic_pack.acquire_active");
@@ -604,50 +695,42 @@ fn activate_legacy_configured_semantic_models(
             &CancellationToken::default(),
         )
     };
-    match outcome {
-        SemanticModelRuntimeOutcome::Ready { active, .. } => {
-            // Post-activation proof: a registered model that never reaches the
-            // active set is invisible, and an invisible model decides answers
-            // by its absence. MCP treats every such case, review gate
-            // included, as a hard bind error.
-            if let Some(inactive) =
-                workspace_semantic_models_not_active(&workspace_models, &active).first()
-            {
-                return Err(format!(
-                    "workspace semantic model {} did not activate: {:?}",
-                    inactive.model.path,
-                    active.activation_report()
-                ));
-            }
-            eprintln!(
-                "bifrost: semantic-pack activation active_set={} shards={} records={}",
-                active.active_model_set_hash(),
-                active.shards().len(),
-                active.activation_report().loaded_records
-            );
-            if active.shards().is_empty() {
-                eprintln!(
-                    "bifrost: semantic-pack activation selected no shards: {:?}",
-                    active.activation_report()
-                );
-            }
-            Ok(WorkspacePackActivationState {
-                config: None,
-                ecosystems: Vec::new(),
-                failure: None,
-                pending_acquisitions: Vec::new(),
-            })
+    if let SemanticModelRuntimeOutcome::Ready { active, .. } = &outcome {
+        // Post-activation proof: a registered model that never reaches the
+        // active set is invisible, and an invisible model decides answers
+        // by its absence. MCP treats every such case, review gate
+        // included, as a hard bind error.
+        if let Some(inactive) =
+            workspace_semantic_models_not_active(&workspace_models, active).first()
+        {
+            return Err(format!(
+                "workspace semantic model {} did not activate: {:?}",
+                inactive.model.path,
+                active.activation_report()
+            ));
         }
-        SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
-            "configured semantic-pack activation was incomplete: {report:?}"
-        )),
-        SemanticModelRuntimeOutcome::Cancelled(report) => Err(format!(
-            "configured semantic-pack activation was cancelled: {report:?}"
-        )),
-        SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
-            "configured semantic-pack activation was unavailable: {report:?}"
-        )),
+        eprintln!(
+            "bifrost: semantic-pack activation active_set={} shards={} records={}",
+            active.active_model_set_hash(),
+            active.shards().len(),
+            active.activation_report().loaded_records
+        );
+        if active.shards().is_empty() {
+            eprintln!(
+                "bifrost: semantic-pack activation selected no shards: {:?}",
+                active.activation_report()
+            );
+        }
     }
+    let mut state = WorkspacePackActivationState {
+        config: None,
+        ecosystems: Vec::new(),
+        failure: None,
+        overlay: SemanticModelOverlayStatus::NoModels,
+        pending_acquisitions: Vec::new(),
+    };
+    state.set_runtime_outcome(Some(&outcome));
+    Ok(state)
 }
 
 /// Activate shipped and configured semantic models against an already-built
@@ -850,6 +933,127 @@ mod workspace_semantic_model_configuration_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7563: MCP reported semantic packs ready while the overlay was unavailable"
+    )]
+    fn active_workspace_reports_overlay_budget_rejection_after_warm_settles() {
+        let (temp, _) = workspace(WORKSPACE_PACK);
+        let root = temp.path().canonicalize().unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let models_bytes = {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            let ready = activate_configured_semantic_models(
+                &root,
+                &session.snapshot,
+                Some(workspace_configuration()),
+            )
+            .unwrap();
+            assert!(ready.failure.is_none(), "{ready:?}");
+            session.semantic_packs.publish_final(Some(Arc::new(ready)));
+            session
+                .snapshot
+                .analyzer()
+                .active_semantic_model_snapshot()
+                .unwrap()
+                .active_models()
+                .retained_bytes()
+        };
+        let ready = service
+            .call_tool_value("get_active_workspace", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(ready["semantic_packs_ready"], true);
+        assert_eq!(ready["semantic_model_overlay"]["state"], "ready");
+        {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            let snapshot = session
+                .snapshot
+                .analyzer()
+                .active_semantic_model_snapshot()
+                .unwrap();
+            let mut report = snapshot.active_models().report.clone();
+            report.explanations.push(
+                crate::analyzer::semantic_model::SemanticModelActivationExplanation {
+                    manifest_digest: String::new(),
+                    pack_id: None,
+                    shard_id: String::new(),
+                    source_kind: crate::analyzer::semantic_model::CatalogPackSourceKind::Embedded,
+                    source_id: String::new(),
+                    status:
+                        crate::analyzer::semantic_model::SemanticModelActivationStatus::Unavailable,
+                    reason: "one model could not be activated".to_owned(),
+                },
+            );
+            let outcome = SemanticModelRuntimeOutcome::Incomplete {
+                usable: Some(Arc::clone(snapshot.active_models())),
+                report,
+            };
+            let mut partial = WorkspacePackActivationState {
+                config: None,
+                ecosystems: Vec::new(),
+                failure: None,
+                overlay: SemanticModelOverlayStatus::NoModels,
+                pending_acquisitions: Vec::new(),
+            };
+            partial.set_runtime_outcome(Some(&outcome));
+            assert!(partial.failure.is_none(), "{partial:?}");
+            session
+                .semantic_packs
+                .publish_final(Some(Arc::new(partial)));
+        }
+        let partial = service
+            .call_tool_value("get_active_workspace", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(partial["semantic_packs_ready"], true);
+        assert_eq!(partial["semantic_model_overlay"]["state"], "partial");
+        assert_eq!(
+            partial["semantic_model_overlay"]["reasons"][0],
+            "one model could not be activated"
+        );
+        let service = service.with_limits(SemanticModelRuntimeLimits {
+            max_retained_bytes: models_bytes,
+            ..Default::default()
+        });
+        {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            // Hydration fits exactly; the added overlay must exceed the combined budget.
+            let unavailable = activate_legacy_configured_semantic_models_with_limits(
+                &root,
+                &session.snapshot,
+                Some(workspace_configuration()),
+                None,
+                service.semantic_model_runtime_limits,
+            )
+            .unwrap();
+            assert!(unavailable.failure.is_some(), "{unavailable:?}");
+            session
+                .semantic_packs
+                .publish_final(Some(Arc::new(unavailable)));
+        }
+        let result = service
+            .call_tool_value("get_active_workspace", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(result["semantic_packs_ready"], true);
+        let overlay = &result["semantic_model_overlay"];
+        assert_eq!(overlay["state"], "unavailable");
+        assert_eq!(
+            overlay["reason"],
+            "semantic-model overlay exceeds the combined retained-byte budget"
+        );
+        assert!(overlay["loaded_records"].as_u64().unwrap() > 0);
+        assert_eq!(overlay["models_retained_bytes"], models_bytes);
+        assert!(overlay["overlay_working_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(overlay["combined_budget_bytes"], models_bytes);
+        let validator = jsonschema::validator_for(
+            &crate::output_schemas::output_schema_for("get_active_workspace").unwrap(),
+        )
+        .unwrap();
+        assert!(validator.is_valid(&result), "{result}");
+    }
+
+    #[test]
     fn invalid_workspace_pack_stops_activation_with_the_source_path() {
         let (root, analyzer) = workspace("{}");
         let state = activate_configured_semantic_models(
@@ -998,11 +1202,13 @@ struct RunPolicyParams {
     /// Absent means yes. `false` forces full evaluation without policy-unit
     /// cache access when diagnosing a difference.
     incremental: Option<bool>,
-    /// Opt-in wall-clock stage attribution (#2611). When set, the result
-    /// carries a `stage_timings` sibling next to the canonical report; the
-    /// report itself stays byte-identical either way.
+    /// Opt-in wall-clock stage attribution (#2611). Adds a `stage_timings`
+    /// sibling and each run's `evaluation.elapsed_ms` work metric.
     #[serde(default)]
     include_stage_timings: bool,
+    /// Advisory dispatch order only; leaves the report unchanged.
+    #[serde(default)]
+    policy_cost_hints: crate::policy::PolicyCostHints,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1032,9 +1238,8 @@ impl From<RunPolicyFailOn> for PolicyFailOn {
 pub(crate) struct RunPolicyToolResult {
     status: &'static str,
     exit_status: u8,
-    /// Present only when the caller passed `include_stage_timings`, so a
-    /// result carrying timings is structurally distinguishable from one that
-    /// does not. The canonical `report` never changes shape either way.
+    /// Added when the caller passes `include_stage_timings`; each run also
+    /// gains an `evaluation.elapsed_ms` work metric in the report.
     #[serde(skip_serializing_if = "Option::is_none")]
     stage_timings: Option<Vec<PolicyStageTiming>>,
     report: PolicyReportDocument,
@@ -1298,6 +1503,8 @@ pub struct SearchToolsService {
     /// for a trusted whole-workspace caller, never a tool argument: a query
     /// document must not be able to raise its own limits.
     workspace_scaled_query_limits: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    semantic_model_runtime_limits: SemanticModelRuntimeLimits,
 }
 
 /// Calls `get_symbol_sources` and decodes its JSON response for tests that
@@ -1500,7 +1707,8 @@ impl SemanticPackWarm {
     }
 
     /// Whether the warm has fully settled, expensive stage included. This is
-    /// what `get_active_workspace` reports as `semantic_packs_ready`.
+    /// what `get_active_workspace` reports as `semantic_packs_ready`;
+    /// `semantic_model_overlay` tells whether models are active.
     fn is_ready(&self) -> bool {
         matches!(
             *self
@@ -1509,6 +1717,24 @@ impl SemanticPackWarm {
                 .expect("semantic-pack warm mutex poisoned"),
             PackWarmState::Settled(_)
         )
+    }
+
+    fn overlay_status(&self) -> SemanticModelOverlayStatus {
+        match &*self
+            .state
+            .lock()
+            .expect("semantic-pack warm mutex poisoned")
+        {
+            PackWarmState::Pending | PackWarmState::AcquisitionPending(_) => {
+                SemanticModelOverlayStatus::Pending
+            }
+            PackWarmState::Settled(Some(state)) => state.overlay.clone(),
+            PackWarmState::Settled(None) => SemanticModelOverlayStatus::Unavailable {
+                reason: "semantic-pack warm failed before publishing an activation outcome"
+                    .to_owned(),
+                budget: None,
+            },
+        }
     }
 
     /// How long the warm ran, or `None` while it is pending.
@@ -1602,6 +1828,8 @@ fn start_pack_warm_worker(
     std::thread::Builder::new()
         .name("bifrost-semantic-pack-warm".to_string())
         .spawn(move || {
+            let _attribution =
+                brokk_bifrost_analysis::analyzer::ReadAttribution::broadcast().install();
             #[cfg(test)]
             if let Some(hold) = &warm.hold {
                 hold.park_until_released();
@@ -2632,6 +2860,7 @@ mod pack_acquisition_pending_tests {
             config: None,
             ecosystems: Vec::new(),
             failure: None,
+            overlay: SemanticModelOverlayStatus::NoModels,
             pending_acquisitions: entries
                 .iter()
                 .map(|(ecosystem, dependency_id)| {
@@ -3368,7 +3597,8 @@ fn decode_run_policy_arguments(
             .with_baseline(baseline)
             .with_fail_on(fail_on)
             .with_incremental(params.incremental.unwrap_or(true))
-            .with_policy_timings(params.include_stage_timings);
+            .with_policy_timings(params.include_stage_timings)
+            .with_policy_cost_hints(params.policy_cost_hints);
     if let Some(revision) = params.diff_base {
         if revision.is_empty()
             || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
@@ -3402,6 +3632,13 @@ fn decode_run_policy_arguments(
 }
 
 impl SearchToolsService {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_limits(mut self, limits: SemanticModelRuntimeLimits) -> Self {
+        self.semantic_model_runtime_limits = limits;
+        self
+    }
+
     /// Configure trusted Git objects that immutable `analyze_diff` endpoints
     /// may resolve. This is host configuration, never a tool argument.
     #[must_use]
@@ -5104,6 +5341,8 @@ impl SearchToolsService {
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            #[cfg(any(test, feature = "test-support"))]
+            semantic_model_runtime_limits: SemanticModelRuntimeLimits::default(),
         }
     }
 
@@ -5169,6 +5408,8 @@ impl SearchToolsService {
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            #[cfg(any(test, feature = "test-support"))]
+            semantic_model_runtime_limits: SemanticModelRuntimeLimits::default(),
         }
     }
 
@@ -5397,6 +5638,8 @@ impl SearchToolsService {
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            #[cfg(any(test, feature = "test-support"))]
+            semantic_model_runtime_limits: SemanticModelRuntimeLimits::default(),
         })
     }
 
@@ -5408,7 +5651,7 @@ impl SearchToolsService {
     ///
     /// A session installed here may still be running its semantic-pack warm;
     /// that is deliberate (issue #3372) and `get_active_workspace` reports it
-    /// as `semantic_packs_ready`.
+    /// as `semantic_packs_ready`; `semantic_model_overlay` tells whether models are active.
     fn ensure_ready(&self) -> Result<(), SearchToolsServiceError> {
         let mut pending = self
             .pending_build
@@ -7027,6 +7270,7 @@ fn activate_session_pack_stage<T>(
         &WorkspaceAnalyzer,
         Option<ConfiguredSemanticModels>,
     ) -> Result<T, String>,
+    failed: impl FnOnce(WorkspacePackActivationState) -> T,
 ) -> Option<T> {
     match configured_semantic_models()
         .and_then(|configured| activate(project_root, workspace, configured))
@@ -7034,7 +7278,11 @@ fn activate_session_pack_stage<T>(
         Ok(state) => Some(state),
         Err(error) => {
             eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
-            None
+            Some(failed(WorkspacePackActivationState::unavailable(
+                None,
+                Vec::new(),
+                error,
+            )))
         }
     }
 }
@@ -7046,14 +7294,19 @@ fn activate_session_semantic_packs(
     project_root: &Path,
     workspace: &WorkspaceAnalyzer,
 ) -> Option<Arc<WorkspacePackActivationState>> {
-    activate_session_pack_stage(project_root, workspace, activate_configured_semantic_models)
-        .map(Arc::new)
+    activate_session_pack_stage(
+        project_root,
+        workspace,
+        activate_configured_semantic_models,
+        |state| state,
+    )
+    .map(Arc::new)
 }
 
 /// The installed-pack stage of [`activate_session_semantic_packs`]: the cheap
 /// stage of the session's activation, which the query path awaits (issue
 /// #3401). An unavailable activation reports the same stated stderr failure
-/// and `None` as the full stage.
+/// and structured failure state as the full stage.
 fn activate_session_installed_semantic_packs(
     project_root: &Path,
     workspace: &WorkspaceAnalyzer,
@@ -7062,6 +7315,7 @@ fn activate_session_installed_semantic_packs(
         project_root,
         workspace,
         activate_configured_semantic_models_installed_stage,
+        InstalledPackStageOutcome::Settled,
     )
 }
 
@@ -7191,6 +7445,8 @@ fn assemble_session_with_warm(
             std::thread::Builder::new()
                 .name("bifrost-usage-index-warm".to_string())
                 .spawn(move || {
+                    let _attribution =
+                        brokk_bifrost_analysis::analyzer::ReadAttribution::broadcast().install();
                     let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
                     snapshot.warm_rust_usage_facts();
                 })
@@ -7263,12 +7519,14 @@ fn active_workspace_result(
     root: &Path,
     usage_index_ready: bool,
     semantic_packs_ready: bool,
+    semantic_model_overlay: SemanticModelOverlayStatus,
     session_subset: Option<SubsetCoverage>,
 ) -> Result<ToolOutput, SearchToolsServiceError> {
     let structured = serde_json::to_value(ActiveWorkspaceResult {
         workspace_path: root.display().to_string(),
         usage_index_ready,
         semantic_packs_ready,
+        semantic_model_overlay,
         session_subset,
     })
     .map_err(|err| {
@@ -7288,6 +7546,7 @@ fn active_workspace_result_for_session(
         root,
         session.usage_index_ready(),
         session.semantic_packs.is_ready(),
+        session.semantic_packs.overlay_status(),
         session_subset(session.snapshot.analyzer()),
     )
 }
@@ -7323,6 +7582,8 @@ fn unbound_test_service(
         diff_snapshot_object_dir: None,
         diff_scoring: DiffScoringSession::default(),
         workspace_scaled_query_limits: false,
+        #[cfg(any(test, feature = "test-support"))]
+        semantic_model_runtime_limits: SemanticModelRuntimeLimits::default(),
     }
 }
 
@@ -7911,6 +8172,32 @@ mod watcher_startup_tests {
             .expect_err("an id outside the named pack selects nothing to run");
         assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
         assert!(error.message.contains("matches no policy"), "{error:?}");
+    }
+
+    #[test]
+    fn run_policy_rejects_malformed_cost_hints() {
+        let max = crate::policy::PolicyBatchBudget::default().max_policies();
+        let too_many = (0..=max)
+            .map(|index| (format!("policy-{index}"), json!(1)))
+            .collect::<serde_json::Map<_, _>>();
+        for hints in [
+            json!(null),
+            json!([]),
+            json!({"": 1}),
+            json!({"id": -1}),
+            json!({"id": 1.5}),
+            json!({"id": "1"}),
+            json!({"id": 18446744073709551616.0_f64}),
+            Value::Object(too_many),
+        ] {
+            let error = decode_run_policy_arguments(json!({
+                "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                "evaluation_date": "2026-10-27", "policy_cost_hints": hints
+            }))
+            .err()
+            .expect("malformed hints must be rejected");
+            assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        }
     }
 
     #[test]
@@ -10010,6 +10297,8 @@ public partial class MudDialogContainer
             diff_snapshot_object_dir: None,
             diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
+            #[cfg(any(test, feature = "test-support"))]
+            semantic_model_runtime_limits: SemanticModelRuntimeLimits::default(),
         }
     }
 

@@ -182,6 +182,7 @@ pub fn explain_flow_candidate(
     let snapshot = context.analyzer.active_semantic_model_snapshot();
     let authored = solve_flow_candidate(
         policy,
+        context.flow_resources(),
         spec,
         workspace,
         snapshot.clone(),
@@ -672,6 +673,7 @@ fn attribution_stage(
     relaxed_spec.sanitizers.clear();
     let relaxed = solve_flow_candidate(
         policy,
+        context.flow_resources(),
         &relaxed_spec,
         workspace,
         snapshot,

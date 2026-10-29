@@ -2,7 +2,8 @@
 //! fixpoint. Each rule has one definition here; the flow and policy crates
 //! call these functions.
 
-use std::collections::HashSet;
+use crate::analyzer::semantic::{BindingOriginIndex, CallSiteId, ValueId};
+use std::collections::{HashMap, HashSet};
 
 use crate::analyzer::semantic::ControlEdgeId;
 
@@ -197,4 +198,194 @@ pub fn guard_edge_kills(procedure: &ProcedureHandle) -> Vec<GuardEdgeKill> {
         });
     }
     kills
+}
+
+/// Accepting values of a policy-selected call-result guard. Policy requirements
+/// and carrier referent stability are proved before a candidate enters this rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalGuardResult {
+    True,
+    False,
+    Nil,
+    NonNil,
+}
+
+/// One call already matched by a policy selector, within this procedure only.
+#[derive(Debug, Clone)]
+pub struct ConditionalGuardSanitizer {
+    pub call: CallSiteId,
+    pub result_index: Option<u32>,
+    pub accepts: ConditionalGuardResult,
+    pub carrier: Option<ValueId>,
+}
+
+#[derive(Debug)]
+pub struct ConditionalGuardKill {
+    pub sanitizer: usize,
+    pub kill: GuardEdgeKill,
+}
+
+#[derive(Debug)]
+pub struct ConditionalGuardDecline {
+    pub sanitizer: usize,
+    pub point: ProgramPointId,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Default)]
+pub struct ConditionalGuardKills {
+    pub kills: Vec<ConditionalGuardKill>,
+    pub declines: Vec<ConditionalGuardDecline>,
+}
+
+/// Derive query-local kills without changing the policy-independent partial flows.
+/// A stored guard result is nominated through value-dependence edges to explain why it
+/// was declined; those edges never establish a sanitizer proof.
+pub fn conditional_guard_edge_kills(
+    procedure: &ProcedureHandle,
+    sanitizers: &[ConditionalGuardSanitizer],
+) -> ConditionalGuardKills {
+    let semantics = procedure.semantics();
+    let origins = BindingOriginIndex::new(procedure);
+    let mut by_call = HashMap::<CallSiteId, Vec<usize>>::new();
+    for (index, sanitizer) in sanitizers.iter().enumerate() {
+        assert!(
+            semantics.call_site(sanitizer.call).is_some(),
+            "sanitizer call belongs to its procedure"
+        );
+        by_call.entry(sanitizer.call).or_default().push(index);
+    }
+    let mut answer = ConditionalGuardKills::default();
+    for guard in semantics.guard_facts() {
+        let Some(subject) = guard.subject else {
+            continue;
+        };
+        let mut direct = semantics
+            .call_phase_points(subject)
+            .into_iter()
+            .flatten()
+            .flat_map(|point| {
+                semantics
+                    .call_result_site_ids(subject, *point)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        direct.sort_unstable();
+        direct.dedup();
+        if direct.is_empty() {
+            let mut pending = vec![subject];
+            let mut seen = HashSet::new();
+            let mut nominated = HashSet::new();
+            while let Some(value) = pending.pop() {
+                if !seen.insert(value) {
+                    continue;
+                }
+                for point in semantics.call_phase_points(value).into_iter().flatten() {
+                    for call in semantics
+                        .call_result_site_ids(value, *point)
+                        .into_iter()
+                        .flatten()
+                    {
+                        nominated.extend(by_call.get(call).into_iter().flatten().copied());
+                    }
+                }
+                pending.extend(origins.value_predecessors(value));
+            }
+            let mut nominated = nominated.into_iter().collect::<Vec<_>>();
+            nominated.sort_unstable();
+            answer
+                .declines
+                .extend(
+                    nominated
+                        .into_iter()
+                        .map(|sanitizer| ConditionalGuardDecline {
+                            sanitizer,
+                            point: guard.point,
+                            reason: "stored call result requires a reaching-definition proof",
+                        }),
+                );
+            continue;
+        }
+        for call_id in &direct {
+            for &index in by_call.get(call_id).into_iter().flatten() {
+                let sanitizer = &sanitizers[index];
+                let call = semantics
+                    .call_site(*call_id)
+                    .expect("the frozen call-result index names a call");
+                let attempt = || {
+                    if direct.len() != 1 {
+                        return Err("guard call result is ambiguous");
+                    }
+                    if !call.normal_results.is_empty() && sanitizer.result_index.is_none() {
+                        return Err("multi-result sanitizer requires an explicit result index");
+                    }
+                    if call.normal_result(sanitizer.result_index.unwrap_or(0) as usize)
+                        != Some(subject)
+                    {
+                        return Err("guard does not test the configured call result index");
+                    }
+                    let true_arm = match (guard.predicate, sanitizer.accepts) {
+                        (GuardPredicate::Truthy { .. }, ConditionalGuardResult::True) => true,
+                        (GuardPredicate::Truthy { .. }, ConditionalGuardResult::False) => false,
+                        (
+                            GuardPredicate::NullComparison { null_on_true },
+                            ConditionalGuardResult::Nil,
+                        ) => null_on_true,
+                        (
+                            GuardPredicate::NullComparison { null_on_true },
+                            ConditionalGuardResult::NonNil,
+                        ) => !null_on_true,
+                        (
+                            GuardPredicate::ConstantBoolean { value: true },
+                            ConditionalGuardResult::True,
+                        ) => true,
+                        (
+                            GuardPredicate::ConstantBoolean { value: false },
+                            ConditionalGuardResult::False,
+                        ) => false,
+                        _ => return Err("guard predicate does not establish the accepting result"),
+                    };
+                    let edge_id = if true_arm {
+                        guard.true_edge
+                    } else {
+                        guard.false_edge
+                    }
+                    .ok_or("accepting guard arm is absent")?;
+                    let binding = origins
+                        .unique_binding_origin(
+                            sanitizer
+                                .carrier
+                                .ok_or("sanitized carrier operand is absent")?,
+                        )
+                        .ok_or("sanitized carrier has no unique binding origin")?;
+                    let value = procedure
+                        .value_handle(binding)
+                        .expect("a binding origin names a live value");
+                    let edge = semantics
+                        .control_edge(edge_id)
+                        .expect("a guard arm names a live edge");
+                    Ok(GuardEdgeKill {
+                        point: guard.point,
+                        target_point: edge.target_point,
+                        kind: edge.kind,
+                        carrier: ValueFlowEndpoint::for_value(value),
+                    })
+                };
+                match attempt() {
+                    Ok(kill) => answer.kills.push(ConditionalGuardKill {
+                        sanitizer: index,
+                        kill,
+                    }),
+                    Err(reason) => answer.declines.push(ConditionalGuardDecline {
+                        sanitizer: index,
+                        point: guard.point,
+                        reason,
+                    }),
+                }
+            }
+        }
+    }
+    answer
 }

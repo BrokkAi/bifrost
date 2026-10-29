@@ -3674,6 +3674,64 @@ pub struct PolicyDiagnostic {
     family_count: u64,
     primary: Option<PolicySourceLocation>,
     related: Vec<RelatedPolicyLocation>,
+    /// The structured account of an incomplete selector discovery, for the
+    /// concise human view. The message keeps the complete diagnostic list, so
+    /// JSON and SARIF need nothing from this.
+    #[serde(skip)]
+    selector_gap: Option<PolicySelectorGapSummary>,
+}
+
+/// One endpoint selector whose discovery did not finish, summarized for a
+/// person: which endpoint, how many diagnostics of each code, and the source
+/// sites those diagnostics named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicySelectorGapSummary {
+    endpoint: String,
+    codes: Vec<(String, u64)>,
+    sites: Vec<(String, Option<usize>)>,
+}
+
+impl PolicySelectorGapSummary {
+    /// `codes` and `sites` may repeat; they are counted and deduplicated here.
+    pub fn new(
+        endpoint: impl Into<String>,
+        codes: impl IntoIterator<Item = String>,
+        sites: impl IntoIterator<Item = (String, Option<usize>)>,
+    ) -> Self {
+        let mut counts = Vec::<(String, u64)>::new();
+        for code in codes {
+            match counts.iter_mut().find(|(known, _)| *known == code) {
+                Some((_, count)) => *count = count.saturating_add(1),
+                None => counts.push((code, 1)),
+            }
+        }
+        counts.sort();
+        let mut sites = sites.into_iter().collect::<Vec<_>>();
+        sites.sort();
+        sites.dedup();
+        Self {
+            endpoint: endpoint.into(),
+            codes: counts,
+            sites,
+        }
+    }
+
+    /// The endpoint's role and display name, such as `source Foo.bar()`.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Each diagnostic code with the number of diagnostics that carried it,
+    /// sorted by code.
+    pub fn codes(&self) -> &[(String, u64)] {
+        &self.codes
+    }
+
+    /// Distinct workspace-relative paths, each with its one-based line when
+    /// the diagnostic named an exact site rather than only a file; sorted.
+    pub fn sites(&self) -> &[(String, Option<usize>)] {
+        &self.sites
+    }
 }
 
 impl PolicyDiagnostic {
@@ -3735,7 +3793,14 @@ impl PolicyDiagnostic {
             family_count: 1,
             primary,
             related,
+            selector_gap: None,
         })
+    }
+
+    /// Attach the human summary of the selector gap this diagnostic reports.
+    pub fn with_selector_gap(mut self, summary: PolicySelectorGapSummary) -> Self {
+        self.selector_gap = Some(summary);
+        self
     }
 
     /// The advisory a policy publishes when one of its own selections matched
@@ -3797,6 +3862,13 @@ impl PolicyDiagnostic {
         &self.family
     }
 
+    /// Aggregate losses without allocating one diagnostic per lost candidate.
+    pub(crate) fn with_family_count(mut self, count: u64) -> Self {
+        assert!(count > 0, "a diagnostic represents at least one occurrence");
+        self.family_count = count;
+        self
+    }
+
     pub const fn family_count(&self) -> u64 {
         self.family_count
     }
@@ -3819,6 +3891,10 @@ impl PolicyDiagnostic {
 
     pub fn related(&self) -> &[RelatedPolicyLocation] {
         &self.related
+    }
+
+    pub const fn selector_gap(&self) -> Option<&PolicySelectorGapSummary> {
+        self.selector_gap.as_ref()
     }
 }
 
@@ -5950,6 +6026,7 @@ fn fold_policy_diagnostics_by_family(diagnostics: &mut Vec<PolicyDiagnostic>) {
             entry.message = entry.family.clone();
             entry.primary = None;
             entry.related = Vec::new();
+            entry.selector_gap = None;
         }
     }
     folded.sort_by(compare_policy_diagnostics);

@@ -7,8 +7,6 @@ use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 
 use brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend;
 
-use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
-
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalDefinition;
@@ -42,7 +40,7 @@ use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
 use brokk_bifrost_analysis::analyzer::resolution::reference_vocabulary::{
-    WithheldCallee, WithheldReference,
+    EdgeSite, WithheldCallee, WithheldReference,
 };
 use brokk_bifrost_core::analyzer::model::DeclarationId;
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
@@ -2472,18 +2470,21 @@ pub(crate) fn scan_usages_backend(
     include_same_owner: bool,
     context: &ScanUsagesExecutionContext,
 ) -> ScanUsagesResult {
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     HEAVY_SCAN_POOL.install(|| {
-        let (entries, scope) = scan_usages_backend_on_pool(
-            analyzer,
-            token,
-            include_tests,
-            paths,
-            symbols,
-            targets,
-            include_same_owner,
-            context,
-        );
-        render_scan_usages_with_budget(entries, scope, surface)
+        attribution.run(|| {
+            let (entries, scope) = scan_usages_backend_on_pool(
+                analyzer,
+                token,
+                include_tests,
+                paths,
+                symbols,
+                targets,
+                include_same_owner,
+                context,
+            );
+            render_scan_usages_with_budget(entries, scope, surface)
+        })
     })
 }
 
@@ -2878,37 +2879,41 @@ fn scan_usages_backend_on_pool(
     // first broad target and report every later target as unexamined. Fan them
     // out on the dedicated heavy-scan pool that already owns this call; each
     // UsageFinder retains its own replay frontier and result state.
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let resolved_queries: Vec<_> = resolved_targets
         .into_par_iter()
         .map(|mut resolved| {
-            if context.cancellation.is_cancelled() {
-                return (resolved, None);
-            }
-            // Location selection starts from physical extraction rows. Give
-            // both scan entry points the same structural target before usage
-            // resolution, while range and signature reads retain provenance.
-            for unit in &mut resolved.overloads {
-                *unit = analyzer.canonical_code_unit(unit, Some(&context.cancellation));
-            }
-            let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref())
-                .with_cancellation(context.cancellation.clone());
-            let max_candidate_files = if path_scoped_candidates.is_some() {
-                context.max_path_scoped_candidate_files
-            } else {
-                context.max_candidate_files
-            };
-            let query = finder.query_with_provider_and_source_budget(
-                analyzer,
-                &resolved.overloads,
-                path_scoped_candidates
-                    .as_ref()
-                    .map(|provider| provider as &dyn CandidateFileProvider),
-                max_candidate_files,
-                context.max_callsites,
-                Some(context.max_source_bytes),
-            );
-            let interrupted = context.cancellation.is_cancelled();
-            (resolved, Some((query, interrupted)))
+            attribution.run(|| {
+                if context.cancellation.is_cancelled() {
+                    return (resolved, None);
+                }
+                // Location selection starts from physical extraction rows. Give
+                // both scan entry points the same structural target before usage
+                // resolution, while range and signature reads retain provenance.
+                for unit in &mut resolved.overloads {
+                    *unit = analyzer.canonical_code_unit(unit, Some(&context.cancellation));
+                }
+                let finder =
+                    scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref())
+                        .with_cancellation(context.cancellation.clone());
+                let max_candidate_files = if path_scoped_candidates.is_some() {
+                    context.max_path_scoped_candidate_files
+                } else {
+                    context.max_candidate_files
+                };
+                let query = finder.query_with_provider_and_source_budget(
+                    analyzer,
+                    &resolved.overloads,
+                    path_scoped_candidates
+                        .as_ref()
+                        .map(|provider| provider as &dyn CandidateFileProvider),
+                    max_candidate_files,
+                    context.max_callsites,
+                    Some(context.max_source_bytes),
+                );
+                let interrupted = context.cancellation.is_cancelled();
+                (resolved, Some((query, interrupted)))
+            })
         })
         .collect();
 
@@ -3226,17 +3231,20 @@ pub(crate) fn scan_usage_reference_sites_by_location(
         .map(|(index, target)| ScanUsageRequest::target(index, target))
         .collect();
     let context = ScanUsagesExecutionContext::with_cancellation(cancellation);
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let (entries, scope) = HEAVY_SCAN_POOL.install(|| {
-        scan_usages_backend_on_pool(
-            analyzer,
-            token,
-            params.include_tests,
-            params.paths.as_deref(),
-            Vec::new(),
-            targets,
-            params.include_same_owner,
-            &context,
-        )
+        attribution.run(|| {
+            scan_usages_backend_on_pool(
+                analyzer,
+                token,
+                params.include_tests,
+                params.paths.as_deref(),
+                Vec::new(),
+                targets,
+                params.include_same_owner,
+                &context,
+            )
+        })
     });
     collect_scan_usages_reference_sites(analyzer, entries, scope, &context)
 }
@@ -3553,6 +3561,58 @@ pub enum UsageGraphWithheldCallee {
     Declaration { to_id: DeclarationId },
 }
 
+/// Bridge the shared legacy scan's unresolved locations to the same evidence
+/// vocabulary used by native graph providers. Caller keys were selected from
+/// the file's declaration index at record time and retain their exact identity.
+fn legacy_usage_graph_withheld_references<
+    K: brokk_bifrost_core::analyzer::usages::inverted_edges::NodeKey,
+>(
+    analyzer: &dyn IAnalyzer,
+    sites: BTreeMap<
+        (Option<K>, String),
+        Vec<brokk_bifrost_core::analyzer::usages::inverted_edges::UnprovenCallSite>,
+    >,
+) -> Vec<WithheldReference> {
+    sites
+        .into_iter()
+        .flat_map(|((caller, _name), sites)| {
+            sites.into_iter().map(move |site| {
+                let file = ProjectFile::new(analyzer.project().root(), site.path.as_ref());
+                let enclosing = site.enclosing;
+                debug_assert!(
+                    enclosing
+                        .as_ref()
+                        .is_none_or(|unit| Some(K::from_unit(unit)) == caller)
+                );
+                WithheldReference {
+                    site: EdgeSite {
+                        file,
+                        range: site.range,
+                        ast_id: None,
+                        enclosing,
+                    },
+                    callee: WithheldCallee::Named(site.name),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Exercise the language-pass/public-bridge boundary with full site evidence.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn legacy_usage_graph_withheld_references_for_test<
+    K: brokk_bifrost_core::analyzer::usages::inverted_edges::NodeKey,
+>(
+    analyzer: &dyn IAnalyzer,
+    sites: BTreeMap<
+        (Option<K>, String),
+        Vec<brokk_bifrost_core::analyzer::usages::inverted_edges::UnprovenCallSite>,
+    >,
+) -> Vec<WithheldReference> {
+    legacy_usage_graph_withheld_references(analyzer, sites)
+}
+
 fn render_usage_graph_withheld_references<'a>(
     catalog: &WorkspaceUsageCatalog,
     references: impl IntoIterator<Item = &'a WithheldReference>,
@@ -3836,6 +3896,7 @@ pub(crate) fn selected_usage_graph_result(
             ),
         ));
     }
+    record_native_graph_obligations(&mut incomplete, &forward_completeness);
     let mut unproven_inbound = 0_usize;
     for node in &nodes {
         if cancellation.is_cancelled() {
@@ -3932,7 +3993,32 @@ pub(crate) fn selected_usage_graph_result(
     result.withheld_references_complete = unresolved_names.is_some();
     record_graph_domain_failures(&mut result, domain_discovery_failures);
     record_graph_build_selection_unavailable(&mut result, build_selection_unavailable);
-    record_graph_skipped_callers(&mut result, skipped_callers, cancellation).then_some(result)
+    if !record_graph_skipped_callers(&mut result, skipped_callers, cancellation) {
+        return None;
+    }
+    debug_assert_unique_usage_graph_file_notes(&result);
+    Some(result)
+}
+
+// Graph-wide language obligations keep their codes and never alter edge proof.
+fn record_native_graph_obligations(
+    incomplete: &mut BTreeSet<(String, String)>,
+    completeness: &brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness,
+) {
+    use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
+        EdgeCompleteness, EdgeIncompleteReason,
+    };
+    if let EdgeCompleteness::Incomplete { reasons } = completeness {
+        for reason in reasons {
+            if let EdgeIncompleteReason::UsageAnalysisFailed {
+                reason_kind,
+                reason,
+            } = reason
+            {
+                incomplete.insert((reason_kind.clone(), reason.clone()));
+            }
+        }
+    }
 }
 
 type UsageGraphSiteKey = (String, usize, String, String);
@@ -4466,6 +4552,8 @@ fn usage_graph_with_passes(
     // same, unchanged prefix each time.
     let mut layer_catalog_once: Option<(usize, WorkspaceUsageCatalog)> = None;
     let mut native_projections: Vec<SelectedWorkspaceUsageGraphProjection> = Vec::new();
+    let mut legacy_withheld = Vec::new();
+    let mut legacy_withheld_complete = true;
     let mut native_admitted_callers = HashSet::default();
     let mut skipped_callers = std::collections::BTreeMap::new();
     let mut build_selection_unavailable = None;
@@ -4646,6 +4734,10 @@ fn usage_graph_with_passes(
                             ),
                         ));
                     }
+                    record_native_graph_obligations(
+                        &mut incomplete,
+                        &projection.forward_completeness,
+                    );
                     let unproven = projection
                         .nodes
                         .iter()
@@ -4708,6 +4800,7 @@ fn usage_graph_with_passes(
                         .is_none_or(|exclusion| !exclusion.excludes(file))
             };
             let ctx = brokk_bifrost_analysis::analyzer::languages::EdgeSiteScanCtx {
+                cancellation,
                 analyzer,
                 fqns: &fqns,
                 scoped_callers: &scoped_callers,
@@ -4717,6 +4810,11 @@ fn usage_graph_with_passes(
                 Some(brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites::Fqn(
                     result,
                 )) => {
+                    legacy_withheld_complete &= result.unproven_sites_complete;
+                    legacy_withheld.extend(legacy_usage_graph_withheld_references(
+                        analyzer,
+                        result.unproven_sites,
+                    ));
                     for ((from, to), sites) in result.edges {
                         if pass.permits_logical_family_targets() {
                             logical_family_edges.insert((
@@ -4740,6 +4838,11 @@ fn usage_graph_with_passes(
                 Some(brokk_bifrost_analysis::analyzer::languages::LanguageEdgeSites::Scoped(
                     result,
                 )) => {
+                    legacy_withheld_complete &= result.unproven_sites_complete;
+                    legacy_withheld.extend(legacy_usage_graph_withheld_references(
+                        analyzer,
+                        result.unproven_sites,
+                    ));
                     // This branch has the same two costs the `Fqn` branch above was
                     // just fixed for: a store round trip per edge target, and a
                     // linear scan of `declarations` per edge for the caller. Batch
@@ -5104,10 +5207,12 @@ fn usage_graph_with_passes(
         // query embeds that worker's own `to_name`, so no worker can
         // possibly need to see another worker's (still pending) insertion.
         let authoritative_exact_sites_snapshot = &authoritative_exact_sites;
-        let results: Vec<AmbiguousTargetResult> = HEAVY_SCAN_POOL.install(|| {
+        let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
+        let results: Vec<AmbiguousTargetResult> = HEAVY_SCAN_POOL.install(|| attribution.run(|| {
+            let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
             ambiguous_targets
                 .par_iter()
-                .map(|target| {
+                .map(|target| attribution.run(|| {
                     let endpoint_key = (target.ecosystem, target.to_name.to_string());
                     let mut endpoints = endpoints_by_name[&endpoint_key].clone();
                     let mut new_authoritative_sites = Vec::new();
@@ -5235,9 +5340,9 @@ fn usage_graph_with_passes(
                         new_inverse_exact_by_site,
                         incomplete_reasons,
                     }
-                })
+                }))
                 .collect()
-        });
+        }));
 
         let mut endpoints_by_target: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
             HashMap::default();
@@ -5286,7 +5391,7 @@ fn usage_graph_with_passes(
                 request_counts.push(all_requests.len() - before);
             }
             let all_outcomes =
-                brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_legacy_usage_graph_definition_batch_with_source(
+                brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch_with_source(
                     analyzer,
                     all_requests,
                     file.clone(),
@@ -5572,6 +5677,7 @@ fn usage_graph_with_passes(
                         .is_none_or(|filter| !filter.excludes(&reference.site.file))
             })
         })
+        .chain(legacy_withheld.iter())
         .collect::<Vec<_>>();
     let dispatch_endpoint_ids = native_projections
         .iter()
@@ -5622,7 +5728,8 @@ fn usage_graph_with_passes(
         incomplete,
     );
     result.withheld_references = public_withheld;
-    result.withheld_references_complete = unavailable_passes.is_empty()
+    result.withheld_references_complete = legacy_withheld_complete
+        && unavailable_passes.is_empty()
         && native_projections
             .iter()
             .all(|projection| projection.unresolved_names.is_some());
@@ -5686,6 +5793,7 @@ fn usage_graph_with_passes(
             "workspace changed while finalizing usage graph".into(),
         );
     }
+    debug_assert_unique_usage_graph_file_notes(&result);
     result
 }
 
@@ -5764,9 +5872,14 @@ fn record_graph_skipped_callers(
                 gowork_path,
                 message,
             } => {
-                record_graph_domain_failures(result, [brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphDomainDiscoveryFailure {
-                    domain_dir: domain_dir.clone(), gowork_path: gowork_path.clone(), discovery_error: message.clone(),
-                }]);
+                record_graph_domain_failures(
+                result,
+                [brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphDomainDiscoveryFailure {
+                    domain_dir: domain_dir.clone(),
+                    gowork_path: gowork_path.clone(),
+                    discovery_error: message.clone(),
+                }],
+            );
             }
             GraphFileSkipReason::Unplaced => {
                 result.incomplete_reasons.push(UsageGraphIncompleteReason {
@@ -5775,13 +5888,28 @@ fn record_graph_skipped_callers(
                     message: "requested file has no selected graph placement".into(),
                     path: Some(path.clone()),
                     module_path: None,
-                })
+                });
             }
         }
         result.file_notes.push(UsageGraphFileNote { path, reason });
     }
     result.complete = result.incomplete_reasons.is_empty();
     true
+}
+
+fn debug_assert_unique_usage_graph_file_notes(result: &UsageGraphResult) {
+    if cfg!(debug_assertions) {
+        let mut seen = HashSet::default();
+        let duplicates: Vec<_> = result
+            .file_notes
+            .iter()
+            .filter(|note| !seen.insert(&note.path))
+            .collect();
+        debug_assert!(
+            duplicates.is_empty(),
+            "duplicate usage graph file notes: {duplicates:?}"
+        );
+    }
 }
 
 fn unavailable_usage_graph_result(
@@ -5950,7 +6078,7 @@ fn finalize_usage_graph_result(
             ),
         });
     }
-    let mut result = UsageGraphResult {
+    let result = UsageGraphResult {
         withheld_references: Vec::new(),
         withheld_references_complete: incomplete_reasons.is_empty(),
         complete: incomplete_reasons.is_empty(),
@@ -5962,41 +6090,8 @@ fn finalize_usage_graph_result(
         file_notes: Vec::new(),
         build_configurations: usage_graph_build_configurations(analyzer),
     };
-    record_unnamed_module_exclusions(&mut result, analyzer);
+    debug_assert_unique_usage_graph_file_notes(&result);
     result
-}
-
-fn record_unnamed_module_exclusions(result: &mut UsageGraphResult, analyzer: &dyn IAnalyzer) {
-    let mut seen_roots = HashSet::default();
-    let mut files = analyzer.source_file_inventory().rows;
-    files.sort();
-    for file in files {
-        let Some(root) = language_support_for_hook(
-            brokk_bifrost_core::analyzer::common::language_for_file(&file),
-            "unnamed_module_root_for_file",
-        )
-        .and_then(|support| support.unnamed_module_root_for_file(analyzer, &file)) else {
-            continue;
-        };
-        let root_path = root.to_string_lossy().replace('\\', "/");
-        let path = rel_path_string(&file);
-        result.file_notes.push(UsageGraphFileNote {
-            path,
-            reason: GraphFileSkipReason::OutsideSelectedModules {
-                module_path: root_path.clone(),
-            },
-        });
-        if seen_roots.insert(root_path.clone()) {
-            result.incomplete_reasons.push(UsageGraphIncompleteReason {
-                discovery_error: None,
-                code: "outside_selected_modules".into(),
-                message: "module has no packages in the selected tool context (#5664)".into(),
-                path: None,
-                module_path: Some(root_path),
-            });
-        }
-    }
-    result.complete = result.incomplete_reasons.is_empty();
 }
 
 /// Cancellation-polled twin of the incumbent result finalizer.

@@ -43,6 +43,7 @@ use crate::aliases::{
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges,
 };
@@ -130,32 +131,39 @@ impl PhpScan<'_> {
     }
 }
 
-fn walk(node: Node<'_>, scan: &mut PhpScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
-    if is_local_scope(node) {
-        let mut scoped = captured_local_scope_bindings(node, scan.source, bindings);
-        seed_parameters(node, scan, &mut scoped);
-        walk_contents(node, scan, &mut scoped);
-    } else {
-        walk_contents(node, scan, bindings);
+fn walk(root: Node<'_>, scan: &mut PhpScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
+    enum Visit<'tree> {
+        Enter(Node<'tree>),
+        Leave(Node<'tree>),
     }
-}
-
-fn walk_contents(
-    node: Node<'_>,
-    scan: &mut PhpScan<'_>,
-    bindings: &mut LocalInferenceEngine<String>,
-) {
-    record_reference(node, scan, bindings);
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk(child, scan, bindings);
+    let mut scopes: Vec<LocalInferenceEngine<String>> = Vec::new();
+    let mut stack = vec![Visit::Enter(root)];
+    while let Some(visit) = stack.pop() {
+        match visit {
+            Visit::Enter(node) => {
+                if is_local_scope(node) {
+                    let incoming = scopes.last().unwrap_or(bindings);
+                    let mut scoped = captured_local_scope_bindings(node, scan.source, incoming);
+                    seed_parameters(node, scan, &mut scoped);
+                    scopes.push(scoped);
+                }
+                record_reference(node, scan, scopes.last().unwrap_or(bindings));
+                stack.push(Visit::Leave(node));
+                for i in (0..node.named_child_count()).rev() {
+                    stack.push(Visit::Enter(
+                        node.named_child(i).expect("valid named child"),
+                    ));
+                }
+            }
+            Visit::Leave(node) => {
+                // RHS references use incoming bindings; update the LHS afterwards.
+                seed_assignment(node, scan, scopes.last_mut().unwrap_or(bindings));
+                if is_local_scope(node) {
+                    scopes.pop().expect("local scope entered");
+                }
+            }
+        }
     }
-
-    // Assignment RHS expressions are evaluated against the incoming binding.
-    // Mutate the LHS only after every RHS reference has been recorded, so
-    // `$x = $x->method()` can still prove the receiver of `method`.
-    seed_assignment(node, scan, bindings);
 }
 
 fn record_reference(
@@ -211,19 +219,28 @@ fn record_reference(
                 // `self::m()` / `static::m()` are same-owner own-type static
                 // calls (#1138): the member edge is unproven inbound. `parent::`
                 // and an explicit class name stay external/proven.
-                let is_same_owner = matches!(node_text(scope, scan.source), "self" | "static");
+                let scope_name = node_text(scope, scan.source);
+                let is_same_owner = scope_name.eq_ignore_ascii_case("self")
+                    || scope_name.eq_ignore_ascii_case("static");
                 route_same_owner(
                     scan,
                     is_same_owner,
                     |scan| {
-                        scan.edges.record_unproven_name(
+                        scan.edges.record_unproven_name_kind(
                             scan.input,
                             method,
+                            CodeUnitType::Function,
                             name_node.start_byte(),
                             name_node.end_byte(),
                         );
                     },
-                    |scan| scan.record(format!("{owner}.{method}"), name_node),
+                    |scan| {
+                        if let Some(callable) =
+                            declared_instance_callable(scan.php, scan.analyzer, &owner, method)
+                        {
+                            scan.record(callable.fq_name(), name_node);
+                        }
+                    },
                 );
             }
         }
@@ -240,14 +257,17 @@ fn record_reference(
                 scan.record(owner.clone(), scope);
                 // `self::$prop` / `static::$prop` are same-owner own-type static
                 // accesses (#1138): the member edge is unproven inbound.
-                let is_same_owner = matches!(node_text(scope, scan.source), "self" | "static");
+                let scope_name = node_text(scope, scan.source);
+                let is_same_owner = scope_name.eq_ignore_ascii_case("self")
+                    || scope_name.eq_ignore_ascii_case("static");
                 route_same_owner(
                     scan,
                     is_same_owner,
                     |scan| {
-                        scan.edges.record_unproven_name(
+                        scan.edges.record_unproven_name_kind(
                             scan.input,
                             property,
+                            CodeUnitType::Field,
                             name_node.start_byte(),
                             name_node.end_byte(),
                         );
@@ -286,9 +306,10 @@ fn record_reference(
                 scan,
                 is_same_owner,
                 |scan| {
-                    scan.edges.record_unproven_name(
+                    scan.edges.record_unproven_name_kind(
                         scan.input,
                         method,
+                        CodeUnitType::Function,
                         name_node.start_byte(),
                         name_node.end_byte(),
                     );
@@ -306,9 +327,10 @@ fn record_reference(
                     if let Some(callable) = callable {
                         scan.record(callable.fq_name(), name_node);
                     } else {
-                        scan.edges.record_unproven_name(
+                        scan.edges.record_unproven_name_kind(
                             scan.input,
                             method,
+                            CodeUnitType::Function,
                             name_node.start_byte(),
                             name_node.end_byte(),
                         );
@@ -335,9 +357,10 @@ fn record_reference(
                 scan,
                 is_same_owner,
                 |scan| {
-                    scan.edges.record_unproven_name(
+                    scan.edges.record_unproven_name_kind(
                         scan.input,
                         member,
+                        CodeUnitType::Field,
                         name_node.start_byte(),
                         name_node.end_byte(),
                     );
@@ -360,7 +383,7 @@ fn record_reference(
         }
         // A bare constant name in reference position (`LIMIT`): not a call, not a
         // member, not a declaration. Resolves to the namespace constant fqn.
-        "name" | "relative_scope" => {
+        "name" | "relative_scope" | "qualified_name" => {
             if is_instanceof_type_name(node)
                 && let Some(fqn) = scan.resolve_type_reference_fqn(node)
             {

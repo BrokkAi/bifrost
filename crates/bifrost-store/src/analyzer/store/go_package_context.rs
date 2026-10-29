@@ -1,7 +1,7 @@
 //! Revision-selected Go tool output. Canonical discovery is request-owned;
 //! reusable package membership and provider relationships live in SQLite.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use git2::{ObjectType, Oid};
@@ -22,8 +22,69 @@ use brokk_bifrost_go::package_discovery::{GoPackage, GoPackageDiscovery};
 /// folds refused inputs into each domain's input digest. Version 12 labels
 /// contexts from builds of this change before its final gap vocabulary, so
 /// those contexts are never selected.
+/// Version 14 hashes an input by kind, path and content OID only; modified time and length no longer take part, so an unchanged save reuses the context.
 #[doc(hidden)]
-pub const DERIVATION_VERSION: i64 = 13;
+pub const DERIVATION_VERSION: i64 = 14;
+
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct GoOverlayPlacement {
+    pub changed_membership: bool,
+    pub reuse_context: bool,
+}
+
+/// Immutable replacement bytes owned by one discovery request, never a workspace cache.
+/// Deletions are unsupported: this snapshot supplies bytes, not deletion markers.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct GoOverlaySnapshot {
+    pub files: Vec<GoOverlayFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct GoOverlayFile {
+    pub path: String,
+    pub oid: String,
+    pub disk_oid: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl GoOverlaySnapshot {
+    pub fn capture(project: &dyn Project) -> Result<Self> {
+        let mut files = Vec::new();
+        if let Some(overlays) = project.overlay_content() {
+            for (file, _) in overlays.entries() {
+                // Go configuration capture currently selects disk bytes, not
+                // editor buffers (tree_sitter_analyzer::workspace_configuration_inputs).
+                // Unsaved go.mod/go.work edits are unsupported until save.
+                if file
+                    .rel_path()
+                    .extension()
+                    .is_none_or(|extension| extension != "go")
+                {
+                    continue;
+                }
+                let source = project.read_source_snapshot(file)?;
+                let disk = match std::fs::read(file.abs_path()) {
+                    Ok(bytes) => Some(Oid::hash_object(ObjectType::Blob, &bytes)?.to_string()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                let oid = source.oid().to_string();
+                if disk.as_deref() != Some(&oid) {
+                    files.push(GoOverlayFile {
+                        path: crate::path_utils::rel_path_string(file),
+                        oid,
+                        disk_oid: disk,
+                        bytes: source.source().as_bytes().to_vec(),
+                    });
+                }
+            }
+        }
+        Ok(Self { files })
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[doc(hidden)]
@@ -301,7 +362,7 @@ pub(crate) fn go_context_status_on(
 
 impl AnalyzerStore {
     /// Observe the disk input domain against the exact selected revision.
-    /// Fresh inventory and byte/stat checks detect ordinary concurrent edits;
+    /// Fresh inventory and content identities detect ordinary concurrent edits;
     /// this is an optimistic check, not an atomic filesystem snapshot.
     #[doc(hidden)]
     pub fn observe_go_context_inputs(
@@ -310,9 +371,81 @@ impl AnalyzerStore {
         project: &dyn Project,
         cancellation: &CancellationToken,
     ) -> Result<GoInputObservationOutcome> {
+        let overlays = GoOverlaySnapshot::capture(project)?;
+        self.observe_go_context_inputs_with_overlay(snapshot, project, cancellation, &overlays)
+    }
+
+    /// Validate the exact immutable bytes supplied to this request's Go tool.
+    #[doc(hidden)]
+    pub fn observe_go_context_inputs_with_overlay(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        project: &dyn Project,
+        cancellation: &CancellationToken,
+        overlays: &GoOverlaySnapshot,
+    ) -> Result<GoInputObservationOutcome> {
         assert_eq!(snapshot.lang, "go");
         if cancellation.is_cancelled() {
             return Ok(GoInputObservationOutcome::Cancelled);
+        }
+        // A new or changed buffer must not publish the old discovery snapshot.
+        // Saving identical bytes is harmless and intentionally has the same OID.
+        let current = GoOverlaySnapshot::capture(project)?;
+        for file in current.files.iter().chain(&overlays.files) {
+            let selected = crate::analyzer::ProjectFile::new(
+                project.root().to_path_buf(),
+                PathBuf::from(&file.path),
+            );
+            let source = match project.read_source_snapshot(&selected) {
+                Ok(source) => source,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(GoInputObservationOutcome::InputsChanged(
+                        GoInputChange::Missing {
+                            kind: "source".into(),
+                            path: file.path.clone(),
+                        },
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if source.oid().to_string() != file.oid
+                || current
+                    .files
+                    .iter()
+                    .find(|entry| entry.path == file.path)
+                    .is_some_and(|entry| entry.oid != file.oid)
+            {
+                return Ok(GoInputObservationOutcome::InputsChanged(
+                    GoInputChange::ContentChanged {
+                        kind: "source".into(),
+                        path: file.path.clone(),
+                    },
+                ));
+            }
+            if current
+                .files
+                .iter()
+                .find(|entry| entry.path == file.path)
+                .is_some_and(|entry| {
+                    entry.disk_oid != file.disk_oid
+                        && entry.disk_oid.as_deref() != Some(file.oid.as_str())
+                })
+            {
+                return Ok(GoInputObservationOutcome::InputsChanged(
+                    GoInputChange::ContentChanged {
+                        kind: "source".into(),
+                        path: file.path.clone(),
+                    },
+                ));
+            }
+            if !overlays.files.iter().any(|entry| entry.path == file.path) {
+                return Ok(GoInputObservationOutcome::InputsChanged(
+                    GoInputChange::ContentChanged {
+                        kind: "source".into(),
+                        path: file.path.clone(),
+                    },
+                ));
+            }
         }
         project.invalidate_cached_file_listing();
         let files = project.all_files_shared()?;
@@ -351,7 +484,7 @@ impl AnalyzerStore {
             snapshot.generation.get(),
             snapshot.revision
         ];
-        let mut hash = CanonicalHasher::new(b"bifrost-go-observed-inputs:v2");
+        let mut hash = CanonicalHasher::new(b"bifrost-go-observed-inputs:v3");
         let mut selected = conn.prepare_cached(OBSERVE_INPUTS_SQL)?;
         let mut rows = selected.query(params)?;
         while let Some(row) = rows.next()? {
@@ -363,6 +496,7 @@ impl AnalyzerStore {
             let oid: String = row.get(2)?;
             if let Some(change) = observe_recorded_input(
                 project,
+                overlays,
                 &mut inventory,
                 &mut hash,
                 &kind,
@@ -389,6 +523,7 @@ impl AnalyzerStore {
             hash.field("refusal", reason.as_bytes());
             if let Some(change) = observe_recorded_input(
                 project,
+                overlays,
                 &mut inventory,
                 &mut hash,
                 "source",
@@ -464,8 +599,10 @@ impl AnalyzerStore {
 /// Match one recorded input against the listing and its current bytes, and
 /// fold its identity into the observation. `family` is the listing family the
 /// recorded `kind` accounts for.
+#[allow(clippy::too_many_arguments)]
 fn observe_recorded_input(
     project: &dyn Project,
+    overlays: &GoOverlaySnapshot,
     inventory: &mut BTreeSet<(String, String)>,
     hash: &mut CanonicalHasher,
     family: &str,
@@ -481,15 +618,18 @@ fn observe_recorded_input(
         }));
     }
     let absolute = project.root().join(&path);
-    let bytes = match std::fs::read(&absolute) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Some(GoInputChange::Missing {
-                kind: kind_owned(),
-                path,
-            }));
-        }
-        Err(error) => return Err(error.into()),
+    let bytes = match overlays.files.iter().find(|file| file.path == path) {
+        Some(file) => std::borrow::Cow::Borrowed(file.bytes.as_slice()),
+        None => match std::fs::read(&absolute) {
+            Ok(bytes) => std::borrow::Cow::Owned(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(GoInputChange::Missing {
+                    kind: kind_owned(),
+                    path,
+                }));
+            }
+            Err(error) => return Err(error.into()),
+        },
     };
     if Oid::hash_object(ObjectType::Blob, &bytes)?.to_string() != oid {
         return Ok(Some(GoInputChange::ContentChanged {
@@ -497,12 +637,9 @@ fn observe_recorded_input(
             path,
         }));
     }
-    let metadata = std::fs::metadata(&absolute)?;
     hash.field("kind", kind.as_bytes());
     hash.field("path", path.as_bytes());
     hash.field("oid", oid.as_bytes());
-    hash.field("modified", format!("{:?}", metadata.modified()?).as_bytes());
-    hash.field("length", &metadata.len().to_le_bytes());
     Ok(None)
 }
 
@@ -1448,6 +1585,143 @@ impl AnalyzerStore {
             [u8; 32],
         )>,
     > {
+        self.go_discovery_domain_inputs_replacing(snapshot, root, &HashMap::new())
+    }
+
+    /// The same manifest digests used by transient placement decide whether
+    /// buffers require tool discovery. No second parser or header hash exists.
+    #[doc(hidden)]
+    pub fn go_overlay_placement(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        root: &Path,
+        context_id: Option<i64>,
+        domain: &brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
+        overlays: &GoOverlaySnapshot,
+    ) -> Result<GoOverlayPlacement> {
+        if overlays.files.is_empty() {
+            return Ok(GoOverlayPlacement::default());
+        }
+        let conn = self.read_conn()?;
+        let revision = context_id
+            .map(|context_id| {
+                conn.query_row(
+                    "SELECT valid_from FROM go_context_publications WHERE context_id=?1",
+                    [context_id],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .transpose()?;
+        let boundaries = conn.prepare_cached(
+            "SELECT rel_path FROM workspace_file_versions WHERE workspace_id=?1 AND lang='go' AND generation=?2
+             AND input_kind='configuration' AND (rel_path='go.mod' OR rel_path LIKE '%/go.mod')
+             AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until)")?
+            .query_map(params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision],|row|row.get::<_,String>(0))?
+            .map(|row|row.map(|path|PathBuf::from(path).parent().expect("module path parent").to_path_buf()))
+            .collect::<std::result::Result<BTreeSet<_>,_>>()?;
+        // The output can cut off across several saves, updating its input key
+        // without moving valid_from. Compare membership against recorded source
+        // versions, rather than treating valid_from as the latest input key.
+        // This map is the result of this reconciliation query only. It avoids
+        // a scan of every header match for each workspace input and dies here.
+        let replacements = if let Some(revision) = revision {
+            conn.prepare_cached(
+            "SELECT current.rel_path, previous.blob_oid FROM workspace_file_versions current
+             JOIN workspace_file_versions previous ON previous.workspace_id=current.workspace_id
+               AND previous.lang=current.lang AND previous.generation=current.generation
+               AND previous.input_kind=current.input_kind AND previous.rel_path=current.rel_path
+               AND previous.valid_from<=?4 AND (previous.valid_until IS NULL OR ?4<previous.valid_until)
+             JOIN blobs old_blob ON old_blob.blob_oid=previous.blob_oid AND old_blob.lang='go' AND old_blob.generation=current.generation
+             JOIN source_go_manifests old ON old.blob_id=old_blob.id
+             JOIN blobs new_blob ON new_blob.blob_oid=current.blob_oid AND new_blob.lang='go' AND new_blob.generation=current.generation
+             JOIN source_go_manifests new ON new.blob_id=new_blob.id AND new.membership_digest=old.membership_digest
+             WHERE current.workspace_id=?1 AND current.lang='go' AND current.generation=?2 AND current.input_kind='source'
+               AND current.valid_from<=?3 AND (current.valid_until IS NULL OR ?3<current.valid_until)")?
+            .query_map(params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,revision],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+            .collect::<std::result::Result<HashMap<_,_>,_>>()?
+        } else {
+            HashMap::new()
+        };
+        let mut has_overlay = false;
+        let mut changed_membership = false;
+        for file in &overlays.files {
+            let owner = Path::new(&file.path)
+                .parent()
+                .expect("source path parent")
+                .ancestors()
+                .find(|directory| boundaries.contains(*directory));
+            if owner.is_some_and(|owner| {
+                domain
+                    .modules
+                    .iter()
+                    .any(|(directory, _)| Path::new(directory) == owner)
+            }) {
+                has_overlay = true;
+                // An already-published unsaved import must still be supplied
+                // on a later forced discovery. Compare the captured overlay
+                // with its recorded disk underlay, not with that overlay's own
+                // context version. Both digests come from the same source parse
+                // authority as transient placement. Missing versions or NULL
+                // digests, including new unsaved files, never prove equality.
+                let same_disk_header: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_file_versions recorded
+                     JOIN blobs old_blob ON old_blob.blob_oid=recorded.blob_oid AND old_blob.lang=recorded.lang AND old_blob.generation=recorded.generation
+                     JOIN source_go_manifests old ON old.blob_id=old_blob.id
+                     JOIN blobs new_blob ON new_blob.blob_oid=?5 AND new_blob.lang=recorded.lang AND new_blob.generation=recorded.generation
+                     JOIN source_go_manifests new ON new.blob_id=new_blob.id AND new.membership_digest=old.membership_digest
+                     WHERE recorded.workspace_id=?1 AND recorded.lang='go' AND recorded.generation=?2
+                       AND recorded.input_kind='source' AND recorded.rel_path=?3 AND recorded.blob_oid=?4)",
+                    params![snapshot.workspace_id.as_str(),snapshot.generation.get(),file.path,file.disk_oid,file.oid],
+                    |row|row.get(0),
+                )?;
+                changed_membership |= !same_disk_header;
+            }
+        }
+        if !has_overlay {
+            return Ok(GoOverlayPlacement::default());
+        }
+        drop(conn);
+        let Some(revision) = revision else {
+            return Ok(GoOverlayPlacement {
+                changed_membership,
+                reuse_context: false,
+            });
+        };
+        let mut recorded = snapshot.clone();
+        recorded.revision = revision;
+        let baseline = self.go_discovery_domain_inputs(&recorded, root)?;
+        let current = self.go_discovery_domain_inputs_replacing(snapshot, root, &replacements)?;
+        let digest = |inputs: &[(
+            brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
+            [u8; 32],
+        )]| {
+            inputs
+                .iter()
+                .find(|(input, _)| {
+                    input.directory == domain.directory && input.gowork_path == domain.gowork_path
+                })
+                .map(|(_, digest)| *digest)
+        };
+        Ok(GoOverlayPlacement {
+            changed_membership,
+            // Reuse compares with the placed context independently of whether
+            // the buffer still differs from disk. Body edits after an unsaved
+            // import therefore skip discovery too.
+            reuse_context: digest(&baseline).is_some() && digest(&baseline) == digest(&current),
+        })
+    }
+
+    fn go_discovery_domain_inputs_replacing(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        root: &Path,
+        replacements: &HashMap<String, String>,
+    ) -> Result<
+        Vec<(
+            brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
+            [u8; 32],
+        )>,
+    > {
         let conn = self.read_conn()?;
         let mut query = conn.prepare_cached(
             "SELECT f.rel_path,f.blob_oid,f.input_kind,retained.source_bytes
@@ -1518,7 +1792,9 @@ impl AnalyzerStore {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let selected = rows.iter().map(|(path, oid, _, _)| ("path", path, oid));
+        let selected = rows
+            .iter()
+            .map(|(path, oid, _, _)| ("path", path, replacements.get(path).unwrap_or(oid)));
         let refused = refused
             .iter()
             .map(|(path, oid)| ("refused-path", path, oid));
@@ -1615,18 +1891,36 @@ pub(crate) const MISSING_MEMBER_PATHS_SQL: &str="SELECT member.rel_path FROM go_
 // Q1/Q4: membership is authority, never an ancestor-directory approximation.
 // Provider membership selects every build context holding the source as a target.
 // Owner lookup selects only main-module packages to resolve and scan callers once.
-pub(crate) const CONTEXTS_FOR_FILE_SQL: &str = r#"
-SELECT DISTINCT c.selection_id, c.context_id, c.publication_digest, s.profile_digest
+macro_rules! participating_context_files_sql {
+    () => {
+        r#"
 FROM go_package_files f
 JOIN go_package_instances p ON p.package_id=f.package_id
 JOIN go_context_publications c ON c.context_id=p.context_id
 JOIN go_context_selections s ON s.selection_id=c.selection_id
-WHERE f.rel_path=?6 AND p.provider_kind='workspace' AND f.source_role<>'ignored'
+WHERE p.provider_kind='workspace' AND f.source_role<>'ignored'
   AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
   AND s.base_profile_digest=?4 AND s.derivation_version=?5
   AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
-ORDER BY c.context_id
-"#;
+"#
+    };
+}
+
+pub(crate) const CONTEXTS_FOR_FILE_SQL: &str = concat!(
+    "SELECT DISTINCT c.selection_id, c.context_id, c.publication_digest, s.profile_digest ",
+    participating_context_files_sql!(),
+    " AND f.rel_path=?6 ORDER BY c.context_id"
+);
+
+pub(crate) const OUTSIDE_SELECTED_BUILD_FILES_SQL: &str = concat!(
+    "SELECT source.rel_path FROM workspace_file_versions source
+     WHERE source.workspace_id=?1 AND source.lang='go' AND source.generation=?2
+       AND source.input_kind='source'
+       AND source.valid_from<=?3 AND (source.valid_until IS NULL OR ?3<source.valid_until)
+       AND NOT EXISTS (SELECT 1 ",
+    participating_context_files_sql!(),
+    " AND f.rel_path=source.rel_path) ORDER BY source.rel_path"
+);
 
 pub(crate) const OWNER_CONTEXT_FOR_FILE_SQL: &str = r#"
 SELECT DISTINCT c.selection_id, c.context_id, c.publication_digest, s.profile_digest
@@ -1710,27 +2004,55 @@ fn contexts_for_file_statement_on(
             DERIVATION_VERSION,
             path
         ],
-        |row| {
-            Ok((
-                GoContextIdentity {
-                    revision: snapshot.revision,
-                    selection_id: row.get(0)?,
-                    context_id: row.get(1)?,
-                    publication_digest: row
-                        .get::<_, Vec<u8>>(2)?
-                        .try_into()
-                        .expect("schema checks digest width"),
-                },
-                row.get::<_, Vec<u8>>(3)?
-                    .try_into()
-                    .expect("schema checks profile width"),
-            ))
-        },
+        |row| context_for_file_row(row, snapshot),
     )?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Decode the same publication evidence for direct and selected-operation readers.
+pub(crate) fn context_for_file_row(
+    row: &rusqlite::Row<'_>,
+    snapshot: &WorkspaceSnapshotId,
+) -> rusqlite::Result<(GoContextIdentity, [u8; 32])> {
+    Ok((
+        GoContextIdentity {
+            revision: snapshot.revision,
+            selection_id: row.get(0)?,
+            context_id: row.get(1)?,
+            publication_digest: row
+                .get::<_, Vec<u8>>(2)?
+                .try_into()
+                .expect("schema checks digest width"),
+        },
+        row.get::<_, Vec<u8>>(3)?
+            .try_into()
+            .expect("schema checks profile width"),
+    ))
+}
+
 impl AnalyzerStore {
+    /// All source files with no non-ignored membership in any selected context.
+    #[doc(hidden)]
+    pub fn go_files_outside_selected_build(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        base: &[u8; 32],
+    ) -> Result<Vec<String>> {
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare_cached(OUTSIDE_SELECTED_BUILD_FILES_SQL)?;
+        let rows = statement.query_map(
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.get(),
+                snapshot.revision,
+                base,
+                DERIVATION_VERSION
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     #[doc(hidden)]
     pub fn go_contexts_for_file(
         &self,

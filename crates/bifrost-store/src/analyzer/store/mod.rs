@@ -5448,7 +5448,7 @@ impl AnalyzerStore {
                 out.insert(
                     file.clone(),
                     ImportFacts {
-                        package_name: adapter.hydrate_content_qualifier(package_name, &file),
+                        package_name: adapter.hydrate_content_qualifier(package_name, &file)?,
                         imports: imports_by_oid.get(&oid).cloned().unwrap_or_default(),
                         contains_tests: adapter.hydrate_contains_tests(*contains_tests, &file, ""),
                     },
@@ -12504,13 +12504,22 @@ fn write_prepared_blob_rows_tx(
             stmt.execute(params![blob_id, lang, row.0, row.1, row.2])?;
         }
     );
-    insert_rows!(
-        signature_metadata_insert_sql(),
-        &blob.signature_metadata,
-        |stmt, row| {
-            row.2.insert(&mut stmt, blob_id, lang, row.0, row.1)?;
-        }
-    );
+    {
+        let rows = blob
+            .signature_metadata
+            .iter()
+            .map(|(unit_key, ordinal, metadata)| {
+                metadata.bound_row(blob_id, lang, *unit_key, *ordinal)
+            })
+            .collect::<Vec<_>>();
+        let (prefix, _) = signature_metadata_insert_sql()
+            .split_once(" VALUES")
+            .expect("signature metadata insert has a VALUES clause");
+        let prefix = format!("{prefix} VALUES");
+        let arity = 4 + SIGNATURE_METADATA_VALUE_COLUMNS.len();
+        let row_sql = format!("({})", vec!["?"; arity].join(", "));
+        source_facts::insert_rows(tx, &prefix, &row_sql, &rows, cancellation)?;
+    }
     insert_rows!(
         "INSERT OR IGNORE INTO unit_signature_metadata_signatures(
            blob_id, unit_key, metadata_ordinal, signature_ordinal
@@ -13302,7 +13311,7 @@ fn hydrate_file_state_conn<A: StoreLanguageAdapter>(
         additional_projections: Vec::new(),
     };
 
-    adapter.synthesize_hydrated_units(file, source, &mut state);
+    adapter.synthesize_hydrated_units(file, source, &mut state)?;
     synthesize_file_scope(file, source, &mut state);
     Ok(Some(state))
 }
@@ -13659,7 +13668,7 @@ fn hydrate_file_states_conn<A: StoreLanguageAdapter>(
 
         let mut state = FileState {
             source: source.unwrap_or("").to_string(),
-            package_name: adapter.hydrate_content_qualifier(&meta.content_package, file),
+            package_name: adapter.hydrate_content_qualifier(&meta.content_package, file)?,
             content_qualifier: meta.content_package.clone(),
             top_level_declarations: top_level.into_iter().map(|(_, unit)| unit).collect(),
             declarations,
@@ -13693,7 +13702,7 @@ fn hydrate_file_states_conn<A: StoreLanguageAdapter>(
         };
 
         if let Some(source) = source {
-            adapter.synthesize_hydrated_units(file, source, &mut state);
+            adapter.synthesize_hydrated_units(file, source, &mut state)?;
             synthesize_file_scope(file, source, &mut state);
         }
         out.insert(file.clone(), state);
@@ -13750,7 +13759,7 @@ pub fn read_blob_meta<A: StoreLanguageAdapter>(
     let side_counts = side_table_counts_from_raw(raw_side_counts)?;
     Ok(Some(BlobMetaRow {
         contains_tests: adapter.hydrate_contains_tests(contains_tests != 0, file, source),
-        content_package: adapter.hydrate_content_qualifier(&content_package, file),
+        content_package: adapter.hydrate_content_qualifier(&content_package, file)?,
         raw_content_package: content_package,
         type_identifiers,
         stored_unit_count: i64_to_usize(stored_unit_count)?,
@@ -18408,12 +18417,12 @@ pub fn hydrate_unit_fq<A: StoreLanguageAdapter>(
     content_qualifier: &str,
     file: &ProjectFile,
 ) -> Result<(FqName, usize)> {
-    hydrate_unit_fq_with_anchor(
-        persisted,
-        content_qualifier,
-        file,
-        |anchor, qualifier, file| adapter.resolve_package_anchor(anchor, qualifier, file),
-    )
+    let prefix = persisted
+        .and_then(|identity| identity.anchor)
+        .map(|anchor| adapter.hydrate_package_anchor(anchor, content_qualifier, file))
+        .transpose()?
+        .flatten();
+    hydrate_unit_fq_with_anchor(persisted, content_qualifier, file, |_, _, _| prefix)
 }
 
 #[doc(hidden)]
@@ -18834,51 +18843,64 @@ impl SignatureMetadataColumns {
         unit_key: i64,
         ordinal: i64,
     ) -> Result<()> {
-        stmt.execute(params![
+        let row = self.bound_row(blob_id, lang, unit_key, ordinal);
+        let mut values = Vec::with_capacity(4 + SIGNATURE_METADATA_VALUE_COLUMNS.len());
+        row_batch::RowBindings::append_values(&row, &mut values);
+        stmt.execute(rusqlite::params_from_iter(values))?;
+        Ok(())
+    }
+
+    fn bound_row<'a>(
+        &'a self,
+        blob_id: i64,
+        lang: &'a str,
+        unit_key: i64,
+        ordinal: i64,
+    ) -> impl row_batch::RowBindings + 'a {
+        (
             blob_id,
             lang,
             unit_key,
             ordinal,
-            self.label,
-            self.parameters,
-            self.return_type_text,
-            self.return_type_identity,
-            self.underlying_type_identity,
-            self.declaration_only,
-            self.callable_arity_required,
-            self.callable_arity_total,
-            self.callable_arity_repeated,
-            self.type_parameters,
-            self.bare_return_type_parameter,
-            self.callable_linkage,
-            self.dispatch_extensibility,
-            self.extension_receiver_type,
-            self.extension_receiver_type_identity,
-            self.extension_receiver_is_unconstrained,
-            self.field_is_static,
-            self.field_is_final,
-            self.field_has_initializer,
-            self.cpp_field_linkage,
-            self.companion_object,
-            self.callable_is_static,
-            self.callable_is_constructor,
-            self.callable_declared_visibility,
-            self.callable_modifiers_recorded,
-            self.callable_parameter_types,
-            self.callable_is_native,
-            self.class_like_is_interface,
-            self.class_like_is_static,
-            self.java_constructor_shape,
-            self.java_constructor_arity_required,
-            self.java_constructor_arity_total,
-            self.java_constructor_arity_repeated,
-            self.class_like_kind,
-            self.type_parameters_recorded,
-            self.result_type_identities,
-            self.parameter_type_identities,
-            self.callable_override_modifier,
-        ])?;
-        Ok(())
+            &self.label,
+            &self.parameters,
+            &self.return_type_text,
+            &self.return_type_identity,
+            &self.underlying_type_identity,
+            &self.declaration_only,
+            &self.callable_arity_required,
+            &self.callable_arity_total,
+            &self.callable_arity_repeated,
+            &self.type_parameters,
+            &self.bare_return_type_parameter,
+            &self.callable_linkage,
+            &self.dispatch_extensibility,
+            &self.extension_receiver_type,
+            &self.extension_receiver_type_identity,
+            &self.extension_receiver_is_unconstrained,
+            &self.field_is_static,
+            &self.field_is_final,
+            &self.field_has_initializer,
+            &self.cpp_field_linkage,
+            &self.companion_object,
+            &self.callable_is_static,
+            &self.callable_is_constructor,
+            &self.callable_declared_visibility,
+            &self.callable_modifiers_recorded,
+            &self.callable_parameter_types,
+            &self.callable_is_native,
+            &self.class_like_is_interface,
+            &self.class_like_is_static,
+            &self.java_constructor_shape,
+            &self.java_constructor_arity_required,
+            &self.java_constructor_arity_total,
+            &self.java_constructor_arity_repeated,
+            &self.class_like_kind,
+            &self.type_parameters_recorded,
+            &self.result_type_identities,
+            &self.parameter_type_identities,
+            &self.callable_override_modifier,
+        )
     }
 }
 
@@ -19173,6 +19195,8 @@ struct StructuralNodeJson(
     Option<u8>,
     Option<Vec<String>>,
     Option<bool>,
+    Option<Vec<String>>,
+    Option<String>,
 );
 
 /// One `source_structural_facts.roles` element, ordered by source node.
@@ -19236,7 +19260,23 @@ fn decode_structural_nodes(
                 type_shape,
                 bounds,
                 unsafe_context,
+                declaration_modifiers,
+                declaration_type_kind,
             ) = row;
+            let declaration_attributes = match (declaration_modifiers, declaration_type_kind) {
+                (None, None) => None,
+                (Some(modifiers), type_kind) => Some(
+                    brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes {
+                        modifiers,
+                        type_kind,
+                    },
+                ),
+                (None, Some(_)) => {
+                    return Err(serde::de::Error::custom(
+                        "declaration type kind without modifier attributes",
+                    ));
+                }
+            };
             use brokk_bifrost_core::analyzer::structural::callable::{
                 CalleeProvenance, CalleeProvenanceFact, CalleeSupplier, CalleeTypeShape,
             };
@@ -19306,6 +19346,7 @@ fn decode_structural_nodes(
                 string_value,
                 is_async: is_async.map(|value| value != 0),
                 unsafe_context,
+                declaration_attributes,
                 construct,
                 span: PersistedSpan { start, end },
                 parent,
@@ -20300,6 +20341,8 @@ pub mod tests {
             null,
             null,
             null,
+            null,
+            null,
             null
         ]])
         .to_string();
@@ -20617,7 +20660,18 @@ pub mod tests {
             oid_for(b"complete metadata"),
             oid_for(b"incomplete metadata"),
         ];
-        let metadata = SignatureMetadata::new("f()", vec![]);
+        // Cross all three batch sizes while the AFTER INSERT trigger expands
+        // each row's parameters and clears its JSON transport cell.
+        let metadata = (0..73)
+            .map(|ordinal| {
+                let label = format!("f{ordinal}(value)");
+                let start = label.len() - 6;
+                SignatureMetadata::new(
+                    label,
+                    vec![ParameterMetadata::new("value", start, start + 5).with_name("value")],
+                )
+            })
+            .collect::<Vec<_>>();
         let prepared = oids.map(|oid| {
             let mut blob = empty_publication(oid, "java");
             blob.content_package = "pkg".into();
@@ -20650,11 +20704,13 @@ pub mod tests {
                 package_fqn_tail: Default::default(),
                 relational_fq_segments: Default::default(),
             });
-            blob.signature_metadata.push((
-                0,
-                0,
-                SignatureMetadataColumns::encode(&metadata).unwrap(),
-            ));
+            for (ordinal, row) in metadata.iter().enumerate() {
+                blob.signature_metadata.push((
+                    0,
+                    usize_to_i64(ordinal).unwrap(),
+                    SignatureMetadataColumns::encode(row).unwrap(),
+                ));
+            }
             blob.imports = ImportRows::from_imports(
                 &[ImportInfo {
                     raw_snippet: "import pkg.Dependency;".into(),
@@ -20683,7 +20739,7 @@ pub mod tests {
                 store
                     .signature_metadata_for_unit(oid, "java", GenerationId::BOOTSTRAP, &unit)
                     .unwrap(),
-                vec![metadata.clone()]
+                metadata.clone()
             );
         }
         assert_eq!(
@@ -20702,6 +20758,16 @@ pub mod tests {
                 read_import_metadata_bulk(&conn, "java", &texts).unwrap(),
                 expected
             );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM unit_signature_metadata
+                     WHERE parameters = '[]' AND parameter_count = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                146
+            );
             // Leave declaration visibility available: parse completeness is an
             // independent witness that each of the three readers must check.
             conn.execute("UPDATE blob_meta SET is_complete=0 WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1)",[oids[1].to_string()]).unwrap();
@@ -20718,7 +20784,7 @@ pub mod tests {
             store
                 .signature_metadata_for_unit(oids[0], "java", GenerationId::BOOTSTRAP, &unit)
                 .unwrap(),
-            vec![metadata]
+            metadata
         );
         assert!(
             store
@@ -22691,9 +22757,9 @@ pub mod tests {
             .unwrap();
         let measured_resolution_bytes: usize = conn
             .query_row(
-                resolution_manifest::COMPLETE_PUBLICATION_COST_SQL,
+                resolution_manifest::COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL,
                 [blob_id],
-                |row| row.get(resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS.len()),
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(manifest_bytes, measured_resolution_bytes);

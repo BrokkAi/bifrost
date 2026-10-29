@@ -425,6 +425,9 @@ The other arguments match the CLI policy flags:
 - `incremental` (default `true`) reuses verified policy units from the
   analyzer cache. Set it to `false` to evaluate every policy in full. Findings
   and status are the same either way.
+- `policy_cost_hints` is an optional JSON object from non-empty policy IDs to
+  non-negative integer milliseconds. Parallel batches start unknown policies first,
+  then hinted policies from longest to shortest; hints never change the report.
 - `include_stage_timings` (default `false`) adds a `stage_timings` field with
   the wall-clock time of each evaluation stage.
 

@@ -77,3 +77,67 @@ pub fn jsts_unit_is_type_only(host: &dyn JsTsSource, unit: &CodeUnit) -> bool {
         })
     })
 }
+
+/// Read a named type's base through grammar fields, without treating type
+/// arguments, object members or function parameters as the receiver's name.
+/// Type queries stay with their dedicated value-space resolver.
+pub fn ts_named_type_identifier<'source>(
+    mut node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    loop {
+        node = match node.kind() {
+            "type_identifier" | "identifier" | "predefined_type" => {
+                return source
+                    .get(node.start_byte()..node.end_byte())
+                    .map(str::trim);
+            }
+            "type_annotation" | "parenthesized_type" | "readonly_type" | "array_type" => {
+                node.named_child(0)?
+            }
+            "generic_type" => node.child_by_field_name("name")?,
+            "nested_type_identifier" => crate::syntax::nested_type_identifier_parts(node)?.0,
+            _ => return None,
+        };
+    }
+}
+
+#[cfg(test)]
+mod quicksilver_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn annotation_and_named_type_grammar_boundary() {
+        for (source, expected) in [
+            ("let value: Token;", Some("Token")),
+            ("let value: Box<Token>;", Some("Box")),
+            ("let value: (Token);", Some("Token")),
+            ("let value: readonly Token[];", Some("Token")),
+            ("let value: typeof namespace.Member;", None),
+            ("let value: First | Second;", None),
+            ("let value: {field: Token};", None),
+            ("let value: (x: First)=>Second;", None),
+        ] {
+            let tree = crate::test_support::parse_typescript(source);
+            assert!(!tree.root_node().has_error());
+            let declarator = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            let annotation = declarator.child_by_field_name("type").unwrap();
+            let bare = annotation.named_child(0).unwrap();
+            assert_eq!(
+                ts_type_annotation_text(annotation, source),
+                crate::syntax::slice(bare, source)
+            );
+            assert_eq!(
+                ts_named_type_identifier(annotation, source),
+                expected,
+                "{source}: {}",
+                annotation.to_sexp()
+            );
+        }
+    }
+}

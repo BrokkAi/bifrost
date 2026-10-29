@@ -1177,7 +1177,9 @@ impl ValueFlowProblem<'_> {
                 .edge_kills(edge.source(), edge.target().id(), kind);
             active.retain(|flow| {
                 !kills.iter().any(|kill| {
-                    kill.carrier == flow.carrier
+                    // A label narrowing cannot remove the whole provenance fact.
+                    kill.labels.is_none()
+                        && kill.carrier == flow.carrier
                         && self
                             .plan
                             .source_list(kill.sources)

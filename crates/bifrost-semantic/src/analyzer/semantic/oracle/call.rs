@@ -350,6 +350,16 @@ impl CallArgumentGroup {
     }
 }
 
+/// Query-time preparation of a deferred member invocation's written receiver.
+/// The owning call supplies its exact receiver value and optional place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemberReceiverPreparation {
+    Reference,
+    AddressOfPlace,
+    CopyValue,
+    CopyPointee,
+}
+
 /// One candidate-specific caller/callee boundary relation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CallBinding {

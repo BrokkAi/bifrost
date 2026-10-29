@@ -423,7 +423,8 @@ impl JavaConversionTypes for OperandTypes<'_, '_, '_> {
         self.data.names.contains_key(&ty) && !self.data.declared.contains(&ty)
     }
     fn nominal_widening(&mut self, a: SemanticId, b: SemanticId) -> StoreResult<Option<bool>> {
-        self.evaluation.jvm_type_is_subtype(a, b, self.states)
+        self.evaluation
+            .jvm_closed_type_is_subtype(a, b, self.states)
     }
     fn boxed_widening(
         &mut self,
@@ -440,8 +441,289 @@ impl JavaConversionTypes for OperandTypes<'_, '_, '_> {
         match source {
             Some(source) => self
                 .evaluation
-                .jvm_type_is_subtype(source, target, self.states),
+                .jvm_closed_type_is_subtype(source, target, self.states),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#7620: absent nominal hierarchy rows refuted Java array initializer conversions")]
+    fn nominal_negatives_require_closed_hierarchy_evidence() {
+        // These are selected row fixtures, not a catalog of Java supertypes.
+        // In particular, no String/Integer fact follows from their spellings.
+        let cases = [
+            ("java.lang.String", "java.lang.Object"),
+            ("java.lang.String", "java.lang.String"),
+            ("java.lang.String", "java.lang.CharSequence"),
+            ("java.lang.String", "java.lang.Comparable<java.lang.String>"),
+            ("java.lang.String", "java.io.Serializable"),
+            ("java.util.ArrayList", "java.util.List"),
+            ("java.lang.Integer", "java.lang.Number"),
+            ("workspace.Child", "workspace.Base"),
+            ("java.lang.String", "java.lang.Integer"),
+        ];
+        for (source_name, target_name) in cases {
+            // Separate selected identities can still have the same spelling.
+            let source = SemanticId::for_test(format!("source:{source_name}"));
+            let target = SemanticId::for_test(format!("target:{target_name}"));
+            let service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+            let cancellation = CancellationToken::new();
+            let mut session = preloaded_session(&service, &cancellation);
+            let mut arena = HierarchyOperationArena::default();
+            let mut evaluation = FactEvaluation::new(&mut session, &mut arena, source);
+            let states = StateMap::default();
+            let mut types = OperandTypes {
+                evaluation: &mut evaluation,
+                states: &states,
+                data: OperandTypeData {
+                    names: [
+                        (source, source_name.to_owned()),
+                        (target, target_name.to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ground: [source, target].into_iter().collect(),
+                    ..OperandTypeData::default()
+                },
+            };
+            let hook = types.nominal_widening(source, target).unwrap();
+            assert_eq!(hook, None, "{source_name} -> {target_name}");
+            let conversion =
+                brokk_bifrost_jvm::java::conversion::classify(&mut types, source, target).unwrap();
+            let expected = if source_name == target_name || target_name == "java.lang.Object" {
+                JavaConversion::Strict
+            } else {
+                JavaConversion::Unknown
+            };
+            assert_eq!(conversion, expected, "{source_name} -> {target_name}");
+            println!(
+                "unindexed {source_name} -> {target_name}: hook={hook:?}, classify={conversion:?}"
+            );
+        }
+
+        // A concrete selected path proves a widening; closed inventories with
+        // no path prove a negative. Missing any traversed owner's inventory
+        // cannot prove that negative, even when the endpoints are indexed.
+        for (source_name, target_name, linked) in [
+            ("java.lang.String", "java.lang.CharSequence", true),
+            ("java.lang.String", "java.io.Serializable", true),
+            ("java.util.ArrayList", "java.util.List", true),
+            ("java.lang.Integer", "java.lang.Number", true),
+            ("workspace.Child", "workspace.Base", true),
+            ("java.lang.String", "java.lang.Integer", false),
+        ] {
+            let source = SemanticId::for_test(source_name);
+            let target = SemanticId::for_test(target_name);
+            let reference = SemanticId::for_test(b"parent-reference");
+            let frontier = SemanticId::for_test(b"parent-frontier");
+            let fragment = BindingFragmentId::for_test(b"java-conversion-closed-proof");
+            let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+            for identity in [source, target] {
+                service
+                    .typed
+                    .source_row_fragments
+                    .insert(identity, fragment);
+                service
+                    .typed
+                    .member_scope_by_definition
+                    .insert(identity, BindingNodeId::for_test(identity.to_string()));
+            }
+            let mut states = StateMap::default();
+            if linked {
+                service
+                    .typed
+                    .source_row_fragments
+                    .insert(reference, fragment);
+                service.typed.supertypes_by_definition.insert(
+                    source,
+                    vec![
+                        LoweredSourceSupertypeProperty::new(
+                            source,
+                            reference,
+                            frontier,
+                            ResolutionSupertypeKind::Superclass,
+                            0,
+                        )
+                        .into(),
+                    ],
+                );
+                states.insert(
+                    frontier,
+                    Arc::new(TypedFrontierState::new(
+                        frontier,
+                        vec![ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                            target, 0,
+                        ))],
+                        ResolutionCompletion::Complete,
+                    )),
+                );
+            }
+            let cancellation = CancellationToken::new();
+            let mut session = preloaded_session(&service, &cancellation);
+            let mut arena = HierarchyOperationArena::default();
+            let mut evaluation = FactEvaluation::new(&mut session, &mut arena, source);
+            let result = evaluation
+                .jvm_closed_type_is_subtype(source, target, &states)
+                .unwrap();
+            assert_eq!(result, Some(linked), "{source_name} -> {target_name}");
+            println!("indexed {source_name} -> {target_name}: hook={result:?}");
+        }
+
+        let source = SemanticId::for_test(b"indexed-child");
+        let middle = SemanticId::for_test(b"unindexed-middle");
+        let target = SemanticId::for_test(b"indexed-unrelated-target");
+        let reference = SemanticId::for_test(b"missing-middle-reference");
+        let frontier = SemanticId::for_test(b"missing-middle-frontier");
+        let fragment = BindingFragmentId::for_test(b"missing-middle-inventory");
+        let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+        for identity in [source, target] {
+            service
+                .typed
+                .source_row_fragments
+                .insert(identity, fragment);
+            service
+                .typed
+                .member_scope_by_definition
+                .insert(identity, BindingNodeId::for_test(identity.to_string()));
+        }
+        service
+            .typed
+            .source_row_fragments
+            .insert(reference, fragment);
+        service.typed.supertypes_by_definition.insert(
+            source,
+            vec![
+                LoweredSourceSupertypeProperty::new(
+                    source,
+                    reference,
+                    frontier,
+                    ResolutionSupertypeKind::Superclass,
+                    0,
+                )
+                .into(),
+            ],
+        );
+        let states = [(
+            frontier,
+            Arc::new(TypedFrontierState::new(
+                frontier,
+                vec![ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                    middle, 0,
+                ))],
+                ResolutionCompletion::Complete,
+            )),
+        )]
+        .into_iter()
+        .collect();
+        let cancellation = CancellationToken::new();
+        let mut session = preloaded_session(&service, &cancellation);
+        let mut arena = HierarchyOperationArena::default();
+        let mut evaluation = FactEvaluation::new(&mut session, &mut arena, source);
+        assert_eq!(
+            evaluation
+                .jvm_closed_type_is_subtype(source, target, &states)
+                .unwrap(),
+            None
+        );
+        println!("indexed endpoints with a missing intermediate inventory: None");
+    }
+    #[test]
+    #[hardwon(
+        "#7620: exhausted unindexed hierarchy denied protected access instead of retaining uncertainty"
+    )]
+    fn protected_visibility_obligation_retains_missing_hierarchy_reason() {
+        use crate::analyzer::resolution::fact_source::{
+            DeclarationAccessRow, FactPageVisitor, SelectedDeclarationAccessSource,
+            SelectedTypedFactSource, TypedFactReadOutcome, TypedFactRequest,
+        };
+        struct Protected;
+        impl SelectedDeclarationAccessSource for Protected {
+            fn identity(&self) -> SemanticId {
+                SemanticId::for_test(b"protected-access-policy")
+            }
+            fn visit_access_pages(
+                &self,
+                _: &dyn SelectedTypedFactSource,
+                _: TypedFactRequest<DeclarationAccessRequest>,
+                _: &CancellationToken,
+                _: &mut FactPageVisitor<DeclarationAccessRow>,
+            ) -> StoreResult<TypedFactReadOutcome> {
+                panic!("exact obligation already loaded")
+            }
+        }
+        let service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+        let reference = SemanticId::for_test(b"protected-call-site");
+        let target = SemanticId::for_test(b"protected-member");
+        let caller = SemanticId::for_test(b"caller-with-missing-hierarchy");
+        let owner = SemanticId::for_test(b"protected-declaring-owner");
+        let cancellation = CancellationToken::new();
+        let mut session = preloaded_session(&service, &cancellation);
+        session.declaration_access_source = Some(&Protected);
+        let request = DeclarationAccessRequest {
+            reference,
+            definition: target,
+        };
+        session.declaration_access.insert(
+            request,
+            DeclarationAccessRow {
+                request,
+                decision: DeclarationAccessDecision::Unknown,
+                activation_reason: None,
+                // This is the producer's real visibility obligation. Without it
+                // the generic non-obligated endpoint path would allow access.
+                visibility_applies: true,
+                subclass_access: Some(SubclassAccessContext {
+                    enclosing_templates: vec![caller],
+                    declaration_template: owner,
+                }),
+            },
+        );
+        let mut arena = HierarchyOperationArena::default();
+        let mut evaluation = FactEvaluation::new(&mut session, &mut arena, reference);
+        let mut answers = [(
+            reference,
+            Arc::new(ResolutionAnswer::new(
+                vec![target],
+                vec![ResolutionWitness::new(
+                    reference,
+                    target,
+                    vec![],
+                    ResolutionCompletion::Complete,
+                )],
+                ResolutionCompletion::Complete,
+            )),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            evaluation
+                .apply_contextual_declaration_access(&mut answers, &StateMap::default())
+                .unwrap()
+        );
+        let answer = &answers[&reference];
+        assert_eq!(
+            answer.targets(),
+            &[target],
+            "navigation witness survives uncertainty"
+        );
+        assert_eq!(
+            answer.completion(),
+            &incomplete(reference),
+            "visibility obligation must not take the generic grant path"
+        );
+        assert_eq!(
+            answer.witnesses()[0].completion(),
+            &incomplete(reference),
+            "no complete witness can grant an exact binding"
+        );
+        println!(
+            "protected obligation: incomplete, UnsupportedSemantic(call-site), no complete binding witness; generic grant path not taken"
+        );
     }
 }

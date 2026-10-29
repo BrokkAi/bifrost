@@ -106,6 +106,11 @@ impl ImportAnalysisProvider for CppAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-cpp-analysis/src/analyzer/cpp/imports.rs",
+            );
 
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
@@ -119,8 +124,12 @@ impl ImportAnalysisProvider for CppAnalyzer {
         }
 
         let resolved = Arc::new(resolved);
-        self.imported_code_units
-            .insert(file.clone(), Arc::clone(&resolved));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&resolved);
+            persistent_fill_guard.installed("imported_code_units");
+            self.imported_code_units.insert(cache_key, cache_value);
+        };
         resolved
     }
 
@@ -130,6 +139,11 @@ impl ImportAnalysisProvider for CppAnalyzer {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-cpp-analysis/src/analyzer/cpp/imports.rs",
+            );
 
         let references = self
             .reverse_include_index(token)
@@ -137,8 +151,12 @@ impl ImportAnalysisProvider for CppAnalyzer {
             .map(|files| (**files).clone())
             .unwrap_or_default();
 
-        self.referencing_files
-            .insert(file.clone(), Arc::new(references.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(references.clone());
+            persistent_fill_guard.installed("referencing_files");
+            self.referencing_files.insert(cache_key, cache_value);
+        };
         references
     }
 
@@ -236,16 +254,23 @@ impl CppAnalyzer {
     /// pins as a boundary.
     pub(crate) fn include_target_index(&self) -> &IncludeTargetIndex {
         self.include_target_index.get_or_init(|| {
-            let _scope = brokk_bifrost_core::profiling::scope("cpp.include_target_index.build");
-            let mut files = self.inner.workspace_language_files();
-            let listed: HashSet<ProjectFile> = files.iter().cloned().collect();
-            files.extend(
-                self.inner
-                    .all_files()
-                    .into_iter()
-                    .filter(|file| !listed.contains(file)),
-            );
-            IncludeTargetIndex::build(files.iter())
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "cpp.include_target_index",
+                || {
+                    let _scope =
+                        brokk_bifrost_core::profiling::scope("cpp.include_target_index.build");
+                    let mut files = self.inner.workspace_language_files();
+                    let listed: HashSet<ProjectFile> = files.iter().cloned().collect();
+                    files.extend(
+                        self.inner
+                            .all_files()
+                            .into_iter()
+                            .filter(|file| !listed.contains(file)),
+                    );
+                    IncludeTargetIndex::build(files.iter())
+                },
+            )
         })
     }
 
@@ -255,8 +280,20 @@ impl CppAnalyzer {
     ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         brokk_bifrost_core::analyzer::capabilities::memoized_reverse_file_index(
             &self.reverse_include_index,
-            || self.inner.all_files(),
-            |candidate| self.include_targets_for_file(token, candidate),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "cpp.reverse_file_index",
+                    || self.inner.all_files(),
+                )
+            },
+            |candidate| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "cpp.reverse_file_index",
+                    || self.include_targets_for_file(token, candidate),
+                )
+            },
         )
     }
 
@@ -289,8 +326,20 @@ impl CppAnalyzer {
     /// analyzer generation turns over.
     fn transitive_reverse_tu_index(&self, token: QueryToken<'_>) -> Arc<TransitiveReverseTuIndex> {
         self.transitive_reverse_tu_index.get_or_build(
-            || self.build_transitive_reverse_tu_index_data(token),
-            || self.build_transitive_reverse_tu_index_data(token),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "cpp.transitive_reverse_tu_index",
+                    || self.build_transitive_reverse_tu_index_data(token),
+                )
+            },
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "cpp.transitive_reverse_tu_index",
+                    || self.build_transitive_reverse_tu_index_data(token),
+                )
+            },
         )
     }
 
@@ -508,8 +557,16 @@ impl CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> HeaderLanguageAttribution {
-        self.header_language_attribution_by_file
-            .get_with_by_ref(file, || self.build_header_language_attribution(token, file))
+        match self
+            .header_language_attribution_by_file
+            .try_get_with_by_ref(file, || {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                    self.build_header_language_attribution(token, file)
+                })
+            }) {
+            Ok(value) => value,
+            Err(value) => *value,
+        }
     }
 
     /// The evidence walk behind [`Self::header_language_attribution`], run

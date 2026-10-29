@@ -1,10 +1,11 @@
 //! RQL projection of source-backed branch and loop body relations.
 
+use super::language_rules::{LanguageRuleMatches, UndecidedSite};
+use crate::analyzer::ProjectFile;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{ProjectFile, Range};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::body_relations::{
-    BodyOwner, BodyState, body_relation_for_block, body_state,
+    BodyOwner, BodyState, BodyStateAnswer, body_relation_for_block, body_state,
 };
 use brokk_bifrost_core::analyzer::tree_walk::named_children_iter;
 use brokk_bifrost_core::analyzer::tree_walk::node_range;
@@ -19,19 +20,32 @@ pub(super) fn matches_for_file(
     language: Language,
     state: BodyState,
     owner: Option<BodyOwner>,
-) -> Vec<Range> {
+) -> LanguageRuleMatches {
     let Some(tree) = parse_tree_for_language(file, language, source) else {
-        return Vec::new();
+        return LanguageRuleMatches::default();
     };
+    let regions = brokk_bifrost_analysis::analyzer::languages::language_knowledge(language)
+        .expect("body relation language is registered")
+        .structural_spec()
+        .conditional_regions(tree.root_node(), source);
+    let mut undecided = Vec::new();
     let mut pending = vec![tree.root_node()];
     let mut ranges = Vec::new();
     while let Some(node) = pending.pop() {
-        if let Some(relation) = body_relation_for_block(node, language)
-            && relation.state == state
+        if let Some(relation) = body_relation_for_block(node, language, &regions)
             && owner.is_none_or(|expected| relation.owner_kind == expected)
             && !(state == BodyState::Empty && relation.for_has_update)
         {
-            ranges.push(node_range(relation.block));
+            match relation.state {
+                BodyStateAnswer::Decided(actual) if actual == state => {
+                    ranges.push(node_range(relation.block))
+                }
+                BodyStateAnswer::Undecided => undecided.push(UndecidedSite::at(
+                    node_range(relation.block),
+                    "conditional-compilation activation is unproven",
+                )),
+                _ => {}
+            }
         }
         // Callable bodies use the same structured state classifier as branch
         // and loop blocks. Returning the owner range lets a method pattern
@@ -43,16 +57,29 @@ pub(super) fn matches_for_file(
                 node.kind(),
                 "method_declaration" | "constructor_declaration" | "local_function_statement"
             )
-            && node
-                .child_by_field_name("body")
-                .is_some_and(|body| body_state(body) == state)
+            && let Some(body) = node.child_by_field_name("body")
         {
-            ranges.push(node_range(node));
+            match body_state(body, &regions) {
+                BodyStateAnswer::Decided(actual) if actual == state => {
+                    ranges.push(node_range(node))
+                }
+                BodyStateAnswer::Undecided => undecided.push(UndecidedSite::at(
+                    node_range(node),
+                    "conditional-compilation activation is unproven",
+                )),
+                _ => {}
+            }
         }
         let children = named_children_iter(node).collect::<Vec<Node<'_>>>();
         pending.extend(children.into_iter().rev());
     }
     ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
     ranges.dedup();
-    ranges
+    LanguageRuleMatches::decided(
+        ranges,
+        undecided,
+        language.config_label(),
+        "body-state",
+        file,
+    )
 }

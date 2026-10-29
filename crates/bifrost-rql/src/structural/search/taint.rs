@@ -63,6 +63,14 @@ impl TaintQueryState {
         ) {
             Ok(result) => result,
             Err(error) => {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=session:taint detail={error:?}",
+                        file!(),
+                        line!()
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
                 self.push_context_error(error);
                 return Vec::new();
             }

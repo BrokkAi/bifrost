@@ -17,10 +17,10 @@ use crate::graph::extractor::{
 use crate::graph::resolver::{
     ReceiverMode, ReceiverType, RubySemanticIndex, resolve_constant_reference,
 };
-use crate::graph::scope::{RubyScopeExit, exit_scope};
+use crate::graph::scope::{RubyScopeExit, exit_scope, ruby_type_body_declaration};
 use crate::graph::syntax::{
-    dynamic_dispatch_target_argument, for_each_ruby_superclass_constant,
-    is_bare_method_reference_identifier, method_receiver_mode, node_text, ruby_call_is_same_owner,
+    dynamic_dispatch_target_argument, is_bare_method_reference_identifier,
+    is_dynamic_dispatch_method, method_receiver_mode, node_text, ruby_call_is_same_owner,
 };
 use crate::graph_support::RubySource;
 use crate::syntax::ruby_semantic_identifier_range;
@@ -54,25 +54,25 @@ pub fn scan_file(
         semantic: &semantic,
         support,
         file,
-        source: input.source,
         visible_files,
         class_ranges: ClassRangeIndex::build(graph.index, file),
-        input,
-        edges: PerFileEdges::default(),
+        evidence: RubyEdgeEvidence {
+            source: input.source,
+            input,
+            edges: PerFileEdges::default(),
+        },
     };
     scan.scan(input.root());
-    scan.edges
+    scan.evidence.edges
 }
 
 struct RubyEdgeScan<'a> {
     semantic: &'a RubySemanticIndex<'a>,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
-    source: &'a str,
     visible_files: HashSet<ProjectFile>,
     class_ranges: ClassRangeIndex,
-    input: &'a FileEdgeScanInput<'a>,
-    edges: PerFileEdges,
+    evidence: RubyEdgeEvidence<'a>,
 }
 
 impl RubyEdgeScan<'_> {
@@ -92,7 +92,18 @@ impl RubyEdgeScan<'_> {
             |state| state.exit(),
         );
     }
+}
 
+// The grammar-to-edge boundary owns token normalization and the shared ledger.
+// Keep it independent of semantic lookup so source evidence can be validated
+// against the released grammar before aggregation discards individual offsets.
+struct RubyEdgeEvidence<'a> {
+    source: &'a str,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
+}
+
+impl RubyEdgeEvidence<'_> {
     fn record(&mut self, callee: String, node: Node<'_>) {
         let range = ruby_semantic_identifier_range(node, self.source);
         self.edges.record_kind(
@@ -102,6 +113,18 @@ impl RubyEdgeScan<'_> {
             range.start_byte,
             range.end_byte,
         );
+    }
+
+    fn record_unproven_dispatch(&mut self, node: Node<'_>) {
+        let range = ruby_semantic_identifier_range(node, self.source);
+        for callee in self.input.inbound_callees() {
+            self.edges.record_unproven(
+                self.input,
+                callee.clone(),
+                range.start_byte,
+                range.end_byte,
+            );
+        }
     }
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
@@ -122,35 +145,34 @@ struct RubyEdgeWalkState<'scan, 'ctx> {
 
 impl RubyEdgeWalkState<'_, '_> {
     fn enter(&mut self, node: Node<'_>) -> TreeWalkAction {
-        match node.kind() {
-            "class" | "module" => {
-                self.record_superclass_reference(node);
-                let owner = self.type_owner(node);
-                if let Some(owner) = owner.as_ref() {
-                    self.lexical_stack.push(owner.clone());
-                }
-                self.receiver_context.push(ReceiverMode::Instance);
-                self.exits.push(RubyScopeExit::Type {
-                    has_lexical_owner: owner.is_some(),
-                });
-                self.record_reference(node);
-                return TreeWalkAction::DescendWithExit;
+        if let Some(declaration) = ruby_type_body_declaration(node) {
+            let owner = self.type_owner(declaration);
+            if let Some(owner) = owner.as_ref() {
+                self.lexical_stack.push(owner.clone());
             }
+            self.receiver_context.push(ReceiverMode::Instance);
+            self.exits.push(RubyScopeExit::Type {
+                has_lexical_owner: owner.is_some(),
+                locals: std::mem::take(&mut self.locals),
+            });
+            return TreeWalkAction::DescendWithExit;
+        }
+        match node.kind() {
             "method" | "singleton_method" => {
-                self.locals.enter_scope();
+                let locals = std::mem::take(&mut self.locals);
                 self.seed_parameter_shadows(node);
                 self.method_stack.push(method_receiver_mode(
                     node,
                     self.receiver_context.last().copied(),
                 ));
-                self.exits.push(RubyScopeExit::Method);
+                self.exits.push(RubyScopeExit::Method { locals });
                 return TreeWalkAction::DescendWithExit;
             }
             "singleton_class" => {
-                self.locals.enter_scope();
+                let locals = std::mem::take(&mut self.locals);
                 self.method_stack.push(ReceiverMode::Class);
                 self.receiver_context.push(ReceiverMode::Class);
-                self.exits.push(RubyScopeExit::SingletonClass);
+                self.exits.push(RubyScopeExit::SingletonClass { locals });
                 return TreeWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
@@ -182,17 +204,13 @@ impl RubyEdgeWalkState<'_, '_> {
             &self.scan.visible_files,
             &self.lexical_stack,
             node,
-            self.scan.source,
+            self.scan.evidence.source,
         )
     }
 
     fn record_reference(&mut self, node: Node<'_>) {
         self.record_constant_reference(node);
         self.record_method_reference(node);
-    }
-
-    fn record_superclass_reference(&mut self, node: Node<'_>) {
-        for_each_ruby_superclass_constant(node, |current| self.record_constant_reference(current));
     }
 
     fn record_constant_reference(&mut self, node: Node<'_>) {
@@ -202,12 +220,12 @@ impl RubyEdgeWalkState<'_, '_> {
             &self.scan.visible_files,
             &self.lexical_stack,
             node,
-            self.scan.source,
+            self.scan.evidence.source,
         ) else {
             return;
         };
         if reference.unit.is_class() || reference.unit.is_module() {
-            self.scan.record(reference.unit.fq_name(), node);
+            self.scan.evidence.record(reference.unit.fq_name(), node);
         }
     }
 
@@ -222,12 +240,12 @@ impl RubyEdgeWalkState<'_, '_> {
         let Some(method) = node.child_by_field_name("method") else {
             return;
         };
-        let member = node_text(method, self.scan.source);
+        let member = node_text(method, self.scan.evidence.source);
         if member.is_empty() {
             return;
         }
         if let Some((dispatched_member, dispatched_node)) =
-            dynamic_dispatch_target_argument(node, self.scan.source)
+            dynamic_dispatch_target_argument(node, self.scan.evidence.source)
         {
             self.record_call_method_reference(
                 node,
@@ -235,6 +253,10 @@ impl RubyEdgeWalkState<'_, '_> {
                 dispatched_node,
                 MethodLookup::Explicit,
             );
+            return;
+        }
+        if is_dynamic_dispatch_method(method, self.scan.evidence.source) {
+            self.scan.evidence.record_unproven_dispatch(method);
             return;
         }
         self.record_call_method_reference(
@@ -266,7 +288,7 @@ impl RubyEdgeWalkState<'_, '_> {
             None => self.enclosing_receiver(node.start_byte()),
         };
         let Some(receiver) = receiver else {
-            self.scan.record_unproven_name(member, hit_node);
+            self.scan.evidence.record_unproven_name(member, hit_node);
             return;
         };
         if member == "new" && receiver.mode == ReceiverMode::Class {
@@ -293,7 +315,7 @@ impl RubyEdgeWalkState<'_, '_> {
     }
 
     fn record_bare_identifier_method_reference(&mut self, node: Node<'_>) {
-        let name = node_text(node, self.scan.source);
+        let name = node_text(node, self.scan.evidence.source);
         if name.is_empty()
             || self.locals.is_shadowed(name)
             || !is_bare_method_reference_identifier(node)
@@ -346,13 +368,13 @@ impl RubyEdgeWalkState<'_, '_> {
         same_owner: bool,
     ) {
         if same_owner {
-            self.scan.record_unproven_name(member, node);
+            self.scan.evidence.record_unproven_name(member, node);
             return;
         }
         if let Some(fqn) = unique_candidate_fqn(candidates) {
-            self.scan.record(fqn, node);
+            self.scan.evidence.record(fqn, node);
         } else {
-            self.scan.record_unproven_name(member, node);
+            self.scan.evidence.record_unproven_name(member, node);
         }
     }
 
@@ -365,7 +387,7 @@ impl RubyEdgeWalkState<'_, '_> {
             &self.locals,
             &self.method_stack,
             node,
-            self.scan.source,
+            self.scan.evidence.source,
         )
     }
 
@@ -397,12 +419,12 @@ impl RubyEdgeWalkState<'_, '_> {
             &self.method_stack,
             &mut self.locals,
             node,
-            self.scan.source,
+            self.scan.evidence.source,
         );
     }
 
     fn seed_parameter_shadows(&mut self, node: Node<'_>) {
-        ruby_seed_parameter_shadows(&mut self.locals, node, self.scan.source);
+        ruby_seed_parameter_shadows(&mut self.locals, node, self.scan.evidence.source);
     }
 }
 
@@ -420,5 +442,147 @@ fn unique_candidate_fqn(candidates: Vec<CodeUnit>) -> Option<String> {
             .map(|candidate| candidate.fq_name())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RubyKnowledge;
+    use crate::declarations::parse_ruby_tree;
+    use brokk_bifrost_core::analyzer::model::CodeUnitType;
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+        FileDeclarations, FileEdgeSyntax, terminal_index,
+    };
+    use brokk_bifrost_core::hash::HashMap;
+    use brokk_bifrost_core::text_utils::compute_line_starts;
+
+    #[test]
+    fn ruby_edge_evidence_preserves_grammar_token_ranges() {
+        // Offsets come from Ruby/Ripper's method, constant and symbol tokens.
+        let source = "def fixture\n  receiver.run\n  unknown.run\n  self.run\n  Outer::Target\n  obj.__send__(:run)\nend\n";
+        let tree = parse_ruby_tree(source).expect("Ruby grammar");
+        assert!(!tree.root_node().has_error());
+        let method = tree.root_node().named_child(0).expect("method");
+        assert_eq!(method.kind(), "method");
+        let body = method.child_by_field_name("body").expect("body");
+        let mut cursor = body.walk();
+        let statements: Vec<_> = body.named_children(&mut cursor).collect();
+        assert_eq!(statements.len(), 5);
+        let lines = compute_line_starts(source);
+        let nodes: HashSet<_> = [
+            "fixture".to_string(),
+            "Target.run".to_string(),
+            "Outer$Target".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let declarations = FileDeclarations {
+            enclosers: vec![(
+                method.start_byte(),
+                method.end_byte(),
+                "fixture".to_string(),
+            )],
+            enclosing_units: HashMap::default(),
+            definitions: HashMap::default(),
+        };
+        let syntax = || FileEdgeSyntax {
+            tree: &tree,
+            source,
+            line_starts: &lines,
+        };
+        let catalog = terminal_index(&RubyKnowledge, &nodes, |_| vec![CodeUnitType::Function]);
+        let input = FileEdgeScanInput::new(
+            syntax(),
+            &RubyKnowledge,
+            Some(&nodes),
+            Some(&nodes),
+            &declarations,
+            &catalog,
+        );
+        let mut evidence = RubyEdgeEvidence {
+            source,
+            input: &input,
+            edges: PerFileEdges::default(),
+        };
+        for (index, start) in [(0, 23), (1, 37), (2, 48)] {
+            let call = statements[index];
+            assert_eq!(call.kind(), "call");
+            let token = call.child_by_field_name("method").expect("selector");
+            assert_eq!(token.kind(), "identifier");
+            assert_eq!(token.byte_range(), start..start + 3);
+            if index == 0 {
+                evidence.record("Target.run".to_string(), token);
+            } else {
+                evidence.record_unproven_name("run", token);
+            }
+        }
+        let constant = statements[3];
+        assert_eq!(constant.kind(), "scope_resolution");
+        assert_eq!(constant.byte_range(), 54..67);
+        assert_eq!(
+            constant
+                .child_by_field_name("name")
+                .expect("terminal constant")
+                .byte_range(),
+            61..67
+        );
+        evidence.record("Outer$Target".to_string(), constant);
+        let symbol = statements[4]
+            .child_by_field_name("arguments")
+            .expect("dispatch arguments")
+            .named_child(0)
+            .expect("symbol");
+        assert_eq!(symbol.kind(), "simple_symbol");
+        assert_eq!(symbol.byte_range(), 83..87);
+        evidence.record_unproven_name("run", symbol);
+        let selector = statements[4].child_by_field_name("method").unwrap();
+        let mut graph_evidence = RubyEdgeEvidence {
+            source,
+            input: &input,
+            edges: PerFileEdges::default(),
+        };
+        graph_evidence.record_unproven_dispatch(selector);
+        assert!(graph_evidence.edges.unproven_inbound.is_empty());
+        let callees: HashSet<String> = ["Target.run".to_string()].into_iter().collect();
+        let inbound_catalog =
+            terminal_index(&RubyKnowledge, &callees, |_| vec![CodeUnitType::Function]);
+        let inbound = FileEdgeScanInput::new(
+            syntax(),
+            &RubyKnowledge,
+            None,
+            Some(&callees),
+            &declarations,
+            &inbound_catalog,
+        );
+        let mut inbound_evidence = RubyEdgeEvidence {
+            source,
+            input: &inbound,
+            edges: PerFileEdges::default(),
+        };
+        inbound_evidence.record_unproven_dispatch(selector);
+        assert_eq!(
+            inbound_evidence.edges.unproven_inbound,
+            std::collections::BTreeMap::from([(
+                "Target.run".to_string(),
+                [selector.start_byte()].into_iter().collect::<HashSet<_>>()
+            )])
+        );
+        assert_eq!(
+            evidence.edges.edge_lines[&("fixture".to_string(), "Target.run".to_string())][&2].spans,
+            [(23, 26)]
+        );
+        assert_eq!(
+            evidence.edges.edge_lines[&("fixture".to_string(), "Outer$Target".to_string())][&5]
+                .spans,
+            [(54, 67)]
+        );
+        assert_eq!(
+            evidence.edges.unproven_inbound,
+            std::collections::BTreeMap::from([(
+                "Target.run".to_string(),
+                [37, 48, 84].into_iter().collect::<HashSet<_>>()
+            )])
+        );
     }
 }

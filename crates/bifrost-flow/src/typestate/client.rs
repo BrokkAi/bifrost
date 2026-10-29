@@ -19,12 +19,12 @@ use crate::dataflow::{
 
 use super::{
     BoundTypestateEvent, BoundTypestateInitialSeed, BoundTypestateTerminal, CompiledProtocol,
-    DirectScalarSource, ProtocolEventId, ProtocolEventOccurrence, ProtocolExpectationKey,
-    ProtocolObservationPhase, ProtocolStateId, ProtocolStateKey, ProtocolTerminalObservationSpec,
-    ProtocolUncertaintyCause, ProtocolUncertaintyResolution, ProtocolUnmatchedEventBehavior,
-    TypestateBindingPlan, TypestateBindingPlanHash, TypestateBindingQuality,
-    TypestateEventBindingId, TypestateEventCondition, TypestateProtocolHash, TypestateSubjectId,
-    TypestateSubjectKey, TypestateTerminalBindingId, direct_scalar_source,
+    DirectScalarSource, ProtocolEventId, ProtocolEventOccurrence, ProtocolObservationPhase,
+    ProtocolStateId, ProtocolStateKey, ProtocolTerminalObservationSpec, ProtocolUncertaintyCause,
+    ProtocolUncertaintyResolution, ProtocolUnmatchedEventBehavior, TypestateBindingPlan,
+    TypestateBindingPlanHash, TypestateBindingQuality, TypestateEventBindingId,
+    TypestateEventCondition, TypestateProtocolHash, TypestateSubjectId, TypestateSubjectKey,
+    TypestateTerminalBindingId, direct_scalar_source,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -763,43 +763,6 @@ impl<'plan> TypestateFlowProblem<'plan> {
             .state_id(state)
             .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
         Ok(TypestateFact::state(self.bindings.hash(), subject, state))
-    }
-
-    /// Construct a terminal observation fact suitable for a backward demand.
-    pub fn terminal_fact(
-        &self,
-        subject: &TypestateSubjectKey,
-        expectation: &ProtocolExpectationKey,
-        state: &ProtocolStateKey,
-    ) -> Result<TypestateFact, TypestateFlowProblemError> {
-        let subject = self
-            .bindings
-            .subject_id(subject)
-            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-        let state = self
-            .protocol
-            .state_id(state)
-            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-        let terminal_binding = self
-            .bindings
-            .terminal_bindings()
-            .iter()
-            .find(|binding| {
-                binding.subject() == subject
-                    && self
-                        .protocol
-                        .terminal_expectation(binding.expectation())
-                        .is_some_and(|terminal| terminal.key() == expectation)
-            })
-            .ok_or(TypestateFlowProblemError::InvalidFactIdentity)?;
-        Ok(TypestateFact::summary_terminal(
-            self.bindings.hash(),
-            subject,
-            terminal_binding.id(),
-            state,
-            TypestateUncertaintySet::default(),
-            false,
-        ))
     }
 
     fn validate_entry_facts(

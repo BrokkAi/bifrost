@@ -263,7 +263,7 @@ impl RustItemSourceCollector {
                 });
             }
             "impl_item" => self.record_impl(node, source, sink, types, context),
-            "trait_item" => self.record_trait(node, sink, context),
+            "trait_item" => self.record_trait(node, source, sink, context),
             "type_item" | "associated_type" => {
                 self.record_syntax(sink.intern_node(node), node.has_error());
                 self.record_alias(node, source, sink, types, context)
@@ -300,7 +300,7 @@ impl RustItemSourceCollector {
             .children(&mut node.walk())
             .find(|child| child.kind() == "!")
             .map(|token| sink.intern_node(token));
-        let (body, body_children) = self.record_body(node, sink);
+        let (body, body_children) = self.record_body(node, source, sink);
         self.facts.impls.push(RustImplSourceFact {
             declaration,
             context,
@@ -315,11 +315,12 @@ impl RustItemSourceCollector {
     fn record_trait(
         &mut self,
         node: Node<'_>,
+        source: &str,
         sink: &mut dyn RustItemSourceSink,
         context: SourceOccurrenceId,
     ) {
         let declaration = sink.declare_node(node);
-        let (body, body_children) = self.record_body(node, sink);
+        let (body, body_children) = self.record_body(node, source, sink);
         self.facts.traits.push(RustTraitSourceFact {
             declaration,
             context,
@@ -396,11 +397,25 @@ impl RustItemSourceCollector {
     fn body_children(
         &mut self,
         body: Node<'_>,
+        source: &str,
         sink: &mut dyn RustItemSourceSink,
     ) -> Vec<RustItemBodyChildSourceFact> {
         let mut cursor = body.walk();
         body.named_children(&mut cursor)
             .map(|child| {
+                let payload = crate::syntax::unwrap_attributes(child);
+                // Only source-preserving wrappers are transparent. Keep malformed,
+                // conditional and transforming wrappers visible to hierarchy readers.
+                let child = if payload != child
+                    && !child.has_error()
+                    && sink.cfg_condition(payload, source)
+                        == crate::lexical_scope::RustCfgCondition::Always
+                    && !crate::resolution::rust_item_has_generated_surface_boundary(payload, source)
+                {
+                    payload
+                } else {
+                    child
+                };
                 let occurrence = sink.intern_node(child);
                 self.record_syntax(occurrence, child.has_error());
                 let declaration = if child.kind() == "impl_item"
@@ -422,13 +437,14 @@ impl RustItemSourceCollector {
     fn record_body(
         &mut self,
         node: Node<'_>,
+        source: &str,
         sink: &mut dyn RustItemSourceSink,
     ) -> (Option<SourceOccurrenceId>, Vec<RustItemBodyChildSourceFact>) {
         let Some(body) = node.child_by_field_name("body") else {
             return (None, Vec::new());
         };
         let body_occurrence = sink.intern_node(body);
-        let children = self.body_children(body, sink);
+        let children = self.body_children(body, source, sink);
         (Some(body_occurrence), children)
     }
 

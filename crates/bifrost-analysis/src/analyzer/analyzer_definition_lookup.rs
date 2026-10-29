@@ -663,7 +663,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
 
     fn fqn_for_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         let read = || self.fqn_for_language_unrecorded(fqn, language);
-        if !self.analyzer.read_ledger_attached() {
+        if !crate::analyzer::read_attribution_records_reads(|| self.analyzer.read_ledger_attached())
+        {
             return read();
         }
         let (matches, reads) =
@@ -679,7 +680,9 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     }
 
     fn record_resolved_name(&self, name: &str, language: Option<Language>, matches: &[CodeUnit]) {
-        if !self.analyzer.read_ledger_attached() || !self.can_publish() {
+        if !crate::analyzer::read_attribution_records_reads(|| self.analyzer.read_ledger_attached())
+            || !self.can_publish()
+        {
             return;
         }
         self.analyzer
@@ -1047,7 +1050,7 @@ fn analyzer_for_language(
 impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let units = self.fqn_for_languages(fqn, self.query_languages());
-        if self.analyzer.read_ledger_attached()
+        if crate::analyzer::read_attribution_records_reads(|| self.analyzer.read_ledger_attached())
             && *self
                 .language
                 .lock()

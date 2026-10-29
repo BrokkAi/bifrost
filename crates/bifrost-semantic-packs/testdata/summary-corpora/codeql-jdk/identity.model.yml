@@ -1,0 +1,11 @@
+# Synthetic test-only rows for the identity classification boundary.
+# These are not upstream models or product pack content.
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: summaryModel
+    data:
+      - ["java.lang", "StringBuilder", False, "reverse", "()", "", "Argument[this]", "ReturnValue", "value", "test-only"]
+      - ["java.lang", "StringBuilder", False, "reverse", "()", "", "Argument[this]", "ReturnValue", "taint", "test-only"]
+      - ["java.lang", "StringBuilder", False, "toString", "()", "", "Argument[this].Element", "ReturnValue", "value", "test-only"]
+      - ["java.lang", "StringBuilder", False, "substring", "(int)", "", "Argument[this]", "ReturnValue", "taint", "test-only"]

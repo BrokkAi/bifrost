@@ -13,6 +13,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::usages::effects::EffectCoverage;
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_test_macros::hardwon;
 use semver::Version;
 
 #[test]
@@ -1080,6 +1081,12 @@ fn retained_execution_snapshot_wins_over_a_later_changed_source() {
 
 #[test]
 fn conflicting_held_snapshots_are_negative_cached_and_typed_incomplete() {
+    let directory = tempfile::tempdir().unwrap();
+    let analyzer = JavascriptAnalyzer::from_project(TestProject::new(
+        directory.path().to_path_buf(),
+        Language::JavaScript,
+    ));
+
     let file = ProjectFile::new(
         std::env::temp_dir().join("bifrost-conflicting-query-snapshot"),
         PathBuf::from("src/app.ts"),
@@ -1088,6 +1095,7 @@ fn conflicting_held_snapshots_are_negative_cached_and_typed_incomplete() {
     let mut diagnostics = Vec::new();
 
     assert!(!retain_held_source_snapshot(
+        &analyzer,
         &mut cache,
         &file,
         "fn before() {}\n",
@@ -1096,6 +1104,7 @@ fn conflicting_held_snapshots_are_negative_cached_and_typed_incomplete() {
         &mut diagnostics,
     ));
     assert!(retain_held_source_snapshot(
+        &analyzer,
         &mut cache,
         &file,
         "// shifted\nfn before() {}\n",
@@ -4104,6 +4113,68 @@ fn assert_open_unknown_result_contract_uses(
 }
 
 #[test]
+#[hardwon("#7379: a store through a nil pointer was not a nil-dereference operation")]
+fn go_nilness_selects_pointer_stores_with_exact_and_unknown_facts() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+func nilStore(r *int) { var c *int; *c = *r }
+func allocatedStore(r *int) { c := new(int); *c = *r }
+func unknownStore(c *int, r *int) { *c = *r }
+func nilReadModifyWrite() { var c *int; *c += 1 }
+func parenthesizedRead() int { var c *int; return *(c) }
+func parenthesizedStore() { var c *int; *(c) = 1 }
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for (name, expected_count, expected_fact, expected_proof, expected_coverage) in [
+        ("nilStore", 2, "nil", "exact", "exhaustive"),
+        ("allocatedStore", 2, "non_nil", "exact", "exhaustive"),
+        ("unknownStore", 2, "unknown", "unknown", "open"),
+        ("nilReadModifyWrite", 1, "nil", "exact", "exhaustive"),
+        ("parenthesizedRead", 1, "nil", "exact", "exhaustive"),
+        ("parenthesizedStore", 1, "nil", "exact", "exhaustive"),
+    ] {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [{ "op": "procedure_of" }, { "op": "nilness_operations" }],
+            "result_detail": "full"
+        }))
+        .expect("Go nilness query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{result:#?}"
+        );
+        let operations = result
+            .results
+            .iter()
+            .map(|item| {
+                let CodeQueryResultValue::NilnessOperation { value } = &item.value else {
+                    panic!("expected nilness operation: {item:#?}");
+                };
+                value
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), expected_count, "{name}: {result:#?}");
+        assert!(
+            operations.iter().any(|value| value.fact == expected_fact
+                && value.proof == expected_proof
+                && value.coverage == expected_coverage),
+            "{name}: {result:#?}"
+        );
+    }
+}
+
+#[test]
 fn go_nilness_keeps_unconstrained_pointer_parameters_open() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -4858,6 +4929,15 @@ fn c_assignment_relations_report_configuration_and_recovery_as_incomplete() {
             matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
             "{name}: {result:#?}"
         );
+        if matches!(name, "configured" | "macro_wrapped") {
+            assert!(
+                result.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CodeQueryDiagnosticCode::EffectDerivationIncomplete
+                        && diagnostic.message.contains("preprocessing_present")
+                }),
+                "content configuration gaps must retain their diagnostic class: {result:#?}"
+            );
+        }
     }
 }
 
@@ -6246,6 +6326,7 @@ fn union_query_over_root_limit_reports_exactly_one_truncation_diagnostic() {
 
     let detailed = execute_code_query_detailed_eager_index(
         &analyzer,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -6407,6 +6488,121 @@ const TYPE_FLOW_BUILTINS_PACK: &str = r#"{
     }
   }]
 }"#;
+
+#[test]
+fn enclosing_decl_keeps_nested_source_filters_out_of_model_augmentation() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("SourceClass.java", "class SourceClass {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    // Engine-only model fixture: an ordinary public class has no source
+    // declaration attributes for the source-only predicates below to inspect.
+    let source = json!({
+        "schema_version": 2,
+        "pack_id": "test.rql.java-source-declaration-filters",
+        "version": "1.0.0",
+        "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
+        "language": "java",
+        "ecosystem": "maven",
+        "compatibility": { "bifrost": ">=0.10.5, <1.0.0", "toolchains": [] },
+        "provenance": { "source": "test:rql-4365-declaration-filters", "revision": "reviewed" },
+        "license": "Apache-2.0",
+        "completeness": "partial",
+        "safety": { "generated_code_only": false, "review_required": false },
+        "shards": [{
+            "id": "java.declarations",
+            "activation": [{}],
+            "payload": {
+                "kind": "declaration_facts",
+                "types": [{
+                    "id": "type.example.ordinary",
+                    "name": "example.Ordinary",
+                    "type_kind": "class",
+                    "visibility": "public",
+                    "is_abstract": false,
+                    "is_sealed": false,
+                    "type_parameters": [],
+                    "hierarchy": [],
+                    "aliases": [],
+                    "extension_surfaces": [],
+                    "locator": { "kind": "artifact", "path": "Ordinary.java", "symbol": "example.Ordinary" }
+                }],
+                "members": [],
+                "relations": []
+            }
+        }]
+    });
+    let pack = compile_source(
+        SourceFormat::Json,
+        source.to_string().as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("declaration fixture compiles: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+        .expect("ephemeral semantic-pack catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "test:rql-4365-declaration-filters".to_owned(),
+            },
+        )
+        .expect("register engine-only declaration fixture");
+    let activation = acquire_active_semantic_models(
+        workspace.analyzer(),
+        &catalog,
+        None,
+        &SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".to_owned(),
+                ecosystem: "maven".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        },
+        &CancellationToken::default(),
+    );
+    let SemanticModelRuntimeOutcome::Ready { snapshot, .. } = activation else {
+        panic!("declaration fixture activates: {activation:#?}");
+    };
+    let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        workspace.analyzer(),
+        Some(snapshot),
+    );
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let baseline = execute_workspace(
+        &workspace,
+        &flow,
+        &CodeQuery::from_sexp("(enclosing-decl (language java (class)))")
+            .expect("unfiltered modeled declarations"),
+    );
+    assert!(
+        baseline.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::Declaration { value } if value.fq_name == "example.Ordinary"
+        )),
+        "the model must participate before testing exclusions: {baseline:#?}"
+    );
+    for source in [
+        r#"(enclosing-decl (language java (class :and [(type-kind "interface")])))"#,
+        r#"(enclosing-decl (language java (class :and [(modifier "abstract")])))"#,
+        r#"(enclosing-decl (language java (class :or [(type-kind "interface") (modifier "abstract")])))"#,
+        r#"(enclosing-decl (language java (class :not (type-kind "class"))))"#,
+    ] {
+        let query = CodeQuery::from_sexp(source).expect("composed declaration filter");
+        let result = execute_workspace(&workspace, &flow, &query);
+        assert!(result.results.is_empty(), "{source}: {result:#?}");
+    }
+}
 
 #[test]
 fn anchor_step_reports_a_named_capture_range_and_keeps_the_structural_root() {

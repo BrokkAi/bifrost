@@ -903,6 +903,21 @@ fn validate_procedure(
             "call site",
         )?;
         validate_call_site(procedures, procedure_locators, procedure, call_site)?;
+        if let Some(selection) = &call_site.member_selection {
+            if selection.member.is_empty() || call_site.receiver.is_none() {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    format!(
+                        "call site {} member selection requires a name and receiver",
+                        call_site.id
+                    ),
+                ));
+            }
+            if let Some(place) = &selection.receiver_place {
+                validate_semantic_place(key, procedure, place, "member selection receiver place")?;
+            }
+        }
         for argument in &call_site.arguments {
             if argument.keyword.is_some()
                 && !matches!(
@@ -4267,6 +4282,13 @@ pub fn measure_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWo
             }
             if let Some(ArgumentDomain::LanguageDefined(name)) = argument.expansion.domain() {
                 account_text(name, &mut work);
+            }
+        }
+        if let Some(selection) = &call_site.member_selection {
+            work.nested_entries = work.nested_entries.saturating_add(1);
+            account_text(&selection.member, &mut work);
+            if let Some(place) = &selection.receiver_place {
+                account_place(place, &mut work);
             }
         }
         account_target_resolution(&call_site.declared_targets, &mut work);

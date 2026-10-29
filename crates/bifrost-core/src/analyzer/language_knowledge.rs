@@ -1,7 +1,9 @@
 //! Language rules available without an analyzer or store.
 
+use std::borrow::Cow;
+
 use crate::analyzer::fq_name::FqName;
-use crate::analyzer::model::LanguageDialect;
+use crate::analyzer::model::{CodeUnitType, LanguageDialect};
 use crate::analyzer::resolution_facts::IntrinsicTypeKind;
 use crate::analyzer::structural::spec::StructuralSpec;
 use crate::analyzer::usages::reference_site::node_range;
@@ -30,8 +32,73 @@ impl ParserFlavor {
     }
 }
 
+/// Every nominal supertype of one builtin type, transitively, as the language
+/// fixes them. Spellings are intrinsic type descriptor spellings.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinSupertypes {
+    /// Spellings of this same JVM type in another JVM language's vocabulary,
+    /// such as Scala's `scala.Int` and Java's `int` for Kotlin's `kotlin.Int`.
+    /// A formal declared in that language names the builtin with them.
+    pub aliases: &'static [&'static str],
+    /// Supertypes that take no type arguments, and other spellings of the
+    /// builtin itself.
+    pub nominal: &'static [&'static str],
+    /// Spellings whose relation the table cannot decide, such as a
+    /// supertype whose type arguments the spelling omits.
+    pub open: &'static [&'static str],
+}
+
+/// Grammar shapes used by shared guard-condition normalization.
+#[derive(Debug)]
+pub struct GuardConditionSyntax {
+    pub call_kinds: &'static [&'static str],
+    pub parenthesis_kinds: &'static [&'static str],
+    /// None selects the first named, non-comment child.
+    pub parenthesis_field: Option<&'static str>,
+    pub negation_kinds: &'static [&'static str],
+    pub operator_field: &'static str,
+    pub negation_operator: &'static str,
+    pub operand_field: &'static str,
+}
+
 /// Language syntax and rules independent of query-time engine state.
 pub trait LanguageKnowledge: Send + Sync {
+    /// Compose every semantic-model shard of this language from catalog rows.
+    /// Row-backed declarations are projected on demand in the bounded store cache.
+    fn models_compose_from_catalog_rows(&self) -> bool {
+        false
+    }
+
+    /// Whether a value of this named, resolved declared type cannot have its
+    /// referent mutated after a check through any reference. Return true only
+    /// when that guarantee holds; an unmodeled or unknown type answers false.
+    ///
+    /// Callers pass only a named resolved type in its canonical spelling.
+    /// The shared compiler excludes pointer, array, slice, map and interface
+    /// shapes before calling this hook; language implementations classify
+    /// names only, without repeating those shape checks.
+    fn declared_type_is_referent_immutable(&self, canonical_type: &str) -> bool;
+
+    /// The string value denoted by a ConstantString payload produced by this
+    /// language. The payload is a language-defined key, not necessarily decoded
+    /// text. Return None for labels, non-UTF-8 bytes, or other payloads that are
+    /// not decodable string literals. This is a query-time interpretation;
+    /// implementations must not change the producer's payload representation.
+    fn semantic_string_constant_value(&self, _payload: &str) -> Option<String> {
+        None
+    }
+
+    /// Grammar descriptions for languages using shared direct-call guards.
+    fn guard_condition_syntax(&self) -> Option<&'static GuardConditionSyntax> {
+        None
+    }
+
+    /// Normalize a structurally selected terminal name for possible-callee
+    /// accounting. This does not change declaration identities or stored facts.
+    fn normalize_terminal_name<'a>(&self, name: &'a str, _kind: CodeUnitType) -> Cow<'a, str> {
+        Cow::Borrowed(name)
+    }
+
     /// Promote the exact static operand type names for one numeric expression
     /// to the intrinsic result type. Names come from selected type descriptors,
     /// never source-text parsing.
@@ -65,9 +132,22 @@ pub trait LanguageKnowledge: Send + Sync {
         false
     }
 
+    /// The complete supertypes of a builtin type whose supertypes no indexed
+    /// declaration supplies. A builtin with this answer is a subtype of its
+    /// own, each `aliases` and each `nominal` spelling, of no other builtin
+    /// spelling, and leaves an `open` spelling undecided.
+    fn builtin_supertypes(&self, _spelling: &str) -> Option<BuiltinSupertypes> {
+        None
+    }
+
     /// Whether invocation applicability may select among callee declarations.
     /// Languages with applicability-independent binding may keep a positioned
     /// callee reference complete while its call obligation remains incomplete.
+    /// Read by `fact_lowering::lower_file_resolution_facts_with_identities`
+    /// (the applicability-gap filter) and the runtime call-rule accessor
+    /// `LoweredCallApplicabilityObligation::argument_independent_binding`.
+    /// The lowering reader stays because it assigns lexical gap coverage when
+    /// facts are produced; runtime eligibility must not rewrite persisted rows.
     fn call_applicability_may_select_callee(&self) -> bool {
         true
     }
@@ -217,6 +297,16 @@ pub trait LanguageKnowledge: Send + Sync {
     /// The callee of a call whose grammar names it positionally rather than by field, or
     /// `None` when the generic field lookup already finds it.
     fn call_callee_node<'t>(&self, _call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+        None
+    }
+
+    /// The binding target and value of a field initializer or assignment.
+    /// Shared usage classification decides which side contains a reference;
+    /// language hooks supply only the grammar shape.
+    fn field_initializer<'t>(
+        &self,
+        _node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
         None
     }
 

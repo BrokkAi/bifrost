@@ -194,13 +194,18 @@ impl CppAnalyzer {
         if imports::is_cpp_translation_unit(file) {
             return None;
         }
-        self.c_readings_by_file.get_with_by_ref(file, || {
-            let c_state = self
-                .inner
-                .projection_file_state(file, CPP_C_STORAGE_LANGUAGE_KEY)?;
-            let cpp_state = self.inner.fetch_file_state(file)?;
-            Some(Arc::new(CppCReading::build(&c_state, &cpp_state)))
-        })
+        match self.c_readings_by_file.try_get_with_by_ref(file, || {
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                let c_state = self
+                    .inner
+                    .projection_file_state(file, CPP_C_STORAGE_LANGUAGE_KEY)?;
+                let cpp_state = self.inner.fetch_file_state(file)?;
+                Some(Arc::new(CppCReading::build(&c_state, &cpp_state)))
+            })
+        }) {
+            Ok(value) => value,
+            Err(value) => (*value).clone(),
+        }
     }
 
     /// Whether a reference written in the header `file` reads its visible

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::go_facts::GoCallableFact;
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
@@ -25,6 +27,38 @@ use crate::resolution::{GoResolutionBuilder, GoResolutionOutput};
 use crate::structural::GO_STRUCTURAL_SPEC;
 
 pub use brokk_bifrost_core::analyzer::common::node_source_text as go_node_text;
+
+/// The generic receiver base and positional binder syntax, after pointer wrappers.
+/// Receiver arguments declare names rather than referring to package type names.
+pub fn go_generic_receiver_type(mut kind: Node<'_>) -> Option<Node<'_>> {
+    while matches!(kind.kind(), "pointer_type" | "parenthesized_type") {
+        kind =
+            brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(kind, |child| {
+                !child.is_extra()
+            })?;
+    }
+    (kind.kind() == "generic_type").then_some(kind)
+}
+
+/// Flatten the grammar's type-element wrappers without interpreting type text.
+pub fn go_type_argument_nodes(arguments: Node<'_>) -> Vec<Node<'_>> {
+    let mut positional = Vec::new();
+    for element in named_children(arguments)
+        .into_iter()
+        .filter(|child| !child.is_extra())
+    {
+        if element.kind() == "type_elem" {
+            positional.extend(
+                named_children(element)
+                    .into_iter()
+                    .filter(|child| !child.is_extra()),
+            );
+        } else {
+            positional.push(element);
+        }
+    }
+    positional
+}
 
 /// Whether a Go identifier is exported from its declaring package.
 ///
@@ -193,28 +227,39 @@ pub fn collect_go_import_infos_from_declaration(
 /// canonical and native projections.
 pub(crate) struct GoImportSpecSyntax<'tree, 'source> {
     pub(crate) node: Node<'tree>,
-    pub(crate) path: &'source str,
-    pub(crate) segments: Vec<&'source str>,
+    pub(crate) path: Cow<'source, str>,
+    pub(crate) segments: Vec<Cow<'source, str>>,
     pub(crate) alias: Option<(&'source str, Node<'tree>)>,
+}
+
+/// Decode the selected import literal without allocating unchanged contents.
+fn go_import_spec_path<'source>(node: Node<'_>, source: &'source str) -> Option<Cow<'source, str>> {
+    let literal = node.child_by_field_name("path")?;
+    let text = go_node_text(literal, source);
+    let (content, needs_decoding) = match literal.kind() {
+        "interpreted_string_literal" => {
+            let content = text.strip_prefix('"')?.strip_suffix('"')?;
+            (content, content.contains('\\'))
+        }
+        "raw_string_literal" => {
+            let content = text.strip_prefix('`')?.strip_suffix('`')?;
+            (content, content.contains('\r'))
+        }
+        _ => return None,
+    };
+    let path = if needs_decoding {
+        Cow::Owned(String::from_utf8(crate::build_files::go_string_literal_bytes(text)?).ok()?)
+    } else {
+        Cow::Borrowed(content)
+    };
+    (!path.is_empty()).then_some(path)
 }
 
 pub(crate) fn parse_go_import_spec_syntax<'tree, 'source>(
     node: Node<'tree>,
     source: &'source str,
 ) -> Option<GoImportSpecSyntax<'tree, 'source>> {
-    let path_node = node.child_by_field_name("path").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
-            .find(|child| child.kind().contains("string"))
-    })?;
-    let raw_path = go_node_text(path_node, source).trim();
-    let path = raw_path
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('\'');
-    if path.is_empty() {
-        return None;
-    }
+    let path = go_import_spec_path(node, source)?;
 
     let alias = node
         .child_by_field_name("name")
@@ -222,7 +267,13 @@ pub(crate) fn parse_go_import_spec_syntax<'tree, 'source>(
     // A Go import path is one string-literal AST node, and '/' is Go's own
     // separator inside its value. Keep the split path in the shared record so
     // native lowering does not reconstruct it from the display DTO.
-    let segments = path.split('/').collect();
+    let segments = match &path {
+        Cow::Borrowed(path) => path.split('/').map(Cow::Borrowed).collect(),
+        Cow::Owned(path) => path
+            .split('/')
+            .map(|segment| Cow::Owned(segment.to_owned()))
+            .collect(),
+    };
     Some(GoImportSpecSyntax {
         node,
         path,
@@ -267,7 +318,7 @@ impl<'tree, 'source> GoImportSpecSyntax<'tree, 'source> {
                     || {
                         self.segments
                             .last()
-                            .copied()
+                            .map(|segment| segment.as_ref())
                             .expect("Go import path has a segment")
                     },
                     |(alias, _)| alias,
@@ -296,7 +347,7 @@ impl<'tree, 'source> GoImportSpecSyntax<'tree, 'source> {
                 segments: self
                     .segments
                     .iter()
-                    .map(|segment| (*segment).to_string())
+                    .map(|segment| segment.to_string())
                     .collect(),
                 kind: Some(StructuredImportPathKind::Namespace),
                 lexical_prefixes: Vec::new(),
@@ -311,17 +362,31 @@ impl<'tree, 'source> GoImportSpecSyntax<'tree, 'source> {
 pub fn go_import_spec_parts<'source>(
     node: Node<'_>,
     source: &'source str,
-) -> Option<(&'source str, Option<&'source str>)> {
-    let syntax = parse_go_import_spec_syntax(node, source)?;
-    Some((syntax.path, syntax.alias.map(|(alias, _)| alias)))
+) -> Option<(Cow<'source, str>, Option<&'source str>)> {
+    let path = go_import_spec_path(node, source)?;
+    let alias = node
+        .child_by_field_name("name")
+        .map(|alias| go_node_text(alias, source).trim());
+    Some((path, alias))
 }
 
 pub fn go_import_spec_binding_name<'source>(
     node: Node<'_>,
     source: &'source str,
-) -> Option<&'source str> {
+) -> Option<Cow<'source, str>> {
     let (path, alias) = go_import_spec_parts(node, source)?;
-    Some(alias.unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path)))
+    Some(match alias {
+        Some(alias) => Cow::Borrowed(alias),
+        None => match path {
+            Cow::Borrowed(path) => Cow::Borrowed(path.rsplit('/').next().unwrap_or(path)),
+            Cow::Owned(mut path) => {
+                if let Some(separator) = path.rfind('/') {
+                    path.drain(..=separator);
+                }
+                Cow::Owned(path)
+            }
+        },
+    })
 }
 
 pub fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
@@ -441,15 +506,6 @@ fn go_callable_declared_visibility(node: Node<'_>, source: &str) -> DeclaredVisi
         Some(_) => DeclaredVisibility::PackagePrivate,
         None => DeclaredVisibility::Unknown,
     }
-}
-
-pub fn go_signature_metadata(
-    signature: String,
-    node: Node<'_>,
-    source: &str,
-    parameter_text: &str,
-) -> SignatureMetadata {
-    go_signature_metadata_with_identities(signature, node, source, parameter_text, None, None)
 }
 
 pub fn go_signature_metadata_with_identities(
@@ -701,11 +757,7 @@ pub fn go_structured_type_identity_with(
                                 node.named_children(&mut cursor)
                                     .find(|child| child.kind() == "type_arguments")
                             })?;
-                        let mut argument_nodes = Vec::new();
-                        let mut cursor = arguments.walk();
-                        for argument in arguments.named_children(&mut cursor) {
-                            argument_nodes.push(argument);
-                        }
+                        let argument_nodes = go_type_argument_nodes(arguments);
                         frames.push(GoStructuredTypeFrame::Generic {
                             argument_count: argument_nodes.len(),
                         });
@@ -795,28 +847,6 @@ pub fn go_embedded_type_texts(node: Node<'_>, source: &str) -> Vec<String> {
     embedded
 }
 
-pub fn go_embedded_type_identity(
-    type_node: Node<'_>,
-    source: &str,
-) -> Option<StructuredTypeIdentity> {
-    let mut identity = go_structured_type_identity(type_node, source)?;
-    let Some(field) = type_node
-        .parent()
-        .filter(|parent| parent.kind() == "field_declaration")
-    else {
-        return Some(identity);
-    };
-    let pointer = (0..field.child_count()).any(|index| {
-        field
-            .child(index)
-            .is_some_and(|child| !child.is_named() && child.kind() == "*")
-    });
-    if pointer {
-        identity = identity.wrap_pointer()?;
-    }
-    Some(identity)
-}
-
 pub fn go_embedded_type_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     match node.kind() {
         "struct_type" => {
@@ -835,11 +865,18 @@ pub fn go_embedded_type_nodes(node: Node<'_>) -> Vec<Node<'_>> {
         "interface_type" => named_children_of_kind(node, "type_elem")
             .into_iter()
             .filter_map(|element| {
-                let children = named_children(element);
+                let children = named_children(element)
+                    .into_iter()
+                    .filter(|child| !child.is_extra())
+                    .collect::<Vec<_>>();
                 let [embedded] = children.as_slice() else {
                     return None;
                 };
-                matches!(embedded.kind(), "type_identifier" | "qualified_type").then_some(*embedded)
+                matches!(
+                    embedded.kind(),
+                    "type_identifier" | "qualified_type" | "generic_type"
+                )
+                .then_some(*embedded)
             })
             .collect(),
         _ => Vec::new(),
@@ -951,41 +988,29 @@ pub fn go_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     labels
 }
 
-pub fn go_value_signature(
-    node: Node<'_>,
-    source: &str,
-    keyword: &str,
-    name: &str,
-    identifier_count: usize,
-) -> String {
-    let raw = go_node_text(node, source).trim();
-    let after_keyword = raw.strip_prefix(keyword).map(str::trim).unwrap_or(raw);
-    if identifier_count > 1 && after_keyword.contains('=') {
-        return name.to_string();
+pub fn go_value_signature(node: Node<'_>, source: &str, name: &str) -> String {
+    let value = node.child_by_field_name("value");
+    if children_by_field(node, "name").len() > 1 && value.is_some() {
+        return name.to_owned();
     }
-
-    let remainder = after_keyword
-        .strip_prefix(name)
-        .map(str::trim)
-        .unwrap_or(after_keyword);
-    let (type_part, value_part) = remainder
-        .split_once('=')
-        .map(|(left, right)| (left.trim(), Some(right.trim())))
-        .unwrap_or((remainder.trim(), None));
-
-    let mut signature = name.to_string();
-    if !type_part.is_empty() {
+    let mut signature = name.to_owned();
+    if let Some(ty) = node.child_by_field_name("type") {
         signature.push(' ');
-        signature.push_str(type_part);
+        signature.push_str(go_node_text(ty, source));
     }
-
-    if let Some(value) = value_part
-        && go_value_is_simple_literal(value)
-    {
-        signature.push_str(" = ");
-        signature.push_str(value);
+    if let Some(values) = value {
+        let mut cursor = values.walk();
+        let mut values = values
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra());
+        if let Some(value) = values.next()
+            && values.next().is_none()
+            && go_value_is_simple_literal(value)
+        {
+            signature.push_str(" = ");
+            signature.push_str(go_node_text(value, source));
+        }
     }
-
     signature
 }
 
@@ -1010,29 +1035,34 @@ pub fn extract_go_receiver_name(node: Node<'_>, source: &str) -> Option<String> 
 }
 
 pub fn extract_go_type_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "type_identifier" | "identifier" => {
-            let text = go_node_text(node, source).trim();
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        "pointer_type" | "slice_type" | "array_type" | "generic_type" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(|child| extract_go_type_name(child, source))
-        }
-        "qualified_type" => node
-            .child_by_field_name("name")
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor).last()
-            })
-            .and_then(|child| extract_go_type_name(child, source)),
-        _ => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(|child| extract_go_type_name(child, source))
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "type_identifier" | "identifier" => {
+                let text = go_node_text(node, source).trim();
+                if !text.is_empty() {
+                    return Some(text.to_owned());
+                }
+            }
+            "array_type" | "implicit_length_array_type" | "slice_type" => {
+                if let Some(element) = node.child_by_field_name("element") {
+                    stack.push(element);
+                }
+            }
+            "qualified_type" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    stack.push(name);
+                }
+            }
+            _ => stack.extend(
+                named_children(node)
+                    .into_iter()
+                    .rev()
+                    .filter(|child| !child.is_extra()),
+            ),
         }
     }
+    None
 }
 
 pub fn go_struct_field_suffix(node: Node<'_>, source: &str) -> String {
@@ -1057,19 +1087,20 @@ pub fn go_field_inline_container_type(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| matches!(child.kind(), "struct_type" | "interface_type"))
 }
 
-pub fn go_value_is_simple_literal(value: &str) -> bool {
-    let trimmed = value.trim();
-    brokk_bifrost_core::analyzer::test_assertions::is_common_assertion_literal(trimmed)
-        || matches!(trimmed, "iota" | "true" | "false" | "nil")
-        || trimmed.parse::<i128>().is_ok()
-        || (trimmed.starts_with('`') && trimmed.ends_with('`'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-}
-
-/// Whether a Go struct `field_declaration` is an embedded (anonymous) field.
-pub fn go_field_declaration_is_embedded(node: Node<'_>) -> bool {
-    node.child_by_field_name("name")
-        .is_none_or(|name| name.kind() == "type_identifier")
+pub fn go_value_is_simple_literal(value: Node<'_>) -> bool {
+    matches!(
+        value.kind(),
+        "int_literal"
+            | "float_literal"
+            | "imaginary_literal"
+            | "rune_literal"
+            | "raw_string_literal"
+            | "interpreted_string_literal"
+            | "iota"
+            | "true"
+            | "false"
+            | "nil"
+    )
 }
 
 pub fn parse_go_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
@@ -1815,7 +1846,6 @@ where
 
     fn register_value_spec(&mut self, node: Node<'_>, keyword: &'static str) {
         let names = children_by_field(node, "name");
-        let identifier_count = names.len();
         let range_node = sole_spec_declaration_node(
             node,
             node.kind(),
@@ -1851,7 +1881,7 @@ where
             );
             self.parsed.add_signature(
                 code_unit.clone(),
-                go_value_signature(node, self.source, keyword, name, identifier_count),
+                go_value_signature(node, self.source, name),
             );
             self.source_declaration(range_node, Some(name_node), code_unit);
         }
@@ -2691,6 +2721,306 @@ mod tests {
     use super::*;
     use crate::parse::parse_go;
 
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn syntax_nodes<'a>(tree: &'a Tree, kind: &str) -> Vec<Node<'a>> {
+        let mut nodes = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind {
+                nodes.push(node);
+            }
+            stack.extend(named_children(node).into_iter().rev());
+        }
+        nodes
+    }
+
+    #[test]
+    #[hardwon(
+        "a23aa6f37f80: generic embeddings were omitted; #7317 review found array lengths hiding element names"
+    )]
+    fn embedded_type_grammar_fields_preserve_names_and_supertypes() {
+        let source = "package p\ntype S struct { pkg.T; Box[int]; *pkg.Box[string] }\ntype Child interface { Base[int]; /* note */ Other }\nvar Array [N]T\n";
+        let tree = parse_go(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let fields = syntax_nodes(&tree, "field_declaration");
+        for (field, expected) in fields.into_iter().zip(["T", "Box", "Box"]) {
+            let ty = field.child_by_field_name("type").unwrap();
+            let name = go_embedded_field_name_node(ty).unwrap();
+            assert_eq!(go_node_text(name, source), expected);
+            assert_eq!(name.kind(), "type_identifier");
+            assert_eq!(extract_go_type_name(ty, source).as_deref(), Some(expected));
+        }
+        let array = syntax_nodes(&tree, "array_type")[0];
+        assert_eq!(extract_go_type_name(array, source).as_deref(), Some("T"));
+        let interface = syntax_nodes(&tree, "interface_type")[0];
+        assert_eq!(
+            go_embedded_type_texts(interface, source),
+            ["Base[int]", "Other"]
+        );
+        let root = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(root.path().to_path_buf(), "shapes.go");
+        let parsed = parse_go_file(&file, source, &tree);
+        let supers = parsed
+            .raw_supertypes
+            .iter()
+            .find(|(unit, _)| unit.short_name() == "Child")
+            .unwrap()
+            .1;
+        assert_eq!(supers, &["Base[int]", "Other"]);
+    }
+
+    #[test]
+    #[hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: comments and expression delimiters corrupted value signatures"
+    )]
+    fn value_spec_fields_determine_compact_signatures() {
+        let source = concat!(
+            "package p\n",
+            "var Comment /* = misleading */ int\n",
+            "const Hex = 0xff\nconst Binary = 0b101\nconst Octal = 0o77\nconst Imaginary = 2i\n",
+            "const Joined = `a` + `b`\nconst Quoted = \"a\" + \"b\"\n",
+            "const Boolean = true\nconst Ordinal = iota\nconst Text = \"x\"\nconst Raw = `x`\n",
+            "var PairA, PairB = 1, 2\nvar Called = make([]int, 1)\n"
+        );
+        let tree = parse_go(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let root = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(root.path().to_path_buf(), "values.go");
+        let parsed = parse_go_file(&file, source, &tree);
+        let mut signatures = parsed
+            .signatures
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        signatures.sort_unstable();
+        assert_eq!(
+            signatures,
+            [
+                "Binary = 0b101",
+                "Boolean = true",
+                "Called",
+                "Comment int",
+                "Hex = 0xff",
+                "Imaginary = 2i",
+                "Joined",
+                "Octal = 0o77",
+                "Ordinal = iota",
+                "PairA",
+                "PairB",
+                "Quoted",
+                "Raw = `x`",
+                "Text = \"x\""
+            ]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: interpreted import paths retained escape syntax"
+    )]
+    fn import_literal_grammar_preserves_decoded_values_and_aliases() {
+        for (literal, expected) in [
+            (r#""\x66mt""#, "fmt"),
+            (r#""\146\u006dt""#, "fmt"),
+            ("`example.com/a/b`", "example.com/a/b"),
+            (r#""example.com/a/b""#, "example.com/a/b"),
+            (r#""example.com/a/\x62""#, "example.com/a/b"),
+            ("`example.com/\ra/b`", "example.com/a/b"),
+        ] {
+            for alias in [None, Some("alias"), Some("."), Some("_")] {
+                let source = format!(
+                    "package p\nimport (\n{} {literal}\n)\n",
+                    alias.unwrap_or("")
+                );
+                let tree = parse_go(&source).unwrap();
+                assert!(!tree.root_node().has_error());
+                let spec = syntax_nodes(&tree, "import_spec")[0];
+                let (path, actual_alias) = go_import_spec_parts(spec, &source).unwrap();
+                assert_eq!(path, expected);
+                assert_eq!(actual_alias, alias);
+                let borrowed = !literal.contains('\\') && !literal.contains('\r');
+                assert_eq!(matches!(&path, Cow::Borrowed(_)), borrowed);
+                let syntax = parse_go_import_spec_syntax(spec, &source).unwrap();
+                assert!(
+                    syntax
+                        .segments
+                        .iter()
+                        .all(|segment| matches!(segment, Cow::Borrowed(_)) == borrowed)
+                );
+                let binding = go_import_spec_binding_name(spec, &source).unwrap();
+                assert_eq!(
+                    binding.as_ref(),
+                    alias.unwrap_or_else(|| expected.rsplit('/').next().unwrap())
+                );
+                assert_eq!(
+                    matches!(binding, Cow::Borrowed(_)),
+                    alias.is_some() || borrowed
+                );
+                let info = parse_go_import_spec(spec, &source).unwrap();
+                assert!(!info.is_wildcard);
+                assert!(!info.is_global);
+                assert_eq!(info.alias.as_deref(), alias);
+                assert_eq!(
+                    info.binder_span,
+                    spec.child_by_field_name("name")
+                        .map(brokk_bifrost_core::analyzer::common::node_span)
+                );
+                assert_eq!(info.path.unwrap().segments.join("/"), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn universe_type_table_matches_go_specification() {
+        // go/types.Universe TypeName objects, independently enumerated by Go.
+        for name in [
+            "any",
+            "bool",
+            "byte",
+            "comparable",
+            "complex64",
+            "complex128",
+            "error",
+            "float32",
+            "float64",
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "rune",
+            "string",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "uintptr",
+        ] {
+            assert!(is_predeclared_go_type(name), "{name}");
+        }
+        for name in ["run", "Int", "append", "true", "nil", "iota", "len"] {
+            assert!(!is_predeclared_go_type(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn callable_grammar_fields_preserve_parameter_and_result_positions() {
+        let source = "package p\nfunc Plain(x int) string { return \"\" }\nfunc Grouped(x, y int, rest ...string) (a, b int, c string) { return }\nfunc Unnamed(int, string) {}\nfunc Mixed() (chan int, string) { return nil, \"\" }\nfunc Maps() (map[string]int, error) { return nil, nil }\n";
+        let tree = parse_go(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        for (node, expected_parameters, expected_results) in
+            syntax_nodes(&tree, "function_declaration")
+                .into_iter()
+                .zip([
+                    vec!["int"],
+                    vec!["int", "int", "string"],
+                    vec!["int", "string"],
+                    vec![],
+                    vec![],
+                ])
+                .zip([
+                    vec![],
+                    vec!["int", "int", "string"],
+                    vec![],
+                    vec![],
+                    vec!["map[string]int", "error"],
+                ])
+                .map(|((a, b), c)| (a, b, c))
+        {
+            let (signature, parameters) = go_function_signature(node, source);
+            let metadata = go_signature_metadata_with_identities(
+                signature,
+                node,
+                source,
+                &parameters,
+                None,
+                None,
+            );
+            let identities = metadata.parameter_type_identities();
+            assert_eq!(identities.len(), expected_parameters.len());
+            for (identity, expected) in identities.iter().zip(expected_parameters) {
+                let ty_source = format!("package p\nvar v {expected}\n");
+                let ty_tree = parse_go(&ty_source).unwrap();
+                let ty = syntax_nodes(&ty_tree, "var_spec")[0]
+                    .child_by_field_name("type")
+                    .unwrap();
+                assert_eq!(*identity, go_structured_type_identity(ty, &ty_source));
+            }
+            let expected = expected_results
+                .iter()
+                .map(|ty| {
+                    let text = format!("package p\nvar v {ty}\n");
+                    let tree = parse_go(&text).unwrap();
+                    if *ty == "map[string]int" {
+                        let mut builder = StructuredTypeIdentityBuilder::default();
+                        let key = builder
+                            .named(
+                                StructuredTypeName::new(vec!["string".into()], vec![], false)
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        let value = builder
+                            .named(
+                                StructuredTypeName::new(vec!["int".into()], vec![], false).unwrap(),
+                            )
+                            .unwrap();
+                        let map = builder.map(key, value).unwrap();
+                        builder.finish(map).unwrap()
+                    } else {
+                        go_structured_type_identity(
+                            syntax_nodes(&tree, "var_spec")[0]
+                                .child_by_field_name("type")
+                                .unwrap(),
+                            &text,
+                        )
+                        .unwrap()
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(metadata.result_type_identities(), expected);
+            if go_node_text(node.child_by_field_name("name").unwrap(), source) == "Plain" {
+                assert_eq!(metadata.return_type_text(), Some("string"));
+            }
+        }
+    }
+
+    #[test]
+    fn coordinated_native_walk_preserves_skipped_subtrees() {
+        let source = "package p\nimport (alias \"example.com/lib\"; . \"example.com/dot\"; _ \"example.com/blank\")\ntype Generic[T any] struct{}\ntype Holder struct { Value Generic[struct { Hidden int }] }\ntype M map[string]struct { Hidden int }\ntype F func() interface { Hidden() }\nfunc Keep(arg int) { _ = arg }\n";
+        let tree = parse_go(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let root = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(root.path().to_path_buf(), "subtrees.go");
+        let parsed = parse_go_file(&file, source, &tree);
+        let direct = crate::resolution::extract_go_resolution_facts(tree.root_node(), source);
+        assert!(
+            direct.names.iter().any(|name| name.spelling == "Keep"),
+            "{direct:?}"
+        );
+        assert_eq!(parsed.resolution_facts, direct);
+    }
+
+    #[test]
+    fn identifier_inventory_uses_only_syntax_tokens() {
+        let source = "package p\nimport (alias \"example.com/lib\"; . \"example.com/dot\"; _ \"example.com/blank\")\ntype Box struct { Field int }\nfunc F(arg Box) { _ = arg; _ = \"fakeToken\" }\n// fakeComment\n";
+        let tree = parse_go(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let root = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(root.path().to_path_buf(), "inventory.go");
+        let parsed = parse_go_file(&file, source, &tree);
+        let mut expected = ["p", "alias", "_", "Box", "Field", "int", "F", "arg"]
+            .map(String::from)
+            .into_iter()
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let mut actual = parsed.type_identifiers.iter().cloned().collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn callable_metadata_records_go_receiver_contracts_structurally() {
         const SOURCE: &str = concat!(
@@ -2782,4 +3112,25 @@ go 1.22
             "an interface method is dispatched on the interface value"
         );
     }
+}
+
+/// tree-sitter-go has no `nil` alternative among type nodes, so `case nil`
+/// parses its entry as a type_identifier; the name tells the two apart.
+pub(crate) fn go_is_nil_case_entry(entry: Node<'_>, source: &str) -> bool {
+    entry.kind() == "type_identifier" && go_node_text(entry, source).trim() == "nil"
+}
+
+/// Go gives a clause alias its case type only for one non-nil entry.
+pub fn go_single_type_switch_case_type<'tree>(
+    clause: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if clause.kind() != "type_case" {
+        return None;
+    }
+    let mut entries = children_by_field(clause, "type")
+        .into_iter()
+        .filter(|entry| entry.is_named());
+    let entry = entries.next()?;
+    (entries.next().is_none() && !go_is_nil_case_entry(entry, source)).then_some(entry)
 }

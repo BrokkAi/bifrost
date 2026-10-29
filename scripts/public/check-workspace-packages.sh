@@ -9,6 +9,10 @@ readonly cargo_patch_args=("${RELEASE_CRATE_PATCH_ARGS[@]}")
 readonly max_crate_bytes="${MAX_CRATE_BYTES:-10000000}"
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 readonly repo_root
+if [[ -d "$repo_root/crates/workspace-hack" ]]; then
+  exec node "$repo_root/scripts/public/with-release-workspace.mjs" \
+    bash scripts/public/check-workspace-packages.sh "$@"
+fi
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/bifrost-package-set.XXXXXX")
 readonly temporary
 trap 'rm -rf "$temporary"' EXIT INT TERM
@@ -73,6 +77,15 @@ for package in "${packages[@]}"; do
   require_archive_file "$package" Cargo.toml
   require_archive_file "$package" src/lib.rs
   package_files=$(tar -tzf "$archive" | sed 's@^[^/]*/@@')
+  for manifest in Cargo.toml Cargo.toml.orig Cargo.lock; do
+    if grep -Fxq "$manifest" <<<"$package_files"; then
+      manifest_contents=$(tar -xOf "$archive" "${package}-${version}/$manifest")
+      if [[ "$manifest_contents" == *workspace-hack* ]]; then
+        echo "$package archive retains workspace-hack in $manifest" >&2
+        exit 1
+      fi
+    fi
+  done
   if grep -Eq '^(tests/|src/bin/.*-test-server[.]rs$)' <<<"$package_files"; then
     echo "$package archive contains package-test implementation files:" >&2
     grep -E '^(tests/|src/bin/.*-test-server[.]rs$)' <<<"$package_files" >&2

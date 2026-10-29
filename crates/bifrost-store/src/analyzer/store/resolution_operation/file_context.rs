@@ -29,6 +29,13 @@ pub(super) struct PeerSelection {
     pub(super) source_role: String,
 }
 
+/// The concrete memo key owns its relation and every ordered SQL binding.
+pub(super) trait PackagePeerRelation {
+    const RELATION: &'static str;
+
+    fn params(&self) -> impl rusqlite::Params;
+}
+
 type PreparedPackageMembers = Arc<HashMap<SemanticId, Vec<LoweredPackageMember>>>;
 
 #[derive(Default)]
@@ -139,12 +146,8 @@ impl SelectedResolutionOperation<'_, '_> {
             .ready
             .inventory
             .connection()
-            .prepare_cached(super::go_same_package::PACKAGE_PEER_MOUNTS)?;
-        let mut rows = statement.query(rusqlite::params![
-            request.context_id,
-            request.package,
-            request.source_role
-        ])?;
+            .prepare_cached(PeerSelection::RELATION)?;
+        let mut rows = statement.query(request.params())?;
         let mut peers = Vec::new();
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {

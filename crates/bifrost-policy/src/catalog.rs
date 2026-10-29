@@ -18,9 +18,11 @@ use super::definition::{
     CatalogRef, EndpointObservationPhase, MAX_POLICY_DISPLAY_TEXT_BYTES, MAX_POLICY_SET_ITEMS,
     POLICY_DOCUMENT_SCHEMA_VERSION, PolicyCategoryId, PolicyEndpointBinding, PolicyId, PolicyPort,
     PolicySelector, TaintCatalogHash, TaintEntryId, TaintExternalModelSpec, TaintImpact,
-    TaintLabel, TaintSanitizerSpec, TaintSinkSpec, TaintSourceEvidence, TaintSourceSpec,
-    TaintSystemEntry, TaintTag, TaintThreatModel, TaintTransferEffect, TaintTransferSpec,
-    TaintTransformSpec, TaintTrustBoundary, TypestateCallBinding, TypestateSeedBinding,
+    TaintLabel, TaintSanitizerCondition, TaintSanitizerKind, TaintSanitizerOperand,
+    TaintSanitizerRequirement, TaintSanitizerResult, TaintSanitizerSpec, TaintSanitizerWhen,
+    TaintSinkSpec, TaintSourceEvidence, TaintSourceSpec, TaintSystemEntry, TaintTag,
+    TaintThreatModel, TaintTransferEffect, TaintTransferSpec, TaintTransformSpec,
+    TaintTrustBoundary, TypestateCallBinding, TypestateSeedBinding, validate_sanitizer_arity,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
@@ -45,6 +47,7 @@ pub struct TaintCatalogDefinition {
     pub schema_version: u32,
     pub name: PolicyId,
     pub version: u32,
+    pub categories: Vec<PolicyCategoryId>,
     pub sources: Vec<TaintSourceSpec>,
     pub sinks: Vec<TaintSinkSpec>,
     pub sanitizers: Vec<TaintSanitizerSpec>,
@@ -331,15 +334,25 @@ impl TaintCatalogRegistry {
         &self,
         reference: &CatalogRef,
     ) -> Result<&RegisteredTaintCatalog, CatalogRegistryError> {
+        let CatalogRef::Named {
+            name,
+            version,
+            sha256,
+        } = reference
+        else {
+            return Err(CatalogRegistryError::InvalidModel(
+                "a wildcard cannot name an exact catalog endpoint".into(),
+            ));
+        };
         let identity = TaintCatalogIdentity {
-            name: reference.name.clone(),
-            version: reference.version,
+            name: name.clone(),
+            version: *version,
         };
         let catalog = self
             .catalogs
             .get(&identity)
             .ok_or(CatalogRegistryError::UnknownCatalog { identity })?;
-        if let Some(expected) = reference.sha256
+        if let Some(expected) = *sha256
             && expected != catalog.semantic_hash
         {
             return Err(CatalogRegistryError::HashPinMismatch {
@@ -349,6 +362,37 @@ impl TaintCatalogRegistry {
             });
         }
         Ok(catalog)
+    }
+
+    /// Resolve catalog selection against this run's bounded registry.
+    pub fn select(
+        &self,
+        reference: &CatalogRef,
+    ) -> Result<Vec<&RegisteredTaintCatalog>, CatalogRegistryError> {
+        match reference {
+            CatalogRef::Named { .. } => Ok(vec![self.resolve(reference)?]),
+            CatalogRef::AnyRegistered { predicate } => {
+                if self.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let categories = match predicate {
+                    super::definition::CategoryPredicate::Any { categories }
+                    | super::definition::CategoryPredicate::All { categories } => categories,
+                };
+                for category in categories {
+                    if !self
+                        .catalogs
+                        .values()
+                        .any(|catalog| catalog.definition.categories.contains(category))
+                    {
+                        return Err(CatalogRegistryError::InvalidModel(format!(
+                            "unknown catalog category `{category}`"
+                        )));
+                    }
+                }
+                Ok(self.iter().collect())
+            }
+        }
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &RegisteredTaintCatalog> {
@@ -782,6 +826,36 @@ fn normalize_and_validate_catalog(
     if catalog.version == 0 {
         return Err(CatalogRegistryError::ZeroVersion);
     }
+    if catalog.categories.len() > MAX_POLICY_SET_ITEMS {
+        return Err(CatalogRegistryError::InvalidModel(
+            "catalog category vocabulary exceeds set limit".into(),
+        ));
+    }
+    catalog.categories.sort();
+    catalog.categories.dedup();
+    for categories in catalog
+        .sources
+        .iter()
+        .map(|entry| &entry.categories)
+        .chain(catalog.sinks.iter().map(|entry| &entry.categories))
+        .chain(catalog.sanitizers.iter().map(|entry| &entry.categories))
+        .chain(catalog.transforms.iter().map(|entry| &entry.categories))
+        .chain(
+            catalog
+                .external_models
+                .iter()
+                .map(|entry| &entry.categories),
+        )
+    {
+        for category in categories {
+            if !catalog.categories.contains(category) {
+                return Err(CatalogRegistryError::InvalidModel(format!(
+                    "catalog `{}` entry uses undeclared category `{category}`",
+                    catalog.name
+                )));
+            }
+        }
+    }
     let entry_count = catalog.entry_count();
     if entry_count == 0 {
         return Err(CatalogRegistryError::EmptyCatalog);
@@ -964,25 +1038,61 @@ fn normalize_sink(sink: &mut TaintSinkSpec) -> Result<(), CatalogRegistryError> 
 }
 
 fn normalize_sanitizer(sanitizer: &mut TaintSanitizerSpec) -> Result<(), CatalogRegistryError> {
+    normalize_set(
+        CatalogEntryKind::Sanitizer,
+        &sanitizer.id,
+        "categories",
+        &mut sanitizer.categories,
+    )?;
     validate_selector(&sanitizer.id, &sanitizer.selector)?;
-    reject_field_port(CatalogEntryKind::Sanitizer, &sanitizer.id, &sanitizer.input)?;
-    reject_field_port(
-        CatalogEntryKind::Sanitizer,
-        &sanitizer.id,
-        &sanitizer.output,
-    )?;
-    validate_port(
-        CatalogEntryKind::Sanitizer,
-        &sanitizer.id,
-        "input",
-        &sanitizer.input,
-    )?;
-    validate_port(
-        CatalogEntryKind::Sanitizer,
-        &sanitizer.id,
-        "output",
-        &sanitizer.output,
-    )?;
+    match &mut sanitizer.kind {
+        TaintSanitizerKind::Transfer { input, output } => {
+            reject_field_port(CatalogEntryKind::Sanitizer, &sanitizer.id, input)?;
+            reject_field_port(CatalogEntryKind::Sanitizer, &sanitizer.id, output)?;
+            validate_port(CatalogEntryKind::Sanitizer, &sanitizer.id, "input", input)?;
+            validate_port(CatalogEntryKind::Sanitizer, &sanitizer.id, "output", output)?;
+        }
+        TaintSanitizerKind::Conditional { requires, .. } => {
+            if requires.len() > 64 {
+                return Err(CatalogRegistryError::InvalidModel(
+                    "too many sanitizer requirements".into(),
+                ));
+            }
+            let mut keys = HashSet::new();
+            for item in requires.iter() {
+                if let TaintSanitizerCondition::ResultOf(selector) = &item.condition {
+                    validate_selector(&sanitizer.id, selector)?;
+                }
+                if let TaintSanitizerCondition::Equals(literal) = &item.condition
+                    && !matches!(
+                        literal,
+                        Value::String(_) | Value::Number(_) | Value::Bool(_)
+                    )
+                {
+                    return Err(CatalogRegistryError::InvalidModel(
+                        "sanitizer equals requires a string, number or Boolean literal".into(),
+                    ));
+                }
+                let key = serde_json_canonicalizer::to_vec(
+                    &crate::canonical::sanitizer_requirement_to_json(item),
+                )
+                .expect("sanitizer requirement encodes as JSON");
+                if !keys.insert(key) {
+                    return Err(CatalogRegistryError::InvalidModel(
+                        "duplicate sanitizer requirement".into(),
+                    ));
+                }
+            }
+            requires.sort_by_cached_key(|item| {
+                serde_json_canonicalizer::to_vec(&crate::canonical::sanitizer_requirement_to_json(
+                    item,
+                ))
+                .expect("sanitizer requirement encodes as JSON")
+            });
+        }
+    }
+    validate_sanitizer_arity(&sanitizer.selector, &sanitizer.kind)
+        .map_err(CatalogRegistryError::InvalidModel)?;
     normalize_nonempty_set(
         CatalogEntryKind::Sanitizer,
         &sanitizer.id,
@@ -992,6 +1102,12 @@ fn normalize_sanitizer(sanitizer: &mut TaintSanitizerSpec) -> Result<(), Catalog
 }
 
 fn normalize_transform(transform: &mut TaintTransformSpec) -> Result<(), CatalogRegistryError> {
+    normalize_set(
+        CatalogEntryKind::Transform,
+        &transform.id,
+        "categories",
+        &mut transform.categories,
+    )?;
     validate_selector(&transform.id, &transform.selector)?;
     reject_field_port(CatalogEntryKind::Transform, &transform.id, &transform.input)?;
     reject_field_port(
@@ -1036,6 +1152,12 @@ fn normalize_transform(transform: &mut TaintTransformSpec) -> Result<(), Catalog
 fn normalize_external_model(
     model: &mut TaintExternalModelSpec,
 ) -> Result<(), CatalogRegistryError> {
+    normalize_set(
+        CatalogEntryKind::ExternalModel,
+        &model.id,
+        "categories",
+        &mut model.categories,
+    )?;
     validate_selector(&model.id, &model.selector)?;
     if model.transfers.is_empty() {
         return invalid_entry(
@@ -1297,6 +1419,7 @@ struct CatalogWire {
     schema_version: u32,
     name: String,
     version: u32,
+    categories: Vec<String>,
     sources: Vec<SourceWire>,
     sinks: Vec<SinkWire>,
     sanitizers: Vec<SanitizerWire>,
@@ -1340,19 +1463,162 @@ struct SinkWire {
     impacts: Vec<String>,
 }
 
+fn deserialize_sanitizer_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SanitizerWire {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    categories: Vec<String>,
     id: String,
     selector: SelectorWire,
-    input: PortWire,
-    output: PortWire,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    input: Option<PortWire>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    output: Option<PortWire>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    when: Option<SanitizerWhenWire>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    sanitizes: Option<SanitizerOperandWire>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    requires: Option<Vec<SanitizerRequirementWire>>,
     removes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SanitizerWhenWire {
+    result: SanitizerResultWire,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SanitizerResultWire {
+    True,
+    False,
+    Nil,
+    NonNil,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum SanitizerOperandWire {
+    Receiver {},
+    Argument { index: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SanitizerRequirementWire {
+    operand: SanitizerOperandWire,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    constant: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    equals: Option<SanitizerLiteralWire>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sanitizer_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    result_of: Option<SelectorWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SanitizerLiteralWire {
+    String(String),
+    Number(serde_json::Number),
+    Boolean(bool),
+}
+
+impl From<SanitizerOperandWire> for TaintSanitizerOperand {
+    fn from(value: SanitizerOperandWire) -> Self {
+        match value {
+            SanitizerOperandWire::Receiver {} => Self::Receiver,
+            SanitizerOperandWire::Argument { index } => Self::Argument { index },
+        }
+    }
+}
+impl From<TaintSanitizerOperand> for SanitizerOperandWire {
+    fn from(value: TaintSanitizerOperand) -> Self {
+        match value {
+            TaintSanitizerOperand::Receiver => Self::Receiver {},
+            TaintSanitizerOperand::Argument { index } => Self::Argument { index },
+        }
+    }
+}
+impl From<SanitizerWhenWire> for TaintSanitizerWhen {
+    fn from(value: SanitizerWhenWire) -> Self {
+        Self {
+            index: value.index,
+            result: match value.result {
+                SanitizerResultWire::True => TaintSanitizerResult::True,
+                SanitizerResultWire::False => TaintSanitizerResult::False,
+                SanitizerResultWire::Nil => TaintSanitizerResult::Nil,
+                SanitizerResultWire::NonNil => TaintSanitizerResult::NonNil,
+            },
+        }
+    }
+}
+impl From<TaintSanitizerWhen> for SanitizerWhenWire {
+    fn from(value: TaintSanitizerWhen) -> Self {
+        Self {
+            index: value.index,
+            result: match value.result {
+                TaintSanitizerResult::True => SanitizerResultWire::True,
+                TaintSanitizerResult::False => SanitizerResultWire::False,
+                TaintSanitizerResult::Nil => SanitizerResultWire::Nil,
+                TaintSanitizerResult::NonNil => SanitizerResultWire::NonNil,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransformWire {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    categories: Vec<String>,
     id: String,
     selector: SelectorWire,
     input: PortWire,
@@ -1364,6 +1630,8 @@ struct TransformWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExternalModelWire {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    categories: Vec<String>,
     id: String,
     selector: SelectorWire,
     transfers: Vec<TransferWire>,
@@ -1577,6 +1845,12 @@ impl TryFrom<CatalogWire> for TaintCatalogDefinition {
             schema_version: wire.schema_version,
             name: PolicyId::new(wire.name).map_err(invalid_wire_identifier("catalog name"))?,
             version: wire.version,
+            categories: wire
+                .categories
+                .into_iter()
+                .map(PolicyCategoryId::new)
+                .collect::<Result<_, _>>()
+                .map_err(invalid_wire_identifier("catalog category"))?,
             sources: wire
                 .sources
                 .into_iter()
@@ -1632,6 +1906,11 @@ impl From<&TaintCatalogDefinition> for CatalogWire {
             schema_version: definition.schema_version,
             name: definition.name.as_str().to_string(),
             version: definition.version,
+            categories: definition
+                .categories
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             sources: definition.sources.iter().map(SourceWire::from).collect(),
             sinks: definition.sinks.iter().map(SinkWire::from).collect(),
             sanitizers: definition
@@ -1832,14 +2111,36 @@ impl From<&TaintSinkSpec> for SinkWire {
 
 impl TryFrom<SanitizerWire> for TaintSanitizerSpec {
     type Error = CatalogRegistryError;
-
     fn try_from(wire: SanitizerWire) -> Result<Self, Self::Error> {
         let id = TaintEntryId::new(wire.id).map_err(invalid_wire_identifier("sanitizer ID"))?;
+        let kind = match (wire.input, wire.output, wire.when, wire.sanitizes, wire.requires) {
+            (Some(input), Some(output), None, None, None) => TaintSanitizerKind::Transfer { input: input.into(), output: output.into() },
+            (None, None, Some(when), Some(sanitizes), requires) => {
+                if requires.as_ref().is_some_and(Vec::is_empty) {
+                    return Err(CatalogRegistryError::InvalidModel("sanitizer requires must not be empty".into()));
+                }
+                let requires = requires.unwrap_or_default().into_iter().map(|item| {
+                    let condition = match (item.constant, item.equals, item.result_of) {
+                        (Some(true), None, None) => TaintSanitizerCondition::Constant,
+                        (None, Some(literal), None) => TaintSanitizerCondition::Equals(match literal {
+                            SanitizerLiteralWire::String(value) => Value::String(value),
+                            SanitizerLiteralWire::Number(value) => Value::Number(value),
+                            SanitizerLiteralWire::Boolean(value) => Value::Bool(value),
+                        }),
+                        (None, None, Some(selector)) => TaintSanitizerCondition::ResultOf(decode_selector(&id, selector)?),
+                        _ => return Err(CatalogRegistryError::InvalidModel("sanitizer requirement needs exactly one of constant:true, equals or result_of".into())),
+                    };
+                    Ok(TaintSanitizerRequirement { operand: item.operand.into(), condition })
+                }).collect::<Result<Vec<_>, CatalogRegistryError>>()?;
+                TaintSanitizerKind::Conditional { when: when.into(), sanitizes: sanitizes.into(), requires }
+            }
+            _ => return Err(CatalogRegistryError::InvalidModel("use exactly one sanitizer shape: input/output or when/sanitizes with optional requires".into())),
+        };
         Ok(Self {
+            categories: parse_ids(wire.categories, PolicyCategoryId::new, "category")?,
             selector: decode_selector(&id, wire.selector)?,
             id,
-            input: wire.input.into(),
-            output: wire.output.into(),
+            kind,
             removes: parse_ids(wire.removes, TaintLabel::new, "sanitizer label")?,
         })
     }
@@ -1847,20 +2148,48 @@ impl TryFrom<SanitizerWire> for TaintSanitizerSpec {
 
 impl From<&TaintSanitizerSpec> for SanitizerWire {
     fn from(spec: &TaintSanitizerSpec) -> Self {
-        let (id, selector, input, output, removes) = taint_port_transform_wire_fields(
-            &spec.id,
-            &spec.selector,
-            &spec.input,
-            &spec.output,
-            &spec.removes,
-        );
-        Self {
-            id,
-            selector,
-            input,
-            output,
-            removes,
+        let mut wire = Self {
+            categories: display_ids(&spec.categories),
+            id: spec.id.as_str().to_owned(),
+            selector: encode_selector(&spec.selector),
+            input: None,
+            output: None,
+            when: None,
+            sanitizes: None,
+            requires: None,
+            removes: display_ids(&spec.removes),
+        };
+        match &spec.kind {
+            TaintSanitizerKind::Transfer { input, output } => {
+                wire.input = Some(PortWire::from(input));
+                wire.output = Some(PortWire::from(output));
+            }
+            TaintSanitizerKind::Conditional {
+                when,
+                sanitizes,
+                requires,
+            } => {
+                wire.when = Some((*when).into());
+                wire.sanitizes = Some((*sanitizes).into());
+                if !requires.is_empty() {
+                    wire.requires = Some(requires.iter().map(|requirement| {
+                        let mut item = SanitizerRequirementWire { operand: requirement.operand.into(), constant: None, equals: None, result_of: None };
+                        match &requirement.condition {
+                            TaintSanitizerCondition::Constant => item.constant = Some(true),
+                            TaintSanitizerCondition::Equals(literal) => item.equals = Some(match literal {
+                                Value::String(value) => SanitizerLiteralWire::String(value.clone()),
+                                Value::Number(value) => SanitizerLiteralWire::Number(value.clone()),
+                                Value::Bool(value) => SanitizerLiteralWire::Boolean(*value),
+                                _ => unreachable!("sanitizer equals literals are string, number or Boolean"),
+                            }),
+                            TaintSanitizerCondition::ResultOf(selector) => item.result_of = Some(encode_selector(selector)),
+                        }
+                        item
+                    }).collect());
+                }
+            }
         }
+        wire
     }
 }
 
@@ -1870,6 +2199,7 @@ impl TryFrom<TransformWire> for TaintTransformSpec {
     fn try_from(wire: TransformWire) -> Result<Self, Self::Error> {
         let id = TaintEntryId::new(wire.id).map_err(invalid_wire_identifier("transform ID"))?;
         Ok(Self {
+            categories: parse_ids(wire.categories, PolicyCategoryId::new, "category")?,
             selector: decode_selector(&id, wire.selector)?,
             id,
             input: wire.input.into(),
@@ -1890,6 +2220,7 @@ impl From<&TaintTransformSpec> for TransformWire {
             &spec.removes,
         );
         Self {
+            categories: display_ids(&spec.categories),
             id,
             selector,
             input,
@@ -1907,6 +2238,7 @@ impl TryFrom<ExternalModelWire> for TaintExternalModelSpec {
         let id =
             TaintEntryId::new(wire.id).map_err(invalid_wire_identifier("external-model ID"))?;
         Ok(Self {
+            categories: parse_ids(wire.categories, PolicyCategoryId::new, "category")?,
             selector: decode_selector(&id, wire.selector)?,
             id,
             transfers: wire
@@ -1921,6 +2253,7 @@ impl TryFrom<ExternalModelWire> for TaintExternalModelSpec {
 impl From<&TaintExternalModelSpec> for ExternalModelWire {
     fn from(spec: &TaintExternalModelSpec) -> Self {
         Self {
+            categories: display_ids(&spec.categories),
             id: spec.id.as_str().to_string(),
             selector: encode_selector(&spec.selector),
             transfers: spec.transfers.iter().map(TransferWire::from).collect(),
@@ -2182,6 +2515,10 @@ mod tests {
 
     fn catalog(name: &str, source_id: &str, display: &str) -> TaintCatalogDefinition {
         TaintCatalogDefinition {
+            categories: vec![
+                PolicyCategoryId::new("input.user").unwrap(),
+                PolicyCategoryId::new("sink.data").unwrap(),
+            ],
             schema_version: 1,
             name: PolicyId::new(name).unwrap(),
             version: 1,
@@ -2191,6 +2528,97 @@ mod tests {
             transforms: vec![],
             external_models: vec![],
         }
+    }
+
+    #[test]
+    fn conditional_sanitizer_catalog_round_trip_enforces_the_wire_contract() {
+        let source = r#"(policy :id test.guard :name "Guard" :message "M" :severity warning
+          :analysis (analysis :type taint :mode may :sources (endpoint-set) :sinks (endpoint-set)
+            :sanitizers (endpoint-set :entries [(sanitizer :id guard :selector (rql :schema-version 1 (call (arity 2)))
+              :when (result false :index 1) :sanitizes (argument :index 0)
+              :requires [(receiver :result-of (rql :schema-version 1 (call))) (argument :index 1 :equals "..")
+                         (argument :index 0 :constant true)] :removes [secret])])) )"#;
+        let parsed =
+            crate::parse_rqlp_source(source, crate::PolicySourceIdentity::new("test")).unwrap();
+        let crate::RqlpDocument::Policy { definition } = parsed.document() else {
+            panic!("expected policy")
+        };
+        let crate::PolicyAnalysis::Taint { spec } = &definition.analysis else {
+            panic!("expected taint")
+        };
+        let mut definition = catalog("test.guard", "request", "request");
+        definition.sanitizers = spec.sanitizers.entries.clone();
+        let mut typed = TaintCatalogRegistry::new_without_workspace(Default::default());
+        let hash = typed.register(definition).unwrap();
+        let bytes = typed.iter().next().unwrap().canonical_json();
+        let mut wire = TaintCatalogRegistry::new_without_workspace(Default::default());
+        assert_eq!(
+            wire.register_json_bytes(CatalogSourceIdentity::new("test").unwrap(), bytes)
+                .unwrap(),
+            hash
+        );
+        assert_eq!(wire.iter().next().unwrap().canonical_json(), bytes);
+        let value: Value = serde_json::from_slice(bytes).unwrap();
+        for (field, payload) in [
+            ("input", serde_json::json!({"type":"receiver"})),
+            ("output", serde_json::json!({"type":"return_value"})),
+            ("input", Value::Null),
+            ("requires", serde_json::json!([])),
+            (
+                "requires",
+                serde_json::json!([{"operand":{"type":"receiver"},"constant":true},{"operand":{"type":"receiver"},"constant":true}]),
+            ),
+            (
+                "requires",
+                serde_json::json!([{"operand":{"type":"argument","index":2},"constant":true}]),
+            ),
+            (
+                "requires",
+                serde_json::json!([{"operand":{"type":"receiver"},"constant":false}]),
+            ),
+            (
+                "requires",
+                serde_json::json!([{"operand":{"type":"receiver"},"constant":true,"equals":null}]),
+            ),
+            ("when", serde_json::json!({"result":"true","unknown":1})),
+            (
+                "sanitizes",
+                serde_json::json!({"type":"receiver","index":0}),
+            ),
+            ("unknown", serde_json::json!(true)),
+        ] {
+            let mut invalid = value.clone();
+            invalid["sanitizers"][0][field] = payload;
+            let result = TaintCatalogRegistry::new_without_workspace(Default::default())
+                .register_json_bytes(
+                    CatalogSourceIdentity::new("test").unwrap(),
+                    &serde_json::to_vec(&invalid).unwrap(),
+                );
+            assert!(result.is_err(), "accepted invalid wire: {invalid}");
+        }
+    }
+
+    #[test]
+    fn transfer_sanitizer_catalog_identity_is_unchanged() {
+        let mut definition = catalog("test.sanitizers", "request", "request");
+        definition.sanitizers.push(TaintSanitizerSpec {
+            categories: vec![],
+            id: TaintEntryId::new("scrub").unwrap(),
+            selector: crate::test_support::inline_match_selector("clean"),
+            kind: crate::definition::TaintSanitizerKind::Transfer {
+                input: PolicyPort::ArgumentIndex { index: 0 },
+                output: PolicyPort::ReturnValue,
+            },
+            removes: vec![TaintLabel::new("secret").unwrap()],
+        });
+        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
+        let hash = registry.register(definition).unwrap();
+        let resolved = registry.iter().next().unwrap();
+        assert_eq!(resolved.canonical_json.len(), 711);
+        assert_eq!(
+            hash.to_string(),
+            "5c5d6f4fcaf8e316cb9bdd46468c2a84e86d0f4906c73c3c763b583d0b54bffc"
+        );
     }
 
     #[test]
@@ -2478,6 +2906,87 @@ mod tests {
         assert_eq!(
             registry.register_json_path("catalogs/default.json"),
             Err(CatalogRegistryError::WorkspaceAccessUnavailable)
+        );
+    }
+}
+
+#[cfg(test)]
+mod category_contract_tests {
+    use super::*;
+    use crate::definition::CategoryPredicate;
+
+    #[test]
+    fn catalog_wire_validates_vocabulary_and_auxiliary_category_selection() {
+        let category = |name| PolicyCategoryId::new(name).unwrap();
+        let mut definition = TaintCatalogDefinition {
+            schema_version: 1,
+            name: PolicyId::new("test.auxiliary").unwrap(),
+            version: 1,
+            categories: vec![category("sql-injection"), category("path-injection")],
+            sources: Vec::new(),
+            sinks: Vec::new(),
+            transforms: Vec::new(),
+            external_models: Vec::new(),
+            sanitizers: [Some("sql-injection"), Some("path-injection"), None]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| TaintSanitizerSpec {
+                    id: TaintEntryId::new(format!("clean-{index}")).unwrap(),
+                    categories: name.map(category).into_iter().collect(),
+                    selector: crate::test_support::inline_match_selector("clean"),
+                    kind: crate::definition::TaintSanitizerKind::Transfer {
+                        input: PolicyPort::ArgumentIndex { index: 0 },
+                        output: PolicyPort::ReturnValue,
+                    },
+                    removes: vec![TaintLabel::new("untrusted").unwrap()],
+                })
+                .collect(),
+        };
+        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
+        let bytes = serde_json::to_vec(&CatalogWire::from(&definition)).unwrap();
+        registry
+            .register_json_bytes(
+                CatalogSourceIdentity::new("test-only auxiliary fixture").unwrap(),
+                &bytes,
+            )
+            .unwrap();
+        let named = CatalogRef::new(definition.name.clone(), 1, None).unwrap();
+        let wildcard = CatalogRef::AnyRegistered {
+            predicate: CategoryPredicate::Any {
+                categories: vec![category("sql-injection")],
+            },
+        };
+        let entries = &registry.select(&wildcard).unwrap()[0]
+            .definition()
+            .sanitizers;
+        let selected = entries
+            .iter()
+            .filter(|entry| wildcard.includes_categories(&entry.categories))
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(selected, ["clean-0"]);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| named.includes_categories(&entry.categories))
+                .count(),
+            3
+        );
+        definition.sanitizers[0].categories = vec![category("sql-injectoin")];
+        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
+        let bytes = serde_json::to_vec(&CatalogWire::from(&definition)).unwrap();
+        let error = registry
+            .register_json_bytes(CatalogSourceIdentity::new("typo").unwrap(), &bytes)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("undeclared category `sql-injectoin`"),
+            "{error}"
+        );
+        assert!(
+            registry.is_empty(),
+            "failed registration must be transactional"
         );
     }
 }

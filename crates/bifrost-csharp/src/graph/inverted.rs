@@ -27,18 +27,18 @@ use crate::graph::resolver::{
     CSharpBuiltinValueArguments, UnqualifiedMethodGroupResolution, argument_count,
     class_unit_for_fq_name, collection_target_element_type_node, extension_visibility_site_key,
     for_local_variable_declarators, invocation_member_candidates_for_owner, is_type_reference_node,
-    nearest_member_candidates_for_owner, node_text, object_created_type,
-    object_creation_collection_target, object_initializer_for_label,
-    object_initializer_owner_type_node, reference_type_text, resolve_arity_free_type_fq_name_at,
-    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
-    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    usage_attribute_type_candidates, usage_class_field_receiver_type, usage_direct_base,
-    usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
-    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
-    usage_visible_extension_method_candidates,
+    nearest_member_candidates_for_owner, node_text, object_creation_collection_target,
+    object_initializer_for_label, object_initializer_owner_type_node, reference_type_text,
+    resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
+    resolve_unqualified_method_group_for_owner, same_node, unqualified_member_has_local_binding,
+    unqualified_member_has_structured_shadow, usage_attribute_type_candidates,
+    usage_class_field_receiver_type, usage_direct_base, usage_member_declared_type_fq_name,
+    usage_method_return_type_fq_name_for_arity, usage_relational_generic_call_has_type_argument,
+    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
 use crate::graph_support::CSharpSource;
 use crate::graph_support::{CSharpCompilationVisibility, identity_visibility};
+use crate::imports::csharp_static_using_from_import;
 use crate::syntax::{
     CSharpMemberName, CSharpNamedArgumentLabel, csharp_attribute_type_names,
     csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
@@ -49,7 +49,9 @@ use crate::syntax::{
     csharp_unqualified_invocation_for_name, map_csharp_type_arguments,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    TreeWalkAction, first_named_child_matching, walk_tree_iterative,
+};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, first_precise,
 };
@@ -76,7 +78,7 @@ pub fn scan_file(
 ) -> PerFileEdges {
     // Every lookup this file's scan makes is held to the file's compilation
     // membership.
-    let membership = MembershipScopedSource::new(csharp.shared_source(), file);
+    let membership = MembershipScopedSource::new(csharp, file);
     let mut ctx = CsScan {
         graph,
         csharp: &membership,
@@ -102,7 +104,7 @@ struct CsScan<'a> {
     graph: &'a CSharpGraphSource<'a>,
     csharp: &'a dyn CSharpSource,
     /// The same source as `csharp`, for its doubt count.
-    membership: &'a MembershipScopedSource,
+    membership: &'a MembershipScopedSource<'a>,
     /// Doubt admitted before the node now being recorded: an edge whose
     /// derivation admitted more is not proven.
     site_doubt: usize,
@@ -482,11 +484,12 @@ fn record_reference(
     {
         record_arity_free_type_candidate(owner, token, ctx, bindings);
     }
-    if !recovered_method_group
-        && let Some(root) = csharp_type_reference_root(node)
-        && same_node(root, node)
-    {
-        record_structured_type_candidate(root, token, false, ctx, bindings);
+    if !recovered_method_group && let Some(root) = csharp_type_reference_root(node) {
+        // Record the canonical type site once. Descendant name nodes belong
+        // to this same site; their shorter spans can inflate the call-site cap.
+        if same_node(root, node) {
+            record_structured_type_candidate(root, token, false, ctx, bindings);
+        }
         return;
     }
     match node.kind() {
@@ -570,6 +573,36 @@ fn record_reference(
                 }
                 if let Some(owner) = ctx.enclosing_class(node.start_byte()).map(str::to_string) {
                     let arity = argument_count(invocation, ctx.source);
+                    let local_candidates = class_unit_for_fq_name(ctx.csharp, token, &owner)
+                        .map(|owner| {
+                            invocation_member_candidates_for_owner(
+                                ctx.graph,
+                                ctx.csharp,
+                                token,
+                                &owner,
+                                name,
+                                explicit_generic_arity,
+                                arity,
+                            )
+                        })
+                        .unwrap_or_default();
+                    if local_candidates.is_empty() {
+                        let imported = imported_static_invocation_candidates(
+                            ctx.graph,
+                            ctx.csharp,
+                            token,
+                            ctx.file,
+                            name,
+                            explicit_generic_arity,
+                            arity,
+                        );
+                        if !imported.is_empty() {
+                            for candidate in imported {
+                                ctx.record(candidate.fq_name(), node);
+                            }
+                            return;
+                        }
+                    }
                     // A bare `Member(..)` is an implicit-this call on the current
                     // instance — a same-owner reference (#1138), now routed to
                     // unproven inbound. This is the inverted routing that unlocks
@@ -614,9 +647,14 @@ fn record_reference(
                             else {
                                 return;
                             };
-                            let resolution = resolve_unqualified_method_group_for_owner(
+                            let mut resolution = resolve_unqualified_method_group_for_owner(
                                 ctx.graph, ctx.csharp, token, &owner, &name,
                             );
+                            if matches!(resolution, UnqualifiedMethodGroupResolution::NoMember) {
+                                resolution = resolve_imported_static_method_group(
+                                    ctx.csharp, token, ctx.file, &name,
+                                );
+                            }
                             let doubted = ctx.membership.doubt() > before;
                             ctx.method_group_cache
                                 .insert(key, (resolution.clone(), doubted));
@@ -720,6 +758,95 @@ fn record_reference(
         }
         _ => {}
     }
+}
+
+fn resolve_imported_static_method_group(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> UnqualifiedMethodGroupResolution {
+    let owners = imported_static_using_owners(csharp, token, file);
+
+    let mut candidates = owners
+        .iter()
+        .flat_map(|owner| csharp.member_candidates_for_owner(owner, name))
+        .filter(|candidate| imported_by_using_static(csharp, candidate))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    match candidates.len() {
+        0 => UnqualifiedMethodGroupResolution::NoMember,
+        1 => UnqualifiedMethodGroupResolution::Unique(candidates.remove(0)),
+        _ => UnqualifiedMethodGroupResolution::Ambiguous(candidates),
+    }
+}
+
+fn imported_static_invocation_candidates(
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    name: &str,
+    explicit_generic_arity: Option<usize>,
+    call_arity: usize,
+) -> Vec<CodeUnit> {
+    let owners = imported_static_using_owners(csharp, token, file);
+
+    // The member lookup walks the owner's hierarchy, so a static inherited
+    // from the named type's base is also admitted; C# imports only members
+    // declared in the named type. A rare over-approximation.
+    let mut candidates = owners
+        .iter()
+        .filter_map(|owner| class_unit_for_fq_name(csharp, token, owner))
+        .flat_map(|owner| {
+            invocation_member_candidates_for_owner(
+                graph,
+                csharp,
+                token,
+                &owner,
+                name,
+                explicit_generic_arity,
+                call_arity,
+            )
+        })
+        .filter(|candidate| imported_by_using_static(csharp, candidate))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// `using static T` imports T's static members for unqualified use, but not
+/// its extension methods: those stay reachable only through extension-method
+/// lookup on a receiver.
+fn imported_by_using_static(csharp: &dyn CSharpSource, candidate: &CodeUnit) -> bool {
+    candidate.is_function()
+        && csharp.signature_metadata(candidate).iter().any(|metadata| {
+            metadata.callable_is_static() && metadata.extension_receiver_type().is_none()
+        })
+}
+
+fn imported_static_using_owners(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Vec<String> {
+    let mut owners = csharp
+        .usage_global_static_using_types()
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect::<Vec<_>>();
+    owners.extend(
+        csharp
+            .import_info_of(token, file)
+            .iter()
+            .filter_map(csharp_static_using_from_import)
+            .map(str::to_string),
+    );
+    owners.sort();
+    owners.dedup();
+    owners
 }
 
 fn record_structured_type_candidate(
@@ -847,57 +974,7 @@ fn receiver_type_fqn(
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
-    match receiver.kind() {
-        "identifier" => {
-            let name = node_text(receiver, ctx.source);
-            // A typed local or nearest inherited member wins over the type
-            // namespace. An ambiguous value binding, or a local of unknown
-            // type, must not fall through to a same-named visible static type.
-            match unqualified_value_type_fqn(receiver, token, name, ctx, bindings) {
-                SymbolResolution::Precise(targets) if targets.len() == 1 => {
-                    targets.into_iter().next()
-                }
-                SymbolResolution::Unknown if !bindings.is_shadowed(name) => {
-                    ctx.resolve_type_fqn_at(token, name, receiver)
-                }
-                SymbolResolution::Precise(_)
-                | SymbolResolution::Ambiguous
-                | SymbolResolution::Unknown => None,
-            }
-        }
-        "this" => ctx
-            .enclosing_class(receiver.start_byte())
-            .map(str::to_string),
-        "base" => ctx
-            .enclosing_class(receiver.start_byte())
-            .and_then(|owner| class_unit_for_fq_name(ctx.csharp, token, owner))
-            .and_then(|owner| usage_direct_base(ctx.graph, ctx.csharp, token, &owner))
-            .map(|owner| owner.fq_name()),
-        "invocation_expression" => invocation_return_type_fqn(receiver, token, ctx, bindings),
-        "parenthesized_expression" | "checked_expression" => receiver
-            .named_child(0)
-            .and_then(|inner| receiver_type_fqn(inner, token, ctx, bindings)),
-        "cast_expression" | "as_expression" => receiver
-            .child_by_field_name(if receiver.kind() == "cast_expression" {
-                "type"
-            } else {
-                "right"
-            })
-            .and_then(|type_node| {
-                ctx.resolve_type_fqn_at(
-                    token,
-                    &reference_type_text(type_node, ctx.source),
-                    type_node,
-                )
-            }),
-        "member_access_expression" | "conditional_access_expression" => {
-            expression_type_fqn(receiver, token, ctx, bindings)
-        }
-        "qualified_name" | "generic_name" => {
-            ctx.resolve_type_fqn_at(token, &reference_type_text(receiver, ctx.source), receiver)
-        }
-        _ => None,
-    }
+    resolve_type_steps(vec![TypeStep::Receiver(receiver)], token, ctx, bindings)
 }
 
 fn seed_declaration(
@@ -941,15 +1018,7 @@ fn seed_variable_declaration(
         // `var x = new Foo()` infers from the initializer; other `var` is unknown.
         let resolved = ctx.membership.measured(|| {
             if type_text == "var" {
-                object_created_type(child)
-                    .and_then(|type_node| {
-                        ctx.resolve_type_fqn_at(
-                            token,
-                            &reference_type_text(type_node, ctx.source),
-                            type_node,
-                        )
-                    })
-                    .or_else(|| var_initializer_type(child, token, ctx, bindings))
+                var_initializer_type(child, token, ctx, bindings)
             } else {
                 ctx.resolve_type_fqn_at(token, type_text, type_node)
             }
@@ -974,7 +1043,7 @@ fn seed_typed(
     bindings.seed_or_shadow(binding_name.to_string(), resolved.filter(|_| !doubted));
 }
 
-/// The type node of a `new Foo()` initializer reachable from a declarator.
+/// Infer from the declarator's initializer expression itself.
 fn var_initializer_type(
     declarator: Node<'_>,
     token: QueryToken<'_>,
@@ -993,64 +1062,190 @@ fn expression_type_fqn(
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
-    match expression.kind() {
-        "object_creation_expression" => object_created_type(expression).and_then(|type_node| {
-            ctx.resolve_type_fqn_at(
-                token,
-                &reference_type_text(type_node, ctx.source),
-                type_node,
-            )
-        }),
-        "invocation_expression" => invocation_return_type_fqn(expression, token, ctx, bindings),
-        "parenthesized_expression" | "checked_expression" => expression
-            .named_child(0)
-            .and_then(|inner| expression_type_fqn(inner, token, ctx, bindings)),
-        "cast_expression" | "as_expression" => expression
-            .child_by_field_name(if expression.kind() == "cast_expression" {
-                "type"
-            } else {
-                "right"
-            })
-            .and_then(|type_node| {
-                ctx.resolve_type_fqn_at(
+    resolve_type_steps(vec![TypeStep::Expression(expression)], token, ctx, bindings)
+}
+
+/// A receiver chain has one dependent expression at each level. Resolve its
+/// leaf first, then apply the member/call continuations without Rust recursion.
+enum TypeStep<'tree> {
+    Expression(Node<'tree>),
+    Receiver(Node<'tree>),
+    Member(Node<'tree>),
+    Call {
+        invocation: Node<'tree>,
+        name: Node<'tree>,
+    },
+}
+
+fn resolve_type_steps(
+    mut pending: Vec<TypeStep<'_>>,
+    token: QueryToken<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let mut resolved = None;
+    while let Some(step) = pending.pop() {
+        match step {
+            TypeStep::Receiver(receiver) => match receiver.kind() {
+                "parenthesized_expression" | "checked_expression" => {
+                    pending.push(TypeStep::Receiver(first_named_child_matching(
+                        receiver,
+                        |child| !child.is_extra(),
+                    )?));
+                }
+                "identifier" => {
+                    let name = node_text(receiver, ctx.source);
+                    resolved =
+                        match unqualified_value_type_fqn(receiver, token, name, ctx, bindings) {
+                            SymbolResolution::Precise(targets) if targets.len() == 1 => {
+                                targets.into_iter().next()
+                            }
+                            SymbolResolution::Unknown if !bindings.is_shadowed(name) => {
+                                ctx.resolve_type_fqn_at(token, name, receiver)
+                            }
+                            SymbolResolution::Precise(_)
+                            | SymbolResolution::Ambiguous
+                            | SymbolResolution::Unknown => None,
+                        };
+                }
+                "this" => {
+                    resolved = ctx
+                        .enclosing_class(receiver.start_byte())
+                        .map(str::to_string)
+                }
+                "base" => {
+                    resolved = ctx
+                        .enclosing_class(receiver.start_byte())
+                        .and_then(|owner| class_unit_for_fq_name(ctx.csharp, token, owner))
+                        .and_then(|owner| usage_direct_base(ctx.graph, ctx.csharp, token, &owner))
+                        .map(|owner| owner.fq_name())
+                }
+                "qualified_name" | "generic_name" => {
+                    resolved = ctx.resolve_type_fqn_at(
+                        token,
+                        &reference_type_text(receiver, ctx.source),
+                        receiver,
+                    );
+                }
+                "invocation_expression"
+                | "cast_expression"
+                | "as_expression"
+                | "member_access_expression"
+                | "conditional_access_expression" => {
+                    pending.push(TypeStep::Expression(receiver));
+                }
+                _ => return None,
+            },
+            TypeStep::Expression(expression) => match expression.kind() {
+                "object_creation_expression" => {
+                    let type_node = expression.child_by_field_name("type")?;
+                    resolved = ctx.resolve_type_fqn_at(
+                        token,
+                        &reference_type_text(type_node, ctx.source),
+                        type_node,
+                    );
+                }
+                "parenthesized_expression" | "checked_expression" => {
+                    pending.push(TypeStep::Expression(first_named_child_matching(
+                        expression,
+                        |child| !child.is_extra(),
+                    )?));
+                }
+                "cast_expression" | "as_expression" => {
+                    let type_node = expression.child_by_field_name(
+                        if expression.kind() == "cast_expression" {
+                            "type"
+                        } else {
+                            "right"
+                        },
+                    )?;
+                    resolved = ctx.resolve_type_fqn_at(
+                        token,
+                        &reference_type_text(type_node, ctx.source),
+                        type_node,
+                    );
+                }
+                "identifier" => {
+                    let name = node_text(expression, ctx.source);
+                    resolved =
+                        match unqualified_value_type_fqn(expression, token, name, ctx, bindings) {
+                            SymbolResolution::Precise(targets) if targets.len() == 1 => {
+                                targets.into_iter().next()
+                            }
+                            SymbolResolution::Precise(_)
+                            | SymbolResolution::Ambiguous
+                            | SymbolResolution::Unknown => None,
+                        };
+                }
+                "member_access_expression" | "conditional_access_expression" => {
+                    let (receiver, name) = type_member_access(expression)?;
+                    pending.push(TypeStep::Member(name));
+                    pending.push(TypeStep::Receiver(receiver));
+                }
+                "invocation_expression" => {
+                    let function = expression.child_by_field_name("function")?;
+                    match function.kind() {
+                        "identifier" | "generic_name" => {
+                            resolved = ctx
+                                .enclosing_class(expression.start_byte())
+                                .map(str::to_string);
+                            pending.push(TypeStep::Call {
+                                invocation: expression,
+                                name: function,
+                            });
+                        }
+                        "member_access_expression" | "conditional_access_expression" => {
+                            let (receiver, name) = type_member_access(function)?;
+                            pending.push(TypeStep::Call {
+                                invocation: expression,
+                                name,
+                            });
+                            pending.push(TypeStep::Receiver(receiver));
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            },
+            TypeStep::Member(name_node) => {
+                let owner = class_unit_for_fq_name(ctx.csharp, token, &resolved.take()?)?;
+                let name = csharp_member_name(name_node)?;
+                resolved = usage_member_declared_type_fq_name(
+                    ctx.csharp,
                     token,
-                    &reference_type_text(type_node, ctx.source),
-                    type_node,
-                )
-            }),
-        "member_access_expression" | "conditional_access_expression" => {
-            let (receiver, name_node) = match expression.kind() {
-                "member_access_expression" => (
-                    member_access_receiver(expression)?,
-                    member_access_name(expression)?,
-                ),
-                _ => {
-                    let access = csharp_conditional_member_access(expression)?;
-                    (access.receiver, access.name)
-                }
-            };
-            let owner_fqn = receiver_type_fqn(receiver, token, ctx, bindings)?;
-            let owner = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)?;
-            let name = csharp_member_name(name_node)?;
-            usage_member_declared_type_fq_name(
-                ctx.csharp,
-                token,
-                &owner,
-                node_text(name.identifier, ctx.source),
-            )
-        }
-        "identifier" => {
-            let name = node_text(expression, ctx.source);
-            match unqualified_value_type_fqn(expression, token, name, ctx, bindings) {
-                SymbolResolution::Precise(targets) if targets.len() == 1 => {
-                    targets.into_iter().next()
-                }
-                SymbolResolution::Precise(_)
-                | SymbolResolution::Ambiguous
-                | SymbolResolution::Unknown => None,
+                    &owner,
+                    node_text(name.identifier, ctx.source),
+                );
+            }
+            TypeStep::Call { invocation, name } => {
+                let owner = class_unit_for_fq_name(ctx.csharp, token, &resolved.take()?)?;
+                let name = csharp_member_name(name)?;
+                let type_arguments = resolved_type_arguments(name, token, ctx);
+                resolved = method_return_type_for_call(
+                    ctx,
+                    token,
+                    &owner,
+                    node_text(name.identifier, ctx.source),
+                    argument_count(invocation, ctx.source),
+                    name.explicit_generic_arity,
+                    type_arguments.as_deref(),
+                );
             }
         }
-        _ => None,
+    }
+    resolved
+}
+
+fn type_member_access(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    match node.kind() {
+        "member_access_expression" => {
+            Some((member_access_receiver(node)?, member_access_name(node)?))
+        }
+        "conditional_access_expression" => {
+            let access = csharp_conditional_member_access(node)?;
+            Some((access.receiver, access.name))
+        }
+        _ => unreachable!("type continuation requires a member access"),
     }
 }
 
@@ -1068,72 +1263,6 @@ fn unqualified_value_type_fqn(
             )
         }
         resolution => resolution,
-    }
-}
-
-fn invocation_return_type_fqn(
-    invocation: Node<'_>,
-    token: QueryToken<'_>,
-    ctx: &CsScan<'_>,
-    bindings: &LocalInferenceEngine<String>,
-) -> Option<String> {
-    let function = invocation.child_by_field_name("function")?;
-    match function.kind() {
-        "identifier" => {
-            let name = node_text(function, ctx.source);
-            let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
-            let owner = class_unit_for_fq_name(ctx.csharp, token, owner_fqn)?;
-            method_return_type_for_call(
-                ctx,
-                token,
-                &owner,
-                name,
-                argument_count(invocation, ctx.source),
-                None,
-                None,
-            )
-        }
-        "generic_name" => {
-            let name = csharp_member_name(function)?;
-            let type_arguments = resolved_type_arguments(name, token, ctx);
-            let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
-            let owner = class_unit_for_fq_name(ctx.csharp, token, owner_fqn)?;
-            method_return_type_for_call(
-                ctx,
-                token,
-                &owner,
-                node_text(name.identifier, ctx.source),
-                argument_count(invocation, ctx.source),
-                name.explicit_generic_arity,
-                type_arguments.as_deref(),
-            )
-        }
-        "member_access_expression" | "conditional_access_expression" => {
-            let (receiver, name_node) = match function.kind() {
-                "member_access_expression" => (
-                    member_access_receiver(function)?,
-                    member_access_name(function)?,
-                ),
-                _ => {
-                    let access = csharp_conditional_member_access(function)?;
-                    (access.receiver, access.name)
-                }
-            };
-            let name = csharp_member_name(name_node)?;
-            let type_arguments = resolved_type_arguments(name, token, ctx);
-            let owner_fqn = receiver_type_fqn(receiver, token, ctx, bindings)?;
-            let owner = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)?;
-            method_return_type_for_call(
-                ctx,
-                token,
-                &owner,
-                node_text(name.identifier, ctx.source),
-                argument_count(invocation, ctx.source),
-                name.explicit_generic_arity,
-                type_arguments.as_deref(),
-            )
-        }
-        _ => None,
     }
 }
 

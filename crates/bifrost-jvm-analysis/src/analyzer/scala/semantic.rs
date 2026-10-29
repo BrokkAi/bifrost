@@ -3696,6 +3696,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 point: invoke,
                 callee,
                 receiver: None,
+                member_selection: None,
                 arguments: vec![SemanticCallArgument::direct(
                     source,
                     ArgumentDomain::Positional,
@@ -3860,6 +3861,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 point: invoke,
                 callee,
                 receiver: None,
+                member_selection: None,
                 arguments: vec![SemanticCallArgument::direct(
                     payload,
                     ArgumentDomain::Positional,
@@ -4892,6 +4894,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: arguments.into(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -5435,6 +5438,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: arguments.into(),
                 normal_results: Box::new([]),
                 result: Some(result),

@@ -1140,6 +1140,7 @@ impl<'a> Scheduler<'a> {
     fn blocked_task_component(
         &self,
         id: usize,
+        cancellation: &CancellationToken,
     ) -> (
         HashSet<Runnable>,
         ResolutionCompletion,
@@ -1148,10 +1149,13 @@ impl<'a> Scheduler<'a> {
     ) {
         let mut stack = vec![Runnable::Task(id)];
         let mut seen = HashSet::default();
-        let mut reasons = ResolutionCompletion::Complete;
+        let mut reasons = Vec::new();
         let mut pending = Vec::new();
         let mut unavailable = false;
         while let Some(node) = stack.pop() {
+            if cancellation.is_cancelled() {
+                return (seen, incomplete_cancelled(), pending, true);
+            }
             if !seen.insert(node) {
                 continue;
             }
@@ -1163,9 +1167,9 @@ impl<'a> Scheduler<'a> {
                     }
                     pending.push(task.root.reference);
                     if let Some(wait) = self.qualified_members.get(&id) {
-                        reasons = reasons.combine(&wait.completion);
+                        reasons.push(&wait.completion);
                         if let Some(frame) = &wait.member_selection {
-                            reasons = reasons.combine(&frame.completion);
+                            reasons.push(&frame.completion);
                         }
                     }
                     stack.extend(task.waits_on.iter().copied().map(Runnable::Relation));
@@ -1183,9 +1187,9 @@ impl<'a> Scheduler<'a> {
                     if relation.closed {
                         continue;
                     }
-                    reasons = reasons.combine(&relation.member_completion);
+                    reasons.push(&relation.member_completion);
                     if let Some(frame) = &relation.member_selection {
-                        reasons = reasons.combine(&frame.completion);
+                        reasons.push(&frame.completion);
                         pending.push(
                             frame
                                 .evaluation
@@ -1196,22 +1200,60 @@ impl<'a> Scheduler<'a> {
                     }
                     if let Some((_, completion)) = &relation.unavailable {
                         unavailable = true;
-                        reasons = reasons.combine(completion);
+                        reasons.push(completion);
                     }
                     stack.extend(relation.dependencies.iter().copied().map(Runnable::Task));
                     stack.extend(relation.waits_on.iter().copied().map(Runnable::Relation));
                 }
             }
         }
+        let reasons = ResolutionCompletion::combine_all_with_poll(reasons, &mut || {
+            cancellation.is_cancelled()
+        })
+        .unwrap_or_else(incomplete_cancelled);
         (seen, reasons, pending, unavailable)
+    }
+
+    /// A typed reference edge must itself close a cycle. Merely reaching an
+    /// unrelated prefix cycle does not turn that cycle into a typed one.
+    fn has_typed_reference_cycle(
+        &self,
+        nodes: &HashSet<Runnable>,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        // Both callers discard assembled evidence when cancellation is observed.
+        nodes
+            .iter()
+            .take_while(|_| !cancellation.is_cancelled())
+            .any(|node| {
+                let Runnable::Task(id) = *node else {
+                    return false;
+                };
+                let dependency = self
+                    .qualified_members
+                    .get(&id)
+                    .and_then(|wait| wait.close_reference.map(|(_, dependency)| dependency))
+                    .or_else(|| {
+                        self.typed_references
+                            .get(&id)
+                            .map(|&(_, dependency)| dependency)
+                    });
+                dependency.is_some_and(|dependency| {
+                    demanded_reference_wait_closes_a_cycle(self, id, dependency, cancellation)
+                        == Some(true)
+                })
+            })
     }
 
     /// Only an access row receives this local terminal reply. The blocked task,
     /// prefix waits and relation publication retain their existing state.
-    fn resume_drained_access_references(&mut self, operation: &Resources<'_, 'a>) -> bool {
+    fn resume_drained_access_references(
+        &mut self,
+        operation: &Resources<'_, 'a>,
+    ) -> StoreResult<bool> {
         let cancellation = operation.session.cancellation;
         if cancellation.is_cancelled() || operation.session.resolution_stopped() {
-            return false;
+            return Ok(false);
         }
         let mut waits = self
             .relations
@@ -1237,30 +1279,45 @@ impl<'a> Scheduler<'a> {
             .into_iter()
             .map(|(consumer, target)| {
                 let (nodes, mut completion, pending, unavailable) =
-                    self.blocked_task_component(target);
+                    self.blocked_task_component(target, cancellation);
+                let initial = completion;
+                let mut operands = vec![&initial];
                 for node in &nodes {
                     if let Runnable::Task(id) = *node
                         && let Some(frame) = &self.tasks[id].frame
                     {
                         if let Some(state) = &frame.evaluation {
                             if let Some(seed) = &state.root_seed {
-                                completion = completion.combine(seed.completion());
+                                operands.push(seed.completion());
                             }
                             for gap in state
                                 .forced_reference_gaps
                                 .values()
                                 .chain(state.forced_slot_gaps.values())
                             {
-                                completion = completion.combine(gap);
+                                operands.push(gap);
                             }
                         }
                         for answer in frame.answers.values() {
-                            completion = completion.combine(answer.completion());
+                            operands.push(answer.completion());
                         }
                         for state in frame.states.values() {
-                            completion = completion.combine(state.completion());
+                            operands.push(state.completion());
                         }
                     }
+                }
+                completion = ResolutionCompletion::combine_all_with_poll(operands, &mut || {
+                    cancellation.is_cancelled()
+                })
+                .unwrap_or_else(incomplete_cancelled);
+                if !unavailable && self.has_typed_reference_cycle(&nodes, cancellation) {
+                    completion = completion.combine(&ResolutionCompletion::incomplete([
+                        typed_fixed_point_cycle_reason(
+                            operation.session,
+                            operation.hierarchy,
+                            self.tasks[target].root.reference,
+                        )?,
+                    ]));
                 }
                 let consumer_node = match consumer {
                     MemberConsumerId::Relation(id) => Runnable::Relation(id),
@@ -1297,7 +1354,7 @@ impl<'a> Scheduler<'a> {
                                 .and_then(ReferenceSeed::site_metadata)
                         })
                     });
-                (
+                Ok((
                     consumer,
                     target,
                     Box::new(incomplete_fact_resolution_answer(
@@ -1305,11 +1362,11 @@ impl<'a> Scheduler<'a> {
                         completion,
                         cancellation,
                     )),
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<StoreResult<Vec<_>>>()?;
         if cancellation.is_cancelled() || operation.session.resolution_stopped() {
-            return false;
+            return Ok(false);
         }
         let resumed = !replies.is_empty();
         for (consumer, target, reply) in replies {
@@ -1338,7 +1395,7 @@ impl<'a> Scheduler<'a> {
                 consumer.enqueue(self);
             }
         }
-        resumed
+        Ok(resumed)
     }
 
     /// Finalize only input roots left blocked after all runnable work drained.
@@ -1355,10 +1412,22 @@ impl<'a> Scheduler<'a> {
             .enumerate()
             .map(|(id, task)| {
                 if task.answer.is_some() {
-                    return None;
+                    return Ok(None);
                 }
-                let (_, reasons, pending, unavailable) = self.blocked_task_component(id);
-                Some(if unavailable {
+                let (_, mut reasons, pending, unavailable) =
+                    self.blocked_task_component(id, operation.session.cancellation);
+                if let Some(state) = task
+                    .frame
+                    .as_ref()
+                    .and_then(|frame| frame.evaluation.as_ref())
+                {
+                    reasons = ResolutionCompletion::combine_all_with_poll(
+                        std::iter::once(&reasons).chain(state.forced_reference_gaps.values()),
+                        &mut || operation.session.cancellation.is_cancelled(),
+                    )
+                    .unwrap_or_else(incomplete_cancelled);
+                }
+                Ok(Some(if unavailable {
                     let seed_completion = task
                         .frame
                         .as_ref()
@@ -1378,9 +1447,9 @@ impl<'a> Scheduler<'a> {
                             .into_iter()
                             .map(ResolutionIncompleteReason::CyclicPrefixDependency),
                     ))
-                })
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<StoreResult<Vec<_>>>()?;
         for (task, completion) in self.tasks[..root_task_count].iter_mut().zip(completions) {
             let Some(completion) = completion else {
                 continue;
@@ -2724,7 +2793,7 @@ fn drive_scheduler_inner<'source>(
             }
         }
         let Some(runnable) = scheduler.runnable.pop_front() else {
-            if scheduler.resume_drained_access_references(operation) {
+            if scheduler.resume_drained_access_references(operation)? {
                 continue;
             }
             if let Some((endpoint, reason)) = scheduler.relations.iter().find_map(|relation| {
@@ -2770,23 +2839,68 @@ fn drive_scheduler_inner<'source>(
                 !pending_roots.is_empty(),
                 "a drained scheduler with no pending root has an answer"
             );
-            let mut completion = ResolutionCompletion::incomplete(
+            // Record typed evidence while the wait graph still exists. The
+            // driver's cleanup detaches those edges before root finalization.
+            let typed_cycles = scheduler
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(id, task)| {
+                    if task.answer.is_some() {
+                        return None;
+                    }
+                    let (nodes, _, _, unavailable) =
+                        scheduler.blocked_task_component(id, cancellation);
+                    (!unavailable && scheduler.has_typed_reference_cycle(&nodes, cancellation))
+                        .then_some(id)
+                })
+                .collect::<Vec<_>>();
+            if cancellation.is_cancelled() {
+                return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+            }
+            for id in typed_cycles {
+                let root = scheduler.tasks[id].root.reference;
+                let completion =
+                    ResolutionCompletion::incomplete([typed_fixed_point_cycle_reason(
+                        operation.session,
+                        operation.hierarchy,
+                        root,
+                    )?]);
+                let state = scheduler.tasks[id]
+                    .frame
+                    .as_mut()
+                    .expect("a blocked typed task retains its frame")
+                    .evaluation
+                    .as_mut()
+                    .expect("task is between polls");
+                let gap = state
+                    .forced_reference_gaps
+                    .entry(root)
+                    .or_insert(ResolutionCompletion::Complete);
+                *gap = gap.combine(&completion);
+            }
+            let initial = ResolutionCompletion::incomplete(
                 pending_roots
                     .iter()
                     .map(|&root| ResolutionIncompleteReason::CyclicPrefixDependency(root)),
             );
+            let mut operands = vec![&initial];
             for relation in &scheduler.relations {
-                completion = completion.combine(&relation.member_completion);
+                operands.push(&relation.member_completion);
                 if let Some(frame) = &relation.member_selection {
-                    completion = completion.combine(&frame.completion);
+                    operands.push(&frame.completion);
                 }
             }
             for wait in scheduler.qualified_members.values() {
-                completion = completion.combine(&wait.completion);
+                operands.push(&wait.completion);
                 if let Some(frame) = &wait.member_selection {
-                    completion = completion.combine(&frame.completion);
+                    operands.push(&frame.completion);
                 }
             }
+            let completion = ResolutionCompletion::combine_all_with_poll(operands, &mut || {
+                cancellation.is_cancelled()
+            })
+            .unwrap_or_else(incomplete_cancelled);
             let outcome = BatchOutcome::Unsupported(Unsupported::CyclicPrefixDependency {
                 pending_roots,
                 pending_endpoints: scheduler
@@ -3538,7 +3652,11 @@ fn poll_round<'a>(
                     .expect("an awaited demanded reference has a live owner")
                     .owner;
                 assert_ne!(owner, id, "a task never waits on its own claim");
-                let closes_a_cycle = demanded_reference_wait_closes_a_cycle(scheduler, id, owner);
+                let Some(closes_a_cycle) =
+                    demanded_reference_wait_closes_a_cycle(scheduler, id, owner, cancellation)
+                else {
+                    return Ok(RoundOutcome::Cancelled);
+                };
                 let claim = scheduler
                     .claims
                     .get_mut(&reference)
@@ -3736,12 +3854,16 @@ fn demanded_reference_wait_closes_a_cycle(
     scheduler: &Scheduler<'_>,
     waiter: usize,
     owner: usize,
-) -> bool {
+    cancellation: &CancellationToken,
+) -> Option<bool> {
     let mut seen = HashSet::default();
     let mut stack = vec![Runnable::Task(owner)];
     while let Some(node) = stack.pop() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         if node == Runnable::Task(waiter) {
-            return true;
+            return Some(true);
         }
         if !seen.insert(node) {
             continue;
@@ -3779,7 +3901,7 @@ fn demanded_reference_wait_closes_a_cycle(
             }
         }
     }
-    false
+    Some(false)
 }
 
 /// Read this round's keyed source rows once for the whole round.
@@ -5242,6 +5364,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "3eec006ab65d: the demanded-reference wait-cycle walk ignored cancellation"
+    )]
     fn demand_scheduler_environment_claim_wait_and_cycle_edges_are_separate() {
         with_resources(|resources| {
             let mut scheduler = new_scheduler();
@@ -5283,18 +5408,50 @@ mod tests {
                 scheduler.tasks[waiter].claim_wait = Some(key);
                 scheduler.tasks[waiter].waiting = 1;
             }
-            assert!(demanded_reference_wait_closes_a_cycle(
-                &scheduler, owners[0], waiters[0]
-            ));
-            assert!(!demanded_reference_wait_closes_a_cycle(
-                &scheduler, owners[0], waiters[1]
-            ));
-            assert!(demanded_reference_wait_closes_a_cycle(
-                &scheduler, owners[1], waiters[1]
-            ));
-            assert!(!demanded_reference_wait_closes_a_cycle(
-                &scheduler, owners[1], waiters[0]
-            ));
+            assert!(
+                demanded_reference_wait_closes_a_cycle(
+                    &scheduler,
+                    owners[0],
+                    waiters[0],
+                    &CancellationToken::new()
+                )
+                .expect("uncancelled cycle check")
+            );
+            assert!(
+                !demanded_reference_wait_closes_a_cycle(
+                    &scheduler,
+                    owners[0],
+                    waiters[1],
+                    &CancellationToken::new()
+                )
+                .expect("uncancelled cycle check")
+            );
+            assert!(
+                demanded_reference_wait_closes_a_cycle(
+                    &scheduler,
+                    owners[1],
+                    waiters[1],
+                    &CancellationToken::new()
+                )
+                .expect("uncancelled cycle check")
+            );
+            assert!(
+                !demanded_reference_wait_closes_a_cycle(
+                    &scheduler,
+                    owners[1],
+                    waiters[0],
+                    &CancellationToken::new()
+                )
+                .expect("uncancelled cycle check")
+            );
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            assert_eq!(
+                demanded_reference_wait_closes_a_cycle(
+                    &scheduler, owners[0], waiters[0], &cancelled
+                ),
+                None
+            );
             assert!(release_demanded_reference(
                 resources,
                 &mut scheduler,
@@ -6434,9 +6591,15 @@ mod tests {
                     ) => {
                         assert_eq!(provider.context_reads, 1);
                         assert_eq!(provider.accesses, 0);
-                        assert!(demanded_reference_wait_closes_a_cycle(
-                            &scheduler, task, task
-                        ));
+                        assert!(
+                            demanded_reference_wait_closes_a_cycle(
+                                &scheduler,
+                                task,
+                                task,
+                                &CancellationToken::new()
+                            )
+                            .expect("uncancelled cycle check")
+                        );
                         assert!(completion.contains_reason(
                             ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(
                                 "retained-receiver-obligation"

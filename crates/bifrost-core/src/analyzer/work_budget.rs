@@ -1,5 +1,8 @@
 //! Shared multidimensional work-budget accounting.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// One fixed set of independently measured work dimensions.
 pub trait BudgetWork: Copy {
     type Dimension: Copy + 'static;
@@ -38,15 +41,59 @@ impl<Dimension: Copy> WorkBudgetExceeded<Dimension> {
 }
 
 /// Atomic accounting shared by semantic materialization and data-flow solves.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BudgetLedger<Work> {
     limits: Work,
     used: Work,
+    refusals: Arc<AtomicUsize>,
 }
 
+impl<Work: PartialEq> PartialEq for BudgetLedger<Work> {
+    fn eq(&self, other: &Self) -> bool {
+        self.limits == other.limits && self.used == other.used
+    }
+}
+impl<Work: Eq> Eq for BudgetLedger<Work> {}
+
 impl<Work> BudgetLedger<Work> {
-    pub const fn new(limits: Work, used: Work) -> Self {
-        Self { limits, used }
+    pub fn new(limits: Work, used: Work) -> Self {
+        Self {
+            limits,
+            used,
+            refusals: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Failed checks, including those on discarded staging copies. This
+    /// observation is monotonic and never refunded with resident usage.
+    pub fn refusal_count(&self) -> usize {
+        self.refusals.load(Ordering::Relaxed)
+    }
+
+    /// Replace resident usage while preserving the logical budget's failures.
+    pub fn with_used(&self, used: Work) -> Self
+    where
+        Work: Clone,
+    {
+        Self {
+            limits: self.limits.clone(),
+            used,
+            refusals: Arc::clone(&self.refusals),
+        }
+    }
+
+    #[track_caller]
+    pub fn record_refusal(&self) {
+        let origin = std::panic::Location::caller();
+        crate::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=budget:{} observation=refusal",
+                origin.file(),
+                origin.line(),
+                std::any::type_name::<Work>()
+            )
+        });
+        self.refusals.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -55,7 +102,7 @@ where
     Work: ZeroBudgetWork,
 {
     /// Create a ledger with the work shape's all-zero usage value.
-    pub const fn with_zero_usage(limits: Work) -> Self {
+    pub fn with_zero_usage(limits: Work) -> Self {
         Self::new(limits, Work::ZERO)
     }
 }
@@ -76,6 +123,7 @@ where
         for &dimension in Work::DIMENSIONS {
             let limit = self.limits.get(dimension);
             let Some(attempted) = self.used.get(dimension).checked_add(work.get(dimension)) else {
+                self.record_refusal();
                 return Err(WorkBudgetExceeded {
                     dimension,
                     limit,
@@ -83,6 +131,7 @@ where
                 });
             };
             if attempted > limit {
+                self.record_refusal();
                 return Err(WorkBudgetExceeded {
                     dimension,
                     limit,
@@ -166,10 +215,30 @@ macro_rules! define_work_dimensions {
                 }
             }
 
+            /// Combine corresponding dimensions with the same operation.
+            #[allow(dead_code)]
+            pub fn zip_with(self, other: Self, f: impl Fn(usize, usize) -> usize) -> Self {
+                Self {
+                    $($field: f(self.$field, other.$field)),+
+                }
+            }
+
             pub fn checked_add(self, other: Self) -> Option<Self> {
                 Some(Self {
                     $($field: self.$field.checked_add(other.$field)?),+
                 })
+            }
+
+            #[allow(dead_code)]
+            pub const fn is_empty(&self) -> bool {
+                $(self.$field == 0)&&+
+            }
+
+            #[allow(dead_code)]
+            pub const fn saturating_add(self, other: Self) -> Self {
+                Self {
+                    $($field: self.$field.saturating_add(other.$field)),+
+                }
             }
 
             pub const fn saturating_sub(self, other: Self) -> Self {
@@ -227,6 +296,18 @@ mod tests {
         assert_eq!(exceeded.limit(), 4);
         assert_eq!(exceeded.attempted(), 5);
         assert_eq!(ledger.used(), before);
+        assert_eq!(ledger.refusal_count(), 1);
+        let staged = ledger.clone();
+        assert!(
+            staged
+                .check(TestWork {
+                    rows: usize::MAX,
+                    bytes: 0
+                })
+                .is_err()
+        );
+        assert_eq!(ledger.refusal_count(), 2);
+        assert_eq!(ledger.with_used(TestWork::default()).refusal_count(), 2);
         assert_eq!(ledger.limits().bytes, 8);
         assert_eq!(TestDimension::Bytes.label(), "bytes");
         assert_eq!(

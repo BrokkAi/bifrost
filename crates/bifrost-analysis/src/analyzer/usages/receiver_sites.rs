@@ -1,7 +1,7 @@
 //! Language-neutral receiver/member site projection from canonical structural facts.
 //!
 //! Language adapters own syntax normalization through [`FileFacts`]. This module only
-//! projects their normalized `Call`/`FieldAccess` facts and role edges into exact source
+//! projects their normalized `Call`/`FieldAccess`/`Subscript` facts and role edges into exact source
 //! ranges. It deliberately does not parse source or classify receivers as static or instance
 //! values; those decisions belong to the language's existing type and definition resolvers.
 
@@ -277,14 +277,24 @@ pub(crate) fn build_receiver_site_index(
 
         let (kind, receiver_role, member_role) = if node.kind.satisfies(NormalizedKind::Call) {
             (ReceiverSiteKind::Call, Role::Receiver, Role::Callee)
-        } else if node.kind == NormalizedKind::FieldAccess {
+        } else if matches!(
+            node.kind,
+            NormalizedKind::FieldAccess | NormalizedKind::Subscript
+        ) {
             (ReceiverSiteKind::FieldAccess, Role::Object, Role::Field)
         } else {
             continue;
         };
         let fact_id = source_order as u32;
         let mut receiver = None;
-        let mut member_span = node.name;
+        // An indexer has no named member token. Its complete subscript is
+        // the member range the language adapter can interpret (for example,
+        // the CLR Item property), while Object remains the receiver.
+        let mut member_span = if node.kind == NormalizedKind::Subscript {
+            Some(node.span())
+        } else {
+            node.name
+        };
         for target in facts.roles(fact_id) {
             if is_cancelled(cancellation) {
                 return ReceiverSiteIndexBuild::Cancelled { inspected_work };

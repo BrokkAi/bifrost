@@ -816,6 +816,7 @@ fn model_call_binding(
         analyzer,
         modeled_key,
         arm.exact_external_target.as_ref(),
+        unmaterialized.and_then(|target| target.selected_external_descriptor.as_ref()),
         shape,
         bindings,
     )
@@ -835,13 +836,21 @@ fn model_call_binding_for_external_dispatch(
         has_receiver: target.has_receiver(),
         parameter_count: target.parameter_count(),
     };
-    model_call_binding_for_external_shape(analyzer, modeled_key, None, shape, bindings)
+    model_call_binding_for_external_shape(
+        analyzer,
+        modeled_key,
+        None,
+        target.selected_external_descriptor.as_ref(),
+        shape,
+        bindings,
+    )
 }
 
 fn model_call_binding_for_external_shape(
     analyzer: &dyn IAnalyzer,
     modeled_key: ModeledProcedureKey,
     exact_external_target: Option<&crate::analyzer::semantic::ExactExternalProcedureTarget>,
+    selected_descriptor: Option<&crate::analyzer::resolution::ExternalMemberIdentity>,
     shape: &CallShapeValue,
     bindings: &mut CallBindingCache,
 ) -> ModelCallBinding {
@@ -861,7 +870,30 @@ fn model_call_binding_for_external_shape(
     );
     let application = structured_model_application(shape);
     let model_callable_id = overlay.callable_family_id_for_target(key);
-    let matched = overlay.callable_for_application(key, &application);
+    let selected_record = match selected_descriptor {
+        Some(selected) => {
+            let Some(record) = analyzer
+                .active_semantic_model_snapshot()
+                .and_then(|snapshot| {
+                    crate::analyzer::store::active_models::selected_external_descriptor(
+                        snapshot.active_models(),
+                        selected,
+                    )
+                })
+            else {
+                return ModelCallBinding::Unavailable;
+            };
+            Some(record)
+        }
+        None => None,
+    };
+    let matched = overlay.callable_for_selected_application(
+        key,
+        &application,
+        selected_record
+            .as_ref()
+            .map(|(provider, record)| (provider.as_str(), record.as_str())),
+    );
     let exact_target_matches = |symbol: &crate::analyzer::semantic_model::SemanticModelSymbol| {
         exact_external_target.is_none_or(|target| {
             symbol.has_exact_artifact_locator(target.procedure().path().as_str(), target.symbol())
@@ -975,8 +1007,7 @@ fn model_call_binding_for_external_shape(
                 analyzer,
                 &shape.report,
                 shape
-                    .source
-                    .as_deref()
+                    .source()
                     .map(|source| (&shape.report.outcome.file, source)),
                 &candidates,
             ) {
@@ -1720,6 +1751,7 @@ mod authored_override_residual_tests {
             exceeded_limit: None,
             arms: Vec::new(),
             call_contexts: vec![super::super::dispatch::DispatchCallContext {
+                member_receiver_preparation: None,
                 procedure_id: "test-procedure".to_owned(),
                 caller: None,
                 caller_is_exact: false,
@@ -2425,7 +2457,7 @@ pub(super) fn call_binding_expansions(
                 ..
             }
         );
-    let mut report = call_binding_report(&file, &shape.report, target);
+    let mut report = call_binding_report(analyzer, &file, &shape.report, target, cancellation);
     if let Some(original_gap) = native_resolution_gap.as_ref() {
         diagnostics.push(CodeQueryDiagnostic {
             related: Vec::new(),
@@ -2609,7 +2641,7 @@ pub(super) fn call_binding_expansions(
         CallBindingSelectorProof::unavailable()
     };
     if has_semantic && !binding_is_complete {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -2625,9 +2657,9 @@ pub(super) fn call_binding_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }, match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
     } else if has_semantic && !selector.exact {
-        diagnostics.push(CodeQueryDiagnostic {
+        diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallBindingDispatchPartial,
@@ -2640,7 +2672,7 @@ pub(super) fn call_binding_expansions(
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        });
+        }, match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
     }
     let site = CallBindingSiteValue {
         report,

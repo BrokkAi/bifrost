@@ -1063,6 +1063,11 @@ impl TypeHierarchyProvider for PythonAnalyzer {
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-python-analysis/src/analyzer/python/hierarchy.rs",
+            );
 
         let ancestors: Vec<_> = self
             .inner
@@ -1073,8 +1078,12 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             // superclass. In particular, a rebound builtin can name a field.
             .filter(CodeUnit::is_class)
             .collect();
-        self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        {
+            let cache_key = code_unit.clone();
+            let cache_value = Arc::new(ancestors.clone());
+            persistent_fill_guard.installed("direct_ancestors");
+            self.direct_ancestors.insert(cache_key, cache_value);
+        };
         ancestors
     }
 
@@ -1084,7 +1093,10 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             code_unit,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
-        .expect("a descendant index that cannot stop always completes")
+        // The compatibility API has no failure channel. The guarded builder
+        // records operational failures in the query context and refuses to
+        // cache them, even when this particular traversal has no stop token.
+        .unwrap_or_default()
     }
     fn get_direct_descendants_within(
         &self,
@@ -1092,7 +1104,11 @@ impl TypeHierarchyProvider for PythonAnalyzer {
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
         descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
-            build_direct_descendant_index(self, self, scope)
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                build_direct_descendant_index(self, self, scope)
+            })
+            .ok()
+            .flatten()
         })
     }
 }

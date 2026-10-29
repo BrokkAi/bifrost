@@ -200,7 +200,18 @@ use std::sync::Arc;
 // #7033 (#6902 item 7): declarations.rs functions this lowerer imports
 // changed; bumped without a trace because no checked-in golden prints C/C++
 // semantic ids, so the rotation costs nothing and a stale lowering would.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v52";
+// #7082 (#6902 items 1, 3, 5, 6): grammar 0.24.8 changes the trees this
+// lowerer reads for unchanged bytes; no checked-in golden prints C/C++
+// semantic ids.
+// #6902 item 10: definition lookup applies reference guards to conditional
+// alias arms before canonicalizing them, so resolved type references change
+// for unchanged bytes.
+// #7078: every reference guard check uses the effective context (source
+// guards, build-proven defines, stable __cplusplus state), and the lowerer's
+// bounded call resolver reaches declaration_visible_at through it, so
+// resolved calls change for unchanged bytes. Also covers #7074, which changed
+// the same checks without a bump.
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v55";
 
 /// Procedure-local source roles for both C and C++. The two dialects share
 /// tree-sitter syntax for the control constructs covered by B2 and B3; their
@@ -4826,6 +4837,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point,
                 callee,
                 receiver: Some(target),
+                member_selection: None,
                 arguments: vec![SemanticCallArgument::direct(
                     transfer.source,
                     ArgumentDomain::Positional,
@@ -8325,6 +8337,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     point: invoke,
                     callee,
                     receiver,
+                    member_selection: None,
                     arguments: argument_values
                         .iter()
                         .map(|value| {
@@ -8345,6 +8358,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     point: invoke,
                     callee,
                     receiver,
+                    member_selection: None,
                     arguments: argument_values
                         .iter()
                         .map(|value| {

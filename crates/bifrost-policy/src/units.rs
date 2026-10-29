@@ -17,6 +17,7 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use brokk_bifrost_analysis::analyzer::invalidation::{ArtifactVerdictLog, BudgetMode};
 use brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest;
@@ -25,13 +26,14 @@ use brokk_bifrost_analysis::analyzer::semantic::ids::{LengthDelimitedDigest, Sta
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
 use brokk_bifrost_analysis::analyzer::store::policy_units::{
-    PolicyUnitPartitionRow, PolicyUnitRow, PolicyUnitRowKey,
+    PolicyUnitAttestation, PolicyUnitPartitionRow, PolicyUnitRow, PolicyUnitRowKey,
 };
 use brokk_bifrost_analysis::analyzer::{
     ChangedFacts, HeadInputs, Language, Oid, ReadKey, ReadSetDigest, WorkspaceAnalyzer,
     analysis_epoch_digest,
 };
 use brokk_bifrost_flow::dataflow::SolverWork;
+use brokk_bifrost_rql::PlanWidenDetail;
 use brokk_bifrost_rql::structural::UnitExecutionResult;
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryExecutionWork,
@@ -168,7 +170,80 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 // resident source holds that re-enter a later region's ledger.
 // #5964: Recompute chain-demand completeness, including formerly false complete
 // Boolean/wildcard products and operator-disjoint negative proofs.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof";
+// #7186: Recompute compact-constructor bindings; old read ledgers omit lexical lookups.
+// #7289: a field initializer's right-hand reads are usages again. Query-time
+// classification; policy read ledgers do not record it (#7262), so units from an
+// older engine would replay the old answer.
+// #7150: Go nested call result counts change call-binding answers.
+// #7179: Recompute member-family rows that dropped established edges or
+// carried no row coverage, and dispatch products that omitted their targets.
+// #2445 Milestone 2: class-set roots now solve under an engine-owned
+// allotment from a fresh ledger (#7294), which can complete a root that
+// exhausted the asking policy's budget, so a unit persisted before it can hold
+// a less complete answer than a fresh evaluation.
+// #4365 M4: Recompute Java Javadoc rule findings, which now anchor on the
+// offending @param or @throws tag instead of the whole declaration.
+// #7379: Go nilness selects loads and stores through a pointer as dereferences.
+// #7344, #7345: C# compound-assignment result writes join as overwrite candidates.
+// #5658: Python single-writer identity and loop-local read openness change
+// query-time answers that policy read ledgers do not record (#7262).
+// #5658: deferred Python module reads count only structural module receivers.
+// #7373: Recompute lexical bindings for contextual keyword identifier wrappers.
+// #5658: Python attribute-space reads count only structural owners' writes.
+// #5658: Python calls bind without demanding their arguments.
+// #7371/#7372: exact nonlocal distinctions and initializer-independent bodies.
+// #7179: unread Java ancestors and per-direction member-family completeness.
+// #7547: String-literal predicates now consume decoded Java values.
+// #4365 M3: Recompute statement-fact products. Java now produces rows, and C#
+// and JavaScript statement-fact queries are incomplete instead of complete-empty.
+// #7202: only explicitly classified summary returns establish receiver identity.
+// #7107: Recompute units and base rows under content-diagnostic admission,
+// per-item reporting, completion-code composition and exact diagnostic dedup.
+// #7220: Query-time usage accounting changes for unchanged bytes; read ledgers record no usage lookup.
+// #7226: Deref receiver steps change selected callees for unchanged source bytes.
+// #7464: Recompute C# incoming-call products with exact overload target proof.
+// #7368/#7369: Recompute C# cast and pattern argument binding identities.
+// #7340: Recompute overwrite proofs whose gaps lie outside the selected live region.
+// #7514: a sole global or nonlocal writer in another execution fixes Python identity.
+// #7548: Configuration facts exclude generated .bifrost metadata directories.
+// #7642: witness retention no longer removes findings; missing attribution is incomplete.
+// #7620: invalidate units whose Java wildcard call applicability changed.
+// Quicksilver round 12 on brokk-bifrost-analysis: Rust semicolon statements,
+// Kotlin anonymous functions and labeled returns, and Scala declared types
+// change Boolean result contexts; tokenless import binders take their import's
+// span and source order. Both are query-time answers that policies read.
+// Quicksilver round 12 tranche 2 on brokk-bifrost-analysis: Ruby closure
+// capture reads, nested-loop counter sets and condition operators, and callable
+// metrics that own only their root body change query-time facts policies read.
+// #7578: Java native trial carrier proofs change policy admission; production stays gated.
+// #7578: requirement origins select CFG-reaching writers, including loop backedges.
+// #7471: Query-time Go binding selection changes policy results for unchanged bytes.
+// #7619: inherited external JVM calls change policy binding answers.
+// #7386: C# conditional-compilation regions make block, handler and useless-if
+// emptiness undecided instead of certain, for unchanged bytes.
+// #7341, #7342: Go constant-divisor and comma-ok map reads lower without fabricated panic gaps.
+// #7617: unnamed Go composites publish direct type shapes.
+// #7343: Recompute Go failure branches using the compared value's proven static type.
+// #7393: Separate native handler identity from the structural body verdict.
+// #7470: Type-switch and variadic static bindings change failure-handler results.
+// Quicksilver round 12 tranche 3 on brokk-bifrost-analysis: XML attribute values
+// get XML 1.0 normalization and YAML block scalars keep their chomped content,
+// which configuration value predicates read.
+// #7578: Branch-conditioned sanitizers kill taint on their guarded condition edges.
+// #7618: Java native receiver-site classification changes call binding.
+// #7560: C# models compose from catalog rows; composition reads one language's packs; CLR special member names split at the right dot.
+// #7348/#7349/#7369: Java compound/static writes and pattern binding identities.
+// #4379 M3b: C# statement rows and per-kind admission preserve unsupported enum coverage.
+// #5658: Python member targets answer from the native definition under the trial.
+// #5658: unimportable files stage their own references; unknown placement stays a reverse obligation.
+// #7516: Go constructor shadows no longer seed package receivers, which changes reverse answers.
+// #7673: Python module members follow the target module's re-exports under the trial.
+// #7735: binding targets selecting their authored declaration are declaration sites.
+// #5658: proven import declarations classify alias targets and synthetic import reads.
+// #7509 M3a: Go type answers at declaration names come from the declaration value slot.
+// #3494: closed Ruby member selections discharge their dispatch gaps.
+// #7509 M3a part 2: Go failure-handler binding proofs come from native evidence.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof-7186-compact-constructor-bindings-7289-field-initializer-reads-7150-go-call-result-counts-7219-rust-concrete-receiver-closed-7183-unproven-family-dispatch-7179-incomplete-family-edges-and-coverage-2445-root-allotment-4365-javadoc-tag-anchors-7379-dereference-store-operations-7344-7345-csharp-compound-writes-5658-single-writer-identity-5658-structural-module-mutations-7373-csharp-contextual-keyword-binders-5658-python-attribute-space-owners-5658-python-argument-independent-calls-7371-nonlocal-branch-distinction-7372-initializer-body-relations-7179-java-unread-ancestors-4365-shared-statement-facts-7107-content-diagnostic-units-7220-php-terminal-case-fold-rust-deref-receiver-steps-7226-7464-csharp-incoming-overload-partition-7368-7369-csharp-equals-argument-identity-7150-open-member-calls-7340-live-region-overwrite-veto-7520-go-interface-dispatch-references-5658-python-global-writer-identity-5658-python-native-member-targets-7548-configuration-skips-bifrost-dir-analysis-quicksilver-round12-boolean-contexts-binder-spans-7202-classified-summary-identity-7547-java-string-literal-values-analysis-quicksilver-round12-fact-analyzers-7471-go-short-var-redeclaration-7386-conditional-compilation-regions-7341-7342-go-remainder-comma-ok-7617-go-direct-type-shapes-7343-go-static-type-failure-branches-7393-unproven-nonempty-failure-branches-7470-go-visible-binding-shapes-7616-go-modeled-package-result-unknown-analysis-quicksilver-round12-config-lookup-7518-go-undecided-receiver-candidates-7578-branch-conditioned-sanitizers-7618-java-creation-receiver-site-7560-csharp-row-backed-models-7348-7349-7369-java-compound-static-patterns-4379-m3b-csharp-statement-facts-7642-witness-budget-incomplete-5658-python-unplaced-file-references-7516-go-constructor-shadow-7673-python-qualified-module-members-7619-java-implicit-external-inherited-calls-7620-java-wildcard-sibling-applicability-7578-java-observed-value-type-7578-guard-writer-reachability-7735-binder-declaration-sites-5658-python-import-occurrence-kinds-7781-synthetic-members-completeness-7509-go-declaration-value-types-7755-refused-alternative-before-budget-3494-ruby-member-closure-7789-indexed-import-destinations-7817-external-supertype-kind-7849-java-external-owner-observed-type-7509-go-native-binding-proofs";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {
@@ -759,11 +834,14 @@ impl<'de> Visitor<'de> for FindingListSeed<'_> {
 /// construction, so the two can never disagree about which reads a unit's
 /// verification must cover.
 ///
-/// `snapshot` is the content identity of the workspace whose name-index
-/// answers the unit read. A name-index read is proved by the names that moved
-/// between two workspaces, which holds only for a read set whose index answers
-/// are the first workspace's, so a reader verifies a unit's index reads only
-/// against what moved since that snapshot.
+/// `snapshots` are the content identities of the workspaces the unit's
+/// name-index answers are known to hold on. A name-index read is proved by the
+/// names that moved between two workspaces, which holds only for a read set
+/// whose index answers are the first workspace's, so a reader verifies a
+/// unit's index reads only against what moved since one of these snapshots.
+/// The snapshot that computed the unit is one; every later verification adds
+/// the snapshots it proved the answers on (see
+/// [`PolicyIncrementalContext::publication_snapshots`]).
 #[derive(Debug, Clone)]
 pub struct PolicyUnit {
     key: PolicyUnitKey,
@@ -771,19 +849,23 @@ pub struct PolicyUnit {
     reads: Vec<ReadKey>,
     read_digest: ReadSetDigest,
     budget_mode: BudgetMode,
-    snapshot: StableDigest,
+    snapshots: Vec<StableDigest>,
 }
 
 impl PolicyUnit {
     /// Publish one unit's product under the reads that produced it, whose
-    /// name-index answers are those of the workspace identified by `snapshot`.
+    /// name-index answers are those of each workspace in `snapshots`.
     pub(crate) fn new(
         key: PolicyUnitKey,
         product: PolicyUnitProduct,
         reads: Vec<ReadKey>,
         budget_mode: BudgetMode,
-        snapshot: StableDigest,
+        snapshots: Vec<StableDigest>,
     ) -> Self {
+        assert!(
+            !snapshots.is_empty(),
+            "a unit's index answers hold on the snapshot that computed it"
+        );
         let read_digest = read_set_digest(&reads);
         Self {
             key,
@@ -791,7 +873,7 @@ impl PolicyUnit {
             reads,
             read_digest,
             budget_mode,
-            snapshot,
+            snapshots,
         }
     }
 
@@ -815,10 +897,19 @@ impl PolicyUnit {
         self.budget_mode
     }
 
-    /// The content identity of the workspace whose name-index answers this
-    /// unit read.
-    pub const fn snapshot(&self) -> StableDigest {
-        self.snapshot
+    /// The content identities of the workspaces this unit's name-index
+    /// answers hold on.
+    pub fn snapshots(&self) -> &[StableDigest] {
+        &self.snapshots
+    }
+
+    /// Record that this unit's name-index answers hold on `snapshots` too.
+    fn attest(&mut self, snapshots: &[StableDigest]) {
+        for snapshot in snapshots {
+            if !self.snapshots.contains(snapshot) {
+                self.snapshots.push(*snapshot);
+            }
+        }
     }
 
     /// Whether any read of this unit is a name-index probe, the one kind of
@@ -858,6 +949,19 @@ pub trait PolicyUnitStore: Send {
 
     fn lookup(&self, key: &PolicyUnitKey) -> Option<&PolicyUnit>;
     fn publish(&mut self, unit: PolicyUnit);
+
+    /// Record that the unit under `key`, verified from `verified_on`, holds on
+    /// `snapshots` too.
+    ///
+    /// Applies only while the unit this store holds is still attested on
+    /// `verified_on`: verification proved its answers there equal its answers
+    /// on `snapshots`, and says nothing about a unit holding other answers.
+    fn attest(
+        &mut self,
+        key: &PolicyUnitKey,
+        verified_on: StableDigest,
+        snapshots: &[StableDigest],
+    );
 }
 
 /// A store that could not answer.
@@ -909,6 +1013,19 @@ impl PolicyUnitStore for InMemoryPolicyUnitStore {
     fn publish(&mut self, unit: PolicyUnit) {
         self.units.insert(unit.key.clone(), unit);
     }
+
+    fn attest(
+        &mut self,
+        key: &PolicyUnitKey,
+        verified_on: StableDigest,
+        snapshots: &[StableDigest],
+    ) {
+        if let Some(unit) = self.units.get_mut(key)
+            && unit.snapshots.contains(&verified_on)
+        {
+            unit.attest(snapshots);
+        }
+    }
 }
 
 /// The units of one batch, backed by the repository's analyzer cache.
@@ -929,6 +1046,7 @@ pub struct PersistedPolicyUnitStore {
     store: Arc<AnalyzerStore>,
     loaded: HashMap<PolicyUnitKey, PolicyUnit>,
     pending: Vec<PolicyUnit>,
+    attestations: Vec<PolicyUnitAttestation>,
     published: usize,
 }
 
@@ -938,16 +1056,31 @@ impl PersistedPolicyUnitStore {
             store,
             loaded: HashMap::new(),
             pending: Vec::new(),
+            attestations: Vec::new(),
             published: 0,
         }
     }
 
-    /// Write every buffered publication, in one transaction.
+    /// Write every buffered publication, in one transaction, and then every
+    /// buffered attestation.
     ///
     /// The caller decides when: a cancelled or deadline-terminated run flushes
     /// nothing, because its units describe work that stopped early and nothing
-    /// downstream can tell that from work that finished.
+    /// downstream can tell that from work that finished. Returns how many
+    /// units were published.
     pub fn flush(&mut self) -> Result<usize, PolicyUnitStoreError> {
+        let written = self.flush_units()?;
+        // After the units, so that a unit this run published and a later
+        // policy of the same run verified on another snapshot is in the store
+        // when its attestation names it.
+        let attestations = std::mem::take(&mut self.attestations);
+        self.store
+            .attest_policy_units(attestations)
+            .map_err(|error| PolicyUnitStoreError::new(format!("{error}")))?;
+        Ok(written)
+    }
+
+    fn flush_units(&mut self) -> Result<usize, PolicyUnitStoreError> {
         if self.pending.is_empty() {
             return Ok(0);
         }
@@ -1011,6 +1144,30 @@ impl PolicyUnitStore for PersistedPolicyUnitStore {
     fn publish(&mut self, unit: PolicyUnit) {
         self.loaded.insert(unit.key.clone(), unit.clone());
         self.pending.push(unit);
+    }
+
+    fn attest(
+        &mut self,
+        key: &PolicyUnitKey,
+        verified_on: StableDigest,
+        snapshots: &[StableDigest],
+    ) {
+        let Some(unit) = self.loaded.get_mut(key) else {
+            return;
+        };
+        if !unit.snapshots.contains(&verified_on) {
+            return;
+        }
+        unit.attest(snapshots);
+        self.attestations.push(PolicyUnitAttestation {
+            key: row_key(key),
+            read_set_digest: *unit.read_digest.digest().as_bytes(),
+            verified_on: *verified_on.as_bytes(),
+            snapshots: snapshots
+                .iter()
+                .map(|snapshot| *snapshot.as_bytes())
+                .collect(),
+        });
     }
 }
 
@@ -1125,7 +1282,11 @@ fn unit_row(unit: &PolicyUnit) -> Result<PolicyUnitRow, PolicyUnitStoreError> {
         product,
         read_set_digest: *unit.read_digest.digest().as_bytes(),
         reads: unit.reads.clone(),
-        content_identity: *unit.snapshot.as_bytes(),
+        snapshots: unit
+            .snapshots
+            .iter()
+            .map(|snapshot| *snapshot.as_bytes())
+            .collect(),
     })
 }
 
@@ -1185,7 +1346,10 @@ pub fn unit_of_row(
         product,
         row.reads,
         BudgetMode::Exhaustive,
-        StableDigest::from_array(row.content_identity),
+        row.snapshots
+            .into_iter()
+            .map(StableDigest::from_array)
+            .collect(),
     );
     if unit.read_digest.digest().as_bytes() != &row.read_set_digest {
         return Err(PolicyUnitStoreError::new(
@@ -1334,11 +1498,24 @@ pub struct PolicyIncrementalContext<'a> {
     base: IncrementalBaseState,
     verdicts: ArtifactVerdictLog,
     runs: Mutex<Vec<PolicyIncrementalRun>>,
+    unit_metrics: Mutex<HashMap<PolicyId, UnitPhaseMetrics>>,
     units: Mutex<Vec<(PolicyId, Vec<PolicyUnitKey>)>>,
     /// Recomputed units stay provisional until their policy's complete unit
     /// key set is recorded. A sliced attempt can widen after recomputing one
     /// or more units; those products must not become visible to later runs.
     staged: Mutex<HashMap<PolicyId, HashMap<PolicyUnitKey, PolicyUnit>>>,
+    /// Workspace-total base widening can predict that slicing the head will
+    /// widen too, so those policies can use their reference whole execution.
+    base_workspace_widens: HashMap<PolicyId, WidenReason>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct UnitPhaseMetrics {
+    pub(crate) prefetch: Duration,
+    pub(crate) verify: Duration,
+    pub(crate) lookup_replay: Duration,
+    pub(crate) recompute: Duration,
+    pub(crate) lookups_replayed: u64,
 }
 
 impl<'a> PolicyIncrementalContext<'a> {
@@ -1365,9 +1542,42 @@ impl<'a> PolicyIncrementalContext<'a> {
             base,
             verdicts: ArtifactVerdictLog::default(),
             runs: Mutex::new(Vec::new()),
+            unit_metrics: Mutex::new(HashMap::new()),
             units: Mutex::new(Vec::new()),
             staged: Mutex::new(HashMap::new()),
+            base_workspace_widens: HashMap::new(),
         }
+    }
+
+    /// Carry only workspace-total widening from a base evaluated in this run.
+    /// These two reasons depend on workspace totals, which base and head share
+    /// up to the change; plan-only reasons fire before enumeration, while
+    /// unit-content reasons can differ between base and head.
+    ///
+    /// This is a prediction, not an observation: a head that would have
+    /// sliced (the change took it under the cap) is evaluated whole anyway.
+    /// Whole evaluation is the reference answer, so a wrong prediction loses
+    /// reuse, never correctness.
+    pub fn with_base_review(mut self, review: Option<&PolicyIncrementalReview>) -> Self {
+        if let Some(review) = review.filter(|review| review.base == IncrementalBaseState::Evaluated)
+        {
+            self.base_workspace_widens = review
+                .policies
+                .iter()
+                .filter_map(|run| match run.widen_reason {
+                    Some(
+                        reason @ (WidenReason::MergedLimitReached
+                        | WidenReason::VerificationBudgetExceeded),
+                    ) => Some((run.policy_id.clone(), reason)),
+                    _ => None,
+                })
+                .collect();
+        }
+        self
+    }
+
+    pub fn base_workspace_widen(&self, policy_id: &PolicyId) -> Option<WidenReason> {
+        self.base_workspace_widens.get(policy_id).copied()
     }
 
     /// The content identity of the workspace this context evaluates.
@@ -1375,48 +1585,57 @@ impl<'a> PolicyIncrementalContext<'a> {
         self.snapshots.head
     }
 
-    /// The snapshot whose name-index answers a unit computed here with
-    /// `reads` holds.
+    /// The snapshots whose name-index answers a unit with `reads` holds, once
+    /// this context computed it or verified it.
     ///
-    /// The head computed it, but when none of its index probes names a name
-    /// that moved between the base and the head, the head answered every one
-    /// of them exactly as the base would: that is what the changed-name set
-    /// states. Such a unit is published as the base's, so a later head
-    /// compared with the same base verifies it against its own difference
-    /// from that base. A unit that probed a moved name holds only on this
+    /// The head always: it computed the unit, or verification proved the
+    /// unit's answers equal the head's. The base too when none of its index
+    /// probes names a name that moved between the base and the head, because
+    /// then the head answered every one of them exactly as the base would:
+    /// that is what the changed-name set states. Holding both is what serves
+    /// both common flows. Several heads checked against one base verify the
+    /// unit against their own difference from that base, and a chain of checks,
+    /// each based on the previous head, verifies it against the difference
+    /// from that head. A unit that probed a moved name holds only on this
     /// head. An incomplete changed-name set proves nothing about the base.
-    pub fn publication_snapshot(&self, reads: &[ReadKey]) -> StableDigest {
-        let base_answers = self.changed.is_complete()
+    pub fn publication_snapshots(&self, reads: &[ReadKey]) -> Vec<StableDigest> {
+        let base_answers = self.snapshots.base != self.snapshots.head
+            && self.changed.is_complete()
             && reads.iter().all(|read| match read {
                 ReadKey::Index { family, key } => !self.changed.contains(*family, key),
                 _ => true,
             });
         if base_answers {
-            self.snapshots.base
+            vec![self.snapshots.head, self.snapshots.base]
         } else {
-            self.snapshots.head
+            vec![self.snapshots.head]
         }
     }
 
-    /// What moved between the snapshot that computed a unit and this
-    /// context's head, or `None` when the unit was computed on a snapshot this
-    /// comparison is not between.
+    /// One snapshot of `unit_snapshots` this comparison is between, with what
+    /// moved between it and this context's head, or `None` when the unit holds
+    /// on neither.
     ///
     /// Only a name-index read depends on the answer: every other read is
     /// checked against the head itself. A name-index read is proved by the
-    /// names that moved since the snapshot that recorded it, so a unit from
-    /// the base is checked against what moved between the base and the head,
-    /// a unit from the head against nothing, and a unit from anywhere else
-    /// cannot be checked at all.
-    pub fn changed_since(&self, unit_snapshot: StableDigest) -> Option<&ChangedFacts> {
-        if unit_snapshot == self.snapshots.head {
-            if self.snapshots.base == self.snapshots.head {
-                Some(self.changed)
+    /// names that moved since a snapshot it holds on, so a unit that holds on
+    /// the head is checked against nothing, one that holds on the base against
+    /// what moved between the base and the head, and a unit from anywhere else
+    /// cannot be checked at all. The head is preferred because it proves every
+    /// index read without looking at any name.
+    pub fn changed_since(
+        &self,
+        unit_snapshots: &[StableDigest],
+    ) -> Option<(StableDigest, &ChangedFacts)> {
+        if unit_snapshots.contains(&self.snapshots.head) {
+            let changed = if self.snapshots.base == self.snapshots.head {
+                self.changed
             } else {
-                Some(self.head_unchanged.get_or_init(|| self.changed.head_only()))
-            }
-        } else if unit_snapshot == self.snapshots.base {
-            Some(self.changed)
+                self.head_unchanged.get_or_init(|| self.changed.head_only())
+            };
+            Some((self.snapshots.head, changed))
+        } else if unit_snapshots.contains(&self.snapshots.base) {
+            Some((self.snapshots.base, self.changed))
         } else {
             None
         }
@@ -1457,6 +1676,31 @@ impl<'a> PolicyIncrementalContext<'a> {
             .lock()
             .expect("policy incremental runs mutex poisoned")
             .push(run);
+    }
+
+    /// Add one sliced attempt's phase times and replay count to its policy.
+    ///
+    /// A policy can run more than one attempt (typestate keeps selector and
+    /// root units apart), so the record is a sum.
+    pub(crate) fn add_unit_metrics(&self, policy_id: &PolicyId, attempt: UnitPhaseMetrics) {
+        let mut metrics = self
+            .unit_metrics
+            .lock()
+            .expect("policy unit metrics mutex poisoned");
+        let metrics = metrics.entry(policy_id.clone()).or_default();
+        metrics.prefetch += attempt.prefetch;
+        metrics.verify += attempt.verify;
+        metrics.lookup_replay += attempt.lookup_replay;
+        metrics.recompute += attempt.recompute;
+        metrics.lookups_replayed += attempt.lookups_replayed;
+    }
+
+    pub(crate) fn unit_phase_metrics(&self, policy_id: &PolicyId) -> Option<UnitPhaseMetrics> {
+        self.unit_metrics
+            .lock()
+            .expect("policy unit metrics mutex poisoned")
+            .get(policy_id)
+            .copied()
     }
 
     /// Keep one recomputed unit provisional until its policy succeeds.
@@ -1521,13 +1765,28 @@ impl<'a> PolicyIncrementalContext<'a> {
 
     /// The review of everything this evaluation reused, in policy order.
     pub fn review(&self) -> PolicyIncrementalReview {
+        // The replay count is joined here rather than when a run is recorded:
+        // a sliced attempt reports its metrics when its reuse state drops,
+        // which can be after the policy recorded its run.
+        let metrics = self
+            .unit_metrics
+            .lock()
+            .expect("policy unit metrics mutex poisoned");
+        let policies = self
+            .runs
+            .lock()
+            .expect("policy incremental runs mutex poisoned")
+            .iter()
+            .map(|run| PolicyIncrementalRun {
+                lookups_replayed: metrics
+                    .get(&run.policy_id)
+                    .map_or(0, |metrics| metrics.lookups_replayed),
+                ..run.clone()
+            })
+            .collect();
         PolicyIncrementalReview {
             base: self.base,
-            policies: self
-                .runs
-                .lock()
-                .expect("policy incremental runs mutex poisoned")
-                .clone(),
+            policies,
         }
     }
 }
@@ -1649,12 +1908,26 @@ pub struct PolicyIncrementalRun {
     pub units_reused: u64,
     pub units_recomputed: u64,
     pub units_unbounded: u64,
+    pub lookups_replayed: u64,
+    /// Why the policy was evaluated whole. With `units_total` zero and a
+    /// workspace-total reason (`merged_limit_reached`,
+    /// `verification_budget_exceeded`), the head did not attempt units: the
+    /// reason was predicted from this run's base evaluation rather than
+    /// observed on the head.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widen_reason: Option<WidenReason>,
+    /// The structural reason query-unit slicing widened. Taint selector
+    /// fallback details are not currently copied here; only their widening
+    /// reason is retained in range diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widen_detail: Option<PlanWidenDetail>,
     pub base_units_reused: u64,
     pub base_units_recomputed: u64,
+    pub base_lookups_replayed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_widen_reason: Option<WidenReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_widen_detail: Option<PlanWidenDetail>,
 }
 
 impl PolicyIncrementalRun {
@@ -1681,10 +1954,14 @@ impl PolicyIncrementalRun {
             units_reused: 0,
             units_recomputed: 0,
             units_unbounded: 0,
+            lookups_replayed: 0,
             widen_reason: Some(reason),
+            widen_detail: None,
             base_units_reused: 0,
             base_units_recomputed: 0,
+            base_lookups_replayed: 0,
             base_widen_reason: None,
+            base_widen_detail: None,
         }
     }
 
@@ -1696,7 +1973,9 @@ impl PolicyIncrementalRun {
         );
         self.base_units_reused = base.units_reused;
         self.base_units_recomputed = base.units_recomputed;
+        self.base_lookups_replayed = base.lookups_replayed;
         self.base_widen_reason = base.widen_reason;
+        self.base_widen_detail = base.widen_detail;
         self
     }
 }
@@ -1852,6 +2131,59 @@ mod tests {
             "5113-returned-refinement-census-v4",
             "-5113-reference-inventory-ownership",
             "-5964-comparison-chain-demand-proof",
+            "-7464-csharp-incoming-overload-partition",
+            "-7368-7369-csharp-equals-argument-identity",
+            "-7289-field-initializer-reads",
+            "-7150-go-call-result-counts",
+            "-7379-dereference-store-operations",
+            "-7344-7345-csharp-compound-writes",
+            "-7373-csharp-contextual-keyword-binders",
+            "-7371-nonlocal-branch-distinction-7372-initializer-body-relations",
+            "-7107-content-diagnostic-units",
+            "-rust-deref-receiver-steps-7226",
+            "-7219-rust-concrete-receiver-closed",
+            "-7150-open-member-calls",
+            "-7340-live-region-overwrite-veto",
+            "-7520-go-interface-dispatch-references",
+            "-analysis-quicksilver-round12-boolean-contexts-binder-spans",
+            "-analysis-quicksilver-round12-fact-analyzers",
+            "-7471-go-short-var-redeclaration",
+            "-7341-7342-go-remainder-comma-ok",
+            "-7617-go-direct-type-shapes",
+            "-7343-go-static-type-failure-branches",
+            "-7393-unproven-nonempty-failure-branches",
+            "-7470-go-visible-binding-shapes",
+            "-7616-go-modeled-package-result-unknown",
+            "-analysis-quicksilver-round12-config-lookup",
+            "-7518-go-undecided-receiver-candidates",
+            "-7578-branch-conditioned-sanitizers",
+            "-7618-java-creation-receiver-site",
+            "-7560-csharp-row-backed-models",
+            "-7348-7349-7369-java-compound-static-patterns",
+            "-5658-single-writer-identity",
+            "-5658-structural-module-mutations",
+            "-5658-python-attribute-space-owners",
+            "-5658-python-argument-independent-calls",
+            "-5658-python-global-writer-identity",
+            "-5658-python-native-member-targets",
+            "-7642-witness-budget-incomplete",
+            "-5658-python-unplaced-file-references",
+            "-7516-go-constructor-shadow",
+            "-7673-python-qualified-module-members",
+            "-7817-external-supertype-kind",
+            "-7619-java-implicit-external-inherited-calls",
+            "-7620-java-wildcard-sibling-applicability",
+            "-7578-java-observed-value-type",
+            "-7578-guard-writer-reachability",
+            "-7735-binder-declaration-sites",
+            "-5658-python-import-occurrence-kinds",
+            "-7781-synthetic-members-completeness",
+            "-7509-go-declaration-value-types",
+            "-7755-refused-alternative-before-budget",
+            "-3494-ruby-member-closure",
+            "-7789-indexed-import-destinations",
+            "-7849-java-external-owner-observed-type",
+            "-7509-go-native-binding-proofs",
         ] {
             assert_eq!(POLICY_SUBSTRATE_EPOCH.matches(component).count(), 1);
             let old_substrate = POLICY_SUBSTRATE_EPOCH.replacen(component, "", 1);
@@ -1906,10 +2238,14 @@ mod tests {
                     units_reused: 39,
                     units_recomputed: 1,
                     units_unbounded: 0,
+                    lookups_replayed: 0,
                     widen_reason: None,
+                    widen_detail: None,
                     base_units_reused: 38,
                     base_units_recomputed: 2,
+                    base_lookups_replayed: 0,
                     base_widen_reason: Some(WidenReason::MergedLimitReached),
+                    base_widen_detail: None,
                 },
                 PolicyIncrementalRun::whole_family(whole.clone()),
             ],

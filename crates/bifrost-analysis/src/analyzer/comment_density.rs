@@ -84,13 +84,15 @@ fn analyze_file(
     walk_tree_preorder(tree.root_node(), true, |node| {
         if node.kind() == "primary_constructor" {
             primary_constructor_ranges.push((node.start_byte(), node.end_byte()));
-        }
-        if node.kind() == "class_parameter"
-            && let Some(primary) = node
-                .parent()
-                .filter(|parent| parent.kind() == "primary_constructor")
-        {
-            class_parameter_ranges.push((node.start_byte(), node.end_byte(), primary.start_byte()));
+            for parameter in brokk_bifrost_core::analyzer::tree_walk::named_children_iter(node)
+                .filter(|child| child.kind() == "class_parameter")
+            {
+                class_parameter_ranges.push((
+                    parameter.start_byte(),
+                    parameter.end_byte(),
+                    node.start_byte(),
+                ));
+            }
         }
         if node.kind().ends_with("comment") {
             comments.push(node);
@@ -139,7 +141,10 @@ fn analyze_file(
         &primary_constructor_ranges,
         &class_parameter_ranges,
     );
-    let mut aggregates: HashMap<String, (u32, u32)> = HashMap::default();
+    // Key by the full CodeUnit identity, not the FQ name: overloads (such as
+    // a Kotlin primary and secondary constructor) share an FQ name but are
+    // distinct declarations, and a class roll-up visits each of them.
+    let mut aggregates: HashMap<CodeUnit, (u32, u32)> = HashMap::default();
     for comment in comments {
         let start = comment.start_byte();
         let end = comment.end_byte();
@@ -151,7 +156,7 @@ fn analyze_file(
             .row
             .saturating_sub(comment.start_position().row)
             + 1) as u32;
-        let counts = aggregates.entry(code_unit.fq_name()).or_default();
+        let counts = aggregates.entry(code_unit.clone()).or_default();
         if end <= range.declaration_start {
             counts.0 += lines;
         } else {
@@ -166,7 +171,7 @@ fn analyze_file(
 
 struct DensityFile {
     declarations: Vec<DensityDeclaration>,
-    aggregates: HashMap<String, (u32, u32)>,
+    aggregates: HashMap<CodeUnit, (u32, u32)>,
 }
 
 struct DensityDeclaration {
@@ -340,11 +345,8 @@ fn build_roll_up_stats(code_unit: &CodeUnit, density: &DensityFile) -> Option<Co
     })
 }
 
-fn own_counts(code_unit: &CodeUnit, aggregates: &HashMap<String, (u32, u32)>) -> (u32, u32) {
-    aggregates
-        .get(&code_unit.fq_name())
-        .copied()
-        .unwrap_or_default()
+fn own_counts(code_unit: &CodeUnit, aggregates: &HashMap<CodeUnit, (u32, u32)>) -> (u32, u32) {
+    aggregates.get(code_unit).copied().unwrap_or_default()
 }
 
 fn is_kotlin_primary_constructor(
@@ -401,4 +403,51 @@ pub fn assert_projection_matches_direct(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::analyzer::{CodeUnitType, ProjectFile};
+
+    fn unit(kind: CodeUnitType, name: &str) -> CodeUnit {
+        let root = if cfg!(windows) {
+            r"C:\workspace"
+        } else {
+            "/workspace"
+        };
+        CodeUnit::new(ProjectFile::new(root, "src/A.kt"), kind, "", name)
+    }
+
+    #[test]
+    fn class_rollup_descends_into_nested_classes() {
+        let outer = unit(CodeUnitType::Class, "Outer");
+        let nested = unit(CodeUnitType::Class, "Inner");
+        let method = unit(CodeUnitType::Function, "method");
+        let density = DensityFile {
+            declarations: vec![
+                DensityDeclaration {
+                    code_unit: outer.clone(),
+                    depth: 0,
+                    ranges: vec![],
+                    children: vec![1],
+                    span_lines: 1,
+                },
+                DensityDeclaration {
+                    code_unit: nested.clone(),
+                    depth: 1,
+                    ranges: vec![],
+                    children: vec![2],
+                    span_lines: 1,
+                },
+                DensityDeclaration {
+                    code_unit: method.clone(),
+                    depth: 2,
+                    ranges: vec![],
+                    children: vec![],
+                    span_lines: 1,
+                },
+            ],
+            aggregates: [(method, (2, 3))].into_iter().collect(),
+        };
+        let stats = build_roll_up_stats(&outer, &density).unwrap();
+        assert_eq!(stats.rolled_up_span_lines, 3);
+    }
+}

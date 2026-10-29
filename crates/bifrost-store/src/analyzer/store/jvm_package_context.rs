@@ -7,6 +7,9 @@ use std::path::{Component, Path, PathBuf};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
+use super::resolution_operation::nominal_rules::{
+    jvm_package_rules, nominal_package_rules_for_storage,
+};
 use super::{AnalyzerStore, Result, WorkspaceSnapshotId, WorkspaceSnapshots};
 use crate::analyzer::store::maven::MavenConfigurationFacts;
 use crate::analyzer::store::maven::MavenModelLimitation;
@@ -23,7 +26,7 @@ pub(super) const JVM_NATIVE_SOURCE_MEMBERSHIP_SQL: &str =
 impl AnalyzerStore {
     #[doc(hidden)]
     pub fn reconcile_jvm_package_contexts(&self, snapshots: &WorkspaceSnapshots) -> Result<()> {
-        for language in ["java", "kotlin", "scala"] {
+        for &language in jvm_package_rules().storage_languages() {
             if let Some(snapshot) = snapshots.get(language) {
                 self.reconcile_jvm_package_context(snapshot)?;
             }
@@ -33,10 +36,8 @@ impl AnalyzerStore {
 
     #[doc(hidden)]
     pub fn reconcile_jvm_package_context(&self, snapshot: &WorkspaceSnapshotId) -> Result<i64> {
-        assert!(matches!(
-            snapshot.lang.as_str(),
-            "java" | "kotlin" | "scala"
-        ));
+        nominal_package_rules_for_storage(&snapshot.lang)
+            .expect("a package context snapshot belongs to a nominal family");
         let snapshot = snapshot.clone();
         self.conn.execute(move |connection| {
             // Reserve the writer before reading; a deferred snapshot upgrade can

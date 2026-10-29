@@ -121,7 +121,6 @@ pub fn decoded_xml_scalar_value(
     };
     let range = fact.evidence();
     let raw = source.get(range.start_byte()..range.end_byte())?;
-    let decoded = quick_xml::escape::unescape(raw).ok()?.into_owned();
     let is_element_text = fact
         .parent()
         .and_then(|parent| document.fact(parent))
@@ -134,11 +133,23 @@ pub fn decoded_xml_scalar_value(
                 } if *header == fact_id
             )
         });
-    Some(if is_element_text {
-        decoded.trim().to_string()
+    if is_element_text {
+        Some(quick_xml::escape::unescape(raw).ok()?.trim().to_string())
     } else {
-        decoded
-    })
+        // The fact already selected an attribute value. Delegate XML 1.0
+        // sections 2.11 and 3.3.3 to the maintained reader: normalize literal
+        // whitespace before expanding references, preserving referenced tabs.
+        let attribute = quick_xml::events::attributes::Attribute {
+            key: quick_xml::name::QName(b""),
+            value: std::borrow::Cow::Borrowed(raw.as_bytes()),
+        };
+        Some(
+            attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()?
+                .into_owned(),
+        )
+    }
 }
 
 /// Decode one authored Java-properties scalar after the maintained grammar has
@@ -199,7 +210,7 @@ pub fn decoded_yaml_scalar_value(
     };
     let range = fact.evidence();
     let raw = source.get(range.start_byte()..range.end_byte())?;
-    serde_saphyr::from_str::<String>(raw.trim()).ok()
+    serde_saphyr::from_str::<String>(raw).ok()
 }
 
 fn decode_properties_value(raw: &str) -> String {
@@ -2846,6 +2857,342 @@ caf\\u00e9.mode=on\n";
     }
 
     #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: XML attribute whitespace was not normalized"
+    )]
+    fn xml_attribute_normalization_preserves_character_references() {
+        // XML 1.0 sections 2.11 and 3.3.3: literal whitespace becomes a
+        // space (CRLF is one line ending); character references retain value.
+        for (authored, expected) in [
+            ("a\tb", "a b"),
+            ("a\nb", "a b"),
+            ("a\rb", "a b"),
+            ("a\r\nb", "a b"),
+            ("a&#x9;b", "a\tb"),
+            ("a&#10;b", "a\nb"),
+            ("a&#13;b", "a\rb"),
+        ] {
+            let source = format!("<server host=\"{authored}\"/>");
+            let document = xml_facts(&source);
+            let (index, _) = document
+                .facts()
+                .iter()
+                .enumerate()
+                .find(|(_, fact)| matches!(fact.kind(), ConfigurationNodeKind::Scalar { .. }))
+                .unwrap();
+            assert_eq!(
+                decoded_xml_scalar_value(
+                    &document,
+                    &source,
+                    ConfigurationFactId::new(index).unwrap()
+                ),
+                Some(expected.to_owned()),
+                "{authored:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: YAML block decoding discarded significant trailing whitespace"
+    )]
+    fn yaml_block_scalars_preserve_content_and_chomping() {
+        // YAML 1.2.2 sections 8.1.1.2, 8.1.2 and 8.1.3. Trailing spaces
+        // are content; strip/clip/keep govern only the final line breaks.
+        for (header, expected) in [
+            ("|-", "a  "),
+            ("|", "a  \n"),
+            ("|+", "a  \n\n\n"),
+            (">-", "a  "),
+            (">", "a  \n"),
+            (">+", "a  \n\n\n"),
+        ] {
+            let source = format!("value: {header}\n  a  \n\n\n");
+            let entire: std::collections::BTreeMap<String, String> =
+                serde_saphyr::from_str(&source).unwrap();
+            assert_eq!(entire["value"], expected, "{header}");
+            let document = yaml_facts(&source);
+            let (index, _) = document
+                .facts()
+                .iter()
+                .enumerate()
+                .find(|(_, fact)| matches!(fact.kind(), ConfigurationNodeKind::Scalar { .. }))
+                .unwrap();
+            assert_eq!(
+                decoded_yaml_scalar_value(
+                    &document,
+                    &source,
+                    ConfigurationFactId::new(index).unwrap()
+                ),
+                Some(expected.to_owned()),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_property_only_nodes_follow_empty_scalar_resolution() {
+        // YAML 1.2.2 sections 7.2 and 10.3: an untagged empty node is null;
+        // an explicit string tag selects an empty string instead.
+        for (source, kind, property) in [
+            (
+                "key: &anchor\n",
+                ConfigurationScalarKind::Null,
+                Some("anchor"),
+            ),
+            ("key: !!str\n", ConfigurationScalarKind::String, Some("tag")),
+            ("key:\n", ConfigurationScalarKind::Null, None),
+        ] {
+            let tree = parse_tree(&tree_sitter_yaml::LANGUAGE.into(), "YAML", source).unwrap();
+            let mut stack = vec![tree.root_node()];
+            let mut pair = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "block_mapping_pair" {
+                    pair = Some(node);
+                    break;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            let value = pair.unwrap().child_by_field_name("value");
+            if let Some(property) = property {
+                let value = value.unwrap();
+                assert_eq!(value.kind(), "flow_node");
+                let parts = yaml_node_parts(value);
+                assert!(parts.content.is_none());
+                assert_eq!(value.named_child(0).unwrap().kind(), property);
+            } else {
+                assert!(value.is_none());
+            }
+            let document = yaml_facts(source);
+            assert!(recovery_reasons(&document).is_empty());
+            assert!(document.facts().iter().any(|fact|
+                matches!(fact.kind(), ConfigurationNodeKind::Scalar { scalar_kind: actual } if *actual == kind)
+            ), "{source}: {:?}", document.facts());
+        }
+    }
+
+    #[test]
+    fn string_decoders_agree_on_specification_escape_vectors() {
+        // RFC 8259 section 7, YAML 1.2.2 section 5.7, Properties.load.
+        for (escape, expected) in [
+            (r"\t", "a\tb"),
+            (r"\n", "a\nb"),
+            (r"\r", "a\rb"),
+            (r"\f", "a\x0cb"),
+            (r"\u263a", "a\u{263a}b"),
+        ] {
+            for (path, source, decode) in [
+                (
+                    "config.json",
+                    format!(r#"{{"host":"a{escape}b"}}"#),
+                    decoded_json_scalar_value
+                        as fn(
+                            &ConfigurationDocumentFacts,
+                            &str,
+                            ConfigurationFactId,
+                        ) -> Option<String>,
+                ),
+                (
+                    "config.yaml",
+                    format!("host: \"a{escape}b\"\n"),
+                    decoded_yaml_scalar_value,
+                ),
+                (
+                    "config.properties",
+                    format!("host=a{escape}b\n"),
+                    decoded_properties_scalar_value,
+                ),
+            ] {
+                let ConfigurationIngestionOutcome::Facts(document) =
+                    ingest_configuration_document(Path::new(path), source.as_bytes())
+                else {
+                    panic!("{path}")
+                };
+                let (index, _) = document
+                    .facts()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, fact)| matches!(fact.kind(), ConfigurationNodeKind::Scalar { .. }))
+                    .unwrap();
+                assert_eq!(
+                    decode(&document, &source, ConfigurationFactId::new(index).unwrap()).as_deref(),
+                    Some(expected),
+                    "{path}: {escape}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_json_keys_preserve_all_grammar_children() {
+        let source = r#"{" a\ud800 z ":1,"a\ud800z":2}"#;
+        let tree = parse_tree(&tree_sitter_json::LANGUAGE.into(), "JSON", source).unwrap();
+        let root = tree.root_node().named_child(0).unwrap();
+        let mut cursor = root.walk();
+        let keys: Vec<_> = root
+            .named_children(&mut cursor)
+            .map(|pair| pair.child_by_field_name("key").unwrap())
+            .collect();
+        let document = facts(source);
+        for (node, key) in keys.iter().zip(member_keys(&document)) {
+            let mut cursor = node.walk();
+            assert_eq!(
+                node.named_children(&mut cursor)
+                    .map(|child| child.kind())
+                    .collect::<Vec<_>>(),
+                ["string_content", "escape_sequence", "string_content"]
+            );
+            assert_eq!(key, &source[node.start_byte() + 1..node.end_byte() - 1]);
+        }
+        assert_ne!(member_keys(&document)[0], member_keys(&document)[1]);
+        assert!(
+            recovery_reasons(&document).contains(&ConfigurationRecoveryReason::UnsupportedScalar)
+        );
+    }
+
+    #[test]
+    fn json_missing_punctuation_matches_grammar_recovery_evidence() {
+        for source in [r#"{"a":1"#, r#"[1"#] {
+            let tree = parse_tree(&tree_sitter_json::LANGUAGE.into(), "JSON", source).unwrap();
+            let mut cursor = tree.walk();
+            let mut missing = Vec::new();
+            loop {
+                let node = cursor.node();
+                if node.is_missing() && !node.is_named() {
+                    missing.push(source_range(node).unwrap());
+                }
+                if cursor.goto_first_child() {
+                    continue;
+                }
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() {
+                        break;
+                    }
+                }
+                if cursor.node() == tree.root_node() {
+                    break;
+                }
+            }
+            assert!(!missing.is_empty(), "{}", tree.root_node().to_sexp());
+            let document = facts(source);
+            let recoveries = crate::test_support::configuration_recovery_ranges(&document);
+            for range in missing {
+                assert!(
+                    recoveries.contains(&(
+                        ConfigurationRecoveryReason::MalformedSyntax,
+                        range.start_byte()..range.end_byte()
+                    )),
+                    "{recoveries:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn synthesized_toml_objects_retain_the_authored_key_span() {
+        let source = "a = { a.b = 1 }";
+        let parsed = source.parse::<ImDocument<String>>().unwrap();
+        let inline = parsed
+            .as_table()
+            .get("a")
+            .unwrap()
+            .as_value()
+            .unwrap()
+            .as_inline_table()
+            .unwrap();
+        assert!(inline.get("a").unwrap().span().is_none());
+        let document = crate::test_support::configuration_facts(Path::new("config.toml"), source);
+        let member = member_at(&document, &["a", "a"]);
+        let ConfigurationNodeKind::Member {
+            key,
+            value: Some(value),
+            ..
+        } = member.kind()
+        else {
+            panic!("{member:?}")
+        };
+        let object = document.fact(*value).unwrap();
+        assert!(matches!(
+            object.kind(),
+            ConfigurationNodeKind::Object { .. }
+        ));
+        assert_eq!(slice(source, key.evidence()), "a");
+        assert_eq!(object.evidence(), key.evidence());
+    }
+
+    #[test]
+    fn yaml_key_properties_match_grammar_tag_evidence() {
+        // YAML 1.2.2 sections 6.8.2 and 6.9.1: secondary handles can be
+        // rebound, verbatim core tags cannot; collection tags require shape.
+        for (directive, key, tag, resolved) in [
+            ("", "!!str caf\u{e9}", "!!str", true),
+            (
+                "",
+                "!<tag:yaml.org,2002:str> caf\u{e9}",
+                "!<tag:yaml.org,2002:str>",
+                true,
+            ),
+            ("", "!custom caf\u{e9}", "!custom", false),
+            ("", "!!str", "!!str", true),
+            ("", "!!seq [a, b]", "!!seq", true),
+            ("", "!!str [a, b]", "!!str", false),
+            (
+                "%TAG !! tag:example.com,2000:app/\r\n---\r\n",
+                "!!str caf\u{e9}",
+                "!!str",
+                false,
+            ),
+            (
+                "%TAG !! tag:example.com,2000:app/\r\n---\r\n",
+                "!<tag:yaml.org,2002:str> caf\u{e9}",
+                "!<tag:yaml.org,2002:str>",
+                true,
+            ),
+        ] {
+            let source = format!(
+                "{directive}pr\u{e9}fix: &anchor value\r\n? {key}\r\n: result\r\n? *anchor\r\n: alias\r\n"
+            );
+            let tree = parse_tree(&tree_sitter_yaml::LANGUAGE.into(), "YAML", &source).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let mut stack = vec![tree.root_node()];
+            let mut tags = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "block_mapping_pair" {
+                    let key = node.child_by_field_name("key").unwrap();
+                    let mut cursor = key.walk();
+                    for property in key.named_children(&mut cursor) {
+                        if property.kind() == "tag" {
+                            assert_eq!(key.kind(), "flow_node");
+                            tags.push(source_range(property).unwrap());
+                        }
+                    }
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(tags.len(), 1, "{}", tree.root_node().to_sexp());
+            assert_eq!(slice(&source, tags[0]), tag);
+            let document = yaml_facts(&source);
+            let (ConfigurationFeatureState::Authored { evidence }
+            | ConfigurationFeatureState::Unresolved { evidence }) = document.features().tags()
+            else {
+                panic!("{document:#?}")
+            };
+            assert_eq!(evidence, &tags);
+            assert_eq!(
+                document.features().tags().is_resolved(),
+                resolved,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn adapter_epochs_are_stable_and_distinct_per_adapter() {
         let epochs = [
             json_configuration_adapter_epoch(),
@@ -3099,6 +3446,7 @@ caf\\u00e9.mode=on\n";
         let document = xml_facts(source);
         assert!(document.completeness().is_complete(), "{document:#?}");
         assert_eq!(document.format(), ConfigurationFormat::Xml);
+        arena_children_are_exclusive(&document);
         let members: Vec<_> = document
             .facts()
             .iter()

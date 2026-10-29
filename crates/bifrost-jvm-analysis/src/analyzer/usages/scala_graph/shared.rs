@@ -454,6 +454,7 @@ impl<'a> ScalaFrontierScan<'a> {
                 let mut observed_hits = BTreeSet::new();
                 let mut unproven_hits = BTreeSet::new();
                 let mut sink = ScalaQueryHitSink {
+                    tree: &item.tree,
                     analyzer: &dispatch,
                     scala: self.scala,
                     file: &item.file,

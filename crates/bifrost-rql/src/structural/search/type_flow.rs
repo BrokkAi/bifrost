@@ -24,32 +24,38 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
     CandidateCoverage, ClassIdentity, DeclarationSegmentKind, ExactResultProducer, IcfgProvider,
     IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemberAccessKind, MemberDeclaration,
-    ProcedureHandle, SemanticBudget, SemanticBudgetDimension, SemanticIrVersion, SemanticWork,
-    SourceMappingKind, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
-    WorkspaceIcfgProvider, WorkspaceRelativePath, type_flow_adapter,
+    ProcedureHandle, SemanticBudget, SemanticBudgetDimension, SemanticIrVersion,
+    SemanticProcedureReference, SemanticWork, SourceMappingKind, SourceSiteKind, SourceSpan,
+    StableDigest, TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider, WorkspaceRelativePath,
+    type_flow_adapter,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::path_utils::rel_path_string;
+use brokk_bifrost_analysis::analyzer::store::cache_budget::{RetainedBytes, RetainedHeap};
 use brokk_bifrost_analysis::analyzer::store::class_set_root_results::{
     ClassSetRootResultGenerationKey, ClassSetRootResultLookup, FindingFreeClassSetRootKey,
     FindingFreeClassSetRootResult, PersistedClassSetAtom, PersistedClassSetRootRow,
     PersistedClassSetStatus,
 };
+use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads, replay_query_read_keys};
+use brokk_bifrost_core::complete_value_cache::{
+    CompleteValueAcquisition, CompleteValueCache, CompleteValuePermit,
+};
 use brokk_bifrost_flow::dataflow::{
     DataflowDirectionRequest, DataflowQueryPlanConfig, DataflowRequest, SolverBudget,
-    SolverBudgetDimension, SummaryWitnessError,
+    SolverBudgetDimension, SolverWork, SummaryWitnessError,
 };
 use brokk_bifrost_flow::flow_state::procedure_public_digest;
 use brokk_bifrost_flow::type_flow::{
     AbsentMemberProof, ClassSetStatus, DynamicWriteEvidence, FeedbackLimits, FieldSlotIndex,
     FieldSlotIndexAcquisitionKind, FieldSlotIndexMissReason, ProcedureRefinements,
-    ReceiverClassSet, RootExhaustedLane, RootIncompleteEvidence, TypeFlowError, TypeFlowPlanError,
-    TypeFlowRootPersistenceStatus, TypeFlowRootResult, TypeFlowSitePurpose,
-    active_semantic_model_pack_digest, solve_type_flow_for_root_with_refinements,
-    sort_unknown_reasons,
+    RootExhaustedLane, RootIncompleteEvidence, TypeFlowError, TypeFlowPlanError,
+    TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
+    TypeFlowSitePurpose, active_semantic_model_pack_digest,
+    solve_type_flow_for_root_with_refinements, sort_unknown_reasons,
 };
 use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCacheStatsSnapshot};
 
@@ -58,18 +64,84 @@ use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCac
 const CLOSURE_LIMITS: ClosureLimits = ClosureLimits {
     max_procedures: 512,
 };
-const ROOT_RESULT_REPRESENTATION_VERSION: u32 = 4;
+const ROOT_RESULT_REPRESENTATION_VERSION: u32 = 5;
 
-fn field_slot_semantic_limits(caller: SemanticWork) -> SemanticWork {
-    caller.component_max(SemanticWork::default_limits())
+/// Engine-owned limits for every product shared by class-set root solves.
+/// Selector continuations carry this value unchanged from their parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodeQueryRootAllotment {
+    solver: SolverWork,
+    semantic: SemanticWork,
+}
+
+impl CodeQueryRootAllotment {
+    /// Derive root limits once from the original query, before any continuation.
+    pub fn from_execution_limits(limits: &super::CodeQueryExecutionLimits) -> Self {
+        let solver = limits.value_flow.solver_work;
+        let semantic = super::semantic::semantic_budget_limits(limits.semantic);
+        fn round(query: usize, default: usize) -> usize {
+            let limit = query.max(default);
+            let rounded = limit.checked_next_power_of_two().unwrap_or(limit);
+            assert!(rounded >= default && rounded >= query);
+            rounded
+        }
+        Self {
+            solver: solver.zip_with(SolverWork::default_limits(), round),
+            semantic: semantic.zip_with(SemanticWork::default_limits(), round),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TypeFlowCacheKey {
-    root: ProcedureHandle,
+    root: SemanticProcedureReference,
     /// Separates results if this cache is ever reused across provider builds.
     provider_behavior: IcfgProviderBehaviorIdentity,
     field_slots: StableDigest,
+}
+
+// Cold scans on 2026-10-26 retained 34.4 MiB for one product per unique root
+// on pallets/flask and 2.0 MiB on axios. Eviction is safe under root allotments.
+const ROOT_MEMO_RETAINED_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TypeFlowRootMemoKey {
+    root: TypeFlowCacheKey,
+    allotment: CodeQueryRootAllotment,
+    active_pack: StableDigest,
+    workspace_content: [u8; 32],
+}
+
+/// One policy run's bounded, single-flight memo. Never retain this in
+/// FlowWorkspaceState: a service reuses that state across requests.
+#[derive(Clone)]
+pub struct TypeFlowRootMemo {
+    products: CompleteValueCache<TypeFlowRootMemoKey, TypeFlowRootProduct>,
+}
+
+impl Default for TypeFlowRootMemo {
+    fn default() -> Self {
+        Self {
+            products: CompleteValueCache::new(
+                ROOT_MEMO_RETAINED_BYTES,
+                |_, product: &Arc<TypeFlowRootProduct>| {
+                    product.retained_bytes().min(u32::MAX as usize) as u32
+                },
+            ),
+        }
+    }
+}
+
+type RootMemoPermit = Box<CompleteValuePermit<TypeFlowRootMemoKey, TypeFlowRootProduct>>;
+
+enum RootProductSource {
+    Solved,
+    Memo,
+}
+
+enum RootProductAcquisition {
+    Solve(Option<RootMemoPermit>),
+    Applied(Option<CachedTypeFlowAnalysis>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -87,14 +159,569 @@ struct FieldSlotCacheKey {
     provider_behavior: IcfgProviderBehaviorIdentity,
 }
 
+/// A solve that returned an error is `Owned` with the product's `failure`
+/// set, so the failure travels with the product. `Failed` records this
+/// query's own outcome: its lookup or publication was cancelled, or its
+/// admission of the product's census was refused.
 #[derive(Debug, Clone)]
 enum CachedTypeFlowAnalysis {
-    Live {
-        result: Arc<TypeFlowRootResult>,
-        projected_rows: Option<Arc<[ClassSetRowValue]>>,
-    },
+    Owned(QueryRootProduct),
     FindingFreeRows(Arc<[ClassSetRowValue]>),
     Failed,
+}
+
+/// A query's admission ends independently of any other owner of the output.
+#[derive(Debug, Clone)]
+struct QueryRootProduct {
+    product: Arc<TypeFlowRootProduct>,
+    _owner: Arc<()>,
+}
+
+/// Query-owned observations. No field contains a lowered artifact handle.
+#[derive(Debug, Clone)]
+pub(super) struct OwnedTypeFlowSite {
+    pub(super) procedure: SemanticProcedureReference,
+    pub(super) is_generator: bool,
+    pub(super) call: Option<crate::analyzer::semantic::CallSiteId>,
+    pub(super) call_span: Option<SourceSpan>,
+    pub(super) file: ProjectFile,
+    pub(super) span: SourceSpan,
+    pub(super) member: Box<str>,
+    pub(super) kind: MemberAccessKind,
+    pub(super) purpose: TypeFlowSitePurpose,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct OwnedReceiverClassSet {
+    pub(super) site: OwnedTypeFlowSite,
+    pub(super) classes: Vec<(ClassIdentity, crate::analyzer::semantic::SourceSite)>,
+    pub(super) constructor_origin: Option<crate::analyzer::semantic::ConstructorResultOrigin>,
+    pub(super) exact_result_receiver_proven: bool,
+    pub(super) member_declarations:
+        Vec<(ClassIdentity, crate::analyzer::semantic::MemberLookupHit)>,
+    pub(super) flow_unknown: Vec<UnknownReason>,
+    pub(super) unknown: Vec<UnknownReason>,
+    pub(super) dynamic_writes: Vec<DynamicWriteEvidence>,
+    pub(super) status: ClassSetStatus,
+}
+
+#[derive(Debug)]
+struct TypeFlowRootProduct {
+    root: SemanticProcedureReference,
+    failure: Option<(CodeQueryDiagnosticCode, String)>,
+    projected_rows: Vec<ClassSetRowValue>,
+    class_sets: Vec<OwnedReceiverClassSet>,
+    findings: Vec<AbsentMemberFindingValue>,
+    complete: bool,
+    semantic_budget_exhausted: bool,
+    incomplete_evidence: RootIncompleteEvidence,
+    persistence_status: TypeFlowRootPersistenceStatus,
+    work: CodeQueryTypeFlowWork,
+    solver_work: SolverWork,
+    semantic_work: SemanticWork,
+    reads: Vec<ReadKey>,
+    unattributed_reads: usize,
+}
+
+impl TypeFlowRootProduct {
+    fn work_for(result: &TypeFlowRootResult) -> CodeQueryTypeFlowWork {
+        CodeQueryTypeFlowWork {
+            solves: 1,
+            summary_cache_hits: result.reusable_summary_hits as u64,
+            summary_cache_misses: result.reusable_summary_misses as u64,
+            root_summary_cache_hits: result.reusable_root_summary_hits as u64,
+            root_summary_observation_rejections: result.reusable_root_summary_observation_rejections
+                as u64,
+            published_summaries: result.published_summaries as u64,
+            summary_profile: result.summary_profile,
+            solver_attempts: result.solver_attempts.len() as u64,
+            incomplete_roots: u64::from(!result.complete),
+            ..Default::default()
+        }
+    }
+
+    fn new(
+        workspace: &WorkspaceAnalyzer,
+        procedure: &SemanticProcedureValue,
+        result: TypeFlowRootResult,
+        projected_rows: Vec<ClassSetRowValue>,
+        semantic_work: SemanticWork,
+    ) -> Self {
+        let work = Self::work_for(&result);
+        let solver_work = result
+            .solver_attempts
+            .iter()
+            .fold(SolverWork::default(), |sum, attempt| {
+                sum.saturating_add(attempt.work)
+            });
+        let findings = project_absent_members(workspace, procedure, &result);
+        let class_sets = result
+            .class_sets
+            .into_iter()
+            .map(|set| {
+                let call_span = set.site.call.and_then(|id| {
+                    let semantics = set.site.procedure.semantics();
+                    let call = semantics.call_site(id)?;
+                    let mapping = semantics.source_mapping(call.source)?;
+                    (mapping.kind == SourceMappingKind::Exact)
+                        .then(|| mapping.locator.anchor().span())
+                });
+                OwnedReceiverClassSet {
+                    site: OwnedTypeFlowSite {
+                        procedure: SemanticProcedureReference::of(&set.site.procedure),
+                        is_generator: set.site.procedure.semantics().properties().is_generator,
+                        call: set.site.call,
+                        call_span,
+                        file: set.site.file,
+                        span: set.site.span,
+                        member: set.site.member,
+                        kind: set.site.kind,
+                        purpose: set.site.purpose,
+                    },
+                    classes: set.classes,
+                    constructor_origin: set.constructor_origin,
+                    exact_result_receiver_proven: set.exact_result_receiver_proven,
+                    member_declarations: set.member_declarations,
+                    flow_unknown: set.flow_unknown,
+                    unknown: set.unknown,
+                    dynamic_writes: set.dynamic_writes,
+                    status: set.status,
+                }
+            })
+            .collect();
+        Self {
+            root: result.root,
+            failure: None,
+            projected_rows,
+            class_sets,
+            findings,
+            complete: result.complete,
+            semantic_budget_exhausted: result.semantic_budget_exhausted,
+            incomplete_evidence: result.incomplete_evidence,
+            persistence_status: result.persistence_status,
+            work,
+            solver_work,
+            semantic_work,
+            reads: Vec::new(),
+            unattributed_reads: 0,
+        }
+    }
+}
+
+/// Type-specific walk over the shared retained-allocation census. Core file and
+/// declaration handles are charged per handle, conservatively, because their
+/// Arcs are private to core; RetainedHeap deduplicates exposed Arcs by address.
+fn retained_text(heap: &mut RetainedHeap, value: &String) {
+    heap.add(value.capacity());
+    heap.add_entries(1);
+}
+fn retained_file(heap: &mut RetainedHeap, value: &ProjectFile) {
+    heap.add(
+        value
+            .retained_bytes()
+            .saturating_sub(std::mem::size_of_val(value)),
+    );
+    heap.add_entries(1);
+}
+fn retained_class(heap: &mut RetainedHeap, value: &ClassIdentity) {
+    match value {
+        ClassIdentity::Workspace(unit) => {
+            heap.add(
+                unit.retained_bytes()
+                    .saturating_sub(std::mem::size_of_val(unit)),
+            );
+            heap.add_entries(1);
+        }
+        ClassIdentity::External {
+            qualified_name,
+            symbol_id,
+        } => {
+            heap.add(qualified_name.len().saturating_add(symbol_id.len()));
+            heap.add_entries(2);
+        }
+        ClassIdentity::Intrinsic { qualified_name } => {
+            heap.add(qualified_name.len());
+            heap.add_entries(1);
+        }
+    }
+}
+fn retained_unknown(heap: &mut RetainedHeap, values: &Vec<UnknownReason>) {
+    heap.vec(values);
+    for value in values {
+        if let UnknownReason::UnmodeledGuard { class } = value {
+            heap.add(class.len());
+            heap.add_entries(1);
+        }
+    }
+}
+fn retained_dynamic(heap: &mut RetainedHeap, values: &Vec<DynamicWriteEvidence>) {
+    heap.vec(values);
+    for value in values {
+        retained_file(heap, &value.site.file);
+        if let Some(UnknownReason::UnmodeledGuard { class }) = &value.reason {
+            heap.add(class.len());
+            heap.add_entries(1);
+        }
+    }
+}
+fn retained_reference(heap: &mut RetainedHeap, value: &SemanticProcedureReference) {
+    heap.add(value.key.path().as_str().len());
+    heap.add_entries(1);
+    heap.add(value.locator.path().as_str().len());
+    heap.add_entries(1);
+    let segments = value.locator.declaration().segments();
+    heap.add(std::mem::size_of_val(segments));
+    heap.add_entries(segments.len());
+    for segment in segments {
+        if let Some(name) = segment.name() {
+            heap.add(name.len());
+            heap.add_entries(1);
+        }
+    }
+}
+fn retained_symbol(heap: &mut RetainedHeap, value: &super::CodeQueryFlowSymbolSite) {
+    retained_text(heap, &value.id);
+    retained_text(heap, &value.path);
+    heap.vec(&value.declaration);
+    for segment in &value.declaration {
+        if let Some(name) = &segment.name {
+            retained_text(heap, name);
+        }
+    }
+}
+fn retained_event(heap: &mut RetainedHeap, value: &super::CodeQueryFlowEvent) {
+    retained_text(heap, &value.id);
+    retained_text(heap, &value.path);
+    retained_symbol(heap, &value.site);
+    retained_carrier(heap, &value.carrier);
+}
+fn retained_carrier(heap: &mut RetainedHeap, value: &super::CodeQueryFlowCarrierSymbol) {
+    use super::CodeQueryFlowCarrierSymbol as C;
+    use super::CodeQueryFlowSelectorSymbol as S;
+    // Carrier trees can be deeply nested. Walk boxed children iteratively.
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            C::Value { id, site, role, .. } => {
+                retained_text(heap, id);
+                retained_symbol(heap, site);
+                retained_text(heap, role);
+            }
+            C::Port { id, procedure, .. } => {
+                retained_text(heap, id);
+                retained_symbol(heap, procedure);
+            }
+            C::Allocation { id, site } | C::ScopedRoot { id, site, .. } => {
+                retained_text(heap, id);
+                retained_symbol(heap, site);
+            }
+            C::CallResult {
+                id,
+                call,
+                result,
+                callee,
+            } => {
+                retained_text(heap, id);
+                retained_symbol(heap, call);
+                retained_symbol(heap, callee);
+                heap.add(std::mem::size_of::<super::CodeQueryFlowCarrierSymbol>());
+                heap.add_entries(1);
+                pending.push(result);
+            }
+            C::Location {
+                id,
+                root,
+                selectors,
+                ..
+            } => {
+                retained_text(heap, id);
+                heap.vec(selectors);
+                heap.add(std::mem::size_of::<super::CodeQueryFlowCarrierSymbol>());
+                heap.add_entries(1);
+                pending.push(root);
+                for selector in selectors {
+                    match selector {
+                        S::Field { field } => retained_symbol(heap, field),
+                        S::Property { key } => retained_text(heap, key),
+                        S::ConstantIndex { index } => retained_text(heap, index),
+                        S::ExactIndex { index } => {
+                            heap.add(std::mem::size_of::<super::CodeQueryFlowCarrierSymbol>());
+                            heap.add_entries(1);
+                            pending.push(index);
+                        }
+                        S::AnyIndex => {}
+                    }
+                }
+            }
+            C::RuntimeObject {
+                id,
+                runtime_profile_digest,
+                realm,
+                exposure_id,
+                container_member,
+                state_boundary,
+                refinement_identity,
+                active_model_set_hash,
+                manifest_digest,
+                shard_id,
+                behavior_id,
+                activation_source,
+            } => {
+                for text in [
+                    id,
+                    runtime_profile_digest,
+                    realm,
+                    exposure_id,
+                    container_member,
+                    state_boundary,
+                    refinement_identity,
+                    active_model_set_hash,
+                    manifest_digest,
+                    shard_id,
+                    behavior_id,
+                    activation_source,
+                ] {
+                    retained_text(heap, text);
+                }
+            }
+        }
+    }
+}
+fn retained_fact(heap: &mut RetainedHeap, value: &super::CodeQueryFlowFactSymbol) {
+    use super::CodeQueryFlowFactSymbol as F;
+    match value {
+        F::Zero => {}
+        F::Carrier {
+            source, carrier, ..
+        } => {
+            heap.add(
+                std::mem::size_of_val(source.as_ref()) + std::mem::size_of_val(carrier.as_ref()),
+            );
+            heap.add_entries(2);
+            retained_event(heap, source);
+            retained_carrier(heap, carrier);
+        }
+        F::Meeting { source, sink, .. } => {
+            heap.add(2 * std::mem::size_of_val(source.as_ref()));
+            heap.add_entries(2);
+            retained_event(heap, source);
+            retained_event(heap, sink);
+        }
+    }
+}
+fn retained_witness(
+    heap: &mut RetainedHeap,
+    value: &super::witness_projection::ProjectedSummaryWitness,
+) {
+    heap.vec(value.steps());
+    for step in value.steps() {
+        retained_text(heap, &step.source.path);
+        for site in [&step.target, &step.origin].into_iter().flatten() {
+            retained_text(heap, &site.path);
+        }
+        for symbol in [
+            &step.source_symbol,
+            &step.target_symbol,
+            &step.origin_symbol,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            retained_symbol(heap, symbol);
+        }
+        if let Some(boundary) = &step.boundary {
+            retained_text(heap, boundary);
+        }
+        for fact in [&step.input, &step.output].into_iter().flatten() {
+            retained_fact(heap, fact);
+        }
+        if let Some(reason) = &step.evidence.reason {
+            retained_text(heap, reason);
+        }
+    }
+}
+
+fn retained_read_key(heap: &mut RetainedHeap, key: &ReadKey) {
+    use brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion;
+    match key {
+        ReadKey::File { rel_path, .. } | ReadKey::PathAbsent { rel_path, .. } => {
+            heap.add(rel_path.len());
+            heap.add_entries(1);
+        }
+        ReadKey::Index { key, .. } => {
+            heap.add(key.len());
+            heap.add_entries(1);
+        }
+        ReadKey::Lookup { question, .. } => match question {
+            LookupQuestion::Name { name, .. } => {
+                heap.add(name.len());
+                heap.add_entries(1);
+            }
+            LookupQuestion::Declaration {
+                rel_path,
+                fq_name,
+                signature,
+                ..
+            } => {
+                heap.add(rel_path.len().saturating_add(fq_name.len()));
+                heap.add_entries(2);
+                if let Some(signature) = signature {
+                    retained_text(heap, signature);
+                }
+            }
+            LookupQuestion::File { rel_path }
+            | LookupQuestion::CallSite { rel_path, .. }
+            | LookupQuestion::ProcedureCallSite { rel_path, .. } => {
+                heap.add(rel_path.len());
+                heap.add_entries(1);
+            }
+            LookupQuestion::Summary { .. } => {}
+        },
+        ReadKey::Artifact { rel_path, .. } => {
+            if let Some(path) = rel_path {
+                heap.add(path.len());
+                heap.add_entries(1);
+            }
+        }
+        ReadKey::Scope { languages, .. } => {
+            heap.slice(languages);
+        }
+        ReadKey::Models(_)
+        | ReadKey::Policy { .. }
+        | ReadKey::Configuration(_)
+        | ReadKey::Epoch(_) => {}
+    }
+}
+
+impl TypeFlowRootProduct {
+    fn output_census(&self) -> RetainedHeap {
+        let mut heap = RetainedHeap::default();
+        heap.add(std::mem::size_of_val(self) + 2 * std::mem::size_of::<usize>());
+        heap.add_entries(1);
+        retained_reference(&mut heap, &self.root);
+        if let Some((_, message)) = &self.failure {
+            retained_text(&mut heap, message);
+        }
+        heap.vec(&self.projected_rows);
+        for row in &self.projected_rows {
+            retained_file(&mut heap, &row.file);
+            for text in [&row.id, &row.member, &row.origin] {
+                retained_text(&mut heap, text);
+            }
+            if let Some(class) = &row.class {
+                retained_text(&mut heap, class);
+            }
+            if let Some(path) = &row.portable_path {
+                heap.add(path.as_str().len());
+                heap.add_entries(1);
+            }
+        }
+        heap.vec(&self.class_sets);
+        for set in &self.class_sets {
+            retained_reference(&mut heap, &set.site.procedure);
+            retained_file(&mut heap, &set.site.file);
+            heap.add(set.site.member.len());
+            heap.add_entries(1);
+            heap.vec(&set.classes);
+            for (class, site) in &set.classes {
+                retained_class(&mut heap, class);
+                retained_file(&mut heap, &site.file);
+            }
+            if let Some(origin) = &set.constructor_origin {
+                heap.add(std::mem::size_of_val(origin.classes.as_ref()));
+                heap.add_entries(origin.classes.len());
+                for class in &origin.classes {
+                    retained_class(&mut heap, class);
+                }
+                retained_file(&mut heap, &origin.source.file);
+            }
+            heap.vec(&set.member_declarations);
+            for (class, hit) in &set.member_declarations {
+                retained_class(&mut heap, class);
+                match &hit.declaration {
+                    MemberDeclaration::Workspace(unit) => {
+                        heap.add(
+                            unit.retained_bytes()
+                                .saturating_sub(std::mem::size_of_val(unit)),
+                        );
+                        heap.add_entries(1);
+                    }
+                    MemberDeclaration::External(decl) => {
+                        heap.add(std::mem::size_of_val(decl.symbol_ids()));
+                        heap.add_entries(decl.symbol_ids().len());
+                        for id in decl.symbol_ids() {
+                            heap.add(id.len());
+                            heap.add_entries(1);
+                        }
+                    }
+                }
+            }
+            retained_unknown(&mut heap, &set.unknown);
+            retained_unknown(&mut heap, &set.flow_unknown);
+            retained_dynamic(&mut heap, &set.dynamic_writes);
+        }
+        heap.vec(&self.findings);
+        for finding in &self.findings {
+            retained_file(&mut heap, &finding.file);
+            for text in [
+                &finding.id,
+                &finding.member,
+                &finding.class,
+                &finding.class_name,
+            ] {
+                retained_text(&mut heap, text);
+            }
+            if let AbsentMemberProof::Conditional {
+                remainders,
+                unbounded_dynamic_writes,
+            } = &finding.proof
+            {
+                retained_unknown(&mut heap, remainders);
+                retained_dynamic(&mut heap, unbounded_dynamic_writes);
+            }
+            heap.vec(&finding.roots);
+            for root in &finding.roots {
+                retained_text(&mut heap, &root.root_procedure_id);
+                retained_text(&mut heap, &root.caller);
+                retained_file(&mut heap, &root.origin_file);
+                heap.vec(&root.also_fails_at);
+                for (file, _) in &root.also_fails_at {
+                    retained_file(&mut heap, file);
+                }
+                if let Ok(witness) = &root.witness {
+                    retained_witness(&mut heap, witness);
+                }
+            }
+        }
+        heap.vec(&self.incomplete_evidence.lanes);
+        heap
+    }
+    fn provenance_census(&self) -> RetainedHeap {
+        let mut heap = RetainedHeap::default();
+        heap.vec(&self.reads);
+        for key in &self.reads {
+            retained_read_key(&mut heap, key);
+        }
+        heap
+    }
+    fn census(&self) -> SemanticWork {
+        // Read keys are dependency metadata. The query's ReadLedger receives the same
+        // keys on replay without a semantic-lane charge, so admit only the output.
+        let (bytes, entries) = self.output_census().totals();
+        SemanticWork {
+            owned_text_bytes: bytes,
+            nested_entries: entries,
+            ..Default::default()
+        }
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::cache_budget::RetainedBytes for TypeFlowRootProduct {
+    fn retained_bytes(&self) -> usize {
+        self.output_census()
+            .total()
+            .saturating_add(self.provenance_census().total())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +761,10 @@ enum RootResultPublicationOutcome {
 
 pub(super) struct TypeFlowQueryState {
     value_flow_cache: ValueFlowCache,
-    summary_state: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
+    summary_partitions: brokk_bifrost_flow::type_flow::TypeFlowSummaryPartitions,
+    summary_state: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
+    allotment: CodeQueryRootAllotment,
+    root_memo: Option<TypeFlowRootMemo>,
     /// Exact procedure-local derivations shared only by roots in this query.
     /// The query owns one pinned analyzer/model context and one diagnostics
     /// ledger, so reuse cannot cross policy, request, or snapshot boundaries.
@@ -169,24 +799,49 @@ impl Drop for TypeFlowQueryState {
 
 impl Default for TypeFlowQueryState {
     fn default() -> Self {
-        Self::new(ValueFlowCache::default(), Default::default())
+        Self::new(
+            ValueFlowCache::default(),
+            Default::default(),
+            CodeQueryRootAllotment::from_execution_limits(
+                &super::CodeQueryExecutionLimits::default(),
+            ),
+        )
     }
 }
 
 impl TypeFlowQueryState {
+    fn select_summary_partition(&mut self) {
+        if self.summary_state.is_none() {
+            self.summary_state = Some(
+                self.summary_partitions
+                    .select(self.allotment.solver, self.allotment.semantic),
+            );
+        }
+    }
+
+    pub(super) fn set_root_memo(&mut self, memo: Option<TypeFlowRootMemo>) {
+        self.root_memo = memo;
+    }
+
     pub(super) fn release_file_window(&mut self) {
+        // Bound query-owned output and refund its holders at each window.
+        // The products themselves do not depend on resident artifacts.
         self.cache.clear();
     }
 
     pub(super) fn new(
         value_flow_cache: ValueFlowCache,
-        summary_state: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
+        summary_partitions: brokk_bifrost_flow::type_flow::TypeFlowSummaryPartitions,
+        allotment: CodeQueryRootAllotment,
     ) -> Self {
         let value_flow_cache = value_flow_cache.with_fresh_stats();
         let provider_stats_baseline = value_flow_cache.stats();
         Self {
             value_flow_cache,
-            summary_state,
+            summary_partitions,
+            summary_state: None,
+            allotment,
+            root_memo: None,
             refinements: ProcedureRefinements::default(),
             provider_stats_baseline,
             cache: HashMap::default(),
@@ -283,11 +938,22 @@ impl AbsentMemberFindingValue {
         &self.file
     }
 
+    pub(super) fn roots_in_source_order(&self) -> Vec<&AbsentMemberRootEvidence> {
+        let mut roots = self.roots.iter().collect::<Vec<_>>();
+        roots.sort_unstable_by_key(|root| {
+            (&root.origin_file, root.origin_span, &root.root_procedure_id)
+        });
+        roots
+    }
+
     pub(super) fn representative(&self) -> &AbsentMemberRootEvidence {
-        self.roots
+        let roots = self.roots_in_source_order();
+        roots
             .iter()
+            .copied()
             .find(|root| root.witness.is_ok())
-            .unwrap_or_else(|| self.roots.first().expect("a finding has root evidence"))
+            .or_else(|| roots.first().copied())
+            .expect("a finding has root evidence")
     }
 
     /// Merge another root set's evidence for the same finding. A Proven tier
@@ -406,10 +1072,7 @@ impl TypeFlowQueryState {
             return Vec::new();
         };
         let rows = match result {
-            CachedTypeFlowAnalysis::Live {
-                result,
-                projected_rows,
-            } => projected_rows.map_or_else(|| project_class_sets(&result), |rows| rows.to_vec()),
+            CachedTypeFlowAnalysis::Owned(result) => result.product.projected_rows.clone(),
             CachedTypeFlowAnalysis::FindingFreeRows(rows) => rows.to_vec(),
             CachedTypeFlowAnalysis::Failed => {
                 unreachable!("failed type-flow cache entries return None")
@@ -446,9 +1109,10 @@ impl TypeFlowQueryState {
         ) else {
             return ReceiverDispatchAssessment::NotApplicable;
         };
-        let CachedTypeFlowAnalysis::Live { result, .. } = cached else {
-            unreachable!("solve_live returns only live results")
+        let CachedTypeFlowAnalysis::Owned(result) = cached else {
+            unreachable!("solve_live returns only owned root products")
         };
+        let result = result.product;
         if !result.complete || result.semantic_budget_exhausted {
             return ReceiverDispatchAssessment::NotApplicable;
         }
@@ -459,7 +1123,10 @@ impl TypeFlowQueryState {
                 set.site.file == *file
                     && set.site.kind == MemberAccessKind::Call
                     && set.site.purpose == TypeFlowSitePurpose::MemberAccess
-                    && receiver_site_matches_call(set, range)
+                    && set.site.call_span.is_some_and(|span| {
+                        span.start_byte() as usize == range.start_byte
+                            && span.end_byte() as usize == range.end_byte
+                    })
             })
             .collect::<Vec<_>>();
         let [set] = matching.as_slice() else {
@@ -563,7 +1230,7 @@ impl TypeFlowQueryState {
         limits: CodeQueryValueFlowLimits,
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-    ) -> Vec<brokk_bifrost_flow::type_flow::ReceiverClassSet> {
+    ) -> Vec<OwnedReceiverClassSet> {
         if !is_python_iterator_method(procedure) {
             return Vec::new();
         }
@@ -577,15 +1244,16 @@ impl TypeFlowQueryState {
         ) else {
             return Vec::new();
         };
-        let CachedTypeFlowAnalysis::Live { result, .. } = result else {
-            unreachable!("solve_live returns only live results")
+        let CachedTypeFlowAnalysis::Owned(result) = result else {
+            unreachable!("solve_live returns only owned root products")
         };
+        let result = result.product;
         result
             .class_sets
             .iter()
             .filter(|set| {
                 set.site.purpose == TypeFlowSitePurpose::PythonIteratorReturn
-                    && set.site.procedure == procedure.handle
+                    && set.site.procedure == SemanticProcedureReference::of(&procedure.handle)
             })
             .cloned()
             .collect()
@@ -612,72 +1280,13 @@ impl TypeFlowQueryState {
             return Vec::new();
         };
         let result = match result {
-            CachedTypeFlowAnalysis::Live { result, .. } => result,
+            CachedTypeFlowAnalysis::Owned(result) => result.product,
             CachedTypeFlowAnalysis::FindingFreeRows(_) => return Vec::new(),
             CachedTypeFlowAnalysis::Failed => {
                 unreachable!("failed type-flow cache entries return None")
             }
         };
-        let caller = procedure_name(&procedure.handle);
-        let mut rows: Vec<AbsentMemberFindingValue> = Vec::new();
-        let mut seen: crate::hash::HashMap<_, usize> = crate::hash::HashMap::default();
-        for finding in &result.findings {
-            // The duplicate Call/Load sinks of one call-shaped access report
-            // the same finding twice; the first witness is kept, as in the
-            // workspace report.
-            let key = (
-                finding.site.file.clone(),
-                finding.site.span,
-                finding.site.member.clone(),
-                finding.class.qualified_name().to_string(),
-            );
-            let value = AbsentMemberFindingValue {
-                id: absent_member_finding_id(
-                    &finding.site.file,
-                    finding.site.span,
-                    &finding.site.member,
-                    finding.class.qualified_name(),
-                ),
-                file: finding.site.file.clone(),
-                range: source_range(finding.site.span),
-                member: finding.site.member.to_string(),
-                class: finding.class.qualified_name().to_string(),
-                class_name: match &finding.class {
-                    ClassIdentity::Workspace(unit) => unit.terminal_name().to_owned(),
-                    ClassIdentity::External { qualified_name, .. } => qualified_name.to_string(),
-                    ClassIdentity::Intrinsic { qualified_name } => qualified_name.to_string(),
-                },
-                proof: finding.proof.clone(),
-                roots: vec![AbsentMemberRootEvidence {
-                    root_procedure_id: super::semantic::procedure_wire_id(&finding.root),
-                    origin_file: finding.origin.file.clone(),
-                    origin_range: source_range(finding.origin.span),
-                    origin_span: finding.origin.span,
-                    origin_kind: finding.origin.kind,
-                    also_fails_at: finding.also_fails_at.clone(),
-                    origin_is_guard: finding.origin.kind == SourceSiteKind::NarrowingGuard,
-                    caller: caller.clone(),
-                    witness: finding
-                        .witness
-                        .as_ref()
-                        .map(|witness| {
-                            super::witness_projection::ProjectedSummaryWitness::new(
-                                workspace,
-                                witness,
-                                limits.max_witness_steps,
-                                limits.max_witness_bytes,
-                            )
-                        })
-                        .map_err(Clone::clone),
-                }],
-            };
-            if let Some(index) = seen.get(&key).copied() {
-                rows[index].merge_evidence(value);
-            } else {
-                seen.insert(key, rows.len());
-                rows.push(value);
-            }
-        }
+        let rows = result.findings.clone();
         self.work.finding_rows = self
             .work
             .finding_rows
@@ -701,7 +1310,7 @@ impl TypeFlowQueryState {
             .unwrap_or(limits.max_witness_bytes)
             .min(limits.max_witness_bytes);
         let mut rows = Vec::new();
-        for (witness_index, root) in finding.roots.iter().enumerate() {
+        for (witness_index, root) in finding.roots_in_source_order().into_iter().enumerate() {
             let key = AbsentMemberWitnessProjectionKey {
                 finding_id: finding.id.clone(),
                 root_procedure_id: root.root_procedure_id.clone(),
@@ -823,6 +1432,7 @@ impl TypeFlowQueryState {
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Option<CachedTypeFlowAnalysis> {
+        self.select_summary_partition();
         if is_python_iterator_method(procedure) {
             return self.solve_live(
                 workspace,
@@ -841,12 +1451,16 @@ impl TypeFlowQueryState {
             active_semantic_model_snapshot.clone(),
         )?;
         let cache_key = TypeFlowCacheKey {
-            root: procedure.handle.clone(),
+            root: SemanticProcedureReference::of(&procedure.handle),
             provider_behavior,
             field_slots: field_slots.digest(),
         };
         match self.cache.get(&cache_key).cloned() {
             Some(CachedTypeFlowAnalysis::Failed) => {
+                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
+                return None;
+            }
+            Some(CachedTypeFlowAnalysis::Owned(result)) if result.product.failure.is_some() => {
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return None;
             }
@@ -856,6 +1470,17 @@ impl TypeFlowQueryState {
             }
             None => {}
         }
+        let memo_permit = match self.acquire_root_memo(
+            workspace,
+            &cache_key,
+            procedure,
+            semantic_budget,
+            cancellation,
+            active_semantic_model_snapshot.as_deref(),
+        ) {
+            RootProductAcquisition::Applied(result) => return result,
+            RootProductAcquisition::Solve(permit) => permit,
+        };
         let persistent_key = if field_slots.semantic_budget_exhausted() {
             None
         } else {
@@ -867,7 +1492,7 @@ impl TypeFlowQueryState {
                 &procedure.handle,
                 active_semantic_model_snapshot.as_deref(),
                 limits,
-                semantic_budget.limits(),
+                self.allotment,
             )
         };
         let mut persistent_store_failed = false;
@@ -928,10 +1553,11 @@ impl TypeFlowQueryState {
             limits,
             cancellation,
             active_semantic_model_snapshot,
+            memo_permit,
         )
     }
 
-    /// This root's live type-flow result, never the finding-free projection.
+    /// This root's full owned type-flow product, never the finding-free projection.
     ///
     /// Receiver dispatch reads per-site class sets, constructor origins and
     /// member declarations that the projection does not carry. Answering it
@@ -947,6 +1573,7 @@ impl TypeFlowQueryState {
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Option<CachedTypeFlowAnalysis> {
+        self.select_summary_partition();
         let (adapter, provider_behavior, field_slots) = self.query_field_slots(
             workspace,
             procedure,
@@ -955,14 +1582,18 @@ impl TypeFlowQueryState {
             active_semantic_model_snapshot.clone(),
         )?;
         let cache_key = TypeFlowCacheKey {
-            root: procedure.handle.clone(),
+            root: SemanticProcedureReference::of(&procedure.handle),
             provider_behavior,
             field_slots: field_slots.digest(),
         };
         match self.cache.get(&cache_key).cloned() {
-            Some(result @ CachedTypeFlowAnalysis::Live { .. }) => {
+            Some(CachedTypeFlowAnalysis::Owned(result)) => {
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
-                return Some(result);
+                return result
+                    .product
+                    .failure
+                    .is_none()
+                    .then_some(CachedTypeFlowAnalysis::Owned(result));
             }
             Some(CachedTypeFlowAnalysis::Failed) => {
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
@@ -971,6 +1602,17 @@ impl TypeFlowQueryState {
             Some(CachedTypeFlowAnalysis::FindingFreeRows(_)) | None => {}
         }
         // A live solve still publishes its projection for row consumers.
+        let memo_permit = match self.acquire_root_memo(
+            workspace,
+            &cache_key,
+            procedure,
+            semantic_budget,
+            cancellation,
+            active_semantic_model_snapshot.as_deref(),
+        ) {
+            RootProductAcquisition::Applied(result) => return result,
+            RootProductAcquisition::Solve(permit) => permit,
+        };
         let persistent_key =
             if field_slots.semantic_budget_exhausted() || is_python_iterator_method(procedure) {
                 None
@@ -983,7 +1625,7 @@ impl TypeFlowQueryState {
                     &procedure.handle,
                     active_semantic_model_snapshot.as_deref(),
                     limits,
-                    semantic_budget.limits(),
+                    self.allotment,
                 )
             };
         self.solve_root(
@@ -998,6 +1640,7 @@ impl TypeFlowQueryState {
             limits,
             cancellation,
             active_semantic_model_snapshot,
+            memo_permit,
         )
     }
 
@@ -1040,16 +1683,14 @@ impl TypeFlowQueryState {
             Some(None) => return None,
             None => {
                 let parent_scope = semantic_budget.scope_snapshot();
-                // A field index is an explicit whole-workspace prepass, not
-                // one root's semantic closure. The query's memory-shaped row
-                // estimates can be lower than the finite workspace semantic
-                // floors, so retain the caller's larger lanes while giving
-                // this shared child enough headroom to visit the workspace
-                // once. Root children below keep the caller's exact limits.
-                let field_slot_limits = field_slot_semantic_limits(semantic_budget.limits());
+                // Shared field slots use the same engine-owned allotment as roots.
                 let mut field_slot_budget =
-                    SemanticBudget::new_child(field_slot_limits, &parent_scope);
-                let field_slot_cache = self.summary_state.field_slot_indexes();
+                    SemanticBudget::new_child(self.allotment.semantic, &parent_scope);
+                let field_slot_cache = self
+                    .summary_state
+                    .as_ref()
+                    .expect("partition selected before field slots")
+                    .field_slot_indexes();
                 let acquired = {
                     let _timing = crate::profiling::scope("type_flow.field_slot_acquire");
                     FieldSlotIndex::acquire(
@@ -1178,72 +1819,39 @@ impl TypeFlowQueryState {
         limits: CodeQueryValueFlowLimits,
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+        memo_permit: Option<RootMemoPermit>,
     ) -> Option<CachedTypeFlowAnalysis> {
         self.work.solves = self.work.solves.saturating_add(1);
-        let mut solver_budget = SolverBudget::new(limits.solver_work);
-        let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
-        // Root work starts at zero, while its resident bound includes
-        // the parent's current file, which coexists with its callees.
-        // Historical admissions from the prepass or earlier roots do
-        // not make these new callee admissions free.
-        let mut child_budget = SemanticBudget::new_root_child(semantic_budget);
-        let outcome = solve_type_flow_for_root_with_refinements(
-            workspace,
-            adapter,
-            &field_slots,
-            &procedure.handle,
-            active_semantic_model_snapshot,
-            CLOSURE_LIMITS,
-            FeedbackLimits::default(),
-            self.value_flow_cache.clone(),
-            self.summary_state.clone(),
-            &mut child_budget,
-            &mut request,
-            &mut self.refinements,
-        );
-        // Callee handles are local to the completed root solve.
-        // Fold performed work and its peak into the parent without
-        // importing those now-released resident admissions.
-        semantic_budget.absorb_root_work(child_budget);
-        match outcome {
-            Ok(result) => {
-                self.work.summary_cache_hits = self
-                    .work
-                    .summary_cache_hits
-                    .saturating_add(result.reusable_summary_hits as u64);
-                self.work.summary_cache_misses = self
-                    .work
-                    .summary_cache_misses
-                    .saturating_add(result.reusable_summary_misses as u64);
-                self.work.root_summary_cache_hits = self
-                    .work
-                    .root_summary_cache_hits
-                    .saturating_add(result.reusable_root_summary_hits as u64);
-                self.work.root_summary_observation_rejections = self
-                    .work
-                    .root_summary_observation_rejections
-                    .saturating_add(result.reusable_root_summary_observation_rejections as u64);
-                self.work.published_summaries = self
-                    .work
-                    .published_summaries
-                    .saturating_add(result.published_summaries as u64);
-                self.work.summary_profile = self
-                    .work
-                    .summary_profile
-                    .saturating_add(result.summary_profile);
-                self.work.solver_attempts = self
-                    .work
-                    .solver_attempts
-                    .saturating_add(result.solver_attempts.len() as u64);
-                if result.semantic_budget_exhausted {
-                    self.semantic_budget_exhausted = true;
-                    self.record_semantic_exhausted_root(procedure, &result.incomplete_evidence);
-                }
-                if !result.complete {
-                    self.work.incomplete_roots = self.work.incomplete_roots.saturating_add(1);
-                    self.record_incomplete_root(procedure, &result.incomplete_evidence);
-                }
-                let projected_rows = if !persistent_store_failed
+        let mut solver_budget = SolverBudget::new(self.allotment.solver);
+        // Each root gets a fresh ledger, independent of the parent's live census.
+        let mut child_budget =
+            SemanticBudget::new_child(self.allotment.semantic, &semantic_budget.scope_snapshot());
+        let (product, reads) = capture_query_reads(workspace.analyzer(), || {
+            let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
+            let outcome = solve_type_flow_for_root_with_refinements(
+                workspace,
+                adapter,
+                &field_slots,
+                &procedure.handle,
+                active_semantic_model_snapshot,
+                CLOSURE_LIMITS,
+                FeedbackLimits::default(),
+                self.value_flow_cache.clone(),
+                self.summary_state
+                    .as_ref()
+                    .expect("partition selected before root solve")
+                    .clone(),
+                &mut child_budget,
+                &mut request,
+                &mut self.refinements,
+            );
+            // Callee handles are local to the completed root solve.
+            // Fold performed work and its peak into the parent without
+            // importing those now-released resident admissions.
+            match outcome {
+                Ok(result) => {
+                    let projected_rows = project_class_sets(&result);
+                    if !persistent_store_failed
                     && result.persistence_status == TypeFlowRootPersistenceStatus::Eligible
                     && result.findings.is_empty()
                     // Constructor-origin evidence is request-local:
@@ -1256,51 +1864,245 @@ impl TypeFlowQueryState {
                             .iter()
                             .any(|set| set.constructor_origin.is_some()))
                     && let Some(persistent_key) = persistent_key.as_ref()
-                {
-                    let projected: Arc<[ClassSetRowValue]> = project_class_sets(&result).into();
-                    let publication = self.publish_finding_free_root_result(
-                        workspace,
-                        persistent_key,
-                        &result,
-                        &projected,
-                        limits,
-                        cancellation,
-                    );
-                    if publication == RootResultPublicationOutcome::Cancelled {
-                        push_deduplicated_diagnostic(
-                            &mut self.diagnostics,
-                            CodeQueryDiagnosticCode::Cancelled,
-                            "class-set root-result publication was cancelled".to_string(),
+                    {
+                        let publication = self.publish_finding_free_root_result(
+                            workspace,
+                            persistent_key,
+                            &result,
+                            &projected_rows,
+                            limits,
+                            cancellation,
                         );
-                        self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
-                        return None;
+                        if publication == RootResultPublicationOutcome::Cancelled {
+                            self.work = self.work.saturating_add(CodeQueryTypeFlowWork {
+                                solves: 0,
+                                ..TypeFlowRootProduct::work_for(&result)
+                            });
+                            push_deduplicated_diagnostic(
+                                &mut self.diagnostics,
+                                CodeQueryDiagnosticCode::Cancelled,
+                                "class-set root-result publication was cancelled".to_string(),
+                            );
+                            child_budget.release_resident();
+                            semantic_budget.absorb_root_work(child_budget);
+                            self.cache
+                                .insert(cache_key.clone(), CachedTypeFlowAnalysis::Failed);
+                            return None;
+                        }
                     }
-                    Some(projected)
-                } else {
-                    None
-                };
-                let cached = CachedTypeFlowAnalysis::Live {
-                    result: Arc::new(result),
-                    projected_rows,
-                };
-                self.cache.insert(cache_key, cached.clone());
-                Some(cached)
+                    let product = TypeFlowRootProduct::new(
+                        workspace,
+                        procedure,
+                        result,
+                        projected_rows,
+                        child_budget.used(),
+                    );
+                    debug_assert_eq!(product.work.solves, 1);
+                    debug_assert!(
+                        product.persistence_status != TypeFlowRootPersistenceStatus::Eligible
+                            || product.complete
+                    );
+                    child_budget.release_resident();
+                    semantic_budget.absorb_root_work(child_budget);
+                    Some(product)
+                }
+                Err(error) => {
+                    let semantic_work = child_budget.used();
+                    child_budget.release_resident();
+                    semantic_budget.absorb_root_work(child_budget);
+                    let code = match &error {
+                        TypeFlowError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
+                        TypeFlowError::Plan(_) | TypeFlowError::Solve(_) | TypeFlowError::Io(_) => {
+                            CodeQueryDiagnosticCode::SemanticProviderFailed
+                        }
+                    };
+                    let product = TypeFlowRootProduct {
+                        root: SemanticProcedureReference::of(&procedure.handle),
+                        failure: Some((code, format!("class-set analysis failed: {error}"))),
+                        projected_rows: Vec::new(),
+                        class_sets: Vec::new(),
+                        findings: Vec::new(),
+                        complete: false,
+                        semantic_budget_exhausted: false,
+                        incomplete_evidence: RootIncompleteEvidence::default(),
+                        persistence_status: TypeFlowRootPersistenceStatus::Ineligible(
+                            if code == CodeQueryDiagnosticCode::Cancelled {
+                                TypeFlowRootPersistenceRejection::SolverIncomplete
+                            } else {
+                                TypeFlowRootPersistenceRejection::ProviderFailure
+                            },
+                        ),
+                        work: CodeQueryTypeFlowWork {
+                            solves: 1,
+                            failed_solves: 1,
+                            ..Default::default()
+                        },
+                        solver_work: solver_budget.used(),
+                        semantic_work,
+                        reads: Vec::new(),
+                        unattributed_reads: 0,
+                    };
+                    Some(product)
+                }
             }
-            Err(error) => {
-                self.work.failed_solves = self.work.failed_solves.saturating_add(1);
-                let code = match &error {
-                    TypeFlowError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
-                    TypeFlowError::Plan(_) | TypeFlowError::Solve(_) | TypeFlowError::Io(_) => {
-                        CodeQueryDiagnosticCode::SemanticProviderFailed
-                    }
-                };
+        });
+        let mut product = product?;
+        product.reads = reads.keys();
+        product.unattributed_reads = reads.unattributed_reads();
+        let product = Arc::new(product);
+        // No memo reentry from the flow engine. A cancelled leader leaves its
+        // permit unpublished so a live follower can retry as leader.
+        if let Some(permit) = memo_permit
+            && !cancellation.is_cancelled()
+            && product
+                .failure
+                .as_ref()
+                .is_none_or(|(code, _)| *code != CodeQueryDiagnosticCode::Cancelled)
+            && !product
+                .incomplete_evidence
+                .lanes
+                .contains(&RootExhaustedLane::Cancelled)
+        {
+            (*permit).publish_complete(Arc::clone(&product));
+        }
+        self.apply_product(
+            workspace,
+            cache_key,
+            procedure,
+            product,
+            semantic_budget,
+            RootProductSource::Solved,
+        )
+    }
+
+    /// Apply the same immutable evidence and query-owned residency to every
+    /// consumer, including the flight leader. Work attribution never decides completeness.
+    fn apply_product(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        key: TypeFlowCacheKey,
+        procedure: &SemanticProcedureValue,
+        product: Arc<TypeFlowRootProduct>,
+        budget: &mut SemanticBudget,
+        source: RootProductSource,
+    ) -> Option<CachedTypeFlowAnalysis> {
+        match source {
+            RootProductSource::Solved => {
+                self.work = self.work.saturating_add(CodeQueryTypeFlowWork {
+                    solves: 0,           // Counted before the solve, including cancelled publication.
+                    incomplete_roots: 0, // Attributed below for every consumer.
+                    ..product.work
+                });
+            }
+            RootProductSource::Memo => {
+                replay_query_read_keys(
+                    workspace.analyzer(),
+                    product.reads.iter().cloned(),
+                    product.unattributed_reads,
+                );
+                self.work.root_memo_hits = self.work.root_memo_hits.saturating_add(1);
+                self.work.root_memo_solver_work = self
+                    .work
+                    .root_memo_solver_work
+                    .saturating_add(product.solver_work);
+                self.work.root_memo_semantic_work = self
+                    .work
+                    .root_memo_semantic_work
+                    .saturating_add(product.semantic_work);
+            }
+        }
+        if let Some((code, message)) = &product.failure {
+            push_deduplicated_diagnostic(&mut self.diagnostics, *code, message.clone());
+        } else {
+            if product.semantic_budget_exhausted {
+                self.semantic_budget_exhausted = true;
+                self.record_semantic_exhausted_root(procedure, &product.incomplete_evidence);
+            }
+            if !product.complete {
+                self.work.incomplete_roots = self.work.incomplete_roots.saturating_add(1);
+                self.record_incomplete_root(procedure, &product.incomplete_evidence);
+            }
+        }
+        let before = budget.replay_snapshot();
+        let census = product.census();
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "type_flow.root_product root={} retained_bytes={} nested_entries={}",
+                product.root.public_digest(),
+                census.owned_text_bytes,
+                census.nested_entries
+            )
+        });
+        if let Err(exceeded) = budget.admit(census) {
+            self.semantic_budget_exhausted = true;
+            push_deduplicated_diagnostic(
+                &mut self.diagnostics,
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                format!("class-set root product admission failed: {exceeded}"),
+            );
+            self.cache.insert(key, CachedTypeFlowAnalysis::Failed);
+            return None;
+        }
+        let owner = Arc::new(());
+        let bound = budget.bind_replay_holder(&owner, &before);
+        debug_assert_eq!(
+            bound, census,
+            "a root product holder pays its returned census"
+        );
+        let failed = product.failure.is_some();
+        let cached = CachedTypeFlowAnalysis::Owned(QueryRootProduct {
+            product,
+            _owner: owner,
+        });
+        self.cache.insert(key, cached.clone());
+        (!failed).then_some(cached)
+    }
+
+    fn acquire_root_memo(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        key: &TypeFlowCacheKey,
+        procedure: &SemanticProcedureValue,
+        budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+        snapshot: Option<&ActiveSemanticModelSnapshot>,
+    ) -> RootProductAcquisition {
+        let Some(memo) = self.root_memo.as_ref() else {
+            return RootProductAcquisition::Solve(None);
+        };
+        let Some(identity) = workspace.analyzer().workspace_content_identity() else {
+            return RootProductAcquisition::Solve(None);
+        };
+        let memo_key = TypeFlowRootMemoKey {
+            root: key.clone(),
+            allotment: self.allotment,
+            active_pack: active_semantic_model_pack_digest(snapshot),
+            workspace_content: *identity.as_bytes(),
+        };
+        match memo.products.acquire(&memo_key, cancellation).0 {
+            CompleteValueAcquisition::Cached { value } => {
+                RootProductAcquisition::Applied(self.apply_product(
+                    workspace,
+                    key.clone(),
+                    procedure,
+                    value,
+                    budget,
+                    RootProductSource::Memo,
+                ))
+            }
+            CompleteValueAcquisition::Leader { permit } => {
+                RootProductAcquisition::Solve(Some(Box::new(permit)))
+            }
+            CompleteValueAcquisition::Cancelled => {
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
-                    code,
-                    format!("class-set analysis failed: {error}"),
+                    CodeQueryDiagnosticCode::Cancelled,
+                    "class-set root memo acquisition was cancelled".to_owned(),
                 );
-                self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
-                None
+                RootProductAcquisition::Applied(None)
+            }
+            CompleteValueAcquisition::Rejected => {
+                unreachable!("root memo leaders never reject a flight")
             }
         }
     }
@@ -1475,7 +2277,7 @@ fn root_result_persistence_key(
     root: &ProcedureHandle,
     active_semantic_model_snapshot: Option<&ActiveSemanticModelSnapshot>,
     limits: CodeQueryValueFlowLimits,
-    semantic_limits: SemanticWork,
+    allotment: CodeQueryRootAllotment,
 ) -> Option<FindingFreeClassSetRootKey> {
     if workspace.store().is_none_or(|store| store.is_ephemeral()) {
         return None;
@@ -1484,7 +2286,7 @@ fn root_result_persistence_key(
         workspace.semantic_artifact_storage_language_key(root.artifact().key())?;
     let workspace_content = workspace.analyzer().workspace_content_identity()?;
     let active_pack = active_semantic_model_pack_digest(active_semantic_model_snapshot);
-    let semantics = root_result_semantics_digest(adapter, limits, semantic_limits);
+    let semantics = root_result_semantics_digest(adapter, limits, allotment);
     Some(FindingFreeClassSetRootKey {
         generation: ClassSetRootResultGenerationKey {
             language: adapter.language(),
@@ -1503,7 +2305,7 @@ fn root_result_persistence_key(
 fn root_result_semantics_digest(
     adapter: &dyn TypeFlowAdapter,
     limits: CodeQueryValueFlowLimits,
-    semantic_limits: SemanticWork,
+    allotment: CodeQueryRootAllotment,
 ) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-class-set-root-result-semantics-v1");
     let adapter_version = adapter.semantics_version();
@@ -1525,7 +2327,7 @@ fn root_result_semantics_digest(
     digest.push(&[plan_config.minimum_backward_savings_percent()]);
     for dimension in SolverBudgetDimension::ALL {
         digest.push(dimension.label().as_bytes());
-        push_usize(&mut digest, limits.solver_work.get(dimension));
+        push_usize(&mut digest, allotment.solver.get(dimension));
     }
     for value in [
         limits.max_retained_relations,
@@ -1543,7 +2345,7 @@ fn root_result_semantics_digest(
     }
     for dimension in SemanticBudgetDimension::ALL {
         digest.push(dimension.label().as_bytes());
-        push_usize(&mut digest, semantic_limits.get(dimension));
+        push_usize(&mut digest, allotment.semantic.get(dimension));
     }
     digest.finish()
 }
@@ -1556,23 +2358,6 @@ fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
             .expect("bounded type-flow configuration fits in u64")
             .to_le_bytes(),
     );
-}
-
-fn receiver_site_matches_call(set: &ReceiverClassSet, range: Range) -> bool {
-    let Some(call_id) = set.site.call else {
-        return false;
-    };
-    let Some(call) = set.site.procedure.semantics().call_site(call_id) else {
-        return false;
-    };
-    let Some(mapping) = set.site.procedure.semantics().source_mapping(call.source) else {
-        return false;
-    };
-    if mapping.kind != SourceMappingKind::Exact {
-        return false;
-    }
-    let span = mapping.locator.anchor().span();
-    span.start_byte() as usize == range.start_byte && span.end_byte() as usize == range.end_byte
 }
 
 fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
@@ -1976,16 +2761,84 @@ fn absent_member_finding_id(
     digest.finish().to_string()
 }
 
+fn project_absent_members(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &SemanticProcedureValue,
+    result: &TypeFlowRootResult,
+) -> Vec<AbsentMemberFindingValue> {
+    let caller = procedure_name(&procedure.handle);
+    let mut rows: Vec<AbsentMemberFindingValue> = Vec::new();
+    let mut seen: crate::hash::HashMap<_, usize> = crate::hash::HashMap::default();
+    for finding in &result.findings {
+        // The duplicate Call/Load sinks of one call-shaped access report
+        // the same finding twice; the first witness is kept, as in the
+        // workspace report.
+        let key = (
+            finding.site.file.clone(),
+            finding.site.span,
+            finding.site.member.clone(),
+            finding.class.qualified_name().to_string(),
+        );
+        let value = AbsentMemberFindingValue {
+            id: absent_member_finding_id(
+                &finding.site.file,
+                finding.site.span,
+                &finding.site.member,
+                finding.class.qualified_name(),
+            ),
+            file: finding.site.file.clone(),
+            range: source_range(finding.site.span),
+            member: finding.site.member.to_string(),
+            class: finding.class.qualified_name().to_string(),
+            class_name: match &finding.class {
+                ClassIdentity::Workspace(unit) => unit.terminal_name().to_owned(),
+                ClassIdentity::External { qualified_name, .. } => qualified_name.to_string(),
+                ClassIdentity::Intrinsic { qualified_name } => qualified_name.to_string(),
+            },
+            proof: finding.proof.clone(),
+            roots: vec![AbsentMemberRootEvidence {
+                root_procedure_id: super::semantic::procedure_wire_id(&finding.root),
+                origin_file: finding.origin.file.clone(),
+                origin_range: source_range(finding.origin.span),
+                origin_span: finding.origin.span,
+                origin_kind: finding.origin.kind,
+                also_fails_at: finding.also_fails_at.clone(),
+                origin_is_guard: finding.origin.kind == SourceSiteKind::NarrowingGuard,
+                caller: caller.clone(),
+                witness: finding
+                    .witness
+                    .as_ref()
+                    .map(|witness| {
+                        super::witness_projection::ProjectedSummaryWitness::new(
+                            workspace,
+                            witness,
+                            usize::MAX,
+                            usize::MAX,
+                        )
+                    })
+                    .map_err(Clone::clone),
+            }],
+        };
+        if let Some(index) = seen.get(&key).copied() {
+            rows[index].merge_evidence(value);
+        } else {
+            seen.insert(key, rows.len());
+            rows.push(value);
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AbsentMemberFindingValue, AbsentMemberProof, AbsentMemberRootEvidence,
-        ROOT_RESULT_ALGORITHM_ID, SourceSiteKind, TypeFlowQueryState, field_slot_semantic_limits,
+        CodeQueryRootAllotment, ROOT_RESULT_ALGORITHM_ID, SourceSiteKind, TypeFlowQueryState,
         root_result_semantics_digest,
     };
     use crate::analyzer::semantic::{
-        ProcedureHandle, SemanticBudget, SemanticRequest, SemanticWork, SourcePosition, SourceSpan,
-        type_flow_adapter,
+        ProcedureHandle, SemanticBudget, SemanticBudgetDimension, SemanticRequest, SemanticWork,
+        SourcePosition, SourceSpan, type_flow_adapter,
     };
     use crate::analyzer::{AnalyzerConfig, Language, Range, WorkspaceAnalyzer};
     use crate::cancellation::CancellationToken;
@@ -1997,8 +2850,9 @@ mod tests {
     };
     use brokk_bifrost_flow::dataflow::{
         DataflowEdge, DataflowOutput, DistributiveDataflowProblem, SolverBudget,
-        SummaryDataflowResult, SummarySolveInput, SummaryWitness, SummaryWitnessError,
-        WitnessReconstructionLimits, WitnessRetentionLimits, solve_with_summaries,
+        SolverBudgetDimension, SolverWork, SummaryDataflowResult, SummarySolveInput,
+        SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits, WitnessRetentionLimits,
+        solve_with_summaries,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2204,6 +3058,253 @@ mod tests {
     }
 
     #[test]
+    fn type_flow_root_memo_products_are_independent_of_root_order() {
+        use super::super::semantic::SemanticQueryContext;
+        use super::{CachedTypeFlowAnalysis, TypeFlowRootMemo, TypeFlowRootProduct};
+        use std::sync::Arc;
+
+        // Several entry roots share normalize and its precise constructor input,
+        // exercising both summary and refinement history without a budget boundary.
+        let project = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file("app.py", "class Item:\n    pass\n\ndef normalize(x):\n    return x.missing\n\ndef first():\n    return normalize(Item())\n\ndef second():\n    return normalize(Item())\n\ndef third():\n    return first()\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        assert!(workspace.analyzer().workspace_content_identity().is_some());
+        let mut context = SemanticQueryContext::new(&workspace, None, Default::default());
+        let references = context.procedure_references(&project.file("app.py"));
+        let mut roots = references
+            .iter()
+            .map(|reference| {
+                context
+                    .resolve_procedure_reference(reference)
+                    .expect("fixture procedure")
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|root| root.handle.semantics().locator().clone());
+        assert!(
+            roots.len() >= 4,
+            "fixture must exercise several roots: {roots:?}"
+        );
+        let cancellation = CancellationToken::default();
+        let snapshot = workspace.analyzer().active_semantic_model_snapshot();
+        let solve = |state: &mut TypeFlowQueryState, root: &super::SemanticProcedureValue| {
+            state.release_file_window();
+            let mut budget = SemanticBudget::default();
+            let result = state.solve_live(
+                &workspace,
+                root,
+                &mut budget,
+                CodeQueryValueFlowLimits::default(),
+                &cancellation,
+                snapshot.clone(),
+            );
+            let Some(CachedTypeFlowAnalysis::Owned(result)) = result else {
+                panic!(
+                    "fixture root must produce owned evidence: {:?}",
+                    state.take_diagnostics()
+                );
+            };
+            result.product
+        };
+        // Compare semantic observations, excluding work and captured dependency reads.
+        let observations = |product: &TypeFlowRootProduct| {
+            format!(
+                "{:?}",
+                (
+                    &product.root,
+                    &product.failure,
+                    &product.projected_rows,
+                    &product.class_sets,
+                    &product.findings,
+                    product.complete,
+                    product.semantic_budget_exhausted,
+                    &product.incomplete_evidence,
+                    product.persistence_status,
+                )
+            )
+        };
+        let fresh = roots
+            .iter()
+            .map(|root| {
+                let mut state = TypeFlowQueryState::default();
+                state.set_root_memo(Some(TypeFlowRootMemo::default()));
+                observations(&solve(&mut state, root))
+            })
+            .collect::<Vec<_>>();
+        for order in [
+            (0..roots.len()).collect::<Vec<_>>(),
+            (0..roots.len()).rev().collect::<Vec<_>>(),
+        ] {
+            let memo = TypeFlowRootMemo::default();
+            let mut state = TypeFlowQueryState::default();
+            state.set_root_memo(Some(memo.clone()));
+            let mut products = vec![None; roots.len()];
+            for index in order {
+                let product = solve(&mut state, &roots[index]);
+                assert_eq!(
+                    observations(&product),
+                    fresh[index],
+                    "producer root index={index}"
+                );
+                products[index] = Some(product);
+            }
+            assert_eq!(state.work.root_memo_hits, 0);
+            assert_eq!(state.work.solves, roots.len() as u64);
+            for (index, root) in roots.iter().enumerate() {
+                let mut consumer = TypeFlowQueryState::default();
+                consumer.set_root_memo(Some(memo.clone()));
+                let replay = solve(&mut consumer, root);
+                let produced = products[index].as_ref().unwrap();
+                assert!(
+                    Arc::ptr_eq(&replay, produced),
+                    "consumer must read the memo product"
+                );
+                assert_eq!(
+                    observations(&replay),
+                    fresh[index],
+                    "memo root index={index}"
+                );
+                assert_eq!(consumer.work.solves, 0);
+                assert_eq!(consumer.work.root_memo_hits, 1);
+                assert_eq!(consumer.work.root_memo_solver_work, produced.solver_work);
+                assert_eq!(
+                    consumer.work.root_memo_semantic_work,
+                    produced.semantic_work
+                );
+                assert_eq!(
+                    consumer.work.incomplete_roots,
+                    u64::from(!produced.complete)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_member_owned_witness_matches_consumer_capped_projection() {
+        use super::super::witness_projection::{
+            ProjectedSummaryWitness, public_absent_member_witness,
+        };
+        let (project, workspace, root) = witness_workspace();
+        for retention in [
+            WitnessRetentionLimits::new(8).expect("strict retention"),
+            WitnessRetentionLimits::best_effort(1, 1, 64 * 1024 * 1024).expect("marker retention"),
+        ] {
+            let raw = solve_witness(&workspace, &root, retention, 4096).expect("fixture witness");
+            let full = absent_finding(&project, &workspace, "projection-equality", Ok(raw.clone()));
+            for steps in [0, 1, 2, usize::MAX] {
+                for bytes in [0, 1, 512, 4096, usize::MAX] {
+                    let mut old = full.clone();
+                    old.roots[0].witness =
+                        Ok(ProjectedSummaryWitness::new(&workspace, &raw, steps, bytes));
+                    let mut old_cache = Default::default();
+                    let mut new_cache = Default::default();
+                    let old_row = public_absent_member_witness(
+                        &workspace,
+                        &old,
+                        &old.roots[0],
+                        0,
+                        steps,
+                        bytes,
+                        &mut old_cache,
+                    );
+                    let new_row = public_absent_member_witness(
+                        &workspace,
+                        &full,
+                        &full.roots[0],
+                        0,
+                        steps,
+                        bytes,
+                        &mut new_cache,
+                    );
+                    assert_eq!(
+                        old_row, new_row,
+                        "consumer limits steps={steps} bytes={bytes}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_root_product_residency_ends_with_its_cache_window() {
+        use super::{
+            CachedTypeFlowAnalysis, QueryRootProduct, RootIncompleteEvidence, TypeFlowCacheKey,
+            TypeFlowRootPersistenceStatus, TypeFlowRootProduct,
+        };
+        use crate::analyzer::semantic::{IcfgProvider, SemanticProcedureReference, StableDigest};
+        use brokk_bifrost_analysis::analyzer::store::cache_budget::RetainedBytes;
+        use std::sync::Arc;
+        let (project, workspace, root) = witness_workspace();
+        let witness = solve_witness(
+            &workspace,
+            &root,
+            WitnessRetentionLimits::new(8).unwrap(),
+            4096,
+        )
+        .unwrap();
+        assert!(!witness.steps().is_empty());
+        let product = Arc::new(TypeFlowRootProduct {
+            root: SemanticProcedureReference::of(&root),
+            failure: None,
+            projected_rows: Vec::new(),
+            class_sets: Vec::new(),
+            findings: vec![absent_finding(
+                &project,
+                &workspace,
+                "owned-root",
+                Ok(witness),
+            )],
+            complete: true,
+            semantic_budget_exhausted: false,
+            incomplete_evidence: RootIncompleteEvidence::default(),
+            persistence_status: TypeFlowRootPersistenceStatus::Eligible,
+            work: Default::default(),
+            solver_work: Default::default(),
+            semantic_work: Default::default(),
+            reads: Vec::new(),
+            unattributed_reads: 0,
+        });
+        let census = product.census();
+        assert_eq!(census.owned_text_bytes, product.retained_bytes());
+        assert!(census.nested_entries > 0);
+        let mut refused_limits = SemanticWork::default_limits();
+        refused_limits.owned_text_bytes = census.owned_text_bytes - 1;
+        let mut refused = SemanticBudget::new(refused_limits).unwrap();
+        assert!(refused.admit(census).is_err());
+        assert!(
+            product.complete,
+            "consumer refusal does not weaken a product"
+        );
+        let mut budget = SemanticBudget::default();
+        let owner = Arc::new(());
+        let before = budget.replay_snapshot();
+        budget.admit(census).unwrap();
+        assert_eq!(budget.bind_replay_holder(&owner, &before), census);
+        let key = TypeFlowCacheKey {
+            root: product.root.clone(),
+            provider_behavior: workspace.icfg_provider().behavior_identity(),
+            field_slots: StableDigest::from_array([0; 32]),
+        };
+        let mut state = TypeFlowQueryState::default();
+        state.cache.insert(
+            key,
+            CachedTypeFlowAnalysis::Owned(QueryRootProduct {
+                product: Arc::clone(&product),
+                _owner: owner,
+            }),
+        );
+        assert_eq!(budget.resident().owned_text_bytes, census.owned_text_bytes);
+        state.release_file_window();
+        assert!(
+            product.complete,
+            "another consumer may still own the output"
+        );
+        assert_eq!(budget.resident().owned_text_bytes, 0);
+        assert_eq!(budget.resident().nested_entries, 0);
+    }
+
+    #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
             ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v17",
@@ -2211,13 +3312,15 @@ mod tests {
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");
         let limits = CodeQueryValueFlowLimits::default();
-        let semantic = SemanticWork::default_limits();
+        let semantic = CodeQueryRootAllotment::from_execution_limits(
+            &super::super::CodeQueryExecutionLimits::default(),
+        );
         let baseline = root_result_semantics_digest(adapter, limits, semantic);
 
-        let mut solver = limits;
-        solver.solver_work.interned_facts -= 1;
+        let mut solver = semantic;
+        solver.solver.interned_facts -= 1;
         assert_ne!(
-            root_result_semantics_digest(adapter, solver, semantic),
+            root_result_semantics_digest(adapter, limits, solver),
             baseline
         );
 
@@ -2229,7 +3332,7 @@ mod tests {
         );
 
         let mut semantic = semantic;
-        semantic.source_mappings -= 1;
+        semantic.semantic.source_mappings -= 1;
         assert_ne!(
             root_result_semantics_digest(adapter, limits, semantic),
             baseline
@@ -2575,17 +3678,26 @@ mod tests {
     }
 
     #[test]
-    fn field_slot_prepass_keeps_finite_workspace_floors_and_larger_caller_lanes() {
-        assert_eq!(
-            field_slot_semantic_limits(SemanticWork::uniform(1)),
-            SemanticWork::default_limits()
-        );
-
-        let mut caller = SemanticWork::default_limits();
-        caller.source_mappings = caller.source_mappings.saturating_mul(2);
-        assert_eq!(
-            field_slot_semantic_limits(caller).source_mappings,
-            caller.source_mappings
-        );
+    fn root_allotment_preserves_defaults_larger_queries_and_overflow() {
+        let mut limits = super::super::CodeQueryExecutionLimits::default();
+        limits.value_flow.solver_work = SolverWork::uniform(1);
+        limits.value_flow.solver_work.interned_facts = usize::MAX;
+        limits.semantic.max_rows_per_dimension = 2_000_001;
+        limits.semantic.max_retained_bytes = usize::MAX;
+        let solver = limits.value_flow.solver_work;
+        let semantic = super::super::semantic::semantic_budget_limits(limits.semantic);
+        let allotment = CodeQueryRootAllotment::from_execution_limits(&limits);
+        for dimension in SolverBudgetDimension::ALL {
+            assert!(allotment.solver.get(dimension) >= SolverWork::default_limits().get(dimension));
+            assert!(allotment.solver.get(dimension) >= solver.get(dimension));
+        }
+        for dimension in SemanticBudgetDimension::ALL {
+            assert!(
+                allotment.semantic.get(dimension) >= SemanticWork::default_limits().get(dimension)
+            );
+            assert!(allotment.semantic.get(dimension) >= semantic.get(dimension));
+        }
+        assert_eq!(allotment.solver.interned_facts, usize::MAX);
+        assert_eq!(allotment.semantic.source_mappings, 2_097_152);
     }
 }

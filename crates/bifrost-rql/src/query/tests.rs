@@ -302,6 +302,7 @@ fn decorator_bindings_accepts_exact_import_identity_filters() {
         QueryStep::DecoratorBindings(DecoratorBindingFilter {
             module: Some("@nestjs/common".to_string()),
             imported_name: Some("Query".to_string()),
+            annotation_type: None,
         })
     );
     assert_eq!(
@@ -320,6 +321,32 @@ fn decorator_bindings_accepts_exact_import_identity_filters() {
     assert_eq!(
         rql_query.to_canonical_json(),
         json_query.to_canonical_json()
+    );
+
+    let annotation_query = parse_ok(json!({
+        "match": { "kind": "parameter" },
+        "steps": [{
+            "op": "decorator_bindings",
+            "annotation_type": "org.springframework.web.bind.annotation.RequestParam"
+        }]
+    }));
+    assert_eq!(
+        annotation_query.plan.steps[0],
+        QueryStep::DecoratorBindings(DecoratorBindingFilter {
+            module: None,
+            imported_name: None,
+            annotation_type: Some(
+                "org.springframework.web.bind.annotation.RequestParam".to_string()
+            ),
+        })
+    );
+    assert_eq!(
+        CodeQuery::from_sexp(
+            r#"(decorator-bindings :annotation-type "org.springframework.web.bind.annotation.RequestParam" (parameter))"#,
+        )
+        .expect("annotation type filter should lower")
+        .to_canonical_json(),
+        annotation_query.to_canonical_json()
     );
 
     assert!(

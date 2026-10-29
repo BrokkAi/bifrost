@@ -62,6 +62,7 @@ pub enum InlineLocalSemanticProjectionError {
     FileSelector { path: String },
     EndpointSetFile { path: String },
     CatalogReference { name: String, version: u32 },
+    WildcardCatalogReference,
     MatchDirectory { path: String },
     ExactEndpointSet { endpoint_ids: Vec<String> },
     MatchEndpointReference { endpoint_id: String },
@@ -79,6 +80,9 @@ impl fmt::Display for InlineLocalSemanticProjectionError {
             }
             Self::EndpointSetFile { path } => {
                 write!(formatter, "endpoint-set file `{path}` has not been loaded")
+            }
+            Self::WildcardCatalogReference => {
+                formatter.write_str("wildcard catalog has not been composed")
             }
             Self::CatalogReference { name, version } => {
                 write!(
@@ -218,6 +222,16 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
             extend_taint_selector_paths(&mut paths, segments.sources, &spec.sources.entries);
             extend_taint_selector_paths(&mut paths, segments.sinks, &spec.sinks.entries);
             extend_taint_selector_paths(&mut paths, segments.sanitizers, &spec.sanitizers.entries);
+            for entry in &spec.sanitizers.entries {
+                let base = format!(
+                    "/analysis/{}/entries/{}/selector",
+                    segments.sanitizers,
+                    json_pointer_segment(entry.id.as_str())
+                );
+                for (index, _) in entry.kind.requirement_selectors() {
+                    paths.insert(sanitizer_requirement_selector_path(&base, index));
+                }
+            }
             extend_taint_selector_paths(
                 &mut paths,
                 segments.entry_points,
@@ -325,6 +339,9 @@ fn ensure_inline_local_taint(
     }
     for sanitizer in &spec.sanitizers.entries {
         ensure_inline_selector(&sanitizer.selector)?;
+        for (_, selector) in sanitizer.kind.requirement_selectors() {
+            ensure_inline_selector(selector)?;
+        }
     }
     for entry_point in &spec.entry_points.entries {
         ensure_inline_selector(&entry_point.selector)?;
@@ -395,10 +412,7 @@ fn ensure_local_endpoint_set<T>(
         });
     }
     if let Some(reference) = set.include_sets.first() {
-        return Err(InlineLocalSemanticProjectionError::CatalogReference {
-            name: reference.name.to_string(),
-            version: reference.version,
-        });
+        return Err(catalog_projection_error(reference));
     }
     if let Some(reference) = set.include_matches.first() {
         ensure_resolved_match_endpoint_set(reference)?;
@@ -449,12 +463,7 @@ fn ensure_local_endpoint_ref(
                 entry_id: entry_id.to_string(),
             },
         ),
-        EndpointRef::Catalog { catalog, .. } => {
-            Err(InlineLocalSemanticProjectionError::CatalogReference {
-                name: catalog.name.to_string(),
-                version: catalog.version,
-            })
-        }
+        EndpointRef::Catalog { catalog, .. } => Err(catalog_projection_error(catalog)),
         EndpointRef::MatchEndpoint { endpoint_id } => {
             Err(InlineLocalSemanticProjectionError::MatchEndpointReference {
                 endpoint_id: endpoint_id.to_string(),
@@ -1778,16 +1787,41 @@ fn endpoint_set_file_refs_to_json(references: &[EndpointSetFileRef]) -> Value {
     )
 }
 
+fn catalog_projection_error(reference: &CatalogRef) -> InlineLocalSemanticProjectionError {
+    match reference {
+        CatalogRef::Named { name, version, .. } => {
+            InlineLocalSemanticProjectionError::CatalogReference {
+                name: name.to_string(),
+                version: *version,
+            }
+        }
+        CatalogRef::AnyRegistered { .. } => {
+            InlineLocalSemanticProjectionError::WildcardCatalogReference
+        }
+    }
+}
+
 fn catalog_ref_to_json(reference: &CatalogRef) -> Value {
-    let mut object = Map::new();
-    insert(&mut object, "name", json!(reference.name.as_str()));
-    insert(&mut object, "version", json!(reference.version));
-    insert_option(
-        &mut object,
-        "sha256",
-        reference.sha256.map(|hash| json!(hash.to_string())),
-    );
-    Value::Object(object)
+    match reference {
+        CatalogRef::Named {
+            name,
+            version,
+            sha256,
+        } => {
+            let mut object = Map::new();
+            insert(&mut object, "name", json!(name.as_str()));
+            insert(&mut object, "version", json!(version));
+            insert_option(
+                &mut object,
+                "sha256",
+                sha256.map(|hash| json!(hash.to_string())),
+            );
+            Value::Object(object)
+        }
+        CatalogRef::AnyRegistered { predicate } => {
+            json!({"any_registered": true, "categories": category_predicate_to_json(predicate)})
+        }
+    }
 }
 
 fn match_endpoint_set_ref_to_json(reference: &MatchEndpointSetRef) -> Value {
@@ -1999,21 +2033,30 @@ fn flow_observation_to_json(observation: &TaintSinkSpec) -> Value {
 }
 
 fn flow_kill_to_json(kill: &TaintSanitizerSpec) -> Value {
-    Value::Object(taint_port_operation_fields_to_json(
-        &kill.id,
-        &kill.selector,
-        &kill.input,
-        &kill.output,
-    ))
+    let mut fields = sanitizer_kind_to_json(&kill.kind)
+        .as_object()
+        .expect("sanitizer kind is an object")
+        .clone();
+    insert(&mut fields, "id", json!(kill.id.as_str()));
+    insert(&mut fields, "selector", selector_to_json(&kill.selector));
+    Value::Object(fields)
 }
 
 fn flow_transform_to_json(transform: &TaintTransformSpec) -> Value {
-    Value::Object(taint_port_operation_fields_to_json(
+    let mut fields = taint_port_operation_fields_to_json(
         &transform.id,
         &transform.selector,
         &transform.input,
         &transform.output,
-    ))
+    );
+    if !transform.categories.is_empty() {
+        insert(
+            &mut fields,
+            "categories",
+            id_set(transform.categories.iter().map(PolicyCategoryId::as_str)),
+        );
+    }
+    Value::Object(fields)
 }
 
 fn taint_entry_point_to_json(entry_point: &TaintEntryPointSpec) -> Value {
@@ -2027,6 +2070,7 @@ fn taint_entry_point_to_json(entry_point: &TaintEntryPointSpec) -> Value {
 
 pub(crate) fn value_type_predicate_to_json(predicate: ValueTypePredicate) -> Value {
     match predicate {
+        ValueTypePredicate::IntrinsicNumeric => json!({ "type": "intrinsic", "kind": "numeric" }),
         ValueTypePredicate::IntrinsicBool => json!({ "type": "intrinsic", "kind": "bool" }),
         ValueTypePredicate::FieldlessEnum => json!({ "type": "enum", "fieldless": true }),
     }
@@ -2036,18 +2080,93 @@ fn taint_barrier_to_json(barrier: &TaintBarrierSpec) -> Value {
     json!({ "id": barrier.id.as_str(), "value_type": value_type_predicate_to_json(barrier.value_type) })
 }
 
+pub(crate) fn sanitizer_operand_to_json(operand: TaintSanitizerOperand) -> Value {
+    match operand {
+        TaintSanitizerOperand::Receiver => json!({"type": "receiver"}),
+        TaintSanitizerOperand::Argument { index } => json!({"type": "argument", "index": index}),
+    }
+}
+
+pub(crate) fn sanitizer_requirement_to_json(requirement: &TaintSanitizerRequirement) -> Value {
+    let mut fields = Map::new();
+    insert(
+        &mut fields,
+        "operand",
+        sanitizer_operand_to_json(requirement.operand),
+    );
+    match &requirement.condition {
+        TaintSanitizerCondition::Constant => insert(&mut fields, "constant", json!(true)),
+        TaintSanitizerCondition::Equals(literal) => insert(&mut fields, "equals", literal.clone()),
+        TaintSanitizerCondition::ResultOf(selector) => {
+            insert(&mut fields, "result_of", selector_to_json(selector))
+        }
+    }
+    Value::Object(fields)
+}
+
+pub(crate) fn sanitizer_kind_to_json(kind: &TaintSanitizerKind) -> Value {
+    match kind {
+        TaintSanitizerKind::Transfer { input, output } => {
+            json!({"input": policy_port_to_json(input), "output": policy_port_to_json(output)})
+        }
+        TaintSanitizerKind::Conditional {
+            when,
+            sanitizes,
+            requires,
+        } => {
+            let mut result = json!({"result": match when.result {
+                TaintSanitizerResult::True => "true", TaintSanitizerResult::False => "false",
+                TaintSanitizerResult::Nil => "nil", TaintSanitizerResult::NonNil => "non-nil",
+            }});
+            if let Some(index) = when.index {
+                result["index"] = json!(index);
+            }
+            let mut fields = Map::new();
+            insert(&mut fields, "when", result);
+            insert(
+                &mut fields,
+                "sanitizes",
+                sanitizer_operand_to_json(*sanitizes),
+            );
+            if !requires.is_empty() {
+                let mut requirements = requires
+                    .iter()
+                    .map(sanitizer_requirement_to_json)
+                    .collect::<Vec<_>>();
+                requirements.sort_by_cached_key(|value| {
+                    serde_json_canonicalizer::to_vec(value)
+                        .expect("sanitizer requirements encode as JSON")
+                });
+                insert(&mut fields, "requires", Value::Array(requirements));
+            }
+            Value::Object(fields)
+        }
+    }
+}
+
 fn taint_sanitizer_to_json(sanitizer: &TaintSanitizerSpec) -> Value {
-    let mut fields = taint_port_operation_fields_to_json(
-        &sanitizer.id,
-        &sanitizer.selector,
-        &sanitizer.input,
-        &sanitizer.output,
+    let mut fields = sanitizer_kind_to_json(&sanitizer.kind)
+        .as_object()
+        .expect("sanitizer kind is an object")
+        .clone();
+    insert(&mut fields, "id", json!(sanitizer.id.as_str()));
+    insert(
+        &mut fields,
+        "selector",
+        selector_to_json(&sanitizer.selector),
     );
     insert(
         &mut fields,
         "removes",
         id_set(sanitizer.removes.iter().map(TaintLabel::as_str)),
     );
+    if !sanitizer.categories.is_empty() {
+        insert(
+            &mut fields,
+            "categories",
+            id_set(sanitizer.categories.iter().map(PolicyCategoryId::as_str)),
+        );
+    }
     Value::Object(fields)
 }
 
@@ -2108,6 +2227,13 @@ fn taint_transform_to_json(transform: &TaintTransformSpec) -> Value {
         "adds",
         id_set(transform.adds.iter().map(TaintLabel::as_str)),
     );
+    if !transform.categories.is_empty() {
+        insert(
+            &mut fields,
+            "categories",
+            id_set(transform.categories.iter().map(PolicyCategoryId::as_str)),
+        );
+    }
     Value::Object(fields)
 }
 
@@ -2139,11 +2265,12 @@ pub(crate) fn taint_port_fields_to_json(
 }
 
 fn taint_external_model_to_json(model: &TaintExternalModelSpec) -> Value {
-    json!({
-        "id": model.id.as_str(),
-        "selector": selector_to_json(&model.selector),
-        "transfers": sorted_values(model.transfers.iter().map(taint_transfer_to_json)),
-    })
+    let mut value = json!({ "id": model.id.as_str(), "selector": selector_to_json(&model.selector),
+        "transfers": sorted_values(model.transfers.iter().map(taint_transfer_to_json)), });
+    if !model.categories.is_empty() {
+        value["categories"] = id_set(model.categories.iter().map(PolicyCategoryId::as_str));
+    }
+    value
 }
 
 pub(crate) fn taint_transfer_to_json(transfer: &TaintTransferSpec) -> Value {
@@ -2716,10 +2843,29 @@ fn sorted_encoded_array<T>(
 }
 
 fn compare_catalog_refs(left: &CatalogRef, right: &CatalogRef) -> Ordering {
-    left.name
-        .cmp(&right.name)
-        .then_with(|| left.version.cmp(&right.version))
-        .then_with(|| left.sha256.cmp(&right.sha256))
+    match (left, right) {
+        (
+            CatalogRef::Named {
+                name: left_name,
+                version: left_version,
+                sha256: left_hash,
+            },
+            CatalogRef::Named {
+                name: right_name,
+                version: right_version,
+                sha256: right_hash,
+            },
+        ) => left_name
+            .cmp(right_name)
+            .then_with(|| left_version.cmp(right_version))
+            .then_with(|| left_hash.cmp(right_hash)),
+        (
+            CatalogRef::AnyRegistered { predicate: left },
+            CatalogRef::AnyRegistered { predicate: right },
+        ) => compare_category_predicates(left, right),
+        (CatalogRef::Named { .. }, CatalogRef::AnyRegistered { .. }) => Ordering::Less,
+        (CatalogRef::AnyRegistered { .. }, CatalogRef::Named { .. }) => Ordering::Greater,
+    }
 }
 
 fn compare_match_endpoint_set_refs(

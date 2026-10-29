@@ -13,6 +13,95 @@ mod tests {
 
     include!("rust_forwarded_surface_tests.rs");
 
+    #[test]
+    fn unindexed_trait_impl_subject_is_found_by_identity_through_renamed_imports() {
+        let mut results = Vec::new();
+        for subject in ["W", "Alias"] {
+            let project = InlineTestProject::new()
+                .file(
+                    "Cargo.toml",
+                    "[package]\nname = \"trait_subject\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                )
+                .file(
+                    "src/lib.rs",
+                    format!(
+                        "pub struct Item;\npub struct W(Item);\nuse W as Alias;\n\
+                         impl std::ops::Deref for {subject} {{\n\
+                             type Target = Item;\n\
+                             fn deref(&self) -> &Self::Target {{ &self.0 }}\n\
+                         }}\n"
+                    ),
+                )
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let store = workspace.store().unwrap();
+            let conn = store.conn.lock().unwrap();
+            brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn)
+                .unwrap();
+            brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+            conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+            let (unit_key, module_path, identity): (Vec<u8>, String, i64) = conn
+                .query_row(
+                    "SELECT units.unit_key, exports.module_path, exports.identity_id
+                     FROM selected_rust_unit_summaries AS units
+                     JOIN rust_resolution_unit_summary_exports AS exports
+                       ON exports.summary_id=units.summary_id
+                     WHERE exports.name='W' AND exports.namespace='type'
+                       AND exports.origin='declaration'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            const PROBE: &str = "SELECT trait.endpoint_state, trait.unresolved_spelling
+                FROM rust_resolution_unit_summary_trait_endpoints AS subject
+                  INDEXED BY rust_resolution_unit_summary_trait_endpoints_target
+                CROSS JOIN selected_rust_unit_summaries AS owner
+                  ON owner.summary_id=subject.summary_id
+                CROSS JOIN rust_resolution_unit_summary_trait_endpoints AS trait
+                  ON trait.summary_id=subject.summary_id
+                 AND trait.member_ordinal=subject.member_ordinal
+                 AND trait.owner_module_path=subject.owner_module_path
+                 AND trait.source_relation_key=subject.source_relation_key
+                 AND trait.endpoint_role='trait'
+                WHERE subject.target_unit_key=?1 AND subject.target_module_path=?2
+                  AND subject.target_identity_id=?3 AND subject.endpoint_role='subject'
+                  AND subject.endpoint_state='resolved'";
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {PROBE}"))
+                .unwrap()
+                .query_map(rusqlite::params![unit_key, module_path, identity], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(
+                    |step| step.contains("rust_resolution_unit_summary_trait_endpoints_target")
+                ),
+                "subject identity probe must seek its index: {plan:?}"
+            );
+            println!("subject={subject}; selected-snapshot QEP: {plan:#?}");
+            let endpoints = conn
+                .prepare(PROBE)
+                .unwrap()
+                .query_map(rusqlite::params![unit_key, module_path, identity], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            results.push((subject, endpoints));
+        }
+        assert_eq!(
+            results,
+            ["W", "Alias"]
+                .map(|subject| (subject, vec![("unresolved".to_owned(), "Deref".to_owned())])),
+            "both impl headers must be found by W's identity with an unindexed trait"
+        );
+    }
+
     fn live_summaries(workspace: &WorkspaceAnalyzer) -> BTreeMap<String, (i64, Vec<u8>)> {
         let store = workspace.store().unwrap();
         let conn = store.read_conn().unwrap();
@@ -2329,6 +2418,68 @@ pub fn enclosing() {
         assert!(
             visited.is_empty(),
             "an incomplete batch publishes no edges: {visited:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod included_impl_subject_placement {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#7226: rust_crate_unresolved_trait_impls keyed no placing module, so two module placements of one included impl kept one row"
+    )]
+    fn included_impl_subjects_preserve_module_placement() {
+        let project = InlineTestProject::new()
+            .file("Cargo.toml", "[package]\nname='placed_impl'\nversion='0.1.0'\nedition='2021'\n")
+            .file("src/lib.rs", "pub mod one { pub struct W; include!(\"shared.rs\"); }\npub mod two { pub struct W; include!(\"shared.rs\"); }\n")
+            .file("src/shared.rs", "impl std::ops::Deref for W { type Target = u8; fn deref(&self) -> &u8 { &0 } }\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = workspace.store().unwrap();
+        let conn = store.read_conn().unwrap();
+        let subjects = conn
+            .prepare(
+                "SELECT endpoint.owner_module_path, target.module_path, target.name
+             FROM rust_resolution_unit_summary_trait_endpoints AS endpoint
+             JOIN resolution_unit_summary_versions AS versions USING(summary_id)
+             JOIN rust_resolution_unit_summary_exports AS target
+               ON target.summary_id=endpoint.summary_id
+              AND target.identity_id=endpoint.target_identity_id
+              AND target.module_path=endpoint.target_module_path
+              AND target.namespace='type' AND target.origin='declaration'
+             WHERE versions.valid_until IS NULL AND endpoint.endpoint_role='subject'
+               AND endpoint.endpoint_state='resolved'
+             ORDER BY endpoint.owner_module_path, target.module_path",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            subjects,
+            vec![
+                (
+                    "crate::one".to_owned(),
+                    "crate::one".to_owned(),
+                    "W".to_owned()
+                ),
+                (
+                    "crate::two".to_owned(),
+                    "crate::two".to_owned(),
+                    "W".to_owned()
+                ),
+            ]
         );
     }
 }

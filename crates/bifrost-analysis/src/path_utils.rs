@@ -278,3 +278,110 @@ fn is_bare_literal_candidate(input: &str, rel: &Path) -> bool {
     }
     rel.components().count() == 1
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{EmptyAnalyzer, FilesystemProject};
+    use std::sync::Arc;
+
+    #[test]
+    fn relative_path_normalization_removes_rendered_current_directory() {
+        let normalized = normalize_relative_components(Path::new("./src/main.rs")).unwrap();
+        assert_eq!(workspace_relative_slash_path(&normalized), "src/main.rs");
+    }
+
+    #[test]
+    fn file_selector_scope_reports_resolved_exact_and_ambiguous_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(temp.path().join("src/Shared.java"), "class Shared {}").unwrap();
+        std::fs::write(temp.path().join("tests/Shared.java"), "class Shared {}").unwrap();
+        let project = Arc::new(FilesystemProject::new(temp.path()).unwrap());
+        let analyzer = EmptyAnalyzer::new(project);
+        let resolver = WorkspaceFileResolver::for_analyzer(&analyzer);
+
+        let exact = resolver.classify_selector("src/Shared.java");
+        if !matches!(exact, WorkspacePathSelector::Files(_)) {
+            panic!("exact workspace file did not resolve");
+        }
+        assert_eq!(exact.scope_paths(), ["src/Shared.java"]);
+
+        let ambiguous = resolver.classify_selector("Shared.java");
+        if !matches!(ambiguous, WorkspacePathSelector::Files(_)) {
+            panic!("ambiguous basename did not resolve to its workspace files");
+        }
+        assert_eq!(
+            ambiguous.scope_paths(),
+            ["src/Shared.java", "tests/Shared.java"]
+        );
+    }
+
+    #[test]
+    fn filesystem_selectors_resolve_paths_and_report_their_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/deep")).unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(temp.path().join("src/Shared.java"), "class Shared {}").unwrap();
+        std::fs::write(temp.path().join("src/deep/B.java"), "class B {}").unwrap();
+        std::fs::write(temp.path().join("tests/C.java"), "class C {}").unwrap();
+        std::fs::write(temp.path().join("name with space.java"), "class Spaced {}").unwrap();
+        let project = Arc::new(FilesystemProject::new(temp.path()).unwrap());
+        let analyzer = EmptyAnalyzer::new(project);
+        let resolver = WorkspaceFileResolver::for_analyzer(&analyzer);
+
+        for root_spelling in [".", "./", r".\"] {
+            let root = resolver.classify_selector(root_spelling);
+            assert_eq!(root.scope_paths(), [""]);
+            assert!(root.matches("src/Shared.java"));
+            assert!(root.matches("tests/C.java"));
+        }
+
+        let immediate = resolver.classify_selector("src/*.java");
+        let backslash_glob = resolver.classify_selector(r"src\*.java");
+        let recursive = resolver.classify_selector("src/**/*.java");
+        for selector in [&immediate, &backslash_glob] {
+            assert!(selector.matches("src/Shared.java"));
+            assert!(!selector.matches("src/deep/B.java"));
+            assert!(!selector.matches("tests/C.java"));
+        }
+        assert_eq!(immediate.scope_paths(), backslash_glob.scope_paths());
+        assert!(recursive.matches("src/Shared.java"));
+        assert!(recursive.matches("src/deep/B.java"));
+
+        let directory = resolver.classify_selector("src");
+        assert_eq!(directory.scope_paths(), ["src/"]);
+        assert!(directory.matches("src/deep/B.java"));
+        let exact = resolver.classify_selector("src/Shared.java");
+        assert_eq!(exact.scope_paths(), ["src/Shared.java"]);
+        assert!(
+            !resolver
+                .classify_selector("missing.java")
+                .matches("src/Shared.java")
+        );
+
+        assert!(matches!(
+            resolver.resolve_literal("  src/Shared.java  "),
+            ResolvedFileInput::File(_)
+        ));
+        assert!(matches!(
+            resolver.resolve_literal("  Shared.java  "),
+            ResolvedFileInput::File(_)
+        ));
+        assert!(matches!(
+            resolver.resolve_literal("name with space.java"),
+            ResolvedFileInput::File(_)
+        ));
+
+        let root_shared = resolver.resolve_literal(r"\Shared.java");
+        assert!(matches!(root_shared, ResolvedFileInput::NotFound(_)));
+    }
+
+    #[test]
+    fn relative_path_normalization_rejects_parent_escape() {
+        assert!(normalize_relative_components(Path::new("./src")).is_some());
+        assert!(normalize_relative_components(Path::new("src/../../outside")).is_none());
+        assert!(normalize_relative_components(Path::new("../outside")).is_none());
+    }
+}

@@ -29,8 +29,24 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
         "SELECT name FROM sqlite_schema WHERE type = 'table'
          AND (name LIKE 'resolution_%' OR name LIKE 'source_%'
               OR name LIKE 'python_binding_%' OR name LIKE 'python_member_%'
-              OR name LIKE 'go_context_%' OR name LIKE 'go_package_%') AND ?1 = ''",
+              OR name LIKE 'go_context_%' OR name LIKE 'go_package_%'
+              OR name = 'semantic_ir_call_sites') AND ?1 = ''",
         "",
+    );
+    assert_eq!(
+        string_column(
+            &conn,
+            "SELECT \"from\" || ':' || \"table\" || '.' || \"to\"
+             FROM pragma_foreign_key_list(?1)
+             WHERE \"from\" IN ('receiver_place_locator', 'receiver_place_location')
+             ORDER BY \"from\"",
+            "semantic_ir_call_sites",
+        ),
+        [
+            "receiver_place_location:semantic_ir_memory_locations.location",
+            "receiver_place_locator:semantic_ir_locators.locator",
+        ],
+        "both receiver place variants must have an enforced parent relation",
     );
     for state in PlannerStatisticsState::BOTH {
         state.install(&conn);

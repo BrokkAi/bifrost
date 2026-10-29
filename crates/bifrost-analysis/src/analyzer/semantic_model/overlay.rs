@@ -47,10 +47,15 @@ use crate::analyzer::semantic_model::SemanticModelMatchDisposition;
 use crate::analyzer::semantic_model::TypeFact;
 use crate::analyzer::semantic_model::TypeRef;
 use crate::analyzer::semantic_model::Visibility;
+use crate::analyzer::semantic_model::{AssemblyReference, CatalogError};
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+use brokk_bifrost_semantic::analyzer::semantic_model::catalog::type_forwards::{
+    AssemblyProvider, AssemblyTypeTarget, resolve_assembly_type,
+};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -58,8 +63,15 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct SemanticModelOverlay {
-    row_source: Option<row_entry_points::RowOverlay>,
+    // Eager declaration shards also publish normalized rows. Keep their
+    // existing active-set reader available to request-time forward queries.
+    active_models: Option<Arc<ResolvedActiveSemanticModels>>,
+    row_source: Option<Arc<row_entry_points::RowOverlay>>,
+    selected_source: Option<Arc<row_entry_points::RowOverlay>>,
     active_model_set_hash: String,
+    // Per-request results only, never an index of the selected model set.
+    model_member_cache: moka::sync::Cache<ModelDeclarationRequest, Option<ModelOwnerAnswer>>,
+    model_result_cache: moka::sync::Cache<ModelDeclarationRequest, Option<Vec<Option<TypeRef>>>>,
     composition_diagnostics: Vec<Arc<SemanticModelCompositionDiagnostic>>,
     extraction_gaps: Vec<Arc<ActivePackExtractionGap>>,
     extraction_gap_by_declaration: HashMap<String, usize>,
@@ -145,7 +157,237 @@ pub fn owner_declaration(
         .map(|record| record.record)
 }
 
+/// Request identity includes both the activation and the compilation selection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModelDeclarationRequest {
+    active_model_set_hash: String,
+    schema_version: u32,
+    selection_digest: [u8; 32],
+    symbol: ModelSymbolRef,
+}
+
 impl SemanticModelOverlay {
+    fn model_declaration_request(
+        &self,
+        symbol: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+    ) -> ModelDeclarationRequest {
+        ModelDeclarationRequest {
+            active_model_set_hash: self.active_model_set_hash.clone(),
+            schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+            selection_digest: selection.digest(),
+            symbol: symbol.clone(),
+        }
+    }
+
+    fn selected_model_symbols(
+        &self,
+        symbol: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<SemanticModelSymbol>, SemanticModelOverlayBuildError> {
+        if let Some(source) = &self.selected_source {
+            return source.selected_symbols(symbol, selection, cancellation);
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(declaration) = self.symbols.iter().find(|s| {
+            s.id == symbol.symbol_id && ModelProvider::from(&s.provenance) == symbol.provider
+        }) {
+            return Ok(self
+                .model_selected_groups(
+                    &declaration.language,
+                    &TypeRef::Declared {
+                        id: symbol.symbol_id.clone(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                    selection,
+                    cancellation,
+                )?
+                .into_iter()
+                .flatten()
+                .collect());
+        }
+        Ok(Vec::new())
+    }
+
+    fn selected_model_symbol(
+        &self,
+        symbol: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Option<SemanticModelSymbol>, SemanticModelOverlayBuildError> {
+        if !selection.contains(&symbol.provider) {
+            return Ok(None);
+        }
+        Ok(self
+            .selected_model_symbols(symbol, selection, cancellation)?
+            .into_iter()
+            .find(|declaration| {
+                declaration.id == symbol.symbol_id
+                    && ModelProvider::from(&declaration.provenance) == symbol.provider
+            }))
+    }
+
+    /// Selected composed alias groups for a structured owner name or declaration
+    /// ID. Every defining provider remains a separate facet within its group.
+    /// Cancellation and bounded composition failures remain distinct errors.
+    pub fn model_selected_groups(
+        &self,
+        language: &str,
+        reference: &TypeRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<Vec<SemanticModelSymbol>>, SemanticModelOverlayBuildError> {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        if let Some(source) = &self.selected_source {
+            return source.selected_groups(language, reference, selection, cancellation);
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            test_support::selected_fixture_groups(
+                &self.symbols,
+                language,
+                reference,
+                selection,
+                cancellation,
+            )
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        Ok(Vec::new())
+    }
+
+    /// The owner a nominal type reference names among the selected providers.
+    /// Each defining provider stays a separate candidate, so the same owner
+    /// declared by two selected providers is Ambiguous. No alias, underlying or
+    /// forward traversal; a field or embedded reference searches the whole
+    /// selection.
+    pub fn model_type_owner(
+        &self,
+        language: &str,
+        nominal: &TypeRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<ModelTypeOwnerAnswer<SemanticModelSymbol>, SemanticModelOverlayBuildError> {
+        let groups = self.model_selected_groups(language, nominal, selection, cancellation)?;
+        let candidates = groups.iter().flatten().filter(|symbol| match nominal {
+            TypeRef::Named { name, .. } => {
+                symbol.qualified_name == *name || symbol.aliases.contains(name)
+            }
+            TypeRef::Declared { id, .. } => symbol.id == *id,
+            _ => false,
+        });
+        let hook = model_composition_language(language);
+        Ok(
+            classify_model_type_owner(candidates, |kind| hook.is_type_owner_kind(kind))
+                .map_declaration(Clone::clone),
+        )
+    }
+
+    /// Composed declarations grouped by (owner id, defining provider), excluding
+    /// identified Go promotion copies. Consult members_state before treating
+    /// every remaining member as a direct declaration.
+    /// Ok(None) means the owner is outside the selected active model set.
+    pub fn model_member_declarations(
+        &self,
+        owner: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Option<ModelOwnerAnswer>, SemanticModelOverlayBuildError> {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        if !selection.contains(&owner.provider) {
+            return Ok(None);
+        }
+        self.model_member_cache
+            .try_get_with(self.model_declaration_request(owner, selection), || {
+                let symbols = self.selected_model_symbols(owner, selection, cancellation)?;
+                let Some(declaration) = symbols
+                    .iter()
+                    .find(|declaration| {
+                        declaration.id == owner.symbol_id
+                            && ModelProvider::from(&declaration.provenance) == owner.provider
+                    })
+                    .cloned()
+                else {
+                    return Ok(None);
+                };
+                // The overlay currently has no forward records. C# M7 owns their walk.
+                let members = symbols
+                    .into_iter()
+                    .filter(|member| {
+                        member.promoted_from.is_none()
+                            && member.owner_id.as_deref() == Some(owner.symbol_id.as_str())
+                            && ModelProvider::from(&member.provenance) == owner.provider
+                    })
+                    .map(|member| ModelMemberDeclaration {
+                        member: ModelSymbolRef {
+                            symbol_id: member.id.clone(),
+                            provider: owner.provider.clone(),
+                        },
+                        declaration: member,
+                    })
+                    .collect();
+                Ok(Some(ModelOwnerAnswer::Declared(ModelOwnerDeclarations {
+                    owner: owner.clone(),
+                    members_state: declaration.members_state,
+                    declaration,
+                    members,
+                })))
+            })
+            .map_err(|error| *error)
+    }
+
+    /// Declared results by ordinal, from structured_signature.returns only.
+    /// An unknown result retains its ordinal as None.
+    /// None is also returned for a selected callable without a structured
+    /// signature, and for `returns: None` from a producer that does not
+    /// conform to the returns contract (#7570); it does not mean the symbol
+    /// is not a model callable.
+    pub fn model_callable_results(
+        &self,
+        callable: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Option<Vec<Option<TypeRef>>>, SemanticModelOverlayBuildError> {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        self.model_result_cache
+            .try_get_with(self.model_declaration_request(callable, selection), || {
+                let Some(declaration) =
+                    self.selected_model_symbol(callable, selection, cancellation)?
+                else {
+                    return Ok(None);
+                };
+                let Some(signature) = declaration.structured_signature else {
+                    return Ok(None);
+                };
+                let results = match signature.returns {
+                    Some(TypeRef::Tuple { elements }) => elements,
+                    Some(result) => vec![result],
+                    // Only these producers write None solely for "declares no
+                    // results"; the others also use it for an inferred or
+                    // undecodable result (#7570). Every other language stays
+                    // unknown rather than claiming no results.
+                    None => match declaration.language.as_str() {
+                        "go" | "java" | "csharp" | "rust" => Vec::new(),
+                        _ => return Ok(None),
+                    },
+                };
+                Ok(Some(
+                    results
+                        .into_iter()
+                        .map(|result| (result != TypeRef::Unknown).then_some(result))
+                        .collect(),
+                ))
+            })
+            .map_err(|error| *error)
+    }
+
     #[doc(hidden)]
     pub fn build(
         analyzer: &dyn IAnalyzer,
@@ -157,8 +399,12 @@ impl SemanticModelOverlay {
         // traverse a large analyzer to derive facts for an empty model set.
         if active.shards().is_empty() {
             return Ok(Self {
+                active_models: Some(Arc::clone(active)),
                 row_source: None,
+                selected_source: None,
                 active_model_set_hash: active.active_model_set_hash().to_string(),
+                model_member_cache: moka::sync::Cache::new(128),
+                model_result_cache: moka::sync::Cache::new(128),
                 composition_diagnostics: Vec::new(),
                 extraction_gaps: active.extraction_gaps().to_vec(),
                 extraction_gap_by_declaration: extraction_gap_index(&active.extraction_gaps()),
@@ -314,30 +560,42 @@ impl SemanticModelOverlay {
             member_ids,
             relation_ids,
         )?;
+        // compose() removes folded curated owners and members and rewrites
+        // generated relation endpoints, and an authored anchor lives in the
+        // removed symbol's location, not its provenance; a narrower selection
+        // needs those originals, so the copies stay and are charged.
+        let selected_source = Some({
+            let generated = symbols
+                .iter()
+                .filter(|s| s.provenance.rule_id.is_some())
+                .cloned()
+                .collect();
+            let generated_relations = relations
+                .iter()
+                .filter(|r| r.provenance.rule_id.is_some())
+                .cloned()
+                .collect();
+            Arc::new(row_entry_points::RowOverlay::new(
+                analyzer,
+                active,
+                generated,
+                generated_relations,
+                analyzer
+                    .snapshot_caches()
+                    .and_then(|c| c.semantic_models().native_inventory_store())
+                    .map(|store| store.cache_budget.clone()),
+                &symbols,
+            ))
+        });
         let row_source = active
             .shards
             .iter()
             .any(|shard| shard.decoded.is_none())
             .then(|| {
-                let generated = symbols
-                    .iter()
-                    .filter(|s| s.provenance.rule_id.is_some())
-                    .cloned()
-                    .collect();
-                let generated_relations = relations
-                    .iter()
-                    .filter(|r| r.provenance.rule_id.is_some())
-                    .cloned()
-                    .collect();
-                row_entry_points::RowOverlay::new(
-                    analyzer,
-                    active,
-                    generated,
-                    generated_relations,
-                    analyzer
-                        .snapshot_caches()
-                        .and_then(|c| c.semantic_models().native_inventory_store())
-                        .map(|store| store.cache_budget.clone()),
+                Arc::clone(
+                    selected_source
+                        .as_ref()
+                        .expect("row-backed active set has its reader"),
                 )
             });
         if let Some(rows) = &row_source {
@@ -392,8 +650,12 @@ impl SemanticModelOverlay {
                 .push(index);
         }
         let mut overlay = Self {
+            active_models: Some(Arc::clone(active)),
             row_source,
+            selected_source,
             active_model_set_hash: active.active_model_set_hash().to_string(),
+            model_member_cache: moka::sync::Cache::new(128),
+            model_result_cache: moka::sync::Cache::new(128),
             composition_diagnostics: composition_diagnostics.into_iter().map(Arc::new).collect(),
             extraction_gaps: active.extraction_gaps().to_vec(),
             extraction_gap_by_declaration: extraction_gap_index(&active.extraction_gaps()),
@@ -431,9 +693,179 @@ impl SemanticModelOverlay {
             .saturating_add(overlay.retained_bytes_lower_bound())
             > max_combined_retained_bytes
         {
-            return Err(SemanticModelOverlayBuildError::RetainedBytesExceeded);
+            return Err(SemanticModelOverlayBuildError::RetainedBytesExceeded(
+                crate::analyzer::semantic_model::SemanticModelOverlayBudgetExceeded {
+                    loaded_records: active.activation_report().loaded_records,
+                    models_retained_bytes: active.retained_bytes(),
+                    overlay_working_bytes: overlay.retained_bytes_lower_bound(),
+                    combined_budget_bytes: max_combined_retained_bytes,
+                },
+            ));
         }
         Ok(overlay)
+    }
+
+    /// Follow only providers selected by the caller. A facade's complete-pack
+    /// absence proof consults forwards before it can return AbsentOnProvider.
+    pub fn assembly_type_target(
+        &self,
+        selected: &[AssemblyProvider],
+        provider: &AssemblyProvider,
+        name: &str,
+    ) -> Result<AssemblyTypeTarget, CatalogError> {
+        let Some(reader) = self
+            .active_models
+            .as_ref()
+            .and_then(|active| active.source_reader())
+        else {
+            return Ok(AssemblyTypeTarget::OpenBoundary {
+                reason: format!(
+                    "forwarder {provider:?}: assembly row reader unavailable for {name}"
+                ),
+                trace: Vec::new(),
+            });
+        };
+        let connection = reader
+            .connection
+            .lock()
+            .expect("active semantic reader mutex poisoned");
+        resolve_assembly_type(&connection, selected, provider, name)
+    }
+
+    /// Legacy C# has one provider set until per-compilation selection lands.
+    /// This method annotates misses only; successful legacy lookups keep their
+    /// existing full-name result. Native callers use assembly_type_target with
+    /// the narrower compilation's providers instead.
+    pub fn type_forward_boundaries(&self, name: &str) -> Vec<String> {
+        use crate::analyzer::store::model_catalog::semantic_catalog_question;
+        semantic_catalog_question(
+            "ASSEMBLY_TYPE_TARGET",
+            name,
+            self.type_forward_targets(name),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|target| match target {
+            AssemblyTypeTarget::OpenBoundary { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect()
+    }
+
+    /// After a retained TypeDef miss, every forward remains an open diagnostic
+    /// boundary, even if another catalog surface knows its defining owner.
+    /// None means no activated row reader, never a complete empty answer.
+    pub fn type_forward_miss_boundaries(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<String>>, CatalogError> {
+        let Some(targets) = self.type_forward_targets(name)? else {
+            return Ok(None);
+        };
+        let reasons = targets
+            .into_iter()
+            .map(|target| match target {
+                AssemblyTypeTarget::OpenBoundary { reason, .. } => reason,
+                other => format!("forwarded {name} is unreadable in retained TypeDefs: {other:?}"),
+            })
+            .collect();
+        Ok(Some(reasons))
+    }
+
+    fn type_forward_targets(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<AssemblyTypeTarget>>, CatalogError> {
+        let Some(active) = &self.active_models else {
+            return Ok(None);
+        };
+        let Some(reader) = active.source_reader() else {
+            return Ok(None);
+        };
+        let selected: Vec<_> = active
+            .shards
+            .iter()
+            .filter(|shard| shard.manifest.language == "csharp")
+            .map(|shard| AssemblyProvider {
+                manifest_digest: shard.manifest.content_sha256.clone(),
+                shard_id: shard.descriptor.shard_id.clone(),
+                complete: shard.manifest.completeness == Completeness::Complete,
+            })
+            .collect();
+        let providers = reader.scalar_question(
+            statements::TYPE_FORWARD_PROVIDERS_BY_NAME,
+            rusqlite::named_params! {":name":name},
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let connection = reader
+            .connection
+            .lock()
+            .expect("active semantic reader mutex poisoned");
+        let mut targets = Vec::new();
+        for (manifest, shard) in providers {
+            if let Some(provider) = selected
+                .iter()
+                .find(|provider| provider.manifest_digest == manifest && provider.shard_id == shard)
+            {
+                targets.push(resolve_assembly_type(
+                    &connection,
+                    &selected,
+                    provider,
+                    name,
+                )?);
+            }
+        }
+        Ok(Some(targets))
+    }
+
+    /// A readable row source must cover every forwarding assembly the retained
+    /// index read. Merely having some activated reader cannot close a miss.
+    pub fn type_forward_sources_complete(
+        &self,
+        identities: &[AssemblyReference],
+    ) -> Result<Option<bool>, CatalogError> {
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        let Some(reader) = self
+            .active_models
+            .as_ref()
+            .and_then(|active| active.source_reader())
+        else {
+            return Ok(None);
+        };
+        let identities = serde_json::to_string(identities).map_err(|error| {
+            CatalogError::Integrity(format!("encode forwarding assembly identities: {error}"))
+        })?;
+        let rows = reader.scalar_question(
+            statements::TYPE_FORWARD_SOURCES_COMPLETE,
+            rusqlite::named_params! {":identities":identities},
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(Some(*rows.first().expect("EXISTS always returns one row")))
+    }
+
+    /// Namespace-range seek over structured export namespaces; no resolution or
+    /// retained prefix map. The complete, distinct assembly pairs are
+    /// sorted by SQL for diagnostic rendering.
+    pub fn namespace_type_forward_boundaries(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<Vec<(String, String)>>, CatalogError> {
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        let Some(reader) = self
+            .active_models
+            .as_ref()
+            .and_then(|active| active.source_reader())
+        else {
+            return Ok(None);
+        };
+        let upper = format!("{namespace}/");
+        reader
+            .scalar_question(
+                statements::TYPE_FORWARD_PAIRS_BY_NAMESPACE,
+                rusqlite::named_params! {":ns":namespace, ":ns_upper":upper},
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
     }
 
     pub fn composition_diagnostics(&self) -> Vec<Arc<SemanticModelCompositionDiagnostic>> {
@@ -1632,6 +2064,17 @@ impl SemanticModelOverlay {
         key: SemanticModelCallableKey<'_>,
         application: &SemanticModelCallApplication,
     ) -> SemanticModelCallableMatch {
+        self.callable_for_selected_application(key, application, None)
+    }
+
+    /// Bind the resolver's selected declaration before considering overload layouts.
+    /// Calls without an exact descriptor retain ordinary family matching.
+    pub fn callable_for_selected_application(
+        &self,
+        key: SemanticModelCallableKey<'_>,
+        application: &SemanticModelCallApplication,
+        selected_record: Option<(&str, &str)>,
+    ) -> SemanticModelCallableMatch {
         let Some((_, _, has_spread)) = application.written() else {
             return SemanticModelCallableMatch {
                 records: Vec::new(),
@@ -1640,7 +2083,10 @@ impl SemanticModelOverlay {
                 ),
             };
         };
-        let owners = self.callable_owner_candidates(key);
+        let mut owners = self.callable_owner_candidates(key);
+        if let Some((provider, _)) = &selected_record {
+            owners.retain(|owner| owner.provenance.pack_digest == *provider);
+        }
 
         if owners.is_empty() {
             return SemanticModelCallableMatch {
@@ -1669,6 +2115,12 @@ impl SemanticModelOverlay {
                     || !member_is_callable(&member)
                     || member_has_receiver(&member) != key.has_receiver
                 {
+                    continue;
+                }
+                if selected_record.as_ref().is_some_and(|(provider, record)| {
+                    member.provenance.pack_digest != *provider
+                        || member.provenance.record_id != *record
+                }) {
                     continue;
                 }
                 let Some(signature) = member.structured_signature.as_ref() else {
@@ -2346,55 +2798,25 @@ impl SemanticModelOverlay {
         let symbol_bytes = self
             .symbols
             .iter()
-            .map(|symbol| {
-                std::mem::size_of::<SemanticModelSymbol>()
-                    .saturating_add(symbol.id.capacity())
-                    .saturating_add(symbol.owner_id.as_ref().map_or(0, String::capacity))
-                    .saturating_add(symbol.name.capacity())
-                    .saturating_add(symbol.qualified_name.capacity())
-                    .saturating_add(semantic_symbol_source_key(symbol).0.len())
-                    .saturating_add(symbol.rust_generated_scope.as_ref().map_or(0, |scope| {
-                        std::mem::size_of_val(scope.as_ref())
-                            .saturating_add(scope.module.capacity())
-                            .saturating_add(scope.file.capacity())
-                    }))
-                    .saturating_add(symbol.language.capacity())
-                    .saturating_add(symbol.signature.as_ref().map_or(0, String::capacity))
-                    .saturating_add(symbol.aliases.iter().map(String::capacity).sum::<usize>())
-                    .saturating_add(match &symbol.location {
-                        SemanticModelLocation::Authored(anchor) => anchor
-                            .path
-                            .capacity()
-                            .saturating_add(anchor.symbol.capacity()),
-                        SemanticModelLocation::Model(location) => location.uri.capacity(),
-                    })
-                    .saturating_add(symbol.provenance.retained_string_bytes())
-                    .saturating_add(
-                        symbol
-                            .semantic_contributors
-                            .iter()
-                            .map(|contributor| {
-                                std::mem::size_of::<SemanticModelProvenance>()
-                                    + contributor.retained_string_bytes()
-                            })
-                            .sum::<usize>(),
-                    )
-            })
+            .map(|symbol| symbol_retained_bytes(symbol))
             .sum::<usize>();
         let relation_bytes = self
             .relations
             .iter()
-            .map(|relation| {
-                std::mem::size_of::<SemanticModelRelation>()
-                    .saturating_add(relation.id.capacity())
-                    .saturating_add(relation.kind.capacity())
-                    .saturating_add(relation.from.capacity())
-                    .saturating_add(relation.to.capacity())
-                    .saturating_add(semantic_relation_source_key(relation).0.len())
-                    .saturating_add(semantic_relation_source_key(relation).3.len())
-                    .saturating_add(relation.provenance.retained_string_bytes())
-            })
+            .map(|relation| relation_retained_bytes(relation))
             .sum::<usize>();
+        // row_source and selected_source usually share one allocation. Charge
+        // its retained original inputs once, including for decoded-only sets.
+        let source_bytes = self
+            .selected_source
+            .iter()
+            .chain(self.row_source.iter().filter(|row| {
+                self.selected_source
+                    .as_ref()
+                    .is_none_or(|selected| !Arc::ptr_eq(row, selected))
+            }))
+            .flat_map(|source| source.retained_owned_input_bytes())
+            .fold(0usize, usize::saturating_add);
         let hierarchy_bytes = self
             .java_hierarchy
             .iter()
@@ -2477,6 +2899,7 @@ impl SemanticModelOverlay {
                         })
                         .sum::<usize>(),
                 )
+                .saturating_add(source_bytes)
                 .saturating_add(symbol_bytes)
                 .saturating_add(relation_bytes)
                 .saturating_add(hierarchy_bytes)
@@ -3203,74 +3626,77 @@ pub(crate) fn generated_overlay_facts(
         }
         // A large workspace can exceed the per-file hydration cache. Keep the
         // file outside the rule loop so each file state is loaded only once.
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let generated_files = files
             .par_iter()
             .map(|file| {
-                if cancellation.is_cancelled() {
-                    return Err(SemanticModelOverlayBuildError::Cancelled);
-                }
-                let mut generated = GeneratedFileFacts {
-                    symbols: Vec::new(),
-                    relations: Vec::new(),
-                    aliases: Vec::new(),
-                };
-                let Some(facts) = provider.structural_facts(file) else {
-                    return Ok(generated);
-                };
-                for (node_index, node) in facts.nodes().iter().enumerate() {
+                context.run(|| {
                     if cancellation.is_cancelled() {
                         return Err(SemanticModelOverlayBuildError::Cancelled);
                     }
-                    let node_id = u32::try_from(node_index)
-                        .expect("structural fact IDs are bounded to u32 by FileFacts");
-                    let matching_rules = rules
-                        .iter()
-                        .filter(|&(_, rule)| {
-                            rule_trigger_matches(analyzer, file, &rule.trigger, &facts, node_id)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if matching_rules.is_empty() {
-                        continue;
-                    }
-                    // Enclosing-symbol lookup can hydrate source ranges. Do it
-                    // only after a cheap trigger match, and share it across rules.
-                    let enclosing = analyzer.enclosing_code_unit(file, &node.range);
-                    for (shard, rule) in matching_rules {
-                        let Ok(captures) = rule_capture_values(
-                            analyzer,
-                            &rule,
-                            &facts,
-                            node_id,
-                            file,
-                            enclosing.as_ref(),
-                        ) else {
+                    let mut generated = GeneratedFileFacts {
+                        symbols: Vec::new(),
+                        relations: Vec::new(),
+                        aliases: Vec::new(),
+                    };
+                    let Some(facts) = provider.structural_facts(file) else {
+                        return Ok(generated);
+                    };
+                    for (node_index, node) in facts.nodes().iter().enumerate() {
+                        if cancellation.is_cancelled() {
+                            return Err(SemanticModelOverlayBuildError::Cancelled);
+                        }
+                        let node_id = u32::try_from(node_index)
+                            .expect("structural fact IDs are bounded to u32 by FileFacts");
+                        let matching_rules = rules
+                            .iter()
+                            .filter(|&(_, rule)| {
+                                rule_trigger_matches(analyzer, file, &rule.trigger, &facts, node_id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if matching_rules.is_empty() {
                             continue;
-                        };
-                        for captures in &captures {
-                            emit_rule_match(
-                                active,
-                                &shard,
+                        }
+                        // Enclosing-symbol lookup can hydrate source ranges. Do it
+                        // only after a cheap trigger match, and share it across rules.
+                        let enclosing = analyzer.enclosing_code_unit(file, &node.range);
+                        for (shard, rule) in matching_rules {
+                            let Ok(captures) = rule_capture_values(
+                                analyzer,
                                 &rule,
-                                captures,
-                                &mut generated.symbols,
-                                &mut generated.relations,
-                                &mut generated.aliases,
-                            );
+                                &facts,
+                                node_id,
+                                file,
+                                enclosing.as_ref(),
+                            ) else {
+                                continue;
+                            };
+                            for captures in &captures {
+                                emit_rule_match(
+                                    active,
+                                    &shard,
+                                    &rule,
+                                    captures,
+                                    &mut generated.symbols,
+                                    &mut generated.relations,
+                                    &mut generated.aliases,
+                                );
+                            }
                         }
                     }
-                }
-                crate::analyzer::languages::language_support_for_hook(
-                    provider.structural_language(),
-                    "bind_generated_symbols",
-                )
-                .expect("every structural fact provider language has registered support")
-                .bind_generated_symbols(
-                    file,
-                    facts.source(),
-                    &mut generated.symbols,
-                );
-                Ok(generated)
+                    crate::analyzer::languages::language_support_for_hook(
+                        provider.structural_language(),
+                        "bind_generated_symbols",
+                    )
+                    .expect("every structural fact provider language has registered support")
+                    .bind_generated_symbols(
+                        file,
+                        facts.source(),
+                        &mut generated.symbols,
+                    );
+                    Ok(generated)
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Indexed Rayon collection preserves file order, so fact ordering is
@@ -3963,6 +4389,8 @@ pub(crate) fn emit_rule_match(
                         locator_path: None,
                         locator_symbol: None,
                         rust_generated_scope: None,
+                        promoted_from: None,
+                        members_state: brokk_bifrost_semantic::analyzer::semantic_model::ModelMembersState::Exact,
                         location,
                         provenance: model_provenance,
                     },
@@ -4035,6 +4463,8 @@ pub(crate) fn emit_rule_match(
                             locator_path: None,
                             locator_symbol: None,
                             rust_generated_scope: None,
+                            promoted_from: None,
+                            members_state: brokk_bifrost_semantic::analyzer::semantic_model::ModelMembersState::Exact,
                             location,
                             provenance: model_provenance,
                         }
@@ -4135,6 +4565,8 @@ pub(crate) fn type_symbol(
         locator_path: Some(locator_path(&record.locator).to_owned()),
         locator_symbol: locator_symbol(&record.locator).map(str::to_owned),
         rust_generated_scope: None,
+        promoted_from: None,
+        members_state: brokk_bifrost_semantic::analyzer::semantic_model::ModelMembersState::Exact,
         provenance: provenance(
             active,
             shard,
@@ -4214,6 +4646,8 @@ pub(crate) fn member_symbol(
         locator_path: Some(locator_path(&record.locator).to_owned()),
         locator_symbol: locator_symbol(&record.locator).map(str::to_owned),
         rust_generated_scope: None,
+        promoted_from: None,
+        members_state: brokk_bifrost_semantic::analyzer::semantic_model::ModelMembersState::Exact,
         provenance: provenance(
             active,
             shard,
@@ -4360,6 +4794,124 @@ pub fn activated_type_provenance<E>(
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
+    #[test]
+    fn model_declarations_keep_provider_versions_and_selections_separate() {
+        use super::{ModelOwnerAnswer, ModelProvider, ModelProviderSelection, ModelSymbolRef};
+        // Test-only composed pack fixture: both releases reuse declaration IDs.
+        let owner_a = class("example.Owner", "go");
+        let mut owner_b = owner_a.clone();
+        owner_b.provenance.pack_version = "2.0.0".into();
+        owner_b.provenance.pack_digest = "second-release".into();
+        let provider_a = ModelProvider::from(&owner_a.provenance);
+        let provider_b = ModelProvider::from(&owner_b.provenance);
+        let selection_a = ModelProviderSelection::new([provider_a.clone()]);
+        let selection_b = ModelProviderSelection::new([provider_b.clone()]);
+        let selection_both = ModelProviderSelection::new([provider_b.clone(), provider_a.clone()]);
+        let owner_ref_a = ModelSymbolRef {
+            symbol_id: owner_a.id.clone(),
+            provider: provider_a.clone(),
+        };
+        let owner_ref_b = ModelSymbolRef {
+            symbol_id: owner_b.id.clone(),
+            provider: provider_b.clone(),
+        };
+        let mut member_a = method(
+            &owner_a,
+            "same-method-id",
+            "First",
+            Some(signature(&[], false)),
+        );
+        member_a.provenance = owner_a.provenance.clone();
+        member_a.structured_signature.as_mut().unwrap().returns = Some(TypeRef::Tuple {
+            elements: vec![
+                TypeRef::Unknown,
+                TypeRef::Declared {
+                    id: owner_a.id.clone(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+            ],
+        });
+        let mut member_b = member_a.clone();
+        member_b.name = "Second".into();
+        member_b.provenance = owner_b.provenance.clone();
+        member_b.structured_signature.as_mut().unwrap().returns = Some(TypeRef::Tuple {
+            elements: Vec::new(),
+        });
+        let overlay = overlay(vec![owner_a, owner_b, member_a, member_b], Vec::new());
+        for (owner, selection, expected) in [
+            (&owner_ref_a, &selection_a, "First"),
+            (&owner_ref_b, &selection_b, "Second"),
+            (&owner_ref_a, &selection_both, "First"),
+            (&owner_ref_b, &selection_both, "Second"),
+        ] {
+            let Some(ModelOwnerAnswer::Declared(answer)) = overlay
+                .model_member_declarations(owner, selection, &crate::CancellationToken::new())
+                .unwrap()
+            else {
+                panic!("selected owner must be declared");
+            };
+            assert_eq!(answer.owner, *owner);
+            assert_eq!(answer.members.len(), 1);
+            assert_eq!(answer.members[0].declaration.name, expected);
+            assert_eq!(answer.members[0].member.provider, owner.provider);
+        }
+        // The same request under a different compilation cannot reuse a hit.
+        assert!(
+            overlay
+                .model_member_declarations(
+                    &owner_ref_a,
+                    &selection_b,
+                    &crate::CancellationToken::new()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            overlay
+                .model_member_declarations(
+                    &owner_ref_a,
+                    &selection_a,
+                    &crate::CancellationToken::new()
+                )
+                .unwrap(),
+            Some(ModelOwnerAnswer::Declared(_))
+        ));
+        assert_ne!(
+            overlay.model_declaration_request(&owner_ref_a, &selection_a),
+            overlay.model_declaration_request(&owner_ref_a, &selection_b)
+        );
+        let callable_a = ModelSymbolRef {
+            symbol_id: "same-method-id".into(),
+            provider: provider_a,
+        };
+        let callable_b = ModelSymbolRef {
+            symbol_id: "same-method-id".into(),
+            provider: provider_b,
+        };
+        let results = overlay
+            .model_callable_results(&callable_a, &selection_a, &crate::CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], None);
+        assert!(
+            matches!(&results[1], Some(TypeRef::Declared { id, .. }) if id == &owner_ref_a.symbol_id)
+        );
+        assert_eq!(
+            overlay
+                .model_callable_results(&callable_b, &selection_b, &crate::CancellationToken::new())
+                .unwrap(),
+            Some(Vec::new())
+        );
+        assert!(
+            overlay
+                .model_callable_results(&callable_a, &selection_b, &crate::CancellationToken::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[cfg(test)]
     use crate::analyzer::semantic_model::overlay::go_extra_support_0::*;
     #[cfg(test)]
@@ -6690,4 +7242,56 @@ fn overlay_declarations(
     });
 
     Ok((symbols, relations))
+}
+
+fn symbol_retained_bytes(symbol: &SemanticModelSymbol) -> usize {
+    std::mem::size_of::<SemanticModelSymbol>()
+        .saturating_add(symbol.id.capacity())
+        .saturating_add(
+            symbol
+                .promoted_from
+                .as_ref()
+                .map_or(0, |mark| mark.declaring_member_id.capacity()),
+        )
+        .saturating_add(symbol.owner_id.as_ref().map_or(0, String::capacity))
+        .saturating_add(symbol.name.capacity())
+        .saturating_add(symbol.qualified_name.capacity())
+        .saturating_add(semantic_symbol_source_key(symbol).0.len())
+        .saturating_add(symbol.rust_generated_scope.as_ref().map_or(0, |scope| {
+            std::mem::size_of_val(scope.as_ref())
+                .saturating_add(scope.module.capacity())
+                .saturating_add(scope.file.capacity())
+        }))
+        .saturating_add(symbol.language.capacity())
+        .saturating_add(symbol.signature.as_ref().map_or(0, String::capacity))
+        .saturating_add(symbol.aliases.iter().map(String::capacity).sum::<usize>())
+        .saturating_add(match &symbol.location {
+            SemanticModelLocation::Authored(anchor) => anchor
+                .path
+                .capacity()
+                .saturating_add(anchor.symbol.capacity()),
+            SemanticModelLocation::Model(location) => location.uri.capacity(),
+        })
+        .saturating_add(symbol.provenance.retained_string_bytes())
+        .saturating_add(
+            symbol
+                .semantic_contributors
+                .iter()
+                .map(|contributor| {
+                    std::mem::size_of::<SemanticModelProvenance>()
+                        + contributor.retained_string_bytes()
+                })
+                .sum::<usize>(),
+        )
+}
+
+fn relation_retained_bytes(relation: &SemanticModelRelation) -> usize {
+    std::mem::size_of::<SemanticModelRelation>()
+        .saturating_add(relation.id.capacity())
+        .saturating_add(relation.kind.capacity())
+        .saturating_add(relation.from.capacity())
+        .saturating_add(relation.to.capacity())
+        .saturating_add(semantic_relation_source_key(relation).0.len())
+        .saturating_add(semantic_relation_source_key(relation).3.len())
+        .saturating_add(relation.provenance.retained_string_bytes())
 }

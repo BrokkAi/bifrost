@@ -47,7 +47,7 @@ pub(crate) fn weight_cpp_file_facts(
 
 pub(crate) fn weight_statement_fact_rows(
     _key: &ProjectFile,
-    value: &Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>,
+    value: &Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>,
 ) -> u32 {
     value.estimated_retained_bytes().clamp(1, u32::MAX as usize) as u32
 }

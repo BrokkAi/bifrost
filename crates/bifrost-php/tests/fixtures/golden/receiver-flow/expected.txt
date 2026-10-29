@@ -1,0 +1,10 @@
+Child.consume -> Base.run
+Child.same -> Base.run
+Child.uppercase -> Base.run
+Collections.braced -> A.touch
+Collections.unbraced -> A.touch
+Constructed.consume -> A.touch
+alias_union -> A.run
+guarded -> A.touch
+loop_guard -> A.touch
+reassigned -> B.touch

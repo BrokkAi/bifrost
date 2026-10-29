@@ -486,3 +486,44 @@ pub fn terminal_callee_leaf(
         };
     }
 }
+
+/// Read direct grammar modifier tokens and modifier wrappers, excluding names,
+/// annotations and declaration bodies. Adapters select the declaration owner.
+pub fn declaration_modifier_words(node: Node<'_>, source: &str) -> Vec<String> {
+    use crate::analyzer::tree_walk::children_iter;
+    let container = children_iter(node).find(|child| child.kind() == "modifiers");
+    let mut words = Vec::new();
+    for child in children_iter(container.unwrap_or(node)) {
+        let word = match child.kind() {
+            "modifier" | "accessibility_modifier" => source.get(child.byte_range()),
+            "static get" => Some("static"),
+            "static" | "abstract" | "final" | "volatile" | "synchronized" | "transient"
+            | "native" | "strictfp" | "default" | "sealed" | "non-sealed" | "public"
+            | "protected" | "private" | "readonly" | "override" | "virtual" | "async"
+            | "partial" | "unsafe" | "extern" | "new" | "required" => Some(child.kind()),
+            _ => None,
+        };
+        if let Some(word) = word {
+            words.push(word.to_owned());
+        }
+    }
+    if node.kind() == "abstract_method_signature" && !words.iter().any(|word| word == "abstract") {
+        words.push("abstract".to_owned());
+    }
+    words
+}
+
+/// Attach all children of each selected grammar field in source order.
+pub fn attach_field_roles<'tree>(
+    sink: &mut RoleSink<'_>,
+    node: Node<'tree>,
+    fields: &[(Role, &str)],
+    derive_name: impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) {
+    for &(role, field) in fields {
+        let mut cursor = node.walk();
+        for child in node.children_by_field_name(field, &mut cursor) {
+            attach_role_with_derived_name(sink, role, expression_target_node(child), &derive_name);
+        }
+    }
+}

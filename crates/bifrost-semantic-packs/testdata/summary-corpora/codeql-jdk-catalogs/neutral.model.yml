@@ -1,0 +1,8 @@
+# Test-only synthetic neutral rows; see LICENSE and excerpt.model.yml.
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: neutralModel
+    data:
+      - ["java.lang", "String", "concat", "(String)", "sink", "manual"]
+      - ["java.lang", "String", "getBytes", "()", "source", "manual"]

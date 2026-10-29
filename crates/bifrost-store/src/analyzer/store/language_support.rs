@@ -28,7 +28,216 @@ pub trait NamespaceDefinitionClassifier {
 
 pub type NamespaceDefinitionProvider = fn() -> Box<dyn NamespaceDefinitionClassifier>;
 
+/// Generic operation accessors; language hooks interpret the selected values.
+pub trait SelectedTypeHeadSource {
+    fn named_reason(
+        &self,
+        semantic: crate::analyzer::resolution::SemanticId,
+    ) -> Option<(&'static str, std::sync::Arc<str>)>;
+    fn cached_external_type_import_paths(
+        &self,
+        semantic: crate::analyzer::resolution::SemanticId,
+    ) -> Vec<Vec<String>>;
+    fn external_type_import_path(
+        &mut self,
+        semantic: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<Option<Vec<String>>>;
+}
+
+/// Substitution provenance for one operation-local receiver step. Slots keep
+/// nested generic arguments in the existing typed evaluator rather than copying
+/// their type trees into the controller.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SelectedReceiverInstantiation {
+    pub application_slot: crate::analyzer::resolution::SemanticId,
+    pub substitutions: Vec<(
+        crate::analyzer::resolution::SemanticId,
+        crate::analyzer::resolution::SemanticId,
+    )>,
+}
+
+/// The language interprets one receiver; the shared controller owns ordering.
+pub struct SelectedReceiverStepRequest<'a> {
+    pub reference: crate::analyzer::resolution::SemanticId,
+    pub call: Option<crate::analyzer::resolution::SemanticId>,
+    pub qualifier_slot: crate::analyzer::resolution::SemanticId,
+    pub value: crate::analyzer::resolution::ResolutionSlotValue,
+    pub instantiation: &'a SelectedReceiverInstantiation,
+}
+
+/// A language may evaluate a Target frontier. The controller admits exactly
+/// one value; several values stop that cursor with incomplete evidence.
+pub struct SelectedReceiverStep {
+    pub values: Vec<crate::analyzer::resolution::ResolutionSlotValue>,
+    pub instantiation: SelectedReceiverInstantiation,
+    pub completion: crate::analyzer::resolution::ResolutionCompletion,
+    /// A language-specific conservative stop, named by the shared controller.
+    pub stop_reason: Option<&'static str>,
+}
+
+pub enum SelectedReceiverStepRead {
+    ReadyNone,
+    ReadyStep(SelectedReceiverStep),
+    Pending,
+    Cancelled,
+}
+
+/// Bounded operation-owned reads and demands, never an evaluator or SQL handle.
+pub trait SelectedReceiverStepSource {
+    fn rust_impl_targets(
+        &mut self,
+        owner: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<Vec<crate::analyzer::resolution::SemanticId>>;
+    fn impl_owner(
+        &mut self,
+        target: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<
+        Option<crate::analyzer::resolution::LoweredDeferredMemberOwner>,
+    >;
+    fn applicability(
+        &mut self,
+        owner: crate::analyzer::resolution::LoweredDeferredMemberOwner,
+        request: &SelectedReceiverStepRequest<'_>,
+    ) -> crate::analyzer::store::Result<Option<crate::analyzer::resolution::ResolutionCompletion>>;
+    fn activation(
+        &mut self,
+        reference: crate::analyzer::resolution::SemanticId,
+        target: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<crate::analyzer::resolution::DeclarationAccessDecision>;
+    fn target(
+        &mut self,
+        target: crate::analyzer::resolution::SemanticId,
+        request: &SelectedReceiverStepRequest<'_>,
+    ) -> crate::analyzer::store::Result<SelectedReceiverSlotRead>;
+    fn has_type_arguments(
+        &mut self,
+        application: crate::analyzer::resolution::SemanticId,
+        nominal: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<Option<bool>>;
+    fn type_head_source(&mut self) -> &mut dyn SelectedTypeHeadSource;
+    fn poll_cancelled(&mut self) -> bool;
+    /// Missing state demands the slot and returns Pending on this round.
+    fn slot(
+        &mut self,
+        slot: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<SelectedReceiverSlotRead>;
+    fn gap_origins(
+        &mut self,
+        reasons: &[crate::analyzer::resolution::SemanticId],
+    ) -> crate::analyzer::store::Result<
+        Option<Vec<crate::analyzer::resolution::SelectedGapReasonProvenance>>,
+    >;
+    fn declared_types(
+        &mut self,
+        definition: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<
+        Option<Vec<crate::analyzer::resolution::LoweredDeclarationTypeProperty>>,
+    >;
+}
+
+pub enum SelectedReceiverSlotRead {
+    Ready(crate::analyzer::resolution::TypedFrontierState),
+    Pending,
+    Cancelled,
+}
+
+/// One selected route and its language-owned wrapper classification.
+pub struct SelectedWrapperPath {
+    pub path: Vec<String>,
+    pub projection: Option<WrapperPayloadProjection>,
+}
+
+/// Evidence for one boundary; canonical proven routes also discharge prefixes.
+pub struct SelectedWrapperBoundary {
+    pub semantic: crate::analyzer::resolution::SemanticId,
+    pub canonical_proven_paths: Vec<Vec<String>>,
+    pub paths: Vec<SelectedWrapperPath>,
+}
+
+/// The payload position and extra unproven indirection of a proven wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WrapperPayloadProjection {
+    pub ordinal: u32,
+    pub indirection_delta: i8,
+}
+
 pub trait StoreLanguageSupport: Send + Sync {
+    /// File publications retain their canonical OwnModule identity for hydration.
+    fn publishes_own_module_file_anchors(&self) -> bool {
+        false
+    }
+
+    /// Whether the shared native type projector should publish direct
+    /// constructor shapes for this language's selected type components.
+    fn supports_direct_type_shapes(&self) -> bool {
+        false
+    }
+
+    /// Selected module authority for an OwnModule definition anchor. A language
+    /// without this policy cannot have persisted module-anchored declarations.
+    fn selected_definition_module_anchor(
+        &self,
+        _selection: &super::resolution_selection::SelectedResolutionMountInventory<'_>,
+        _mount: crate::analyzer::resolution::SelectedResolutionMountOrdinal,
+        _project: &dyn crate::analyzer::project::Project,
+        _file: &ProjectFile,
+    ) -> super::Result<Option<crate::analyzer::fq_name::FqName>> {
+        Err(super::StoreError::corrupt(
+            "source declaration has an unsupported package anchor",
+        ))
+    }
+
+    /// Project only a nameless module declaration from its selected source file.
+    /// Other nameless declaration kinds must not enter this hook.
+    fn selected_module_definition(
+        &self,
+        _project: &dyn crate::analyzer::project::Project,
+        _file: &ProjectFile,
+        _module_anchor: Option<&crate::analyzer::fq_name::FqName>,
+    ) -> super::Result<Option<crate::analyzer::CodeUnit>> {
+        Err(super::StoreError::corrupt(
+            "unsupported nameless declaration kind: module",
+        ))
+    }
+
+    /// Default languages have no derived receiver and perform no source reads.
+    fn selected_receiver_step(
+        &self,
+        _request: SelectedReceiverStepRequest<'_>,
+        _source: &mut dyn SelectedReceiverStepSource,
+    ) -> crate::analyzer::store::Result<SelectedReceiverStepRead> {
+        Ok(SelectedReceiverStepRead::ReadyNone)
+    }
+
+    /// Callable result formals can be substituted inside constructed types.
+    /// The default keeps languages without the required formal facts out.
+    fn callable_results_instantiate_nested_generic_projections(&self) -> bool {
+        false
+    }
+
+    /// Default languages never classify a head as a wrapper. The shared
+    /// evaluator excludes ConditionalPayload from both ordinary rule paths
+    /// and owns candidate union, demand, traversal and completion.
+    fn selected_wrapper_payload(
+        &self,
+        boundaries: &[crate::analyzer::resolution::SemanticId],
+        _source: &mut dyn SelectedTypeHeadSource,
+    ) -> crate::analyzer::store::Result<Option<Vec<SelectedWrapperBoundary>>> {
+        Ok(Some(
+            boundaries
+                .iter()
+                .map(|&semantic| SelectedWrapperBoundary {
+                    semantic,
+                    canonical_proven_paths: Vec::new(),
+                    paths: vec![SelectedWrapperPath {
+                        path: Vec::new(),
+                        projection: None,
+                    }],
+                })
+                .collect(),
+        ))
+    }
+
     /// Go member lookup keeps these namespaces without blocking lexical
     /// names in other namespaces. Other member kinds retain lexical authority.
     fn go_member_definition_namespaces(

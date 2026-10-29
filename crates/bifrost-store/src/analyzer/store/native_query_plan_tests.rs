@@ -234,6 +234,10 @@ pub mod rust_wave2_root_test_support {
                 go_unit_summaries::GO_LIVE_SUMMARY_SQL,
             ),
             (
+                "file_context::PeerSelection::RELATION",
+                crate::analyzer::store::resolution_operation::go_same_package::PACKAGE_PEER_MOUNTS,
+            ),
+            (
                 "rust_unit_summaries::DEPENDENCY_REEXPORT_WITNESS_SQL",
                 rust_unit_summaries::DEPENDENCY_REEXPORT_WITNESS_SQL,
             ),
@@ -244,14 +248,6 @@ pub mod rust_wave2_root_test_support {
             (
                 "rust_crate_context::DEPENDENCY",
                 rust_crate_context::DEPENDENCY.as_str(),
-            ),
-            (
-                "rust_crate_context::CLOSURE_SCOPE_MOUNTS_PIN",
-                rust_crate_context::sql_pins()
-                    .into_iter()
-                    .find(|(name, _, _)| *name == "rust_scope_closure_mounts")
-                    .unwrap()
-                    .1,
             ),
             (
                 "rust_crate_rows::REFERENCE_NAMES_WORKSPACE_CRATE",
@@ -268,6 +264,10 @@ pub mod rust_wave2_root_test_support {
             (
                 "rust_reverse_rows::DEFINITION_SITE_SQL",
                 rust_reverse_rows::DEFINITION_SITE_SQL,
+            ),
+            (
+                "go_package_context::OUTSIDE_SELECTED_BUILD_FILES_SQL",
+                crate::analyzer::store::go_package_context::OUTSIDE_SELECTED_BUILD_FILES_SQL,
             ),
             (
                 "resolution_lexical::SELECTED_MOUNT_OF_BLOB_SQL",

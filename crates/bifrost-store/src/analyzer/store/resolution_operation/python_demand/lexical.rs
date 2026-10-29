@@ -23,6 +23,7 @@ use crate::analyzer::store::python_binding_rows::PythonBindingRows;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     PythonNativeGuardFact, PythonNativeGuardKind, PythonNativePredicateKind,
     ResolutionBindingEventKind, ResolutionBindingObservationFact, ResolutionBindingObservationKind,
+    ResolutionScopeId, find_scope_in_chain,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -50,6 +51,8 @@ pub(crate) struct PythonBindingProofs {
     /// Complete cell inventory plus current mutation checks prove this name
     /// absent in every observation. This does not claim invocation/completion.
     pub(crate) absent_scopes: Vec<u32>,
+    /// Module dictionaries whose existing attribute-space proof remains open.
+    pub(crate) open_scopes: Vec<u32>,
     /// One event per import write, not per alternative target. The route
     /// adapter retains all target/provider alternatives under that event.
     /// Occurrences must be disjoint from retained binding-event ordinals.
@@ -79,6 +82,8 @@ impl From<ResolutionBindingObservationFact> for Observation {
 pub(crate) struct PythonLexical {
     pub(crate) selection: TemporalSelection,
     pub(crate) start_scope: u32,
+    pub(crate) deferred_module_scope: Option<u32>,
+    pub(crate) builtin_fallback: bool,
     observation: Observation,
     name: String,
     profile: PythonBindingProfile,
@@ -95,13 +100,36 @@ pub(crate) fn unconditional_import(rows: &PythonBindingRows, site: u32) -> bool 
     guard_chain(rows, site).is_empty()
 }
 
-/// One effective import writer fixes this name, without completing other cells.
-fn fixed_import_identity(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriterIdentity {
+    Fixed,
+    BuiltinFallback,
+    Open,
+}
+
+/// One unguarded writer in the owning scope keeps the existing identity rule.
+/// A sole writer in another execution scope also fixes identity: a read before
+/// that global/nonlocal write raises NameError, not an alternative binding.
+/// A module cell with a builtin fallback is the exception: the builtin remains
+/// an alternative until this observation's own execution has committed the write.
+/// Like a conditional module writer of a builtin name, retain the authored
+/// writer target with open completeness, without publishing a builtin target.
+fn fixed_writer_identity(
     rows: &PythonBindingRows,
     scope: u32,
     name: &str,
     proofs: &PythonBindingProofs,
-) -> bool {
+    observation: &Observation,
+) -> WriterIdentity {
+    use crate::analyzer::resolution::ResolutionCompletion;
+    if proofs.open_scopes.contains(&scope)
+        || proofs
+            .source_completion
+            .as_ref()
+            .is_some_and(|completion| completion != &ResolutionCompletion::Complete)
+    {
+        return WriterIdentity::Open;
+    }
     let slot = rows
         .slots
         .iter()
@@ -116,21 +144,80 @@ fn fixed_import_identity(
         .collect::<Vec<_>>();
     let stars = rows.import_positions.iter().filter(|(site, owner, _)| *owner == scope && rows.imports.iter().any(|import| import.import_site.get() == *site && import.form == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::Star) && !proofs.absent_star_members.iter().any(|(absent,n)| absent == site && n == name)).map(|(site,_,_)| *site).collect::<Vec<_>>();
     if writers.len() + stars.len() != 1 {
-        return false;
+        return WriterIdentity::Open;
     }
     if let Some(event) = writers.first() {
-        return event.kind == ResolutionBindingEventKind::Import
-            && rows.imports.iter().any(|import| {
+        if event.kind == ResolutionBindingEventKind::Delete
+            || !guard_chain(rows, event.target).is_empty()
+        {
+            return WriterIdentity::Open;
+        }
+        if event.execution_scope != scope
+            && rows
+                .scopes
+                .iter()
+                .any(|row| row.scope == scope && row.parent.is_none())
+            && brokk_bifrost_python::intrinsics::builtin(name).is_some()
+            && (event.execution_scope != observation.execution_scope.get()
+                || event.commit_byte > observation.point_byte)
+        {
+            return WriterIdentity::BuiltinFallback;
+        }
+        let fixed = event.kind != ResolutionBindingEventKind::Import
+            || rows.imports.iter().any(|import| {
                 import.binding_event == Some(event.event)
                     && proofs
                         .conditional_imports
                         .contains(&import.import_site.get())
             });
+        return if fixed {
+            WriterIdentity::Fixed
+        } else {
+            WriterIdentity::Open
+        };
     }
-    proofs
-        .route_bindings
+    let fixed = proofs.route_bindings.iter().any(|route| {
+        stars.contains(&route.import_site)
+            && route.name == name
+            && route.certain
+            && route.completion == ResolutionCompletion::Complete
+            && guard_chain(rows, route.import_site).is_empty()
+    });
+    if fixed {
+        WriterIdentity::Fixed
+    } else {
+        WriterIdentity::Open
+    }
+}
+
+/// A unique unguarded parameter fixes its local cell at every observation.
+/// Inventory scans can reuse the ordinary single-writer proof without spending
+/// scope traversal budget on each read of the same receiver parameter.
+pub(crate) fn fixed_parameter<'a>(
+    rows: &'a PythonBindingRows,
+    reference: u32,
+    name: &str,
+    proofs: &PythonBindingProofs,
+) -> Option<&'a crate::analyzer::store::python_binding_rows::BindingEvent> {
+    let observation = Observation::from(
+        *rows
+            .observations
+            .iter()
+            .find(|row| row.reference.get() == reference)?,
+    );
+    let scope = observation.execution_scope.get();
+    if directive(rows, scope, name).is_some()
+        || fixed_writer_identity(rows, scope, name, proofs, &observation) != WriterIdentity::Fixed
+    {
+        return None;
+    }
+    let slot = rows
+        .slots
         .iter()
-        .any(|route| stars.contains(&route.import_site) && route.name == name && route.certain)
+        .find(|slot| slot.scope == scope && slot.name == name)?;
+    rows.events.iter().find(|event| {
+        event.slot == slot.slot && event.kind == ResolutionBindingEventKind::Parameter
+    })
 }
 
 pub(crate) fn lexical_selection(
@@ -146,17 +233,9 @@ pub(crate) fn lexical_selection(
         .find(|observation| observation.reference.get() == reference_site)?;
     let (region, _) = guard_region(rows, reference_site, profile, &proofs);
     let mut selection = TemporalSelection::new(region?);
-    selection.open = guard_chain(rows, reference_site).iter().any(|guard| {
-        matches!(
-            guard.kind,
-            PythonNativeGuardKind::LoopBody
-                | PythonNativeGuardKind::LoopElse
-                | PythonNativeGuardKind::UnknownControl
-        )
-    });
-    // A write from an earlier iteration is now an alternative of its own (#6405),
-    // so the openness above no longer hides a missing write. It still keeps a
-    // read in a loop from falling back to a builtin as a complete answer.
+    selection.open = guard_chain(rows, reference_site)
+        .iter()
+        .any(|guard| guard.kind == PythonNativeGuardKind::UnknownControl);
     if let Some(completion) = &proofs.source_completion {
         selection.completion = selection.completion.combine(completion);
     }
@@ -177,6 +256,8 @@ pub(crate) fn lexical_selection(
     Some(PythonLexical {
         selection,
         start_scope,
+        deferred_module_scope: None,
+        builtin_fallback: false,
         observation: observation.into(),
         name: name.to_owned(),
         profile,
@@ -232,37 +313,26 @@ fn completed_scope_selection(
     proofs: PythonBindingProofs,
 ) -> PythonLexical {
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId;
+    let observation = Observation {
+        reference: None,
+        execution_scope: ResolutionScopeId::new(scope),
+        point_byte: usize::MAX,
+        kind: ResolutionBindingObservationKind::Immediate,
+    };
     let mut selection = TemporalSelection::new(Region::default());
     // A unique writer fixes identity without proving import activation or the
     // completion of every cell in the enclosing module.
-    let single_writer = rows
-        .slots
-        .iter()
-        .find(|slot| slot.scope == scope && slot.name == name)
-        .is_some_and(|slot| {
-            rows.events
-                .iter()
-                .filter(|event| {
-                    event.slot == slot.slot && event.kind != ResolutionBindingEventKind::Annotation
-                })
-                .count()
-                == 1
-        });
     selection.open = !proofs.completed_scopes.contains(&scope)
-        && !single_writer
-        && !fixed_import_identity(rows, scope, name, &proofs);
+        && fixed_writer_identity(rows, scope, name, &proofs, &observation) != WriterIdentity::Fixed;
     if let Some(completion) = &proofs.source_completion {
         selection.completion = selection.completion.combine(completion);
     }
     PythonLexical {
         selection,
         start_scope: scope,
-        observation: Observation {
-            reference: None,
-            execution_scope: ResolutionScopeId::new(scope),
-            point_byte: usize::MAX,
-            kind: ResolutionBindingObservationKind::Immediate,
-        },
+        deferred_module_scope: None,
+        builtin_fallback: false,
+        observation,
         name: name.to_owned(),
         profile,
         proofs,
@@ -351,14 +421,91 @@ pub(crate) fn lexical_tier(
     }
     let slot = lexical_slot(state, rows, scope);
     let whole_scope = slot.is_some_and(|slot| slot.whole_scope);
-    let fixed_import = fixed_import_identity(rows, scope, &state.name, &state.proofs);
-    let deferred_external = state.observation.kind == ResolutionBindingObservationKind::Deferred
-        && state.observation.execution_scope.get() != scope;
+    let writer_identity =
+        fixed_writer_identity(rows, scope, &state.name, &state.proofs, &state.observation);
+    let fixed_writer = writer_identity == WriterIdentity::Fixed;
+    state.builtin_fallback |= writer_identity == WriterIdentity::BuiltinFallback;
+    // Executable scopes, including comprehensions, remain deferral boundaries:
+    // no retained scope-kind fact distinguishes them here. Such a fact would
+    // restore chronology for module-level comprehension bodies (#7375).
+    // A read before its sole writer raises NameError, not an alternative binding.
+    // Keep the retained chronology for cells without that fixed-writer proof.
+    // If namespace proof revokes the exemption, keep the boundary open on retry.
+    // Class bodies execute in the enclosing invocation, so skip them when
+    // finding the execution boundary of a class nested in a function.
+    let deferred_external = (state.observation.kind == ResolutionBindingObservationKind::Deferred
+        || fixed_writer
+        || state.proofs.open_scopes.contains(&scope))
+        && find_scope_in_chain(
+            Some(state.observation.execution_scope),
+            |id| {
+                rows.scopes
+                    .iter()
+                    .find(|row| row.scope == id.get())
+                    .expect("retained execution scope")
+                    .parent
+                    .map(ResolutionScopeId::new)
+            },
+            |id| {
+                id.get() == scope
+                    || !rows
+                        .scopes
+                        .iter()
+                        .find(|row| row.scope == id.get())
+                        .expect("retained execution scope")
+                        .class_body
+            },
+        )
+        .expect("execution scope chain reaches the module")
+        .get()
+            != scope;
+    if deferred_external
+        && rows
+            .scopes
+            .iter()
+            .any(|row| row.scope == scope && row.parent.is_none())
+    {
+        state.deferred_module_scope = Some(scope);
+    }
     let observed_guards = state
         .observation
         .reference
         .map(|site| guard_chain(rows, site))
         .unwrap_or_default();
+    // A loop changes a cell's identity only through writes in that loop.
+    // A nested def that writes through global is already an other-scope writer
+    // in the cell inventory; it needs no special case here.
+    let loop_carried = |site, point| {
+        rows.loop_regions.iter().any(|(execution, region)| {
+            *execution == state.observation.execution_scope.get()
+                && region.contains(&state.observation.point_byte)
+                && region.contains(&point)
+        }) || guard_chain(rows, site).iter().any(|writer| {
+            writer.kind == PythonNativeGuardKind::LoopBody
+                && observed_guards.iter().any(|observed| {
+                    matches!(
+                        observed.kind,
+                        PythonNativeGuardKind::LoopBody | PythonNativeGuardKind::LoopElse
+                    ) && observed.site == writer.site
+                        && observed.execution_scope == writer.execution_scope
+                })
+        })
+    };
+    state.selection.open |= rows.events.iter().any(|event| {
+        slot.is_some_and(|slot| slot.slot == event.slot)
+            && event.kind != ResolutionBindingEventKind::Annotation
+            && loop_carried(event.target, event.entry_byte)
+    }) || rows.imports.iter().any(|import| {
+        import.form == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::Star
+            && !state
+                .proofs
+                .absent_star_members
+                .iter()
+                .any(|(site, name)| *site == import.import_site.get() && *name == state.name)
+            && rows.import_positions.iter().any(|(site, owner, point)| {
+                *site == import.import_site.get() && *owner == scope && loop_carried(*site, *point)
+            })
+    });
     let mut events = rows
         .events
         .iter()
@@ -378,12 +525,16 @@ pub(crate) fn lexical_tier(
             let committed = event.commit_byte <= state.observation.point_byte || iteration_active;
             let previous_iteration = !committed && shared_loop.is_some();
             let same_execution = event.execution_scope == state.observation.execution_scope.get();
-            let known_outer_execution = event.execution_scope == scope
-                && (!deferred_external
-                    || state.proofs.completed_scopes.contains(&scope)
-                    || fixed_import);
+            // A unique cell writer fixes identity across execution scopes,
+            // including writes redirected through global or nonlocal.
+            let known_outer_execution = fixed_writer
+                || (event.execution_scope == scope
+                    && (!deferred_external || state.proofs.completed_scopes.contains(&scope)));
             let effect = if region.is_none()
-                || ((same_execution || !deferred_external) && !committed && !previous_iteration)
+                || ((same_execution
+                    || (!deferred_external && !(fixed_writer && event.execution_scope != scope)))
+                    && !committed
+                    && !previous_iteration)
             {
                 Effect::NoWrite
             } else {
@@ -497,7 +648,7 @@ pub(crate) fn lexical_tier(
                 ordering: if previous_iteration
                     || (deferred_external
                         && !state.proofs.completed_scopes.contains(&scope)
-                        && !fixed_import)
+                        && !fixed_writer)
                 {
                     EventOrdering::Unordered
                 } else {
@@ -510,15 +661,18 @@ pub(crate) fn lexical_tier(
                     && !previous_iteration
                     && (!deferred_external
                         || state.proofs.completed_scopes.contains(&scope)
-                        || fixed_import),
+                        || fixed_writer),
             };
             events.extend(with_earlier_iteration(write, earlier));
         }
     }
     // Global/cell writes from other invocation scopes remain alternatives. The
     // absence of an invocation-order proof is explicit, not source-byte ordering.
+    // An intervening scope with no such cell is a lexical continuation, not
+    // an unordered writer. Unknown wildcard routes were kept open above.
     if deferred_external
-        && !fixed_import
+        && (slot.is_some() || !events.is_empty() || state.proofs.open_scopes.contains(&scope))
+        && !fixed_writer
         && !state.proofs.completed_scopes.contains(&scope)
         && !state.proofs.absent_scopes.contains(&scope)
     {

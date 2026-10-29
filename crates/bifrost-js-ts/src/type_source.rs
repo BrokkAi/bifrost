@@ -174,3 +174,55 @@ impl JsTsTypeCollector {
         self.by_node[&root.id()]
     }
 }
+
+#[cfg(test)]
+mod quicksilver_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn type_fact_grammar_boundary() {
+        for (source, expected) in [
+            (
+                "type Value = typeof ns.Widget;",
+                vec![
+                    ("Widget", "named"),
+                    ("ns.Widget", "named"),
+                    ("typeof ns.Widget", "query"),
+                ],
+            ),
+            (
+                "type Value = Left | Right;",
+                vec![("Left | Right", "union")],
+            ),
+            (
+                "type Value = Left & Right;",
+                vec![("Left & Right", "intersection")],
+            ),
+        ] {
+            let tree = crate::test_support::parse_typescript(source);
+            assert!(!tree.root_node().has_error());
+            let alias = tree.root_node().named_child(0).unwrap();
+            let value = alias.child_by_field_name("value").unwrap();
+            let mut occurrences = PrimarySourceFactCollector::new(source);
+            let mut facts = Vec::new();
+            JsTsTypeCollector::default().capture(value, source, &mut occurrences, &mut facts);
+            let actual: Vec<_> = facts
+                .iter()
+                .map(|fact| {
+                    let range = occurrences.occurrence(fact.occurrence).range;
+                    let tag = match &fact.shape {
+                        JsTsTypeShape::Named(_) => "named",
+                        JsTsTypeShape::Query(_) => "query",
+                        JsTsTypeShape::Union(_) => "union",
+                        JsTsTypeShape::Intersection(_) => "intersection",
+                        _ => "other",
+                    };
+                    (&source[range.start_byte..range.end_byte], tag)
+                })
+                .collect();
+            for row in expected {
+                assert!(actual.contains(&row), "{source}: {actual:?}");
+            }
+        }
+    }
+}

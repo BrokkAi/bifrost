@@ -516,7 +516,7 @@ fn pack_source(
         version: FIXTURE_PACKAGE_VERSION.to_owned(),
         producer: Producer {
             name: "bifrost-summary-foundry".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: super::FOUNDRY_PRODUCER_VERSION.to_owned(),
         },
         language: language.language().to_owned(),
         ecosystem: language.ecosystem().to_owned(),

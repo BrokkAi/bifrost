@@ -31,8 +31,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::analyzer::csharp::CSharpAnalyzer;
 use brokk_bifrost_analysis::analyzer::store::csharp_compilation::{
-    self, CSharpCompilationFact, CSharpCompilationFacts, CSharpCompilationGap, CSharpCompileItem,
-    CSharpCompileItemKind, CSharpConfigurationInput, SelectedCSharpCompilations,
+    self, CSharpCompilationFact, CSharpCompilationFacts, CSharpCompilationGap,
+    CSharpCompilationMetadata, CSharpCompileItem, CSharpCompileItemKind, CSharpConfigurationInput,
+    CSharpGlobalUsing, SelectedCSharpCompilations,
 };
 use brokk_bifrost_analysis::analyzer::store::workspace_inputs::NativeConfigurationOverlayAuthority;
 use brokk_bifrost_core::analyzer::model::Language;
@@ -151,6 +152,11 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             references: Vec::new(),
             references_complete: true,
             transitive_flow: false,
+            metadata: CSharpCompilationMetadata {
+                global_usings_complete: true,
+                internals_visible_to_complete: true,
+                ..Default::default()
+            },
         });
         return facts;
     }
@@ -184,6 +190,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 references: Vec::new(),
                 references_complete: false,
                 transitive_flow: false,
+                metadata: CSharpCompilationMetadata::default(),
             });
             continue;
         };
@@ -201,7 +208,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         let implicit_imports = |names: &[&'static str]| {
             names
                 .iter()
-                .filter(|_| project.sdk_project)
+                .filter(|_| !project.sdks.is_empty())
                 .filter_map(|name| nearest_input(&parsed, directory, name))
                 .collect::<Vec<_>>()
         };
@@ -214,6 +221,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         for path in implicit_imports(&["Directory.Build.targets"]) {
             expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
         }
+        let metadata_chain_complete = chain_gaps.is_empty();
         for (path, evidence) in chain_gaps {
             facts.membership_complete = false;
             gap(&mut facts, "unresolved_import", path, &evidence);
@@ -411,9 +419,409 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             references,
             references_complete,
             transitive_flow,
+            metadata: derive_metadata(
+                project_path,
+                project,
+                &chain,
+                body_start,
+                metadata_chain_complete,
+                &mut facts.gaps,
+            ),
         });
     }
     facts
+}
+
+/// Ordered configuration items; these are MSBuild values, not C# source syntax.
+#[derive(Debug)]
+struct MetadataOperation {
+    item: String,
+    target: String,
+    remove: bool,
+    alias: Option<String>,
+    is_static: bool,
+}
+
+fn metadata_operation(
+    item: &str,
+    attributes: &[(String, String)],
+    conditioned: bool,
+) -> Option<MetadataOperation> {
+    if conditioned
+        || attributes.iter().any(|(name, value)| {
+            !static_property_value(value)
+                || !["Include", "Remove", "Static", "Alias", "Label"]
+                    .iter()
+                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        })
+    {
+        return None;
+    }
+    let include = attribute(attributes, "Include");
+    let remove = attribute(attributes, "Remove");
+    if include.is_some() == remove.is_some() {
+        return None;
+    }
+    let target = include.or(remove)?.trim();
+    let alias = attribute(attributes, "Alias").map(str::to_owned);
+    let is_static = match attribute(attributes, "Static") {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("true") => true,
+        Some(value) if value.eq_ignore_ascii_case("false") => false,
+        _ => return None,
+    };
+    let identifier = |name: &str| {
+        let mut chars = name.strip_prefix('@').unwrap_or(name).chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+            && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+    };
+    if target.is_empty()
+        || target.contains(['*', '?', ';'])
+        || (item == "using" && !target.split('.').all(identifier))
+        || alias.as_deref().is_some_and(|alias| !identifier(alias))
+        || (is_static && alias.is_some())
+        || (item == "internalsvisibleto" && (alias.is_some() || is_static))
+    {
+        return None;
+    }
+    Some(MetadataOperation {
+        item: item.to_owned(),
+        target: target.to_owned(),
+        remove: remove.is_some(),
+        alias,
+        is_static,
+    })
+}
+
+fn derive_metadata(
+    project_path: &str,
+    project: &ParsedProject,
+    chain: &[(&str, &ParsedProject)],
+    body_start: usize,
+    chain_complete: bool,
+    gaps: &mut Vec<CSharpCompilationGap>,
+) -> CSharpCompilationMetadata {
+    use brokk_bifrost_csharp::compilation::{ImplicitUsingCondition, SDK_IMPLICIT_USINGS};
+    let mut result = CSharpCompilationMetadata {
+        assembly_name: Path::new(project_path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned),
+        global_usings_complete: chain_complete,
+        internals_visible_to_complete: chain_complete,
+        ..Default::default()
+    };
+    let mut properties = HashMap::default();
+    for (_, fragment) in chain {
+        properties.extend(
+            fragment
+                .properties
+                .metadata
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_deref())),
+        );
+    }
+    let frameworks = properties
+        .get("targetframework")
+        .filter(|value| value.is_none_or(|value| !value.is_empty()))
+        .or_else(|| properties.get("targetframeworks"));
+    let mut gap = |code: &str, path: &str, evidence: String| {
+        gaps.push(CSharpCompilationGap {
+            code: code.to_owned(),
+            path: path.to_owned(),
+            evidence,
+        })
+    };
+    let envelope_complete =
+        chain_complete && chain.iter().all(|(_, fragment)| fragment.metadata_complete);
+    if !envelope_complete {
+        result.global_usings_complete = false;
+        result.internals_visible_to_complete = false;
+        result.assembly_name = None;
+        gap(
+            "unresolved_compilation_metadata",
+            project_path,
+            "an unsupported configuration shape can change compilation metadata".to_owned(),
+        );
+    }
+    if let Some(value) = properties.get("assemblyname") {
+        match value {
+            Some(value) if !value.is_empty() => result.assembly_name = Some((*value).to_owned()),
+            Some(_) => {} // The SDK's empty-name default is MSBuildProjectName.
+            None => {
+                result.assembly_name = None;
+                gap(
+                    "unresolved_assembly_name",
+                    project_path,
+                    "AssemblyName has a dynamic value or condition".to_owned(),
+                );
+            }
+        }
+    }
+    if !envelope_complete {
+        result.assembly_name = None;
+    }
+    let mut sdk_rows = Vec::new();
+    for sdk in &project.sdks {
+        match SDK_IMPLICIT_USINGS
+            .iter()
+            .find(|(name, _)| sdk.eq_ignore_ascii_case(name))
+        {
+            Some(row) => sdk_rows.push(row),
+            None => {
+                result.global_usings_complete = false;
+                result.internals_visible_to_complete = false;
+                result.assembly_name = None;
+                gap(
+                    "unknown_implicit_usings_sdk",
+                    project_path,
+                    format!("unmodeled SDK {sdk}"),
+                );
+            }
+        }
+    }
+    let implicit = match properties.get("implicitusings") {
+        None => false,
+        Some(Some(value)) => {
+            value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("enable")
+        }
+        Some(None) => {
+            result.global_usings_complete = false;
+            gap(
+                "unresolved_global_usings",
+                project_path,
+                "ImplicitUsings has a dynamic value or condition".to_owned(),
+            );
+            false
+        }
+    };
+    // .NET 10 Razor targets can add a using before GenerateGlobalUsings,
+    // based on .razor inputs this configuration-only evaluator does not see.
+    let uses_razor = project.sdks.iter().any(|sdk| {
+        [
+            "Microsoft.NET.Sdk.Razor",
+            "Microsoft.NET.Sdk.Web",
+            "Microsoft.NET.Sdk.BlazorWebAssembly",
+        ]
+        .iter()
+        .any(|name| sdk.eq_ignore_ascii_case(name))
+    });
+    let targeting_net10 = frameworks.and_then(|value| *value).is_some_and(|value| {
+        value.split(';').any(|tfm| {
+            let tfm = tfm.trim().to_ascii_lowercase();
+            tfm.strip_prefix("net")
+                .filter(|version| version.contains('.'))
+                .and_then(|version| version.split('.').next())
+                .and_then(|version| version.parse::<u32>().ok())
+                .is_some_and(|version| version >= 10)
+        })
+    });
+    let embedded_using_disabled = match properties.get("includeembeddedvalidationglobalusing") {
+        Some(Some(value)) if !value.is_empty() => !value.eq_ignore_ascii_case("true"),
+        Some(None) => false,
+        _ => properties
+            .get("generateembeddedvalidatabletypeattribute")
+            .is_some_and(|value| {
+                value.is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("true"))
+            }),
+    };
+    if uses_razor && targeting_net10 && !embedded_using_disabled {
+        result.global_usings_complete = false;
+        gap("unresolved_global_usings", project_path,
+            ".NET 10 Razor _AddEmbeddedValidationAttribute can add Microsoft.Extensions.Validation.Embedded based on unevaluated Razor inputs".to_owned());
+    }
+    let mut implicit_usings = Vec::<CSharpGlobalUsing>::new();
+    let make_implicit = |target: &str| {
+        CSharpGlobalUsing(
+            "namespace".to_owned(),
+            target.split('.').map(str::to_owned).collect(),
+            None,
+            "implicit".to_owned(),
+        )
+    };
+    if implicit && !sdk_rows.is_empty() {
+        // Inferred TargetFrameworkIdentifier participates in the SDK item
+        // condition after MSBuild's property pass. Mixed inner builds do not
+        // establish one compilation-wide list.
+        let framework = match properties.get("targetframeworkidentifier") {
+            Some(Some(value)) if !value.is_empty() => {
+                Some(value.eq_ignore_ascii_case(".NETFramework"))
+            }
+            Some(None) => None,
+            _ => {
+                match frameworks {
+                    Some(None) => None,
+                    Some(Some(value)) if !value.is_empty() => {
+                        let mut kinds = value.split(';').map(|tfm| {
+                            let tfm = tfm.trim().to_ascii_lowercase();
+                            if tfm.starts_with("netstandard")
+                                || tfm.starts_with("netcoreapp")
+                                || tfm.starts_with("net") && tfm.contains('.')
+                            {
+                                Some(false)
+                            } else if tfm.strip_prefix("net").is_some_and(|version| {
+                                !version.is_empty() && version.bytes().all(|ch| ch.is_ascii_digit())
+                            }) {
+                                Some(true)
+                            } else {
+                                None
+                            }
+                        });
+                        let first = kinds.next().flatten();
+                        if kinds.all(|kind| kind == first) {
+                            first
+                        } else {
+                            None
+                        }
+                    }
+                    // An unset framework identifier compares unequal to .NETFramework.
+                    _ => Some(false),
+                }
+            }
+        };
+        for (target, condition) in SDK_IMPLICIT_USINGS[0].1 {
+            if *condition == ImplicitUsingCondition::NotNetFramework {
+                if framework.is_none() {
+                    result.global_usings_complete = false;
+                    gap("unresolved_global_usings", project_path, "TargetFrameworkIdentifier does not establish the System.Net.Http condition".to_owned());
+                }
+                if framework != Some(false) {
+                    continue;
+                }
+            }
+            let property = match condition {
+                ImplicitUsingCondition::WindowsForms => Some("usewindowsforms"),
+                ImplicitUsingCondition::WpfRemove => Some("usewpf"),
+                _ => None,
+            };
+            if let Some(property) = property {
+                match properties.get(property) {
+                    Some(None) => {
+                        result.global_usings_complete = false;
+                        gap(
+                            "unresolved_global_usings",
+                            project_path,
+                            format!("{property} has a dynamic value or condition"),
+                        );
+                        continue;
+                    }
+                    Some(Some(value)) if value.eq_ignore_ascii_case("true") => {}
+                    _ => continue,
+                }
+            }
+            if *condition == ImplicitUsingCondition::WpfRemove {
+                implicit_usings.retain(|using| using.1.join(".") != *target);
+            } else {
+                implicit_usings.push(make_implicit(target));
+            }
+        }
+        for row in sdk_rows {
+            if row.0.eq_ignore_ascii_case("Microsoft.NET.Sdk") {
+                continue;
+            }
+            match properties.get("language") {
+                Some(None) => {
+                    result.global_usings_complete = false;
+                    gap(
+                        "unresolved_global_usings",
+                        project_path,
+                        "Language has a dynamic value or condition".to_owned(),
+                    );
+                    continue;
+                }
+                Some(Some(language)) if !language.eq_ignore_ascii_case("C#") => continue,
+                _ => {}
+            }
+            let mut extra = row.1;
+            if row.0.eq_ignore_ascii_case("Microsoft.NET.Sdk.Web") {
+                // Web/Sdk/Sdk.props delegates browser targets to BlazorWasmSdk.
+                let browser = match frameworks {
+                    Some(None) => None,
+                    Some(Some(value)) => {
+                        let mut platforms = value.split(';').map(|tfm| {
+                            tfm.split('-').nth(1).is_some_and(|platform| {
+                                platform
+                                    .chars()
+                                    .take_while(|ch| !ch.is_ascii_digit())
+                                    .collect::<String>()
+                                    .eq_ignore_ascii_case("browser")
+                            })
+                        });
+                        let first = platforms.next().unwrap_or(false);
+                        platforms.all(|platform| platform == first).then_some(first)
+                    }
+                    None => Some(false),
+                };
+                match browser {
+                    Some(true) => {
+                        extra = SDK_IMPLICIT_USINGS
+                            .iter()
+                            .find(|(sdk, _)| *sdk == "Microsoft.NET.Sdk.BlazorWebAssembly")
+                            .expect("Blazor SDK table row")
+                            .1
+                    }
+                    Some(false) => {}
+                    None => {
+                        result.global_usings_complete = false;
+                        gap(
+                            "unresolved_global_usings",
+                            project_path,
+                            "TargetFramework does not establish the Web SDK browser condition"
+                                .to_owned(),
+                        );
+                        continue;
+                    }
+                }
+            }
+            implicit_usings.extend(extra.iter().map(|(target, _)| make_implicit(target)));
+        }
+    }
+    for (index, (path, fragment)) in chain.iter().enumerate() {
+        if index == body_start {
+            result.global_usings.append(&mut implicit_usings);
+        }
+        for (item, evidence) in &fragment.metadata_gaps {
+            if item == "internalsvisibleto" {
+                result.internals_visible_to_complete = false;
+                gap("unresolved_internals_visible_to", path, evidence.clone());
+            } else {
+                result.global_usings_complete = false;
+                gap("unresolved_global_usings", path, evidence.clone());
+            }
+        }
+        for operation in &fragment.metadata_operations {
+            if operation.item == "internalsvisibleto" {
+                if operation.remove {
+                    result
+                        .internals_visible_to
+                        .retain(|name| !name.eq_ignore_ascii_case(&operation.target));
+                } else {
+                    result.internals_visible_to.push(operation.target.clone());
+                }
+            } else if operation.remove {
+                result
+                    .global_usings
+                    .retain(|using| !using.1.join(".").eq_ignore_ascii_case(&operation.target));
+            } else {
+                result.global_usings.push(CSharpGlobalUsing(
+                    if operation.alias.is_some() {
+                        "alias"
+                    } else if operation.is_static {
+                        "static"
+                    } else {
+                        "namespace"
+                    }
+                    .to_owned(),
+                    operation.target.split('.').map(str::to_owned).collect(),
+                    operation.alias.clone(),
+                    "item".to_owned(),
+                ));
+            }
+        }
+    }
+    result
 }
 
 /// The configuration input named `name` in `directory` or its nearest
@@ -674,6 +1082,10 @@ impl CSharpAnalyzer {
 
 #[derive(Debug)]
 struct ParsedProject {
+    sdks: Vec<String>,
+    metadata_operations: Vec<MetadataOperation>,
+    metadata_complete: bool,
+    metadata_gaps: Vec<(String, String)>,
     /// A .NET SDK project, which compiles C# with default Compile items.
     sdk_project: bool,
     /// A traversal or no-targets SDK project: no compilation at all.
@@ -708,6 +1120,8 @@ struct DefaultItemProperties {
     enable_default_compile_items: Option<String>,
     base_output_path: Option<String>,
     base_intermediate_output_path: Option<String>,
+    // Some(None) is an assignment whose value or condition is not statically known.
+    metadata: HashMap<String, Option<String>>,
 }
 
 impl DefaultItemProperties {
@@ -719,7 +1133,9 @@ impl DefaultItemProperties {
             PropertyKind::BaseIntermediateOutputPath => {
                 Some(&mut self.base_intermediate_output_path)
             }
-            PropertyKind::Unsupported | PropertyKind::ReferenceFlow => None,
+            PropertyKind::Unsupported | PropertyKind::ReferenceFlow | PropertyKind::Metadata(_) => {
+                None
+            }
         }
     }
 
@@ -735,6 +1151,7 @@ impl DefaultItemProperties {
 
     /// Apply a later file's assignments.
     fn overlay(&mut self, later: &Self) {
+        self.metadata.extend(later.metadata.clone());
         for (value, later) in [
             (&mut self.enable_default_items, &later.enable_default_items),
             (
@@ -826,6 +1243,7 @@ struct PropertyCapture {
 
 #[derive(Debug, Clone, Copy)]
 enum PropertyKind {
+    Metadata(&'static str),
     EnableDefaultItems,
     EnableDefaultCompileItems,
     BaseOutputPath,
@@ -844,6 +1262,9 @@ fn parse_project(source: &str) -> ParsedProject {
     let mut reader = Reader::from_str(source);
     let mut stack = Vec::<ElementFrame>::new();
     let mut operations = Vec::new();
+    let mut metadata_operations = Vec::new();
+    let mut metadata_gaps = Vec::new();
+    let mut metadata_imports_complete = true;
     let mut references = Vec::new();
     let mut references_complete = true;
     let mut references_mutated = false;
@@ -978,6 +1399,11 @@ fn parse_project(source: &str) -> ParsedProject {
             complete = false;
             break;
         };
+        if let Some(capture) = capture.as_mut() {
+            // XML children in a scalar property are not a statically known value.
+            capture.conditioned = true;
+            complete = false;
+        }
         let parent = stack.last().map(|frame| frame.name.as_str());
         let conditioned = stack.last().is_some_and(|frame| frame.conditioned)
             || is_conditioning_element(&name, &attributes);
@@ -994,6 +1420,19 @@ fn parse_project(source: &str) -> ParsedProject {
             .iter()
             .any(|frame| frame.name == "itemdefinitiongroup");
         let mut reference = None;
+        if !is_property && matches!(name.as_str(), "using" | "internalsvisibleto") {
+            match metadata_operation(
+                &name,
+                &attributes,
+                conditioned || in_item_definitions || !is_empty,
+            ) {
+                Some(operation) => metadata_operations.push(operation),
+                None => metadata_gaps.push((
+                    name.clone(),
+                    format!("unsupported {name} item: {attributes:?}"),
+                )),
+            }
+        }
         match name.as_str() {
             "project" | "sdk" => {
                 let attribute_name = if name == "project" { "Sdk" } else { "Name" };
@@ -1023,6 +1462,10 @@ fn parse_project(source: &str) -> ParsedProject {
                     || references_mutated
                     || !properties.is_empty()
                     || !transitive_flow;
+                let metadata_seen = !metadata_operations.is_empty()
+                    || !metadata_gaps.is_empty()
+                    || !properties.metadata.is_empty();
+                let imports_before = imports.len();
                 collect_import(
                     &attributes,
                     conditioned,
@@ -1030,6 +1473,11 @@ fn parse_project(source: &str) -> ParsedProject {
                     &mut imports,
                     &mut complete,
                 );
+                if metadata_seen && imports.len() != imports_before {
+                    metadata_imports_complete = false;
+                    metadata_gaps.push(("configuration".to_owned(),
+                        "an Import follows compilation metadata whose evaluation order is unmodeled".to_owned()));
+                }
             }
             "compile" if !is_property => {
                 collect_compile_operation(&attributes, conditioned, &mut operations, &mut complete);
@@ -1093,6 +1541,7 @@ fn parse_project(source: &str) -> ParsedProject {
     if pending_reference.is_some() {
         references_complete = false;
     }
+    let metadata_complete = complete && metadata_imports_complete;
     // Only Microsoft.NET.Sdk's default Compile item is modeled. A traversal
     // or no-targets project compiles nothing; any other SDK (including the
     // Microsoft.NET.Sdk.* family, whose props add their own excludes) is
@@ -1113,6 +1562,10 @@ fn parse_project(source: &str) -> ParsedProject {
         complete = false;
     }
     ParsedProject {
+        sdks,
+        metadata_operations,
+        metadata_complete,
+        metadata_gaps,
         sdk_project,
         compiles_nothing,
         operations,
@@ -1188,6 +1641,20 @@ fn is_conditioning_element(name: &str, attributes: &[(String, String)]) -> bool 
 /// compare case-insensitively) bears on Compile membership.
 fn property_kind(name: &str) -> Option<PropertyKind> {
     Some(match name {
+        "includeembeddedvalidationglobalusing" => {
+            PropertyKind::Metadata("includeembeddedvalidationglobalusing")
+        }
+        "generateembeddedvalidatabletypeattribute" => {
+            PropertyKind::Metadata("generateembeddedvalidatabletypeattribute")
+        }
+        "language" => PropertyKind::Metadata("language"),
+        "implicitusings" => PropertyKind::Metadata("implicitusings"),
+        "assemblyname" => PropertyKind::Metadata("assemblyname"),
+        "targetframeworkidentifier" => PropertyKind::Metadata("targetframeworkidentifier"),
+        "usewpf" => PropertyKind::Metadata("usewpf"),
+        "usewindowsforms" => PropertyKind::Metadata("usewindowsforms"),
+        "targetframework" => PropertyKind::Metadata("targetframework"),
+        "targetframeworks" => PropertyKind::Metadata("targetframeworks"),
         "enabledefaultitems" => PropertyKind::EnableDefaultItems,
         "enabledefaultcompileitems" => PropertyKind::EnableDefaultCompileItems,
         "baseoutputpath" => PropertyKind::BaseOutputPath,
@@ -1240,6 +1707,14 @@ fn assign_property(
     transitive_flow: &mut bool,
     complete: &mut bool,
 ) {
+    if let PropertyKind::Metadata(name) = kind {
+        let value = text.trim();
+        properties.metadata.insert(
+            name.to_owned(),
+            (!conditioned && static_property_value(value)).then(|| value.to_owned()),
+        );
+        return;
+    }
     if matches!(kind, PropertyKind::ReferenceFlow) {
         // Any setting, conditioned or not, may withhold the references'
         // references from this project.
@@ -1520,6 +1995,98 @@ mod tests {
         analyzer
             .global_using_dependencies(files, std::slice::from_ref(global))
             .expect("membership reads succeed")
+    }
+
+    /// Evaluated configuration crosses the producer/SQLite/selected-reader boundary.
+    #[test]
+    fn compilation_metadata_round_trips_configuration_golden() {
+        use std::fmt::Write;
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compilation-metadata");
+        let projects = [
+            "App",
+            "Default",
+            "Framework",
+            "Mixed",
+            "Web",
+            "Browser",
+            "MixedWeb",
+            "Worker",
+            "Razor",
+            "Razor10",
+            "Razor10Disabled",
+            "Blazor",
+            "Desktop",
+            "Unknown",
+            "Conditional",
+        ];
+        let mut owned = vec![
+            (
+                "Directory.Build.props".to_owned(),
+                fs::read_to_string(fixture_root.join("Directory.Build.props")).unwrap(),
+            ),
+            (
+                "Directory.Build.targets".to_owned(),
+                fs::read_to_string(fixture_root.join("Directory.Build.targets")).unwrap(),
+            ),
+        ];
+        for name in projects {
+            let path = format!("{name}/{name}.csproj");
+            owned.push((
+                path.clone(),
+                fs::read_to_string(fixture_root.join(path)).unwrap(),
+            ));
+            owned.push((format!("{name}/Source.cs"), "class Source {}".to_owned()));
+        }
+        let files = owned
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>();
+        let (_root, _project, _files, analyzer) = analyzed(&files);
+        let selection = analyzer
+            .selected_compilations()
+            .unwrap()
+            .expect("published compilation set");
+        let mut rendered = String::new();
+        for name in projects {
+            let metadata = selection
+                .metadata(Some(&format!("{name}/{name}.csproj")))
+                .unwrap()
+                .expect("selected compilation");
+            writeln!(rendered, "{name}: assembly={:?}", metadata.assembly_name).unwrap();
+            writeln!(
+                rendered,
+                "  usings complete={}",
+                metadata.global_usings_complete
+            )
+            .unwrap();
+            for using in metadata.global_usings {
+                writeln!(
+                    rendered,
+                    "    {} {} alias={:?} origin={}",
+                    using.0,
+                    using.1.join("."),
+                    using.2,
+                    using.3
+                )
+                .unwrap();
+            }
+            writeln!(
+                rendered,
+                "  friends complete={}: {:?}",
+                metadata.internals_visible_to_complete, metadata.internals_visible_to
+            )
+            .unwrap();
+        }
+        writeln!(rendered, "gaps:").unwrap();
+        for gap in selection.gaps().unwrap() {
+            writeln!(rendered, "  {} {} {}", gap.code, gap.path, gap.evidence).unwrap();
+        }
+        let expected = fixture_root.join("expected.txt");
+        if std::env::var_os("BIFROST_BLESS").is_some() {
+            fs::write(&expected, &rendered).unwrap();
+        }
+        assert_eq!(fs::read_to_string(expected).unwrap(), rendered);
     }
 
     #[test]
@@ -1943,7 +2510,7 @@ mod tests {
             ),
             (
                 "tests/Directory.Build.props",
-                "<Project><Import Project=\"$(MSBuildThisFileDirectory)..\\Directory.Build.props\" /><ItemGroup><ProjectReference Include=\"../../Lib/Lib.csproj\" /></ItemGroup></Project>",
+                "<Project><PropertyGroup><AssemblyName>Tests</AssemblyName></PropertyGroup><Import Project=\"$(MSBuildThisFileDirectory)..\\Directory.Build.props\" /><ItemGroup><ProjectReference Include=\"../../Lib/Lib.csproj\" /></ItemGroup></Project>",
             ),
             ("Lib/Lib.csproj", sdk),
             ("Lib/Lib.cs", "class Lib {}"),

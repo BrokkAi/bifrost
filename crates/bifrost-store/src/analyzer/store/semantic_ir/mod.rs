@@ -48,7 +48,9 @@ use codes::RowCode;
 /// Version 8: unseeded forward single-predecessor points consume entry state;
 /// merges, retreating-edge targets and seeded points retain it. Partial-flow
 /// propagation has a facts-visited traversal cap.
-const SEMANTIC_IR_ROWS_VERSION: u32 = 8;
+/// Version 9: call rows retain deferred member selection, its receiver place
+/// and static pointer depth, instead of requiring a pre-resolved member kind.
+const SEMANTIC_IR_ROWS_VERSION: u32 = 9;
 
 /// What a parse-time lowerer produced for one blob.
 #[derive(Debug)]
@@ -591,7 +593,8 @@ tables! {
         "procedure", "call_site", "point", "invocation_mode", "execution_timing", "callee",
         "receiver", "result", "thrown", "normal_results", "target_resolution", "targets",
         "target_evidence", "normal_continuation", "normal_target", "exceptional_continuation",
-        "exceptional_target", "source", "evidence",
+        "exceptional_target", "source", "evidence", "member", "receiver_place_kind",
+        "receiver_place_locator", "receiver_place_location", "receiver_pointer_depth",
     ] jsonb ["normal_results"] order "procedure, call_site";
     CallArguments => "semantic_ir_call_arguments" [
         "procedure", "call_site", "ordinal", "value", "expansion", "domain", "domain_text",

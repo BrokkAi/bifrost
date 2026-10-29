@@ -454,6 +454,8 @@ impl JdkSourceArchivePackProducer {
                 id: format!("declarations.jdk.{module}"),
                 activation: request.activation.clone(),
                 payload: AuthoredPayload::DeclarationFacts {
+                    assembly_identity: None,
+                    type_forwards: Vec::new(),
                     types,
                     members,
                     relations: Vec::new(),

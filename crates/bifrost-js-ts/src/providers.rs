@@ -300,3 +300,381 @@ pub fn compute_direct_ancestors(host: &dyn JsTsSource, code_unit: &CodeUnit) -> 
         &host.raw_supertypes_of(code_unit),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::Range;
+    use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+    use brokk_bifrost_core::analyzer::project::{Project, TestProject};
+    use std::collections::BTreeSet;
+
+    // A query-only host: declarations and imports are real parser products;
+    // the fake replaces only the persistent store's lookup surface.
+    struct ImportHost {
+        project: Arc<TestProject>,
+        aliases: Arc<AliasResolver>,
+        language: Language,
+        source_facts_available: bool,
+        files: HashMap<ProjectFile, ParsedFile>,
+    }
+
+    impl CodeUnitIndex for ImportHost {
+        fn project(&self) -> &dyn Project {
+            self.project.as_ref()
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([self.language])
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(self.files.values().flat_map(|p| p.ranges.keys().cloned()))
+        }
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+            self.files
+                .get(file)
+                .map(|parsed| parsed.ranges.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+            self.files[file].top_level_declarations.clone()
+        }
+        fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+            self.files[unit.source()]
+                .ranges
+                .get(unit)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _file: &ProjectFile,
+            _start_line: usize,
+            _end_line: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_skeleton(&self, _unit: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _unit: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_source(&self, _unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+    impl ImportAnalysisProvider for ImportHost {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+            unimplemented!()
+        }
+        fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
+            unimplemented!()
+        }
+    }
+    impl TypeHierarchyProvider for ImportHost {
+        fn get_direct_ancestors(&self, _unit: &CodeUnit) -> Vec<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_direct_descendants(&self, _unit: &CodeUnit) -> HashSet<CodeUnit> {
+            unimplemented!()
+        }
+    }
+    impl JsTsSource for ImportHost {
+        fn source_file_inventory(
+            &self,
+        ) -> brokk_bifrost_core::analyzer::query_batch::QueryBatch<ProjectFile> {
+            let files = self.all_files();
+            let count = files.len();
+            brokk_bifrost_core::analyzer::query_batch::QueryBatch::complete(files, count)
+        }
+        fn source_facts(&self, file: &ProjectFile) -> Option<Arc<JsTsFileSourceFacts>> {
+            if !self.source_facts_available {
+                return None;
+            }
+            let parsed = self.files.get(file)?;
+            let publication = parsed.source_facts.as_ref()?;
+            let mut declaration_units = HashMap::<_, Vec<_>>::default();
+            for (declaration, unit) in &parsed.source_declaration_units {
+                declaration_units
+                    .entry(*declaration)
+                    .or_default()
+                    .push(unit.clone());
+            }
+            Some(Arc::new(JsTsFileSourceFacts {
+                source: publication.occurrences.clone(),
+                imports: publication.imports.clone(),
+                facts: publication.js_ts.clone()?,
+                declaration_units,
+            }))
+        }
+        fn alias_resolver(&self) -> &Arc<AliasResolver> {
+            &self.aliases
+        }
+        fn language(&self) -> Language {
+            self.language
+        }
+        fn all_files(&self) -> Vec<ProjectFile> {
+            self.files.keys().cloned().collect()
+        }
+        fn bulk_import_infos(
+            &self,
+            _files: &[ProjectFile],
+        ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+            unimplemented!()
+        }
+        fn raw_supertypes_of(&self, _unit: &CodeUnit) -> Vec<String> {
+            unimplemented!()
+        }
+        fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
+            unimplemented!()
+        }
+        fn is_type_alias(&self, _unit: &CodeUnit) -> bool {
+            false
+        }
+        fn raw_signatures(&self, _unit: &CodeUnit) -> Vec<String> {
+            unimplemented!()
+        }
+        fn with_usage_definitions(
+            &self,
+            _token: QueryToken<'_>,
+            _read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+        ) {
+            unimplemented!()
+        }
+        fn usage_index(
+            &self,
+            _cancellation: Option<&CancellationToken>,
+        ) -> Option<Arc<JsTsUsageIndex>> {
+            crate::graph::resolver::build_jsts_usage_index(
+                self,
+                &self.aliases,
+                self.language,
+                false,
+            )
+            .map(Arc::new)
+        }
+    }
+
+    impl BoundedDefinitionLookup for ImportHost {
+        fn fqn(&self, name: &str) -> Vec<CodeUnit> {
+            self.all_declarations()
+                .filter(|u| u.fq_name() == name)
+                .collect()
+        }
+        fn fqn_in_language(&self, name: &str, _language: Language) -> Vec<CodeUnit> {
+            self.fqn(name)
+        }
+        fn file_identifier(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+            self.all_declarations()
+                .filter(|u| u.source() == file && u.identifier() == name)
+                .collect()
+        }
+        fn package_exists(&self, _package: &str) -> bool {
+            false
+        }
+        fn package_exists_in_language(&self, _package: &str, _language: Language) -> bool {
+            false
+        }
+        fn fqn_prefix_exists(&self, _prefix: &str) -> bool {
+            false
+        }
+        fn fqn_direct_children(&self, _fqn: &str) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn imported_declaration_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let project = Arc::new(TestProject::new(root.path(), Language::TypeScript));
+        let aliases = Arc::new(AliasResolver::new(project.clone() as Arc<dyn Project>));
+        let fixtures = [
+            (
+                "spaces.ts",
+                "export interface Item { field:string } export const Item={field:1};",
+            ),
+            (
+                "namespace.ts",
+                "export function first(){} export class Second {}",
+            ),
+            ("default.ts", "export default function Original(){}"),
+            (
+                "decoy.ts",
+                "export function unrelated(){} export class Other {}",
+            ),
+            (
+                "caller.ts",
+                "import * as ns from './namespace'; import Alias from './default'; import Missing from './decoy';",
+            ),
+        ];
+        let mut files = HashMap::default();
+        for (name, source) in fixtures {
+            let file = ProjectFile::new(root.path(), name);
+            std::fs::write(file.abs_path(), source).unwrap();
+            let tree = crate::test_support::parse_typescript(source);
+            files.insert(
+                file.clone(),
+                crate::typescript::parse_typescript_file(&file, source, &tree),
+            );
+        }
+        let host = ImportHost {
+            project,
+            aliases,
+            language: Language::TypeScript,
+            source_facts_available: true,
+            files,
+        };
+        let file = ProjectFile::new(root.path(), "caller.ts");
+        let imports = host.files[&file].imports.clone();
+        assert_eq!(imports.len(), 3);
+        let projected = resolve_imported_code_units(&host, &file, imports);
+        let mut names: Vec<_> = projected.iter().map(|u| u.identifier()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Original", "Second", "first"]);
+        struct NoExternalSurface;
+        impl crate::diagnostics::JsTsExternalSurfaceEvidence for NoExternalSurface {
+            fn classify_exported_name(
+                &self,
+                _module: &str,
+                _name: &str,
+            ) -> crate::diagnostics::JsTsExportedNameEvidence {
+                unimplemented!()
+            }
+            fn classify_module(&self, _module: &str) -> crate::diagnostics::JsTsModuleEvidence {
+                unimplemented!()
+            }
+        }
+        let diagnostics = crate::diagnostics::collect_js_ts_semantic_diagnostics(
+            &host,
+            &NoExternalSurface,
+            &file,
+            "process; console; qs7Missing;",
+            Language::TypeScript,
+            "qs7",
+            &host.aliases,
+        );
+        let messages: Vec<_> = diagnostics
+            .diagnostics()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(messages, ["Unrecognized JS/TS symbol `qs7Missing`"]);
+        // tsc's type/value namespaces select independently declared owners.
+        let chain_source = "ns.Item";
+        let tree = crate::test_support::parse_typescript(chain_source);
+        let member = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        let crate::access_chain::JsTsImportedMemberChainResolution::Exact(chain) =
+            crate::access_chain::resolve_import_member_chain(member, chain_source)
+        else {
+            panic!("static chain")
+        };
+        let binding = brokk_bifrost_core::analyzer::usages::model::ImportBinding {
+            module_specifier: "./spaces".into(),
+            namespace_imported_module: None,
+            kind: brokk_bifrost_core::analyzer::usages::model::ImportKind::Namespace,
+            imported_name: None,
+        };
+        for value_position in [true, false] {
+            let outcome = crate::imports::resolve_js_ts_imported_member_chain(
+                &host,
+                &host,
+                Language::TypeScript,
+                &file,
+                &binding,
+                &chain,
+                Some(&host.aliases),
+                value_position,
+                Default::default(),
+            );
+            let brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome::Precise(owners)=outcome else {panic!("{outcome:?}")};
+            assert_eq!(owners.len(), 1, "{owners:?}");
+            assert_eq!(
+                crate::type_text::jsts_unit_is_type_only(&host, &owners[0].declaration),
+                !value_position,
+                "{owners:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_default_class_resolves_in_both_spaces_for_javascript_and_typescript() {
+        for (language, extension) in [(Language::JavaScript, "js"), (Language::TypeScript, "ts")] {
+            let root = tempfile::tempdir().unwrap();
+            let project = Arc::new(TestProject::new(root.path(), language));
+            let aliases = Arc::new(AliasResolver::new(project.clone() as Arc<dyn Project>));
+            let mut files = HashMap::default();
+            for (name, source) in [
+                (format!("anonymous.{extension}"), "export default class {}"),
+                (format!("caller.{extension}"), ""),
+            ] {
+                let file = ProjectFile::new(root.path(), name);
+                std::fs::write(file.abs_path(), source).unwrap();
+                let tree = match language {
+                    Language::JavaScript => crate::test_support::parse_javascript(source),
+                    Language::TypeScript => crate::test_support::parse_typescript(source),
+                    _ => unreachable!(),
+                };
+                let parsed = match language {
+                    Language::JavaScript => {
+                        crate::javascript::parse_javascript_file(&file, source, &tree)
+                    }
+                    Language::TypeScript => {
+                        crate::typescript::parse_typescript_file(&file, source, &tree)
+                    }
+                    _ => unreachable!(),
+                };
+                files.insert(file, parsed);
+            }
+            let host = ImportHost {
+                project,
+                aliases: aliases.clone(),
+                language,
+                // Keep parser-produced declarations while exercising the
+                // resolver's structured fallback for an unavailable export index.
+                source_facts_available: false,
+                files,
+            };
+            let caller = ProjectFile::new(root.path(), format!("caller.{extension}"));
+            let module_file = ProjectFile::new(root.path(), format!("anonymous.{extension}"));
+            assert!(
+                host.declarations(&module_file)
+                    .iter()
+                    .any(|unit| unit.identifier() == "default"),
+                "{language:?}: {:?}",
+                host.declarations(&module_file)
+            );
+            for value_position in [true, false] {
+                let candidates = crate::imports::resolve_js_ts_module_binding_candidates(
+                    &host,
+                    &host,
+                    language,
+                    &caller,
+                    "./anonymous",
+                    "default",
+                    Some(&aliases),
+                    value_position,
+                );
+                assert_eq!(
+                    candidates.len(),
+                    1,
+                    "{language:?}, value_position={value_position}: {candidates:?}"
+                );
+                assert_eq!(candidates[0].identifier(), "default");
+            }
+        }
+    }
+}

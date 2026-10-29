@@ -276,19 +276,10 @@ impl ProductionTypestateSummaryRepository {
         self.state().results.len()
     }
 
-    pub fn retained_result_bytes(&self) -> usize {
-        self.state().retained_result_bytes
-    }
-
     /// Retained semantic procedure summaries, the identities shared by every
     /// surface that analyzes this workspace.
     pub fn retained_semantic_count(&self) -> usize {
         self.semantic_summaries.len()
-    }
-
-    /// Retained protocol summaries.
-    pub fn retained_protocol_count(&self) -> usize {
-        self.state().protocol.len()
     }
 
     /// Announce to `observer` what this repository holds for every summary in
@@ -324,10 +315,6 @@ impl ProductionTypestateSummaryRepository {
             .publish_components(&summaries.summaries, &summaries.components)
             .inspect_err(|_| self.record_rejection())
             .map_err(Into::into)
-    }
-
-    pub fn semantic_summaries(&self) -> Arc<ProductionSemanticSummaryRepository> {
-        Arc::clone(&self.semantic_summaries)
     }
 
     pub fn record_rejection(&self) {
@@ -633,10 +620,6 @@ impl ProductionTypestateSolveResult {
 
     pub const fn lifecycle(&self) -> ProductionSummaryLifecycleCounters {
         self.lifecycle
-    }
-
-    pub fn into_result(self) -> TypestateSummaryResult {
-        Arc::unwrap_or_clone(self.result)
     }
 }
 
@@ -1007,10 +990,6 @@ pub struct ProductionSemanticSummarySet {
 impl ProductionSemanticSummarySet {
     pub fn summaries(&self) -> &[SemanticProcedureSummary] {
         &self.summaries
-    }
-
-    pub fn components(&self) -> &[std::ops::Range<usize>] {
-        &self.components
     }
 
     pub fn len(&self) -> usize {

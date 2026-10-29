@@ -1314,6 +1314,7 @@ fn append_lifecycle_source(
                 kind: edge.kind,
                 carrier: carrier.clone(),
                 sources: source_specs.intern_list(vec![id]),
+                labels: None,
             });
         }
     }

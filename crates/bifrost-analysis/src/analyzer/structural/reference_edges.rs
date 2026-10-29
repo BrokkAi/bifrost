@@ -87,7 +87,7 @@ use crate::text_utils::compute_line_starts;
 
 use rayon::prelude::*;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The file a scan unit reads: a bare file scans whole, a file with demanded
 /// lines scans only those lines' reference rows. Declared for
@@ -406,6 +406,7 @@ pub struct ReferenceSiteClassifier<'analyzer> {
     nearest_declarations: Box<[Option<NearestDeclaration>]>,
     nearest_assignments: Box<[Option<u32>]>,
     site_identities: SiteIdentityIndex,
+    import_bindings: OnceLock<Option<HashSet<u32>>>,
 }
 
 /// Source-derived state shared by selected reference file wrappers.
@@ -565,7 +566,34 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             nearest_declarations: nearest_declarations.into_boxed_slice(),
             nearest_assignments: nearest_assignments.into_boxed_slice(),
             site_identities,
+            import_bindings: OnceLock::new(),
         })
+    }
+
+    /// Native demand inputs may also read an import's local binding. Its
+    /// structured occurrence is still an import, not another runtime use.
+    pub(crate) fn is_import_binding_reference(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> bool {
+        let Some(&node) = self.site_identities.by_range.get(&(start_byte, end_byte)) else {
+            return false;
+        };
+        if !self
+            .facts
+            .occurrence_roles(node)
+            .iter()
+            .copied()
+            .any(is_import_binding_role)
+        {
+            return false;
+        }
+        self.import_bindings
+            .get_or_init(|| import_binding_nodes_for_file(self.analyzer, file))
+            .as_ref()
+            .is_some_and(|bindings| bindings.contains(&node))
     }
 
     /// Classify one exact source range against its resolved declaration.
@@ -1013,10 +1041,11 @@ impl<'a> ReferenceEngine<'a> {
         };
         let warm_prefix = units.len().min(rayon::current_num_threads().max(2));
         let mut per_file: Vec<FileScan> = units[..warm_prefix].iter().map(scan_one).collect();
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         per_file.extend(
             units[warm_prefix..]
                 .par_iter()
-                .map(scan_one)
+                .map(|unit| context.run(|| scan_one(unit)))
                 .collect::<Vec<FileScan>>(),
         );
         let mut edges = Vec::new();
@@ -1331,7 +1360,7 @@ fn classify_forward_usage_kind(
 /// structured lexical-environment import binder. Export/re-export facts are
 /// not import facts, so an `ImportTarget` row outside this set retains the
 /// ordinary `Reference` fallback.
-fn import_target_nodes_for_file(
+fn import_binding_nodes_for_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
 ) -> Option<HashSet<u32>> {
@@ -1349,18 +1378,44 @@ fn import_target_nodes_for_file(
             provider.structural_language() == crate::analyzer::common::language_for_file(file)
         })
         .and_then(|provider| provider.structural_facts(file))?;
+    // A binder names the local token, but an aliased import also contains
+    // the imported target token. Both are import occurrences. Select the
+    // enclosing import declarations from proven binders, then visit each
+    // declaration once; this also preserves the re-export distinction.
+    let mut declarations = HashSet::default();
+    for binding in environment
+        .bindings
+        .iter()
+        .filter(|binding| binding.import.is_some())
+    {
+        let mut ancestor = binding.node;
+        while let Some(node) = ancestor {
+            if facts.node(node).kind == NormalizedKind::Import {
+                declarations.insert(node);
+                break;
+            }
+            ancestor = facts.node(node).parent;
+        }
+    }
     Some(
-        environment
-            .bindings
-            .iter()
-            .filter(|binding| binding.import.is_some())
-            .filter_map(|binding| binding.node)
-            .filter(|node| {
+        declarations
+            .into_iter()
+            .flat_map(|declaration| declaration..facts.subtree_end(declaration))
+            .filter(|&node| {
                 facts
-                    .occurrence_roles(*node)
-                    .contains(&OccurrenceRole::ImportTarget)
+                    .occurrence_roles(node)
+                    .iter()
+                    .copied()
+                    .any(is_import_binding_role)
             })
             .collect(),
+    )
+}
+
+fn is_import_binding_role(role: OccurrenceRole) -> bool {
+    matches!(
+        role,
+        OccurrenceRole::ImportTarget | OccurrenceRole::ImportAlias
     )
 }
 
@@ -1759,7 +1814,7 @@ pub fn inverse_edges_for_declaration(
         provenance: EdgeProvenance::Inverse,
         generation,
     };
-    if analyzer.read_ledger_attached() {
+    if crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         // The candidate set is a superset the reader confirms, and it is a
         // cross-file answer: a new reference in an unrelated file changes it
         // while no key the reader recorded moves.
@@ -1883,7 +1938,7 @@ pub fn forward_edges_from_occurrences(
     occurrences: OccurrenceFileResult,
     generation: u64,
 ) -> Result<EdgeDerivationResult, OccurrencesCancelled> {
-    let import_target_nodes = import_target_nodes_for_file(analyzer, file).unwrap_or_default();
+    let import_target_nodes = import_binding_nodes_for_file(analyzer, file).unwrap_or_default();
     let reference_sites = ReferenceSiteClassifier::new(analyzer, file);
     let mut edges = Vec::new();
     let mut reasons = Vec::new();
@@ -2051,6 +2106,164 @@ class Child extends Base {
 
     #[cfg(test)]
     #[test]
+    fn confidence_roundtrips_in_public_units() {
+        let temp = tempfile::tempdir().unwrap();
+        let analyzer = super::super::identity_routes::tests::MetadataAnalyzer::new(temp.path());
+        let file = ProjectFile::new(temp.path(), "example.py");
+        let unit = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "f",
+        );
+        for confidence in [-2.0, 0.0, 0.1234567, 0.5, 1.0, 4.0] {
+            let mut hit = UsageHit::new(file.clone(), 1, 0, 1, unit.clone(), confidence, "");
+            hit.reference_kind = Some(ReferenceKind::StaticReference);
+            let reference =
+                reference_hit_for_target(&analyzer, hit, unit.clone(), UsageProof::Proven);
+            assert!((reference.confidence_f64() - confidence.clamp(0.0, 1.0)).abs() <= 0.000001);
+        }
+    }
+
+    #[cfg(test)]
+    fn site_edge(file: ProjectFile, start: usize) -> ReferenceEdgeRow {
+        ReferenceEdgeRow {
+            target: CodeUnit::new(
+                file.clone(),
+                crate::analyzer::CodeUnitType::Function,
+                "",
+                "f",
+            ),
+            site: EdgeSite {
+                file,
+                range: Range {
+                    start_byte: start,
+                    end_byte: start + 1,
+                    start_line: 1,
+                    end_line: 1,
+                },
+                ast_id: None,
+                enclosing: None,
+            },
+            reference_kind: None,
+            proof: UsageProof::Proven,
+            ambiguous_candidate: false,
+            usage_kind: UsageHitKind::Reference,
+            site_class: SiteClass::UseSite,
+            owner_relation: OwnerRelation::Unknown,
+            provenance: EdgeProvenance::Inverse,
+            generation: 0,
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn inverse_answer_digest_depends_on_site_set_and_completeness() {
+        let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let result = |root: &std::path::Path| EdgeDerivationResult {
+            edges: vec![
+                site_edge(ProjectFile::new(root, "a.py"), 1),
+                site_edge(ProjectFile::new(root, "b.py"), 3),
+            ],
+            completeness: EdgeCompleteness::Complete,
+            provenance: EdgeProvenance::Inverse,
+            generation: 0,
+        };
+        let baseline = result(roots[0].path());
+        let digest = inverse_edge_answer_digest(&baseline);
+        for root in &roots {
+            let mut alternate = result(root.path());
+            alternate.edges.reverse();
+            let mut duplicate = alternate.edges[0].clone();
+            duplicate.proof = UsageProof::Unproven;
+            duplicate.reference_kind = Some(ReferenceKind::StaticReference);
+            alternate.edges.push(duplicate);
+            assert_eq!(inverse_edge_answer_digest(&alternate), digest);
+        }
+        let mut moved = baseline.clone();
+        moved.edges[0].site.range.end_byte += 1;
+        assert_ne!(inverse_edge_answer_digest(&moved), digest);
+        moved = baseline.clone();
+        moved.edges[0].site.file = ProjectFile::new(roots[0].path(), "c.py");
+        assert_ne!(inverse_edge_answer_digest(&moved), digest);
+        moved = baseline;
+        moved.completeness = EdgeCompleteness::Incomplete {
+            reasons: vec![EdgeIncompleteReason::Cancelled],
+        };
+        assert_ne!(inverse_edge_answer_digest(&moved), digest);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn cancelled_scan_merges_only_the_serial_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let analyzer = super::super::identity_routes::tests::MetadataAnalyzer::new(temp.path());
+        // The first width units are warmed serially. Put the cancellation in
+        // the parallel suffix and force its successor to finish first.
+        for width in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap();
+            let prefix = width.max(2);
+            let files = (0..prefix + 2)
+                .map(|i| ProjectFile::new(temp.path(), format!("{i}.py")))
+                .collect::<Vec<_>>();
+            let completed = std::sync::atomic::AtomicBool::new(false);
+            let run = pool.install(|| {
+                ReferenceEngine::new().scan_units(&analyzer, &files, |file| {
+                    let index = files
+                        .iter()
+                        .position(|candidate| candidate == file)
+                        .unwrap();
+                    if index == prefix {
+                        if width > 1 {
+                            while !completed.load(std::sync::atomic::Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                        }
+                        return Err(OccurrencesCancelled);
+                    }
+                    let result = EdgeDerivationResult {
+                        edges: vec![site_edge(file.clone(), index)],
+                        completeness: EdgeCompleteness::Complete,
+                        provenance: EdgeProvenance::Forward,
+                        generation: 0,
+                    };
+                    if index == prefix + 1 {
+                        completed.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Ok(result)
+                })
+            });
+            assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(
+                run.edges
+                    .iter()
+                    .map(|edge| edge.site.file.clone())
+                    .collect::<Vec<_>>(),
+                files[..prefix]
+            );
+            assert_eq!(
+                run.work,
+                ReferenceWork {
+                    candidate_files: files.len(),
+                    scanned_files: prefix,
+                    scanned_source_bytes: 0,
+                    emitted_edges: prefix
+                }
+            );
+            assert_eq!(
+                run.completeness,
+                EdgeCompleteness::Incomplete {
+                    reasons: vec![EdgeIncompleteReason::Cancelled]
+                }
+            );
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
     fn completeness_covers_the_declared_axes_only() {
         let complete = EdgeCompleteness::Complete;
         for &axis in EDGE_PRODUCER_AXES {
@@ -2077,6 +2290,46 @@ class Child extends Base {
         for &axis in EDGE_PRODUCER_AXES {
             assert!(!cancelled.covers(axis));
         }
+    }
+    #[cfg(test)]
+    #[test]
+    fn interval_containment_matches_exhaustive_ordered_spans() {
+        let entries: Vec<_> = (0..=5)
+            .flat_map(|start_byte| {
+                (start_byte..=5).map(move |end_byte| Span {
+                    start_byte,
+                    end_byte,
+                })
+            })
+            .enumerate()
+            .map(|(id, span)| (span, id))
+            .collect();
+        for rotation in 0..entries.len() {
+            let mut input = entries.clone();
+            input.rotate_left(rotation);
+            if rotation % 2 == 0 {
+                input.reverse();
+            }
+            let index = ContainingSpanIndex::new(input);
+            for start in 0..=6 {
+                for end in start..=6 {
+                    let expected = entries
+                        .iter()
+                        .filter(|(span, _)| span.start_byte <= start && end <= span.end_byte)
+                        .map(|(_, id)| *id)
+                        .min();
+                    assert_eq!(
+                        index.best_containing_by_key(start, end, |id| id),
+                        expected,
+                        "query {start}..{end}, rotation {rotation}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            ContainingSpanIndex::<usize>::new([]).best_containing_by_key(0, 0, |id| id),
+            None
+        );
     }
 }
 

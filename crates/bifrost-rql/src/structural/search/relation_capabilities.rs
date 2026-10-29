@@ -36,6 +36,18 @@ fn preflight_plan(
     let dialects = source_dialects(&plan.source, files);
     for step in &plan.steps {
         match step {
+            QueryStep::StatementFacts(kind) => {
+                for dialect in &dialects {
+                    if !statement_facts::supports_kind(dialect.language(), *kind) {
+                        report_unsupported(
+                            reported,
+                            diagnostics,
+                            dialect.language(),
+                            format!("statement fact `{}`", kind.label()),
+                        );
+                    }
+                }
+            }
             QueryStep::AssignmentRelations(filter) => {
                 let requested = if filter.relations.is_empty() {
                     vec![AssignmentRelationKind::SelfAssignment]

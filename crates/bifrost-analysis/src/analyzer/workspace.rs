@@ -233,6 +233,17 @@ impl SelectedConfigurationProject {
 }
 
 impl Project for SelectedConfigurationProject {
+    fn selected_module_name(&self, file: &ProjectFile) -> std::io::Result<Option<String>> {
+        if !crate::analyzer::store::store_language_support(self.language)
+            .expect("selected language has store support")
+            .publishes_own_module_file_anchors()
+        {
+            return self.project.selected_module_name(file);
+        }
+        self.store
+            .selected_module_name(&self.snapshot, &crate::path_utils::rel_path_string(file))
+            .map_err(std::io::Error::other)
+    }
     fn root(&self) -> &Path {
         self.project.root()
     }
@@ -746,7 +757,10 @@ impl DependencyPackActivationOutcome {
 impl PythonSemanticModelActivationOutcome {
     pub fn complete(&self) -> bool {
         dependency_discovery_preparation_complete(&self.discovery, self.preparation.as_ref())
-            && self.runtime.is_some()
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. }))
     }
 }
 
@@ -2117,7 +2131,33 @@ impl WorkspaceAnalyzer {
         let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
             delegate, active,
         );
-        provider.materialize(file, request)
+        let result = provider.materialize(file, request);
+        if match &result {
+            Err(_) => true,
+            Ok(outcome) => {
+                matches!(
+                    outcome,
+                    crate::analyzer::semantic::SemanticOutcome::Cancelled { .. }
+                        | crate::analyzer::semantic::SemanticOutcome::ExceededBudget { .. }
+                ) || outcome.available_value().is_some_and(|artifact| {
+                    artifact.procedures().iter().any(|procedure| {
+                        procedure.gaps().iter().any(|gap| {
+                            gap.kind == crate::analyzer::semantic::SemanticGapKind::ExceededBudget
+                        })
+                    })
+                })
+            }
+        } {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=budget:semantic_artifact",
+                    file!(),
+                    line!()
+                )
+            });
+            self.analyzer().mark_execution_dependent();
+        }
+        result
     }
 
     /// The stored partial flows of one procedure, when the procedure's file has
@@ -2208,10 +2248,27 @@ impl WorkspaceAnalyzer {
         // to avoid repeating those reads. A clone shares lazy-index cells
         // while keeping its read cache separate from any overlapping query.
         let snapshot = self.clone();
-        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-        snapshot.begin_query(&context);
+        let execution = crate::analyzer::read_attribution_records_reads(|| {
+            self.analyzer().read_ledger_attached()
+        })
+        .then(|| Arc::new(crate::analyzer::ReadLedger::new()));
+        let scope = match &execution {
+            Some(ledger) => crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+                snapshot.analyzer(),
+                Arc::clone(ledger),
+            ),
+            None => crate::analyzer::AnalyzerQueryScope::new(snapshot.analyzer()),
+        };
         query(snapshot.analyzer());
-        snapshot.end_query(&context);
+        drop(scope);
+        // Index warming has its own registry on the clone. Its consuming
+        // funnels name the index answers, but cannot subsume execution state.
+        // Route that state back through the original request attribution.
+        if let Some(ledger) = execution {
+            for _ in 0..ledger.execution_dependences() {
+                self.analyzer().mark_execution_dependent();
+            }
+        }
     }
 
     /// Build the expensive lazily-initialized per-generation query indexes
@@ -2374,6 +2431,113 @@ mod tests {
 
     use crate::gitblob::test_repo::commit_all;
     use crate::gitblob::test_repo::init_repo;
+    use crate::path_normalization::NormalizePath;
+
+    #[test]
+    fn selected_project_listing_tracks_file_changes_and_overlay_snapshots() {
+        let _language =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Java]);
+        let temp = tempfile::tempdir().unwrap();
+        // `with_cached_listing` asserts the cache root equals its canonical,
+        // normalized root; Windows `canonicalize` returns a verbatim `\\?\`
+        // spelling that only `normalize` collapses.
+        let root = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(root.join("kept.java"), "class Kept {}\n").unwrap();
+        std::fs::write(root.join("café.java"), "class Cafe {}\n").unwrap();
+        let repository = init_repo(&root);
+        commit_all(&repository, "initial source files");
+
+        let listing = Arc::new(crate::analyzer::WorkspaceFileListingCache::new(
+            root.clone(),
+        ));
+        let disk_project =
+            Arc::new(FilesystemProject::with_cached_listing(root.clone(), listing).unwrap());
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            disk_project,
+        ));
+        let project: Arc<dyn Project> = overlay.clone();
+        let selected = SelectedConfigurationProject::new(
+            project,
+            Language::Java,
+            Arc::new(
+                crate::analyzer::store::AnalyzerStore::open_in_memory_single_connection().unwrap(),
+            ),
+            crate::analyzer::store::WorkspaceSnapshotId {
+                workspace_id: crate::analyzer::store::WorkspaceId::for_root(&root),
+                lang: Language::Java.config_label().to_owned(),
+                generation: crate::analyzer::store::GenerationId::BOOTSTRAP,
+                revision: 0,
+            },
+            None,
+        );
+
+        let assert_matches_fresh_project = || {
+            let fresh = FilesystemProject::new(root.clone()).unwrap();
+            let selected_files = selected.all_files().unwrap();
+            let fresh_files = fresh.all_files().unwrap();
+            assert_eq!(selected_files, fresh_files);
+            assert_eq!(
+                selected.analyzable_files(Language::Java).unwrap(),
+                fresh.analyzable_files(Language::Java).unwrap()
+            );
+            assert_eq!(
+                selected
+                    .analyzable_files_from(&selected_files, Language::Java)
+                    .unwrap(),
+                fresh
+                    .analyzable_files_from(&fresh_files, Language::Java)
+                    .unwrap()
+            );
+            assert!(selected.workspace_file_listing_count() >= 2);
+        };
+
+        let kept = ProjectFile::new(&root, "kept.java");
+        assert_eq!(selected.workspace_root_for_file(&kept), root);
+        assert_eq!(selected.persistence_root(), Some(root.as_path()));
+        assert!(!selected.is_gitignored(Path::new("kept.java")));
+        assert_matches_fresh_project();
+
+        overlay.set(kept.abs_path(), "class Unsaved {}\n".to_owned());
+        assert!(selected.has_overlay(&kept));
+        assert!(selected.overlay_content().is_some());
+        let overlay_snapshot = selected.read_source_snapshot(&kept).unwrap();
+        assert_eq!(overlay_snapshot.source(), "class Unsaved {}\n");
+        assert_ne!(
+            overlay_snapshot,
+            FilesystemProject::new(root.clone())
+                .unwrap()
+                .read_source_snapshot(&kept)
+                .unwrap()
+        );
+        overlay.clear(&kept.abs_path());
+        assert!(!selected.has_overlay(&kept));
+        assert_eq!(
+            selected.read_source_snapshot(&kept).unwrap(),
+            FilesystemProject::new(root.clone())
+                .unwrap()
+                .read_source_snapshot(&kept)
+                .unwrap()
+        );
+
+        std::fs::write(root.join("新規.java"), "class Added {}\n").unwrap();
+        assert!(selected.update_cached_listing_for_path(Path::new("新規.java")));
+        assert_matches_fresh_project();
+
+        std::fs::remove_file(root.join("café.java")).unwrap();
+        assert!(selected.update_cached_listing_for_path(Path::new("café.java")));
+        assert_matches_fresh_project();
+
+        std::fs::rename(root.join("kept.java"), root.join("renamed.java")).unwrap();
+        assert!(selected.update_cached_listing_for_path(Path::new("kept.java")));
+        assert!(selected.update_cached_listing_for_path(Path::new("renamed.java")));
+        assert_matches_fresh_project();
+
+        selected.invalidate_cached_file_listing();
+        assert_eq!(
+            selected.all_files().unwrap(),
+            FilesystemProject::new(root).unwrap().all_files().unwrap()
+        );
+    }
 
     #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;

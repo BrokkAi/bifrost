@@ -1,10 +1,18 @@
 // Keep the moved Go regression's original ancestor-relative fixture path.
 use brokk_bifrost_go_analysis::persist_live_go_sources_for_test;
 
+mod analyzer_build_state;
+mod analyzer_dirty_declarations;
+mod analyzer_file_states;
 mod canonical_workspace_graph;
 mod cpp_bounded;
+mod declaration_candidates;
+mod declaration_inventory_bounds;
+mod declaration_limits;
 mod go_native_graph;
+mod overlay_bounded_declarations;
 mod point_latency;
+mod retained_source_queries;
 mod rust_crate_context;
 mod rust_crates;
 mod rust_manifest_update;
@@ -12,6 +20,8 @@ mod rust_native_graph;
 mod rust_selected_shadow;
 mod rust_unit_summaries;
 mod tree_sitter_analyzer;
+mod workspace_analyzer_lifecycle;
+mod workspace_evidence_boundaries;
 
 mod ruby_definition_lookup;
 mod ruby_derived_cache;
@@ -386,3 +396,5 @@ mod jvm_registry_analyzer_workspace_tests;
 pub(crate) mod jvm_generated_fixture;
 
 mod store_jvm_package_context;
+
+mod resolution_rows_dump;

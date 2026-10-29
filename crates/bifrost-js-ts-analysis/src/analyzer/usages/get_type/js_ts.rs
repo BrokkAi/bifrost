@@ -368,8 +368,7 @@ fn resolve_declared_type_text(
     let type_text = ts_type_annotation_text(type_node, source);
     // A union or intersection annotation names more than one type. Its arms
     // come from the annotation's own `union_type`/`intersection_type` nodes, so
-    // every arm stays visible; the text scan below sees only the first one and
-    // would report a two-arm receiver as one precise type (#1477).
+    // every arm stays visible rather than reporting one precise type (#1477).
     if let Some(outcome) = multi_arm_annotation_outcome(
         host,
         support,
@@ -389,11 +388,12 @@ fn resolve_declared_type_text(
     }
 
     if let Some((type_name, candidates)) =
-        named_type_candidates(host, support, file, imports, aliases, &type_text)
+        named_type_candidates(host, support, file, imports, aliases, type_node, source)
     {
         return candidates_outcome_with_target_kind(type_name, candidates, target_kind);
     }
-    if let Some(type_name) = leading_type_identifier(&type_text)
+    if let Some(type_name) =
+        brokk_bifrost_js_ts::type_text::ts_named_type_identifier(type_node, source)
         && let Some(outcome) = model_type_outcome(analyzer, file, type_name, target_kind.clone())
     {
         return outcome;
@@ -836,10 +836,8 @@ fn declaration_pattern_node(node: Node<'_>) -> Option<Node<'_>> {
 /// a single-name answer was hiding.
 ///
 /// Once the tree says the annotation names two or more arms, this function
-/// always answers. Falling through would hand the caller's
-/// `leading_type_identifier` text scan the whole union text, and that scan
-/// reports its first identifier as one precise type -- which is exactly the
-/// misrepresentation this seam exists to remove. A partly resolved union
+/// always answers rather than collapsing multiple receiver alternatives into
+/// one precise type. A partly resolved union
 /// (`ServiceA | ExternalLibService` with only `ServiceA` indexed) therefore
 /// stays `Ambiguous`, and an `unresolved_type_arm` diagnostic names the arms
 /// that no indexed definition backs, so the open arm is stated rather than
@@ -1019,7 +1017,7 @@ fn arm_type_candidates(
     }
     let arm_text = ts_type_annotation_text(arm, source);
     if let Some(candidates) =
-        named_type_candidates(host, support, file, imports, aliases, &arm_text)
+        named_type_candidates(host, support, file, imports, aliases, arm, source)
     {
         return Some(candidates);
     }
@@ -1029,15 +1027,17 @@ fn arm_type_candidates(
     (!owners.is_empty()).then(|| (type_lookup_name(&owners, &arm_text), owners))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn named_type_candidates(
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
-    type_text: &str,
+    type_node: Node<'_>,
+    source: &str,
 ) -> Option<(String, Vec<CodeUnit>)> {
-    let type_name = leading_type_identifier(type_text)?;
+    let type_name = brokk_bifrost_js_ts::type_text::ts_named_type_identifier(type_node, source)?;
     let candidates = identifier_candidates(
         host,
         support,
@@ -1049,14 +1049,6 @@ fn named_type_candidates(
         false,
     );
     (!candidates.is_empty()).then(|| (type_name.to_string(), candidates))
-}
-
-fn leading_type_identifier(text: &str) -> Option<&str> {
-    let text = text.trim().trim_start_matches(':').trim();
-    let end = text
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
-        .unwrap_or(text.len());
-    (end > 0).then_some(&text[..end])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1169,4 +1161,31 @@ fn type_lookup_name(candidates: &[CodeUnit], fallback: &str) -> String {
         .first()
         .map(|unit| unit.identifier().to_string())
         .unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod quicksilver_grammar_tests {
+    use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
+    use brokk_bifrost_js_ts::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
+
+    #[test]
+    fn merged_type_and_value_declarations_keep_their_spaces() {
+        let (_dir, file, analyzer) = crate::test_typescript_project(
+            "export interface Token {x:number} export const Token={make(){return 1;}};",
+        );
+        let candidates: Vec<_> = analyzer
+            .top_level_declarations(&file)
+            .into_iter()
+            .filter(|unit| unit.terminal_name() == "Token")
+            .collect();
+        assert!(candidates.iter().any(CodeUnit::is_class), "{candidates:?}");
+        assert!(candidates.iter().any(CodeUnit::is_field), "{candidates:?}");
+        let values = jsts_value_space_candidates(&analyzer, candidates.clone());
+        let types = jsts_type_space_candidates(&analyzer, candidates);
+        assert!(!values.is_empty(), "{values:?}");
+        assert_eq!(types.len(), 1, "{types:?}");
+        assert!(values.iter().all(CodeUnit::is_field), "{values:?}");
+        assert!(types[0].is_class(), "{types:?}");
+        assert_ne!(values[0], types[0]);
+    }
 }

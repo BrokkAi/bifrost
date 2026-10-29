@@ -37,6 +37,7 @@ const RUNTIME = "brokk-bifrost-runtime";
 const MCP = "brokk-bifrost-mcp";
 const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 const TEST_MACROS = "brokk-bifrost-test-macros";
+const WORKSPACE_HACK = "workspace-hack";
 
 const EXPECTED_MEMBERS = new Set([
   FACADE,
@@ -70,6 +71,7 @@ const EXPECTED_MEMBERS = new Set([
   MCP,
   SEMANTIC_PACKS,
   TEST_MACROS,
+  WORKSPACE_HACK,
 ]);
 // Core is the bottom of the graph. Language knowledge crates depend on core
 // alone; the shared analysis engine sits above those crates. Extracted language
@@ -129,19 +131,21 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
 // directly. These edges are permitted only for tests, never production or builds.
 const ALLOWED_DEVELOPMENT_DEPENDENCIES = new Map([
   [MCP, new Set([GO_ANALYSIS])],
-  [TOOLS, new Set([JS_TS, SEMANTIC, RUBY, JVM_ANALYSIS, JVM])],
+  [TOOLS, new Set([CSHARP, JS_TS, SEMANTIC, RUBY, JVM_ANALYSIS, JVM])],
   [FLOW, new Set([TOOLS])],
   [RUNTIME, new Set([TOOLS])],
   [SEMANTIC_PACKS, new Set([GO_ANALYSIS, TOOLS, JS_TS_ANALYSIS, JVM_ANALYSIS])],
   [RQL, new Set([GO_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, JVM_ANALYSIS])],
   [POLICY, new Set([CPP_ANALYSIS, PYTHON_ANALYSIS, JS_TS_ANALYSIS, JVM_ANALYSIS])],
-  [FACADE, new Set([CORE, JS_TS, JVM, JS_TS_ANALYSIS, JVM_ANALYSIS])],
+  [FACADE, new Set([CORE, CSHARP, JS_TS, JVM, JS_TS_ANALYSIS, JVM_ANALYSIS])],
 ]);
 // Optional production edges for feature-gated binaries. Only tools defines the
 // complete language table the engine links by symbol, so the release-tooling
-// `bifrost-semantic-pack` binary needs it; the library itself must not.
+// `bifrost-semantic-pack` binary needs it; normal library builds must not.
+// Offline catalog authoring uses the owning policy registry and RQL canonical
+// encoder behind release-tooling, so generated catalogs obey the product schema.
 const ALLOWED_OPTIONAL_DEPENDENCIES = new Map([
-  [SEMANTIC_PACKS, new Set([TOOLS])],
+  [SEMANTIC_PACKS, new Set([TOOLS, POLICY, RQL])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [JVM_ANALYSIS, new Set([CORE, ANALYSIS, JVM])],
@@ -239,14 +243,67 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   [FACADE, new Set()],
 ]);
 
+// Production checks seal-time store consistency on a sample of blobs; builds
+// with brokk-bifrost-core/test-support check every blob. `cfg(test)` does not
+// reach dependencies, so a crate whose tests can write store seals must enable
+// that feature through one of its dependencies, or its tests sample silently.
+const SEAL_WRITING_DEPENDENCIES = new Set([STORE, ANALYSIS, SEMANTIC]);
+const CORE_TEST_SUPPORT = "test-support";
+
 function sorted(values) {
   return [...values].sort();
+}
+
+// Follows Cargo feature entries (`feature`, `dependency/feature`,
+// `dependency?/feature`; `dep:` only activates the dependency) from one
+// workspace package's feature to core's test-support feature. A weak
+// `dependency?/feature` entry counts only for a required dependency: deciding
+// whether something else enables an optional one needs full feature resolution.
+function featureReachesCoreTestSupport(membersByName, packageName, feature, visited = new Set()) {
+  if (packageName === CORE) {
+    return feature === CORE_TEST_SUPPORT;
+  }
+  const key = `${packageName}/${feature}`;
+  const pkg = membersByName.get(packageName);
+  if (visited.has(key) || !pkg) {
+    return false;
+  }
+  visited.add(key);
+  for (const entry of pkg.features[feature] ?? []) {
+    if (entry.startsWith("dep:")) {
+      continue;
+    }
+    const slash = entry.indexOf("/");
+    if (slash < 0) {
+      if (featureReachesCoreTestSupport(membersByName, packageName, entry, visited)) {
+        return true;
+      }
+      continue;
+    }
+    const weak = entry[slash - 1] === "?";
+    const local = entry.slice(0, weak ? slash - 1 : slash);
+    const target = pkg.dependencies.find((dependency) => (dependency.rename ?? dependency.name) === local);
+    if (target && !(weak && target.optional) && featureReachesCoreTestSupport(membersByName, target.name, entry.slice(slash + 1), visited)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Cargo unifies features across normal and development edges, so any edge counts.
+function enablesCoreTestSupport(membersByName, pkg) {
+  return pkg.dependencies
+    .some((dependency) => [
+      ...dependency.features,
+      ...(dependency.uses_default_features ? ["default"] : []),
+    ].some((feature) => featureReachesCoreTestSupport(membersByName, dependency.name, feature)));
 }
 
 export function validateWorkspaceGraph(metadata) {
   const packagesById = new Map(metadata.packages.map((pkg) => [pkg.id, pkg]));
   const members = metadata.workspace_members.map((id) => packagesById.get(id)).filter(Boolean);
-  const memberNames = new Set(members.map((pkg) => pkg.name));
+  const membersByName = new Map(members.map((pkg) => [pkg.name, pkg]));
+  const memberNames = new Set(membersByName.keys());
   const errors = [];
 
   // Inspect resolved registry dependencies too: the retired upstream host may
@@ -270,6 +327,18 @@ export function validateWorkspaceGraph(metadata) {
   }
 
   for (const pkg of members) {
+    if (pkg.name === WORKSPACE_HACK) {
+      if (!Array.isArray(pkg.publish) || pkg.publish.length !== 0) {
+        errors.push("workspace-hack must remain unpublished");
+      }
+      const forbidden = new Set([...FORBIDDEN_EXTERNAL_DEPENDENCIES.values()].flatMap(values => [...values]));
+      for (const dependency of pkg.dependencies) {
+        if (dependency.source === null || forbidden.has(dependency.name)) {
+          errors.push(`workspace-hack must not depend on ${dependency.name}`);
+        }
+      }
+      continue;
+    }
     if (pkg.version !== facade.version) {
       errors.push(
         `${pkg.name} version ${pkg.version} does not match facade version ${facade.version}`,
@@ -290,7 +359,21 @@ export function validateWorkspaceGraph(metadata) {
     for (const missing of sorted(missingDependencies)) {
       errors.push(`${pkg.name} must depend on workspace package ${missing}`);
     }
+    const sealWriting = sorted(new Set(pkg.dependencies
+      .map((dependency) => dependency.name)
+      .filter((name) => SEAL_WRITING_DEPENDENCIES.has(name))));
+    if (sealWriting.length > 0 && !enablesCoreTestSupport(membersByName, pkg)) {
+      errors.push(
+        `${pkg.name} depends on ${sealWriting.join(", ")} but no dependency enables ${CORE}/${CORE_TEST_SUPPORT}; its tests would validate only sampled store seals`,
+      );
+    }
     for (const dependency of pkg.dependencies) {
+      if (dependency.name === WORKSPACE_HACK) {
+        if (dependency.kind != null || dependency.optional || dependency.source !== null || dependency.req !== "*") {
+          errors.push(`${pkg.name} dependency on workspace-hack must be a required path-only normal dependency`);
+        }
+        continue;
+      }
       if (
         dependency.name === TEST_MACROS &&
         (dependency.kind !== "dev" || dependency.req !== "*" || dependency.source !== null)

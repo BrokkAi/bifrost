@@ -148,6 +148,27 @@ mod structural_spec_tests {
 
     #[test]
     fn java_kind_table_matches_grammar() {
+        for node in [
+            "binary_expression",
+            "ternary_expression",
+            "switch_expression",
+            "switch_label",
+            "switch_rule",
+            "labeled_statement",
+            "break_statement",
+            "continue_statement",
+            "cast_expression",
+            "instanceof_expression",
+            "array_access",
+            "array_creation_expression",
+            "unary_expression",
+            "synchronized_statement",
+        ] {
+            assert!(
+                JAVA_KIND_TABLE.iter().any(|(name, _)| *name == node),
+                "missing {node}"
+            );
+        }
         brokk_bifrost_core::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
             tree_sitter_java::LANGUAGE.into(),
             "tree-sitter-java",

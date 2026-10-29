@@ -335,7 +335,7 @@ slice, including blank lines between comments.
 | `subtypes` | `subtypes` | `declaration` -> `declaration` | `depth` or `transitive` | Indexed subtypes: direct by default, up to `depth` hops, or the full closure. |
 | `members` | `members` | `declaration` -> `declaration` | none | Direct indexed members of a type. |
 | `owner` | `owner` | `declaration` -> `declaration` | none | The exact indexed type that declares a member. |
-| `member_family` | `member-family`, `member_family` | `declaration` -> `member_family` | none | One method-family outcome row per member: the family ID when proven, otherwise a typed reason. |
+| `member_family` | `member-family`, `member_family` | `declaration` -> `member_family` | none | One method-family outcome row per member: the family ID when proven, otherwise a typed reason and unread ancestor names. Coverage is reported for the whole family and for each direction. |
 | `family_edges` | `family-edges`, `family_edges` | `declaration` -> `member_family_edge` | none | Proven `overrides` and `implements` edges of a member, plus their inverses `overridden_by` and `implemented_by`. |
 | `python_override_signatures` | `python-override-signatures`, `python_override_signatures` | `declaration` -> `python_hierarchy_fact` | none | C3-selected Python override paired with each source and target callable-signature entry, including stable signature IDs, arity, and coverage. |
 
@@ -424,7 +424,7 @@ slice, including blank lines between comments.
 | `cpp_network_to_host_function_as_array_bound` | `cpp-network-to-host-function-as-array-bound`, `cpp_network_to_host_function_as_array_bound` | `call_binding` -> `call_binding` | none | Keep a call-binding row when structured syntax proves a direct `ntohl` result is passed as the `memcpy` bound after exact declared call selection. |
 | `callable_signature` | `callable-signature`, `callable_signature` | `declaration` -> `callable_signature` | none | One row per persisted signature of a declaration; an overload set gives one row per overload. Python special methods additionally carry their query-time protocol arity verdict and placeholder status. |
 | `signature_parameters` | `signature-parameters`, `signature_parameters` | `callable_signature` -> `signature_parameter` | none | The ordered declared parameters of a signature. |
-| `decorator_bindings` | `decorator-bindings`, `decorator_bindings` | `structural_match` -> `decorated_parameter` | `module`, `imported_name` | One row for each decorator applied to a matched parameter. |
+| `decorator_bindings` | `decorator-bindings`, `decorator_bindings` | `structural_match` -> `decorated_parameter` | `module`, `imported_name`, `annotation_type` | One row for each decorator applied to a matched parameter. |
 
 ### C++ typed expression facts
 
@@ -481,7 +481,15 @@ implicit-initializer context, and nested short-loop context.
 | `loop_relations` | `loop-relations`, `loop_relations` | `procedure` -> `loop_relation` | none | For a Java loop, prove whether its body can reach its own repeat edge before it exits. |
 | `statement_reachability` | `statement-reachability`, `statement_reachability` | `procedure` -> `statement_reachability` | none | For Java statements, report whether bounded entry reachability reaches any of the statement's control-flow entries. |
 | `switch_coverage` | `switch-coverage`, `switch_coverage` | `procedure` -> `switch_coverage` | none | One coverage verdict per switch: exhaustive, non-exhaustive, or unknown. |
-| `failure_handler_state` | `failure-handler-state`, `failure_handler_state` | `structural_match` -> `failure_handler_state` | none | Classify a catch, except, or rescue body as empty, nonempty, or unknown. |
+| `failure_handler_state` | `failure-handler-state`, `failure_handler_state` | `structural_match` -> `failure_handler_state` | none | Classify a catch, except, rescue, or native Go/Rust failure candidate body as empty, nonempty, or unknown. |
+
+For native Go and Rust candidates, `nonempty` describes the body even when
+handler identity is unproven. Such rows carry `proof: unknown`,
+`coverage: exhaustive`, and `reason: handler_identity_unproven`, without an
+incomplete-derivation diagnostic. An empty body with unproven handler identity
+remains `unknown` with incomplete coverage. Require `proof: exact` when
+counting proven handlers. A consumer that proves a handler is absent must
+treat `proof: unknown` rows as possible handlers.
 
 ### Flow, state, taint, and typestate
 
@@ -630,6 +638,7 @@ Options are written before the nested query in RQL, for example
 | `member_target_id` | `:member-target-id`, `:member_target_id` | `field_write_value` | no | exact stable ID | every member |
 | `module` | `:module` | `decorator_bindings` | no | exact imported module, at most 4096 bytes | every module |
 | `imported_name` | `:imported-name`, `:imported_name` | `decorator_bindings` | no | exact imported symbol name, at most 4096 bytes | every name |
+| `annotation_type` | `:annotation-type`, `:annotation_type` | `decorator_bindings` | no | exact qualified name of a resolved Java annotation type, at most 4096 bytes; rows whose annotation type is unproven are kept, incomplete | every annotation |
 | `resolves_to` | `:resolves-to`, `:resolves_to` | `resolved_call`, `resolved_value` | yes | [call identity](#patterns-and-calls) | none |
 | `call_proof` | `:proof` | `resolved_call`, `resolved_value` | yes | `exact` or `declared` for calls; `resolved_value` requires `exact` | none |
 | `receiver_type` | `:receiver-type`, `:receiver_type` | `resolved_call` | no | a call identity, or `(assignable-to IDENTITY)` | every receiver |
@@ -952,13 +961,13 @@ in the last column is left out of the JSON when it has no value. With
 | `procedure_effect` | `coverage`, `derivation`, `id`, `language`, `path`, `procedure_id`, `procedure_name`, `range`, `site_id`, `terminal`, `witness_available`, `witness_steps`, `witness_truncated` | `certainty`, `classification`, `depth`, `effect_id`, `execution_timing`, `model_id`, `pack_id`, `reason`, `summary_id`, `timing`, `witness_chain`, `witness_effect_site_id`, `witness_site_id` |
 | `callable_signature` | `coverage`, `declaration`, `declaration_only`, `generic_arity`, `id`, `language`, `ordinal`, `parameter_count`, `path`, `range`, `repeated`, `role`, `site_id` | `label`, `receiver_contract`, `required_arity`, `return_type`, `special_method_expected_maximum`, `special_method_expected_minimum`, `special_method_reason`, `special_method_status`, `total_arity` |
 | `signature_parameter` | `id`, `label`, `label_end_byte`, `label_start_byte`, `parameter_index`, `path`, `range`, `signature_id` | `declared_type`, `optional`, `repeated` |
-| `decorated_parameter` | `binding_status`, `boundary`, `completion`, `coverage`, `decorator_name`, `decorator_range`, `id`, `language`, `parameter_id`, `path`, `range`, `terminal` | `annotation_status`, `annotation_type`, `decorator_id`, `imported_name`, `local_name`, `module`, `owner_id`, `parameter_ordinal`, `port_id`, `procedure_id`, `reason`, `value_id` |
+| `decorated_parameter` | `binding_status`, `boundary`, `completion`, `coverage`, `decorator_name`, `decorator_range`, `id`, `language`, `parameter_id`, `path`, `range`, `terminal` | `annotation_artifact`, `annotation_fq_name`, `annotation_route`, `annotation_status`, `annotation_type`, `decorator_id`, `imported_name`, `local_name`, `module`, `owner_id`, `parameter_ordinal`, `port_id`, `procedure_id`, `reason`, `value_id` |
 | `callable_applicability` | `candidate`, `id`, `language`, `ordinal`, `path`, `range`, `selected`, `site_ast_id`, `verdict` | `failing_argument`, `failing_conversion`, `phase`, `reason`, `tier` |
 | `overload_selection` | `applicable_count`, `considered_count`, `id`, `inapplicable_count`, `language`, `path`, `range`, `resolution`, `site_ast_id`, `supported`, `unknown_count` | none |
 | `member_selection` | `candidate_count`, `coverage`, `id`, `language`, `member`, `outcome`, `path`, `range`, `role`, `selected_count`, `site_ast_id`, `trace_completeness` | none |
 | `dispatch_outcome` | `call_site_count`, `coverage`, `id`, `language`, `outcome`, `path`, `range`, `site_id`, `target_count`, `targets_truncated` | `exceeded_limit`, `semantic_unsupported`, `site_ast_id` |
 | `dispatch_target` | `completeness`, `coverage`, `dispatch`, `id`, `ordinal`, `path`, `proof`, `site_id`, `target_id`, `target_path` | `boundary_kind`, `site_ast_id`, `target_declaration`, `target_fq_name` |
-| `member_family` | `capability`, `coverage`, `edge_count`, `id`, `implemented_by_count`, `implements_count`, `language`, `member_id`, `outcome`, `overridden_by_count`, `overrides_count`, `path`, `range`, `root_count` | `family_id`, `member`, `reason` |
+| `member_family` | `ancestor_coverage`, `capability`, `coverage`, `descendant_coverage`, `edge_count`, `id`, `implemented_by_count`, `implements_count`, `language`, `member_id`, `outcome`, `overridden_by_count`, `overrides_count`, `path`, `range`, `root_count`, `unread_ancestors` | `ancestor_reason`, `descendant_reason`, `family_id`, `member`, `reason` |
 | `member_family_edge` | `completeness`, `coverage`, `hierarchy_depth`, `id`, `member_id`, `ordinal`, `path`, `proof`, `range`, `relation`, `target_id` | `family_id`, `source`, `target` |
 | `python_hierarchy_fact` | `coverage`, `fact_kind`, `id`, `language`, `outcome`, `path`, `range`, `root_id` | `base_branch_definition_count`, `base_resolution`, `base_spelling`, `declaration`, `declaration_id`, `has_non_strict_ordering`, `has_strict_ordering`, `inherited_ne_delegates`, `inherited_ne_present`, `member_name`, `mro_rank`, `ordinal`, `owner`, `owner_id`, `reason`, `root`, `root_declaration_id`, `source_repeated_arity`, `source_required_arity`, `source_signature_coverage`, `source_signature_id`, `source_signature_ordinal`, `source_total_arity`, `target`, `target_id`, `target_non_trivial`, `target_owner`, `target_owner_id`, `target_reads_self`, `target_repeated_arity`, `target_required_arity`, `target_signature_coverage`, `target_signature_id`, `target_signature_ordinal`, `target_total_arity`, `total_ordering_decorator` |
 | `occurrence` | `ast_id`, `class`, `end_byte`, `id`, `language`, `namespace`, `path`, `range`, `raw_spelling`, `role`, `start_byte`, `target` | `decoded_spelling`, `enclosing_symbol` |
@@ -988,6 +997,14 @@ in the last column is left out of the JSON when it has no value. With
 | `build_target` | `build_file`, `completeness`, `id`, `name` | `build_project_id` |
 | `topology_edge` | `build_file`, `completeness`, `from_id`, `from_name`, `id`, `scope`, `to_name` | `to_id` |
 | `cross_domain` | `domain`, `id`, `operator`, `path` | `binding`, `code`, `code_id`, `code_path`, `configuration`, `configuration_contributors`, `configuration_id`, `configuration_path`, `dependency_id`, `effective_configuration`, `key`, `mapping_id`, `mitigated`, `owner`, `range`, `relation` |
+
+Member-family summaries publish `ancestor_coverage` and `descendant_coverage`
+(`exhaustive` or `open`), with optional `ancestor_reason` and `descendant_reason`.
+`unread_ancestors` lists the supertype names behind an ancestor gap. Summary
+`coverage` covers both directions. An `overrides` or `implements` edge uses
+ancestor coverage; an `overridden_by` or `implemented_by` edge uses descendant
+coverage. Established edges remain available when another direction is open.
+
 
 On `call_result_obligation` items, `obligation_provenance` carries the native or
 model origin. The typed row field selector `provenance` selects that origin;
@@ -1176,7 +1193,7 @@ The impact column gives the impact that `query_code` uses for each code.
 | `control_relation_derivation_incomplete` | `incomplete` | Control relations could not be fully derived. |
 | `branch_relation_derivation_incomplete` | `incomplete` | Branch relations could not be fully derived. |
 | `loop_relation_derivation_incomplete` | `incomplete` | Loop relations could not be fully derived. |
-| `failure_handler_derivation_incomplete` | `incomplete` | A failure-handler body could not be classified. |
+| `failure_handler_derivation_incomplete` | `incomplete` | A failure-handler body could not be classified, or an empty candidate's handler identity is unproven. |
 | `statement_reachability_derivation_incomplete` | `incomplete` | Statement reachability could not be fully derived. |
 | `control_relation_exit_partition_partial` | `incomplete` | A control relation could not be computed for every exit partition. |
 | `topology_derivation_incomplete` | `incomplete` | The build topology could not be fully read. |
@@ -1220,7 +1237,7 @@ with `--workspace-scaled-limits`, scale some execution limits by source volume.
 | Plan depth | 16 |
 | Entries in one occurrence, scope, binding, or candidate filter axis | 32 |
 | Binding name | 256 bytes |
-| Decorator-binding `module` or `imported_name` | 4096 bytes |
+| Decorator-binding `module`, `imported_name` or `annotation_type` | 4096 bytes |
 | Entries in one configuration filter axis | 32 |
 | Configuration key | 4096 bytes |
 | Segments in one configuration route | 64 |

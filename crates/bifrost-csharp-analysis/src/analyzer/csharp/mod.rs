@@ -7,6 +7,12 @@
 //! forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and the
 //! `LanguageSupport` SPI block.
 
+/// Presence selects the dormant native producer in trial builds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn trial_native_csharp_selected() -> bool {
+    std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_some()
+}
+
 use brokk_bifrost_analysis::{
     delegate_inner_methods, delegate_inner_procedure_fact_methods,
     forward_file_identity_invalidation, forward_relational_definition_batch,
@@ -200,6 +206,7 @@ pub(crate) use crate::analyzer::csharp::dependency_discovery::is_csharp_dependen
 pub(crate) use crate::analyzer::csharp::dependency_discovery::is_csharp_dependency_input_path;
 
 fn cached_file_value<T: Clone + Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
     cache: &Cache<ProjectFile, Arc<T>>,
     file: &ProjectFile,
     compute: impl FnOnce() -> T,
@@ -207,9 +214,14 @@ fn cached_file_value<T: Clone + Send + Sync + 'static>(
     if let Some(cached) = cache.get(file) {
         return (*cached).clone();
     }
-    let value = compute();
-    cache.insert(file.clone(), Arc::new(value.clone()));
-    value
+    match cache.try_get_with_by_ref(file, || {
+        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
+            Arc::new(compute())
+        })
+    }) {
+        Ok(value) => (*value).clone(),
+        Err(value) => (**value).clone(),
+    }
 }
 
 fn cached_limited_query_rows<T>(
@@ -423,7 +435,7 @@ impl CSharpAnalyzer {
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
-        cached_file_value(&self.memo_caches.namespace_by_file, file, || {
+        cached_file_value(self, &self.memo_caches.namespace_by_file, file, || {
             graph_support::compute_namespace_of_file(self, file)
         })
     }
@@ -439,22 +451,39 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
             return limited_known_rows(1, std::iter::once((*cached).clone()), limit);
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
+            );
         let batch = graph_support::compute_namespace_of_file_limited(self, file, limit);
         if batch.complete {
             let namespace = batch.rows.first().cloned().unwrap_or_default();
-            self.memo_caches
-                .namespace_by_file
-                .insert(file.clone(), Arc::new(namespace));
+            {
+                let cache_key = file.clone();
+                let cache_value = Arc::new(namespace);
+                persistent_fill_guard.installed("namespace_by_file");
+                self.memo_caches
+                    .namespace_by_file
+                    .insert(cache_key, cache_value);
+            };
         }
         batch
     }
 
     pub fn external_declaration_index(&self) -> &CSharpExternalDeclarationIndex {
         self.external_index.get_or_init(|| {
-            CSharpExternalDeclarationIndex::build_for_project(
+            let value = CSharpExternalDeclarationIndex::build_for_project(
                 &self.csharp_config,
                 self.inner.project(),
-            )
+            );
+            if !value.is_complete() || !value.production_diagnostics().is_empty() {
+                self.record_degraded_persistent_fill(
+                    "csharp.external_index",
+                    &format!("provider:{:?}", value.production_diagnostics()),
+                );
+            }
+            value
         })
     }
 
@@ -518,6 +547,23 @@ impl CSharpAnalyzer {
             return (BoundaryStatus::ExternalDeclaredUnindexed, None);
         }
         (BoundaryStatus::ExternalUnknown, None)
+    }
+
+    pub(crate) fn type_forward_boundary(
+        &self,
+        packs: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        reference: &str,
+    ) -> Option<String> {
+        self.external_declarations(packs).forward_boundary_in_file(
+            reference,
+            &self.namespace_of_file(file),
+            &self.using_namespaces_of(token, file),
+            &self.using_aliases_of(token, file),
+        )
     }
 
     pub fn external_member_candidates(
@@ -642,10 +688,20 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
+            );
         let namespaces = graph_support::compute_using_namespaces_of(self, token, file);
-        self.memo_caches
-            .using_namespaces
-            .insert(file.clone(), Arc::new(namespaces.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(namespaces.clone());
+            persistent_fill_guard.installed("using_namespaces");
+            self.memo_caches
+                .using_namespaces
+                .insert(cache_key, cache_value);
+        };
         namespaces
     }
 
@@ -659,6 +715,11 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
             return limited_known_rows(cached.len(), cached.iter().cloned(), limit);
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
+            );
         let batch = graph_support::compute_using_namespaces_of_limited(
             self,
             token,
@@ -667,9 +728,14 @@ impl CSharpAnalyzer {
             &mut continue_query,
         );
         if batch.complete {
-            self.memo_caches
-                .using_namespaces
-                .insert(file.clone(), Arc::new(batch.rows.clone()));
+            {
+                let cache_key = file.clone();
+                let cache_value = Arc::new(batch.rows.clone());
+                persistent_fill_guard.installed("using_namespaces");
+                self.memo_caches
+                    .using_namespaces
+                    .insert(cache_key, cache_value);
+            };
         }
         batch
     }
@@ -682,10 +748,20 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.using_aliases.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
+            );
         let aliases = Arc::new(graph_support::compute_using_aliases_of(self, token, file));
-        self.memo_caches
-            .using_aliases
-            .insert(file.clone(), Arc::clone(&aliases));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&aliases);
+            persistent_fill_guard.installed("using_aliases");
+            self.memo_caches
+                .using_aliases
+                .insert(cache_key, cache_value);
+        };
         aliases
     }
 
@@ -725,9 +801,13 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn global_using_namespaces(&self, token: QueryToken<'_>) -> &HashSet<String> {
-        self.memo_caches
-            .global_using_namespaces
-            .get_or_init(|| graph_support::compute_global_using_namespaces(self, token))
+        self.memo_caches.global_using_namespaces.get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "csharp.global_using_namespaces",
+                || graph_support::compute_global_using_namespaces(self, token),
+            )
+        })
     }
 
     pub(crate) fn global_using_namespaces_limited(
@@ -756,9 +836,13 @@ impl CSharpAnalyzer {
     }
 
     fn global_using_aliases(&self, token: QueryToken<'_>) -> &HashMap<String, String> {
-        self.memo_caches
-            .global_using_aliases
-            .get_or_init(|| graph_support::compute_global_using_aliases(self, token))
+        self.memo_caches.global_using_aliases.get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "csharp.global_using_aliases",
+                || graph_support::compute_global_using_aliases(self, token),
+            )
+        })
     }
 
     pub(crate) fn global_using_aliases_limited(
@@ -795,7 +879,13 @@ impl CSharpAnalyzer {
     pub(crate) fn global_static_using_type_names(&self, token: QueryToken<'_>) -> &[String] {
         self.memo_caches
             .global_static_using_type_names
-            .get_or_init(|| graph_support::compute_global_static_using_type_names(self, token))
+            .get_or_init(|| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "csharp.global_static_using_type_names",
+                    || graph_support::compute_global_static_using_type_names(self, token),
+                )
+            })
     }
 
     pub(crate) fn global_static_using_type_names_limited(
@@ -821,15 +911,25 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn global_static_using_types(&self, token: QueryToken<'_>) -> &[CodeUnit] {
-        self.memo_caches
-            .global_static_using_types
-            .get_or_init(|| graph_support::compute_global_static_using_types(self, token))
+        self.memo_caches.global_static_using_types.get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "csharp.global_static_using_types",
+                || graph_support::compute_global_static_using_types(self, token),
+            )
+        })
     }
 
     pub(crate) fn usage_global_static_using_types(&self, token: QueryToken<'_>) -> &[CodeUnit] {
         self.memo_caches
             .usage_global_static_using_types
-            .get_or_init(|| graph_support::compute_usage_global_static_using_types(self, token))
+            .get_or_init(|| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "csharp.usage_global_static_using_types",
+                    || graph_support::compute_usage_global_static_using_types(self, token),
+                )
+            })
     }
 }
 
@@ -905,10 +1005,6 @@ impl CSharpSource for CSharpAnalyzer {
         candidate: &ProjectFile,
     ) -> Option<graph_support::CSharpCompilationVisibility> {
         CSharpAnalyzer::compilation_visibility(self, reference, candidate)
-    }
-
-    fn shared_source(&self) -> Arc<dyn graph_support::CSharpSource> {
-        Arc::new(self.clone())
     }
 
     fn direct_ancestors_through(
@@ -1076,7 +1172,7 @@ impl CSharpSource for CSharpAnalyzer {
     }
 
     fn file_using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
-        cached_file_value(&self.memo_caches.file_using_namespaces, file, || {
+        cached_file_value(self, &self.memo_caches.file_using_namespaces, file, || {
             graph_support::file_using_namespaces(self, token, file)
         })
     }
@@ -1085,12 +1181,18 @@ impl CSharpSource for CSharpAnalyzer {
         self.memo_caches
             .sorted_global_using_namespaces
             .get_or_init(|| {
-                let mut namespaces: Vec<_> = CSharpSource::global_using_namespaces(self)
-                    .iter()
-                    .cloned()
-                    .collect();
-                namespaces.sort();
-                namespaces
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "csharp.sorted_global_using_namespaces",
+                    || {
+                        let mut namespaces: Vec<_> = CSharpSource::global_using_namespaces(self)
+                            .iter()
+                            .cloned()
+                            .collect();
+                        namespaces.sort();
+                        namespaces
+                    },
+                )
             })
             .clone()
     }
@@ -1331,6 +1433,42 @@ impl CodeUnitIndex for CSharpAnalyzer {
 }
 
 impl IAnalyzer for CSharpAnalyzer {
+    fn statement_source_facts(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
+        use brokk_bifrost_core::analyzer::statement_facts::producer::capture_statement_facts;
+        use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+        use brokk_bifrost_csharp::structural::CSHARP_STRUCTURAL_SPEC;
+        let snapshot = brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk(
+            self.inner.file_source(file)?,
+        );
+        let key = (snapshot.oid(), file.clone());
+        let source = snapshot.source();
+        if let Some(rows) = self.memo_caches.statement_facts.get(&key) {
+            return Some(rows);
+        }
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar");
+        if let Some(ranges) = CSHARP_STRUCTURAL_SPEC.parser_included_ranges(source) {
+            parser
+                .set_included_ranges(&ranges)
+                .expect("C# preprocessor included ranges");
+        }
+        let tree = parser.parse(source, None)?;
+        let rows = Arc::new(capture_statement_facts(
+            &CSHARP_STRUCTURAL_SPEC,
+            tree.root_node(),
+            source,
+        ));
+        self.memo_caches
+            .statement_facts
+            .insert(key, Arc::clone(&rows));
+        Some(rows)
+    }
+
     delegate_inner_procedure_fact_methods!();
 
     forward_relational_definition_batch!();
@@ -1467,12 +1605,21 @@ impl IAnalyzer for CSharpAnalyzer {
             changed_files,
             dependency_discovery::is_csharp_dependency_input,
         );
-        Self {
+        let updated = Self {
             inner: self.inner.update(changed_files),
             memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
             csharp_config: self.csharp_config.clone(),
             external_index,
+        };
+        if Arc::ptr_eq(&self.external_index, &updated.external_index)
+            && self.degraded_persistent_fills() > 0
+        {
+            updated.record_degraded_persistent_fill(
+                "retained_external_index",
+                "inherited_degraded_owner",
+            );
         }
+        updated
     }
 
     fn update_all(&self) -> Self {
@@ -1665,7 +1812,78 @@ static CSHARP_USAGE_STRATEGY: CSharpUsageGraphStrategy = CSharpUsageGraphStrateg
 #[doc(hidden)]
 pub struct CSharpSupport;
 
+fn csharp_branch_reference_site(
+    node: tree_sitter::Node<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite> {
+    use brokk_bifrost_analysis::analyzer::structural::branch_relations::{
+        BranchReferenceKind, BranchReferenceSite,
+    };
+    let (focus, kind) = match node.kind() {
+        "invocation_expression" => {
+            let function = node.child_by_field_name("function")?;
+            if function.kind() != "identifier" {
+                return None;
+            }
+            (function, BranchReferenceKind::Method)
+        }
+        "identifier"
+            if node.parent().is_some_and(|parent| {
+                parent.kind() == "invocation_expression"
+                    && parent.child_by_field_name("function") == Some(node)
+            }) =>
+        {
+            return None;
+        }
+        "identifier" => (node, BranchReferenceKind::Field),
+        _ => return None,
+    };
+    Some(BranchReferenceSite {
+        range: (focus.start_byte(), focus.end_byte()),
+        kind,
+    })
+}
+
 impl LanguageSupport for CSharpSupport {
+    fn branch_current_object_fields(
+        &self,
+    ) -> Option<
+        brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchCurrentObjectFields,
+    > {
+        Some(brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchCurrentObjectFields {
+            access_kind: "member_access_expression",
+            receiver_field: "expression",
+            member_field: "name",
+            current_kind: "this",
+            parent_kind: "base",
+            invocation_kind: "invocation_expression",
+            invocation_target_field: "function",
+            storage_ancestors: &["variable_declarator", "variable_declaration", "field_declaration"],
+        })
+    }
+
+    fn branch_body_reference_site(
+        &self,
+        node: tree_sitter::Node<'_>,
+        _source: &str,
+    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite>
+    {
+        csharp_branch_reference_site(node)
+    }
+
+    fn branch_condition_reference_site(
+        &self,
+        node: tree_sitter::Node<'_>,
+        _source: &str,
+    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite>
+    {
+        csharp_branch_reference_site(node)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn supports_selected_resolution_overlays(&self) -> bool {
+        true
+    }
+
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
@@ -1720,6 +1938,25 @@ impl LanguageSupport for CSharpSupport {
         &self,
     ) -> Option<brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles> {
         Some(semantic::PROCEDURE_SYNTAX_ROLES)
+    }
+
+    fn lexical_pattern_bindings(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::LexicalPatternBindings> {
+        Some(
+            brokk_bifrost_analysis::analyzer::languages::LexicalPatternBindings {
+                declaration_for_name:
+                    brokk_bifrost_csharp::structural::csharp_pattern_binding_declaration,
+                is_scope: brokk_bifrost_csharp::structural::csharp_pattern_scope,
+                visible_at: brokk_bifrost_csharp::structural::csharp_pattern_binding_visible,
+                bindings_may_escape_scope:
+                    brokk_bifrost_csharp::structural::csharp_pattern_bindings_may_escape_scope,
+            },
+        )
+    }
+
+    fn refine_legacy_incoming_overload_families(&self) -> bool {
+        true
     }
 
     fn referencing_candidate_files(
@@ -2299,5 +2536,254 @@ mod package_inventory_gate_tests {
             Some(true),
             "a dirty structured declaration is positive evidence even when persistence misses"
         );
+    }
+
+    #[test]
+    fn csharp_using_namespace_reads_follow_file_and_global_directives() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_core::analyzer::query_token::QueryScope;
+        use brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource;
+        use brokk_bifrost_csharp::graph_support::CSharpSource;
+
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file(
+                "GlobalUsings.cs",
+                "global using Zeta; global using Alpha; global using static Helpers.Tools;",
+            )
+            .file(
+                "Helpers/Tools.cs",
+                "namespace Helpers { public class Tools {} }",
+            )
+            .file(
+                "Beta/Types.cs",
+                "namespace Beta { public class BetaType {} }",
+            )
+            .file(
+                "Consumer.cs",
+                "using Beta; namespace App; class Consumer { BetaType value; }",
+            )
+            .file(
+                "Alpha/Types.cs",
+                "namespace Alpha { public class AlphaType {} }",
+            )
+            .file(
+                "Zeta/Types.cs",
+                "namespace Zeta { public class ZetaType {} }",
+            )
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let file = fixture.file("Consumer.cs");
+        let source = MembershipScopedSource::new(&analyzer, &file);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+
+        let mut namespaces = source.using_namespaces_of(&file);
+        namespaces.sort();
+        assert_eq!(namespaces, vec!["Alpha", "Beta", "Zeta"]);
+        let limited = source.using_namespaces_of_limited(&file, 32, &mut || true);
+        assert!(limited.complete, "complete file using query: {limited:?}");
+        let mut limited_namespaces = limited.rows;
+        limited_namespaces.sort();
+        assert_eq!(limited_namespaces, vec!["Alpha", "Beta", "Zeta"]);
+        assert_eq!(source.file_using_namespaces_of(token, &file), vec!["Beta"]);
+        assert_eq!(
+            source.sorted_global_using_namespaces(),
+            vec!["Alpha", "Zeta"]
+        );
+        assert_eq!(
+            source.global_static_using_type_names(),
+            &["Helpers.Tools".to_owned()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_producer_tests {
+    #[test]
+    fn csharp_trial_cold_index_publishes_resolution_rows() {
+        const CHILD: &str = "BIFROST_CSHARP_COLD_INDEX_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for trial in [false, true] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "analyzer::csharp::native_producer_tests::csharp_trial_cold_index_publishes_resolution_rows", "--nocapture"])
+                    .env(CHILD, "1").env_remove("BIFROST_TRIAL_NATIVE_CSHARP");
+                if trial {
+                    command.env("BIFROST_TRIAL_NATIVE_CSHARP", "");
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "trial={trial}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                    "child must run: {output:?}"
+                );
+            }
+            return;
+        }
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{
+            TreeSitterAnalyzer, store_context_from_store,
+        };
+        use brokk_bifrost_core::analyzer::Language;
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A.cs", "namespace Demo { class A { B field; } }")
+            .file("B.cs", "namespace Demo { class B {} }")
+            .build();
+        let project = fixture.project_dyn();
+        let expected = project.analyzable_files(Language::CSharp).unwrap().len();
+        assert_eq!(expected, 2);
+        let directory = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&directory.path().join("cold.db")).unwrap();
+        let context = store_context_from_store(project.as_ref(), store, false);
+        let store = context.store.clone();
+        let _analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            super::adapter::CSharpAdapter,
+            Default::default(),
+            context,
+            None,
+        )
+        .unwrap();
+        let sql = store.read_conn().unwrap();
+        let indexed: usize = sql
+            .query_row(
+                "SELECT count(*) FROM blobs WHERE lang='csharp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, expected, "prove cold indexing ran");
+        let published: usize = sql.query_row("SELECT count(DISTINCT fact.blob_id) FROM resolution_sites fact JOIN blobs ON blobs.id=fact.blob_id WHERE blobs.lang='csharp'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            published,
+            if super::trial_native_csharp_selected() {
+                expected
+            } else {
+                0
+            }
+        );
+        let bridged: usize = sql.query_row(
+            "SELECT count(*) FROM source_native_declaration_bridges native JOIN source_declaration_units unit ON unit.blob_id=native.blob_id AND unit.declaration_id=native.declaration_id JOIN blobs ON blobs.id=native.blob_id WHERE blobs.lang='csharp'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            bridged,
+            if super::trial_native_csharp_selected() {
+                3
+            } else {
+                0
+            },
+            "two classes and a field must share extractor declaration identities"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lexical_pattern_tests {
+    use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+        LexicalBindingResolution, resolve_lexical_binding,
+    };
+    use brokk_bifrost_analysis::analyzer::{DeclarationKind, Language};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#7369: a C# pattern variable in a local initializer resolved to a same-named field")]
+    fn pattern_binding_in_local_initializer_shadows_field() {
+        let source = "class C { object other; bool Test(object obj) { bool matched = obj is C other && Use(other); return matched; } }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let start = source.find("Use(other)").unwrap() + "Use(".len();
+        let binding = resolve_lexical_binding(
+            Language::CSharp,
+            tree.root_node(),
+            source,
+            start,
+            start + "other".len(),
+            "other",
+        );
+        let Some(LexicalBindingResolution::OtherLocal(binding)) = binding else {
+            panic!("missing initializer pattern binding: {binding:?}");
+        };
+        assert_eq!(binding.kind, DeclarationKind::PatternVariable);
+        assert_eq!(
+            &source[binding.declaration_range.start_byte..binding.declaration_range.end_byte],
+            "C other"
+        );
+    }
+
+    #[test]
+    #[hardwon("#7369: pattern binders were absent from expression and switch lexical scopes")]
+    fn pattern_bindings_follow_expression_and_switch_scopes() {
+        for (body, declaration) in [
+            ("=> obj is C other && Use(other);", Some("C other")),
+            ("=> obj is C {} other && Use(other);", Some("C {} other")),
+            ("=> obj is var other && Use(other);", Some("var other")),
+            ("=> obj is [var other] && Use(other);", Some("var other")),
+            (
+                "=> obj is (var first, var other) && Use(other);",
+                Some("var other"),
+            ),
+            (
+                "=> obj switch { C other => Use(other), _ => false };",
+                Some("C other"),
+            ),
+            (
+                "{ switch (obj) { case C other: return Use(other); default: return false; } }",
+                Some("C other"),
+            ),
+            ("=> obj switch { C other => true, _ => Use(other) };", None),
+            ("{ { if (obj is C other) {} } return Use(other); }", None),
+            (
+                "{ bool Inner(object arg) => arg is C other; return Use(other); }",
+                None,
+            ),
+            (
+                "{ System.Func<object, bool> f = value => value is C other && Use(other); }",
+                Some("C other"),
+            ),
+            ("=> Use(other);", None),
+        ] {
+            let source = format!("class C {{ bool Eq(object obj) {body} }}");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{source}: {}",
+                tree.root_node().to_sexp()
+            );
+            let start = source.find("Use(other)").unwrap() + "Use(".len();
+            let binding = resolve_lexical_binding(
+                Language::CSharp,
+                tree.root_node(),
+                &source,
+                start,
+                start + "other".len(),
+                "other",
+            );
+            let Some(declaration) = declaration else {
+                assert_eq!(binding, None, "{source}");
+                continue;
+            };
+            let Some(LexicalBindingResolution::OtherLocal(binding)) = binding else {
+                panic!("{source}: missing pattern binding: {binding:?}");
+            };
+            assert_eq!(binding.kind, DeclarationKind::PatternVariable, "{source}");
+            assert_eq!(
+                &source[binding.name_range.start_byte..binding.name_range.end_byte],
+                "other"
+            );
+            assert_eq!(
+                &source[binding.declaration_range.start_byte..binding.declaration_range.end_byte],
+                declaration,
+                "{source}"
+            );
+        }
     }
 }

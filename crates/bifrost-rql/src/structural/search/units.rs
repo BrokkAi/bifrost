@@ -180,6 +180,7 @@ impl<'a> CodeQueryExecutionScope<'a> {
 /// used, or its rows would not be that execution's rows.
 pub fn execute_code_query_unit(
     analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
@@ -194,11 +195,20 @@ pub fn execute_code_query_unit(
             1,
             "a seed-union unit must narrow exactly one seed file"
         );
-        return execute_seed_union_unit(analyzer, workspace, query, limits, cancellation, scope);
+        return execute_seed_union_unit(
+            analyzer,
+            flow_state.clone(),
+            workspace,
+            query,
+            limits,
+            cancellation,
+            scope,
+        );
     }
     let mut row_keys = Vec::new();
     let detailed = execute_detailed_unit(
         analyzer,
+        flow_state.clone(),
         workspace,
         query,
         limits,
@@ -214,6 +224,7 @@ pub fn execute_code_query_unit(
 /// query's limit is a cap on the union after all branches have been composed.
 fn execute_seed_union_unit(
     analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
@@ -252,6 +263,7 @@ fn execute_seed_union_unit(
         leaf_scope.inherited_suffix_steps = inherited_suffix_steps;
         let detailed = execute_detailed_unit(
             analyzer,
+            flow_state.clone(),
             workspace,
             &leaf_query,
             limits,
@@ -314,8 +326,10 @@ pub struct SelectorUnitExecution {
 #[allow(clippy::too_many_arguments)]
 pub fn execute_code_query_selector_unit(
     workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
+    root_allotment: super::CodeQueryRootAllotment,
     cancellation: Option<&CancellationToken>,
     parent_semantic: &SemanticBudget,
     parent_execution: &SemanticExecutionBudget,
@@ -325,8 +339,10 @@ pub fn execute_code_query_selector_unit(
     let mut row_keys = Vec::new();
     let detailed = execute_detailed_selector_unit(
         workspace,
+        flow_state.clone(),
         query,
         limits,
+        root_allotment,
         cancellation,
         parent_semantic,
         parent_execution,
@@ -385,8 +401,10 @@ fn project_unit_result(
 #[allow(clippy::too_many_arguments)]
 fn execute_detailed_selector_unit(
     workspace: &WorkspaceAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
+    root_allotment: super::CodeQueryRootAllotment,
     cancellation: Option<&CancellationToken>,
     parent_semantic: &SemanticBudget,
     parent_execution: &SemanticExecutionBudget,
@@ -404,7 +422,7 @@ fn execute_detailed_selector_unit(
         workspace.analyzer(),
         token,
         Some(workspace),
-        None,
+        Some(flow_state.into()),
         None,
         0,
         query,
@@ -419,6 +437,7 @@ fn execute_detailed_selector_unit(
         Some(SemanticQueryContinuation {
             parent_scope,
             child_semantic_limits: parent_semantic.remaining(),
+            root_allotment,
             execution_before,
             execution_child,
             artifact_leases,
@@ -430,8 +449,10 @@ fn execute_detailed_selector_unit(
 }
 
 /// The detailed execution one unit runs, with its rows' dedup keys.
+#[allow(clippy::too_many_arguments)]
 fn execute_detailed_unit(
     analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
     workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
@@ -446,7 +467,7 @@ fn execute_detailed_unit(
         analyzer,
         token,
         workspace,
-        None,
+        Some(flow_state.into()),
         None,
         0,
         query,
@@ -2503,7 +2524,7 @@ pub fn merge_unit_rows(
             PlanPartitioning::fair_share_divisor(&query.plan)
                 .expect("a seed-partitioned set has a checked fair-share divisor")
         }
-        PlanPartitioning::BySeed | PlanPartitioning::Whole => 1,
+        PlanPartitioning::BySeed | PlanPartitioning::Whole(_) => 1,
     };
     let mut raw_rows = Vec::new();
 
@@ -2686,7 +2707,7 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
             }
             (leaves, structural)
         }
-        PlanPartitioning::BySeed | PlanPartitioning::Whole => {
+        PlanPartitioning::BySeed | PlanPartitioning::Whole(_) => {
             let structural = seed_languages(plan).1;
             (vec![plan.clone()], structural)
         }

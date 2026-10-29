@@ -48,8 +48,8 @@ use crate::graph_support::{CSharpCompilationVisibility, CSharpSource, identity_v
 /// declaration of unproven membership is kept and counted as doubt, and a
 /// declaration outside the workspace (a different [`ProjectFile`] root) or a
 /// visible one passes unchanged.
-pub struct MembershipScopedSource {
-    inner: Arc<dyn CSharpSource>,
+pub struct MembershipScopedSource<'a> {
+    inner: &'a dyn CSharpSource,
     reference: ProjectFile,
     /// Request-lifetime membership answers by declaring file.
     ///
@@ -74,8 +74,8 @@ pub struct MembershipScopedSource {
 /// Direct ancestors and whether deriving them admitted doubt.
 type DoubtedAncestors = (Vec<CodeUnit>, bool);
 
-impl MembershipScopedSource {
-    pub fn new(inner: Arc<dyn CSharpSource>, reference: &ProjectFile) -> Self {
+impl<'a> MembershipScopedSource<'a> {
+    pub fn new(inner: &'a dyn CSharpSource, reference: &ProjectFile) -> Self {
         Self {
             inner,
             reference: reference.clone(),
@@ -91,7 +91,7 @@ impl MembershipScopedSource {
     /// The analyzer source this view filters, for questions about every
     /// physical declaration of an identity rather than the visible ones.
     pub fn unscoped(&self) -> &dyn CSharpSource {
-        self.inner.as_ref()
+        self.inner
     }
 
     /// Number of unproven-membership declarations (and failed membership reads)
@@ -182,7 +182,7 @@ impl MembershipScopedSource {
             Some(answer) => answer,
             None => {
                 let answer = identity_visibility(
-                    self.inner.as_ref(),
+                    self.inner,
                     &self.reference,
                     &fqn,
                     Some(part),
@@ -257,7 +257,7 @@ impl MembershipScopedSource {
     /// resolved to, and a transitive walk visits one part per type, so a
     /// type's descendants are those of all its parts.
     fn physical_parts(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        let mut parts = crate::graph_support::partial_type_parts(self.inner.as_ref(), code_unit);
+        let mut parts = crate::graph_support::partial_type_parts(self.inner, code_unit);
         if !parts.contains(code_unit) {
             parts.push(code_unit.clone());
         }
@@ -322,7 +322,7 @@ impl MembershipScopedSource {
     }
 }
 
-impl CodeUnitIndex for MembershipScopedSource {
+impl CodeUnitIndex for MembershipScopedSource<'_> {
     fn project(&self) -> &dyn brokk_bifrost_core::analyzer::project::Project {
         self.inner.project()
     }
@@ -607,7 +607,7 @@ impl CodeUnitIndex for MembershipScopedSource {
     }
 }
 
-impl ImportAnalysisProvider for MembershipScopedSource {
+impl ImportAnalysisProvider for MembershipScopedSource<'_> {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         Arc::new(self.admit_set(self.inner.imported_code_units_of(file).iter().cloned()))
     }
@@ -830,7 +830,7 @@ impl ImportAnalysisProvider for MembershipScopedSource {
 /// A descendant from the analyzer's index stays only when that derivation
 /// names the ancestor. Transitive walks and scoped variants use the trait
 /// defaults over these two.
-impl TypeHierarchyProvider for MembershipScopedSource {
+impl TypeHierarchyProvider for MembershipScopedSource<'_> {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let cached = self
             .direct_ancestors
@@ -890,7 +890,7 @@ impl TypeHierarchyProvider for MembershipScopedSource {
     }
 }
 
-impl CSharpSource for MembershipScopedSource {
+impl CSharpSource for MembershipScopedSource<'_> {
     fn persisted_declaration_candidates_by_fqn(
         &self,
         fqn: &str,
@@ -984,21 +984,6 @@ impl CSharpSource for MembershipScopedSource {
         code_unit: &CodeUnit,
     ) -> Vec<CodeUnit> {
         self.inner.direct_ancestors_through(view, code_unit)
-    }
-
-    /// The same view: shared answers and doubt, so a derivation that takes
-    /// an owned source still counts its doubt here.
-    fn shared_source(&self) -> Arc<dyn CSharpSource> {
-        Arc::new(Self {
-            inner: Arc::clone(&self.inner),
-            reference: self.reference.clone(),
-            answers: Arc::clone(&self.answers),
-            type_identities: Arc::clone(&self.type_identities),
-            direct_ancestors: Arc::clone(&self.direct_ancestors),
-            doubt: Arc::clone(&self.doubt),
-            static_types: OnceLock::new(),
-            usage_static_types: OnceLock::new(),
-        })
     }
 
     fn with_usage_definitions(
@@ -1186,7 +1171,7 @@ impl CSharpSource for MembershipScopedSource {
 /// [`MembershipScopedSource`].
 struct MembershipScopedLookup<'l, 's> {
     inner: &'l dyn BoundedDefinitionLookup,
-    source: &'s MembershipScopedSource,
+    source: &'s MembershipScopedSource<'s>,
 }
 
 impl BoundedDefinitionLookup for MembershipScopedLookup<'_, '_> {

@@ -19,6 +19,64 @@ mod fact_resolution {
         use brokk_bifrost_test_macros::hardwon;
         use tree_sitter::Parser;
 
+        fn crate_receiver_outcome(
+            analyzer: &crate::analyzer::rust::RustAnalyzer,
+            source: &str,
+            marker: &str,
+        ) -> brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome
+        {
+            use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+            use brokk_bifrost_core::analyzer::{
+                model::Range,
+                usages::{
+                    receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                    reference_site::ResolvedReferenceSite, resolution_session::BoundedResolution,
+                },
+            };
+            let position = source.find(marker).expect("fixture call marker")
+                + marker.rfind('.').expect("member marker")
+                + 1;
+            let line = source[..position]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let site = ResolvedReferenceSite {
+                path: marker.to_owned(),
+                text: "run".to_owned(),
+                range: Range {
+                    start_byte: position,
+                    end_byte: position + 3,
+                    start_line: line,
+                    end_line: line,
+                },
+                focus_start_byte: position,
+                focus_end_byte: position + 3,
+            };
+            let file = crate::analyzer::rust::test_support::analyzed_file(analyzer, "src/lib.rs");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let BoundedResolution::Complete { value, .. } =
+                crate::analyzer::rust::native_points::resolve_rust_definition_bounded(
+                    BoundedReceiverQuery {
+                        analyzer,
+                        file: &file,
+                        source,
+                        tree: Some(&tree),
+                        site: &site,
+                        budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                        cancellation: None,
+                    },
+                )
+            else {
+                panic!("fixture query must complete");
+            };
+            value
+        }
+
         #[test]
         #[hardwon("955f6461cafc: a unit struct value is an instance of its struct")]
         fn a_unit_struct_value_is_an_instance_of_its_struct() {
@@ -597,6 +655,8 @@ fn caller() {
         )]
         fn parsed_rust_unwrapped_initializers_reach_the_payload_and_wrapped_ones_do_not() {
             let source = r#"
+use std::result::Result;
+use std::option::Option;
 pub struct Service;
 pub struct Failure;
 
@@ -626,37 +686,33 @@ fn use_wrapped() {
     wrapped.run();
 }
 "#;
-            // This context-free fixture isolates payload propagation; the public
-            // factory needs no selected module-access proof.
-            let fixture = parsed_rust_fixture(source, b"rust-unwrap-initializer");
-            let target = definition_after(&fixture, "pub fn run", "run");
-            // `?`, `.unwrap()` and `.expect(..)` each remove the one unproven layer
-            // that the `Option`/`Result` payload encoding adds, so the binding holds
-            // the payload and reaches its members.
+            let (_project, analyzer) = crate::analyzer::rust::test_support::project(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname=\"payload_fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+                ),
+                ("src/lib.rs", source),
+            ]);
+            use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
+            use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+            let run = analyzer.get_definitions("payload_fixture.Service.run");
+            assert_eq!(run.len(), 1, "the fixture has one payload member");
             for marker in ["expected.run", "tried.run", "taken.run"] {
-                let reference = callable_reference_named_at(&fixture, marker, "run");
-                let answer = fixture
-                    .service
-                    .resolve_reference(reference, &CancellationToken::new())
-                    .expect("Rust unwrapped receiver evaluation succeeds");
-                assert_eq!(answer.binding().targets(), &[target], "{marker}");
+                let answer = crate_receiver_outcome(&analyzer, source, marker);
+                assert_eq!(answer.definitions, run, "{marker}: {answer:?}");
                 assert_eq!(
-                    answer.binding().completion(),
-                    &ResolutionCompletion::Complete,
-                    "{marker}"
+                    answer.status,
+                    DefinitionLookupStatus::Resolved,
+                    "{marker}: {answer:?}"
                 );
             }
-            // An un-unwrapped `Result` receiver keeps the payload behind that layer.
-            // Refusing it is the point: the incumbent's `ConstructorReturn::NeedsUnwrap`
-            // refuses the same receiver, and a transparent projection would be a false
-            // affirmative.
-            let wrapped = callable_reference_named_at(&fixture, "wrapped.run", "run");
-            let answer = fixture
-                .service
-                .resolve_reference(wrapped, &CancellationToken::new())
-                .expect("Rust wrapped receiver evaluation succeeds");
-            assert!(answer.binding().targets().is_empty());
-            assert_incomplete(&answer);
+            let wrapped = crate_receiver_outcome(&analyzer, source, "wrapped.run");
+            assert!(wrapped.definitions.is_empty(), "{wrapped:?}");
+            assert_ne!(
+                wrapped.status,
+                DefinitionLookupStatus::Resolved,
+                "{wrapped:?}"
+            );
         }
 
         #[test]
@@ -744,6 +800,9 @@ fn unknown() { generated(); }
         #[hardwon("#3828: smart pointer member references lost complete receiver resolution")]
         fn parsed_rust_owning_smart_pointer_receivers_reach_their_payload_members() {
             let source = r#"
+use std::boxed::Box;
+use std::sync::Arc;
+use std::rc::Rc;
 pub struct Service;
 
 impl Service {
@@ -754,7 +813,7 @@ fn use_boxed(boxed: Box<Service>) {
     boxed.run();
 }
 
-fn use_shared(shared: std::sync::Arc<Service>) {
+fn use_shared(shared: Arc<Service>) {
     shared.run();
 }
 
@@ -770,41 +829,32 @@ fn use_plain(plain: Wrapper) {
     plain.run();
 }
 "#;
-            let fixture = parsed_rust_fixture(source, b"rust-smart-pointer-receiver");
-            let target = definition_after(&fixture, "impl Service", "run");
-            // `Box<T>`, `Arc<T>` and `Rc<T>` dereference to `T`, so a receiver of one
-            // of them reaches `T`'s members with no explicit operation.
+            let (_project, analyzer) = crate::analyzer::rust::test_support::project(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname=\"pointer_fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+                ),
+                ("src/lib.rs", source),
+            ]);
+            use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
+            use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+            let run = analyzer.get_definitions("pointer_fixture.Service.run");
+            assert_eq!(run.len(), 1, "the fixture has one payload member");
             for marker in ["boxed.run", "shared.run", "counted.run"] {
-                let reference = callable_reference_named_at(&fixture, marker, "run");
-                let answer = fixture
-                    .service
-                    .resolve_reference(reference, &CancellationToken::new())
-                    .expect("Rust smart-pointer receiver evaluation succeeds");
-                assert_eq!(answer.binding().targets(), &[target], "{marker}");
+                let answer = crate_receiver_outcome(&analyzer, source, marker);
+                assert_eq!(answer.definitions, run, "{marker}: {answer:?}");
                 assert_eq!(
-                    answer.binding().completion(),
-                    &ResolutionCompletion::Complete,
-                    "{marker}"
+                    answer.status,
+                    DefinitionLookupStatus::Resolved,
+                    "{marker}: {answer:?}"
                 );
             }
-            // An unknown generic head is not transparent: the receiver keeps the
-            // head and finds no member. Since #3828 the written type argument is a
-            // relational row instead of an unsupported-syntax gap, so the generic
-            // receiver answers exactly as the same head written without arguments.
-            let answer_at = |marker| {
-                let reference = callable_reference_named_at(&fixture, marker, "run");
-                fixture
-                    .service
-                    .resolve_reference(reference, &CancellationToken::new())
-                    .expect("Rust unresolved-head receiver evaluation succeeds")
-            };
-            let opaque = answer_at("opaque.run");
-            let plain = answer_at("plain.run");
-            assert!(opaque.binding().targets().is_empty(), "{opaque:?}");
-            assert!(plain.binding().targets().is_empty(), "{plain:?}");
+            let opaque = crate_receiver_outcome(&analyzer, source, "opaque.run");
+            let plain = crate_receiver_outcome(&analyzer, source, "plain.run");
+            assert!(opaque.definitions.is_empty(), "{opaque:?}");
+            assert!(plain.definitions.is_empty(), "{plain:?}");
             assert_eq!(
-                opaque.binding().completion(),
-                plain.binding().completion(),
+                opaque.status, plain.status,
                 "opaque={opaque:?} plain={plain:?}"
             );
         }

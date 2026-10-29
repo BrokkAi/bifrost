@@ -333,12 +333,16 @@ impl PhpSourcePropertyCollector {
                         class,
                         &mut || true,
                     ),
-                    value_type: value_type.clone(),
-                    doc_element_type: doc_element_type.clone(),
+                    value_type,
+                    doc_element_type,
                 });
-                if kind == PhpFieldWriteKind::Indexed {
-                    break;
-                }
+                break;
+            }
+            if matches!(
+                class.kind(),
+                "anonymous_class" | "trait_declaration" | "enum_declaration"
+            ) {
+                break;
             }
             ancestor = class.parent();
         }
@@ -356,5 +360,136 @@ impl PhpSourcePropertyCollector {
             .declarations
             .get(&node.id())
             .expect("PHP declaration properties captured before display projection")]
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn collect(source: &str) -> PhpSourceFacts {
+        let tree = crate::aliases::parse_php_tree(source).expect("PHP tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut collector = PhpSourcePropertyCollector::new();
+        let mut occurrences = PrimarySourceFactCollector::new(source);
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            collector.capture(node, source, &mut occurrences);
+            collector.capture_write(node, source, &mut occurrences);
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).unwrap());
+            }
+        }
+        collector.facts
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: nested class writes leaked into the outer class"
+    )]
+    fn nested_class_writes_have_one_lexical_owner() {
+        let facts = collect(
+            "<?php class Outer { function factory() { class Inner { function __Construct() { $this->value = new A(); self::$other = new B(); $this->items[] = new A(); } } } }",
+        );
+        assert_eq!(facts.writes.len(), 3, "{:?}", facts.writes);
+        let inner = facts
+            .declarations
+            .iter()
+            .filter(|d| d.kind == PhpDeclarationKind::Class)
+            .nth(1)
+            .unwrap();
+        assert!(facts.writes.iter().all(|w| w.class == inner.declaration));
+        assert!(facts.writes.iter().all(|w| w.directly_in_constructor));
+        let anonymous = collect(
+            "<?php class Outer { function factory() { $object = new class { function __construct() { $this->value=new A(); self::$other=new B(); $this->items[]=new A(); } }; } }",
+        );
+        assert!(anonymous.writes.is_empty(), "{:?}", anonymous.writes);
+    }
+
+    #[test]
+    fn grammar_declaration_kinds_and_nullable_relative_types() {
+        let source = "<?php /** @return A */ function free_fn() { /** @return B */ function nested() {} } class C extends B { /** @return A */ function method() {} public ?self $a; public self|null $b; public null|self $c; public ?parent $d; public parent|null $e; public A|B $f; }";
+        let tree = crate::aliases::parse_php_tree(source).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut callable_syntax = Vec::new();
+        let mut type_shapes = Vec::new();
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "function_definition" | "method_declaration") {
+                callable_syntax.push((
+                    node.child_by_field_name("name")
+                        .unwrap()
+                        .utf8_text(source.as_bytes())
+                        .unwrap(),
+                    node.kind(),
+                ));
+            }
+            if node.kind() == "property_declaration" {
+                type_shapes.push(node.child_by_field_name("type").unwrap().kind());
+            }
+            for i in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(i).unwrap());
+            }
+        }
+        assert_eq!(
+            callable_syntax,
+            vec![
+                ("free_fn", "function_definition"),
+                ("nested", "function_definition"),
+                ("method", "method_declaration")
+            ]
+        );
+        assert_eq!(
+            type_shapes,
+            vec![
+                "optional_type",
+                "union_type",
+                "union_type",
+                "optional_type",
+                "union_type",
+                "union_type"
+            ]
+        );
+        let facts = collect(source);
+        let callables: Vec<_> = facts
+            .declarations
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    PhpDeclarationKind::Method | PhpDeclarationKind::Function
+                )
+            })
+            .map(|d| (d.kind, d.doc_nominal_type.as_deref()))
+            .collect();
+        assert_eq!(
+            callables,
+            vec![
+                (PhpDeclarationKind::Function, Some("A")),
+                (PhpDeclarationKind::Function, Some("B")),
+                (PhpDeclarationKind::Method, Some("A"))
+            ]
+        );
+        let types: Vec<_> = facts
+            .declarations
+            .iter()
+            .filter(|d| d.kind == PhpDeclarationKind::Property)
+            .map(|d| d.declared_type.clone())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                PhpDeclaredSourceType::SelfType,
+                PhpDeclaredSourceType::SelfType,
+                PhpDeclaredSourceType::SelfType,
+                PhpDeclaredSourceType::ParentType,
+                PhpDeclaredSourceType::ParentType,
+                PhpDeclaredSourceType::Nominal(vec!["A".into(), "B".into()])
+            ]
+        );
     }
 }

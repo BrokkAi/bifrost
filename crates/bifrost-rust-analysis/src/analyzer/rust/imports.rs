@@ -775,55 +775,89 @@ impl ImportAnalysisProvider for RustAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-rust-analysis/src/analyzer/rust/imports.rs",
+            );
 
-        let resolved = Arc::new(rust_imported_code_units(
-            self,
-            file,
-            &self.inner.import_info_of(token, file),
-        ));
-
-        self.imported_code_units
-            .insert(file.clone(), Arc::clone(&resolved));
-        resolved
+        let resolved =
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                Arc::new(rust_imported_code_units(
+                    self,
+                    file,
+                    &self.inner.import_info_of(token, file),
+                ))
+            });
+        match resolved {
+            Ok(resolved) => {
+                {
+                    let cache_key = file.clone();
+                    let cache_value = Arc::clone(&resolved);
+                    persistent_fill_guard.installed("imported_code_units");
+                    self.imported_code_units.insert(cache_key, cache_value);
+                };
+                resolved
+            }
+            Err(resolved) => resolved,
+        }
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-rust-analysis/src/analyzer/rust/imports.rs",
+            );
 
-        let referencing = match self.live_path_snapshot().oid_for_path(file) {
-            Some(oid) => self
-                .inner
-                .analyzer_store()
-                .rust_summary_importing_file_paths(
-                    self.inner.selected_workspace_snapshots().as_ref(),
-                    &oid.to_string(),
-                    &brokk_bifrost_core::path_utils::rel_path_string(file),
-                    &self
-                        .inner
-                        .declarations(file)
-                        .iter()
-                        .map(|unit| (unit.identifier().to_owned(), unit.fq_name()))
-                        .collect::<Vec<_>>(),
-                )
-                .map(|paths| {
-                    paths
-                        .into_iter()
-                        .map(|path| ProjectFile::new(file.root().to_path_buf(), path))
-                        .collect()
-                })
-                .unwrap_or_else(|error| {
-                    self.inner.record_store_error(
-                        error.context(format!("reading live Rust summary importers for {file:?}")),
-                    );
-                    HashSet::default()
-                }),
-            None => HashSet::default(),
-        };
-        self.referencing_files
-            .insert(file.clone(), Arc::new(referencing.clone()));
-        referencing
+        let referencing = brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+            self,
+            || match self.live_path_snapshot().oid_for_path(file) {
+                Some(oid) => {
+                    self.inner
+                        .analyzer_store()
+                        .rust_summary_importing_file_paths(
+                            self.inner.selected_workspace_snapshots().as_ref(),
+                            &oid.to_string(),
+                            &brokk_bifrost_core::path_utils::rel_path_string(file),
+                            &self
+                                .inner
+                                .declarations(file)
+                                .iter()
+                                .map(|unit| (unit.identifier().to_owned(), unit.fq_name()))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map(|paths| {
+                            paths
+                                .into_iter()
+                                .map(|path| ProjectFile::new(file.root().to_path_buf(), path))
+                                .collect()
+                        })
+                        .unwrap_or_else(|error| {
+                            self.inner.record_store_error(error.context(format!(
+                                "reading live Rust summary importers for {file:?}"
+                            )));
+                            HashSet::default()
+                        })
+                }
+                None => HashSet::default(),
+            },
+        );
+        match referencing {
+            Ok(referencing) => {
+                {
+                    let cache_key = file.clone();
+                    let cache_value = Arc::new(referencing.clone());
+                    persistent_fill_guard.installed("referencing_files");
+                    self.referencing_files.insert(cache_key, cache_value);
+                };
+                referencing
+            }
+            Err(referencing) => referencing,
+        }
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
@@ -1020,21 +1054,24 @@ impl ImportAnalysisProvider for RustAnalyzer {
         let token = scope.token();
         use rayon::prelude::*;
 
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let mut fq_names: Vec<String> = files
             .par_iter()
             .flat_map_iter(|file| {
-                if cancellation.is_cancelled() {
-                    return Vec::new().into_iter();
-                }
-                let package = rust_package_name(file);
-                let imports = import_infos
-                    .and_then(|infos| infos.get(file).cloned())
-                    .unwrap_or_else(|| self.inner.import_info_of(token, file));
-                imports
-                    .iter()
-                    .filter_map(|import| resolve_rust_import_fq_name(file, &package, import))
-                    .collect::<Vec<_>>()
-                    .into_iter()
+                context.run(|| {
+                    if cancellation.is_cancelled() {
+                        return Vec::new().into_iter();
+                    }
+                    let package = rust_package_name(file);
+                    let imports = import_infos
+                        .and_then(|infos| infos.get(file).cloned())
+                        .unwrap_or_else(|| self.inner.import_info_of(token, file));
+                    imports
+                        .iter()
+                        .filter_map(|import| resolve_rust_import_fq_name(file, &package, import))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                })
             })
             .collect();
         if cancellation.is_cancelled() {

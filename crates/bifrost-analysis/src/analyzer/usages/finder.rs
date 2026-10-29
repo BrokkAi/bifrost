@@ -331,42 +331,61 @@ impl<'a> ReferenceEngine<'a> {
             None => DescendantIndexScope::whole_workspace(&self.cancellation),
         };
         let _cand_scope = crate::profiling::scope("usages::candidate_discovery");
+        let strategy = || {
+            language_support_for_hook(language_for_target(target), "reference_plugin")
+                .map(|support| support.reference_plugin().target_strategy())
+        };
+        // Complete target-directed preparation replaces generic discovery. In
+        // particular, do not build a workspace hierarchy before the native
+        // reverse operation has had a chance to nominate its own exact sites.
+        let target_prepared = explicit_provider
+            .is_none()
+            .then(|| {
+                strategy().and_then(|strategy| {
+                    strategy.prepare_target_usage_query(analyzer, overloads, &self.cancellation)
+                })
+            })
+            .flatten();
         let mut candidates = HashSet::default();
-        for overload in overloads {
-            match explicit_provider {
-                Some(provider) => candidates.extend(provider.find_candidates(overload, analyzer)),
-                None => {
-                    candidates.extend(find_default_candidates_within(
-                        overload,
-                        analyzer,
-                        &hierarchy_scope,
-                    ));
+        let mut supplemental = HashSet::default();
+        let prepared = if let Some(prepared) = target_prepared {
+            Some(prepared)
+        } else {
+            for overload in overloads {
+                match explicit_provider {
+                    Some(provider) => {
+                        candidates.extend(provider.find_candidates(overload, analyzer))
+                    }
+                    None => {
+                        candidates.extend(find_default_candidates_within(
+                            overload,
+                            analyzer,
+                            &hierarchy_scope,
+                        ));
+                    }
+                }
+                if self.cancellation.is_cancelled() {
+                    return Err(Box::new(cancelled_query_result()));
                 }
             }
-            if self.cancellation.is_cancelled() {
-                return Err(Box::new(cancelled_query_result()));
+            let provider_is_complete_scope =
+                explicit_provider.is_some_and(CandidateFileProvider::is_complete_scope);
+            if provider_is_complete_scope {
+                None
+            } else {
+                let plan =
+                    augment_usage_candidates(analyzer, overloads, &candidates, &self.cancellation);
+                candidates = plan.protected_candidates;
+                supplemental = plan.supplemental_candidates;
+                strategy().and_then(|strategy| {
+                    strategy.prepare_usage_query(
+                        analyzer,
+                        overloads,
+                        &candidates,
+                        &self.cancellation,
+                    )
+                })
             }
-        }
-        let strategy = language_support_for_hook(language_for_target(target), "reference_plugin")
-            .map(|support| support.reference_plugin().target_strategy());
-        let provider_is_complete_scope =
-            explicit_provider.is_some_and(CandidateFileProvider::is_complete_scope);
-        let plan = if provider_is_complete_scope {
-            PlannedUsageQuery {
-                protected_candidates: candidates,
-                supplemental_candidates: HashSet::default(),
-            }
-        } else {
-            augment_usage_candidates(analyzer, overloads, &candidates, &self.cancellation)
-        };
-        candidates = plan.protected_candidates;
-        let supplemental = plan.supplemental_candidates;
-        let prepared = if provider_is_complete_scope {
-            None
-        } else {
-            strategy.and_then(|strategy| {
-                strategy.prepare_usage_query(analyzer, overloads, &candidates, &self.cancellation)
-            })
         };
         if let Some(prepared) = prepared.as_ref() {
             candidates.extend(prepared.candidate_files().iter().cloned());

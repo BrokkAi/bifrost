@@ -523,10 +523,28 @@ fn native_definition_retains_canonical_ambiguity_when_display_units_coincide() {
             (),
         )
     };
-    let single = adapt_definition_answer(&left_site, vec![repeated_left(), repeated_left()], false);
+    assert_eq!(
+        left.resolution.binding().completion(),
+        &ResolutionCompletion::Complete
+    );
+    assert_eq!(
+        right.resolution.binding().completion(),
+        &ResolutionCompletion::Complete
+    );
+    let single = adapt_definition_answer(
+        &left_site,
+        vec![repeated_left(), repeated_left()],
+        ResolutionCompletion::Complete,
+        false,
+    );
     assert_eq!(single.status, DefinitionLookupStatus::Resolved);
     assert_eq!(single.definitions.len(), 1);
-    let outcome = adapt_definition_answer(&left_site, vec![left, right], false);
+    let outcome = adapt_definition_answer(
+        &left_site,
+        vec![left, right],
+        ResolutionCompletion::Complete,
+        false,
+    );
     assert_eq!(outcome.definitions.len(), 1, "{outcome:#?}");
     assert_eq!(
         outcome.status,

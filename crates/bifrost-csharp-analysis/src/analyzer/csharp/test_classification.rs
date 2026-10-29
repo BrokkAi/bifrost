@@ -34,20 +34,26 @@ impl CSharpAnalyzer {
         self.memo_caches
             .hierarchy_test_files
             .get_or_build_on_dedicated_pool(|| {
-                let Some(mut facts) = self
-                    .inner
-                    .hierarchy_declaration_facts_by_kind(CodeUnitType::Class)
-                else {
-                    return HashSet::default();
-                };
-                if self
-                    .inner
-                    .hydrate_hierarchy_declaration_facts(&mut facts)
-                    .is_none()
-                {
-                    return directly_classified_files(&facts);
-                }
-                inherited_test_files(&facts)
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "csharp.hierarchy_test_files",
+                    || {
+                        let Some(mut facts) = self
+                            .inner
+                            .hierarchy_declaration_facts_by_kind(CodeUnitType::Class)
+                        else {
+                            return HashSet::default();
+                        };
+                        if self
+                            .inner
+                            .hydrate_hierarchy_declaration_facts(&mut facts)
+                            .is_none()
+                        {
+                            return directly_classified_files(&facts);
+                        }
+                        inherited_test_files(&facts)
+                    },
+                )
             })
     }
 }

@@ -433,8 +433,13 @@ impl RubyAnalyzer {
     }
 
     pub(crate) fn semantic_facts(&self) -> &RubySemanticFacts {
-        self.semantic_facts
-            .get_or_init(|| brokk_bifrost_ruby::graph_support::build_ruby_semantic_facts(self))
+        self.semantic_facts.get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "ruby.semantic_facts",
+                || brokk_bifrost_ruby::graph_support::build_ruby_semantic_facts(self),
+            )
+        })
     }
 
     pub(crate) fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
@@ -1200,9 +1205,12 @@ impl DeadCodeBulkProof for RubyDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        build_fqn_bulk_edges(analyzer, Language::Ruby, candidates, |analyzer, nodes| {
-            build_ruby_usage_edges(analyzer, nodes, |_| true)
-        })
+        build_fqn_bulk_edges(
+            analyzer,
+            Language::Ruby,
+            candidates,
+            |analyzer, nodes, _kinds| build_ruby_usage_edges(analyzer, nodes, |_| true),
+        )
     }
 }
 

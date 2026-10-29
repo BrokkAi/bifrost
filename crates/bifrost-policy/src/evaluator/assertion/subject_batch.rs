@@ -164,12 +164,14 @@ impl<'a> SubjectQueryBatch<'a> {
             let detailed = match context.workspace {
                 Some(workspace) => execute_code_query_detailed_eager_index_workspace(
                     workspace,
+                    context.flow_resources(),
                     query,
                     budget.query_limits(),
                     context.cancellation,
                 ),
                 None => execute_code_query_detailed_eager_index(
                     context.analyzer,
+                    context.flow_resources(),
                     query,
                     budget.query_limits(),
                     context.cancellation,
@@ -263,9 +265,11 @@ impl<'a> SubjectQueryBatch<'a> {
         if let Some(product) = cached {
             // Replay through the analyzer, not the producer's closed ledger:
             // every currently open consumer ledger must observe these reads.
-            for read in &product.reads {
-                analyzer.record_read(read.clone());
-            }
+            brokk_bifrost_analysis::analyzer::replay_query_read_keys(
+                analyzer,
+                product.reads.iter().cloned(),
+                0,
+            );
             if cancelled() {
                 return execute();
             }
@@ -346,6 +350,7 @@ mod tests {
             analyzer: workspace.analyzer(),
             workspace: Some(&workspace),
             flow_state: &flow_state,
+            root_memo: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -397,6 +402,7 @@ mod tests {
             analyzer: workspace.analyzer(),
             workspace: Some(&workspace),
             flow_state: &flow_state,
+            root_memo: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -414,6 +420,7 @@ mod tests {
         let bounded = batch.execute(&query, &context, &narrow);
         let independent = ExecutedQueryRows::of_detailed(execute_code_query_detailed_eager_index(
             workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             &query,
             narrow.query_limits(),
             None,
@@ -456,6 +463,7 @@ mod tests {
             analyzer: workspace.analyzer(),
             workspace: Some(&workspace),
             flow_state: &flow_state,
+            root_memo: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],

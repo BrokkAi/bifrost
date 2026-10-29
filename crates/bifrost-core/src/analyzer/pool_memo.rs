@@ -82,6 +82,8 @@ fn dedicated_build_pool() -> &'static rayon::ThreadPool {
 /// global-pool worker either, because the query that scheduled it goes straight
 /// back to its own parallel fan-out.
 pub fn spawn_on_dedicated_build_pool(task: impl FnOnce() + Send + 'static) {
+    let context = super::carried_context::CarriedContext::current();
+    let task = move || context.run(task);
     if ON_DEDICATED_BUILD_POOL.with(Cell::get) {
         // A background warm that already owns this pool can discover a
         // follow-up build (Rust fact catch-up is the production case). Run it
@@ -104,6 +106,8 @@ pub fn spawn_on_dedicated_build_pool(task: impl FnOnce() + Send + 'static) {
 /// pool is already running a build's own parallelism, so it runs `task` inline
 /// instead of queueing the task behind itself.
 pub fn install_on_dedicated_build_pool<R: Send>(task: impl FnOnce() -> R + Send) -> R {
+    let context = super::carried_context::CarriedContext::current();
+    let task = move || context.run(task);
     if ON_DEDICATED_BUILD_POOL.with(Cell::get) {
         task()
     } else {
@@ -307,6 +311,8 @@ impl<T> PoolSafeMemo<T> {
             pool_independent: true,
         };
 
+        let context = super::carried_context::CarriedContext::current();
+        let build = move || context.run(build);
         let on_dedicated_pool = ON_DEDICATED_BUILD_POOL.with(Cell::get);
         let built = Arc::new(if on_dedicated_pool {
             // A re-entrant builder is already running on the pool that owns its
@@ -361,6 +367,8 @@ impl<T> PoolSafeMemo<T> {
             pool_independent: true,
         };
 
+        let context = super::carried_context::CarriedContext::current();
+        let build = move || context.run(build);
         let on_dedicated_pool = ON_DEDICATED_BUILD_POOL.with(Cell::get);
         let built = if on_dedicated_pool {
             build()

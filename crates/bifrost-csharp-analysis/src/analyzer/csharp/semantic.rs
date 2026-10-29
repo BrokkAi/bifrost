@@ -3,6 +3,13 @@
 //! This module deliberately interprets tree-sitter nodes and fields directly.
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
+//!
+//! Integral addition, subtraction and multiplication may overflow unless an
+//! explicit unchecked context applies. Compilation properties are not known
+//! yet: #7339 Milestone 2 (compiler properties in compilation facts) is where
+//! a known unchecked compilation can disable these conservative checks.
+//! Decimal arithmetic and division retain their own exception rules. Binary
+//! result-type inference leaves native-width nint/nuint unknown.
 
 use brokk_bifrost_core::analyzer::tree_walk::children_by_field_name;
 use brokk_bifrost_semantic::analyzer::semantic::inventory::*;
@@ -60,11 +67,89 @@ use brokk_bifrost_csharp::syntax::{
     csharp_is_member_variable_owner_kind, variable_declarator_initializer,
 };
 
+use brokk_bifrost_semantic::analyzer::semantic::lowering::{
+    CompoundAssignment, CompoundAssignmentOperator, CompoundAssignmentTarget,
+    compute_language_defined_compound_assignment,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct CSharpCompoundContext {
+    operand: Option<CSharpTypeIdentity>,
+    overflow_checks: bool,
+}
+
+const COMPOUND_OPERATORS: &[CompoundAssignmentOperator<CSharpCompoundContext>] = &[
+    CompoundAssignmentOperator {
+        compound: "+=",
+        can_throw: compound_arithmetic_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "-=",
+        can_throw: compound_arithmetic_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "*=",
+        can_throw: compound_arithmetic_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "/=",
+        can_throw: compound_division_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "%=",
+        can_throw: compound_division_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "<<=",
+        can_throw: |_| false,
+    },
+    CompoundAssignmentOperator {
+        compound: ">>=",
+        can_throw: |_| false,
+    },
+    CompoundAssignmentOperator {
+        compound: ">>>=",
+        can_throw: |_| false,
+    },
+    CompoundAssignmentOperator {
+        compound: "&=",
+        can_throw: |_| false,
+    },
+    CompoundAssignmentOperator {
+        compound: "|=",
+        can_throw: |_| false,
+    },
+    CompoundAssignmentOperator {
+        compound: "^=",
+        can_throw: |_| false,
+    },
+];
+
+fn compound_arithmetic_can_throw(context: CSharpCompoundContext) -> bool {
+    use CSharpPredefinedType::*;
+    match context.operand {
+        Some(CSharpTypeIdentity::Predefined(Float | Double | Bool | String)) => false,
+        Some(CSharpTypeIdentity::Predefined(Decimal)) => true,
+        _ => context.overflow_checks,
+    }
+}
+
+fn compound_division_can_throw(context: CSharpCompoundContext) -> bool {
+    !matches!(
+        context.operand,
+        Some(CSharpTypeIdentity::Predefined(
+            CSharpPredefinedType::Float | CSharpPredefinedType::Double
+        ))
+    )
+}
+
 // Bumping this rotates every public wire id hashed from the adapter
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v22";
+// Initializer, event-accessor, arity and parser changes reach the lowerer (v23).
+// Compound assignments and built-in binary result types reach it (v24, #7344, #7345).
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v24";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -78,6 +163,10 @@ struct CSharpSemanticLowerer;
 
 impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
+        // The intrafile lowerer reads no semantic models, so its dependency
+        // fingerprint is the fixed no-intrafile-dependencies hash. The day it
+        // reads models, it must use semantic_model_dependency_fingerprint
+        // from bifrost-analysis semantic/lowering.rs instead.
         SemanticAdapterIdentity::for_adapter(
             "csharp",
             ADAPTER_VERSION,
@@ -267,6 +356,73 @@ enum CSharpPredefinedType {
     Decimal,
     Object,
     String,
+}
+
+/// C# specification 12.4.7.3, for known non-native built-in numeric types.
+/// Each row gives the dominant type and the types it cannot combine with.
+/// Small integral operands fall through to int; uint plus a signed operand
+/// needs long. Native integers require platform-width rules and stay unknown.
+fn binary_numeric_type(
+    operator: &str,
+    left: CSharpPredefinedType,
+    right: CSharpPredefinedType,
+) -> Option<CSharpPredefinedType> {
+    use CSharpPredefinedType::*;
+    const NUMERIC: &[CSharpPredefinedType] = &[
+        SByte, Byte, Short, UShort, Int, UInt, Long, ULong, Char, Float, Double, Decimal,
+    ];
+    const PROMOTION: &[(CSharpPredefinedType, &[CSharpPredefinedType])] = &[
+        (Decimal, &[Float, Double]),
+        (Double, &[]),
+        (Float, &[]),
+        (ULong, &[SByte, Short, Int, Long]),
+        (Long, &[]),
+        (UInt, &[]),
+    ];
+    if matches!(operator, "&" | "|" | "^") && left == Bool && right == Bool {
+        return Some(Bool);
+    }
+    if !NUMERIC.contains(&left) || !NUMERIC.contains(&right) {
+        return None;
+    }
+    if matches!(operator, "<<" | ">>" | ">>>") {
+        return (matches!(right, SByte | Byte | Short | UShort | Char | Int)
+            && !matches!(left, Float | Double | Decimal))
+        .then_some(if matches!(left, SByte | Byte | Short | UShort | Char) {
+            Int
+        } else {
+            left
+        });
+    }
+    if !matches!(operator, "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^") {
+        return None;
+    }
+    if matches!(operator, "&" | "|" | "^")
+        && [left, right]
+            .iter()
+            .any(|ty| matches!(ty, Float | Double | Decimal))
+    {
+        return None;
+    }
+    for &(dominant, incompatible) in PROMOTION {
+        if left == dominant || right == dominant {
+            if incompatible.contains(&left) || incompatible.contains(&right) {
+                return None;
+            }
+            return Some(
+                if dominant == UInt
+                    && [left, right]
+                        .iter()
+                        .any(|ty| matches!(ty, SByte | Short | Int))
+                {
+                    Long
+                } else {
+                    dominant
+                },
+            );
+        }
+    }
+    Some(Int)
 }
 
 impl CSharpPredefinedType {
@@ -2379,67 +2535,111 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// Follow declared member types from an exact lexical binding. The
     /// explicit stack keeps deeply nested member expressions stack-safe.
     fn expression_type_identity(&self, node: Node<'tree>) -> Option<CSharpTypeIdentity> {
-        let mut current = node;
-        let mut members = Vec::new();
-        let mut identity = loop {
-            match current.kind() {
-                "parenthesized_expression" | "checked_expression" => {
-                    current = first_runtime_named_child(current)?;
-                }
-                // A decimal integer literal without a suffix has the first of
-                // `int`, `uint`, `long` and `ulong` that holds its value.
-                "integer_literal" => {
-                    let value = node_text(self.prepared.source(), current)?
-                        .parse::<u64>()
-                        .ok()?;
-                    break CSharpTypeIdentity::Predefined(if value <= i32::MAX as u64 {
-                        CSharpPredefinedType::Int
-                    } else if value <= u32::MAX as u64 {
-                        CSharpPredefinedType::UInt
-                    } else if value <= i64::MAX as u64 {
-                        CSharpPredefinedType::Long
-                    } else {
-                        CSharpPredefinedType::ULong
-                    });
-                }
-                "boolean_literal" => {
-                    break CSharpTypeIdentity::Predefined(CSharpPredefinedType::Bool);
-                }
-                "member_access_expression" => {
-                    let name = current.child_by_field_name("name")?;
-                    if name.kind() != "identifier" {
-                        return None;
-                    }
-                    members.push(nonempty_node_text(self.prepared.source(), name)?);
-                    current = current.child_by_field_name("expression")?;
-                }
-                "cast_expression" => {
-                    break self.type_node_identity(current.child_by_field_name("type")?)?;
-                }
-                "object_creation_expression" => {
-                    break self.type_node_identity(current.child_by_field_name("type")?)?;
-                }
-                "identifier" => {
-                    let name = node_text(self.prepared.source(), current)?;
-                    if self.implicit_member(current).is_none() {
-                        break self.binding_resolved_type(name, current.start_byte())?;
-                    }
-                    // A member named through the implicit `this`.
-                    members.push(name);
-                    break enclosing_type_node(current)
-                        .and_then(|owner| self.type_index.declared_at(owner.start_byte()))?;
-                }
-                "this" => {
-                    break enclosing_type_node(current)
-                        .and_then(|owner| self.type_index.declared_at(owner.start_byte()))?;
-                }
-                _ => return None,
-            }
-        };
-        for name in members.into_iter().rev() {
-            identity = self.type_index.member(identity, name)?.type_identity?;
+        enum Task<'tree> {
+            Evaluate(Node<'tree>),
+            Member(Node<'tree>),
+            Binary(Node<'tree>),
         }
-        Some(identity)
+        let mut tasks = vec![Task::Evaluate(node)];
+        let mut values: Vec<Option<CSharpTypeIdentity>> = Vec::new();
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Member(name) => {
+                    let owner = values.pop().expect("member operand was evaluated");
+                    values.push(owner.and_then(|owner| {
+                        let name = nonempty_node_text(self.prepared.source(), name)?;
+                        self.type_index.member(owner, name)?.type_identity
+                    }));
+                }
+                Task::Binary(binary) => {
+                    let right = values.pop().expect("right operand was evaluated");
+                    let left = values.pop().expect("left operand was evaluated");
+                    let identity = (|| {
+                        let operator = binary.child_by_field_name("operator")?.kind();
+                        // Comparison and conditional logical operators return bool,
+                        // including overloaded comparisons; no numeric type is guessed.
+                        if matches!(
+                            operator,
+                            "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||"
+                        ) {
+                            return Some(CSharpTypeIdentity::Predefined(
+                                CSharpPredefinedType::Bool,
+                            ));
+                        }
+                        let (
+                            CSharpTypeIdentity::Predefined(left),
+                            CSharpTypeIdentity::Predefined(right),
+                        ) = (left?, right?)
+                        else {
+                            return None;
+                        };
+                        let result = binary_numeric_type(operator, left, right)?;
+                        Some(CSharpTypeIdentity::Predefined(result))
+                    })();
+                    values.push(identity);
+                }
+                Task::Evaluate(current) => match current.kind() {
+                    "parenthesized_expression" | "checked_expression" => {
+                        tasks.push(Task::Evaluate(first_runtime_named_child(current)?));
+                    }
+                    "member_access_expression" => {
+                        let name = current.child_by_field_name("name")?;
+                        if name.kind() != "identifier" {
+                            return None;
+                        }
+                        tasks.push(Task::Member(name));
+                        tasks.push(Task::Evaluate(current.child_by_field_name("expression")?));
+                    }
+                    "binary_expression" => {
+                        tasks.push(Task::Binary(current));
+                        tasks.push(Task::Evaluate(current.child_by_field_name("right")?));
+                        tasks.push(Task::Evaluate(current.child_by_field_name("left")?));
+                    }
+                    _ => {
+                        let identity = (|| match current.kind() {
+                            "integer_literal" => {
+                                let value = node_text(self.prepared.source(), current)?
+                                    .parse::<u64>()
+                                    .ok()?;
+                                Some(CSharpTypeIdentity::Predefined(
+                                    if value <= i32::MAX as u64 {
+                                        CSharpPredefinedType::Int
+                                    } else if value <= u32::MAX as u64 {
+                                        CSharpPredefinedType::UInt
+                                    } else if value <= i64::MAX as u64 {
+                                        CSharpPredefinedType::Long
+                                    } else {
+                                        CSharpPredefinedType::ULong
+                                    },
+                                ))
+                            }
+                            "boolean_literal" => {
+                                Some(CSharpTypeIdentity::Predefined(CSharpPredefinedType::Bool))
+                            }
+                            "cast_expression" | "object_creation_expression" => {
+                                self.type_node_identity(current.child_by_field_name("type")?)
+                            }
+                            "identifier" => {
+                                let name = node_text(self.prepared.source(), current)?;
+                                if self.implicit_member(current).is_none() {
+                                    self.binding_resolved_type(name, current.start_byte())
+                                } else {
+                                    let owner = enclosing_type_node(current).and_then(|owner| {
+                                        self.type_index.declared_at(owner.start_byte())
+                                    })?;
+                                    self.type_index.member(owner, name)?.type_identity
+                                }
+                            }
+                            "this" => enclosing_type_node(current)
+                                .and_then(|owner| self.type_index.declared_at(owner.start_byte())),
+                            _ => None,
+                        })();
+                        values.push(identity);
+                    }
+                },
+            }
+        }
+        values.pop().expect("expression was evaluated")
     }
 
     fn access_member_declaration(
@@ -2652,6 +2852,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point,
                 callee,
                 receiver: None,
+                member_selection: None,
                 arguments: vec![SemanticCallArgument::direct(
                     source,
                     ArgumentDomain::Positional,
@@ -3137,6 +3338,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             || self
                 .expression_type_identity(node)
                 .is_some_and(|identity| self.type_index.has_no_user_defined_add_operator(identity))
+    }
+
+    fn builtin_operation_can_throw(&self, node: Node<'tree>) -> bool {
+        if node.kind() == "binary_expression"
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "*"))
+            && let Some(operand @ CSharpTypeIdentity::Predefined(_)) =
+                self.expression_type_identity(node)
+        {
+            return compound_arithmetic_can_throw(CSharpCompoundContext {
+                operand: Some(operand),
+                overflow_checks: arithmetic_overflow_checks_apply(node),
+            });
+        }
+        operation_can_throw_implicitly(node)
     }
 
     /// Whether an operator expression provably runs the language's own
@@ -3927,6 +4144,108 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             value,
         )?;
         Ok(declared_type)
+    }
+
+    /// Built-in compound updates follow Go/Rust's operand -> opaque computed
+    /// value -> assignment shape. The shared language-defined flow helper
+    /// retains dependencies without claiming that arithmetic copies an operand.
+    fn compound_assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        let operation = self.session.add_node_point(builder, node, Vec::new())?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let old = self.expression_value(
+            builder,
+            left,
+            expression_value_kind(self.prepared.source(), left),
+        )?;
+        let operand = self.expression_value(
+            builder,
+            right,
+            expression_value_kind(self.prepared.source(), right),
+        )?;
+        let computed = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let binding = if left.kind() == "identifier" {
+            let name = node_text(self.prepared.source(), left)
+                .ok_or_else(|| missing_field(node, "target name"))?;
+            self.local_at(name, left.start_byte())
+                .map(|value| (value, ValueFlowKind::Local))
+                .or_else(|| {
+                    (!self.by_reference_parameters.contains(name))
+                        .then(|| {
+                            self.parameters
+                                .get(name)
+                                .copied()
+                                .map(|value| (value, ValueFlowKind::Parameter))
+                        })
+                        .flatten()
+                })
+        } else {
+            None
+        };
+        let target = if let Some((value, flow)) = binding {
+            Some(CompoundAssignmentTarget::Binding { value, flow })
+        } else if let Some(target) = self.memory_access_target(builder, terminal, left)? {
+            self.add_memory_identity_gap(builder, terminal, target)?;
+            Some(CompoundAssignmentTarget::Memory {
+                location: target.location,
+                kind: target.kind,
+            })
+        } else {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "compound assignment target has no resolved binding or memory location",
+            )?;
+            None
+        };
+        let operator = required_field(node, "operator")?.kind();
+        if let Some(target) = target {
+            let can_throw = self.session.append_compound_assignment(
+                builder,
+                COMPOUND_OPERATORS,
+                operator,
+                CSharpCompoundContext {
+                    operand: self.expression_type_identity(left),
+                    overflow_checks: arithmetic_overflow_checks_apply(node),
+                },
+                CompoundAssignment {
+                    operation,
+                    write: terminal,
+                    old,
+                    right: operand,
+                    result: computed,
+                    target,
+                },
+                compute_language_defined_compound_assignment,
+            )?;
+            if can_throw {
+                self.implicit_abort_route(builder, node, operation, scope, stack)?;
+            }
+        } else {
+            self.session
+                .add_target_edge(builder, operation, EdgeTarget::normal(terminal))?;
+        }
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[left, right],
+            EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )
     }
 
     fn assignment_expression(
@@ -5184,8 +5503,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment_expression"
                 if node
                     .child_by_field_name("operator")
+                    .is_some_and(|operator| {
+                        COMPOUND_OPERATORS
+                            .iter()
+                            .any(|entry| entry.compound == operator.kind())
+                    })
+                    && runtime_expression_children(node).iter().all(|operand| {
+                        self.expression_is_predefined(*operand)
+                            || matches!(
+                                self.expression_type_identity(*operand),
+                                Some(CSharpTypeIdentity::Predefined(_))
+                            )
+                    }) =>
+            {
+                self.compound_assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "assignment_expression"
+                if node
+                    .child_by_field_name("operator")
                     .is_some_and(|operator| operator.kind() == "??=") =>
             {
+                // ??= is not a binary update: it conditionally stores after
+                // nullable unwrapping/conversion and yields a value on both
+                // paths. Keep its structured short circuit and explicit gap
+                // until nullable target/result identity is modeled.
                 self.session.record_gap(
                     builder,
                     entry,
@@ -5284,9 +5625,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "makeref_expression"
             | "reftype_expression"
             | "refvalue_expression" => {
-                if node.kind() == "checked_expression" {
-                    self.implicit_abort_route(builder, node, entry, scope, stack)?;
-                }
+                // The context selects checks on enclosed operations; entering
+                // checked/unchecked itself cannot throw.
                 if let Some(value) = first_runtime_named_child(node) {
                     self.transparent_expression(builder, node, value, entry, next, scope, stack)
                 } else {
@@ -5439,7 +5779,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.session
                     .append_language_defined_value_flows(builder, terminal, operands, result)?;
-                if operation_can_throw_implicitly(node) {
+                if self.builtin_operation_can_throw(node) {
                     // Integral division by zero and checked-context overflow
                     // still throw. Neither embeds an operand value.
                     self.implicit_abort_route(builder, node, terminal, scope, stack)?;
@@ -6550,6 +6890,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: argument_values.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -7794,13 +8135,13 @@ fn call_function_requires_evaluation(function: Node<'_>) -> bool {
 ///
 /// An assignment target is still scheduled as a child expression, so without
 /// this a write would publish both its store and a spurious load of the very
-/// location it overwrites. A compound assignment genuinely reads as well as
-/// writes, but it represents neither yet, so it is excluded here too rather
-/// than publishing half of the pair.
+/// location it overwrites. A compound assignment reads before writing,
+/// so its target access must publish the load.
 fn access_is_write_target(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         is_update_expression(parent)
             || (parent.kind() == "assignment_expression"
+                && is_simple_assignment(parent)
                 && parent.child_by_field_name("left") == Some(node))
     })
 }
@@ -7963,6 +8304,31 @@ fn binary_operator(node: Node<'_>) -> Option<&'static str> {
     }
 }
 
+/// An absent explicit context may inherit checked project compilation.
+/// Checked/unchecked does not flow into a nested callable's body.
+fn arithmetic_overflow_checks_apply(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(parent.kind(), "checked_expression" | "checked_statement") {
+            return parent
+                .child(0)
+                .is_none_or(|keyword| keyword.kind() != "unchecked");
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "local_function_statement"
+                | "lambda_expression"
+                | "anonymous_method_expression"
+        ) {
+            break;
+        }
+        ancestor = parent.parent();
+    }
+    true
+}
+
 fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
     match node.kind() {
         "prefix_unary_expression"
@@ -8059,6 +8425,45 @@ mod tests {
     use brokk_bifrost_core::text_utils::compute_line_starts;
     use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
+
+    #[test]
+    #[hardwon("#7345: C# binary arithmetic var initializers had no primitive type")]
+    fn binary_numeric_promotion_keeps_signedness_and_small_integral_rules() {
+        use CSharpPredefinedType::*;
+        for (left, right, expected) in [
+            (Byte, Byte, Some(Int)),
+            (Char, UShort, Some(Int)),
+            (Short, Short, Some(Int)),
+            (UInt, Int, Some(Long)),
+            (UInt, Short, Some(Long)),
+            (UInt, SByte, Some(Long)),
+            (UInt, Byte, Some(UInt)),
+            (UInt, Char, Some(UInt)),
+            (ULong, Int, None),
+            (ULong, Long, None),
+            (ULong, Short, None),
+            (ULong, Byte, Some(ULong)),
+            (Long, UInt, Some(Long)),
+            (Float, Long, Some(Float)),
+            (Double, Float, Some(Double)),
+            (Decimal, Int, Some(Decimal)),
+            (Decimal, Float, None),
+            (Decimal, Double, None),
+            (Object, Int, None),
+            (NInt, Int, None),
+        ] {
+            assert_eq!(
+                binary_numeric_type("+", left, right),
+                expected,
+                "{left:?} + {right:?}"
+            );
+            assert_eq!(
+                binary_numeric_type("+", right, left),
+                expected,
+                "{right:?} + {left:?}"
+            );
+        }
+    }
 
     fn lower(source: &str) -> Vec<ProcedureSemanticsParts> {
         let mut parser = tree_sitter::Parser::new();
@@ -8207,6 +8612,84 @@ mod tests {
             &procedure.source_mappings[mapping.index()],
             source,
         )
+    }
+
+    #[test]
+    #[hardwon("#7394: unknown compilation overflow settings were treated as unchecked")]
+    fn integral_arithmetic_uses_conservative_compilation_overflow_checks() {
+        let source = r#"class Fixture {
+            static int Default(int a, int b) {
+                a += b; a -= b; a *= b; return a + b - a * b;
+            }
+            static int Checked(int a, int b) {
+                checked { a += b; a -= b; a *= b; return a + b - a * b; }
+            }
+            static int Unchecked(int a, int b) {
+                unchecked { a += b; a -= b; a *= b; return unchecked(a + b - a * b); }
+            }
+            static string Text(string a, string b) { return unchecked(a + b); }
+        }"#;
+        let procedures = lower(source);
+        for (name, can_throw, count) in [
+            ("Default", true, 6),
+            ("Checked", true, 6),
+            ("Unchecked", false, 6),
+            ("Text", true, 1),
+        ] {
+            let procedure = procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .expect("arithmetic fixture method");
+            let operations = procedure
+                .points
+                .iter()
+                .filter(|point| {
+                    point.events.iter().any(|event| {
+                        matches!(
+                            event.effect,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::LanguageDefined,
+                                ..
+                            }
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                operations.len(),
+                count,
+                "{name}: arithmetic or concatenation operations: {operations:?}"
+            );
+            for operation in operations {
+                let exceptional = procedure.control_edges.iter().any(|edge| {
+                    edge.source_point == operation.id && edge.kind == ControlEdgeKind::Exceptional
+                });
+                assert_eq!(
+                    exceptional,
+                    can_throw,
+                    "{name}: {}",
+                    mapping_text(procedure, source, operation.source)
+                );
+            }
+            if !can_throw {
+                assert!(
+                    procedure
+                        .control_edges
+                        .iter()
+                        .all(|edge| edge.kind != ControlEdgeKind::Exceptional),
+                    "unchecked context wrappers must not add their own exception edges: {:?}",
+                    procedure.control_edges
+                );
+            }
+        }
     }
 
     #[test]

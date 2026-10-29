@@ -85,3 +85,33 @@ mod tests {
         assert!(NpmVersionRange::parse("^1.2.3 || latest").is_err());
     }
 }
+
+#[cfg(test)]
+mod range_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn inclusive_byte_limit_preserves_parser_semantics() {
+        let base = ">=1.0.0";
+        for length in [
+            MAX_NPM_RANGE_BYTES - 1,
+            MAX_NPM_RANGE_BYTES,
+            MAX_NPM_RANGE_BYTES + 1,
+        ] {
+            let requirement = format!("{base}{}", " ".repeat(length - base.len()));
+            let oracle = js_semver::Range::parse(&requirement).unwrap();
+            let result = NpmVersionRange::parse(&requirement);
+            if length > MAX_NPM_RANGE_BYTES {
+                assert_eq!(result.unwrap_err(), NpmVersionError::RangeTooLong);
+            } else {
+                let range = result.unwrap();
+                for version in ["0.9.9", "1.0.0", "2.0.0", "2.0.0-beta.1"] {
+                    assert_eq!(
+                        range.matches_exact(version).unwrap(),
+                        oracle.satisfies(&js_semver::Version::parse(version).unwrap())
+                    );
+                }
+            }
+        }
+    }
+}

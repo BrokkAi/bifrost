@@ -10,6 +10,23 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct RubyKnowledge;
 
 impl LanguageKnowledge for RubyKnowledge {
+    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+        false
+    }
+
+    fn field_initializer<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        if !matches!(node.kind(), "assignment" | "operator_assignment") {
+            return None;
+        }
+        Some((
+            node.child_by_field_name("left")?,
+            node.child_by_field_name("right")?,
+        ))
+    }
+
     fn language(&self) -> Language {
         Language::Ruby
     }

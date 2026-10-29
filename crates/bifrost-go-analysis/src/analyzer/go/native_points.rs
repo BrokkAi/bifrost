@@ -1,6 +1,8 @@
 //! Go selected-context point resolver used by production queries.
 
 use crate::analyzer::go::GoAnalyzer;
+use brokk_bifrost_analysis::analyzer::resolution::SemanticId;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedLocalDeclarationOutcome;
 
 use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -544,6 +546,35 @@ fn go_point_call_expression_callee_reference(
     go_point_expression_value_anchor_reference(call)
 }
 
+fn go_point_argument_value_anchor(
+    mut expression: tree_sitter::Node<'_>,
+) -> Option<(usize, usize, u32)> {
+    while let Some(parent) = expression
+        .parent()
+        .filter(|node| node.kind() == "parenthesized_expression")
+    {
+        expression = parent;
+    }
+    let arguments = expression
+        .parent()
+        .filter(|node| node.kind() == "argument_list")?;
+    let call = arguments.parent()?;
+    if call.child_by_field_name("arguments") != Some(arguments) {
+        return None;
+    }
+    let (start, end) = go_point_call_expression_callee_reference(call)?;
+    let mut cursor = arguments.walk();
+    let ordinal = arguments
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+        .position(|argument| argument == expression)?;
+    Some((
+        start,
+        end,
+        u32::try_from(ordinal).expect("Go call argument ordinal fits u32"),
+    ))
+}
+
 fn go_point_expression_value_anchor_reference(
     expression: tree_sitter::Node<'_>,
 ) -> Option<(usize, usize)> {
@@ -735,7 +766,7 @@ fn go_point_selector_is_package_member_lookup(
     selected_imports: &[GoSelectedExternalImport],
 ) -> bool {
     let Some(selector) =
-        brokk_bifrost_go::graph::reference::go_selector_descriptor(tree.root_node(), query.site)
+        brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), query.site)
     else {
         return false;
     };
@@ -765,6 +796,7 @@ fn go_point_selector_is_package_member_lookup(
     while let Some(node) = pending.pop() {
         if node.kind() == "import_spec" {
             if brokk_bifrost_go::declarations::go_import_spec_binding_name(node, query.source)
+                .as_deref()
                 == Some(base_name)
             {
                 return false;
@@ -795,6 +827,106 @@ fn attach_go_package_incomplete(outcome: &mut DefinitionLookupOutcome, package: 
         ),
         claim: None,
     });
+}
+
+fn go_declaration_definition(
+    site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+    definitions: Vec<(
+        brokk_bifrost_analysis::analyzer::resolution::model::SemanticId,
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinition,
+    )>,
+) -> Option<DefinitionLookupOutcome> {
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinition;
+
+    if definitions.is_empty() {
+        return None;
+    }
+    let mut units = Vec::new();
+    let mut lexical_definition = None;
+    for (_, definition) in definitions {
+        match definition {
+            SelectedNativeDefinition::Unit(unit) => units.push(unit),
+            SelectedNativeDefinition::Lexical(definition) => lexical_definition = Some(definition),
+            SelectedNativeDefinition::Intrinsic { .. } => {
+                debug_assert!(
+                    false,
+                    "a declaration identifier cannot denote an intrinsic definition"
+                );
+            }
+        }
+    }
+    Some(DefinitionLookupOutcome {
+        modeled_definitions: Vec::new(),
+        status: DefinitionLookupStatus::Resolved,
+        reference: Some(site.clone()),
+        definitions: units,
+        lexical_definition,
+        diagnostics: Vec::new(),
+    })
+}
+
+struct GoNativeDefinitionEvidence {
+    answer: brokk_bifrost_analysis::analyzer::resolution::fact_resolution::FactResolutionAnswer,
+    receiver_application: Option<CallApplicationKind>,
+}
+
+enum GoDefinitionOperation<T> {
+    Native {
+        value: T,
+        work: ReceiverAnalysisWork,
+    },
+    Failed(Box<BoundedResolution<(DefinitionLookupOutcome, Option<GoNativeDefinitionEvidence>)>>),
+}
+
+fn go_definition_operation<T>(
+    site: &ResolvedReferenceSite,
+    result: brokk_bifrost_analysis::analyzer::store::Result<
+        BoundedResolution<SelectedResolutionOperationOutcome<T>>,
+    >,
+) -> GoDefinitionOperation<T> {
+    match result {
+        Ok(BoundedResolution::Complete {
+            value: SelectedResolutionOperationOutcome::Native(value),
+            work,
+        }) => GoDefinitionOperation::Native { value, work },
+        Ok(BoundedResolution::Complete {
+            value: SelectedResolutionOperationOutcome::Unavailable(reason),
+            work,
+        }) => GoDefinitionOperation::Failed(Box::new(BoundedResolution::Complete {
+            value: (
+                unavailable_definition(site, "native_unavailable", format!("{reason:?}")),
+                None,
+            ),
+            work,
+        })),
+        Ok(BoundedResolution::Complete {
+            value: SelectedResolutionOperationOutcome::Stale(reason),
+            work,
+        }) => GoDefinitionOperation::Failed(Box::new(BoundedResolution::Complete {
+            value: (
+                unavailable_definition(site, "native_stale", format!("{reason:?}")),
+                None,
+            ),
+            work,
+        })),
+        Ok(BoundedResolution::Complete {
+            value: SelectedResolutionOperationOutcome::Cancelled(_),
+            work,
+        })
+        | Ok(BoundedResolution::Cancelled { work }) => {
+            GoDefinitionOperation::Failed(Box::new(BoundedResolution::Cancelled { work }))
+        }
+        Ok(BoundedResolution::Exceeded { limit, work }) => {
+            GoDefinitionOperation::Failed(Box::new(BoundedResolution::Exceeded { limit, work }))
+        }
+        Err(error) => GoDefinitionOperation::Failed(Box::new(BoundedResolution::Complete {
+            value: (
+                unavailable_definition(site, "native_store_error", error.to_string()),
+                None,
+            ),
+            work: ReceiverAnalysisWork::default(),
+        })),
+    }
 }
 
 fn go_call_selector_reference_at(
@@ -984,6 +1116,18 @@ pub enum GoNativePointRequestOpen<'a> {
 }
 
 impl<'a> GoNativePointRequest<'a> {
+    pub(crate) fn resolve_local_declaration(
+        &mut self,
+        locator: &SelectedSemanticLocator,
+        budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        BoundedResolution<SelectedLocalDeclarationOutcome>,
+    > {
+        self.operation
+            .resolve_local_declaration_bounded(locator, budget, cancellation)
+    }
+
     #[cfg(test)]
     pub(crate) fn method_family_for_test(
         &self,
@@ -1519,7 +1663,29 @@ impl<'a> GoNativePointRequest<'a> {
         &mut self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
-        let answer = self.resolve_type_inner(query);
+        self.resolve_type_with_evidence(query, |_| {})
+    }
+
+    pub(crate) fn resolve_type_with_evidence(
+        &mut self,
+        query: BoundedReceiverQuery<'_>,
+        evidence: impl FnMut(&brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeReferenceTypes),
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        let answer = self.resolve_type_inner(query, None, evidence);
+        self.revalidate_answer(
+            answer,
+            &query.cancellation.cloned().unwrap_or_default(),
+            |kind, message| unavailable_type(query.site, kind, message),
+        )
+    }
+
+    pub(crate) fn resolve_declared_type_with_evidence(
+        &mut self,
+        query: BoundedReceiverQuery<'_>,
+        definition: SemanticId,
+        evidence: impl FnMut(&brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeReferenceTypes),
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        let answer = self.resolve_type_inner(query, Some(definition), evidence);
         self.revalidate_answer(
             answer,
             &query.cancellation.cloned().unwrap_or_default(),
@@ -1530,6 +1696,8 @@ impl<'a> GoNativePointRequest<'a> {
     fn resolve_type_inner(
         &mut self,
         query: BoundedReceiverQuery<'_>,
+        definition: Option<SemanticId>,
+        mut evidence: impl FnMut(&brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeReferenceTypes),
     ) -> BoundedResolution<TypeLookupOutcome> {
         let cancellation = query.cancellation.cloned().unwrap_or_default();
         if cancellation.is_cancelled() {
@@ -1585,7 +1753,7 @@ impl<'a> GoNativePointRequest<'a> {
         // A whole expression asks for its produced value, rather than its
         // anchor binding. Go's AST fields select the anchor; persisted call
         // obligations or construction transfers select its exact value slot.
-        let expression_anchor = query.tree.or(parsed_tree.as_ref()).and_then(|tree| {
+        let selected_expression = query.tree.or(parsed_tree.as_ref()).and_then(|tree| {
             let selected = smallest_named_node_covering(
                 tree.root_node(),
                 query.site.focus_start_byte,
@@ -1593,9 +1761,19 @@ impl<'a> GoNativePointRequest<'a> {
             )?;
             (selected.start_byte() == query.site.focus_start_byte
                 && selected.end_byte() == query.site.focus_end_byte)
-                .then(|| go_point_expression_value_anchor_reference(selected))
-                .flatten()
+                .then_some(selected)
         });
+        let expression_anchor =
+            selected_expression.and_then(go_point_expression_value_anchor_reference);
+        // Computed call arguments already have an exact persisted input slot.
+        // Use that slot, not the callee's return type or an operand's type.
+        let argument_anchor = selected_expression
+            .filter(|node| {
+                expression_anchor.is_none()
+                    && node.named_child_count() > 0
+                    && !matches!(node.kind(), "selector_expression" | "qualified_type")
+            })
+            .and_then(go_point_argument_value_anchor);
         let expression_value = if let Some((start, end)) = expression_anchor {
             match self
                 .operation
@@ -1617,7 +1795,10 @@ impl<'a> GoNativePointRequest<'a> {
             None
         };
         let mut selected_site = query.site.clone();
-        if let Some((start, end)) = expression_anchor.filter(|_| expression_value.is_some()) {
+        if let Some((start, end)) = argument_anchor
+            .map(|(start, end, _)| (start, end))
+            .or_else(|| expression_anchor.filter(|_| expression_value.is_some()))
+        {
             selected_site.focus_start_byte = start;
             selected_site.focus_end_byte = end;
         }
@@ -1675,6 +1856,11 @@ impl<'a> GoNativePointRequest<'a> {
                 selected_site.focus_end_byte,
             )
         };
+        let locator = if let Some((_, _, ordinal)) = argument_anchor {
+            locator.with_call_argument_ordinal(ordinal)
+        } else {
+            locator
+        };
         let mut metrics = SelectedResolutionContextMetrics;
         let native_sql_before = self
             .record_work
@@ -1688,6 +1874,7 @@ impl<'a> GoNativePointRequest<'a> {
                 expression_value,
                 receiver_overlay,
                 &locator,
+                definition,
                 query.budget,
                 &cancellation,
                 &mut metrics,
@@ -1708,7 +1895,9 @@ impl<'a> GoNativePointRequest<'a> {
                 match value {
                     SelectedResolutionOperationOutcome::Native(
                         SelectedResolutionLocated::Found(answer),
-                    ) => match answer.value_types {
+                    ) => {
+                        evidence(&answer);
+                        match answer.value_types {
                         brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeTypes::Cancelled => {
                             BoundedResolution::Cancelled { work }
                         }
@@ -1746,44 +1935,63 @@ impl<'a> GoNativePointRequest<'a> {
                             value: adapt_type_answer(query.site, brokk_bifrost_core::analyzer::model::Language::Go, answer),
                             work,
                         },
-                    },
-                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
-                        let value = go_interface_method_owner_type(query, self.go).unwrap_or_else(|| {
-                            let type_parameter_declaration = query.tree.or(parsed_tree.as_ref()).is_some_and(|tree| {
-                                let Some(selected) = smallest_named_node_covering(
-                                    tree.root_node(), query.site.focus_start_byte, query.site.focus_end_byte,
-                                ) else {
-                                    return false;
-                                };
-                                selected.parent().is_some_and(|parent| {
-                                    parent.kind() == "type_parameter_declaration"
-                                        && {
-                                            let mut cursor = parent.walk();
-                                            parent.children_by_field_name("name", &mut cursor)
-                                                .any(|name| name == selected)
-                                        }
-                                })
+                    }
+                    }
+                    SelectedResolutionOperationOutcome::Native(
+                        SelectedResolutionLocated::Missing,
+                    ) => {
+                        let value =
+                            go_interface_method_owner_type(query, self.go).unwrap_or_else(|| {
+                                let type_parameter_declaration =
+                                    query.tree.or(parsed_tree.as_ref()).is_some_and(|tree| {
+                                        let Some(selected) = smallest_named_node_covering(
+                                            tree.root_node(),
+                                            query.site.focus_start_byte,
+                                            query.site.focus_end_byte,
+                                        ) else {
+                                            return false;
+                                        };
+                                        selected.parent().is_some_and(|parent| {
+                                            parent.kind() == "type_parameter_declaration" && {
+                                                let mut cursor = parent.walk();
+                                                parent
+                                                    .children_by_field_name("name", &mut cursor)
+                                                    .any(|name| name == selected)
+                                            }
+                                        })
+                                    });
+                                if type_parameter_declaration {
+                                    go_type_name_site_outcome(query.site)
+                                } else {
+                                    incomplete_go_type(
+                                        query.site,
+                                        "native_missing",
+                                        "selected native Go type answer is absent".into(),
+                                    )
+                                }
                             });
-                            if type_parameter_declaration {
-                                go_type_name_site_outcome(query.site)
-                            } else {
-                                incomplete_go_type(
-                                    query.site,
-                                    "native_missing",
-                                    "selected native Go type answer is absent".into(),
-                                )
-                            }
-                        });
                         BoundedResolution::Complete { value, work }
                     }
-                    SelectedResolutionOperationOutcome::Unavailable(reason) => BoundedResolution::Complete {
-                        value: unavailable_type(query.site, "native_unavailable", format!("{reason:?}")),
-                        work,
-                    },
-                    SelectedResolutionOperationOutcome::Stale(reason) => BoundedResolution::Complete {
-                        value: unavailable_type(query.site, "native_stale", format!("{reason:?}")),
-                        work,
-                    },
+                    SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                        BoundedResolution::Complete {
+                            value: unavailable_type(
+                                query.site,
+                                "native_unavailable",
+                                format!("{reason:?}"),
+                            ),
+                            work,
+                        }
+                    }
+                    SelectedResolutionOperationOutcome::Stale(reason) => {
+                        BoundedResolution::Complete {
+                            value: unavailable_type(
+                                query.site,
+                                "native_stale",
+                                format!("{reason:?}"),
+                            ),
+                            work,
+                        }
+                    }
                     SelectedResolutionOperationOutcome::Cancelled(_) => {
                         BoundedResolution::Cancelled { work }
                     }
@@ -1804,12 +2012,7 @@ impl<'a> GoNativePointRequest<'a> {
         &mut self,
         query: BoundedReceiverQuery<'_>,
     ) -> (
-        BoundedResolution<(
-            DefinitionLookupOutcome,
-            Option<
-                brokk_bifrost_analysis::analyzer::resolution::fact_resolution::FactResolutionAnswer,
-            >,
-        )>,
+        BoundedResolution<(DefinitionLookupOutcome, Option<GoNativeDefinitionEvidence>)>,
         Vec<GoSelectedExternalImport>,
     ) {
         let cancellation = query.cancellation.cloned().unwrap_or_default();
@@ -1920,6 +2123,69 @@ impl<'a> GoNativePointRequest<'a> {
         } else {
             None
         };
+        let selected_imports = file_context.selected_imports.clone();
+        let declaration_locator = SelectedSemanticLocator::for_declaration_range(
+            "go",
+            &path,
+            query.site.focus_start_byte,
+            query.site.focus_end_byte,
+        );
+        let declaration = self.operation.declaration_at_range_bounded(
+            &declaration_locator,
+            query.budget,
+            &cancellation,
+            |ready, definitions, cancellation, session| {
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::project_native_definition_units(
+                    ready,
+                    definitions,
+                    cancellation,
+                    session,
+                )
+            },
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Cancelled,
+        );
+        if let Some(result) = declaration.transpose() {
+            match go_definition_operation(query.site, result) {
+                GoDefinitionOperation::Native {
+                    value: definitions,
+                    work,
+                } => match definitions {
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Ready(definitions) => {
+                        if let Some(outcome) = go_declaration_definition(query.site, definitions) {
+                            return (
+                                BoundedResolution::Complete {
+                                    value: (outcome, None),
+                                    work,
+                                },
+                                selected_imports,
+                            );
+                        }
+                    }
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Cancelled => {
+                        return (BoundedResolution::Cancelled { work }, selected_imports);
+                    }
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Unavailable => {
+                        return (
+                            BoundedResolution::Complete {
+                                value: (
+                                    unavailable_definition(
+                                        query.site,
+                                        "native_definition_projection_unavailable",
+                                        "selected declaration has no supported source projection".into(),
+                                    ),
+                                    None,
+                                ),
+                                work,
+                            },
+                            selected_imports,
+                        );
+                    }
+                },
+                GoDefinitionOperation::Failed(failure) => {
+                    return (*failure, selected_imports);
+                }
+            }
+        }
         let call_selector = query.tree.or(parsed_tree.as_ref()).is_some_and(|tree| {
             go_call_selector_reference_at(
                 tree,
@@ -1931,7 +2197,6 @@ impl<'a> GoNativePointRequest<'a> {
             .forward_candidate_artifacts
             .entry(path.clone())
             .or_default();
-        let selected_imports = file_context.selected_imports.clone();
         let locator = if call_selector {
             SelectedSemanticLocator::for_reference_range_preferring_namespace(
                 "go",
@@ -1979,73 +2244,61 @@ impl<'a> GoNativePointRequest<'a> {
                 self.phase_nanos.native_sql += after.2 - before.2;
             }
         }
-        let result = match native {
-            Ok(BoundedResolution::Complete { value, work }) => {
-                match value {
-                    SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Found(answer),
-                    ) => match answer.definitions {
-                        brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Cancelled => {
-                            BoundedResolution::Cancelled { work }
-                        }
-                        _ => {
-                            let native_answer = answer.answer.clone();
-                            BoundedResolution::Complete {
-                                value: (
-                                    adapt_definition_answer(
-                                        query.site,
-                                        brokk_bifrost_core::analyzer::model::Language::Go,
-                                        answer,
-                                    ),
-                                    Some(native_answer),
-                                ),
-                                work,
-                            }
-                        }
-                    },
-                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
-                        BoundedResolution::Complete {
-                            value: (
-                                unavailable_definition(
-                                    query.site,
-                                    "native_reference_unavailable",
-                                    "the selected producer has no reference at this source range".into(),
-                                ),
-                                None,
+        let result = match go_definition_operation(query.site, native) {
+            GoDefinitionOperation::Native {
+                value: SelectedResolutionLocated::Found(answer),
+                work,
+            } => match answer.definitions {
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Cancelled => {
+                    BoundedResolution::Cancelled { work }
+                }
+                _ => {
+                    // The selected member route already records whether lookup
+                    // started from a runtime value or a type qualifier. Do not
+                    // resolve its base again with a second type evaluator.
+                    let mut members = answer
+                        .member_contexts
+                        .iter()
+                        .filter(|member| member.selected)
+                        .peekable();
+                    let local_receiver_application = (members.peek().is_some()
+                        && members.all(|member| {
+                            member.route_kind
+                                == brokk_bifrost_analysis::analyzer::resolution::FactMemberRouteKind::Member
+                        }))
+                    .then_some(CallApplicationKind::BoundReceiver);
+                    let native_answer = answer.answer.clone();
+                    BoundedResolution::Complete {
+                        value: (
+                            adapt_definition_answer(
+                                query.site,
+                                brokk_bifrost_core::analyzer::model::Language::Go,
+                                answer,
                             ),
-                            work,
-                        }
-                    }
-                    SelectedResolutionOperationOutcome::Unavailable(reason) => BoundedResolution::Complete {
-                        value: (
-                            unavailable_definition(query.site, "native_unavailable", format!("{reason:?}")),
-                            None,
+                            Some(GoNativeDefinitionEvidence {
+                                answer: native_answer,
+                                receiver_application: local_receiver_application,
+                            }),
                         ),
                         work,
-                    },
-                    SelectedResolutionOperationOutcome::Stale(reason) => BoundedResolution::Complete {
-                        value: (
-                            unavailable_definition(query.site, "native_stale", format!("{reason:?}")),
-                            None,
-                        ),
-                        work,
-                    },
-                    SelectedResolutionOperationOutcome::Cancelled(_) => {
-                        BoundedResolution::Cancelled { work }
                     }
                 }
-            }
-            Ok(BoundedResolution::Exceeded { limit, work }) => {
-                BoundedResolution::Exceeded { limit, work }
-            }
-            Ok(BoundedResolution::Cancelled { work }) => BoundedResolution::Cancelled { work },
-            Err(error) => BoundedResolution::Complete {
+            },
+            GoDefinitionOperation::Native {
+                value: SelectedResolutionLocated::Missing,
+                work,
+            } => BoundedResolution::Complete {
                 value: (
-                    unavailable_definition(query.site, "native_store_error", error.to_string()),
+                    unavailable_definition(
+                        query.site,
+                        "native_reference_unavailable",
+                        "the selected producer has no reference at this source range".into(),
+                    ),
                     None,
                 ),
-                work: ReceiverAnalysisWork::default(),
+                work,
             },
+            GoDefinitionOperation::Failed(failure) => *failure,
         };
         (result, selected_imports)
     }
@@ -2079,10 +2332,9 @@ impl<'a> GoNativePointRequest<'a> {
         {
             return Ok(empty());
         }
-        let Some(selector) = brokk_bifrost_go::graph::reference::go_selector_descriptor(
-            tree.root_node(),
-            query.site,
-        ) else {
+        let Some(selector) =
+            brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), query.site)
+        else {
             return Ok(empty());
         };
         if selector
@@ -2385,7 +2637,7 @@ fn external_callee_identity(
     external_identity_from_proof(proof)
 }
 
-fn go_add_resolution_work(
+pub(super) fn go_add_resolution_work(
     mut first: ReceiverAnalysisWork,
     second: ReceiverAnalysisWork,
 ) -> ReceiverAnalysisWork {
@@ -2586,16 +2838,17 @@ fn finish_go_definition_resolution(
         Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
     >,
     selected_imports: Vec<GoSelectedExternalImport>,
-    native: BoundedResolution<(
-        DefinitionLookupOutcome,
-        Option<brokk_bifrost_analysis::analyzer::resolution::fact_resolution::FactResolutionAnswer>,
-    )>,
+    native: BoundedResolution<(DefinitionLookupOutcome, Option<GoNativeDefinitionEvidence>)>,
 ) -> BoundedResolution<GoNativeDefinitionResolution> {
     match native {
         BoundedResolution::Complete {
-            value: (mut outcome, native_answer),
+            value: (mut outcome, native_evidence),
             work,
         } => {
+            let (native_answer, local_receiver_application) = native_evidence
+                .map_or((None, None), |evidence| {
+                    (Some(evidence.answer), evidence.receiver_application)
+                });
             if query.cancellation.is_some_and(|token| token.is_cancelled()) {
                 return BoundedResolution::Cancelled { work };
             }
@@ -2648,10 +2901,7 @@ fn finish_go_definition_resolution(
                 .flatten();
             let tree = query.tree.or(parsed_tree.as_ref());
             let selector = tree.and_then(|tree| {
-                brokk_bifrost_go::graph::reference::go_selector_descriptor(
-                    tree.root_node(),
-                    query.site,
-                )
+                brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), query.site)
             });
             let import_qualifier = selector.as_ref().is_some_and(|selector| {
                 selector.focus_segment == 0
@@ -2820,11 +3070,20 @@ fn finish_go_definition_resolution(
                     )
                     && exact_external_call.is_none()
                 {
-                    call_application = crate::analyzer::usages::get_definition::go::go_native_local_receiver_call_application(
+                    call_application = local_receiver_application.unwrap_or(call_application);
+                }
+                if outcome.status == DefinitionLookupStatus::Resolved
+                    && let Some(rejected) =
+                        crate::analyzer::usages::get_definition::go::go_source_call_arity_rejection(
                             query_with_tree,
                             &external_session,
+                            &outcome.definitions,
+                            call_application,
                         )
-                        .unwrap_or(call_application);
+                {
+                    outcome = rejected;
+                    exact_external_call = None;
+                    external_callee_identity = None;
                 }
                 match external_session.finish((
                     outcome,

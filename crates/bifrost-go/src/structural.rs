@@ -1,8 +1,9 @@
 //! Go structural spec for `query_code`.
 
+use crate::syntax::first_named_child;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, unquoted_string_content_span,
+    field_name_in_parent, unquoted_string_content_span,
 };
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
@@ -57,18 +58,12 @@ pub fn go_call_result_use(call: Node<'_>, source: &str) -> CallResultUseSite {
             }
             match parent.kind() {
                 "parenthesized_expression"
-                    if parent.named_child_count() == 1
-                        && parent
-                            .named_child(0)
-                            .is_some_and(|child| child.id() == expression.id()) =>
+                    if first_named_child(parent).is_some_and(|child| child == expression) =>
                 {
                     expression = parent;
                 }
                 "expression_statement"
-                    if parent.named_child_count() == 1
-                        && parent
-                            .named_child(0)
-                            .is_some_and(|child| child.id() == expression.id()) =>
+                    if first_named_child(parent).is_some_and(|child| child == expression) =>
                 {
                     break CallResultUse::Discarded;
                 }
@@ -135,9 +130,16 @@ fn go_assignment_result_use(
     let left = assignment.child_by_field_name("left")?;
     let right_index = right
         .named_children(&mut right.walk())
-        .position(|child| child.id() == call.id())?;
-    let right_count = right.named_child_count();
-    let left_children = left.named_children(&mut left.walk()).collect::<Vec<_>>();
+        .filter(|child| !child.is_extra())
+        .position(|child| transparent_parenthesized_expression(child) == call)?;
+    let right_count = right
+        .named_children(&mut right.walk())
+        .filter(|child| !child.is_extra())
+        .count();
+    let left_children = left
+        .named_children(&mut left.walk())
+        .filter(|child| !child.is_extra())
+        .collect::<Vec<_>>();
     let mut overrides = Vec::new();
     if right_count == 1 && right_index == 0 {
         for (ordinal, target) in left_children.into_iter().enumerate() {
@@ -161,7 +163,8 @@ fn go_assignment_result_use(
             .is_ok_and(|text| text == "_")
     {
         overrides.push(CallResultUseFact {
-            result_ordinal: u32::try_from(right_index).expect("Go result ordinal fits u32"),
+            // Each expression in a multi-expression RHS supplies its own port zero.
+            result_ordinal: 0,
             result_use: CallResultUse::IntentionalDiscard(
                 IntentionalDiscardKind::GoBlankAssignment,
             ),
@@ -202,10 +205,6 @@ impl GoCallResultUseIndex {
         end_byte: usize,
     ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
         self.inner.at_span(start_byte, end_byte)
-    }
-
-    pub fn sites(&self) -> &[CallResultUseSite] {
-        self.inner.sites()
     }
 }
 
@@ -925,5 +924,175 @@ mod result_use_tests {
         ));
         let index = GoCallResultUseIndex::new(tree.root_node(), source);
         assert!(index.at_span(call.start_byte(), call.end_byte()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod call_contract_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: parentheses and per-call blank result ordinals"
+    )]
+    fn call_spans_and_result_ports_follow_go_expression_grammar() {
+        let blank = CallResultUse::IntentionalDiscard(IntentionalDiscardKind::GoBlankAssignment);
+        for (body, expected) in [
+            ("(f())", vec![CallResultUse::Discarded]),
+            ("(f() /* comment */)", vec![CallResultUse::Discarded]),
+            ("_ = (f())", vec![blank]),
+            ("x, _ = f(), g()", vec![CallResultUse::Consumed, blank]),
+            (
+                "func() { f() }()",
+                vec![
+                    CallResultUse::Discarded,
+                    CallResultUse::Open(CallResultUseOpenReason::DeferredContext),
+                ],
+            ),
+            (
+                "defer sink(g())",
+                vec![
+                    CallResultUse::Open(CallResultUseOpenReason::DeferredContext),
+                    CallResultUse::Consumed,
+                ],
+            ),
+            (
+                "sink(g())",
+                vec![CallResultUse::Discarded, CallResultUse::Consumed],
+            ),
+        ] {
+            let source = format!("package p\nfunc run() {{ {body} }}");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{body}");
+            let index = GoCallResultUseIndex::new(tree.root_node(), &source);
+            let mut stack = vec![tree.root_node()];
+            let mut calls = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "call_expression" {
+                    calls.push(node);
+                } else if node.kind() == "identifier" {
+                    assert!(
+                        index.at_span(node.start_byte(), node.end_byte()).is_err(),
+                        "{body}"
+                    );
+                }
+                stack.extend(node.named_children(&mut node.walk()));
+            }
+            calls.sort_by_key(|node| node.start_byte());
+            assert_eq!(calls.len(), expected.len(), "{body}");
+            for (call, expected) in calls.into_iter().zip(expected) {
+                let site = index.at_span(call.start_byte(), call.end_byte()).unwrap();
+                assert_eq!(
+                    site.for_port(0),
+                    expected,
+                    "{body}: {}",
+                    &source[call.byte_range()]
+                );
+                if body == "x, _ = f(), g()" {
+                    assert_eq!(site.for_port(1), CallResultUse::Consumed);
+                }
+            }
+        }
+        let source = "unc run(){ if x { return g() } }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut count = 0;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" && &source[node.byte_range()] == "g()" {
+                count += 1;
+                assert!(!node.has_error());
+                assert_eq!(
+                    go_call_result_use(node, source).for_port(0),
+                    CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+                );
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        assert_eq!(count, 1);
+    }
+}
+
+#[cfg(test)]
+mod structural_grammar_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
+    use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
+    use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
+    use brokk_bifrost_core::analyzer::structural::spec::CompiledKinds;
+
+    #[test]
+    fn structural_rows_agree_with_go_assignment_and_call_fields() {
+        let source = "package p\nconst (\n A=1\n B\n)\nvar uninitialized int\nfunc run() { x,y = f(),g(); (obj.Method)() }\n";
+        let grammar = tree_sitter_go::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let context = CallSiteContext::default();
+        let mut collector = StructuralFactCollector::new(
+            &GO_STRUCTURAL_SPEC,
+            source,
+            &context,
+            ParentIndex::new(tree.root_node()),
+            usize::MAX,
+            None,
+        );
+        let kinds = CompiledKinds::compile(&grammar, GO_KIND_TABLE);
+        let mut occurrences = PrimarySourceFactCollector::new(source);
+        let mut stack = vec![(tree.root_node(), None)];
+        while let Some((node, parent)) = stack.pop() {
+            let parent = collector
+                .enter_syntax(node, parent, &kinds, &mut occurrences)
+                .unwrap();
+            for index in (0..node.named_child_count()).rev() {
+                stack.push((node.named_child(index).unwrap(), parent));
+            }
+        }
+        let rows = collector.finish(tree.root_node()).unwrap();
+        let text = |id| {
+            let range = occurrences.occurrence(id).range;
+            &source[range.start_byte..range.end_byte]
+        };
+        let assignments = rows
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == NormalizedKind::Assignment)
+            .map(|node| (text(node.occurrence), node.name.map(text)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assignments,
+            [("A=1", Some("A")), ("x,y = f(),g()", Some("x"))]
+        );
+        let (id, call) = rows
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| text(node.occurrence) == "(obj.Method)()")
+            .unwrap();
+        assert_eq!(call.name.map(text), Some("Method"));
+        let roles = rows.roles(u32::try_from(id).unwrap());
+        assert!(
+            roles
+                .iter()
+                .any(|role| role.role == Role::Receiver && text(role.occurrence) == "obj")
+        );
+        assert!(
+            roles
+                .iter()
+                .any(|role| role.role == Role::Callee && role.name.map(text) == Some("Method"))
+        );
+        // The common query planner uses this capability to distinguish an
+        // unsupported role from an authoritative empty role relation.
+        assert!(!GO_STRUCTURAL_SPEC.supports_role(Role::Element));
+        assert!(GO_STRUCTURAL_SPEC.supports_role(Role::Receiver));
     }
 }

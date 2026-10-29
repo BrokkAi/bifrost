@@ -2122,11 +2122,13 @@ pub struct BindingFilter {
 pub struct DecoratorBindingFilter {
     pub module: Option<String>,
     pub imported_name: Option<String>,
+    /// Exact qualified name of a resolved Java annotation type.
+    pub annotation_type: Option<String>,
 }
 
 impl DecoratorBindingFilter {
     pub fn is_empty(&self) -> bool {
-        self.module.is_none() && self.imported_name.is_none()
+        self.module.is_none() && self.imported_name.is_none() && self.annotation_type.is_none()
     }
 }
 
@@ -5455,6 +5457,8 @@ pub struct Pattern {
     /// A declaration modifier read from the declaration's structured modifier
     /// nodes. This is a generic source relation, not a language/framework rule.
     pub modifier: Option<DeclarationModifier>,
+    /// Source-written class-like declaration form.
+    pub type_kind: Option<String>,
     /// Decoded value of a normalized string literal. This is semantic fact
     /// data, not a predicate over the source spelling.
     pub string_value: Option<StringPredicate>,
@@ -5521,6 +5525,15 @@ pub struct Pattern {
     pub any: Vec<Pattern>,
     // Role sub-patterns. Only valid when `kind` is declared and the role is
     // valid for at least one of its kinds (see `Role::valid_for`).
+    pub type_operand: Option<Box<Pattern>>,
+    pub operand: Option<Box<Pattern>>,
+    pub consequence: Option<Box<Pattern>>,
+    pub alternative: Option<Box<Pattern>>,
+    pub body: Option<Box<Pattern>>,
+    pub label: Option<Box<Pattern>>,
+    pub binding: Option<Box<Pattern>>,
+    pub indices: Vec<Pattern>,
+    pub dimensions: Vec<Pattern>,
     pub callee: Option<Box<Pattern>>,
     pub receiver: Option<Box<Pattern>>,
     /// Each listed pattern must match some positional argument; matches must
@@ -5569,24 +5582,59 @@ pub struct Pattern {
 pub enum DeclarationModifier {
     Static,
     Abstract,
+    Final,
+    Volatile,
+    Synchronized,
+    Transient,
+    Native,
+    Strictfp,
+    Default,
+    Sealed,
+    NonSealed,
+    Public,
+    Protected,
+    Private,
 }
 
 impl DeclarationModifier {
-    pub const ALL: [Self; 2] = [Self::Static, Self::Abstract];
+    pub const ALL: [Self; 14] = [
+        Self::Static,
+        Self::Abstract,
+        Self::Final,
+        Self::Volatile,
+        Self::Synchronized,
+        Self::Transient,
+        Self::Native,
+        Self::Strictfp,
+        Self::Default,
+        Self::Sealed,
+        Self::NonSealed,
+        Self::Public,
+        Self::Protected,
+        Self::Private,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Static => "static",
             Self::Abstract => "abstract",
+            Self::Final => "final",
+            Self::Volatile => "volatile",
+            Self::Synchronized => "synchronized",
+            Self::Transient => "transient",
+            Self::Native => "native",
+            Self::Strictfp => "strictfp",
+            Self::Default => "default",
+            Self::Sealed => "sealed",
+            Self::NonSealed => "non-sealed",
+            Self::Public => "public",
+            Self::Protected => "protected",
+            Self::Private => "private",
         }
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "static" => Some(Self::Static),
-            "abstract" => Some(Self::Abstract),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|value| value.label() == label)
     }
 }
 
@@ -5598,6 +5646,7 @@ impl Pattern {
             && self.is_async.is_none()
             && self.unsafe_context.is_none()
             && self.modifier.is_none()
+            && self.type_kind.is_none()
             && self.string_value.is_none()
             && self.language_rule.is_none()
             && self.body_state.is_none()
@@ -5657,6 +5706,14 @@ impl Pattern {
             Role::Value => self.value.as_deref(),
             Role::Key => self.key.as_deref(),
             Role::Test => self.test.as_deref(),
+            Role::Type => self.type_operand.as_deref(),
+            Role::Operand => self.operand.as_deref(),
+            Role::Consequence => self.consequence.as_deref(),
+            Role::Alternative => self.alternative.as_deref(),
+            Role::Body => self.body.as_deref(),
+            Role::Label => self.label.as_deref(),
+            Role::Binding => self.binding.as_deref(),
+
             Role::Arg
             | Role::Kwarg
             | Role::Decorator
@@ -5664,6 +5721,8 @@ impl Pattern {
             | Role::Attributes
             | Role::Children
             | Role::Part
+            | Role::Indices
+            | Role::Dimensions
             | Role::TypeArguments => None,
         }
     }
@@ -5677,6 +5736,9 @@ impl Pattern {
             Role::Children => &self.children,
             Role::TypeArguments => &self.type_arguments,
             Role::Part => &self.parts,
+            Role::Indices => &self.indices,
+            Role::Dimensions => &self.dimensions,
+
             Role::Callee
             | Role::Receiver
             | Role::Kwarg
@@ -5690,7 +5752,14 @@ impl Pattern {
             | Role::Tag
             | Role::Value
             | Role::Key
-            | Role::Test => &[],
+            | Role::Test
+            | Role::Type
+            | Role::Operand
+            | Role::Consequence
+            | Role::Alternative
+            | Role::Body
+            | Role::Label
+            | Role::Binding => &[],
         }
     }
 

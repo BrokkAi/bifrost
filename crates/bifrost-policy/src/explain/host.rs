@@ -285,6 +285,7 @@ fn with_one_policy<T>(
         analyzer: workspace.analyzer(),
         workspace: Some(workspace),
         flow_state,
+        root_memo: None,
         cancellation,
         cvss_overlays: &[],
         organizational_risk: &[],
@@ -357,6 +358,7 @@ pub fn explain_loaded_policy(
                 ProductionTaintPolicyEvaluator::default,
                 |workspace| {
                     ProductionTaintPolicyEvaluator::prepare(
+                        context.flow_resources(),
                         std::iter::once(policy),
                         workspace,
                         Ok(active_semantic_model_snapshot.clone()),

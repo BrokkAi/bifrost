@@ -209,14 +209,18 @@ pub struct CfgAlgorithmBudget {
 }
 
 impl CfgAlgorithmBudget {
-    pub const fn new(limits: CfgAlgorithmWork) -> Self {
+    pub fn new(limits: CfgAlgorithmWork) -> Self {
         Self {
             ledger: BudgetLedger::with_zero_usage(limits),
         }
     }
 
-    pub const fn uniform(limit: usize) -> Self {
+    pub fn uniform(limit: usize) -> Self {
         Self::new(CfgAlgorithmWork::uniform(limit))
+    }
+
+    pub fn refusal_count(&self) -> usize {
+        self.ledger.refusal_count()
     }
 
     pub const fn limits(&self) -> CfgAlgorithmWork {

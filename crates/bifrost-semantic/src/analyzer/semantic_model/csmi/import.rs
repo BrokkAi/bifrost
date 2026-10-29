@@ -1178,6 +1178,8 @@ fn import_semantic_document(
                 ),
                 activation: vec![selector],
                 payload: AuthoredPayload::DeclarationFacts {
+                    assembly_identity: None,
+                    type_forwards: Vec::new(),
                     types,
                     members,
                     relations: Vec::new(),
@@ -1250,6 +1252,8 @@ fn import_semantic_document(
             id: format!("csmi.{pack_digest}.summaries"),
             activation: selectors,
             payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
                 types,
                 members,
                 relations: Vec::new(),

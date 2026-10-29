@@ -48,6 +48,8 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
+use brokk_bifrost_analysis::analyzer::store::go_package_context::GoOverlaySnapshot;
+
 const MAX_GO_ENV_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_GO_LIST_STDOUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GO_STDERR_BYTES: usize = 1024 * 1024;
@@ -127,6 +129,35 @@ impl GoCommandRunner for SystemGoCommandRunner {
     }
 }
 
+/// All replacement bytes and the Go mapping die together on every return,
+/// including cancellation during a bounded process. Nothing is written beside
+/// a workspace source file, even when that source does not exist on disk yet.
+struct GoOverlayDirectory {
+    directory: tempfile::TempDir,
+}
+
+impl GoOverlayDirectory {
+    fn write(root: &Path, overlays: &GoOverlaySnapshot) -> std::io::Result<Option<Self>> {
+        if overlays.files.is_empty() {
+            return Ok(None);
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("bifrost-go-overlay-")
+            .tempdir()?;
+        let mut replacements = BTreeMap::new();
+        for (ordinal, file) in overlays.files.iter().enumerate() {
+            let destination = directory.path().join(format!("{ordinal}.go"));
+            std::fs::write(&destination, &file.bytes)?;
+            // Paths are native absolute paths. Portable API renderers must not
+            // normalize the path spelling consumed by the host Go tool.
+            replacements.insert(root.join(&file.path), destination);
+        }
+        let mapping = serde_json::to_vec(&serde_json::json!({"Replace": replacements}))?;
+        std::fs::write(directory.path().join("overlay.json"), mapping)?;
+        Ok(Some(Self { directory }))
+    }
+}
+
 /// Canonical source membership and the independently filtered semantic product.
 /// None means discovery was disabled or failed before decoding primary records.
 #[derive(Debug)]
@@ -195,6 +226,7 @@ fn discover_with_runner(
         runner,
         &Default::default(),
         None,
+        None,
     )
 }
 
@@ -207,6 +239,7 @@ fn discover_domain_with_runner(
     runner: &dyn GoCommandRunner,
     domain: &brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
     environment: Option<GoEnvironment>,
+    overlays: Option<&GoOverlaySnapshot>,
 ) -> GoDiscoveryOutcome {
     let root = project.root().join(&domain.directory);
     let discovery = &config.dependency_discovery;
@@ -284,6 +317,53 @@ fn discover_domain_with_runner(
         )
         .into();
     }
+    let captured;
+    let overlays = if let Some(overlays) = overlays {
+        overlays
+    } else {
+        captured = match GoOverlaySnapshot::capture(project) {
+            Ok(overlays) => overlays,
+            Err(error) => {
+                return failed_outcome(
+                    "go.overlay_capture_failed",
+                    error.to_string(),
+                    cancellation,
+                    limits,
+                )
+                .into();
+            }
+        };
+        &captured
+    };
+    // The environment query already supplies the toolchain identity; never
+    // probe support by executing a failing list command on older toolchains.
+    if !overlays.files.is_empty()
+        && go_version(&environment.goversion)
+            .is_some_and(|version| version < Version::new(1, 16, 0))
+    {
+        return failed_outcome(
+            "go.overlay_unsupported_toolchain",
+            format!(
+                "Go {} does not support -overlay (requires Go 1.16 or newer)",
+                environment.goversion
+            ),
+            cancellation,
+            limits,
+        )
+        .into();
+    }
+    let overlay = match GoOverlayDirectory::write(project.root(), overlays) {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            return failed_outcome(
+                "go.overlay_write_failed",
+                error.to_string(),
+                cancellation,
+                limits,
+            )
+            .into();
+        }
+    };
     let vendor = root.join("vendor").join("modules.txt").is_file();
     let mut list_args = vec![
         OsString::from("list"),
@@ -297,6 +377,11 @@ fn discover_domain_with_runner(
             "-mod=readonly"
         }),
     ];
+    if let Some(overlay) = &overlay {
+        let mut argument = OsString::from("-overlay=");
+        argument.push(overlay.directory.path().join("overlay.json"));
+        list_args.push(argument);
+    }
     if !build_configuration.tags.is_empty() {
         list_args.push(OsString::from(format!(
             "-tags={}",
@@ -1171,7 +1256,10 @@ fn module_version(raw: &str) -> Option<Version> {
 
 fn go_version(raw: &str) -> Option<Version> {
     let version = raw.strip_prefix("go").unwrap_or(raw);
-    if let Ok(version) = Version::parse(version) {
+    // Initial Go releases before 1.21 omit the patch component (go1.15).
+    if let Ok(version) =
+        Version::parse(version).or_else(|_| Version::parse(&format!("{version}.0")))
+    {
         return Some(version);
     }
     for marker in ["rc", "beta"] {
@@ -1373,6 +1461,7 @@ pub(crate) fn discover_domain(
     cancellation: &CancellationToken,
     domain: &brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
     environment: GoEnvironment,
+    overlays: &GoOverlaySnapshot,
 ) -> GoDiscoveryOutcome {
     discover_domain_with_runner(
         config,
@@ -1382,6 +1471,7 @@ pub(crate) fn discover_domain(
         &SystemGoCommandRunner,
         domain,
         Some(environment),
+        Some(overlays),
     )
 }
 
@@ -1465,6 +1555,335 @@ mod tests {
             "GOARCH": "arm64"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn go_overlay_discovery_cancellation_removes_only_request_files() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("main.go", "package main\nfunc main(){}\n")
+            .build();
+        let overlay =
+            brokk_bifrost_core::analyzer::project::OverlayProject::new(fixture.project_dyn());
+        overlay.set(
+            fixture.file("main.go").abs_path(),
+            "package main\nfunc main(){ println(1) }\n".into(),
+        );
+        overlay.set(fixture.file("new.go").abs_path(), "package main\n".into());
+        struct CancelRunner {
+            directory: RefCell<Option<PathBuf>>,
+            runs: std::cell::Cell<usize>,
+        }
+        impl GoCommandRunner for CancelRunner {
+            fn run(
+                &self,
+                _executable: &Path,
+                root: &Path,
+                _config: &GoDependencyDiscoveryConfig,
+                invocation: &GoInvocation,
+                cancellation: Option<&CancellationToken>,
+            ) -> Result<Vec<u8>, String> {
+                self.runs.set(self.runs.get() + 1);
+                if invocation.args[0] == "env" {
+                    return Ok(environment(root));
+                }
+                let argument = invocation
+                    .args
+                    .iter()
+                    .find_map(|arg| arg.to_str().and_then(|arg| arg.strip_prefix("-overlay=")))
+                    .unwrap();
+                let mapping: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(argument).unwrap()).unwrap();
+                let directory = Path::new(argument).parent().unwrap();
+                assert!(!directory.starts_with(root));
+                let replacements = mapping["Replace"].as_object().unwrap();
+                assert_eq!(replacements.len(), 2);
+                for (source, replacement) in replacements {
+                    assert!(Path::new(source).is_absolute());
+                    let replacement = Path::new(replacement.as_str().unwrap());
+                    assert!(replacement.starts_with(directory));
+                    assert!(replacement.is_file());
+                }
+                assert_eq!(
+                    std::fs::read_to_string(root.join("main.go")).unwrap(),
+                    "package main\nfunc main(){}\n"
+                );
+                assert!(!root.join("new.go").exists());
+                *self.directory.borrow_mut() = Some(directory.to_path_buf());
+                cancellation.unwrap().cancel();
+                Err("cancelled during discovery".into())
+            }
+        }
+        let runner = CancelRunner {
+            directory: RefCell::new(None),
+            runs: std::cell::Cell::new(0),
+        };
+        let cancellation = CancellationToken::new();
+        let result = discover_with_runner(
+            &config(),
+            &overlay,
+            &Default::default(),
+            Some(&cancellation),
+            &runner,
+        );
+        assert!(!result.semantic_packs.complete);
+        assert_eq!(runner.runs.get(), 2, "overlay adds no tool invocations");
+        let directory = runner.directory.borrow();
+        assert!(
+            !directory.as_ref().unwrap().exists(),
+            "drop removes overlay after cancellation"
+        );
+    }
+
+    #[test]
+    fn go_overlay_rejects_old_toolchain_without_list() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("main.go", "package main\n")
+            .build();
+        let overlay =
+            brokk_bifrost_core::analyzer::project::OverlayProject::new(fixture.project_dyn());
+        overlay.set(
+            fixture.file("main.go").abs_path(),
+            "package main\nfunc main(){}\n".into(),
+        );
+        let mut env: serde_json::Value =
+            serde_json::from_slice(&environment(fixture.root())).unwrap();
+        for version in ["go1.15", "go1.15.15"] {
+            env["GOVERSION"] = version.into();
+            let runner = FakeRunner::with_outputs([serde_json::to_vec(&env).unwrap()]);
+            let outcome =
+                discover_with_runner(&config(), &overlay, &Default::default(), None, &runner);
+            assert!(!outcome.semantic_packs.complete);
+            assert!(
+                outcome
+                    .semantic_packs
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "go.overlay_unsupported_toolchain"),
+                "{outcome:?}"
+            );
+            assert_eq!(runner.invocations.borrow().len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[hardwon(
+        "#7154: unsaved import edits failed to publish while body-only overlays must reuse placement"
+    )]
+    fn installed_go_overlay_membership_discovery_and_unchanged_save_reuse() {
+        use brokk_bifrost_analysis::analyzer::workspace::{
+            DependencyPackEcosystem, WorkspaceAnalyzer,
+        };
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        if !Command::new("go")
+            .arg("version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let Some(go) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|path| path.join("go"))
+            .find(|path| path.is_file())
+        else {
+            return;
+        };
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/overlay\n\ngo 1.22\n")
+            .file("consumer.go", "package overlay\nfunc Run(){}\n")
+            .file("new/new.go", "package new\nfunc New(){}\n")
+            .build();
+        let log = fixture.root().join("go-runs");
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let wrapper = fixture.root().join("go-wrapper");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = list ]; then echo list >> {}; fi\nexec {} \"$@\"\n",
+                quote(&log),
+                quote(&go)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+        config.go.dependency_discovery.go_executable = Some(wrapper);
+        let mut workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(overlay.clone(), config.clone()).unwrap();
+        let outcome = workspace.resolve_dependency_discovery(
+            DependencyPackEcosystem::Go,
+            &config,
+            &Default::default(),
+            &CancellationToken::new(),
+        );
+        assert!(outcome.complete, "{outcome:?}");
+        let runs = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let context = |workspace: &WorkspaceAnalyzer| {
+            let conn = workspace.store().unwrap().read_conn().unwrap();
+            conn.query_row("SELECT p.context_id FROM go_context_publications p JOIN go_context_selections s USING(selection_id) WHERE s.profile_digest<>?1 AND p.valid_until IS NULL",[brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile()],|row|row.get::<_,i64>(0)).unwrap()
+        };
+        let publications = |workspace: &WorkspaceAnalyzer| {
+            let conn = workspace.store().unwrap().read_conn().unwrap();
+            conn.query_row("SELECT count(*) FROM go_context_publications p JOIN go_context_selections s USING(selection_id) WHERE s.profile_digest<>?1",[brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile()],|row|row.get::<_,i64>(0)).unwrap()
+        };
+        // Equal-output saves move the input key without moving valid_from.
+        // A later body overlay must still compare the recorded membership.
+        fixture
+            .file("consumer.go")
+            .write("package overlay\nfunc Run(){println(0)}\n")
+            .unwrap();
+        workspace = workspace.update(&BTreeSet::from([fixture.file("consumer.go")]));
+        let original = context(&workspace);
+        let before = runs();
+        let before_publications = publications(&workspace);
+        let consumer = fixture.file("consumer.go");
+        overlay.set(
+            consumer.abs_path(),
+            "package overlay\nfunc Run(){println(1)}\n".into(),
+        );
+        workspace = workspace.update(&BTreeSet::from([consumer.clone()]));
+        assert_eq!(runs(), before, "body-only overlay runs no discovery");
+        assert_eq!(context(&workspace), original);
+        assert_eq!(
+            publications(&workspace),
+            before_publications,
+            "body-only overlay publishes nothing"
+        );
+        let edited =
+            "package overlay\nimport \"example.test/overlay/new\"\nfunc Run(){new.New()}\n";
+        overlay.set(consumer.abs_path(), edited.into());
+        let provider = fixture.file("new/new.go");
+        overlay.set(
+            provider.abs_path(),
+            "package new\nfunc New(){println(2)}\n".into(),
+        );
+        workspace = workspace.update(&BTreeSet::from([consumer.clone(), provider]));
+        assert_eq!(
+            runs(),
+            before + 1,
+            "one existing discovery invocation per changed domain"
+        );
+        assert_eq!(
+            publications(&workspace),
+            before_publications + 1,
+            "one tool context published for import edit"
+        );
+        let imported = context(&workspace);
+        assert_ne!(imported, original);
+        overlay.set(
+            consumer.abs_path(),
+            edited.replace("new.New()", "new.New();println(3)"),
+        );
+        workspace = workspace.update(&BTreeSet::from([consumer.clone()]));
+        assert_eq!(
+            runs(),
+            before + 1,
+            "a body edit after an unsaved import also reuses placement"
+        );
+        assert_eq!(publications(&workspace), before_publications + 1);
+        overlay.set(consumer.abs_path(), edited.into());
+        workspace = workspace.update(&BTreeSet::from([consumer.clone()]));
+        assert_eq!(runs(), before + 1);
+        consumer.write(edited).unwrap();
+        overlay.clear(&consumer.abs_path());
+        workspace = workspace.update(&BTreeSet::from([consumer.clone()]));
+        assert_eq!(runs(), before + 1, "unchanged save does no discovery");
+        assert_eq!(context(&workspace), imported);
+        let snapshot = {
+            let conn = workspace.store().unwrap().read_conn().unwrap();
+            conn.query_row("SELECT workspace_id,generation,revision FROM workspace_heads WHERE lang='go'",[],|row|Ok(brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId {
+                workspace_id:brokk_bifrost_analysis::analyzer::store::WorkspaceId::for_root(fixture.root()),lang:"go".into(),
+                generation:brokk_bifrost_analysis::analyzer::store::GenerationId::from_persisted(row.get(1)?),revision:row.get(2)? })).unwrap()
+        };
+        let observe = |workspace: &WorkspaceAnalyzer| {
+            workspace
+                .store()
+                .unwrap()
+                .observe_go_context_inputs(
+                    &snapshot,
+                    workspace.analyzer().project(),
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+        };
+        let observed = observe(&workspace);
+        std::fs::File::open(consumer.abs_path())
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(60)),
+            )
+            .unwrap();
+        assert!(
+            matches!((observed,observe(&workspace)),(brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome::Ready(before),brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome::Ready(after)) if before==after),
+            "mtime does not participate in observation"
+        );
+        workspace = workspace.update(&BTreeSet::from([consumer]));
+        assert_eq!(
+            runs(),
+            before + 1,
+            "equal-byte mtime touch does no discovery"
+        );
+        assert_eq!(context(&workspace), imported);
+        let added = fixture.file("added.go");
+        overlay.set(
+            added.abs_path(),
+            "package overlay\nimport \"example.test/overlay/new\"\nfunc Added(){new.New()}\n"
+                .into(),
+        );
+        workspace = workspace.update(&BTreeSet::from([added]));
+        assert_eq!(runs(), before + 2, "missing predecessor triggers discovery");
+        assert_eq!(publications(&workspace), before_publications + 2);
+        let conn = workspace.store().unwrap().read_conn().unwrap();
+        assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM go_package_files f JOIN go_package_instances p USING(package_id) WHERE f.rel_path='added.go' AND p.context_id=?1)",[context(&workspace)],|row|row.get::<_,bool>(0)).unwrap(),"Go must list the new unsaved file");
+        drop(conn);
+        let mut latest = snapshot.clone();
+        latest.revision = workspace
+            .store()
+            .unwrap()
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT revision FROM workspace_heads WHERE lang='go'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let captured = GoOverlaySnapshot::capture(workspace.analyzer().project()).unwrap();
+        let store = workspace.store().unwrap();
+        assert!(matches!(store.observe_go_context_inputs_with_overlay(&latest,workspace.analyzer().project(),&CancellationToken::new(),&captured).unwrap(),brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome::Ready(_)));
+        overlay.set(
+            fixture.file("added.go").abs_path(),
+            "package overlay\nfunc Added(){}\n".into(),
+        );
+        assert!(matches!(store.observe_go_context_inputs_with_overlay(&latest,workspace.analyzer().project(),&CancellationToken::new(),&captured).unwrap(),brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome::InputsChanged(_)),"a newer buffer cannot validate a captured discovery");
+        assert!(overlay.clear(&fixture.file("added.go").abs_path()));
+        assert!(!fixture.file("added.go").abs_path().exists());
+        assert!(
+            matches!(
+                store.observe_go_context_inputs_with_overlay(
+                    &latest,
+                    workspace.analyzer().project(),
+                    &CancellationToken::new(),
+                    &captured,
+                ).unwrap(),
+                brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome::InputsChanged(
+                    brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputChange::Missing { path, .. }
+                ) if path == "added.go"
+            ),
+            "closing a new unsaved file must refuse publication without an I/O error"
+        );
     }
 
     #[test]
@@ -1833,6 +2252,7 @@ mod tests {
                 None,
                 &runner,
                 domain,
+                None,
                 None,
             );
             assert!(

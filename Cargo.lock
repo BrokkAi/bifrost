@@ -162,12 +162,13 @@ checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
  "brokk-bifrost-cpp-analysis",
+ "brokk-bifrost-csharp",
  "brokk-bifrost-csharp-analysis",
  "brokk-bifrost-flow",
  "brokk-bifrost-go-analysis",
@@ -218,12 +219,13 @@ dependencies = [
  "tree-sitter-python",
  "url",
  "walkdir",
+ "workspace-hack",
  "zip",
 ]
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "arc-swap",
  "brokk-bifrost-core",
@@ -277,12 +279,13 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-yaml",
  "uuid",
+ "workspace-hack",
  "zip",
 ]
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "bincode",
  "brokk-bifrost-test-macros",
@@ -305,11 +308,12 @@ dependencies = [
  "tree-sitter",
  "walkdir",
  "windows-sys 0.61.2",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-cpp"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -321,11 +325,12 @@ dependencies = [
  "shlex 2.0.1",
  "tempfile",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-cpp-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -340,22 +345,24 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-csharp"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
  "brokk-tree-sitter-c-sharp",
  "regex",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-csharp-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -369,15 +376,17 @@ dependencies = [
  "rayon",
  "semver",
  "serde_json",
+ "sha1",
  "sha2",
  "tempfile",
  "tree-sitter",
  "walkdir",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-flow"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -389,25 +398,26 @@ dependencies = [
  "sha2",
  "tempfile",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-go"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
- "rayon",
  "regex",
  "serde",
  "tempfile",
  "tree-sitter",
  "tree-sitter-go",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-go-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -424,11 +434,12 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-go",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-js-ts"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -439,11 +450,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-js-ts-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -463,12 +475,13 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-yarnlock",
+ "workspace-hack",
  "yarn-lock-parser",
 ]
 
 [[package]]
 name = "brokk-bifrost-jvm"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -481,11 +494,12 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-java",
  "tree-sitter-javadoc",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-jvm-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -505,12 +519,13 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-java",
+ "workspace-hack",
  "zip",
 ]
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -538,11 +553,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-php"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -553,11 +569,12 @@ dependencies = [
  "regex",
  "serde_json",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-php-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -573,11 +590,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-policy"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-cpp-analysis",
@@ -601,24 +619,27 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-python"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
  "regex",
  "tempfile",
  "toml",
+ "tracing",
  "tree-sitter",
  "tree-sitter-python",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-python-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -639,14 +660,17 @@ dependencies = [
  "tempfile",
  "toml",
  "toml_edit",
+ "tracing",
+ "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-python",
+ "workspace-hack",
  "zip",
 ]
 
 [[package]]
 name = "brokk-bifrost-rql"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -679,23 +703,25 @@ dependencies = [
  "strsim",
  "tempfile",
  "tree-sitter",
+ "workspace-hack",
  "zip",
 ]
 
 [[package]]
 name = "brokk-bifrost-ruby"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
  "serde_json",
  "tree-sitter",
  "tree-sitter-ruby",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-ruby-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -712,11 +738,12 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-rbs",
  "tree-sitter-ruby",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-flow",
@@ -729,11 +756,12 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-test-macros",
@@ -749,11 +777,12 @@ dependencies = [
  "tempfile",
  "toml",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-rust-analysis"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -774,11 +803,12 @@ dependencies = [
  "toml",
  "toml_edit",
  "tree-sitter",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-semantic"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-bifrost-cpp",
@@ -807,11 +837,12 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-csharp-analysis",
@@ -820,7 +851,9 @@ dependencies = [
  "brokk-bifrost-js-ts-analysis",
  "brokk-bifrost-jvm-analysis",
  "brokk-bifrost-php-analysis",
+ "brokk-bifrost-policy",
  "brokk-bifrost-python-analysis",
+ "brokk-bifrost-rql",
  "brokk-bifrost-ruby-analysis",
  "brokk-bifrost-rust-analysis",
  "brokk-bifrost-test-macros",
@@ -835,12 +868,13 @@ dependencies = [
  "tar",
  "tempfile",
  "ureq",
+ "workspace-hack",
  "zip",
 ]
 
 [[package]]
 name = "brokk-bifrost-store"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "bincode",
  "brokk-bifrost-core",
@@ -882,15 +916,19 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "brokk-bifrost-test-macros"
-version = "0.14.2"
+version = "0.14.3"
+dependencies = [
+ "workspace-hack",
+]
 
 [[package]]
 name = "brokk-bifrost-tools"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
@@ -936,6 +974,7 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-yaml",
  "walkdir",
+ "workspace-hack",
  "zip",
 ]
 
@@ -951,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "brokk-tree-sitter-cpp"
-version = "0.24.6"
+version = "0.24.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "674f79e5a0d24788fea4086549cbc0ee6290fdfe142c7ac400ba3ae23542d6d8"
+checksum = "f2e30d0312deaa1f5e5250b0bf0c92f7d0c62b96075a29cd708a64af60fccd1a"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -3275,6 +3314,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4359,6 +4409,53 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "allocator-api2",
+ "bit-set",
+ "bit-vec",
+ "bitflags",
+ "cc",
+ "chrono",
+ "either",
+ "errno",
+ "foldhash",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "hashbrown",
+ "idna",
+ "indexmap",
+ "libc",
+ "linux-raw-sys",
+ "memchr",
+ "mio",
+ "num-traits",
+ "percent-encoding",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "rusqlite",
+ "rustix",
+ "schemars",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "simd-adler32",
+ "smallvec",
+ "syn 2.0.118",
+ "syn 3.0.3",
+ "toml_edit",
+ "tracing",
+ "url",
+ "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "writeable"

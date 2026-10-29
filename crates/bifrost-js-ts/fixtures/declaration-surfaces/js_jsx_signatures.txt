@@ -1,0 +1,19 @@
+SOURCE export function Upper(){return <div/>;} export function lower(){return <div/>;}
+Function [("Member", "Upper")] lookup=false signatures=["export function Upper(): JSX.Element ..."] labels=[([], true, false)] supers=[]
+Function [("Member", "lower")] lookup=false signatures=["export function lower() ..."] labels=[([], true, false)] supers=[]
+export Some("Upper") Local { local_name: "Upper" }
+export Some("lower") Local { local_name: "lower" }
+materialized Named "Upper" target=None
+materialized Named "lower" target=None
+SOURCE export const Upper=()=> <div/>; export const lower=()=> <div/>;
+Function [("Member", "Upper")] lookup=false signatures=["export Upper(): JSX.Element => ..."] labels=[([], true, false)] supers=[]
+Function [("Member", "lower")] lookup=false signatures=["export lower() => ..."] labels=[([], true, false)] supers=[]
+export Some("Upper") Local { local_name: "Upper" }
+export Some("lower") Local { local_name: "lower" }
+materialized Named "Upper" target=None
+materialized Named "lower" target=None
+SOURCE class Yes {render(){return <div/>;}} class No {render(){return 42;}}
+Class [("Type", "No")] lookup=false signatures=["class No {"] labels=[] supers=[]
+Class [("Type", "Yes")] lookup=false signatures=["class Yes {"] labels=[] supers=[]
+Function [("Type", "No"), ("Member", "render")] lookup=false signatures=["function render() ..."] labels=[([], false, false)] supers=[]
+Function [("Type", "Yes"), ("Member", "render")] lookup=false signatures=["function render(): JSX.Element ..."] labels=[([], false, false)] supers=[]

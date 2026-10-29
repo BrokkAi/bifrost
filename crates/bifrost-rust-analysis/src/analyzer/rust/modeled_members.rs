@@ -43,6 +43,27 @@ use brokk_bifrost_rust::prelude::{
     RustEdition, RustPreludeCrate, RustPreludeNamespace, rust_prelude_name,
 };
 
+/// Classify the receiver that selected a member, after any dereference.
+/// A trait declaration (including a bound or dyn receiver) cannot close a call.
+/// Primitive model aliases are recognized by their selected canonical identity.
+pub(crate) fn receiver_dispatch_extensibility(
+    kind: SemanticModelSymbolKind,
+    model_identity: Option<&str>,
+) -> Option<brokk_bifrost_core::analyzer::model::DispatchExtensibility> {
+    let primitive_alias = kind == SemanticModelSymbolKind::TypeAlias
+        && model_identity
+            .is_some_and(|name| super::call_conversion::modeled_primitive(name).is_some());
+    (primitive_alias
+        || matches!(
+            kind,
+            SemanticModelSymbolKind::Class
+                | SemanticModelSymbolKind::Struct
+                | SemanticModelSymbolKind::Enum
+                | SemanticModelSymbolKind::Union
+        ))
+    .then_some(brokk_bifrost_core::analyzer::model::DispatchExtensibility::Closed)
+}
+
 /// A trait fixed by a UFCS path, with its structurally selected type arguments.
 pub(crate) struct UfcsTrait<'tree> {
     pub owner: String,
@@ -138,6 +159,8 @@ pub(crate) fn select<'analyzer>(
     };
     // Scope must be known before certifying even an inherent family: a
     // by-value trait method can precede an inherent borrowed-self method.
+    let mut selected_receiver_extensibility =
+        receiver_dispatch_extensibility(owner.kind, Some(&owner.qualified_name));
     let candidates = if let Some(named) = named_trait {
         overlay
             .callable_owners_on_surface(&active, &owner, member)?
@@ -414,6 +437,8 @@ pub(crate) fn select<'analyzer>(
         let mut receiver = owner;
         let mut visited = std::collections::HashSet::new();
         let candidates = loop {
+            selected_receiver_extensibility =
+                receiver_dispatch_extensibility(receiver.kind, Some(&receiver.qualified_name));
             if !visited.insert(receiver.id.clone()) {
                 return None;
             }
@@ -559,9 +584,11 @@ pub(crate) fn select<'analyzer>(
                     return None;
                 }
                 let matched = callable_on(&receiver);
+                let extensibility =
+                    selected_receiver_extensibility.unwrap_or(DispatchExtensibility::Open);
                 return callable_is_proven(&matched).then(|| SelectedMember {
                     owner: receiver.qualified_name.clone(),
-                    extensibility: DispatchExtensibility::Closed,
+                    extensibility,
                 });
             }
             let mut dereferenced = &receiver_type;
@@ -662,7 +689,7 @@ pub(crate) fn select<'analyzer>(
                 selected = Some(SelectedMember {
                     owner: candidate.owner.qualified_name.clone(),
                     extensibility: if implementation_is_proven(&candidate.owner, &matched) {
-                        DispatchExtensibility::Closed
+                        selected_receiver_extensibility.unwrap_or(DispatchExtensibility::Open)
                     } else {
                         DispatchExtensibility::Open
                     },

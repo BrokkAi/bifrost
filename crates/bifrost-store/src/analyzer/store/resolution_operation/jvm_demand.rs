@@ -3,8 +3,9 @@ use super::demand::{
     ClosedForwardSource, ClosedRelations, LanguageContextPreparation, LanguageRootDiscovery,
 };
 use super::demand_closure::{BaseEligibility, ClosureWitness, Read};
+use super::imports::SelectedImportRouteKind;
 use super::jvm_context::{
-    JvmImportContext, JvmImportContextGap, is_jvm_language, jvm_prefix_defers_member_selection,
+    JvmImportContext, JvmImportContextGap, jvm_prefix_defers_member_selection,
 };
 use super::package_context::SelectedPackageRows;
 use super::*;
@@ -17,7 +18,18 @@ use crate::analyzer::resolution::{
     binding_origin_rank, language_implicit_root_providers,
     language_implicit_root_providers_in_namespace,
 };
-use brokk_bifrost_core::analyzer::resolution_facts::{BindingProjectionKind, ResolutionGapKind};
+use brokk_bifrost_core::analyzer::resolution_facts::{
+    BindingProjectionKind, ResolutionGapKind, ResolutionRootImportKind,
+};
+
+pub(in crate::analyzer) fn jvm_root_import_origin(
+    language: Language,
+    kind: ResolutionRootImportKind,
+) -> BindingOrigin {
+    nominal_rules::nominal_language_rules(language)
+        .expect("caller belongs to a nominal family")
+        .root_import_origin(kind)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct JvmBindingPrecedence {
@@ -109,19 +121,20 @@ impl SelectedResolutionOperation<'_, '_> {
                         .as_ref()
                         .is_some_and(|selector| selector.source_name.is_none())
                         || route.as_ref().is_some_and(|route| {
-                            matches!(route.kind.as_str(), "type_on_demand" | "static_on_demand")
+                            matches!(
+                                route.kind,
+                                SelectedImportRouteKind::TypeOnDemand
+                                    | SelectedImportRouteKind::StaticOnDemand
+                            )
                         });
-                    let origin = if wildcard {
-                        match record.semantic_language() {
-                            Language::Kotlin => BindingOrigin::StarImport,
-                            Language::Java => BindingOrigin::OnDemandImport,
-                            _ => BindingOrigin::WildcardImport,
-                        }
-                    } else if record.semantic_language() == Language::Java {
-                        BindingOrigin::SingleTypeImport
-                    } else {
-                        BindingOrigin::ExplicitImport
-                    };
+                    let origin = jvm_root_import_origin(
+                        record.semantic_language(),
+                        if wildcard {
+                            ResolutionRootImportKind::Glob
+                        } else {
+                            ResolutionRootImportKind::Named
+                        },
+                    );
                     let rank = binding_origin_rank(record.semantic_language(), origin);
                     if let Some(rank) = rank {
                         binders.push((*token, *source_scope_head, *activation, rank));
@@ -325,6 +338,8 @@ enum JvmNameContextKey {
 }
 
 struct JvmDemandState<'a, 'store, 'input> {
+    rules: &'static dyn nominal_rules::NominalLanguageRules,
+    family: &'static dyn nominal_rules::NominalPackageRules,
     operation: &'a SelectedResolutionOperation<'store, 'input>,
     base: &'a dyn BatchResolutionFragmentSource,
     initial: crate::analyzer::resolution::SelectedContextPathToken,
@@ -491,7 +506,7 @@ impl JvmDemandState<'_, '_, '_> {
                     .operation
                     .mount_table()
                     .mount_by_ordinal(mount.ordinal())?;
-                if is_jvm_language(record.semantic_language()) {
+                if self.family.admits(record.semantic_language()) {
                     let SelectedPackageRows::Ready(references) =
                         self.operation.selected_package_reference_for_token(
                             mount.ordinal(),
@@ -589,12 +604,16 @@ impl JvmDemandState<'_, '_, '_> {
             .operation
             .mount_table()
             .mount_for_fragment(source.key.fragment)?
-            .filter(|mount| is_jvm_language(mount.semantic_language()))
+            .filter(|mount| self.family.admits(mount.semantic_language()))
         else {
             return Ok(None);
         };
         let source_language = mount.semantic_language();
-        let import_qualifiers = if source_language == Language::Scala {
+        let import_qualifiers = if nominal_rules::nominal_language_rules(source_language)
+            .expect("source belongs to a nominal family")
+            .lexical_import_anchors()
+            .contains(&ResolutionRootImportAnchor::Lexical)
+        {
             self.operation
                 .scala_import_qualifiers(&source.half, self.cancellation)?
                 .map(|qualifiers| (source.half.clone(), qualifiers.into_boxed_slice()))
@@ -733,7 +752,10 @@ impl JvmDemandState<'_, '_, '_> {
                     .operation
                     .ready
                     .context_identities
-                    .jvm_external_provider_type_identity_for_reference(binding.reference)
+                    .jvm_external_provider_type_identity_for_reference(
+                        crate::analyzer::resolution::ExternalOwnerLanguage::Jvm,
+                        binding.reference,
+                    )
                     .and_then(|identity| {
                         self.operation
                             .ready
@@ -912,18 +934,9 @@ impl JvmDemandState<'_, '_, '_> {
                 binding_origin_rank(mount.semantic_language(), BindingOrigin::RootPackage)
         {
             let package_present: bool = self.operation.ready.inventory.connection().query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM main.workspace_file_package_rows AS package INDEXED BY idx_workspace_file_package_rows_name
-                   JOIN temp.selected_resolution_mounts AS mounted ON mounted.file_version_id=package.file_version_id
-                   JOIN main.blob_meta AS meta ON meta.blob_id=mounted.blob_id AND meta.is_complete=1
-                   WHERE mounted.storage_language IN ('java','kotlin','scala')
-                     AND (package.package_name=?1 OR (package.package_name>=?1||'.' AND package.package_name<?1||'/'))
-                   UNION ALL
-                   SELECT 1 FROM temp.selected_resolution_mounts AS mounted
-                   JOIN main.blob_meta AS meta ON meta.blob_id=mounted.blob_id AND meta.is_complete=1
-                   WHERE mounted.file_version_id IS NULL AND mounted.storage_language IN ('java','kotlin','scala')
-                     AND (meta.content_package=?1 OR (meta.content_package>=?1||'.' AND meta.content_package<?1||'/'))
-                 )", [lookup.spelling()], |row| row.get(0),
+                self.family.package_prefix_presence_sql(),
+                [lookup.spelling()],
+                |row| row.get(0),
             )?;
             if package_present {
                 // A qualified package prefix is a positive binding in the
@@ -1013,11 +1026,16 @@ impl JvmDemandState<'_, '_, '_> {
             (
                 reference,
                 receiver,
-                identities.jvm_external_provider_type_identity_for_reference(receiver),
+                identities.jvm_external_provider_type_identity_for_reference(
+                    crate::analyzer::resolution::ExternalOwnerLanguage::Jvm,
+                    receiver,
+                ),
             ),
         );
-        let Some(owner) = identities.jvm_external_provider_type_identity_for_reference(receiver)
-        else {
+        let Some(owner) = identities.jvm_external_provider_type_identity_for_reference(
+            crate::analyzer::resolution::ExternalOwnerLanguage::Jvm,
+            receiver,
+        ) else {
             return Ok(false);
         };
         if identities.external_owner_identity(owner).is_none() {
@@ -1369,7 +1387,7 @@ impl JvmDemandState<'_, '_, '_> {
                 .mount_by_ordinal(self.caller)?
                 .semantic_language();
             let gaps = if !language_implicit_root_providers(language).is_empty()
-                || (language == Language::Java && !implicit_root_reference)
+                || (self.rules.has_context_import_inventory() && !implicit_root_reference)
             {
                 context_gaps
             } else {
@@ -1978,7 +1996,8 @@ impl JvmDemandState<'_, '_, '_> {
         language: Language,
     ) -> Option<Vec<SemanticId>> {
         let values = self.jvm_prefix_projected_values(reference, answer, language)?;
-        let scala = language == Language::Scala;
+        let rules = nominal_rules::nominal_language_rules(language)
+            .expect("caller belongs to a nominal family");
         let type_targets = values
             .iter()
             .map(|value| value.ty().identity())
@@ -1989,7 +2008,8 @@ impl JvmDemandState<'_, '_, '_> {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        (scala || type_targets == binding_targets).then(|| type_targets.into_iter().collect())
+        (rules.has_projected_value_qualifiers() || type_targets == binding_targets)
+            .then(|| type_targets.into_iter().collect())
     }
 
     fn scala_import_projected_values<'answer>(
@@ -2024,14 +2044,13 @@ impl JvmDemandState<'_, '_, '_> {
         answer: &'answer FactResolutionAnswer,
         language: Language,
     ) -> Option<&'answer [ResolutionSlotValue]> {
+        let rules = nominal_rules::nominal_language_rules(language)
+            .expect("caller belongs to a nominal family");
         let mut projections = answer.projections().iter().filter(|projection| {
-            projection.reference() == reference && (
-                matches!(projection.kind(),
-                    brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind::TargetTypeOrDeclaredValueType
-                    | brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind::TargetTypeIdentity)
-                || (language == Language::Scala && projection.kind() ==
-                    brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind::TargetDeclaredValueType)
-            )
+            projection.reference() == reference
+                && rules
+                    .qualifier_projection_kinds()
+                    .contains(&projection.kind())
         });
         let projection = projections.next()?;
         if projections.next().is_some() {
@@ -2042,11 +2061,11 @@ impl JvmDemandState<'_, '_, '_> {
             .iter()
             .find(|frontier| frontier.slot() == projection.output_slot())?;
         let values = frontier.possible_values();
-        let scala = language == Language::Scala;
         if values.is_empty()
             || values.iter().any(|value| {
                 value.ty().indirection() != 0
-                    || (!scala && !matches!(value, ResolutionSlotValue::TypeObject(_, _)))
+                    || (!rules.has_projected_value_qualifiers()
+                        && !matches!(value, ResolutionSlotValue::TypeObject(_, _)))
             })
         {
             return None;
@@ -2190,14 +2209,6 @@ impl JvmDemandState<'_, '_, '_> {
     }
 }
 
-/// Whether a forward point query in this source language runs with the JVM
-/// demand provider, which admits the provider files its qualified routes and
-/// package members reach. Kotlin's producer publishes the qualified routes
-/// required by this path.
-pub(super) fn jvm_demand_storage_language(storage_language: &str) -> bool {
-    matches!(storage_language, "java" | "kotlin" | "scala")
-}
-
 /// Inputs for one caller file's shared JVM forward operation.
 #[doc(hidden)]
 pub struct JvmForwardOperationContext<'a> {
@@ -2251,10 +2262,9 @@ impl SelectedResolutionOperation<'_, '_> {
             .mount_table()
             .mount_for_path(caller_language, caller_path)?
             .expect("located JVM reference has a selected caller mount");
-        assert!(matches!(
-            caller.semantic_language(),
-            Language::Java | Language::Kotlin | Language::Scala
-        ));
+        let rules = nominal_rules::nominal_language_rules(caller.semantic_language())
+            .expect("caller belongs to a nominal family");
+        let family = rules.family();
         let caller = caller.ordinal();
         self.profile_jvm_read(
             "demand_provider",
@@ -2271,6 +2281,8 @@ impl SelectedResolutionOperation<'_, '_> {
             crate::analyzer::resolution::CALLER_ENVIRONMENT,
         );
         let language = JvmDemandState {
+            rules,
+            family,
             operation: self,
             base: lexical,
             initial: blueprint.context_token(),
@@ -2316,7 +2328,7 @@ impl JvmDemandState<'_, '_, '_> {
             .ready
             .inventory
             .mount_record_by_ordinal(mount)?;
-        assert!(is_jvm_language(record.semantic_language()));
+        assert!(self.family.admits(record.semantic_language()));
         match self.operation.jvm_import_context_for_name(
             record.semantic_language(),
             record.persisted_relative_path(),
@@ -2428,7 +2440,7 @@ impl<'a, 'store, 'input> JvmRules<'a, 'store, 'input> {
 
 impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store, 'input> {
     type Placement = ();
-    type Target = super::demand_closure::RouteLocation;
+    type Target = JvmSourceTarget;
     type Member = ();
     type Provider = SemanticId;
     type MemberRow = crate::analyzer::resolution::LoweredMemberOwnerProperty;
@@ -2628,7 +2640,9 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
         let mut reader = source_half
             .map(|half| self.state.operation.jvm_source_reader_context(half))
             .transpose()?;
-        if language == Language::Scala
+        if let Some(origin) = nominal_rules::nominal_language_rules(language)
+            .expect("caller belongs to a nominal family")
+            .lexical_import_head_origin()
             && let Some(SelectedRootPathHalf::Reference {
                 source_reference, ..
             }) = &source.qualified
@@ -2646,8 +2660,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                 reader
                     .as_mut()
                     .expect("source reader prepared")
-                    .package_origin_rank =
-                    binding_origin_rank(Language::Scala, BindingOrigin::RootPackage);
+                    .package_origin_rank = binding_origin_rank(language, origin);
             }
         }
         let member_start =
@@ -2714,7 +2727,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             ..
         }) = &source.qualified
             && (member_start.is_some()
-                || (language == Language::Java && prefix_reference.is_some())
+                || (jvm_prefix_defers_member_selection(language) && prefix_reference.is_some())
                 || (prefix_reference.is_none()
                     && *owner_continued
                     && *anchor == ResolutionRootImportAnchor::Lexical))
@@ -2737,11 +2750,11 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             .map(|(_, retired, _)| retired.clone())
             .unwrap_or_default();
         if let Some(start) = member_start {
-            let mut completion = inputs
-                .iter()
-                .fold(ResolutionCompletion::Complete, |completion, (_, answer)| {
-                    completion.combine(answer.completion())
-                });
+            let mut completion = ResolutionCompletion::combine_all_with_poll(
+                inputs.iter().map(|(_, answer)| answer.completion()),
+                &mut || self.state.cancellation.is_cancelled(),
+            )
+            .unwrap_or_else(cancelled_completion);
             let mut discharges = if source.import_qualifiers.is_some() {
                 JvmDemandState::scala_import_discharges(source)
             } else {
@@ -2785,11 +2798,11 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             ..
         }) = &source.qualified
         {
-            let mut completion = inputs
-                .iter()
-                .fold(ResolutionCompletion::Complete, |completion, (_, answer)| {
-                    completion.combine(answer.completion())
-                });
+            let mut completion = ResolutionCompletion::combine_all_with_poll(
+                inputs.iter().map(|(_, answer)| answer.completion()),
+                &mut || self.state.cancellation.is_cancelled(),
+            )
+            .unwrap_or_else(cancelled_completion);
             let mut discharges = DemandClosureDischarges::default();
             let start = if let Some(prefix) = prefix_reference {
                 let answer = inputs[0].1;
@@ -2847,15 +2860,14 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             let SelectedRootPathHalf::Import { token, .. } = half else {
                 unreachable!("Scala selected import");
             };
-            let completion = inputs
-                .iter()
-                .fold(ResolutionCompletion::Complete, |completion, (_, answer)| {
-                    completion.combine(answer.completion())
-                });
-            // A selected package prefix keeps the caller's existing import
-            // context. It does not turn a proved package into an unknown owner.
-            if source.mount == self.state.caller
-                && !inputs.is_empty()
+            let completion = ResolutionCompletion::combine_all_with_poll(
+                inputs.iter().map(|(_, answer)| answer.completion()),
+                &mut || self.state.cancellation.is_cancelled(),
+            )
+            .unwrap_or_else(cancelled_completion);
+            // A proved package import still owns a source half. Publish its
+            // selected named bindings instead of retaining a name-limited base.
+            if !inputs.is_empty()
                 && inputs.iter().all(|(key, answer)| {
                     answer.binding().targets().is_empty()
                         && matches!(
@@ -2864,31 +2876,91 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                         )
                 })
             {
-                let (completion, endpoint_completion, discharges) =
-                    if source.caller_gap_reasons.is_empty() {
-                        (completion, None, None)
-                    } else {
-                        let Read::Ready {
-                            value: discharges, ..
-                        } = self.state.caller_gap_authority(source)?
-                        else {
-                            return Ok(Some(
-                                super::demand_closure::ProviderPreparation::Unavailable(
-                                    cancelled_completion(),
-                                ),
-                            ));
-                        };
-                        let completion = JvmDemandState::caller_gap_completion(source);
-                        (completion.clone(), Some(completion), discharges)
-                    };
-                self.provider_roots
-                    .insert(frame.endpoint.clone(), Read::ready(discharges));
-                return Ok(Some(
-                    super::demand_closure::ProviderPreparation::RetainBase {
-                        completion,
-                        endpoint_completion,
-                    },
-                ));
+                let Some(mut recipes) = self.state.operation.jvm_lookup_recipes(
+                    self.state
+                        .operation
+                        .mount_table()
+                        .mount_by_ordinal(source.mount)?
+                        .fragment(),
+                    [source.lookup],
+                    self.state.cancellation,
+                )?
+                else {
+                    return Ok(Some(
+                        super::demand_closure::ProviderPreparation::Unavailable(
+                            cancelled_completion(),
+                        ),
+                    ));
+                };
+                let lookup = recipes.pop().expect("one import lookup");
+                let Some((mut context, gaps)) =
+                    self.state.file_context(source.mount, lookup.spelling())?
+                else {
+                    return Ok(Some(
+                        super::demand_closure::ProviderPreparation::Unavailable(
+                            cancelled_completion(),
+                        ),
+                    ));
+                };
+                let mut completion = completion;
+                let mut discharges = JvmDemandState::scala_import_discharges(source);
+                for (key, _) in inputs {
+                    if let Some(JvmPackagePrefix::Witness(retired)) =
+                        self.prefix_evidence.borrow().get(key)
+                    {
+                        completion = completion_without_unsupported_semantics(&completion, retired);
+                        discharges.merge(
+                            DemandClosureDischarges::with_operation_local_placeholders(
+                                retired.clone(),
+                            )
+                            .for_prefix(
+                                key.reference,
+                                retired.clone(),
+                                true,
+                            ),
+                        );
+                    }
+                }
+                for gap in gaps {
+                    context = context.with_context_owned_gap_identity(gap.reason);
+                    if gap.lookup == lookup {
+                        completion = completion.combine(&ResolutionCompletion::incomplete([gap
+                            .boundary_status
+                            .map_or(
+                                ResolutionIncompleteReason::UnsupportedSemantic(gap.reason),
+                                |status| ResolutionIncompleteReason::OpenBoundary {
+                                    semantic: gap.reason,
+                                    status,
+                                },
+                            )]));
+                    }
+                }
+                let bindings: Vec<_> = context
+                    .root_bridges()
+                    .iter()
+                    .filter(|bridge| {
+                        bridge.source_fragment().ordinal() == source.mount.get()
+                            && bridge.source_import_token() == *token
+                            && bridge.source_demand() == &lookup
+                    })
+                    .cloned()
+                    .collect();
+                for bridge in &bindings {
+                    completion = completion.combine(bridge.completion());
+                }
+                let mut state = JvmSourceState::new(
+                    JvmSourceStart::NamedImport,
+                    completion,
+                    discharges,
+                    reader.expect("import reader prepared"),
+                    terminal_reasons,
+                );
+                state.named_import = Some(JvmNamedImport {
+                    context: context.without_root_bridges(),
+                    bindings,
+                });
+                self.source_roots.insert(frame.endpoint.clone(), state);
+                return Ok(None);
             }
             let reason = self.state.operation.scala_import_owner_gap(
                 half,
@@ -3034,7 +3106,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             .operation
             .mount_table()
             .mount_by_ordinal(source.mount)?;
-        SelectedResolutionContextSet::new(
+        let context = SelectedResolutionContextSet::new(
             ready.context_identities.clone(),
             vec![SelectedResolutionMountContext::new(
                 source.mount,
@@ -3045,7 +3117,27 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             )?],
             self.state.operation.mount_table().mount_count(),
             &selected_mount_lookup(self.state.operation.mount_table()),
-        )
+        )?;
+        let Some(named) = self
+            .source_roots
+            .get(&frame.endpoint)
+            .and_then(|state| state.named_import.as_ref())
+        else {
+            return Ok(context);
+        };
+        match context.clone().merge(
+            named.context.clone(),
+            self.state.cancellation,
+            &selected_mount_lookup(self.state.operation.mount_table()),
+        )? {
+            Some(merged) => Ok(merged),
+            None => {
+                // Publication validates cancellation before installing rows.
+                // Keep its inventory evidence valid even on the cancelled path.
+                debug_assert!(self.state.cancellation.is_cancelled());
+                Ok(context)
+            }
+        }
     }
     fn closure_witness(
         &mut self,
@@ -3162,7 +3254,12 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             let preserve_discharges = complete || exact != DemandClosureDischarges::default();
             let mut policy = super::demand_closure::ClosurePolicy::new(
                 member_completion,
-                if self.sources[&frame.endpoint].import_qualifiers.is_some() {
+                // Named import publication is a delta against the initial
+                // context. Keep identical canonical base bindings that the
+                // delta deliberately omits, alongside newly published rows.
+                if self.sources[&frame.endpoint].import_qualifiers.is_some()
+                    && state.named_import.is_none()
+                {
                     BaseEligibility::Exclude
                 } else {
                     BaseEligibility::Retain
@@ -3341,8 +3438,20 @@ struct JvmSourceAuthority {
     external_nominal: Option<SemanticId>,
 }
 
+struct JvmNamedImport {
+    context: SelectedResolutionContextSet,
+    bindings: Vec<crate::analyzer::resolution::SelectedRootBridgeDescriptor>,
+}
+
+#[derive(Clone)]
+enum JvmSourceTarget {
+    Route(super::demand_closure::RouteLocation),
+    Import(usize),
+}
+
 struct JvmSourceState {
     reader: super::jvm_context::JvmSourceReaderContext,
+    named_import: Option<JvmNamedImport>,
     start: JvmSourceStart,
     completion: ResolutionCompletion,
     discharges: DemandClosureDischarges,
@@ -3364,6 +3473,7 @@ impl JvmSourceState {
         let prefix = start.prefix();
         Self {
             reader,
+            named_import: None,
             start,
             completion,
             discharges,
@@ -3382,6 +3492,7 @@ impl JvmSourceState {
 #[derive(Clone)]
 enum JvmSourceStart {
     Absolute,
+    NamedImport,
     PositionedPackage(SemanticId),
     Members {
         reference: SemanticId,
@@ -3392,7 +3503,7 @@ enum JvmSourceStart {
 impl JvmSourceStart {
     fn prefix(&self) -> Option<SemanticId> {
         match self {
-            Self::Absolute => None,
+            Self::Absolute | Self::NamedImport => None,
             Self::Unresolved(prefix) => *prefix,
             Self::PositionedPackage(reference) | Self::Members { reference, .. } => {
                 Some(*reference)
@@ -3410,6 +3521,32 @@ struct JvmHalfRows<'a, 'store, 'input> {
 }
 
 impl JvmHalfRows<'_, '_, '_> {
+    fn import_material(
+        &self,
+        bridge: &crate::analyzer::resolution::SelectedRootBridgeDescriptor,
+    ) -> Result<super::demand_closure::BridgeMaterial> {
+        let context = &self
+            .state
+            .named_import
+            .as_ref()
+            .expect("named import binding")
+            .context;
+        Ok(super::demand_closure::BridgeMaterial {
+            source_language: bridge.source_language(),
+            target_language: bridge.target_language(),
+            precedence: bridge.precedence(),
+            candidate_origin_rank: bridge.candidate_origin_rank(),
+            target_definition: bridge.target_definition(),
+            cross_language_evidence: bridge.jvm_evidence(),
+            callable_import: bridge
+                .callable_import_boundary(
+                    &context.identity_space(),
+                    &self.rules.state.operation.ready.lexical_source(),
+                    self.rules.state.cancellation,
+                )?
+                .map(|_| bridge.source_import_token()),
+        })
+    }
     fn owner_request(
         &self,
         location: &super::demand_closure::RouteLocation,
@@ -3432,34 +3569,25 @@ impl JvmHalfRows<'_, '_, '_> {
         &self,
         lookup: &ResolutionLookupSemanticRecipe,
     ) -> ResolutionLookupSemanticRecipe {
-        if self.language == Language::Scala
-            && matches!(
-                lookup.namespace(),
-                ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
-            )
-        {
-            ResolutionLookupSemanticRecipe::new(
-                Language::Scala,
-                ResolutionNamespace::Value,
-                lookup.spelling(),
-            )
-        } else {
+        let rules = nominal_rules::nominal_language_rules(self.language)
+            .expect("caller belongs to a nominal family");
+        let namespace = rules.qualifier_namespace(lookup.namespace());
+        if namespace == lookup.namespace() {
             lookup.clone()
+        } else {
+            ResolutionLookupSemanticRecipe::new(rules.language(), namespace, lookup.spelling())
         }
     }
+
     fn selection_request(
         &self,
         reference: SemanticId,
         values: Vec<ResolutionSlotValue>,
         lookup: &ResolutionLookupSemanticRecipe,
     ) -> DemandMemberSelectionRequest {
-        let namespace = if self.language == Language::Scala
-            && lookup.namespace() == ResolutionNamespace::Callable
-        {
-            ResolutionNamespace::Value
-        } else {
-            lookup.namespace()
-        };
+        let namespace = nominal_rules::nominal_language_rules(self.language)
+            .expect("caller belongs to a nominal family")
+            .selection_namespace(lookup.namespace());
         DemandMemberSelectionRequest {
             policy: &crate::analyzer::resolution::DEFAULT_HIERARCHY_POLICY,
             order: Some(crate::analyzer::resolution::HierarchyOrderRequest {
@@ -3577,8 +3705,61 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
     type LexicalTiers =
         std::iter::Empty<super::demand_closure::LexicalStartTier<Self::Rank, Self::Provider>>;
     type Placement = ();
-    type Target = super::demand_closure::RouteLocation;
+    type Target = JvmSourceTarget;
     type Member = ();
+    fn source_import_targets(&self, _: &()) -> Result<Read<Option<Vec<Self::Target>>>> {
+        Ok(Read::ready(self.state.named_import.as_ref().map(|named| {
+            named
+                .bindings
+                .iter()
+                .enumerate()
+                .filter(|(_, bridge)| bridge.target_definition().is_some())
+                .map(|(index, _)| JvmSourceTarget::Import(index))
+                .collect()
+        })))
+    }
+    fn proven_targets(
+        &self,
+        _: &(),
+        target: &Self::Target,
+        _: &ResolutionCompletion,
+    ) -> Result<Read<Vec<super::demand_closure::ProvenTarget>>> {
+        let JvmSourceTarget::Import(index) = target else {
+            return Ok(Read::ready(Vec::new()));
+        };
+        let bridge = &self
+            .state
+            .named_import
+            .as_ref()
+            .expect("named import target")
+            .bindings[*index];
+        if !bridge.is_member_target() {
+            return Ok(Read::ready(Vec::new()));
+        }
+        Ok(Read::ready(vec![super::demand_closure::ProvenTarget {
+            target: super::demand_closure::SelectedMemberTarget {
+                fragment: bridge.target_fragment(),
+                token: bridge.target_export_token(),
+                definition: bridge
+                    .target_definition()
+                    .expect("selected import definition"),
+                lookup: bridge.target_demand().clone(),
+                completion: bridge.completion().clone(),
+            },
+            material: self.import_material(bridge)?,
+        }]))
+    }
+    fn source_endpoint_completion(
+        &self,
+        _: &super::demand_closure::SourceHalf,
+        endpoint: &EndpointSignature,
+        _: &ReadySelectedResolution<'_, '_>,
+    ) -> Option<ResolutionCompletion> {
+        self.state.named_import.as_ref()?;
+        let source = &self.rules.sources[endpoint];
+        (!source.caller_gap_reasons.is_empty())
+            .then(|| JvmDemandState::caller_gap_completion(source))
+    }
     fn initial_completion(&self) -> ResolutionCompletion {
         self.state.completion.clone()
     }
@@ -3727,8 +3908,11 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
                         .spelling(),
                     1,
                 )
-            } else if self.source.route.is_empty() && self.language != Language::Java {
-                let Some(package) = self.state.reader.package.as_deref() else {
+            } else if self.source.route.is_empty() {
+                let Some(package) = nominal_rules::nominal_language_rules(self.language)
+                    .expect("caller belongs to a nominal family")
+                    .empty_route_package(self.state.reader.package.as_deref())
+                else {
                     self.state.authority.borrow_mut().complete = false;
                     return Ok(Vec::new());
                 };
@@ -3767,10 +3951,30 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
         _: Option<&Self::Rank>,
         _: Option<ResolutionScopeId>,
     ) -> Self::Target {
-        location
+        JvmSourceTarget::Route(location)
     }
     fn target_location(&self, target: &Self::Target) -> super::demand_closure::RouteLocation {
-        target.clone()
+        match target {
+            JvmSourceTarget::Route(location) => location.clone(),
+            JvmSourceTarget::Import(index) => {
+                let bridge = &self
+                    .state
+                    .named_import
+                    .as_ref()
+                    .expect("named import target")
+                    .bindings[*index];
+                let definition = bridge
+                    .target_definition()
+                    .expect("selected import definition");
+                super::demand_closure::RouteLocation::Owner {
+                    definition: SemanticId::local(
+                        definition.ordinal().expect("mounted import definition"),
+                        definition.local_key().expect("local import definition"),
+                    ),
+                    scope: None,
+                }
+            }
+        }
     }
     fn exports(
         &self,
@@ -3778,7 +3982,72 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
         target: Self::Target,
         completion: &ResolutionCompletion,
     ) -> Result<Option<super::demand_closure::ExportHydration>> {
-        let super::demand_closure::RouteLocation::Container { container, .. } = target else {
+        if let JvmSourceTarget::Import(index) = target {
+            let bridge = &self
+                .state
+                .named_import
+                .as_ref()
+                .expect("named import target")
+                .bindings[index];
+            if bridge.is_member_target() {
+                return Ok(Some(super::demand_closure::ExportHydration {
+                    exports: Vec::new(),
+                    blockers: Vec::new(),
+                    unstaged: ResolutionCompletion::Complete,
+                    coverage: Default::default(),
+                }));
+            }
+            let Some(inventory) = self.rules.state.operation.jvm_root_exports(
+                SelectedResolutionMountOrdinal::new(bridge.target_fragment().ordinal()),
+                self.rules.state.cancellation,
+            )?
+            else {
+                return Ok(None);
+            };
+            if !inventory.outcome.is_exhausted() {
+                return Ok(None);
+            }
+            let export = inventory.halves.iter().find(|half| matches!(half,
+                SelectedRootPathHalf::Export { token, definition, demand, .. }
+                if *token == bridge.target_export_token()
+                    && Some(*definition) == bridge.target_definition()
+                    && *demand == bridge.target_demand().semantic(&self.rules.state.operation.ready.shared_names())
+            )).expect("named import retains its canonical export").clone();
+            let SelectedRootPathHalf::Export {
+                identity,
+                token,
+                demand,
+                definition,
+                ..
+            } = &export
+            else {
+                unreachable!("canonical export");
+            };
+            self.state.material.borrow_mut().insert(
+                super::demand_closure::ExportAuthority {
+                    fragment: identity.fragment(),
+                    token: *token,
+                    demand: *demand,
+                    definition: *definition,
+                },
+                self.import_material(bridge)?,
+            );
+            return Ok(Some(super::demand_closure::ExportHydration {
+                exports: vec![(
+                    export,
+                    bridge.target_demand().clone(),
+                    bridge.completion().clone(),
+                )],
+                blockers: Vec::new(),
+                unstaged: ResolutionCompletion::Complete,
+                coverage: Default::default(),
+            }));
+        }
+        let JvmSourceTarget::Route(super::demand_closure::RouteLocation::Container {
+            container,
+            ..
+        }) = target
+        else {
             panic!("pure package target reached member boundary");
         };
         let Some(rows) = self.rules.state.operation.jvm_pure_package_exports(

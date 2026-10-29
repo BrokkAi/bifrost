@@ -11,7 +11,9 @@ use brokk_bifrost_cpp::graph::resolver::{
 };
 use tree_sitter::Node;
 
-use super::languages::{LocalDeclarationVisibility, language_support_for_hook};
+use super::languages::{
+    LexicalPatternBindings, LocalDeclarationVisibility, language_support_for_hook,
+};
 pub use super::semantic::FormalParameterPassingMode;
 use super::{DeclarationKind, Language, Range};
 
@@ -489,9 +491,36 @@ pub fn resolve_lexical_binding_from_focus(
     focus_start: usize,
     identifier: &str,
 ) -> Option<LexicalBindingResolution> {
+    resolve_lexical_binding_from_focus_with_visibility(
+        language,
+        focus,
+        source,
+        focus_start,
+        identifier,
+    )
+    .ok()
+    .flatten()
+}
+
+/// A pattern could shadow this name, but its visibility was not established.
+/// No declaration identity or outer-binding fallback is justified.
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub struct LexicalPatternVisibilityUnproven;
+
+/// The same lexical search, preserving a visibility refusal for consumers
+/// that must not reinterpret it as a proved field or absent capture.
+#[doc(hidden)]
+pub fn resolve_lexical_binding_from_focus_with_visibility(
+    language: Language,
+    focus: Node<'_>,
+    source: &str,
+    focus_start: usize,
+    identifier: &str,
+) -> Result<Option<LexicalBindingResolution>, LexicalPatternVisibilityUnproven> {
     debug_assert!(focus.start_byte() <= focus_start && focus_start < focus.end_byte());
     if !focus_can_resolve_lexical(language, focus) {
-        return None;
+        return Ok(None);
     }
     let mut ancestors = Vec::new();
     let mut cursor = Some(focus);
@@ -500,26 +529,38 @@ pub fn resolve_lexical_binding_from_focus(
         cursor = node.parent();
     }
 
+    let patterns = language_support_for_hook(language, "lexical_pattern_bindings")
+        .and_then(|support| support.lexical_pattern_bindings());
     // Walk lexical scopes from the focus outwards.  A local in an inner block
     // must win before an enclosing callable's parameters are considered.
     for node in &ancestors {
-        if is_lexical_scope(language, node.kind())
-            && let Some(definition) =
-                scope_matching_local(language, *node, source, focus, focus_start, identifier)
+        if (is_lexical_scope(language, node.kind())
+            || patterns.is_some_and(|patterns| (patterns.is_scope)(node.kind())))
+            && let Some(definition) = scope_matching_local(
+                language,
+                *node,
+                source,
+                focus,
+                focus_start,
+                identifier,
+                patterns,
+            )?
         {
-            return Some(LexicalBindingResolution::OtherLocal(definition));
+            return Ok(Some(LexicalBindingResolution::OtherLocal(definition)));
         }
 
         if is_parameter_owner(language, node.kind())
             && let Some(binding) = matching_parameter(language, *node, source, identifier)
         {
-            return Some(LexicalBindingResolution::Parameter(LexicalDefinition {
-                source_file: None,
-                identifier: identifier.to_owned(),
-                kind: binding.kind,
-                name_range: node_range(binding.name),
-                declaration_range: node_range(binding.declaration),
-            }));
+            return Ok(Some(LexicalBindingResolution::Parameter(
+                LexicalDefinition {
+                    source_file: None,
+                    identifier: identifier.to_owned(),
+                    kind: binding.kind,
+                    name_range: node_range(binding.name),
+                    declaration_range: node_range(binding.declaration),
+                },
+            )));
         }
     }
 
@@ -529,23 +570,32 @@ pub fn resolve_lexical_binding_from_focus(
         && let Some(fragment) = cpp_recovered_function_body(focus, focus_start)
     {
         if let Some(body) = fragment.child_by_field_name("body")
-            && let Some(definition) =
-                scope_matching_local(language, body, source, focus, focus_start, identifier)
+            && let Some(definition) = scope_matching_local(
+                language,
+                body,
+                source,
+                focus,
+                focus_start,
+                identifier,
+                patterns,
+            )?
         {
-            return Some(LexicalBindingResolution::OtherLocal(definition));
+            return Ok(Some(LexicalBindingResolution::OtherLocal(definition)));
         }
         if let Some(binding) = matching_parameter(language, fragment, source, identifier) {
-            return Some(LexicalBindingResolution::Parameter(LexicalDefinition {
-                source_file: None,
-                identifier: identifier.to_owned(),
-                kind: binding.kind,
-                name_range: node_range(binding.name),
-                declaration_range: node_range(binding.declaration),
-            }));
+            return Ok(Some(LexicalBindingResolution::Parameter(
+                LexicalDefinition {
+                    source_file: None,
+                    identifier: identifier.to_owned(),
+                    kind: binding.kind,
+                    name_range: node_range(binding.name),
+                    declaration_range: node_range(binding.declaration),
+                },
+            )));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// The function a C statement belongs to when the parser closed that function
@@ -1023,6 +1073,7 @@ fn parameter_bindings_with_step<'tree>(
 /// wins; a hoisted declaration name (JS/TS function or class, or a JS/TS `var`
 /// binder anywhere in the enclosing callable) is the fallback because source
 /// order does not limit its visibility.
+#[allow(clippy::too_many_arguments)]
 fn scope_matching_local(
     language: Language,
     scope: Node<'_>,
@@ -1030,7 +1081,8 @@ fn scope_matching_local(
     focus: Node<'_>,
     focus_start: usize,
     identifier: &str,
-) -> Option<LexicalDefinition> {
+    patterns: Option<LexicalPatternBindings>,
+) -> Result<Option<LexicalDefinition>, LexicalPatternVisibilityUnproven> {
     // Read the guards from the reference itself. A recovered function body is
     // not an ancestor of the statements the parser cut loose from it, so
     // locating the reference inside `scope` would answer `None` there and drop
@@ -1042,8 +1094,14 @@ fn scope_matching_local(
     let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
     let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
     let mut stack = Vec::new();
-    push_named_children(scope, &mut stack);
-    while let Some(node) = stack.pop() {
+    stack.extend((0..scope.named_child_count()).rev().map(|index| {
+        (
+            scope.named_child(index).expect("named child exists"),
+            true,
+            true,
+        )
+    }));
+    while let Some((node, ordinary_bindings_visible, pattern_bindings_visible)) = stack.pop() {
         // Function declarations are hoisted and class declarations shadow through their TDZ,
         // so source order does not limit declaration-name visibility.
         if hoisted.is_none()
@@ -1058,6 +1116,25 @@ fn scope_matching_local(
         {
             continue;
         }
+        if let Some(patterns) = patterns
+            && (patterns.is_scope)(node.kind())
+            && !is_local_declaration(language, node.kind())
+        {
+            // Inspect pattern binders in every admitted scope. Ordinary
+            // locals remain confined; a pattern can cross this boundary only
+            // when its language permits it and proves reference visibility.
+            let contains_focus = node.start_byte() <= focus_start && focus_start < node.end_byte();
+            let bindings_visible = pattern_bindings_visible
+                && (contains_focus || (patterns.bindings_may_escape_scope)(node.kind()));
+            stack.extend((0..node.named_child_count()).rev().map(|index| {
+                (
+                    node.named_child(index).expect("named child exists"),
+                    false,
+                    bindings_visible,
+                )
+            }));
+            continue;
+        }
         let starts_after_focus = node.start_byte() > focus_start;
         let support = language_support_for_hook(language, "local_declaration_binding_scope");
         let binding_scope =
@@ -1068,6 +1145,16 @@ fn scope_matching_local(
                 .is_some_and(|support| support.knowledge().scans_local_declarations_after_focus())
         {
             continue;
+        }
+        if pattern_bindings_visible
+            && let Some(patterns) = patterns
+            && let Some(declaration) = (patterns.declaration_for_name)(node)
+            && node.start_byte() < focus_start
+            && identifier_matches(language, node, source, identifier)
+            && nearest_before.is_none_or(|(best, _)| node.start_byte() > best.start_byte())
+            && (patterns.visible_at)(declaration, focus).ok_or(LexicalPatternVisibilityUnproven)?
+        {
+            nearest_before = Some((node, declaration));
         }
         if is_local_declaration(language, node.kind()) {
             if binding_scope.is_some_and(|binding| binding.scope.id() != scope.id()) {
@@ -1107,7 +1194,20 @@ fn scope_matching_local(
                 continue;
             }
             for name in binding_name_nodes(language, node, false) {
-                if !identifier_matches(language, name, source, identifier) {
+                if !identifier_matches(language, name, source, identifier)
+                    || (!ordinary_bindings_visible
+                        && patterns
+                            .and_then(|patterns| (patterns.declaration_for_name)(name))
+                            .is_none())
+                {
+                    continue;
+                }
+                if let Some(patterns) = patterns
+                    && let Some(pattern) = (patterns.declaration_for_name)(name)
+                    && (!pattern_bindings_visible
+                        || !(patterns.visible_at)(pattern, focus)
+                            .ok_or(LexicalPatternVisibilityUnproven)?)
+                {
                     continue;
                 }
                 if first_any.is_none() {
@@ -1119,21 +1219,49 @@ fn scope_matching_local(
                     nearest_before = Some((name, node));
                 }
             }
+            if patterns.is_some()
+                && node.start_byte() <= focus_start
+                && focus_start < node.end_byte()
+            {
+                stack.extend((0..node.named_child_count()).rev().map(|index| {
+                    (
+                        node.named_child(index).expect("named child exists"),
+                        false,
+                        pattern_bindings_visible,
+                    )
+                }));
+            }
             continue;
         }
-        push_named_children(node, &mut stack);
+        stack.extend((0..node.named_child_count()).rev().map(|index| {
+            (
+                node.named_child(index).expect("named child exists"),
+                ordinary_bindings_visible,
+                pattern_bindings_visible,
+            )
+        }));
     }
-    let (name, declaration) = nearest_before
+    let Some((name, declaration)) = nearest_before
         .or(first_any)
         .or(hoisted)
-        .or_else(|| js_ts_hoisted_var_binder(language, scope, source, focus_start, identifier))?;
-    Some(LexicalDefinition {
+        .or_else(|| js_ts_hoisted_var_binder(language, scope, source, focus_start, identifier))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(LexicalDefinition {
         source_file: None,
         identifier: identifier.to_owned(),
-        kind: local_declaration_kind(declaration.kind()),
+        kind: if patterns
+            .and_then(|patterns| (patterns.declaration_for_name)(name))
+            .is_some()
+        {
+            DeclarationKind::PatternVariable
+        } else {
+            local_declaration_kind(declaration.kind())
+        },
         name_range: node_range(name),
         declaration_range: node_range(declaration),
-    })
+    }))
 }
 
 /// Best-effort declaration kind for a local binder, keyed by the declaration
@@ -1271,6 +1399,15 @@ fn binding_name_nodes_with_step<'tree>(
     parameter: bool,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<Vec<Node<'tree>>> {
+    if let Some(name) = language_support_for_hook(language, "pattern_binding_name_provider")
+        .and_then(|support| support.pattern_binding_name_provider())
+        .and_then(|provider| provider(declaration))
+    {
+        if !scope_step() {
+            return None;
+        }
+        return Some(vec![name]);
+    }
     if language == Language::Ruby && parameter {
         return brokk_bifrost_ruby::syntax::ruby_parameter_binding_name_nodes(declaration, || {
             scope_step()
@@ -1437,7 +1574,6 @@ fn binding_child_fields(
     parameter: bool,
 ) -> &'static [&'static str] {
     match (language, kind) {
-        (Language::Java, "spread_parameter") => &["declarator"],
         (Language::Cpp, _) => &["declarator"],
         (Language::JavaScript | Language::TypeScript, "assignment_pattern") => &["left"],
         (Language::JavaScript | Language::TypeScript, "pair_pattern") => &["value"],
@@ -1850,6 +1986,426 @@ mod tests {
     use tree_sitter::Parser;
 
     use crate::analyzer::test_support::first_named_kind;
+
+    #[test]
+    fn formal_layouts_preserve_grammar_declaration_boundaries() {
+        let _rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Java,
+            Language::Rust,
+        ]);
+        for (language, grammar, source, owner_kind, parameter_kinds, expected) in [
+            (
+                Language::JavaScript,
+                tree_sitter_javascript::LANGUAGE.into(),
+                "function f({x,y}) {}",
+                "function_declaration",
+                vec!["object_pattern"],
+                vec![vec!["x", "y"]],
+            ),
+            (
+                Language::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "function f({x,y}: S) {}",
+                "function_declaration",
+                vec!["required_parameter"],
+                vec![vec!["x", "y"]],
+            ),
+            (
+                Language::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                "fn f(S { field }: S, S { field: local }: S) {}",
+                "function_item",
+                vec!["parameter", "parameter"],
+                vec![vec!["field"], vec!["local"]],
+            ),
+            (
+                Language::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                "fn f() { let c = |x,y| x; }",
+                "closure_expression",
+                vec!["identifier", "identifier"],
+                vec![vec!["x"], vec!["y"]],
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                "class C { void f(C this, int x) {} }",
+                "method_declaration",
+                vec!["receiver_parameter", "formal_parameter"],
+                vec![vec!["this"], vec!["x"]],
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                "class C { void f(String... args) {} }",
+                "method_declaration",
+                vec!["spread_parameter"],
+                vec![vec!["args"]],
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                "class C { Object f = (x,y) -> x; }",
+                "lambda_expression",
+                vec!["identifier", "identifier"],
+                vec![vec!["x"], vec!["y"]],
+            ),
+        ] {
+            let mut parser = Parser::new();
+            parser.set_language(&grammar).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let owner = first_named_kind(tree.root_node(), owner_kind);
+            let parameters = owner.child_by_field_name("parameters").unwrap();
+            let mut cursor = parameters.walk();
+            let declarations = parameters.named_children(&mut cursor).collect::<Vec<_>>();
+            assert_eq!(
+                declarations.iter().map(Node::kind).collect::<Vec<_>>(),
+                parameter_kinds,
+                "{source}"
+            );
+            if language == Language::Java && owner_kind == "method_declaration" {
+                let mut bindings = parameter_bindings(language, parameters, false, None);
+                bindings.sort_by_key(|binding| binding.declaration.start_byte());
+                assert_eq!(bindings.len(), declarations.len());
+                for (binding, (declaration, names)) in
+                    bindings.iter().zip(declarations.iter().zip(&expected))
+                {
+                    assert_eq!(binding.declaration, *declaration);
+                    assert_eq!(
+                        binding.kind == DeclarationKind::ReceiverParameter,
+                        declaration.kind() == "receiver_parameter"
+                    );
+                    assert_eq!(binding.name.utf8_text(source.as_bytes()).unwrap(), names[0]);
+                }
+                continue;
+            }
+            let slots =
+                formal_parameter_slots_for_owner_with_nodes(language, owner, source).unwrap();
+            assert_eq!(slots.len(), declarations.len(), "{source}");
+            for ((slot, declaration), (grammar_declaration, names)) in
+                slots.iter().zip(declarations.iter().zip(expected))
+            {
+                assert_eq!(declaration, grammar_declaration, "{source}");
+                assert_eq!(slot.names, names, "{source}");
+                assert_eq!(
+                    slot.receiver,
+                    grammar_declaration.kind() == "receiver_parameter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_java_scopes_do_not_export_local_names() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Java]);
+        for (source, scope_kind) in [
+            (
+                "class C { int x; void m() { switch(0) { case 0: int x = 1; use(x); } use(x); } }",
+                "switch_block",
+            ),
+            (
+                "class C { int x; void m() { enum E { A; int x; } use(x); } }",
+                "enum_body",
+            ),
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_java::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let scope = first_named_kind(tree.root_node(), scope_kind);
+            let declaration = first_named_kind(scope, "variable_declarator");
+            let name = declaration.child_by_field_name("name").unwrap();
+            assert_eq!(name.kind(), "identifier");
+            assert_eq!(name.utf8_text(source.as_bytes()).unwrap(), "x");
+            assert!(scope.start_byte() <= name.start_byte());
+            assert!(name.end_byte() <= scope.end_byte());
+            let focus = source.rfind("use(x)").unwrap() + 4;
+            assert!(scope.end_byte() < focus);
+            let result = resolve_lexical_binding(
+                Language::Java,
+                tree.root_node(),
+                source,
+                focus,
+                focus + 1,
+                "x",
+            );
+            assert!(result.is_none(), "{source}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn go_binding_lists_agree_with_left_grammar_fields() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Go]);
+        for (source, kind) in [
+            (
+                "package p\nfunc f() { x,y := values(); use(x,y) }",
+                "short_var_declaration",
+            ),
+            (
+                "package p\nfunc f() { for x,y := range values { use(x,y) } }",
+                "range_clause",
+            ),
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let declaration = first_named_kind(tree.root_node(), kind);
+            let left = declaration.child_by_field_name("left").unwrap();
+            assert_eq!(left.kind(), "expression_list");
+            let mut cursor = left.walk();
+            let expected = left.named_children(&mut cursor).collect::<Vec<_>>();
+            assert_eq!(expected.len(), 2);
+            assert_eq!(
+                binding_name_nodes(Language::Go, declaration, false),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_recovered_first_statement_retains_its_callable() {
+        for separator in ["", "\n"] {
+            let source = format!("void f(int x) {{ if(x) {{}} }}{separator}x++;\n");
+            let source = source.as_str();
+            let complete = "void f(int x) { if(x) {} x++; }";
+            let _rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+                Language::Cpp,
+            ]);
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let root = tree.root_node();
+            let function = root.named_child(0).unwrap();
+            assert_eq!(function.kind(), "function_definition");
+            let statement = root.named_child(1).unwrap();
+            assert_eq!(statement.kind(), "expression_statement");
+            assert_eq!(
+                statement.start_byte() - function.end_byte(),
+                separator.len()
+            );
+            let focus = first_named_kind(statement, "identifier");
+            assert_eq!(focus.start_byte(), statement.start_byte());
+            assert_eq!(
+                cpp_recovered_function_body(focus, focus.start_byte()),
+                Some(function)
+            );
+            let complete_tree = parser.parse(complete, None).unwrap();
+            let resolve = |root, source: &str, at| {
+                let result = resolve_lexical_binding(Language::Cpp, root, source, at, at + 1, "x");
+                let Some(LexicalBindingResolution::Parameter(definition)) = result else {
+                    panic!("{result:?}")
+                };
+                definition.name_range
+            };
+            assert_eq!(
+                resolve(root, source, focus.start_byte()),
+                resolve(
+                    complete_tree.root_node(),
+                    complete,
+                    complete.rfind("x++").unwrap()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn php_parameter_spellings_and_variadics_follow_variable_nodes() {
+        use brokk_bifrost_core::analyzer::language_knowledge::{LanguageKnowledge, ParserFlavor};
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Php]);
+        let source = "<?php function f($head, &$ref, ...$args) { return $args; }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&brokk_bifrost_php::PhpKnowledge.parser_language(ParserFlavor::Default))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let owner = first_named_kind(tree.root_node(), "function_definition");
+        let layout = formal_parameter_slots_for_owner(Language::Php, owner, source).unwrap();
+        assert_eq!(layout.slots.len(), 3);
+        assert_eq!(layout.slots[2].variadic, Some(FormalVariadicKind::Both));
+        let mut stack = vec![owner.child_by_field_name("parameters").unwrap()];
+        let mut count = 0;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "variable_name" {
+                let name = node.named_child(0).unwrap();
+                assert_eq!(name.kind(), "name");
+                assert!(identifier_matches(
+                    Language::Php,
+                    node,
+                    source,
+                    node.utf8_text(source.as_bytes()).unwrap()
+                ));
+                assert!(identifier_matches(
+                    Language::Php,
+                    node,
+                    source,
+                    name.utf8_text(source.as_bytes()).unwrap()
+                ));
+                count += 1;
+            } else {
+                push_named_children(node, &mut stack);
+            }
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn java_resources_resolve_in_the_try_body() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Java]);
+        let source = "class C { AutoCloseable r; void m() throws Exception { try(AutoCloseable r = open()) { use(r); } } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let resource = first_named_kind(tree.root_node(), "resource");
+        let expected = resource.child_by_field_name("name").unwrap();
+        let focus = source.rfind("use(r)").unwrap() + 4;
+        let result = resolve_lexical_binding(
+            Language::Java,
+            tree.root_node(),
+            source,
+            focus,
+            focus + 1,
+            "r",
+        );
+        let Some(LexicalBindingResolution::OtherLocal(definition)) = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(definition.name_range, node_range(expected));
+        assert_eq!(definition.kind, DeclarationKind::ResourceVariable);
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: catch bindings lost to enclosing formals"
+    )]
+    #[ignore = "finds real bug: #7632, catch bindings resolve to enclosing formals"]
+    fn catch_parameters_shadow_enclosing_formals() {
+        let _rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            Language::JavaScript,
+            Language::TypeScript,
+        ]);
+        let mut resolutions = Vec::new();
+        for (language, grammar) in [
+            (
+                Language::JavaScript,
+                tree_sitter_javascript::LANGUAGE.into(),
+            ),
+            (
+                Language::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+        ] {
+            for source in [
+                "function f(err) { try { throw 1; } catch(err) { return err; } }",
+                "function f(err) { try { throw 1; } catch({err}) { return err; } }",
+            ] {
+                let mut parser = Parser::new();
+                parser.set_language(&grammar).unwrap();
+                let tree = parser.parse(source, None).unwrap();
+                assert!(!tree.root_node().has_error());
+                let catch = first_named_kind(tree.root_node(), "catch_clause");
+                let parameter = catch.child_by_field_name("parameter").unwrap();
+                let focus = source.rfind("err").unwrap();
+                let result = resolve_lexical_binding(
+                    language,
+                    tree.root_node(),
+                    source,
+                    focus,
+                    focus + 3,
+                    "err",
+                );
+                let valid = matches!(
+                    &result,
+                    Some(LexicalBindingResolution::OtherLocal(definition))
+                        if definition.kind == DeclarationKind::CatchParameter
+                            && definition.name_range.start_byte >= parameter.start_byte()
+                            && definition.name_range.end_byte <= parameter.end_byte()
+                );
+                resolutions.push((language, source, result, valid));
+            }
+        }
+        assert_eq!(resolutions.len(), 4);
+        assert!(resolutions.iter().all(|result| result.3), "{resolutions:?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: resource binding leaked past try"
+    )]
+    #[ignore = "finds real bug: #7632, resource bindings remain visible after try"]
+    fn resource_bindings_end_with_the_try_body() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Java]);
+        let source = "class C { AutoCloseable r; void m() throws Exception { try(AutoCloseable r = open()) { use(r); } use(r); } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let resource = first_named_kind(tree.root_node(), "resource");
+        assert_eq!(
+            resource
+                .child_by_field_name("name")
+                .unwrap()
+                .utf8_text(source.as_bytes())
+                .unwrap(),
+            "r"
+        );
+        let focus = source.rfind("use(r)").unwrap() + 4;
+        let result = resolve_lexical_binding(
+            Language::Java,
+            tree.root_node(),
+            source,
+            focus,
+            focus + 1,
+            "r",
+        );
+        assert!(result.is_none(), "resource escaped its try: {result:?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: decorator arguments misclassified method binding"
+    )]
+    #[ignore = "finds real bug: #7632, decorator arguments classify Python methods"]
+    fn decorator_arguments_do_not_classify_python_methods() {
+        for (decorator, expected) in [
+            ("identity(staticmethod)", PythonMethodBinding::Instance),
+            ("identity(classmethod)", PythonMethodBinding::Instance),
+            ("staticmethod", PythonMethodBinding::Static),
+            ("classmethod", PythonMethodBinding::Class),
+        ] {
+            let source = format!("class C:\n    @{decorator}\n    def f(self): pass\n");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let owner = first_named_kind(tree.root_node(), "function_definition");
+            assert_eq!(
+                python_method_binding_with_step(owner, &source, &mut || true),
+                Some(expected),
+                "{decorator}"
+            );
+        }
+    }
 
     #[test]
     fn an_annotated_python_splat_parameter_is_still_variadic() {

@@ -422,10 +422,26 @@ fn eval_pattern_inner_with_name(
 ) -> bool {
     *context.examined_facts = context.examined_facts.saturating_add(1);
     let fact = facts.node(node);
-    // Root modifier predicates are supplied by the source-backed seed
-    // relation. Nested modifier predicates have no role edge and therefore
-    // cannot be evaluated by this normalized fact matcher.
-    if pattern.modifier.is_some() {
+    if let Some(modifier) = pattern.modifier
+        && !fact
+            .declaration_attributes
+            .as_ref()
+            .is_some_and(|attributes| {
+                attributes
+                    .modifiers
+                    .iter()
+                    .any(|word| word == modifier.label())
+            })
+    {
+        return false;
+    }
+    if let Some(type_kind) = &pattern.type_kind
+        && fact
+            .declaration_attributes
+            .as_ref()
+            .and_then(|attributes| attributes.type_kind.as_ref())
+            != Some(type_kind)
+    {
         return false;
     }
     if !pattern.kinds.is_empty()
@@ -973,6 +989,8 @@ fn eval_span_only(
         || pattern.body_owner.is_some()
         || pattern.is_async.is_some()
         || pattern.unsafe_context.is_some()
+        || pattern.modifier.is_some()
+        || pattern.type_kind.is_some()
         || pattern.parenthesized.is_some()
         || pattern.integer_value.is_some()
         || pattern.duplicate_key.is_some()

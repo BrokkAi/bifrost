@@ -1,5 +1,6 @@
 //! Python exposure rules for the shared reverse nomination worklist. This
 //! dormant entry confirms nominations without changing production usages.
+use super::super::python_unit_summaries::PythonSelectedEnvironment;
 use super::reverse_candidates::{
     REVERSE_LOOKUP_IDENTITY_ARM_SQL, ReverseCandidateKey, ReverseContextWitness,
 };
@@ -8,7 +9,45 @@ use super::reverse_nomination::{
     ReverseNominationHooks, ReverseSourceLookup, nominate_reverse_target,
 };
 use super::*;
+use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use rusqlite::{OptionalExtension, params};
+use std::cell::Cell;
+
+/// Scan budget, independent of the usages assembler's final result cap.
+#[derive(Clone, Copy, Debug)]
+pub struct PythonReverseLimits {
+    pub max_sites: usize,
+}
+impl Default for PythonReverseLimits {
+    fn default() -> Self {
+        Self { max_sites: 100_000 }
+    }
+}
+
+struct PythonReverseRequest<'a> {
+    scope: Option<&'a UsageScanScope<'a>>,
+    limits: PythonReverseLimits,
+    session: Option<&'a ResolutionSession>,
+    cancellation: &'a CancellationToken,
+}
+
+impl PythonReverseRequest<'_> {
+    fn stop_reason(&self, retained: usize) -> Option<&'static str> {
+        if self.cancellation.is_cancelled() {
+            Some("cancelled")
+        } else if self.cancellation.soft_deadline_passed() {
+            Some("time_stopped")
+        } else if retained >= self.limits.max_sites {
+            Some("python_reverse_scan_limit")
+        } else if self.session.is_some_and(|session| {
+            !matches!(session.finish(()), BoundedResolution::Complete { .. })
+        }) {
+            Some("python_reverse_session_stopped")
+        } else {
+            None
+        }
+    }
+}
 
 /// Python's root reads have no Rust namespace-prefix restriction. Qualified
 /// routes still use the shared source-lookup arm; positioned spelling uses the
@@ -37,15 +76,20 @@ CROSS JOIN main.python_member_operation_names names INDEXED BY python_member_ope
  ON names.spelling=lookup.spelling AND names.operation=op.id
 WHERE k.lexical
 "#;
+/// A getattr/setattr/delattr/patch with a wholly unknown member name can reference
+/// the target without being listed, as with JVM and Go reflection today. Known
+/// prefixes still nominate matching targets as undecided candidates. If computed-name
+/// access with a resolved module or class receiver proves common, nominate it for
+/// that receiver's members only. Constant names lost by the producer are #7182.
 pub(crate) const PYTHON_UNKNOWN_MEMBER_ARM_SQL: &str = r#"
 SELECT k.key_ordinal,k.input_ordinal,k.blob,k.lookup,op.name_site,0,9223372036854775806,op.id
 FROM temp.reverse_candidate_keys k
 JOIN main.resolution_identities lookup ON lookup.id=k.lookup
 CROSS JOIN main.python_member_operations op INDEXED BY python_member_operations_inventory
- ON op.blob_id=k.blob AND op.name_kind IN (1,2)
-WHERE k.lexical AND (op.name_kind=2 OR EXISTS(
+ ON op.blob_id=k.blob AND op.name_kind=1
+WHERE k.lexical AND EXISTS(
  SELECT 1 FROM main.python_member_operation_names names
- WHERE names.operation=op.id AND substr(lookup.spelling,1,length(names.spelling))=names.spelling))
+ WHERE names.operation=op.id AND substr(lookup.spelling,1,length(names.spelling))=names.spelling)
 "#;
 pub(crate) const PYTHON_REVERSE_ARMS: &[&str] = &[
     REVERSE_LOOKUP_IDENTITY_ARM_SQL,
@@ -71,9 +115,15 @@ struct PythonReverseView {
     inventory: Vec<String>,
     context: PythonReverseContext,
     obligations: Vec<PythonReverseObligation>,
+    query_obligations: Vec<String>,
+    unplaced: Vec<String>,
 }
 impl PythonReverseView {
-    fn select(operation: &SelectedResolutionOperation<'_, '_>, summary: i64) -> Result<Self> {
+    fn select(
+        operation: &SelectedResolutionOperation<'_, '_>,
+        summary: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
         let conn = operation.ready.inventory.connection();
         let (mut unit, digest, output, complete): (Vec<u8>,String,String,bool) = conn.query_row(
             "SELECT unit_key,hex(summary_digest),hex(output_digest),complete FROM resolution_unit_summaries WHERE summary_id=?1 AND lang='python' AND publication_state='complete'", [summary],
@@ -107,19 +157,49 @@ impl PythonReverseView {
         let gaps = conn.prepare_cached("SELECT gap_kind,subject,json(detail) FROM resolution_unit_summary_gaps WHERE summary_id=?1 ORDER BY gap_kind,subject")?
             .query_map([summary], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut obligations = Vec::new();
+        let mut query_obligations = Vec::new();
+        let mut unplaced = Vec::new();
+        let mutation_profile = match profile.as_str() {
+            "runtime" => super::python_lexical::PythonBindingProfile::Runtime,
+            "typing" => super::python_lexical::PythonBindingProfile::Typing,
+            _ => return Err(StoreError::corrupt("invalid Python reverse profile")),
+        };
+        let mutations = super::python_members::operations::structural_mutations(
+            &operation.ready,
+            summary,
+            mutation_profile,
+            &ResolutionSession::unbounded(),
+            cancellation,
+        )?;
+        if let Some(obligation) =
+            super::python_members::operations::dynamic_receiver_obligation(&mutations)
+        {
+            query_obligations.push(obligation);
+        }
         for (kind, subject, detail) in gaps {
             let label = format!("{kind}:{subject}:{detail}");
+            // The selected environment is the certainty boundary. Runtime path
+            // mutation and unacquired external providers are query obligations,
+            // not missing proof for each selected-environment binding.
+            if kind == "python_unknown_placement" {
+                // Importability describes the selected environment, not a
+                // missing reference. The file's own source references still
+                // participate in nomination and confirmation below.
+                unplaced.push(subject);
+                query_obligations.push(label);
+                continue;
+            }
+            if kind == "python_environment_open" {
+                query_obligations.push(label);
+                continue;
+            }
             let mut hash = CanonicalHasher::new(b"python-reverse-environment-obligation:v1");
             hash.field("unit", &raw_unit);
             hash.field("profile", profile.as_bytes());
             hash.field("gap", label.as_bytes());
             let reason = operation.ready.context_identities.named_semantic(
                 hash.finish(),
-                if kind == "python_environment_open" {
-                    "python_environment_open"
-                } else {
-                    "python_reverse_environment_gap"
-                },
+                "python_reverse_environment_gap",
                 &label,
             );
             obligations.push(PythonReverseObligation {
@@ -160,6 +240,8 @@ impl PythonReverseView {
                 unit: raw_unit,
             },
             obligations,
+            query_obligations,
+            unplaced,
         })
     }
 }
@@ -340,10 +422,13 @@ impl PythonReverseHooks<'_, '_, '_> {
             self.operation.ready.project.root(),
             mount.persisted_relative_path(),
         );
-        let prefix = brokk_bifrost_python::declarations::python_module_fq(
-            self.operation.ready.project,
-            &file,
-        );
+        let prefix = self
+            .operation
+            .ready
+            .definition_module_anchor(mount.ordinal(), &file)?
+            .ok_or_else(|| {
+                StoreError::corrupt("selected Python file lacks its published module anchor")
+            })?;
         let found = match match_selected_definitions(&mount, target, &rows, cancellation, |row| {
             let (fq, count) = super::super::hydrate_unit_fq_with_anchor(
                 row.fq.as_ref(),
@@ -612,14 +697,18 @@ impl ReverseNominationHooks for PythonReverseHooks<'_, '_, '_> {
             .type_identity_observation_sites(blob, ResolutionSiteId::new(site), cancel)
     }
     fn site_locators(&self, blob: i64, site: u32) -> Result<Vec<SelectedSemanticLocator>> {
+        // The synthetic callee-value read retains qualifier, service and context
+        // reasons the call reference may lack. It is an operation-internal fact,
+        // not a user-addressable reference. Both reverse consumers select here.
         let observed: bool = self.conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM python_member_operations WHERE blob_id=?1 AND name_site=?2) OR (EXISTS(SELECT 1 FROM resolution_binding_observations WHERE blob_id=?1 AND reference=?2)
+            "SELECT NOT EXISTS(SELECT 1 FROM python_member_operations WHERE blob_id=?1 AND callee_reference=?2)
+             AND (EXISTS(SELECT 1 FROM python_member_operations WHERE blob_id=?1 AND name_site=?2) OR (EXISTS(SELECT 1 FROM resolution_binding_observations WHERE blob_id=?1 AND reference=?2)
                 AND NOT EXISTS(SELECT 1 FROM resolution_binding_slots WHERE blob_id=?1 AND slot=?2)
                 AND NOT EXISTS(
                     SELECT 1 FROM resolution_binding_events events INDEXED BY resolution_binding_events_target
                     JOIN temp.python_reverse_evidence seed ON seed.kind='seed'
                       AND seed.blob=events.blob_id AND seed.site=events.authored
-                    WHERE events.blob_id=?1 AND events.target=?2))",
+                    WHERE events.blob_id=?1 AND events.target=?2)))",
             params![blob, site], |row| row.get(0),
         )?;
         if !observed {
@@ -643,6 +732,93 @@ impl SelectedResolutionOperation<'_, '_> {
         python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
         cancel: &CancellationToken,
     ) -> Result<PythonNativeReverseResult> {
+        self.python_reverse_operation(
+            &PythonSelectedEnvironment {
+                summary,
+                python_version,
+            },
+            targets,
+            PythonReverseRequest {
+                scope: None,
+                limits: PythonReverseLimits {
+                    max_sites: usize::MAX,
+                },
+                session: None,
+                cancellation: cancel,
+            },
+        )
+    }
+
+    /// Graph consumers share the reverse inventory's selected-environment loss
+    /// evidence, without nominating targets or confirming reverse references.
+    /// Returns obligation labels and the callers with unknown placement.
+    #[doc(hidden)]
+    pub fn python_graph_input_evidence(
+        &self,
+        environment: &PythonSelectedEnvironment,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let view = PythonReverseView::select(self, environment.summary, cancellation)?;
+        let mut labels = view.query_obligations;
+        for obligation in view.obligations {
+            labels.push(obligation.label);
+        }
+        Ok((labels, view.unplaced))
+    }
+
+    /// Confirm selected reverse sites within one request's admitted scan scope.
+    /// A stop retains explicit unprocessed targets, never empty complete answers.
+    pub fn python_reverse_targets(
+        &self,
+        environment: &PythonSelectedEnvironment,
+        targets: &[CodeUnit],
+        scope: &UsageScanScope<'_>,
+        limits: PythonReverseLimits,
+        session: &ResolutionSession,
+    ) -> Result<PythonNativeReverseResult> {
+        let cancellation = scope.cancellation().cloned().unwrap_or_default();
+        self.python_reverse_operation(
+            environment,
+            targets,
+            PythonReverseRequest {
+                scope: Some(scope),
+                limits,
+                session: Some(session),
+                cancellation: &cancellation,
+            },
+        )
+    }
+
+    fn python_reverse_operation(
+        &self,
+        environment: &PythonSelectedEnvironment,
+        targets: &[CodeUnit],
+        request: PythonReverseRequest<'_>,
+    ) -> Result<PythonNativeReverseResult> {
+        let PythonSelectedEnvironment {
+            summary,
+            python_version,
+        } = *environment;
+        let cancel = request.cancellation;
+        if let Some(reason) = request.stop_reason(0) {
+            return Ok(PythonNativeReverseResult {
+                targets: Vec::new(),
+                unavailable: Vec::new(),
+                inventory: String::new(),
+                query_obligations: Vec::new(),
+                nominated_paths: Vec::new(),
+                unprocessed: targets
+                    .iter()
+                    .cloned()
+                    .map(|target| PythonNativeReverseUnavailableTarget {
+                        target,
+                        reason: reason.into(),
+                    })
+                    .collect(),
+            });
+        }
+        let retained = Cell::new(0usize);
+        let truncated = Cell::new(false);
         let conn = self.ready.inventory.connection();
         let before = conn.total_changes();
         conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS python_reverse_evidence(kind TEXT NOT NULL,container TEXT NOT NULL,blob INTEGER NOT NULL,site INTEGER NOT NULL,name TEXT NOT NULL,scope INTEGER NOT NULL,PRIMARY KEY(kind,container,blob,site,name,scope)) WITHOUT ROWID,STRICT; DELETE FROM temp.python_reverse_evidence")?;
@@ -688,7 +864,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 .inventory
                 .account_committed_request_changes(changed as u64);
         }
-        let view = PythonReverseView::select(self, summary)?;
+        let view = PythonReverseView::select(self, summary, cancel)?;
         let mut output = view.inventory.join("\n");
         output.push('\n');
         for row in conn.prepare_cached("SELECT mounts.persisted_relative_path,op.site,op.name_site,
@@ -708,10 +884,25 @@ impl SelectedResolutionOperation<'_, '_> {
         })? { output.push_str(&row?); }
         let mut result = PythonNativeReverseResult {
             inventory: output,
+            query_obligations: view.query_obligations.clone(),
+            nominated_paths: Vec::new(),
             targets: Vec::new(),
             unavailable: Vec::new(),
+            unprocessed: Vec::new(),
         };
-        for target in targets {
+        for (target_index, target) in targets.iter().enumerate() {
+            let stopped = request.stop_reason(retained.get());
+            if let Some(reason) = stopped {
+                result
+                    .unprocessed
+                    .extend(targets[target_index..].iter().cloned().map(|target| {
+                        PythonNativeReverseUnavailableTarget {
+                            target,
+                            reason: reason.into(),
+                        }
+                    }));
+                break;
+            }
             let hooks = PythonReverseHooks {
                 operation: self,
                 view: &view,
@@ -742,10 +933,16 @@ impl SelectedResolutionOperation<'_, '_> {
                     });
                     continue;
                 }
-                return Err(StoreError::new(format!(
-                    "Python reverse target unavailable: {}",
-                    target.fq_name_str()
-                )));
+                result
+                    .unavailable
+                    .push(PythonNativeReverseUnavailableTarget {
+                        target: target.clone(),
+                        reason: format!(
+                            "Python reverse target unavailable: {}",
+                            target.fq_name_str()
+                        ),
+                    });
+                continue;
             }
             let semantics = coordinates
                 .iter()
@@ -769,8 +966,21 @@ impl SelectedResolutionOperation<'_, '_> {
                 };
                 locators.extend(candidates.locators);
             }
+            locators.retain(|locator| {
+                request.scope.is_none_or(|scope| {
+                    scope.allows(&ProjectFile::new(
+                        self.ready.project.root(),
+                        locator.relative_path(),
+                    ))
+                })
+            });
             locators.sort();
             locators.dedup();
+            result.nominated_paths.extend(
+                locators
+                    .iter()
+                    .map(|locator| locator.relative_path().to_owned()),
+            );
             let candidates = super::reverse_nomination::ReverseCandidateSet {
                 locators,
                 names: Vec::new(),
@@ -797,6 +1007,13 @@ impl SelectedResolutionOperation<'_, '_> {
                 obligations: view
                     .obligations
                     .iter()
+                    .filter(|obligation| {
+                        obligation.caller.as_ref().is_none_or(|path| {
+                            request.scope.is_none_or(|scope| {
+                                scope.allows(&ProjectFile::new(self.ready.project.root(), path))
+                            })
+                        })
+                    })
                     .map(|obligation| obligation.label.clone())
                     .collect(),
                 confirmation_sql: None,
@@ -809,6 +1026,11 @@ impl SelectedResolutionOperation<'_, '_> {
             let contexts = conn.prepare_cached("SELECT mounts.mount_ordinal,mounts.blob_id,mounts.persisted_relative_path FROM temp.selected_resolution_mounts mounts JOIN resolution_unit_summary_members members ON members.summary_id=?1 AND members.blob_id=mounts.blob_id AND members.rel_path=mounts.persisted_relative_path WHERE mounts.storage_language='python' ORDER BY mounts.mount_ordinal")?
                 .query_map([summary], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             for (mount, blob, path) in contexts {
+                if request.scope.is_some_and(|scope| {
+                    !scope.allows(&ProjectFile::new(self.ready.project.root(), &path))
+                }) {
+                    continue;
+                }
                 let selected = ReverseContextWitness::new(self, mount, blob);
                 let index = answer
                     .proof
@@ -927,7 +1149,8 @@ impl SelectedResolutionOperation<'_, '_> {
             let started = std::time::Instant::now();
             let mut cursor = 0;
             let files = std::iter::from_fn(|| {
-                if cursor == candidates.locators.len() {
+                if cursor == candidates.locators.len() || retained.get() >= request.limits.max_sites
+                {
                     return None;
                 }
                 let start = cursor;
@@ -952,25 +1175,76 @@ impl SelectedResolutionOperation<'_, '_> {
                     python_version,
                     cancellation: cancel,
                     target: &mut answer,
+                    session: request.session,
+                    retained: &retained,
+                    truncated: &truncated,
+                    max_sites: request.limits.max_sites,
                 },
             )?;
-            let stopped = !matches!(progress.stopped, reverse::ReverseBlobControl::Continue);
+            let scan_stopped = truncated.get()
+                || (retained.get() >= request.limits.max_sites
+                    && progress.next < candidates.locators.len());
+            let stopped = !matches!(progress.stopped, reverse::ReverseBlobControl::Continue)
+                || scan_stopped
+                || request.session.is_some_and(|session| {
+                    !matches!(session.finish(()), BoundedResolution::Complete { .. })
+                });
+            if scan_stopped {
+                answer.obligations.push("python_reverse_scan_limit".into());
+            }
             if stopped {
                 answer.complete = false;
+                if request.session.is_some_and(|session| {
+                    !matches!(session.finish(()), BoundedResolution::Complete { .. })
+                }) {
+                    answer
+                        .obligations
+                        .push("python_reverse_session_stopped".into());
+                }
             }
             answer.complete &= !answer.proof.required.is_empty()
-                && answer.proof.evidence.enumeration.completion() == ResolutionCompletion::Complete
-                && answer.proof.evidence.binding.completion() == ResolutionCompletion::Complete
-                && answer.proof.evidence.metadata.completion() == ResolutionCompletion::Complete;
+                && answer
+                    .proof
+                    .evidence
+                    .enumeration
+                    .completion_with_poll(&mut || cancel.is_cancelled())
+                    == Some(ResolutionCompletion::Complete)
+                && answer
+                    .proof
+                    .evidence
+                    .binding
+                    .completion_with_poll(&mut || cancel.is_cancelled())
+                    == Some(ResolutionCompletion::Complete)
+                && answer
+                    .proof
+                    .evidence
+                    .metadata
+                    .completion_with_poll(&mut || cancel.is_cancelled())
+                    == Some(ResolutionCompletion::Complete);
             answer.confirmation_elapsed = started.elapsed();
             answer.confirmation_sql = before
                 .zip(brokk_bifrost_core::cache_db::sql_profile::totals_with_rows())
                 .map(|(before, after)| (after.0 - before.0, after.1 - before.1));
             result.targets.push(answer);
             if stopped {
+                // Later targets carry the cause of the stop (scan limit,
+                // session, time, cancellation) when the request names one.
+                let reason = request
+                    .stop_reason(retained.get())
+                    .unwrap_or("python_reverse_batch_stopped");
+                result
+                    .unprocessed
+                    .extend(targets[target_index + 1..].iter().cloned().map(|target| {
+                        PythonNativeReverseUnavailableTarget {
+                            target,
+                            reason: reason.into(),
+                        }
+                    }));
                 break;
             }
         }
+        result.nominated_paths.sort();
+        result.nominated_paths.dedup();
         Ok(result)
     }
 }
@@ -1153,8 +1427,14 @@ struct PythonReverseContext {
 /// Query-local native answers; production Python find-usages stays on its
 /// existing strategy until publication and cost admission are approved.
 pub struct PythonNativeReverseResult {
+    /// All scoped nomination files, including excluded and unconfirmed sites.
+    pub nominated_paths: Vec<String>,
+    /// Openness outside the selected environment, reported once per query.
+    pub query_obligations: Vec<String>,
     pub targets: Vec<PythonNativeReverseTarget>,
     pub unavailable: Vec<PythonNativeReverseUnavailableTarget>,
+    /// Targets not attempted because a preceding target stopped the batch.
+    pub unprocessed: Vec<PythonNativeReverseUnavailableTarget>,
     inventory: String,
 }
 pub struct PythonNativeReverseUnavailableTarget {
@@ -1184,10 +1464,9 @@ pub struct PythonNativeReverseSite {
     pub certain: bool,
     pub potential: bool,
     /// A point-answer relation requiring complete binding and applicability.
-    /// Query-level openness (including python_environment_open and import
-    /// activation) remains in obligations and PythonNativeReverseTarget::complete,
-    /// so excluded sites still carry those obligations. This is not a certain
-    /// negative for consumers.
+    /// Route and target obligations remain in the target's completeness.
+    /// Environment-wide openness is retained once on the query result. This
+    /// is not a certain negative for consumers outside the selected environment.
     pub excluded: bool,
     /// A site with no reports is undecided with python_reverse_locator_missing,
     /// never excluded.
@@ -1198,6 +1477,7 @@ impl PythonNativeReverseResult {
     pub fn render(&self) -> String {
         use std::fmt::Write;
         let mut output = self.inventory.clone();
+        writeln!(output, "query-obligations={:?}", self.query_obligations).expect("String write");
         for target in &self.targets {
             output.push_str(&target.receipt);
             writeln!(output, "context-obligations={:?}", target.obligations).expect("String write");
@@ -1240,6 +1520,15 @@ impl PythonNativeReverseResult {
             )
             .expect("String write");
         }
+        for unprocessed in &self.unprocessed {
+            writeln!(
+                output,
+                "target {} unprocessed={}",
+                unprocessed.target.fq_name_str(),
+                unprocessed.reason
+            )
+            .expect("String write");
+        }
         output
     }
 }
@@ -1250,8 +1539,23 @@ struct PythonReverseFiles<'a, 'store, 'input> {
     python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
     cancellation: &'a CancellationToken,
     target: &'a mut PythonNativeReverseTarget,
+    session: Option<&'a ResolutionSession>,
+    retained: &'a Cell<usize>,
+    truncated: &'a Cell<bool>,
+    max_sites: usize,
 }
 impl PythonReverseFiles<'_, '_, '_> {
+    fn retain_site(&mut self, site: PythonNativeReverseSite) {
+        if !site.excluded {
+            if self.retained.get() >= self.max_sites {
+                self.truncated.set(true);
+                return;
+            }
+            self.retained.set(self.retained.get() + 1);
+        }
+        self.target.sites.push(site);
+    }
+
     fn site(&self, locator: &SelectedSemanticLocator) -> Result<PythonNativeReverseSite> {
         let mount = self
             .operation
@@ -1309,7 +1613,6 @@ impl PythonReverseFiles<'_, '_, '_> {
         >,
     ) -> Result<()> {
         let required = self.target.proof.extend_contexts(batch.required);
-        let targets = &self.target.semantics;
         for (locator, mut site) in locators.iter().zip(batch.sites) {
             for (context, _) in &mut site.reports {
                 *context = required[*context];
@@ -1382,6 +1685,7 @@ impl PythonReverseFiles<'_, '_, '_> {
                             })
                     })
                 });
+            let targets = &self.target.semantics;
             let reduction = reverse::classify_reverse_context_site(
                 &mut self.target.proof,
                 locator,
@@ -1449,7 +1753,7 @@ impl PythonReverseFiles<'_, '_, '_> {
             rendered.obligations.sort();
             rendered.obligations.dedup();
             if !self.is_import_binding(&rendered)? {
-                self.target.sites.push(rendered);
+                self.retain_site(rendered);
             }
         }
         Ok(())
@@ -1485,23 +1789,27 @@ impl reverse::ReverseFileHooks<Vec<SelectedSemanticLocator>> for PythonReverseFi
         };
         let locators = file.payload.iter().collect::<Vec<_>>();
         reverse::confirm_reverse_contexts(vec![context], &locators, self.cancellation, |_| {
-            let bounded = confirm_reverse_session_bounded(
-                locators.len(),
-                ReceiverAnalysisBudget::default(),
-                self.cancellation,
-                |session, cancellation| {
-                    reverse::confirm_reverse_session(
-                        &locators,
-                        &mut PythonReverseLifecycle {
-                            operation: self.operation,
-                            summary: self.view.summary,
-                            python_version: self.python_version,
-                            cancellation,
-                            session,
-                        },
-                    )
-                },
-            )?;
+            let run = |session: &ResolutionSession, cancellation: &CancellationToken| {
+                reverse::confirm_reverse_session(
+                    &locators,
+                    &mut PythonReverseLifecycle {
+                        operation: self.operation,
+                        summary: self.view.summary,
+                        python_version: self.python_version,
+                        cancellation,
+                        session,
+                    },
+                )
+            };
+            let bounded = match self.session {
+                Some(session) => session.finish(run(session, self.cancellation)?),
+                None => confirm_reverse_session_bounded(
+                    locators.len(),
+                    ReceiverAnalysisBudget::default(),
+                    self.cancellation,
+                    run,
+                )?,
+            };
             Ok(match bounded {
                 BoundedResolution::Complete { value, .. } => {
                     value.map_limit(|never| match never {})
@@ -1529,13 +1837,23 @@ impl reverse::ReverseFileHooks<Vec<SelectedSemanticLocator>> for PythonReverseFi
     ) -> Result<reverse::ReverseBlobControl> {
         let (control, completion, label) = match outcome {
             reverse::ReverseBatch::Ready(never) => match never {},
-            reverse::ReverseBatch::Bounded(_) => (
-                reverse::ReverseBlobControl::Continue,
-                ResolutionCompletion::incomplete([
-                    ResolutionIncompleteReason::ReceiverBudgetExhausted(self.target.semantic),
-                ]),
-                "receiver_budget_exhausted",
-            ),
+            reverse::ReverseBatch::Bounded(limit) => {
+                let label = limit.as_str();
+                let mut hash = CanonicalHasher::new(b"python-resolution-budget:v1");
+                hash.field("limit", label.as_bytes());
+                let reason = self.operation.ready.context_identities.named_semantic(
+                    hash.finish(),
+                    "python_resolution_budget_exceeded",
+                    label,
+                );
+                (
+                    reverse::ReverseBlobControl::Continue,
+                    ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                    ]),
+                    label,
+                )
+            }
             reverse::ReverseBatch::TimeStopped => (
                 reverse::ReverseBlobControl::TimeBudgetExceeded,
                 ResolutionCompletion::incomplete([ResolutionIncompleteReason::TimeBudgetExceeded(
@@ -1609,7 +1927,7 @@ impl reverse::ReverseFileHooks<Vec<SelectedSemanticLocator>> for PythonReverseFi
                 meanings: Vec::new(),
             });
             if !self.is_import_binding(&site)? {
-                self.target.sites.push(site);
+                self.retain_site(site);
             }
         }
         Ok(control)

@@ -1612,6 +1612,11 @@ pub(super) fn render_member_family(
         member: render_unit_declaration(analyzer, &value.member.unit, detail, cache),
         outcome: answer.outcome.label(),
         reason: answer.reason.map(|reason| reason.label()),
+        unread_ancestors: answer.unread_ancestors.clone(),
+        ancestor_coverage: member_family::family_coverage(answer.ancestors.outcome),
+        ancestor_reason: answer.ancestors.reason.map(|reason| reason.label()),
+        descendant_coverage: member_family::family_coverage(answer.descendants.outcome),
+        descendant_reason: answer.descendants.reason.map(|reason| reason.label()),
         capability: answer.capability.label(),
         coverage: member_family::family_coverage(answer.outcome),
         family_id: value.family_id.clone(),
@@ -1652,7 +1657,14 @@ pub(super) fn render_member_family_edge(
         hierarchy_depth: edge.depth,
         proof: edge.proof,
         completeness: "complete",
-        coverage: member_family::family_coverage(family.answer.outcome),
+        coverage: member_family::family_coverage(match edge.relation {
+            MethodFamilyRelation::Overrides | MethodFamilyRelation::Implements => {
+                family.answer.ancestors.outcome
+            }
+            MethodFamilyRelation::OverriddenBy | MethodFamilyRelation::ImplementedBy => {
+                family.answer.descendants.outcome
+            }
+        }),
     }
 }
 
@@ -2256,22 +2268,22 @@ fn render_configuration_fact_range(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryRange {
     let evidence = value.fact().evidence();
-    cache
-        .coordinates_for(&value.file, || Some(value.source.to_string()))
-        .map(|coordinates| {
-            range_for_offsets(
-                &coordinates.source,
-                &coordinates.line_starts,
-                evidence.start_byte(),
-                evidence.end_byte(),
-            )
-        })
-        .unwrap_or(CodeQueryRange {
-            start_line: 1,
-            start_column: 1,
-            end_line: 1,
-            end_column: 1,
-        })
+    match cache.coordinates_for(&value.file, || Some(value.source.to_string())) {
+        Some(coordinates) => range_for_offsets(
+            &coordinates.source,
+            &coordinates.line_starts,
+            evidence.start_byte(),
+            evidence.end_byte(),
+        ),
+        // A conflicting analyzer snapshot of the same path leaves no cached
+        // coordinates. The fact's own source still locates it exactly.
+        None => range_for_offsets(
+            &value.source,
+            &compute_line_starts(&value.source),
+            evidence.start_byte(),
+            evidence.end_byte(),
+        ),
+    }
 }
 
 fn node_kind_label(kind: &ConfigurationNodeKind) -> &'static str {
@@ -2666,20 +2678,13 @@ pub(super) fn model_hierarchy_symbols(
 }
 
 pub(super) fn model_pattern_is_supported(pattern: &Pattern) -> bool {
-    pattern.text.is_none()
-        && pattern.capture.is_none()
-        && pattern.has.is_none()
-        && pattern.not_has.is_none()
-        && pattern.callee.is_none()
-        && pattern.receiver.is_none()
-        && pattern.args.is_empty()
-        && pattern.kwargs.is_empty()
-        && pattern.left.is_none()
-        && pattern.right.is_none()
-        && pattern.module.is_none()
-        && pattern.decorators.is_empty()
-        && pattern.object.is_none()
-        && pattern.field.is_none()
+    // The model matcher evaluates only kind and name predicates. Reject every
+    // remaining predicate, including compositions containing source filters.
+    let mut remainder = pattern.clone();
+    remainder.kinds.clear();
+    remainder.not_kinds.clear();
+    remainder.name = None;
+    remainder.is_empty()
 }
 
 pub(super) fn model_pattern_matches(

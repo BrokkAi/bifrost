@@ -148,17 +148,29 @@ pub(super) fn execute_dependency_evidence_seed(
     let evidence = match state.analyzer.dependency_file_evidence() {
         Ok(evidence) => evidence,
         Err(error) => {
-            diagnostics.push(CodeQueryDiagnostic {
-                related: Vec::new(),
-                source: None,
-                code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                impact: CodeQueryDiagnosticImpact::Incomplete,
-                branch: Vec::new(),
-                language: "workspace",
-                message: format!("static dependency publication is unavailable: {error}"),
-                exhausted_roots: Vec::new(),
-                withheld_rows_path: None,
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:dependency_evidence detail={error:?}",
+                    file!(),
+                    line!()
+                )
             });
+            state.analyzer.mark_execution_dependent();
+            diagnostics.push(super::QueryExecutionState::diagnostic(
+                state.analyzer,
+                CodeQueryDiagnostic {
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!("static dependency publication is unavailable: {error}"),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                },
+                Some(DerivationExecutionCause::Provider),
+            ));
             return PlanExecution {
                 rows: Vec::new(),
                 truncated: true,
@@ -192,17 +204,21 @@ pub(super) fn execute_dependency_evidence_seed(
         Ok(locations) => locations.into_iter().collect::<HashMap<_, _>>(),
         Err(error) => {
             incomplete = true;
-            diagnostics.push(CodeQueryDiagnostic {
-                related: Vec::new(),
-                source: None,
-                code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                impact: CodeQueryDiagnosticImpact::Incomplete,
-                branch: Vec::new(),
-                language: "workspace",
-                message: format!("dependency source presentation proof unavailable: {error}"),
-                exhausted_roots: Vec::new(),
-                withheld_rows_path: None,
-            });
+            diagnostics.push(super::QueryExecutionState::diagnostic(
+                state.analyzer,
+                CodeQueryDiagnostic {
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!("dependency source presentation proof unavailable: {error}"),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                },
+                Some(DerivationExecutionCause::Provider),
+            ));
             HashMap::default()
         }
     };

@@ -112,6 +112,38 @@ pub struct CallShapeReport {
     pub arguments: Vec<ArgumentRow>,
 }
 
+impl CallShapeReport {
+    /// Project producer-proven result slots of one written actual. The caller
+    /// supplies the existing semantic argument count, never an inferred arity.
+    pub fn expand_sole_argument(&mut self, count: usize) {
+        assert!(count > 1);
+        let [argument] = self.arguments.as_slice() else {
+            panic!("logical result expansion replaces one written argument");
+        };
+        let [group] = self.groups.as_mut_slice() else {
+            panic!("logical result expansion has one ordinary argument group");
+        };
+        assert_eq!(group.kind, ArgumentListKind::Ordinary);
+        assert!(!argument.spread && argument.name.is_none());
+        group.argument_count = count;
+        self.arguments = (0..count)
+            .map(|argument_index| ArgumentRow {
+                id: argument_row_id(&group.id, argument_index),
+                argument_index,
+                literal_value: None,
+                ..argument.clone()
+            })
+            .collect();
+    }
+}
+
+fn argument_row_id(group_id: &str, index: usize) -> String {
+    let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_ARGUMENT_ID_DOMAIN);
+    digest.push(group_id.as_bytes());
+    digest.push(&index.to_le_bytes());
+    digest.finish().to_string()
+}
+
 /// Derive the call shape of the call site `call_id` belongs to.
 ///
 /// Returns `None` when `call_id` is not a call node. When `call_id` is one
@@ -185,11 +217,8 @@ pub fn call_shape_for_call(
                 digest.push(&group_index.to_le_bytes());
                 let group_id = digest.finish().to_string();
                 for (argument_index, member) in members.iter().enumerate() {
-                    let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_ARGUMENT_ID_DOMAIN);
-                    digest.push(group_id.as_bytes());
-                    digest.push(&argument_index.to_le_bytes());
                     arguments.push(ArgumentRow {
-                        id: digest.finish().to_string(),
+                        id: argument_row_id(&group_id, argument_index),
                         group_id: group_id.clone(),
                         argument_index,
                         name: member.name.clone(),

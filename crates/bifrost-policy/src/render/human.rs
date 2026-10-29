@@ -477,11 +477,21 @@ fn write_concise_report<W: Write>(
         )
         .map_err(map_io_error)?;
     }
+    let mut summarized_selector_gaps = false;
     for run in report.runs() {
         if matches!(run.completion(), PolicyRunCompletion::NotRun { .. }) {
             continue;
         }
+        let gaps = merged_selector_gaps(run);
+        summarized_selector_gaps |= !gaps.is_empty();
+        for gap in &gaps {
+            warning_count = warning_count.saturating_add(1);
+            write_selector_gap(output, run, gap)?;
+        }
         for diagnostic in run.diagnostics() {
+            if diagnostic.selector_gap().is_some() {
+                continue;
+            }
             warning_count = warning_count.saturating_add(1);
             write!(
                 output,
@@ -541,6 +551,13 @@ fn write_concise_report<W: Write>(
             warning_count = warning_count.saturating_add(1);
         }
         write_run_obligations(output, run, HumanRenderDetail::Concise)?;
+    }
+    if summarized_selector_gaps {
+        writeln!(
+            output,
+            "  Incomplete discovery is summarized; use --verbose or --format json for every diagnostic."
+        )
+        .map_err(map_io_error)?;
     }
     let suppression_reviews = report
         .suppressions()
@@ -2424,6 +2441,7 @@ fn write_evidence_detail<W: Write>(
                 write_endpoint_identity(output, origin.source_endpoint())?;
                 write!(output, " at ").map_err(map_io_error)?;
                 write_location(output, origin.primary()).map_err(map_io_error)?;
+                write!(output, " ({})", origin.certainty().label()).map_err(map_io_error)?;
                 write_evidence_refs_suffix(output, origin.evidence_refs())?;
                 writeln!(output).map_err(map_io_error)?;
                 if let Some(source_evidence) = origin.source_evidence() {
@@ -2513,6 +2531,7 @@ fn write_evidence_detail<W: Write>(
                 write_endpoint_identity(output, origin.source_endpoint())?;
                 write!(output, " at ").map_err(map_io_error)?;
                 write_location(output, origin.primary()).map_err(map_io_error)?;
+                write!(output, " ({})", origin.certainty().label()).map_err(map_io_error)?;
                 write_evidence_refs_suffix(output, origin.evidence_refs())?;
                 writeln!(output).map_err(map_io_error)?;
             }
@@ -4063,6 +4082,108 @@ fn write_count<W: Write>(
             .map_err(map_io_error)?;
     }
     Ok(())
+}
+
+/// Source sites listed per endpoint in the concise view; the rest are counted.
+const MAX_CONCISE_SELECTOR_GAP_SITES: usize = 3;
+
+/// One endpoint's incomplete discovery within one run, merged across every
+/// selector gap that names the same endpoint.
+struct MergedSelectorGap<'a> {
+    endpoint: &'a str,
+    severity: PolicyDiagnosticSeverity,
+    impact: PolicyDiagnosticImpact,
+    codes: Vec<(&'a str, u64)>,
+    sites: Vec<&'a (String, Option<usize>)>,
+}
+
+/// Merge a run's selector-gap diagnostics by endpoint, in first-seen order.
+/// Two selectors can share one display name, and a file-scoped selection
+/// records one gap per file, so the endpoint is the unit a reader acts on.
+fn merged_selector_gaps(run: &PolicyRun) -> Vec<MergedSelectorGap<'_>> {
+    let mut merged = Vec::<MergedSelectorGap<'_>>::new();
+    for diagnostic in run.diagnostics() {
+        let Some(gap) = diagnostic.selector_gap() else {
+            continue;
+        };
+        let index = match merged
+            .iter()
+            .position(|entry| entry.endpoint == gap.endpoint())
+        {
+            Some(index) => index,
+            None => {
+                merged.push(MergedSelectorGap {
+                    endpoint: gap.endpoint(),
+                    severity: diagnostic.severity(),
+                    impact: diagnostic.impact(),
+                    codes: Vec::new(),
+                    sites: Vec::new(),
+                });
+                merged.len() - 1
+            }
+        };
+        let entry = &mut merged[index];
+        for (code, count) in gap.codes() {
+            match entry.codes.iter_mut().find(|(known, _)| *known == code) {
+                Some((_, total)) => *total = total.saturating_add(*count),
+                None => entry.codes.push((code, *count)),
+            }
+        }
+        entry.sites.extend(gap.sites());
+    }
+    for entry in &mut merged {
+        entry.codes.sort();
+        entry.sites.sort();
+        entry.sites.dedup();
+    }
+    merged
+}
+
+fn write_selector_gap<W: Write>(
+    output: &mut BoundedWriter<W>,
+    run: &PolicyRun,
+    gap: &MergedSelectorGap<'_>,
+) -> Result<(), PolicyRenderError> {
+    write!(
+        output,
+        "  {} [{}; {}] {}: discovery incomplete:",
+        escape_terminal_text(run.policy_id().as_str()),
+        diagnostic_severity(gap.severity),
+        diagnostic_impact(gap.impact),
+        escape_terminal_text(gap.endpoint),
+    )
+    .map_err(map_io_error)?;
+    for (index, (code, count)) in gap.codes.iter().enumerate() {
+        let separator = if index == 0 { " " } else { ", " };
+        write!(output, "{separator}{count} {}", escape_terminal_text(code))
+            .map_err(map_io_error)?;
+    }
+    for (index, (path, line)) in gap
+        .sites
+        .iter()
+        .take(MAX_CONCISE_SELECTOR_GAP_SITES)
+        .map(|site| (&site.0, site.1))
+        .enumerate()
+    {
+        let separator = if index == 0 { " at " } else { ", " };
+        write!(output, "{separator}{}", escape_terminal_text(path)).map_err(map_io_error)?;
+        if let Some(line) = line {
+            write!(output, ":{line}").map_err(map_io_error)?;
+        }
+    }
+    let unlisted = gap
+        .sites
+        .len()
+        .saturating_sub(MAX_CONCISE_SELECTOR_GAP_SITES);
+    if unlisted > 0 {
+        write!(
+            output,
+            ", and {unlisted} more site{}",
+            plural_suffix(unlisted)
+        )
+        .map_err(map_io_error)?;
+    }
+    writeln!(output).map_err(map_io_error)
 }
 
 fn write_location<W: Write>(

@@ -180,25 +180,32 @@ pub fn php_contains_tests(source: &str, parsed: &ParsedFile) -> bool {
         return true;
     }
 
-    if parsed.declarations().iter().any(|code_unit| {
-        code_unit.is_function()
-            && code_unit
-                .identifier()
-                .to_ascii_lowercase()
-                .starts_with("test")
-            && php_function_parent_class(code_unit.short_name())
-                .is_some_and(|class_name| test_classes.contains(class_name))
-    }) {
-        return true;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .expect("PHP grammar is valid");
+    let tree = parser.parse(source, None).expect("PHP source parses");
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "function_definition" | "method_declaration")
+            && crate::graph::syntax::declaration_doc_comment(node, source).is_some_and(|comment| {
+                let arena = mago_allocator::LocalArena::new();
+                let document = mago_phpdoc_syntax::PHPDocParser::parse(
+                    &arena,
+                    mago_database::file::FileId::zero(),
+                    comment.as_bytes(),
+                );
+                !document.has_errors()
+                    && document
+                        .tags()
+                        .any(|tag| tag.name.value.eq_ignore_ascii_case(b"test"))
+            })
+        {
+            return true;
+        }
+        brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(node, &mut pending);
     }
-
-    static DOCBLOCK_TEST_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(
-            r"(?is)/\*\*.*?@test.*?\*/\s*(?:(?:public|protected|private|static|final|abstract|readonly)\s+)*function\b",
-        )
-        .unwrap()
-    });
-    DOCBLOCK_TEST_RE.is_match(source)
+    false
 }
 
 fn php_test_classes(parsed: &ParsedFile) -> HashSet<String> {
@@ -229,9 +236,55 @@ fn php_extends_testcase(parent: &str) -> bool {
     parent
         .rsplit(['\\', '.'])
         .next()
-        .is_some_and(|name| name == "TestCase")
+        .is_some_and(|name| name.eq_ignore_ascii_case("TestCase"))
 }
 
-fn php_function_parent_class(short_name: &str) -> Option<&str> {
-    short_name.rsplit_once('.').map(|(parent, _)| parent)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: testcase case and docblock lookalikes"
+    )]
+    fn test_detection_uses_declarations_and_attached_comments() {
+        for (body, expected) in [
+            (r"class Checks extends \PHPUnit\Framework\TestCase {}", true),
+            (r"class Checks extends \PHPUnit\Framework\testcase {}", true),
+            (r"class Checks extends \PHPUnit\Framework\TESTCASE {}", true),
+            ("class CheckoutTest {}", true),
+            ("class CheckoutTestCase {}", true),
+            ("class Contest {}", false),
+            (
+                "class Checks { /** @test*/ public function works() {} }",
+                true,
+            ),
+            (
+                "class Checks { /** prose about @test */ public function works() {} }",
+                false,
+            ),
+            (
+                "class Checks { /** @test */ public function works() {} }",
+                true,
+            ),
+            (
+                "$x = <<<'RAW'\n/** @test */ public function fake() {}\nRAW;",
+                false,
+            ),
+            ("$x = '/** @test */ public function fake() {}';", false),
+            ("/** @test */ $x = 1; function fake() {}", false),
+        ] {
+            let source = format!("<?php {body}");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let file = ProjectFile::new(std::env::temp_dir(), "detection.php");
+            let parsed = crate::declarations::parse_php_file(&file, &source, &tree);
+            assert_eq!(php_contains_tests(&source, &parsed), expected, "{body}");
+        }
+    }
 }

@@ -811,7 +811,8 @@
           },
           "items": [
             121,
-            122
+            122,
+            123
           ],
           "is_negative": false,
           "is_synthetic": false,
@@ -886,6 +887,62 @@
                 "is_mutable": false,
                 "type": {
                   "generic": "Self"
+                }
+              }
+            },
+            "is_c_variadic": false
+          },
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "header": {
+            "is_const": false,
+            "is_unsafe": false,
+            "is_async": false,
+            "abi": "Rust"
+          },
+          "has_body": true,
+          "default_unstable": null
+        }
+      }
+    },
+    "123": {
+      "id": 123,
+      "crate_id": 0,
+      "name": "projected",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "function": {
+          "sig": {
+            "inputs": [],
+            "output": {
+              "qualified_path": {
+                "name": "Item",
+                "args": {
+                  "angle_bracketed": {
+                    "args": [
+                      {
+                        "type": {
+                          "primitive": "u8"
+                        }
+                      }
+                    ],
+                    "constraints": []
+                  }
+                },
+                "self_type": {
+                  "generic": "I"
+                },
+                "trait": {
+                  "path": "Traverse",
+                  "id": 100,
+                  "args": null
                 }
               }
             },

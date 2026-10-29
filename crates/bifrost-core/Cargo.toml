@@ -11,6 +11,7 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 publish = true
+exclude = ["tests/**"]
 
 [lib]
 name = "brokk_bifrost_core"
@@ -31,6 +32,7 @@ rusqlite = { version = "0.40.2", default-features = false, features = [
     "bundled",
     "cache",
     "fallible_uint",
+    "functions",
     "trace",
 ] }
 rustc-hash = "2"
@@ -47,6 +49,7 @@ smallvec = "1"
 tempfile = "3.23.0"
 tree-sitter = "0.25.10"
 walkdir = "2.5.0"
+workspace-hack.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

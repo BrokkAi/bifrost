@@ -143,7 +143,14 @@ impl PythonUsageIndex {
     /// Takes [`PythonSource`], not [`PythonUsageSource`]: the cell this
     /// build fills is only reachable through the latter, so the narrower
     /// parameter is what stops the build from re-entering it.
-    pub fn build(python: &dyn PythonSource, token: QueryToken<'_>) -> Self {
+    pub fn build(
+        python: &dyn PythonSource,
+        token: QueryToken<'_>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Self> {
+        if !keep_going() {
+            return None;
+        }
         let _scope = brokk_bifrost_core::profiling::scope("PythonUsageIndex::build");
         let mut files: Vec<ProjectFile> = python
             .project()
@@ -162,7 +169,10 @@ impl PythonUsageIndex {
         let mut literal_importlib_modules_by_file: HashMap<ProjectFile, HashSet<String>> =
             HashMap::default();
         let mut replacement_modules: HashMap<ProjectFile, String> = HashMap::default();
-        python.visit_file_facts(&files, &mut |file, facts| {
+        python.visit_file_facts(&files, keep_going, &mut |file, facts| {
+            if !keep_going() {
+                return;
+            }
             let module_name = facts
                 .and_then(|facts| {
                     facts
@@ -228,12 +238,18 @@ impl PythonUsageIndex {
             }
         });
         for resolved in module_index.values_mut() {
+            if !keep_going() {
+                return None;
+            }
             resolved.sort();
             resolved.dedup();
         }
 
         let mut raw_replacements: HashMap<ProjectFile, ProjectFile> = HashMap::default();
         for (file, target_module) in replacement_modules {
+            if !keep_going() {
+                return None;
+            }
             let mut targets =
                 resolve_module(&module_index, &module_spellings, &file, &target_module);
             if targets.len() != 1 {
@@ -247,11 +263,17 @@ impl PythonUsageIndex {
 
         let mut canonical_replacements: HashMap<ProjectFile, ProjectFile> = HashMap::default();
         for file in raw_replacements.keys() {
+            if !keep_going() {
+                return None;
+            }
             if let Some(target) = canonical_module_replacement(file, &raw_replacements) {
                 canonical_replacements.insert(file.clone(), target);
             }
         }
         for resolved in module_index.values_mut() {
+            if !keep_going() {
+                return None;
+            }
             let mut seen = HashSet::default();
             resolved.retain_mut(|file| {
                 if let Some(canonical) = canonical_replacements.get(file) {
@@ -265,7 +287,13 @@ impl PythonUsageIndex {
             HashMap::default();
         let mut star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
         for (file, exports) in &exports_by_file {
+            if !keep_going() {
+                return None;
+            }
             for (exported_name, entry) in &exports.exports_by_name {
+                if !keep_going() {
+                    return None;
+                }
                 match entry {
                     ExportEntry::Local { local_name } => {
                         let Some(binder) = binders_by_file.get(file) else {
@@ -322,16 +350,23 @@ impl PythonUsageIndex {
             }
         }
 
+        if !keep_going() {
+            return None;
+        }
         let importer_reverse = build_importer_reverse(
             &module_index,
             &module_spellings,
             &files,
             &import_bindings_by_file,
             &exports_by_file,
-        );
+            keep_going,
+        )?;
         let mut literal_importlib_importers: HashMap<ProjectFile, Vec<ProjectFile>> =
             HashMap::default();
         for (importer, modules) in literal_importlib_modules_by_file {
+            if !keep_going() {
+                return None;
+            }
             for module in modules {
                 for target_file in
                     resolve_module(&module_index, &module_spellings, &importer, &module)
@@ -344,11 +379,17 @@ impl PythonUsageIndex {
             }
         }
         for importers in literal_importlib_importers.values_mut() {
+            if !keep_going() {
+                return None;
+            }
             importers.sort();
             importers.dedup();
         }
 
-        Self {
+        if !keep_going() {
+            return None;
+        }
+        Some(Self {
             module_index,
             module_spellings,
             exports_by_file,
@@ -358,7 +399,7 @@ impl PythonUsageIndex {
             literal_importlib_importers,
             module_binding_timelines: Mutex::new(HashMap::default()),
             scope_facts_by_file: Mutex::new(HashMap::default()),
-        }
+        })
     }
 
     pub fn seeds_for_target(
@@ -507,9 +548,13 @@ fn build_importer_reverse(
     files: &[ProjectFile],
     bindings_by_file: &HashMap<ProjectFile, Vec<(String, ImportBinding)>>,
     exports_by_file: &HashMap<ProjectFile, Arc<ExportIndex>>,
-) -> HashMap<ProjectFile, Vec<ImportEdge>> {
+    keep_going: &dyn Fn() -> bool,
+) -> Option<HashMap<ProjectFile, Vec<ImportEdge>>> {
     let mut reverse: HashMap<ProjectFile, Vec<ImportEdge>> = HashMap::default();
     for file in files {
+        if !keep_going() {
+            return None;
+        }
         let Some(bindings) = bindings_by_file.get(file) else {
             continue;
         };
@@ -562,7 +607,7 @@ fn build_importer_reverse(
             }
         }
     }
-    reverse
+    keep_going().then_some(reverse)
 }
 
 /// Export seeds for the target, following re-export chains.

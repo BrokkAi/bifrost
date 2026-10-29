@@ -444,7 +444,17 @@ fn export_semantic_document<'a>(
                 types: shard_types,
                 members: shard_members,
                 relations: shard_relations,
+                assembly_identity,
+                type_forwards,
             } => {
+                if assembly_identity.is_some() || !type_forwards.is_empty() {
+                    return Err(CsmiExportError::Unsupported {
+                        path: "declaration_facts".to_owned(),
+                        semantic:
+                            "assembly identities and type forwards have no supported CSMI contract"
+                                .to_owned(),
+                    });
+                }
                 if let Some(fact) = shard_types
                     .iter()
                     .find(|fact| fact.callable_surface_complete)

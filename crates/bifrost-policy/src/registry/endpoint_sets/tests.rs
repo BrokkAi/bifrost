@@ -1,4 +1,5 @@
 use super::*;
+use brokk_bifrost_test_macros::hardwon;
 
 const STORE: &str = r#"(endpoint-set-document :schema-version 1 :kind stores
   :set (endpoint-set :entries [
@@ -509,6 +510,7 @@ fn value_type_barrier_imports_preserve_proofs_provenance_and_identity() {
 }
 
 #[test]
+#[hardwon("#7150: positional policy atoms had no hover metadata")]
 fn value_type_barrier_vocabulary_formats_hovers_and_rejects_unproven_syntax() {
     use crate::source::{parse_rqlp_source, rqlp_source_help_at};
     let document = r#"(endpoint-set-document :kind barriers :set (endpoint-set :entries [
@@ -522,9 +524,30 @@ fn value_type_barrier_vocabulary_formats_hovers_and_rejects_unproven_syntax() {
         reparsed.document().to_normalized_authored_json()
     );
     let hover = rqlp_source_help_at(document, document.find(":value-type").unwrap() + 2).unwrap();
-    assert!(hover.signature.contains("intrinsic bool"), "{hover:?}");
+    assert!(
+        hover.signature.contains("intrinsic bool|numeric"),
+        "{hover:?}"
+    );
     let intrinsic = rqlp_source_help_at(document, document.find("intrinsic").unwrap() + 2).unwrap();
-    assert_eq!(intrinsic.signature, "(intrinsic bool)");
+    assert_eq!(intrinsic.signature, "(intrinsic bool|numeric)");
+    let boolean_offset = document.find("intrinsic bool").unwrap() + "intrinsic ".len();
+    let boolean = rqlp_source_help_at(document, boolean_offset + 1).unwrap();
+    assert!(boolean.description.contains("Boolean"), "{boolean:?}");
+    let numeric = document.replace("intrinsic bool", "intrinsic numeric");
+    let parsed_numeric = parse_rqlp_source(&numeric, "numeric.rqlp".into()).unwrap();
+    assert!(
+        parsed_numeric
+            .document()
+            .to_normalized_authored_json()
+            .to_string()
+            .contains("numeric")
+    );
+    let numeric_hover =
+        rqlp_source_help_at(&numeric, numeric.find("numeric").unwrap() + 2).unwrap();
+    assert!(
+        numeric_hover.description.contains("Integer"),
+        "{numeric_hover:?}"
+    );
     for (old, new, rejected) in [
         ("intrinsic bool", "intrinsic i32", "i32"),
         ("fieldless true", "fieldless false", "false"),
@@ -538,5 +561,135 @@ fn value_type_barrier_vocabulary_formats_hovers_and_rejects_unproven_syntax() {
             rejected,
             "{error:?}"
         );
+    }
+}
+
+#[test]
+fn wildcard_identity_tracks_only_contributing_catalogs() {
+    use crate::catalog::TaintCatalogDefinition;
+
+    let temp = tempfile::tempdir().unwrap();
+    let sinks = r#"(endpoint-set :include-sets [
+      (catalog :any-registered true :categories (any [sql-injection]))])"#;
+    std::fs::write(
+        temp.path().join("sinks.rqlp"),
+        format!("(endpoint-set-document :kind sinks :set {sinks})"),
+    )
+    .unwrap();
+    let executable_hash = |set: &str, matched_name: &str, unmatched_name: &str| {
+        let mut catalogs =
+            TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
+        for (name, category, display_name) in [
+            ("test.sql", "sql-injection", matched_name),
+            ("test.path", "path-injection", unmatched_name),
+        ] {
+            let category = PolicyCategoryId::new(category).unwrap();
+            catalogs
+                .register(TaintCatalogDefinition {
+                    schema_version: 1,
+                    name: PolicyId::new(name).unwrap(),
+                    version: 1,
+                    categories: vec![category.clone()],
+                    sources: Vec::new(),
+                    sinks: vec![TaintSinkSpec {
+                        id: TaintEntryId::new("sink").unwrap(),
+                        display_name: display_name.into(),
+                        categories: vec![category],
+                        selector: crate::test_support::inline_match_selector("sink"),
+                        dangerous_operand: PolicyPort::ArgumentIndex { index: 0 },
+                        accepts: vec![TaintLabel::new("untrusted").unwrap()],
+                        tags: Vec::new(),
+                        impacts: Vec::new(),
+                    }],
+                    sanitizers: Vec::new(),
+                    transforms: Vec::new(),
+                    external_models: Vec::new(),
+                })
+                .unwrap();
+        }
+        let mut registry = PolicyRegistry::new_for_workspace(
+            temp.path().to_path_buf(),
+            Arc::new(catalogs),
+            PolicyRegistryLimits::default(),
+        )
+        .unwrap();
+        let source = format!(
+            r#"(policy :id "test.wildcard" :name "Wildcard" :message "flow" :severity warning
+              :analysis (analysis :type taint :mode may
+                :sources (endpoint-set :entries [(source :id raw :display-name "raw"
+                  :categories [input.user] :selector (rql (language rust (call :callee (name "source"))))
+                  :bind return-value :labels [untrusted])])
+                :sinks {set}))"#
+        );
+        let loaded = registry
+            .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+            .unwrap();
+        assert_eq!(loaded.catalogs().len(), 1);
+        assert_eq!(loaded.catalogs()[0].name.as_str(), "test.sql");
+        loaded.semantic_hash()
+    };
+    for set in [
+        sinks,
+        r#"(endpoint-set :include-files [(endpoint-set-file :path "sinks.rqlp")])"#,
+    ] {
+        let baseline = executable_hash(set, "SQL", "Path");
+        assert_eq!(baseline, executable_hash(set, "SQL", "Changed path"));
+        assert_ne!(baseline, executable_hash(set, "Changed SQL", "Path"));
+    }
+}
+
+#[test]
+fn conditional_sanitizer_files_are_hashed_and_validate_loaded_call_arity() {
+    let temp = tempfile::tempdir().unwrap();
+    let entry = r#"(sanitizer :id guard :selector (rql-file :path "guard.rql")
+      :when (result true) :sanitizes (argument :index 0)
+      :requires [(receiver :result-of (rql-file :path "clean.rql"))]
+      :removes [untrusted])"#;
+    std::fs::write(
+        temp.path().join("sanitizers.rqlp"),
+        format!("(endpoint-set-document :kind sanitizers :set (endpoint-set :entries [{entry}]))"),
+    )
+    .unwrap();
+    for set in [
+        format!("(endpoint-set :entries [{entry}])"),
+        r#"(endpoint-set :include-files [(endpoint-set-file :path "sanitizers.rqlp")])"#.to_owned(),
+    ] {
+        let source = policy("guard", "").replace(":stores", &format!(":sanitizers {set} :stores"));
+        std::fs::write(
+            temp.path().join("guard.rql"),
+            "(rql :schema-version 1 (call (arity 1)))",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("clean.rql"),
+            r#"(rql :schema-version 1 (call :callee (name "clean")))"#,
+        )
+        .unwrap();
+        let before = registry(temp.path())
+            .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+            .unwrap()
+            .semantic_hash();
+        std::fs::write(
+            temp.path().join("clean.rql"),
+            r#"(rql :schema-version 1 (call :callee (name "other")))"#,
+        )
+        .unwrap();
+        let after = registry(temp.path())
+            .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+            .unwrap()
+            .semantic_hash();
+        assert_ne!(
+            before, after,
+            "the result-of selector contents affect identity"
+        );
+        std::fs::write(
+            temp.path().join("guard.rql"),
+            "(rql :schema-version 1 (call (arity 0)))",
+        )
+        .unwrap();
+        let error = registry(temp.path())
+            .register_policy_bytes("policy.rqlp".into(), source.as_bytes())
+            .unwrap_err();
+        assert!(error.to_string().contains("argument index 0"), "{error}");
     }
 }

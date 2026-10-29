@@ -152,6 +152,13 @@ pub struct RoleTarget {
     pub name: Option<SourceOccurrenceId>,
 }
 
+/// Source-written declaration attributes, captured while the parser tree is live.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationAttributes {
+    pub modifiers: Vec<String>,
+    pub type_kind: Option<String>,
+}
+
 /// One normalized node occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedNode {
@@ -175,6 +182,7 @@ pub struct NormalizedNode {
     pub is_async: Option<bool>,
     /// Rust call-site unsafe context; absent on other kinds and languages.
     pub unsafe_context: Option<bool>,
+    pub declaration_attributes: Option<DeclarationAttributes>,
     /// Decoded value of a string-literal expression, when the adapter can
     /// classify its complete source spelling. `None` for other kinds or when
     /// the adapter does not support this axis.

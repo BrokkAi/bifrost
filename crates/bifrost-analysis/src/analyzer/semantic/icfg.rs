@@ -109,7 +109,7 @@ pub(crate) fn record_dispatch_read_attribution(
     attribution: &DispatchReadAttribution,
 ) {
     let analyzer = workspace.analyzer();
-    if !analyzer.read_ledger_attached() {
+    if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
     }
     match attribution {
@@ -761,7 +761,7 @@ impl<'a> WorkspaceIcfgProvider<'a> {
     /// nothing.
     fn record_artifact_read(&self, procedure: &ProcedureHandle) {
         let analyzer = self.workspace().analyzer();
-        if !analyzer.read_ledger_attached() {
+        if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
             return;
         }
         let key = procedure.artifact().key();

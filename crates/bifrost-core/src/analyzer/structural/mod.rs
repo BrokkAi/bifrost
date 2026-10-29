@@ -57,8 +57,11 @@ pub mod kinds;
 pub mod materialization;
 pub mod native_obligation;
 pub mod occurrences;
+pub mod regex;
 pub mod resolution;
 pub mod result_use;
 pub mod rewrite_path;
 pub mod routes;
 pub mod spec;
+
+pub mod conditional_regions;

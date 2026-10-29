@@ -1,0 +1,842 @@
+{
+  "catalogs": {
+    "codeql-jdk-barriers-command-injection": {
+      "categories": [
+        "command-injection"
+      ],
+      "external_models": [],
+      "name": "codeql-jdk-barriers-command-injection",
+      "sanitizers": [
+        {
+          "categories": [
+            "command-injection"
+          ],
+          "id": "codeql-c7f86510adf0093170831b3a778ad0681751ac2e65a658e938f4cd29b9bf458d",
+          "input": {
+            "type": "return_value"
+          },
+          "output": {
+            "type": "return_value"
+          },
+          "removes": [
+            "attacker-controlled"
+          ],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "concat"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.concat.0"
+                  }
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          }
+        }
+      ],
+      "schema_version": 1,
+      "sinks": [],
+      "sources": [],
+      "transforms": [],
+      "version": 7
+    },
+    "codeql-jdk-sinks-command-injection": {
+      "categories": [
+        "command-injection"
+      ],
+      "external_models": [],
+      "name": "codeql-jdk-sinks-command-injection",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "command-injection"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.Runtime.exec(java.lang.String[])",
+          "id": "codeql-2cd55b469810a8e91c7c9b4176ee1452f39aa236615bc0bc195bad99432411f8",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "exec"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.runtime.exec"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        }
+      ],
+      "sources": [],
+      "transforms": [],
+      "version": 7
+    },
+    "codeql-jdk-sinks-path-injection": {
+      "categories": [
+        "path-injection"
+      ],
+      "external_models": [],
+      "name": "codeql-jdk-sinks-path-injection",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "path-injection"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.ProcessBuilder.<init>(java.lang.String[])",
+          "id": "codeql-d2588abb3b74afb538dac58b4cb1a8bc054541c567a3ea8517a025a5c1e68eea",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.ProcessBuilder.<init>.0"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        }
+      ],
+      "sources": [],
+      "transforms": [],
+      "version": 7
+    },
+    "codeql-jdk-sinks-path-injection-read": {
+      "categories": [
+        "path-injection-read"
+      ],
+      "external_models": [],
+      "name": "codeql-jdk-sinks-path-injection-read",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "path-injection-read"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.ProcessBuilder.<init>(java.lang.String[])",
+          "id": "codeql-49a9a9aa5d384095ca85a8334945181850e620fc5ad984b3d4feb4153b665067",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.ProcessBuilder.<init>.0"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        }
+      ],
+      "sources": [],
+      "transforms": [],
+      "version": 7
+    },
+    "codeql-jdk-sinks-sql-injection": {
+      "categories": [
+        "sql-injection"
+      ],
+      "external_models": [],
+      "name": "codeql-jdk-sinks-sql-injection",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "sql-injection"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.String.concat(java.lang.String)",
+          "id": "codeql-a59d9b13d858ae98ffdb50fd92b98ed00c52f624592df2f74c18e1727ac0e8aa",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "concat"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.concat.0"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        }
+      ],
+      "sources": [],
+      "transforms": [],
+      "version": 7
+    },
+    "codeql-jdk-sinks-test-mapping": {
+      "categories": [
+        "test-mapping"
+      ],
+      "external_models": [],
+      "name": "codeql-jdk-sinks-test-mapping",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "test-mapping"
+          ],
+          "dangerous_operand": {
+            "index": 1,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.String.join(java.lang.CharSequence,java.lang.Iterable)",
+          "id": "codeql-0a400ac3f87e9dfc5877e843a3420ec32b621bdd4df2a4767901bb5da5d003c6",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "join"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.join.2"
+                  }
+                },
+                {
+                  "formal_index": 1,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        },
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "test-mapping"
+          ],
+          "dangerous_operand": {
+            "type": "receiver"
+          },
+          "display_name": "java.util.ArrayList.iterator()",
+          "id": "codeql-5a2207a2c0169b3277f568a163ebf6d26ac80c8889145837ecbc80e7a9d6def7",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "iterator"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.util.ArrayList.iterator.0"
+                  }
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        },
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "test-mapping"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.String.join(java.lang.CharSequence,java.lang.Iterable)",
+          "id": "codeql-6bd45fddcfe1dd8adfd912d9b2176f988d011b9731b4451ff91b13ee64357be7",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "join"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.join.2"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        },
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "test-mapping"
+          ],
+          "dangerous_operand": {
+            "index": 1,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.String.join(java.lang.CharSequence,java.lang.CharSequence[])",
+          "id": "codeql-95c8de0e1f07d52c95c6df5e2a2f675f6ffbaa5980dd34e5d96b032b63d8fc1e",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "join"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.join.1"
+                  }
+                },
+                {
+                  "formal_index": 1,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        },
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "test-mapping"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.String.concat(java.lang.String)",
+          "id": "codeql-b1b446b60a39699378d4b6a91814d18cbf03c78b23e20939e26a892fe1798b74",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "concat"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.concat.0"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        },
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "test-mapping"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "java.lang.String.join(java.lang.CharSequence,java.lang.CharSequence[])",
+          "id": "codeql-c54464bb6170add5b4f7bbbfd25c195ef60f2f25ea128f13695b6099494969a7",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "join"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.join.1"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        },
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "test-mapping"
+          ],
+          "dangerous_operand": {
+            "type": "receiver"
+          },
+          "display_name": "java.lang.Iterable.iterator()",
+          "id": "codeql-cfef50d206efec4be67bc30e41e2c03523dd6abbab89d40d83b383233e998d0e",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "iterator"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.Iterable.iterator.0"
+                  }
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        }
+      ],
+      "sources": [],
+      "transforms": [],
+      "version": 7
+    },
+    "codeql-jdk-sources-remote": {
+      "categories": [
+        "remote"
+      ],
+      "external_models": [],
+      "name": "codeql-jdk-sources-remote",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [],
+      "sources": [
+        {
+          "bind": {
+            "type": "return_value"
+          },
+          "categories": [
+            "remote"
+          ],
+          "display_name": "java.lang.String.getBytes()",
+          "evidence": null,
+          "id": "codeql-199533502b70694ff6c22adc06a10d409bfa176448997406694ef11f2216f357",
+          "labels": [
+            "attacker-controlled"
+          ],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "getBytes"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.java.lang.String.getBytes.4"
+                  }
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "threat_model": "remote"
+        }
+      ],
+      "transforms": [],
+      "version": 7
+    }
+  },
+  "report": {
+    "catalog_version": 7,
+    "catalogs": {
+      "codeql-jdk-barriers-command-injection": {
+        "entries": 1,
+        "semantic_hash": "03ab5a86d944a9668a0c3873e10f9979e28db3871d2f070af4b6d1f799481a21"
+      },
+      "codeql-jdk-sinks-command-injection": {
+        "entries": 1,
+        "semantic_hash": "47b4f07a3f8e79b797b8e84011abccd390302f4ee6ff6585ed1df47fc10e0277"
+      },
+      "codeql-jdk-sinks-path-injection": {
+        "entries": 1,
+        "semantic_hash": "0d9dffb80ddd939150284ef78ebb37072d33f09757f24da614a30ba33c42eed5"
+      },
+      "codeql-jdk-sinks-path-injection-read": {
+        "entries": 1,
+        "semantic_hash": "69cde09ff13dd8041877c01104b09b06dce0b152a9d849b090181f59a82a1f2a"
+      },
+      "codeql-jdk-sinks-sql-injection": {
+        "entries": 1,
+        "semantic_hash": "855fe9bc200e939e8f7ffc8325cc5364931320e200df47cca1dd604ac0df1345"
+      },
+      "codeql-jdk-sinks-test-mapping": {
+        "entries": 7,
+        "semantic_hash": "ab32d114683f5b1dbf935abac8d62b920df50037a20146f8a9c32397113439a0"
+      },
+      "codeql-jdk-sources-remote": {
+        "entries": 1,
+        "semantic_hash": "50fd15483d884f513d422fd6f1caa710a5e68b28c3b7e26dddfefb1c30806c7b"
+      }
+    },
+    "codeql_commit": "ae741615f300000000000000000000000000000000",
+    "collapsed_by_content_kind": {
+      "ArrayElement": 1
+    },
+    "conflicts": [
+      "java.lang.String.concat Overload { types: [\"java.lang.String\"] }: sink/sql-injection",
+      "java.lang.String.concat Overload { types: [\"java.lang.String\"] }: sink/test-mapping",
+      "java.lang.String.getBytes Overload { types: [] }: source/remote"
+    ],
+    "neutrals_by_kind": {
+      "sink": 1,
+      "source": 1
+    },
+    "rows_by_catalog": {
+      "codeql-jdk-sinks-command-injection": [
+        "Sink: java.lang; Runtime; false; exec; (String[]); ; Argument[0].ArrayElement; command-injection; manual"
+      ],
+      "codeql-jdk-sinks-path-injection": [
+        "Sink: java.lang; ProcessBuilder; false; ProcessBuilder; (String[]); ; Argument[0]; path-injection; manual"
+      ],
+      "codeql-jdk-sinks-path-injection-read": [
+        "Sink: java.lang; ProcessBuilder; false; ProcessBuilder; (String[]); ; Argument[0]; path-injection[read]; manual"
+      ],
+      "codeql-jdk-sinks-sql-injection": [
+        "Sink: java.lang; String; false; concat; (String); ; Argument[0]; sql-injection; generated"
+      ],
+      "codeql-jdk-sinks-test-mapping": [
+        "Sink: java.lang; Iterable; true; iterator; (); ; Argument[this]; test-mapping; manual",
+        "Sink: java.lang; String; false; concat; (String); ; Argument[0]; test-mapping; manual",
+        "Sink: java.lang; String; false; join; ; ; Argument[0..1]; test-mapping; manual"
+      ],
+      "codeql-jdk-sources-remote": [
+        "Source: java.lang; String; false; getBytes; (); ; ReturnValue; remote; manual"
+      ]
+    },
+    "rows_by_extensible_and_kind": {
+      "barrierModel": {
+        "command-injection": 1
+      },
+      "neutralModel": {
+        "sink": 1,
+        "source": 1
+      },
+      "sinkModel": {
+        "command-injection": 1,
+        "path-injection": 1,
+        "path-injection[read]": 1,
+        "regex-use[0]": 1,
+        "sql-injection": 1,
+        "test-mapping": 3
+      },
+      "sourceModel": {
+        "file": 1,
+        "remote": 2
+      }
+    },
+    "rows_by_provenance": {
+      "generated": 1,
+      "manual": 14
+    },
+    "skipped_by_reason": {
+      "guard_sanitizer_requires_conditional_guard_support": 1,
+      "kind_argument_qualifier_unsupported": 1,
+      "source_argument_requires_heap_write_support": 1,
+      "source_parameter_requires_override_binding_support": 1
+    },
+    "skipped_targets_by_reason": {},
+    "source_kinds_without_threat_model": [],
+    "translated_rows": 9,
+    "unmatched_declarations": []
+  }
+}

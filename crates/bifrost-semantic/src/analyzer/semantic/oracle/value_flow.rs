@@ -194,6 +194,23 @@ impl ValueFlowEndpoint {
         }
     }
 
+    /// Canonicalize a location for value flow. Heap cardinality is evidence
+    /// used by update certificates, not a second identity for the flow slot.
+    pub fn for_path(
+        path: crate::analyzer::semantic::AccessPath,
+    ) -> Result<Self, OracleContractError> {
+        let cardinality = if matches!(path.root(), AccessPathRoot::TypeSummary(_)) {
+            crate::analyzer::semantic::ObjectCardinality::Summary
+        } else {
+            crate::analyzer::semantic::ObjectCardinality::Unknown
+        };
+        let object =
+            crate::analyzer::semantic::AbstractObject::new(path.root().clone(), cardinality)?;
+        Ok(Self::Location(Box::new(AbstractLocation::new(
+            object, path,
+        )?)))
+    }
+
     fn validate_at(&self, procedure: &ProcedureHandle) -> Result<(), OracleContractError> {
         match self {
             Self::Value(value) => require_same_procedure(value.procedure(), procedure),
@@ -1145,6 +1162,170 @@ impl ValueFlowRelation {
     }
 }
 
+/// Query-local receiver storage selected for one exact deferred member call.
+/// Empty storage leaves a storage-dependent receiver port unbound; a method
+/// whose summary never consumes or writes that port needs no such storage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemberReceiverFlow {
+    call: crate::analyzer::semantic::CallSiteHandle,
+    preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
+    storage: Box<[ValueFlowEndpoint]>,
+    field_read: Option<Box<MemberFieldRead>>,
+}
+
+/// A field load selected at the exact callable-reference event, before arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MemberFieldRead {
+    point: ProgramPointHandle,
+    event_index: u32,
+    source: ValueFlowEndpoint,
+}
+
+impl MemberReceiverFlow {
+    pub fn new(
+        call: crate::analyzer::semantic::CallSiteHandle,
+        preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
+        storage: Vec<ValueFlowEndpoint>,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError> {
+        let row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .ok_or(OracleContractError::InvalidRelationIdentity)?;
+        if row.member_selection.is_none() || (preparation.is_none() && !storage.is_empty()) {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        if storage.len() > limits.provenance_records() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "member_receiver_storage",
+                limit: limits.provenance_records(),
+                attempted: storage.len(),
+            });
+        }
+        for endpoint in &storage {
+            endpoint.validate_at(call.procedure())?;
+        }
+        Ok(Self {
+            call,
+            preparation,
+            storage: storage.into_boxed_slice(),
+            field_read: None,
+        })
+    }
+
+    /// Retain the load of a proven field without claiming its layout is resolved.
+    /// The caller supplies the occurrence identity, never an interned member name.
+    pub fn with_field_read(
+        mut self,
+        point: ProgramPointHandle,
+        event_index: u32,
+        source: ValueFlowEndpoint,
+    ) -> Result<Self, OracleContractError> {
+        require_same_procedure(point.procedure(), self.call.procedure())?;
+        source.validate_at(self.call.procedure())?;
+        let row = self
+            .call
+            .procedure()
+            .semantics()
+            .call_site(self.call.id())
+            .ok_or(OracleContractError::InvalidRelationIdentity)?;
+        let event = self
+            .call
+            .procedure()
+            .semantics()
+            .point(point.id())
+            .and_then(|point| point.events.get(event_index as usize))
+            .ok_or(OracleContractError::InvalidRelationIdentity)?;
+        if self.preparation.is_some()
+            || !matches!(event.effect,
+            SemanticEffect::CallableReference { result, .. } if result == row.callee)
+            || !matches!(source, ValueFlowEndpoint::Location(_))
+        {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        self.field_read = Some(Box::new(MemberFieldRead {
+            point,
+            event_index,
+            source,
+        }));
+        Ok(self)
+    }
+
+    pub fn call(&self) -> &crate::analyzer::semantic::CallSiteHandle {
+        &self.call
+    }
+    pub const fn preparation(
+        &self,
+    ) -> Option<crate::analyzer::semantic::MemberReceiverPreparation> {
+        self.preparation
+    }
+    pub fn storage(&self) -> &[ValueFlowEndpoint] {
+        &self.storage
+    }
+
+    /// Selecting a value method from a pointer must first read its pointee,
+    /// even when the selected body or summary never consumes the receiver.
+    pub fn selection_is_complete(&self) -> bool {
+        match self.preparation {
+            None => false,
+            Some(crate::analyzer::semantic::MemberReceiverPreparation::CopyPointee) => {
+                !self.storage.is_empty()
+            }
+            Some(_) => true,
+        }
+    }
+
+    /// The selected receiver's dependencies before invocation and after return.
+    /// Copies read their source storage and never write back into it.
+    pub fn transfers(&self) -> impl Iterator<Item = MemberReceiverTransfer> + '_ {
+        self.storage.iter().flat_map(|storage| {
+            let procedure = self.call.procedure();
+            let row = procedure.semantics().call_site(self.call.id()).expect("a selected member call exists");
+            let receiver = ValueFlowEndpoint::for_value(procedure.value_handle(row.receiver.expect("a member receiver exists"))
+                .expect("a member receiver value exists"));
+            let point = procedure.point_handle(row.point).expect("a call point exists");
+            let event_index = u32::try_from(procedure.semantics().point(row.point).expect("a call point exists").events.iter()
+                .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == row.id))
+                .expect("a call point invokes its call")).expect("an event index fits u32");
+            let read = MemberReceiverTransfer { point, event_index, source: storage.clone(), target: receiver.clone(), before_call: true, proof: ProofStatus::Proven, completeness: EvidenceCompleteness::Complete };
+            let write = matches!(self.preparation, Some(crate::analyzer::semantic::MemberReceiverPreparation::Reference
+                | crate::analyzer::semantic::MemberReceiverPreparation::AddressOfPlace))
+                .then(|| row.normal_continuation.target()).flatten().map(|normal| {
+                    let point = procedure.point_handle(normal).expect("a normal continuation exists");
+                    let event_index = u32::try_from(procedure.semantics().point(normal).expect("a normal continuation exists").events.iter()
+                        .position(|event| matches!(event.effect, SemanticEffect::CallContinuation { call_site, .. } if call_site == row.id))
+                        .expect("a normal continuation names its call")).expect("an event index fits u32");
+                    MemberReceiverTransfer { point, event_index, source: receiver, target: storage.clone(), before_call: false, proof: ProofStatus::Proven, completeness: EvidenceCompleteness::Complete }
+                });
+            [Some(read), write].into_iter().flatten()
+        }).chain(self.field_read.iter().map(|read| {
+            let row = self.call.procedure().semantics().call_site(self.call.id())
+                .expect("a member call exists");
+            MemberReceiverTransfer {
+                point: read.point.clone(), event_index: read.event_index,
+                source: read.source.clone(), target: ValueFlowEndpoint::for_value(
+                    self.call.procedure().value_handle(row.callee).expect("a member callee exists")),
+                before_call: false,
+                proof: ProofStatus::Unproven("selected field layout requires refinement".into()),
+                completeness: EvidenceCompleteness::Partial("selected field layout requires refinement".into()),
+            }
+        }))
+    }
+}
+
+/// A query-time dependency of a receiver selected from an open member call.
+#[derive(Debug, Clone)]
+pub struct MemberReceiverTransfer {
+    pub point: ProgramPointHandle,
+    pub event_index: u32,
+    pub source: ValueFlowEndpoint,
+    pub target: ValueFlowEndpoint,
+    pub before_call: bool,
+    pub proof: ProofStatus,
+    pub completeness: EvidenceCompleteness,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValueFlowSnapshot {
     procedure: ProcedureHandle,
@@ -1169,6 +1350,7 @@ pub struct ValueFlowSnapshot {
     /// and without needing the query-time analyzer access that judgment
     /// required.
     discharged_gaps: Box<[SemanticGapId]>,
+    member_receivers: Box<[MemberReceiverFlow]>,
 }
 
 impl ValueFlowSnapshot {
@@ -1197,6 +1379,41 @@ impl ValueFlowSnapshot {
         limits: OracleLimits,
         discharged_gaps: Vec<SemanticGapId>,
     ) -> Result<Self, OracleContractError> {
+        Self::with_member_receivers_and_discharged_gaps(
+            procedure,
+            context,
+            relations,
+            coverage,
+            limits,
+            discharged_gaps,
+            Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_member_receivers_and_discharged_gaps(
+        procedure: ProcedureHandle,
+        context: OracleCallContext,
+        relations: Vec<ValueFlowRelation>,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+        discharged_gaps: Vec<SemanticGapId>,
+        receivers: Vec<MemberReceiverFlow>,
+    ) -> Result<Self, OracleContractError> {
+        let metadata = Self {
+            procedure: procedure.clone(),
+            context: context.clone(),
+            relations: Box::default(),
+            coverage,
+            discharged_gaps: Box::default(),
+            member_receivers: Box::default(),
+        }
+        .with_member_receivers(receivers, limits)?;
+        let member_calls = metadata
+            .member_receivers
+            .iter()
+            .map(|receiver| (receiver.call.id(), receiver))
+            .collect::<std::collections::HashMap<_, _>>();
         let owner = OracleRelationOwner::ProcedureValueFlow {
             procedure: procedure.clone(),
             context: context.clone(),
@@ -1220,7 +1437,30 @@ impl ValueFlowSnapshot {
                 .events
                 .get(relation.event_index as usize)
                 .ok_or(OracleContractError::InvalidRelationIdentity)?;
-            if !relation_matches_event(&procedure, relation, &event.effect, &mut chains)
+            let matches_member_transfer = |receiver: &&MemberReceiverFlow| {
+                receiver.transfers().any(|transfer| {
+                    transfer.point == relation.point
+                        && transfer.event_index == relation.event_index
+                        && transfer.source == relation.source
+                        && transfer.target == relation.target
+                        && transfer.proof == relation.proof
+                        && transfer.completeness == relation.completeness
+                })
+            };
+            let member_transfer = relation.kind == ValueFlowRelationKind::LanguageDefined
+                && relation.transfer.is_none()
+                && match event.effect {
+                    SemanticEffect::Invoke { call_site }
+                    | SemanticEffect::CallContinuation { call_site, .. } => member_calls
+                        .get(&call_site)
+                        .is_some_and(matches_member_transfer),
+                    SemanticEffect::CallableReference { .. } => {
+                        member_calls.values().any(matches_member_transfer)
+                    }
+                    _ => false,
+                };
+            if !(member_transfer
+                || relation_matches_event(&procedure, relation, &event.effect, &mut chains))
                 || !relation.has_valid_memory_authority(&event.effect)
             {
                 return Err(OracleContractError::InvalidRelationIdentity);
@@ -1280,9 +1520,44 @@ impl ValueFlowSnapshot {
             procedure,
             context,
             relations: relations.into_boxed_slice(),
-            coverage,
+            coverage: metadata.coverage,
             discharged_gaps: discharged_gaps.into_boxed_slice(),
+            member_receivers: metadata.member_receivers,
         })
+    }
+
+    pub fn with_member_receivers(
+        mut self,
+        receivers: Vec<MemberReceiverFlow>,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError> {
+        if receivers.len() > limits.provenance_records() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "member_receiver_calls",
+                limit: limits.provenance_records(),
+                attempted: receivers.len(),
+            });
+        }
+        let mut calls = std::collections::HashSet::new();
+        for receiver in &receivers {
+            require_same_procedure(receiver.call.procedure(), &self.procedure)?;
+            if !calls.insert(receiver.call.id()) {
+                return Err(OracleContractError::InvalidRelationIdentity);
+            }
+        }
+        if receivers
+            .iter()
+            .any(|receiver| !receiver.selection_is_complete())
+            && self.coverage == CandidateCoverage::Exhaustive
+        {
+            self.coverage = CandidateCoverage::Open;
+        }
+        self.member_receivers = receivers.into_boxed_slice();
+        Ok(self)
+    }
+
+    pub fn member_receivers(&self) -> &[MemberReceiverFlow] {
+        &self.member_receivers
     }
 
     #[doc(hidden)]
@@ -1294,6 +1569,15 @@ impl ValueFlowSnapshot {
         census.context(&self.context);
         for relation in self.relations() {
             relation.retained_artifacts(census);
+        }
+        for receiver in &self.member_receivers {
+            census.procedure(receiver.call.procedure());
+            if let Some(read) = &receiver.field_read {
+                read.source.retained_artifacts(census);
+            }
+            for endpoint in receiver.storage() {
+                endpoint.retained_artifacts(census);
+            }
         }
     }
 

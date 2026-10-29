@@ -307,151 +307,174 @@ pub fn schedule_selected_queue<I: Sync, A: WorkerAnswer>(
             self
         }
     }
+    let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     rayon::in_place_scope(|scope| {
         for _ in 0..worker_count.min(items.len()) {
             if cancellation.soft_deadline_passed() {
                 break;
             }
+            let context = &context;
             let next = &next;
             let results = &results;
             let work = &work;
             let stop = &stop;
             let sender = sender.clone();
             scope.spawn(move |_| {
-                let mut claimed = Vec::new();
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_selected_worker(store, input, cancellation, |operation| {
-                        while !stop.load(Ordering::Relaxed)
-                            && !cancellation.soft_deadline_passed()
-                            && !cancellation.is_cancelled()
-                        {
-                            let position = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(&index) = dispatch_order.get(position) else {
-                                break;
-                            };
-                            claimed.push(index);
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                || match work(operation, &items[index])? {
-                                    SelectedResolutionOperationOutcome::Native(answer) => {
-                                        Ok(SelectedResolutionOperationOutcome::Native(
-                                            TransportedAnswer::capture(
-                                                operation,
-                                                answer,
-                                                cancellation,
-                                            )?,
-                                        ))
-                                    }
-                                    SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                                        Ok(SelectedResolutionOperationOutcome::Unavailable(reason))
-                                    }
-                                    SelectedResolutionOperationOutcome::Stale(reason) => {
-                                        Ok(SelectedResolutionOperationOutcome::Stale(reason))
-                                    }
-                                    SelectedResolutionOperationOutcome::Cancelled(completion) => {
-                                        Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                            completion,
-                                        ))
-                                    }
-                                },
-                            ))
-                            .unwrap_or_else(|panic| {
-                                Err(StoreError::new(format!(
+                context.run(|| {
+                    let mut claimed = Vec::new();
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_selected_worker(store, input, cancellation, |operation| {
+                            while !stop.load(Ordering::Relaxed)
+                                && !cancellation.soft_deadline_passed()
+                                && !cancellation.is_cancelled()
+                            {
+                                let position = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(&index) = dispatch_order.get(position) else {
+                                    break;
+                                };
+                                claimed.push(index);
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        match work(operation, &items[index])? {
+                                            SelectedResolutionOperationOutcome::Native(answer) => {
+                                                Ok(SelectedResolutionOperationOutcome::Native(
+                                                    TransportedAnswer::capture(
+                                                        operation,
+                                                        answer,
+                                                        cancellation,
+                                                    )?,
+                                                ))
+                                            }
+                                            SelectedResolutionOperationOutcome::Unavailable(
+                                                reason,
+                                            ) => {
+                                                Ok(SelectedResolutionOperationOutcome::Unavailable(
+                                                    reason,
+                                                ))
+                                            }
+                                            SelectedResolutionOperationOutcome::Stale(reason) => {
+                                                Ok(SelectedResolutionOperationOutcome::Stale(
+                                                    reason,
+                                                ))
+                                            }
+                                            SelectedResolutionOperationOutcome::Cancelled(
+                                                completion,
+                                            ) => Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                                completion,
+                                            )),
+                                        }
+                                    }))
+                                    .unwrap_or_else(
+                                        |panic| {
+                                            Err(StoreError::new(format!(
                                     "selected worker panicked for item {index}: {}",
                                     brokk_bifrost_core::panic_report::panic_payload_message(
                                         panic.as_ref()
                                     ),
                                 )))
-                            });
-                            let (status, answer, retirement) = match result {
-                                Ok(SelectedResolutionOperationOutcome::Native(answer)) => (
-                                    Ok(SelectedResolutionOperationOutcome::Native(())),
-                                    Some(answer),
-                                    None,
-                                ),
-                                Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => (
-                                    Ok(SelectedResolutionOperationOutcome::Unavailable(
-                                        reason.clone(),
-                                    )),
-                                    None,
-                                    Some(Ok(SelectedResolutionOperationOutcome::Unavailable(
-                                        reason,
-                                    ))),
-                                ),
-                                Ok(SelectedResolutionOperationOutcome::Stale(reason)) => (
-                                    Ok(SelectedResolutionOperationOutcome::Stale(reason.clone())),
-                                    None,
-                                    Some(Ok(SelectedResolutionOperationOutcome::Stale(reason))),
-                                ),
-                                Ok(SelectedResolutionOperationOutcome::Cancelled(completion)) => (
+                                        },
+                                    );
+                                let (status, answer, retirement) = match result {
+                                    Ok(SelectedResolutionOperationOutcome::Native(answer)) => (
+                                        Ok(SelectedResolutionOperationOutcome::Native(())),
+                                        Some(answer),
+                                        None,
+                                    ),
+                                    Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => {
+                                        (
+                                            Ok(SelectedResolutionOperationOutcome::Unavailable(
+                                                reason.clone(),
+                                            )),
+                                            None,
+                                            Some(Ok(
+                                                SelectedResolutionOperationOutcome::Unavailable(
+                                                    reason,
+                                                ),
+                                            )),
+                                        )
+                                    }
+                                    Ok(SelectedResolutionOperationOutcome::Stale(reason)) => (
+                                        Ok(SelectedResolutionOperationOutcome::Stale(
+                                            reason.clone(),
+                                        )),
+                                        None,
+                                        Some(Ok(SelectedResolutionOperationOutcome::Stale(reason))),
+                                    ),
                                     Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                        completion.clone(),
-                                    )),
-                                    None,
-                                    Some(Ok(SelectedResolutionOperationOutcome::Cancelled(
                                         completion,
-                                    ))),
-                                ),
-                                Err(error) => (Err(error.clone()), None, Some(Err(error))),
-                            };
-                            *results[index].lock().expect("worker result lock") = Some(status);
+                                    )) => (
+                                        Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                            completion.clone(),
+                                        )),
+                                        None,
+                                        Some(Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                            completion,
+                                        ))),
+                                    ),
+                                    Err(error) => (Err(error.clone()), None, Some(Err(error))),
+                                };
+                                *results[index].lock().expect("worker result lock") = Some(status);
+                                assert!(
+                                    sender.send((index, answer)).is_ok(),
+                                    "queue owner is receiving"
+                                );
+                                if let Some(retirement) = retirement {
+                                    // Retire with this item's own outcome. The slots this
+                                    // worker already filled lose their unvalidated answers,
+                                    // so they must carry the real cause and outcome kind;
+                                    // a generic error would turn an Unavailable or Stale
+                                    // item into a request error only when W > 1.
+                                    return retirement;
+                                }
+                            }
+                            Ok(SelectedResolutionOperationOutcome::Native(Finished))
+                        })
+                    }))
+                    .unwrap_or_else(|panic| {
+                        Err(StoreError::new(format!(
+                            "selected worker panicked: {}",
+                            brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref()),
+                        )))
+                    });
+                    if matches!(outcome, Ok(SelectedResolutionOperationOutcome::Native(_))) {
+                        return;
+                    }
+                    // Open, item, and finish failures share retirement: claim the
+                    // remaining queue so failure leaves no undispatched slots.
+                    while let Some(&index) =
+                        dispatch_order.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        claimed.push(index);
+                    }
+                    for index in claimed {
+                        let failure = match &outcome {
+                            Err(error) => Err(error.clone()),
+                            Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => Ok(
+                                SelectedResolutionOperationOutcome::Unavailable(reason.clone()),
+                            ),
+                            Ok(SelectedResolutionOperationOutcome::Stale(reason)) => {
+                                Ok(SelectedResolutionOperationOutcome::Stale(reason.clone()))
+                            }
+                            Ok(SelectedResolutionOperationOutcome::Cancelled(completion)) => Ok(
+                                SelectedResolutionOperationOutcome::Cancelled(completion.clone()),
+                            ),
+                            Ok(SelectedResolutionOperationOutcome::Native(_)) => unreachable!(),
+                        };
+                        let mut slot = results[index].lock().expect("worker result lock");
+                        // Keep a job's own error: reader finalization must not hide
+                        // an earlier indexed failure discovered by that job.
+                        if matches!(
+                            &*slot,
+                            None | Some(Ok(SelectedResolutionOperationOutcome::Native(_)))
+                        ) {
+                            *slot = Some(failure);
                             assert!(
-                                sender.send((index, answer)).is_ok(),
+                                sender.send((index, None)).is_ok(),
                                 "queue owner is receiving"
                             );
-                            if let Some(retirement) = retirement {
-                                // Retire with this item's own outcome. The slots this
-                                // worker already filled lose their unvalidated answers,
-                                // so they must carry the real cause and outcome kind;
-                                // a generic error would turn an Unavailable or Stale
-                                // item into a request error only when W > 1.
-                                return retirement;
-                            }
                         }
-                        Ok(SelectedResolutionOperationOutcome::Native(Finished))
-                    })
-                }))
-                .unwrap_or_else(|panic| {
-                    Err(StoreError::new(format!(
-                        "selected worker panicked: {}",
-                        brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref()),
-                    )))
-                });
-                if matches!(outcome, Ok(SelectedResolutionOperationOutcome::Native(_))) {
-                    return;
-                }
-                // Open, item, and finish failures share retirement: claim the
-                // remaining queue so failure leaves no undispatched slots.
-                while let Some(&index) = dispatch_order.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    claimed.push(index);
-                }
-                for index in claimed {
-                    let failure = match &outcome {
-                        Err(error) => Err(error.clone()),
-                        Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => Ok(
-                            SelectedResolutionOperationOutcome::Unavailable(reason.clone()),
-                        ),
-                        Ok(SelectedResolutionOperationOutcome::Stale(reason)) => {
-                            Ok(SelectedResolutionOperationOutcome::Stale(reason.clone()))
-                        }
-                        Ok(SelectedResolutionOperationOutcome::Cancelled(completion)) => Ok(
-                            SelectedResolutionOperationOutcome::Cancelled(completion.clone()),
-                        ),
-                        Ok(SelectedResolutionOperationOutcome::Native(_)) => unreachable!(),
-                    };
-                    let mut slot = results[index].lock().expect("worker result lock");
-                    // Keep a job's own error: reader finalization must not hide
-                    // an earlier indexed failure discovered by that job.
-                    if matches!(
-                        &*slot,
-                        None | Some(Ok(SelectedResolutionOperationOutcome::Native(_)))
-                    ) {
-                        *slot = Some(failure);
-                        assert!(
-                            sender.send((index, None)).is_ok(),
-                            "queue owner is receiving"
-                        );
                     }
-                }
+                })
             });
         }
         drop(sender);

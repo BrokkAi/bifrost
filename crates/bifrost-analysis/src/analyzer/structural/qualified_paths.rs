@@ -352,6 +352,32 @@ fn completeness(reasons: Vec<QualifiedPathIncompleteReason>) -> QualifiedPathCom
     }
 }
 
+// Canonicalize roots independently of role-token discovery order. Equal-start
+// wrappers precede their inner roots, matching grammar preorder.
+fn qualified_path_roots<'tree>(
+    spec: &dyn StructuralSpec,
+    root: Node<'tree>,
+    ranges: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<Node<'tree>> {
+    let mut roots: Vec<Node<'_>> = Vec::new();
+    let mut seen_roots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (start_byte, end_byte) in ranges {
+        let Some(token) = root.descendant_for_byte_range(start_byte, end_byte) else {
+            continue;
+        };
+        if token.start_byte() != start_byte || token.end_byte() != end_byte {
+            continue;
+        }
+        if let Some(chain_root) = spec.qualified_path_root(token)
+            && seen_roots.insert(chain_root.id())
+        {
+            roots.push(chain_root);
+        }
+    }
+    roots.sort_by_key(|node| (node.start_byte(), std::cmp::Reverse(node.end_byte())));
+    roots
+}
+
 /// Walk the arena's role-bearing tokens once, discover each chain root through
 /// the adapter, and turn every chain into ordered rows.
 fn derive_rows(
@@ -382,26 +408,7 @@ fn derive_rows(
         );
     }
 
-    // Discover chain roots from the classified tokens, deduplicated by the
-    // root's tree node, in source order for deterministic row order.
-    let mut roots: Vec<Node<'_>> = Vec::new();
-    let mut seen_roots: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut ranges: Vec<(usize, usize)> = token_by_range.keys().copied().collect();
-    ranges.sort_unstable();
-    for (start_byte, end_byte) in ranges {
-        let Some(token) = root.descendant_for_byte_range(start_byte, end_byte) else {
-            continue;
-        };
-        if token.start_byte() != start_byte || token.end_byte() != end_byte {
-            continue;
-        }
-        if let Some(chain_root) = spec.qualified_path_root(token)
-            && seen_roots.insert(chain_root.id())
-        {
-            roots.push(chain_root);
-        }
-    }
-    roots.sort_by_key(Node::start_byte);
+    let roots = qualified_path_roots(spec, root, token_by_range.keys().copied());
 
     for chain_root in roots {
         let tokens = spec.path_segment_tokens(chain_root);
@@ -578,7 +585,127 @@ fn namespace_from_targets(targets: &[CodeUnit]) -> Option<Namespace> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn coverage_reasons_preserve_their_declared_axis_scope() {
+        for &axis in super::super::routes::ALL_IDENTITY_AXES {
+            assert_eq!(
+                QualifiedPathCompleteness::Complete.covers(axis),
+                QUALIFIED_PATH_PRODUCER_AXES.contains(&axis)
+            );
+        }
+        for &axis in QUALIFIED_PATH_PRODUCER_AXES {
+            assert!(QualifiedPathCompleteness::Complete.covers(axis));
+            for reason in [
+                QualifiedPathIncompleteReason::FactsUnavailable,
+                QualifiedPathIncompleteReason::NoStructuralAdapter,
+                QualifiedPathIncompleteReason::SyntaxUnavailable,
+                QualifiedPathIncompleteReason::ChainUnenumerable,
+                QualifiedPathIncompleteReason::PathAnchorUnclassified,
+            ] {
+                let coverage = QualifiedPathCompleteness::Incomplete {
+                    unsupported_axes: vec![],
+                    reasons: vec![reason],
+                };
+                assert!(!coverage.covers(axis));
+            }
+            let cancelled = QualifiedPathCompleteness::Incomplete {
+                unsupported_axes: vec![],
+                reasons: vec![QualifiedPathIncompleteReason::ResolutionCancelled],
+            };
+            assert_eq!(
+                cancelled.covers(axis),
+                axis != IdentityAxis::SegmentResolution
+            );
+            for &unsupported in QUALIFIED_PATH_PRODUCER_AXES {
+                let coverage = QualifiedPathCompleteness::Incomplete {
+                    unsupported_axes: vec![],
+                    reasons: vec![QualifiedPathIncompleteReason::AxisUnsupported(unsupported)],
+                };
+                assert_eq!(coverage.covers(axis), axis != unsupported);
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: equal-start generic path roots depend on discovery order"
+    )]
+    fn generic_path_roots_follow_grammar_preorder() {
+        let source = "fn f() { std::vec::Vec::<u8>::new(); other::Thing::make(); }";
+        let grammar = tree_sitter_rust::LANGUAGE.into();
+        let spec = &brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC;
+        let facts = super::super::extract::extract_file_facts(spec, &grammar, source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path(), "example.rs");
+        let ranges = (0..facts.nodes().len())
+            .filter_map(|id| {
+                let id = u32::try_from(id).unwrap();
+                (!facts.occurrence_roles(id).is_empty()).then(|| {
+                    let range = facts.node(id).range;
+                    (range.start_byte, range.end_byte)
+                })
+            })
+            .collect::<Vec<_>>();
+        let forward = qualified_path_roots(spec, tree.root_node(), ranges.iter().copied());
+        let reverse = qualified_path_roots(spec, tree.root_node(), ranges.iter().rev().copied());
+        assert_eq!(
+            forward.iter().map(Node::byte_range).collect::<Vec<_>>(),
+            reverse.iter().map(Node::byte_range).collect::<Vec<_>>()
+        );
+        let mut paths = vec![];
+        let mut segments = vec![];
+        let mut reasons = vec![];
+        derive_rows(
+            spec,
+            &file,
+            &facts,
+            tree.root_node(),
+            &mut paths,
+            &mut segments,
+            &mut reasons,
+        );
+        let mut expected = vec![];
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+                && !node.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "scoped_identifier" | "scoped_type_identifier"
+                    )
+                })
+            {
+                expected.push((node.start_byte(), node.end_byte()));
+            }
+            let mut cursor = node.walk();
+            stack.extend(
+                node.named_children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        expected.dedup();
+        assert!(
+            expected.windows(2).any(|pair| pair[0].0 == pair[1].0),
+            "grammar has equal-start wrappers: {expected:?}"
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .map(|row| (row.range.start_byte, row.range.end_byte))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

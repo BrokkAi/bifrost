@@ -160,7 +160,13 @@ normalized_kinds! {
     Break => "break": "Match a break statement.",
     Continue => "continue": "Match a continue statement.",
     CharacterLiteral => "character_literal": "Match a character literal.",
-    Yield => "yield": "Match a Python yield expression that suspends generator execution.",
+    Yield => "yield": "Match a yield expression or statement that controls generator execution.",
+    Cast => "cast": "Match a cast expression.",
+    InstanceOf => "instance_of": "Match a type-test expression.",
+    Subscript => "subscript": "Match a subscript expression.",
+    ArrayCreation => "array_creation": "Match an array creation expression.",
+    UnaryExpression => "unary_expression": "Match a unary expression.",
+    Lock => "lock": "Match a synchronized or lock statement.",
 }
 
 impl NormalizedKind {
@@ -224,7 +230,7 @@ impl NormalizedKind {
             | Goto
             | Break
             | Continue => None,
-            Yield => None,
+            Yield | Cast | InstanceOf | Subscript | ArrayCreation | UnaryExpression | Lock => None,
         }
     }
 
@@ -278,7 +284,10 @@ impl NormalizedKind {
             | BinaryExpression
             | Comparison
             | ComparisonChain => false,
-            Await | Yield => false,
+            Lock => true,
+            Await | Yield | Cast | InstanceOf | Subscript | ArrayCreation | UnaryExpression => {
+                false
+            }
         }
     }
 }
@@ -387,9 +396,18 @@ roles! {
     Value => "value": Pattern, "Constrain the exact value expression of an attribute, property, or spread.",
     Key => "key": Pattern, "Constrain the static key of an object property.",
     TypeArguments => "type-arguments": PatternList, "Constrain the written generic type arguments of a call callee.",
-    Part => "parts": PatternList, "Constrain the literal parts of an implicitly concatenated string in order.",
+    Part => "parts": PatternList, "Constrain implicitly concatenated literals or interpolated expressions in source order.",
     // Appended to preserve persisted role ordinals.
     Test => "test": Pattern, "Constrain the expression tested by an assertion or conditional.",
+    Type => "type": Pattern, "Constrain the type of a construct.",
+    Operand => "operand": Pattern, "Constrain the operand of a construct.",
+    Consequence => "consequence": Pattern, "Constrain the consequence of a construct.",
+    Alternative => "alternative": Pattern, "Constrain the alternative of a construct.",
+    Body => "body": Pattern, "Constrain the body of a construct.",
+    Label => "label": Pattern, "Constrain the label of a construct.",
+    Binding => "binding": Pattern, "Constrain the binding of a construct.",
+    Indices => "indices": PatternList, "Constrain the indices in source order.",
+    Dimensions => "dimensions": PatternList, "Constrain the dimensions in source order.",
 }
 
 pub const SINGLE_TARGET_ROLES: &[Role] = &[
@@ -406,6 +424,13 @@ pub const SINGLE_TARGET_ROLES: &[Role] = &[
     Role::Value,
     Role::Key,
     Role::Test,
+    Role::Type,
+    Role::Operand,
+    Role::Consequence,
+    Role::Alternative,
+    Role::Body,
+    Role::Label,
+    Role::Binding,
 ];
 
 pub const LIST_TARGET_ROLES: &[Role] = &[
@@ -416,6 +441,8 @@ pub const LIST_TARGET_ROLES: &[Role] = &[
     Role::Children,
     Role::TypeArguments,
     Role::Part,
+    Role::Indices,
+    Role::Dimensions,
 ];
 
 pub const MAP_TARGET_ROLES: &[Role] = &[Role::Kwarg];
@@ -445,7 +472,7 @@ impl Role {
             }
             Role::Left | Role::Right | Role::Operator => matches!(
                 kind,
-                Assignment | BinaryExpression | Comparison | ComparisonChain
+                Assignment | BinaryExpression | Comparison | ComparisonChain | UnaryExpression
             ),
             Role::Module => matches!(kind, Import | Declaration),
             Role::Decorator => matches!(
@@ -459,7 +486,8 @@ impl Role {
                     | Parameter
                     | Declaration
             ),
-            Role::Object | Role::Field => kind == FieldAccess,
+            Role::Object => matches!(kind, FieldAccess | Subscript),
+            Role::Field => kind == FieldAccess,
             // `iterable` is deliberately not valid for the broader `loop`
             // kind: only the for-each family has an iterated expression, and
             // constraining it on `loop`/`while_loop` would silently narrow a
@@ -480,9 +508,20 @@ impl Role {
                     | SpreadElement
                     | Return
                     | Throw
+                    | Cast
+                    | ArrayCreation
+                    | Lock
             ),
             Role::Key => kind == ObjectProperty,
-            Role::Test => matches!(kind, Assertion | If),
+            Role::Test => matches!(kind, Assertion | If | Switch | Case),
+            Role::Type => matches!(kind, Cast | InstanceOf | ArrayCreation),
+            Role::Operand => matches!(kind, InstanceOf | UnaryExpression),
+            Role::Consequence | Role::Alternative => kind == If,
+            Role::Body => matches!(kind, Lock | Switch | Case | Label),
+            Role::Label => matches!(kind, Label | Break | Continue),
+            Role::Binding => kind == InstanceOf,
+            Role::Indices => kind == Subscript,
+            Role::Dimensions => kind == ArrayCreation,
         }
     }
 }

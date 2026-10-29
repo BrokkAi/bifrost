@@ -45,7 +45,7 @@ use brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::AnalyzerDefini
 
 use brokk_bifrost_core::analyzer::definition_lookup::BoundedDefinitionLookup;
 
-use brokk_bifrost_core::analyzer::model::RubyMethodDispatchMode;
+use brokk_bifrost_core::analyzer::model::{DispatchExtensibility, RubyMethodDispatchMode};
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
 
@@ -73,11 +73,14 @@ use brokk_bifrost_ruby::graph::resolver::{
     RubyMethodFind, RubyMethodLookupMode, ruby_dispatch_matches_lookup_mode,
 };
 use brokk_bifrost_ruby::graph::scope::{RubyScopeExit, exit_scope};
-use brokk_bifrost_ruby::hierarchy::ruby_direct_ancestors;
-use brokk_bifrost_ruby::mixins::{ruby_forward_mixin_specs, ruby_forward_superclass_targets};
+use brokk_bifrost_ruby::mixins::ruby_forward_superclass_targets;
 
 mod instance_fields;
-use brokk_bifrost_ruby::local_bindings::{LocalBindingBudget, collect_local_write};
+use brokk_bifrost_ruby::declarations::parse_ruby_tree;
+use brokk_bifrost_ruby::graph_support::RubySource;
+use brokk_bifrost_ruby::local_bindings::{
+    LocalBindingBudget, UnboundedLocalBindingBudget, collect_local_write,
+};
 
 pub(crate) struct RubyDefinitionProvider<'a> {
     ruby: &'a RubyAnalyzer,
@@ -2488,7 +2491,7 @@ fn ruby_has_unknown_receiver_ancestry(
         else {
             return true;
         };
-        if ruby_owner_ancestry_is_unknown(provider, &owner_name) {
+        if ruby_owner_ancestry_is_unknown(provider, context.file, &owner_name) {
             return true;
         }
         if let Some(superclass) = owner.child_by_field_name("superclass")
@@ -2528,12 +2531,50 @@ fn ruby_has_unknown_receiver_ancestry(
     false
 }
 
-fn ruby_owner_ancestry_is_unknown(provider: &RubyDefinitionProvider<'_>, owner: &str) -> bool {
+fn ruby_owner_ancestry_is_unknown(
+    provider: &RubyDefinitionProvider<'_>,
+    file: &ProjectFile,
+    owner: &str,
+) -> bool {
+    ruby_closed_ancestry(provider, file, owner).is_none()
+}
+
+/// The workspace declarations of `owner` and of every ancestor it can reach
+/// through a superclass, `include`, `prepend` or `extend`, when each of them is
+/// declared exactly once and every written ancestor resolves. `None` means some
+/// part of the method-resolution order is unknown: an unresolved or core
+/// superclass other than the few Ruby always supplies, an unresolved mixin, or
+/// an owner the workspace declares more than once (a reopened class).
+///
+/// Mixins resolve per owner, from the declaring owner's own forward facts and
+/// the files `file` can see, the way method lookup resolves them. The
+/// analyzer's workspace mixin graph would answer the same question by
+/// hydrating every Ruby file, which a warm per-call query must not do (#677).
+fn ruby_closed_ancestry(
+    provider: &RubyDefinitionProvider<'_>,
+    file: &ProjectFile,
+    owner: &str,
+) -> Option<Vec<CodeUnit>> {
+    let bounded_definitions = AnalyzerDefinitionLookup::new(provider.ruby, Language::Ruby);
+    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
+        consume(&bounded_definitions);
+    };
+    let scope = AnalyzerQueryScope::new(provider.ruby);
+    let semantic = RubySemanticIndex::build_for_lookup(
+        RubyGraphSource {
+            token: scope.token(),
+            index: provider.ruby,
+            definitions: &definitions,
+        },
+        provider.ruby,
+    );
+    let mut visible_files = provider.visible_files_from(&semantic, file)?;
     let mut pending = vec![owner.to_owned()];
     let mut visited = HashSet::default();
+    let mut ancestry = Vec::new();
     while let Some(owner) = pending.pop() {
         if !provider.scope_step() {
-            return true;
+            return None;
         }
         if !visited.insert(owner.clone()) {
             continue;
@@ -2546,38 +2587,25 @@ fn ruby_owner_ancestry_is_unknown(provider: &RubyDefinitionProvider<'_>, owner: 
         sort_units(&mut declarations);
         declarations.dedup();
         let [declaration] = declarations.as_slice() else {
-            return true;
+            return None;
         };
+        ancestry.push(declaration.clone());
+        // An ancestor written in the owner's own body is visible from it even
+        // when the caller's load closure does not name the owner's file.
+        visible_files.insert(declaration.source().clone());
+        let visible = visible_files.iter().cloned().collect::<Vec<_>>();
         let raw_ancestors = ruby_forward_superclass_targets(provider.ruby, declaration);
         if raw_ancestors.len() > 1 {
-            return true;
+            return None;
         }
-        let resolved_ancestors = ruby_direct_ancestors(provider.ruby, declaration);
-        if raw_ancestors.is_empty() {
-            continue;
+        if let Some(raw) = raw_ancestors.first()
+            && !ruby_known_core_superclass(raw)
+        {
+            pending.push(semantic.resolve_forward_owner_name(provider, &visible, &owner, raw)?);
         }
-        let raw = &raw_ancestors[0];
-        if ruby_known_core_superclass(raw) {
-        } else {
-            let [ancestor] = resolved_ancestors.as_slice() else {
-                return true;
-            };
-            pending.push(ancestor.fq_name().to_owned());
-        }
-        let raw_mixins = ruby_forward_mixin_specs(provider.ruby, declaration);
-        let resolved_mixins = provider
-            .ruby
-            .mixin_relations()
-            .iter()
-            .filter(|relation| relation.from == *declaration)
-            .map(|relation| relation.to.fq_name().to_owned())
-            .collect::<Vec<_>>();
-        if resolved_mixins.len() != raw_mixins.len() {
-            return true;
-        }
-        pending.extend(resolved_mixins);
+        pending.extend(semantic.forward_mixin_targets(provider, &visible, &owner)?);
     }
-    false
+    Some(ancestry)
 }
 
 fn ruby_known_core_superclass(raw: &str) -> bool {
@@ -2594,6 +2622,454 @@ fn ruby_known_core_ancestor(node: Node<'_>, context: &BoundedRubyLookupContext<'
             "Object" | "BasicObject" | "Kernel" | "String"
         )
         && !path.absolute
+}
+
+/// Hook methods Ruby calls on a class or module when its method table or its
+/// ancestry changes, or when a lookup misses. A declaration in the receiver's
+/// ancestry that defines one can add, replace or answer methods at run time.
+const RUBY_DISPATCH_HOOKS: &[&str] = &[
+    "method_missing",
+    "respond_to_missing?",
+    "method_added",
+    "method_removed",
+    "method_undefined",
+    "singleton_method_added",
+    "singleton_method_removed",
+    "singleton_method_undefined",
+    "inherited",
+    "included",
+    "extended",
+    "prepended",
+    "append_features",
+    "prepend_features",
+    "extend_object",
+    "new",
+    "allocate",
+];
+
+/// Calls that run code against another `self`, select a method by a run-time
+/// name, or open a refinement. Any of them in the analysis scope can rewrite
+/// the receiver's method table in ways the declaration index does not record.
+const RUBY_METHOD_TABLE_EVALUATORS: &[&str] = &[
+    "instance_eval",
+    "instance_exec",
+    "class_eval",
+    "class_exec",
+    "module_eval",
+    "module_exec",
+    "send",
+    "__send__",
+    "public_send",
+    "method_missing",
+    "singleton_class",
+    "refine",
+    "using",
+    "included",
+    "prepended",
+    "class_methods",
+    "concerning",
+];
+
+/// Calls that define, alias, delegate or remove a method by name. They keep a
+/// receiver open only when they can name the called member: a literal name
+/// equal to it, or a name the source does not write as a literal.
+const RUBY_METHOD_TABLE_DEFINERS: &[&str] = &[
+    "define_method",
+    "define_singleton_method",
+    "alias_method",
+    "remove_method",
+    "undef_method",
+    "attr",
+    "attr_reader",
+    "attr_writer",
+    "attr_accessor",
+    "delegate",
+    "def_delegator",
+    "def_delegators",
+    "def_instance_delegator",
+    "def_instance_delegators",
+];
+
+/// Whether a resolved Ruby member call selects from a receiver whose identity
+/// and method table are both closed, so the resolver's candidates are every
+/// body the call can run (#3494).
+///
+/// Ruby dispatch is open by default: any receiver value's class can be a
+/// subclass, any class can be reopened, and the method table can be rewritten
+/// at run time. This proof closes one call only when each of those openings
+/// is discharged by structure inside a stated analysis scope:
+///
+/// * Receiver identity is exact. The receiver is a constant path naming one
+///   workspace class or module (singleton dispatch), a `Const.new(...)`
+///   expression on such a class, or a local whose every write in its scope is
+///   `Const.new(...)` of that same class and that is assigned on every path to
+///   the call. `self`, parameters, instance variables and factory results keep
+///   the call open: their class can be any subclass.
+/// * The method-resolution order is closed. The owner and every ancestor are
+///   declared exactly once in the workspace, every written superclass and
+///   mixin resolves, no activated semantic model also publishes one of them
+///   (a gem reopening it), and none defines a dispatch hook, `new` or
+///   `allocate`.
+/// * Every retained candidate is a method of one of those declarations.
+/// * Nothing in the analysis scope can rewrite the method table. The scope is
+///   the caller's file plus every file declaring an owner in the ancestry.
+///   Each must parse cleanly, carry no recorded run-time boundary (dynamic
+///   `require`/`load`, `eval`, `class_eval`, `const_set`, `autoload`, ...),
+///   write no evaluator call, no `alias`/`undef`, no `class << value` other
+///   than `class << self`, and no definer that can name the member. Mixins
+///   must be written with constant arguments in a class body, not inside a
+///   method. A refinement active at the call keeps it open.
+///
+/// Mutation spelled outside that scope -- `Owner.class_eval` in an unrelated
+/// file -- is not seen. That is the stated limit of the proof, not an
+/// oversight: an unbounded workspace scan per call is not an option, and the
+/// files that declare the owner and call it are where Ruby code rewrites a
+/// class in practice.
+pub(crate) fn ruby_member_selection_closed(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    targets: &[CodeUnit],
+    cancellation: Option<&CancellationToken>,
+) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    let Some(ruby) = resolve_analyzer::<RubyAnalyzer>(analyzer) else {
+        return false;
+    };
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
+    let overlay = analyzer.semantic_model_overlay();
+    let mut provider = RubyDefinitionProvider::new(ruby, &session);
+    provider.overlay = overlay.as_deref();
+    let root = tree.root_node();
+    let Some(callee) = ruby_smallest_named_node_covering_bounded(
+        &provider,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
+        return false;
+    };
+    let Some(call) = callee.parent().filter(|call| {
+        call.kind() == "call"
+            && call
+                .child_by_field_name("method")
+                .is_some_and(|method| method.id() == callee.id())
+    }) else {
+        return false;
+    };
+    let Some(receiver_node) = call.child_by_field_name("receiver") else {
+        return false;
+    };
+    if ruby_has_active_refinement(root, call, source) {
+        return false;
+    }
+    let member = ruby_node_text(callee, source);
+    let context =
+        BoundedRubyLookupContext::build(&provider, file, source, root, site.focus_start_byte);
+    let Some(receiver) = ruby_exact_receiver(&context, call, receiver_node) else {
+        return false;
+    };
+    let Some(ancestry) = ruby_closed_ancestry(&provider, file, &receiver.owner_fq_name) else {
+        return false;
+    };
+    let constants = RubyOverlayConstants::new(overlay.as_deref());
+    // The owner's own constant must name only the class or module itself: a
+    // second binding of the same name makes the receiver a different object.
+    if provider
+        .fqn(&receiver.owner_fq_name)
+        .iter()
+        .any(|unit| !unit.is_class() && !unit.is_module())
+    {
+        return false;
+    }
+    for declaration in &ancestry {
+        // Ruby fq names join constant segments with `$`; an activated gem pack
+        // keys its types by the `::`-joined constant path.
+        if constants.publishes_type(&declaration.fq_name().replace('$', "::")) {
+            return false;
+        }
+        let owner = declaration.fq_name();
+        if RUBY_DISPATCH_HOOKS
+            .iter()
+            .any(|hook| !provider.members_for_owner_name(&owner, hook).is_empty())
+        {
+            return false;
+        }
+    }
+    // `Owner.new` runs `Class#new`, which no ancestry declaration overrides
+    // (the hook check above), and then the `initialize` lookup selects on the
+    // new instance. The resolver answers that call with the inherited
+    // initializers, or with the owner class itself when its own `initialize`
+    // (or none) is the one selected.
+    let constructs = receiver.mode == RubyReceiverMode::Class && member == "new";
+    if !targets.iter().all(|target| {
+        if target.is_function() {
+            provider
+                .parent(target)
+                .is_some_and(|owner| ancestry.contains(&owner))
+                && (!constructs || target.identifier() == "initialize")
+        } else {
+            constructs && target.is_class() && target.fq_name() == receiver.owner_fq_name
+        }
+    }) {
+        return false;
+    }
+    let mut scope_files = vec![file.clone()];
+    for declaration in &ancestry {
+        if !scope_files.contains(declaration.source()) {
+            scope_files.push(declaration.source().clone());
+        }
+    }
+    scope_files.iter().all(|scope_file| {
+        let Some(facts) = ruby.source_facts(scope_file) else {
+            return false;
+        };
+        if facts.has_parse_errors || facts.runtime_boundary.is_some() {
+            return false;
+        }
+        if scope_file == file {
+            return ruby_scope_file_keeps_method_table(&provider, root, source, member);
+        }
+        let Ok(scope_source) = analyzer.project().read_source(scope_file) else {
+            return false;
+        };
+        let Some(scope_tree) = parse_ruby_tree(&scope_source) else {
+            return false;
+        };
+        ruby_scope_file_keeps_method_table(&provider, scope_tree.root_node(), &scope_source, member)
+    })
+}
+
+/// The exact class or module a member call selects on, or `None` when the
+/// receiver's run-time class can be anything other than the one written.
+fn ruby_exact_receiver(
+    context: &BoundedRubyLookupContext<'_, '_>,
+    call: Node<'_>,
+    receiver: Node<'_>,
+) -> Option<RubyReceiverType> {
+    match receiver.kind() {
+        "constant" | "scope_resolution" => {
+            context
+                .resolve_constant_owner(receiver)
+                .map(|owner_fq_name| RubyReceiverType {
+                    owner_fq_name,
+                    mode: RubyReceiverMode::Class,
+                })
+        }
+        "call" => {
+            ruby_exact_constructed_owner(context, receiver).map(|owner_fq_name| RubyReceiverType {
+                owner_fq_name,
+                mode: RubyReceiverMode::Instance,
+            })
+        }
+        "identifier" => {
+            let name = ruby_node_text(receiver, context.source);
+            let typed = context.local_receiver_type(name)?;
+            if typed.mode != RubyReceiverMode::Instance
+                || !ruby_local_writes_are_exact_constructions(
+                    context,
+                    call,
+                    name,
+                    &typed.owner_fq_name,
+                )
+            {
+                return None;
+            }
+            Some(typed)
+        }
+        _ => None,
+    }
+}
+
+/// The workspace class a `Const.new(...)` expression constructs.
+fn ruby_exact_constructed_owner(
+    context: &BoundedRubyLookupContext<'_, '_>,
+    call: Node<'_>,
+) -> Option<String> {
+    if call.kind() != "call"
+        || call
+            .child_by_field_name("method")
+            .is_none_or(|method| ruby_node_text(method, context.source) != "new")
+    {
+        return None;
+    }
+    let receiver = call
+        .child_by_field_name("receiver")
+        .filter(|receiver| matches!(receiver.kind(), "constant" | "scope_resolution"))?;
+    let owner = context.resolve_constant_owner(receiver)?;
+    context
+        .provider
+        .fqn(&owner)
+        .iter()
+        .all(CodeUnit::is_class)
+        .then_some(owner)
+}
+
+/// Whether every write of local `name` in the scope that encloses `call` is a
+/// plain assignment of `Const.new(...)` constructing `owner`. Parameters,
+/// compound and destructuring assignments, loop, rescue and pattern bindings
+/// all keep the local's class open.
+fn ruby_local_writes_are_exact_constructions(
+    context: &BoundedRubyLookupContext<'_, '_>,
+    call: Node<'_>,
+    name: &str,
+    owner: &str,
+) -> bool {
+    let mut scope = call;
+    while let Some(parent) = scope.parent() {
+        scope = parent;
+        if matches!(
+            scope.kind(),
+            "method" | "singleton_method" | "class" | "module" | "singleton_class"
+        ) {
+            break;
+        }
+    }
+    let mut pending = vec![scope];
+    while let Some(node) = pending.pop() {
+        if !context.provider.scope_step() {
+            return false;
+        }
+        if node != scope
+            && matches!(
+                node.kind(),
+                "method" | "singleton_method" | "class" | "module" | "singleton_class"
+            )
+        {
+            continue;
+        }
+        match node.kind() {
+            "method_parameters" | "block_parameters" | "lambda_parameters" => {
+                let mut names = vec![node];
+                while let Some(parameter) = names.pop() {
+                    if parameter.kind() == "identifier"
+                        && ruby_node_text(parameter, context.source) == name
+                    {
+                        return false;
+                    }
+                    push_named_children_reversed_as(parameter, &mut names, |child| child);
+                }
+            }
+            "assignment"
+            | "operator_assignment"
+            | "for"
+            | "rescue"
+            | "match_pattern"
+            | "test_pattern"
+            | "in_clause" => {
+                let Ok(written) =
+                    collect_local_write(context.source, node, &mut UnboundedLocalBindingBudget);
+                if written.activations().any(|(written, _)| written == name) {
+                    let exact = node.kind() == "assignment"
+                        && node
+                            .child_by_field_name("left")
+                            .is_some_and(|left| left.kind() == "identifier")
+                        && node.child_by_field_name("right").is_some_and(|right| {
+                            ruby_exact_constructed_owner(context, right).as_deref() == Some(owner)
+                        });
+                    if !exact {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        push_named_children_reversed_as(node, &mut pending, |child| child);
+    }
+    true
+}
+
+/// Whether one file in the analysis scope leaves the called member's method
+/// table as the declaration index records it. See
+/// [`ruby_member_selection_closed`] for the rules.
+fn ruby_scope_file_keeps_method_table(
+    provider: &RubyDefinitionProvider<'_>,
+    root: Node<'_>,
+    source: &str,
+    member: &str,
+) -> bool {
+    let mut pending = vec![(root, false)];
+    while let Some((node, in_method)) = pending.pop() {
+        if !provider.scope_step() {
+            return false;
+        }
+        match node.kind() {
+            "alias" | "undef" => return false,
+            "singleton_class"
+                if node
+                    .child_by_field_name("value")
+                    .is_none_or(|value| value.kind() != "self") =>
+            {
+                return false;
+            }
+            "call" => {
+                let method = node
+                    .child_by_field_name("method")
+                    .map_or("", |method| ruby_node_text(method, source));
+                if RUBY_METHOD_TABLE_EVALUATORS.contains(&method) {
+                    return false;
+                }
+                if matches!(method, "include" | "prepend" | "extend")
+                    && (in_method
+                        || node.child_by_field_name("receiver").is_some()
+                        || node
+                            .child_by_field_name("arguments")
+                            .is_none_or(|arguments| {
+                                arguments.named_child_count() == 0
+                                    || (0..arguments.named_child_count()).any(|index| {
+                                        arguments.named_child(index).is_none_or(|argument| {
+                                            !matches!(
+                                                argument.kind(),
+                                                "constant" | "scope_resolution"
+                                            )
+                                        })
+                                    })
+                            }))
+                {
+                    return false;
+                }
+                if RUBY_METHOD_TABLE_DEFINERS.contains(&method)
+                    && !ruby_definer_names_avoid(node, source, member)
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        let in_method = in_method || matches!(node.kind(), "method" | "singleton_method");
+        for index in (0..node.named_child_count()).rev() {
+            pending.push((
+                node.named_child(index).expect("named child exists"),
+                in_method,
+            ));
+        }
+    }
+    true
+}
+
+/// Whether a method-defining call provably names only members other than
+/// `member`: every name argument is a literal symbol or string, and none of
+/// them, nor a writer derived from one, is `member`. Keyword arguments (the
+/// `to:` of a delegation) do not name a defined method.
+fn ruby_definer_names_avoid(call: Node<'_>, source: &str, member: &str) -> bool {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    (0..arguments.named_child_count()).all(|index| {
+        let Some(argument) = arguments.named_child(index) else {
+            return false;
+        };
+        if argument.kind() == "pair" {
+            return true;
+        }
+        // `attr_writer :total` defines `total=`, which a call can also name.
+        ruby_symbol_or_string_value(argument, source)
+            .is_some_and(|name| name != member && member.strip_suffix('=') != Some(&name))
+    })
 }
 
 /// A splat, keyword group or block argument does not prove written positional
@@ -2866,24 +3342,25 @@ impl<'a> RubyLookupContext<'a> {
                 self.receiver_context.push(RubyReceiverMode::Instance);
                 self.exits.push(RubyScopeExit::Type {
                     has_lexical_owner: owner.is_some(),
+                    locals: std::mem::take(&mut self.locals),
                 });
                 return RubyWalkAction::DescendWithExit;
             }
             "method" | "singleton_method" => {
-                self.locals.enter_scope();
+                let locals = std::mem::take(&mut self.locals);
                 self.seed_parameter_shadows(node);
                 self.method_stack.push(ruby_method_receiver_mode(
                     node,
                     self.receiver_context.last().copied(),
                 ));
-                self.exits.push(RubyScopeExit::Method);
+                self.exits.push(RubyScopeExit::Method { locals });
                 return RubyWalkAction::DescendWithExit;
             }
             "singleton_class" => {
-                self.locals.enter_scope();
+                let locals = std::mem::take(&mut self.locals);
                 self.method_stack.push(RubyReceiverMode::Class);
                 self.receiver_context.push(RubyReceiverMode::Class);
-                self.exits.push(RubyScopeExit::SingletonClass);
+                self.exits.push(RubyScopeExit::SingletonClass { locals });
                 return RubyWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
@@ -3093,6 +3570,26 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             evidence.dispatch_extensibility = proof.dispatch_extensibility();
             evidence.exact_external_call = Some(proof);
             evidence.external_callee_identity = Some(identity);
+        }
+        // #3494: a resolved member call on an exact receiver whose method
+        // table is closed selects only the resolver's candidates. Publishing
+        // that as a closed bound-receiver selection lets the shared exact
+        // member discharge answer the call's dynamic-dispatch gap.
+        if outcome.status == DefinitionLookupStatus::Resolved
+            && tree.as_ref().is_some_and(|tree| {
+                ruby::ruby_member_selection_closed(
+                    analyzer,
+                    &request.file,
+                    source.as_ref(),
+                    tree,
+                    site,
+                    &outcome.definitions,
+                    cancellation,
+                )
+            })
+        {
+            evidence.call_application = CallApplicationKind::BoundReceiver;
+            evidence.dispatch_extensibility = Some(DispatchExtensibility::Closed);
         }
         outcome
     };

@@ -602,7 +602,7 @@ namespace api {
 /**
 * Doc comment
 */
-class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
+class PROJECT_PUBLIC_API RecoveryOwner : public virtual BaseKey {
    public:
       /** Construct from a point. */
       RecoveryOwner(const Group& group, const Point& point) : BaseKey(group, point) {}
@@ -666,24 +666,22 @@ class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
                     .get(recovered_owner)
                     .and_then(|ranges| ranges.first())
                     .expect("the recovered owner must retain its class range");
-                let mut pending = vec![root];
-                let mut recognized_recovery = false;
-                while let Some(node) = pending.pop() {
-                    if crate::declarations::recovered_fragmented_class_has_body(
-                        node,
-                        source,
-                        "RecoveryOwner",
-                        owner_range,
-                    ) {
-                        recognized_recovery = true;
-                        break;
-                    }
-                    let mut cursor = node.walk();
-                    pending.extend(node.named_children(&mut cursor));
-                }
+                // Since brokk-tree-sitter-cpp 0.24.7 a function-like export
+                // macro head parses, so the fixture uses an object-like macro
+                // before a base clause, which still fragments the class. Any
+                // recovery that owns it records its provenance.
                 assert!(
-                    recognized_recovery,
-                    "the fixture must enter the fragmented export-class recovery path"
+                    owner_range.start_byte < owner_range.end_byte,
+                    "the recovered owner must retain a nonempty class range"
+                );
+                assert!(
+                    independent_primary.materialization_records.iter().any(|record| matches!(
+                        record,
+                        brokk_bifrost_core::analyzer::structural::materialization::MaterializationRecord::RecoveredDeclaration { unit, .. }
+                            if unit == recovered_owner
+                    )),
+                    "the fixture must enter export-class recovery: {:#?}",
+                    independent_primary.materialization_records
                 );
                 let mut pending = vec![root];
                 let mut tag = None;

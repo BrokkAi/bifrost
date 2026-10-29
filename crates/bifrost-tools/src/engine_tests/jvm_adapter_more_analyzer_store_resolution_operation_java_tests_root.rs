@@ -562,11 +562,11 @@ pub mod jvm_extraction_tests {
         let cancellation = CancellationToken::new();
         let operation = fixture.open_ready(&cancellation);
         *operation.ready.jvm_context_profile.borrow_mut() = Some(Default::default());
-        let statement = brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JVM_IMPORT_TARGET_MOUNTS;
+        let mounts = brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::jvm_import_target_mounts();
         let read = |namespace| {
             operation
                 .jvm_named_import_targets(
-                    statement,
+                    mounts,
                     "dep",
                     "NoSuchOwner",
                     &[namespace],
@@ -643,7 +643,7 @@ pub mod jvm_extraction_tests {
         assert!(
             operation
                 .jvm_named_import_targets(
-                    statement,
+                    mounts,
                     "dep",
                     "NoSuchOwner",
                     &[ResolutionNamespace::Type],
@@ -736,9 +736,9 @@ pub mod jvm_extraction_tests {
             let second =
                 operation.jvm_generated_lookup(Language::Java, ResolutionNamespace::Type, "Use");
             assert!(Arc::ptr_eq(&first, &second));
-            let statement = brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JVM_IMPORT_TARGET_MOUNTS;
+            let mounts = brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::jvm_import_target_mounts();
             for _ in 0..2 {
-                let _rows = operation.jvm_import_targets(statement, "dep").unwrap();
+                let _rows = operation.jvm_import_targets(mounts, "dep").unwrap();
             }
             assert_eq!(derivations(operation, "derive_import_targets"), 1);
             let lookup = ResolutionLookupSemanticRecipe::new(

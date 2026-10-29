@@ -12,7 +12,6 @@ use brokk_bifrost_core::analyzer::model::{
     CallableArity, DispatchExtensibility, SignatureMetadata,
 };
 use brokk_bifrost_core::analyzer::semantic_diagnostics::same_node;
-use brokk_bifrost_core::analyzer::structural::adapter_helpers::declarator_initializer;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor_with;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, named_children_iter};
@@ -24,7 +23,14 @@ pub fn csharp_is_member_variable_owner_kind(kind: &str) -> bool {
 }
 
 pub fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
-    declarator_initializer(declarator)
+    // The released grammar puts an optional expression after the '=' token.
+    // A deconstruction uses tuple_pattern instead of a named identifier field;
+    // comments and bracketed_argument_list are not initializer expressions.
+    let mut cursor = declarator.walk();
+    declarator
+        .children(&mut cursor)
+        .skip_while(|child| child.kind() != "=")
+        .find(|child| child.is_named() && !child.is_extra())
 }
 
 pub fn csharp_callable_dispatch_extensibility<'tree>(
@@ -104,7 +110,12 @@ fn csharp_enclosing_accessor_owner<'tree>(
     (node.kind() == "accessor_declaration")
         .then(|| csharp_accessor_owner(node, |node| ancestry.parent(node)))
         .flatten()
-        .filter(|owner| matches!(owner.kind(), "property_declaration" | "indexer_declaration"))
+        .filter(|owner| {
+            matches!(
+                owner.kind(),
+                "property_declaration" | "indexer_declaration" | "event_declaration"
+            )
+        })
 }
 
 /// The declaration that owns a C# accessor list.
@@ -211,7 +222,10 @@ pub fn map_csharp_type_arguments<T>(
     arguments: Option<Node<'_>>,
     resolve: impl FnMut(Node<'_>) -> Option<T>,
 ) -> Option<Vec<T>> {
-    named_children_iter(arguments?).map(resolve).collect()
+    named_children_iter(arguments?)
+        .filter(|child| !child.is_extra())
+        .map(resolve)
+        .collect()
 }
 
 pub fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> Option<String> {
@@ -367,6 +381,34 @@ pub fn csharp_source_name_segment(segment: &str) -> &str {
     strip_csharp_generic_arity(segment)
 }
 
+/// ECMA-334 6.4.3: identifier equality ignores the verbatim prefix,
+/// decodes Unicode escapes, then removes Unicode formatting characters.
+/// This consumes an identifier value selected by the grammar, never source syntax.
+/// The borrowed source-name helpers above strip metadata arity for presentation;
+/// this is the shared allocating lookup normalization, before an arity is appended.
+pub fn csharp_lookup_identifier(identifier: &str) -> String {
+    static ESCAPES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))")
+            .expect("constant C# identifier escape expression")
+    });
+    static FORMATTING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\p{Cf}").expect("constant Unicode formatting category expression")
+    });
+    let identifier = identifier.strip_prefix('@').unwrap_or(identifier);
+    let decoded = ESCAPES.replace_all(identifier, |capture: &regex::Captures<'_>| {
+        let digits = capture
+            .get(1)
+            .or_else(|| capture.get(2))
+            .expect("one Unicode escape group");
+        let scalar = u32::from_str_radix(digits.as_str(), 16)
+            .expect("escape expression selects hexadecimal digits");
+        // Preserve an invalid scalar escape as invalid source spelling. It
+        // must not alias a valid identifier or panic during parser recovery.
+        char::from_u32(scalar).map_or_else(|| capture[0].to_owned(), |value| value.to_string())
+    });
+    FORMATTING.replace_all(decoded.as_ref(), "").into_owned()
+}
+
 pub fn csharp_type_node_identity(node: Node<'_>, source: &str) -> String {
     csharp_type_node_identity_with_terminal_suffix(node, source, "")
 }
@@ -433,7 +475,9 @@ pub fn csharp_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 /// mistaking an unbound generic name for an arity-zero identifier (#2209).
 fn csharp_type_argument_arity(arguments: Node<'_>) -> usize {
     debug_assert_eq!(arguments.kind(), "type_argument_list");
-    let bound_arity = arguments.named_child_count();
+    let bound_arity = named_children_iter(arguments)
+        .filter(|child| !child.is_extra())
+        .count();
     if bound_arity > 0 {
         return bound_arity;
     }
@@ -1347,6 +1391,18 @@ pub fn csharp_callable_arity_from_metadata(
         .then_some(arity)
 }
 
+/// Normalize source type syntax for name lookup, retaining every qualified
+/// segment while erasing wrappers and generic arguments structurally.
+pub fn normalize_csharp_type_node(node: Node<'_>, source: &str) -> String {
+    csharp_type_node_segments(node, source)
+        .iter()
+        .map(|segment| strip_csharp_generic_arity(segment))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Legacy normalization for persisted/display spellings without a syntax node.
+/// Source-backed callers should use [`normalize_csharp_type_node`].
 pub fn normalize_csharp_type_fragment(reference: &str) -> String {
     let trimmed = reference.trim();
     let without_nullable = trimmed.trim_end_matches('?').trim();
@@ -1363,14 +1419,27 @@ pub fn normalize_csharp_type_fragment(reference: &str) -> String {
 #[doc(hidden)]
 pub const CSHARP_INDEXER_MEMBER_NAME: &str = "Item";
 
+/// Whether a case pattern matches every value before any when guard.
+pub(crate) fn csharp_is_irrefutable_pattern(mut pattern: Node<'_>) -> bool {
+    while pattern.kind() == "parenthesized_pattern" {
+        let Some(inner) = named_children_iter(pattern).find(|child| !child.is_extra()) else {
+            return false;
+        };
+        pattern = inner;
+    }
+    matches!(pattern.kind(), "discard" | "var_pattern")
+        || (pattern.kind() == "declaration_pattern"
+            && pattern
+                .child_by_field_name("type")
+                .is_some_and(|ty| ty.kind() == "implicit_type"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        csharp_normalize_fq_name, csharp_normalize_full_name, csharp_type_node_identity,
-        segment_interner,
-    };
+    use super::*;
     use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
     use brokk_bifrost_core::analyzer::model::Language;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn generic_identity(source: &str, spelling: &str) -> String {
@@ -1418,5 +1487,489 @@ mod tests {
         let structured = csharp_normalize_fq_name(&name).display_native(Language::CSharp, interner);
         assert_eq!(structured, csharp_normalize_full_name(&exact));
         assert_eq!(structured, "Demo.Box.Box");
+    }
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: comments changed generic arity and substitutions"
+    )]
+    fn generic_argument_grammar_excludes_named_extras() {
+        for (spelling, expected, arity) in [
+            ("Pair<A, /* note */ B>", vec!["A", "B"], 2),
+            ("Pair</* first */ A, B /* last */>", vec!["A", "B"], 2),
+            ("Box</* note */>", vec![], 1),
+            ("Pair</* note */,>", vec![], 2),
+        ] {
+            let source = format!("class C {{ object M() => typeof({spelling}); }}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let mut pending = vec![tree.root_node()];
+            let mut lists = 0;
+            while let Some(node) = pending.pop() {
+                if node.kind() == "type_argument_list" {
+                    lists += 1;
+                    assert!(
+                        super::named_children_iter(node)
+                            .any(|n| n.kind() == "comment" && n.is_extra())
+                    );
+                    assert_eq!(super::csharp_type_argument_arity(node), arity, "{spelling}");
+                    assert_eq!(
+                        super::map_csharp_type_arguments(Some(node), |n| (!n.is_extra())
+                            .then(|| n.utf8_text(source.as_bytes()).unwrap().to_owned())),
+                        Some(expected.iter().map(|s| s.to_string()).collect()),
+                        "{spelling}"
+                    );
+                }
+                pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+            }
+            assert_eq!(lists, 1);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: custom event accessors lost virtual dispatch"
+    )]
+    fn accessor_grammar_retains_owner_dispatch() {
+        let source = "class C { public virtual event Action E { add {} remove {} } public virtual int this[int i] { get { return 0; } } public virtual int P { get { return 0; } } }";
+        let tree = crate::test_support::parse_raw_csharp(source);
+        assert!(!tree.root_node().has_error());
+        let ancestry = super::ParentIndex::new(tree.root_node());
+        let mut pending = vec![tree.root_node()];
+        let mut owners = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "accessor_declaration" {
+                let owner = node.parent().unwrap().parent().unwrap();
+                owners.push(owner.kind());
+                assert_eq!(
+                    super::csharp_enclosing_accessor_owner(node, &ancestry),
+                    Some(owner)
+                );
+                assert_eq!(
+                    super::csharp_callable_dispatch_extensibility(source, node, false, &ancestry),
+                    super::DispatchExtensibility::Open
+                );
+            }
+            pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+        }
+        owners.sort();
+        assert_eq!(
+            owners,
+            [
+                "event_declaration",
+                "event_declaration",
+                "indexer_declaration",
+                "property_declaration"
+            ]
+        );
+    }
+
+    fn grammar_nodes(root: Node<'_>) -> Vec<Node<'_>> {
+        let mut nodes = Vec::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            nodes.push(node);
+            pending.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+        }
+        nodes
+    }
+
+    #[test]
+    fn member_container_grammar_controls_dispatch_and_visibility() {
+        for (declaration, owner_kind, dispatch, visibility) in [
+            (
+                "class C { public virtual void M() {} }",
+                "class_declaration",
+                DispatchExtensibility::Open,
+                DeclaredVisibility::Private,
+            ),
+            (
+                "class C : B { public sealed override void M() {} }",
+                "class_declaration",
+                DispatchExtensibility::Closed,
+                DeclaredVisibility::Private,
+            ),
+            (
+                "interface C { void M(); }",
+                "interface_declaration",
+                DispatchExtensibility::Open,
+                DeclaredVisibility::Public,
+            ),
+            (
+                "struct C { public void M() {} }",
+                "struct_declaration",
+                DispatchExtensibility::Closed,
+                DeclaredVisibility::Private,
+            ),
+        ] {
+            let tree = crate::test_support::parse_raw_csharp(declaration);
+            assert!(!tree.root_node().has_error());
+            let nodes = grammar_nodes(tree.root_node());
+            let method = nodes
+                .iter()
+                .find(|node| node.kind() == "method_declaration")
+                .copied()
+                .unwrap();
+            assert_eq!(method.parent().unwrap().kind(), "declaration_list");
+            assert_eq!(
+                method.parent().unwrap().parent().unwrap().kind(),
+                owner_kind
+            );
+            let ancestry = ParentIndex::new(tree.root_node());
+            assert_eq!(
+                csharp_callable_dispatch_extensibility(declaration, method, false, &ancestry),
+                dispatch,
+                "{declaration}"
+            );
+            assert_eq!(
+                csharp_default_member_visibility(method, &ancestry),
+                visibility,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_grammar_separates_types_from_values() {
+        for (expression, kind, has_type) in [
+            ("x is int", "is_expression", true),
+            ("x is Widget {}", "is_pattern_expression", true),
+            ("x is Widget y", "is_pattern_expression", true),
+            ("x is not (Widget {})", "is_pattern_expression", true),
+            ("x is 42", "is_pattern_expression", false),
+            ("x is (Constant)", "is_pattern_expression", false),
+        ] {
+            let source = format!("class C {{ bool M(object x) => {expression}; }}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            assert!(!tree.root_node().has_error());
+            let nodes = grammar_nodes(tree.root_node());
+            let parent = nodes
+                .iter()
+                .find(|node| node.kind() == kind)
+                .copied()
+                .unwrap();
+            let operand = parent
+                .child_by_field_name(if kind == "is_expression" {
+                    "right"
+                } else {
+                    "pattern"
+                })
+                .unwrap();
+            assert_eq!(
+                operand.utf8_text(source.as_bytes()).unwrap(),
+                expression.strip_prefix("x is ").unwrap()
+            );
+            assert_eq!(
+                csharp_is_expression_type_operand(parent, operand),
+                has_type,
+                "{expression}"
+            );
+            assert!(!csharp_is_expression_type_operand(
+                parent,
+                parent
+                    .child_by_field_name(if kind == "is_expression" {
+                        "left"
+                    } else {
+                        "expression"
+                    })
+                    .unwrap()
+            ));
+        }
+        let source = "class C { Widget? field; }";
+        let tree = crate::test_support::parse_raw_csharp(source);
+        let nodes = grammar_nodes(tree.root_node());
+        let nullable = nodes
+            .iter()
+            .find(|node| node.kind() == "nullable_type")
+            .copied()
+            .unwrap();
+        let name = nullable.child_by_field_name("type").unwrap();
+        assert_eq!(name.kind(), "identifier");
+        assert_eq!(csharp_type_reference_root(name), Some(nullable));
+
+        // A ref wrapper is not itself a dotted identity. Its referent still
+        // carries the grammar's type field for diagnostics to inspect.
+        let source = "class C { ref Missing M() => throw null; }";
+        let tree = crate::test_support::parse_raw_csharp(source);
+        assert!(!tree.root_node().has_error());
+        let nodes = grammar_nodes(tree.root_node());
+        let wrapper = nodes
+            .iter()
+            .find(|node| node.kind() == "ref_type")
+            .copied()
+            .unwrap();
+        let referent = wrapper.child_by_field_name("type").unwrap();
+        assert_eq!(referent.kind(), "identifier");
+        assert_eq!(referent.utf8_text(source.as_bytes()).unwrap(), "Missing");
+        assert_eq!(csharp_type_reference_root(referent), Some(referent));
+    }
+
+    #[test]
+    fn generic_attribute_grammar_selects_terminal_identifier() {
+        for attribute in ["Cache<Payload>", "N.Cache<Payload>"] {
+            let source = format!("[{attribute}] class C {{}}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            assert!(!tree.root_node().has_error());
+            let nodes = grammar_nodes(tree.root_node());
+            let attribute = nodes
+                .iter()
+                .find(|n| n.kind() == "attribute")
+                .copied()
+                .unwrap();
+            let name = attribute.child_by_field_name("name").unwrap();
+            let generic = nodes
+                .iter()
+                .find(|n| n.kind() == "generic_name")
+                .copied()
+                .unwrap();
+            assert!(generic.child_by_field_name("name").is_none());
+            assert_eq!(generic.named_child(0).unwrap().kind(), "identifier");
+            assert_eq!(generic.named_child(1).unwrap().kind(), "type_argument_list");
+            let terminal = csharp_attribute_terminal_name_node(name).unwrap();
+            assert_eq!(terminal.kind(), "identifier");
+            assert_eq!(terminal.utf8_text(source.as_bytes()).unwrap(), "Cache");
+            assert_eq!(
+                csharp_type_node_identity_with_terminal_suffix(name, &source, "Attribute"),
+                if name.kind() == "qualified_name" {
+                    "N.CacheAttribute`1"
+                } else {
+                    "CacheAttribute`1"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn callable_metadata_consensus_is_order_independent() {
+        let arity = CallableArity::new(0, 1, false);
+        let known = SignatureMetadata::new("M(int x = 0)", Vec::new()).with_callable_arity(arity);
+        let different = SignatureMetadata::new("M(int x)", Vec::new())
+            .with_callable_arity(CallableArity::exact(1));
+        let unknown = SignatureMetadata::new("M(...)", Vec::new());
+        for alternative in [different, unknown] {
+            for metadata in [
+                vec![known.clone(), alternative.clone()],
+                vec![alternative.clone(), known.clone()],
+            ] {
+                assert_eq!(
+                    csharp_callable_arity_from_metadata(&metadata),
+                    None,
+                    "conflicting or unavailable metadata cannot prove inapplicability: {metadata:?}"
+                );
+            }
+        }
+        assert_eq!(
+            csharp_callable_arity_from_metadata(&[known.clone(), known]),
+            Some(arity)
+        );
+        assert_eq!(csharp_callable_arity_from_metadata(&[]), None);
+    }
+
+    #[test]
+    fn source_type_normalization_preserves_qualified_generic_segments() {
+        for (spelling, expected) in [
+            ("Widget?", "Widget"),
+            ("Widget?[]", "Widget"),
+            ("Widget[]?", "Widget"),
+            ("Box<Widget>?", "Box"),
+            ("Outer<A>.Inner<B>[]?", "Outer.Inner"),
+        ] {
+            let source = format!("class C {{ {spelling} field; }}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            assert!(!tree.root_node().has_error());
+            let nodes = grammar_nodes(tree.root_node());
+            let declaration = nodes
+                .iter()
+                .find(|n| n.kind() == "variable_declaration")
+                .copied()
+                .unwrap();
+            let declared_type = declaration.child_by_field_name("type").unwrap();
+            assert_eq!(
+                declared_type.utf8_text(source.as_bytes()).unwrap(),
+                spelling
+            );
+            assert_eq!(normalize_csharp_type_node(declared_type, &source), expected);
+        }
+    }
+
+    #[test]
+    fn argument_grammar_distinguishes_recovered_declarations_from_bindings() {
+        for (argument, declared, recovered) in [
+            ("Width * Height", false, false),
+            ("Width?* Height", true, true),
+            ("out Width?* Height", true, false),
+        ] {
+            let source = format!("class C {{ void M() {{ Sink({argument}); }} }}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            assert!(!tree.root_node().has_error());
+            let nodes = grammar_nodes(tree.root_node());
+            let height = nodes
+                .iter()
+                .find(|n| {
+                    n.kind() == "identifier" && n.utf8_text(source.as_bytes()).unwrap() == "Height"
+                })
+                .copied()
+                .unwrap();
+            let parent = height.parent().unwrap();
+            assert_eq!(parent.kind() == "declaration_expression", declared);
+            if declared {
+                assert_eq!(
+                    parent.child_by_field_name("type").unwrap().kind(),
+                    "pointer_type"
+                );
+                assert_eq!(parent.child_by_field_name("name"), Some(height));
+                assert_eq!(
+                    csharp_declaration_expression_is_multiplication(parent),
+                    recovered
+                );
+            }
+            // Only a syntactic declaration with an argument modifier introduces a binder.
+            assert_eq!(csharp_local_binder_name(height), declared && !recovered);
+            if recovered {
+                let width = nodes
+                    .iter()
+                    .find(|n| {
+                        n.kind() == "identifier"
+                            && n.utf8_text(source.as_bytes()).unwrap() == "Width"
+                    })
+                    .copied()
+                    .unwrap();
+                assert_eq!(csharp_type_reference_root(width), None);
+            }
+        }
+    }
+
+    #[test]
+    fn relational_call_candidate_grammar_preserves_operator_and_cast_slots() {
+        // These comparisons force the ambiguous grammar forms explicitly. A
+        // candidate still needs the resolver's type/call applicability proof.
+        let source = "class C { object M() => receiver.Convert < Payload > (Handler)operand; }";
+        let tree = crate::test_support::parse_raw_csharp(source);
+        assert!(!tree.root_node().has_error());
+        let nodes = grammar_nodes(tree.root_node());
+        let member = nodes
+            .iter()
+            .find(|n| n.kind() == "member_access_expression")
+            .copied()
+            .unwrap();
+        let less = member.parent().unwrap();
+        assert_eq!(less.kind(), "binary_expression");
+        assert_eq!(less.child_by_field_name("operator").unwrap().kind(), "<");
+        let greater = less.parent().unwrap();
+        assert_eq!(greater.child_by_field_name("operator").unwrap().kind(), ">");
+        let container = greater.child_by_field_name("right").unwrap();
+        assert_eq!(container.kind(), "cast_expression");
+        let argument = container.child_by_field_name("type").unwrap();
+        assert_eq!(argument.utf8_text(source.as_bytes()).unwrap(), "Handler");
+        assert_eq!(
+            container
+                .child_by_field_name("value")
+                .unwrap()
+                .utf8_text(source.as_bytes())
+                .unwrap(),
+            "operand"
+        );
+        let call = csharp_relational_generic_call(member)
+            .expect("relational candidate has a member and a type slot");
+        assert_eq!(
+            call.type_argument,
+            less.child_by_field_name("right").unwrap()
+        );
+        assert_eq!(call.argument, argument);
+        let from_argument = csharp_relational_generic_call_for_argument(argument).unwrap();
+        assert_eq!(from_argument.member_access, member);
+        assert_eq!(
+            (
+                from_argument.explicit_generic_arity,
+                from_argument.call_arity
+            ),
+            (1, 1)
+        );
+
+        let source = "class C { object M() => (Result)Convert < (Payload) > (Handler); }";
+        let tree = crate::test_support::parse_raw_csharp(source);
+        assert!(!tree.root_node().has_error());
+        let nodes = grammar_nodes(tree.root_node());
+        let name = nodes
+            .iter()
+            .find(|n| {
+                n.kind() == "identifier" && n.utf8_text(source.as_bytes()).unwrap() == "Convert"
+            })
+            .copied()
+            .unwrap();
+        let cast = name.parent().unwrap();
+        assert_eq!(cast.kind(), "cast_expression");
+        assert_eq!(cast.child_by_field_name("value"), Some(name));
+        let less = cast.parent().unwrap();
+        assert_eq!(less.child_by_field_name("operator").unwrap().kind(), "<");
+        assert_eq!(
+            less.parent()
+                .unwrap()
+                .child_by_field_name("operator")
+                .unwrap()
+                .kind(),
+            ">"
+        );
+        let call = csharp_cast_relational_generic_call_for_name(name).unwrap();
+        assert_eq!(call.function, name);
+        assert_eq!(
+            call.type_argument.utf8_text(source.as_bytes()).unwrap(),
+            "(Payload)"
+        );
+        assert_eq!(
+            call.argument.utf8_text(source.as_bytes()).unwrap(),
+            "Handler"
+        );
+        assert_eq!((call.explicit_generic_arity, call.call_arity), (1, 1));
+
+        for spelling in ["int", "string", "Payload"] {
+            let source = format!("class C {{ void M() {{ Convert<{spelling}>(Handler); }} }}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            let nodes = grammar_nodes(tree.root_node());
+            let list = nodes
+                .iter()
+                .find(|n| n.kind() == "type_argument_list")
+                .copied()
+                .unwrap();
+            let argument = list.named_child(0).unwrap();
+            assert_eq!(
+                argument.kind(),
+                if spelling == "Payload" {
+                    "identifier"
+                } else {
+                    "predefined_type"
+                }
+            );
+            assert_eq!(csharp_type_leftmost_identifier(argument), Some(argument));
+        }
+    }
+
+    #[test]
+    fn legacy_metadata_spelling_agrees_with_named_type_grammar() {
+        for spelling in ["Widget?", "Widget[]?", "Box<Widget>?", "Widget[][]"] {
+            let source = format!("class C {{ {spelling} field; }}");
+            let tree = crate::test_support::parse_raw_csharp(&source);
+            let nodes = grammar_nodes(tree.root_node());
+            let declaration = nodes
+                .iter()
+                .find(|n| n.kind() == "variable_declaration")
+                .copied()
+                .unwrap();
+            let node = declaration.child_by_field_name("type").unwrap();
+            assert_eq!(
+                normalize_csharp_type_fragment(spelling),
+                normalize_csharp_type_node(node, &source)
+            );
+        }
+        for separator in ['+', '$'] {
+            let metadata = format!("Namespace.Outer`1{separator}Inner`2");
+            assert_eq!(
+                csharp_normalize_full_name(&metadata),
+                "Namespace.Outer.Inner"
+            );
+        }
     }
 }

@@ -1387,6 +1387,7 @@ impl ScalaAnalyzer {
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
         crate::analyzer::jvm::external::get_or_build_external_declaration_index(
+            self,
             &self.external_index,
             &self.java_config,
             self.inner.project(),
@@ -1673,7 +1674,7 @@ impl ScalaAnalyzer {
         F: FnOnce() -> HashMap<ProjectFile, FileState>,
     {
         self.project_types
-            .get_or_init(|| {
+            .get_or_init(|| brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(self, "scala.project_types", || {
                 self.project_types_build_count
                     .fetch_add(1, Ordering::Relaxed);
                 let file_states: HashMap<ProjectFile, ScalaFileFacts> = file_states()
@@ -1697,11 +1698,12 @@ impl ScalaAnalyzer {
                     // resolves through the store backend and reports its own
                     // errors without reading any file twice.
                     ScalaResolvedSeedOutcome::Cancelled | ScalaResolvedSeedOutcome::Failed(_) => {
+                        self.record_degraded_persistent_fill("scala.project_types", "frontier_fallback");
                         build_scala_project_types_from_seed(self.inner.clone(), unresolved_seed)
                     }
                 };
                 Arc::new(types)
-            })
+            }))
             .clone()
     }
 
@@ -2317,6 +2319,14 @@ impl IAnalyzer for ScalaAnalyzer {
             self.java_config.clone(),
         );
         updated.external_index = external_index;
+        if Arc::ptr_eq(&self.external_index, &updated.external_index)
+            && self.degraded_persistent_fills() > 0
+        {
+            updated.record_degraded_persistent_fill(
+                "retained_external_index",
+                "inherited_degraded_owner",
+            );
+        }
         updated
     }
 
@@ -2632,6 +2642,10 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Scal
 pub struct ScalaSupport;
 
 impl LanguageSupport for ScalaSupport {
+    fn supports_selected_resolution_overlays(&self) -> bool {
+        true
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn probe_assignment_value(
         &self,

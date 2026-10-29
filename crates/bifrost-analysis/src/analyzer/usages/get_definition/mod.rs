@@ -742,7 +742,6 @@ impl ExactExternalCallProof {
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn external_member_identity(
         &self,
@@ -1958,7 +1957,7 @@ pub fn record_definition_batch_probe_reads(
     context: &mut DefinitionBatchContext<'_, '_>,
     requests: &[DefinitionLookupRequest],
 ) {
-    if !analyzer.read_ledger_attached() {
+    if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
     }
     let _scope = profiling::scope("get_definition::record_batch_probe_reads");
@@ -2070,7 +2069,7 @@ fn record_definition_probe_reads(
     site: &ResolvedReferenceSite,
     source: &str,
 ) {
-    if !analyzer.read_ledger_attached() {
+    if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
     }
     debug_assert!(
@@ -2175,7 +2174,9 @@ fn resolve_definition_resolutions<'a>(
             }
             let language = language_for_file(&request.file);
             let file = request.file.clone();
-            let probes = if analyzer.read_ledger_attached() {
+            let probes = if crate::analyzer::read_attribution_records_reads(|| {
+                analyzer.read_ledger_attached()
+            }) {
                 crate::analyzer::i_analyzer::capture_nested_reads(analyzer, || {
                     record_definition_batch_probe_reads(
                         analyzer,
@@ -2201,7 +2202,9 @@ fn resolve_definition_resolutions<'a>(
                         .map(|batch| batch.as_mut() as &mut dyn DefinitionBatchResolver<'a>),
                 )
             };
-            let resolution = if analyzer.read_ledger_attached() {
+            let resolution = if crate::analyzer::read_attribution_records_reads(|| {
+                analyzer.read_ledger_attached()
+            }) {
                 let (resolution, mut reads) =
                     crate::analyzer::i_analyzer::capture_nested_reads(analyzer, resolve);
                 // Only the speculative site probes are subsumed by a
@@ -2251,31 +2254,6 @@ pub fn resolve_definition_batch_with_source(
     let token = scope.token();
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = definition_batch_context_with_source(analyzer, scope.token(), file, source);
-    resolve_definition_requests(analyzer, token, &mut context, requests, None, None)
-}
-
-/// Preserve incumbent deferred-site authority for the legacy usage graph.
-#[doc(hidden)]
-pub fn resolve_legacy_usage_graph_definition_batch_with_source(
-    analyzer: &dyn IAnalyzer,
-    requests: Vec<DefinitionLookupRequest>,
-    file: ProjectFile,
-    source: Arc<str>,
-) -> Vec<DefinitionLookupOutcome> {
-    // Recorded per analyzer instance through the test-hook counter on
-    // `analyzer` itself, rather than a process-wide static: a static here was
-    // inflated by any other test calling this function concurrently (#3010).
-    // A batching caller asserts this collapsed many per-edge calls into one
-    // call per file rather than re-deriving that from timing (bifrost#15).
-    #[cfg(test)]
-    analyzer
-        .test_hooks()
-        .record_resolve_definition_batch_with_source_call_for_test();
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let token = scope.token();
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let mut context = definition_batch_context_with_source(analyzer, scope.token(), file, source);
-    context.route = DefinitionBatchRoute::LegacyUsageGraph;
     resolve_definition_requests(analyzer, token, &mut context, requests, None, None)
 }
 
@@ -3075,8 +3053,6 @@ pub fn resolve_call_reference_definition_with_source(
 #[doc(hidden)]
 pub struct DefinitionBatchContext<'a: 'token, 'token> {
     #[doc(hidden)]
-    pub route: DefinitionBatchRoute,
-    #[doc(hidden)]
     pub analyzer: &'a dyn IAnalyzer,
     /// Proof that the batch's request scope is open for the batch's whole life
     /// (issue #2414 step 3).
@@ -3110,7 +3086,6 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
         Self {
             analyzer,
             token,
-            route: DefinitionBatchRoute::default(),
             bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             language_state: HashMap::default(),
             sources: HashMap::default(),
@@ -3344,9 +3319,11 @@ pub fn resolve_one_with_evidence<'a>(
         std::ops::ControlFlow::Break(resolution) => return resolution,
         std::ops::ControlFlow::Continue(site) => site,
     };
-    // Rust lexical declarations are projected by the native operation with
-    // the same source authority and completion as item definitions.
-    if language != Language::Rust
+    // Languages whose native operation owns local declarations bypass shared
+    // lexical discovery so both paths keep the same authority and completion.
+    if language_support_for_hook(language, "definition_lexical_authority")
+        .expect("supported definition language")
+        .lexical_definitions_are_authoritative()
         && let Some(tree) = tree.as_ref()
         && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
     {
@@ -4272,21 +4249,5 @@ mod tests {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
-
-/// The incumbent graph retains its own deferred-site resolution authority.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum DefinitionBatchRoute {
-    #[default]
-    SelectedNative,
-    LegacyUsageGraph,
-}
-
-impl DefinitionBatchContext<'_, '_> {
-    #[doc(hidden)]
-    pub fn route(&self) -> DefinitionBatchRoute {
-        self.route
-    }
-}
 
 pub use crate::analyzer::resolution::diagnostic_kinds::GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND;

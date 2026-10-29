@@ -352,13 +352,13 @@ pub(super) fn execute(
     incomplete_reasons.sort();
     incomplete_reasons.dedup();
     if !incomplete_reasons.is_empty() {
-        diagnostics.push(cross_domain_diagnostic(
+        diagnostics.push(QueryExecutionState::diagnostic(state.analyzer, cross_domain_diagnostic(
             CodeQueryDiagnosticCode::CrossDomainDocumentIncomplete,
             CodeQueryDiagnosticImpact::Incomplete,
             format!(
                 "configuration_code retained no negative claim for incomplete inputs: {incomplete_reasons:?}"
             ),
-        ));
+        ), (relation.absence && (code.truncated || configuration.truncated)).then_some(DerivationExecutionCause::Budget)));
     }
 
     PlanExecution {

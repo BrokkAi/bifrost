@@ -151,7 +151,52 @@
             ],
             "where_predicates": []
           },
-          "bounds": [],
+          "bounds": [
+            {
+              "trait_bound": {
+                "trait": {
+                  "path": "OtherTraverse",
+                  "id": 5,
+                  "args": null
+                },
+                "generic_params": [],
+                "modifier": "none"
+              }
+            },
+            {
+              "trait_bound": {
+                "trait": {
+                  "path": "OtherTraverse",
+                  "id": 5,
+                  "args": {
+                    "angle_bracketed": {
+                      "args": [
+                        {
+                          "type": {
+                            "qualified_path": {
+                              "name": "Item",
+                              "args": null,
+                              "self_type": {
+                                "generic": "Self"
+                              },
+                              "trait": {
+                                "path": "Traverse",
+                                "id": 3,
+                                "args": null
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      "constraints": []
+                    }
+                  }
+                },
+                "generic_params": [],
+                "modifier": "none"
+              }
+            }
+          ],
           "implementations": [
             20,
             90

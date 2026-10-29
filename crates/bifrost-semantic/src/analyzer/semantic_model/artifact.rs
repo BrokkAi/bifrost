@@ -293,6 +293,10 @@ impl CompiledShard {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompiledPayload {
     DeclarationFacts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assembly_identity: Option<crate::analyzer::semantic_model::AssemblyReference>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_forwards: Vec<crate::analyzer::semantic_model::TypeForwardFact>,
         #[serde(default)]
         types: Vec<Arc<TypeFact>>,
         #[serde(default)]
@@ -974,7 +978,9 @@ impl CompiledPayload {
                 types,
                 members,
                 relations,
-            } => types.len() + members.len() + relations.len(),
+                type_forwards,
+                ..
+            } => types.len() + members.len() + relations.len() + type_forwards.len(),
             Self::GeneratorRules { rules } => rules.len(),
             Self::ProcedureSummaries { summaries } => summaries.len(),
         }
@@ -986,6 +992,7 @@ impl CompiledPayload {
                 types,
                 members,
                 relations,
+                ..
             } => Some((types, members, relations)),
             Self::GeneratorRules { .. } | Self::ProcedureSummaries { .. } => None,
         }
@@ -1997,6 +2004,7 @@ pub fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>
             types,
             members,
             relations,
+            ..
         } => {
             for fact in types {
                 defined.insert(fact.id.clone());
@@ -2251,7 +2259,11 @@ fn authored_payload_from_compiled(payload: &CompiledPayload) -> AuthoredPayload 
             types,
             members,
             relations,
+            assembly_identity,
+            type_forwards,
         } => AuthoredPayload::DeclarationFacts {
+            assembly_identity: assembly_identity.clone(),
+            type_forwards: type_forwards.clone(),
             types: types.iter().map(|record| record.as_ref().clone()).collect(),
             members: members
                 .iter()

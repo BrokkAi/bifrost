@@ -12,6 +12,10 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct PythonKnowledge;
 
 impl LanguageKnowledge for PythonKnowledge {
+    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+        false
+    }
+
     // Applicability decides whether a Python call returns or raises, not which
     // declaration its callee reference names.
     fn call_applicability_may_select_callee(&self) -> bool {

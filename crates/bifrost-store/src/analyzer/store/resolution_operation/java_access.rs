@@ -1,6 +1,7 @@
 //! JVM access refines visibility only; source/classpath coverage stays on the
 //! selected binding paths. This policy retains no source collections.
 
+use super::nominal_rules::nominal_language_rules;
 use super::*;
 use crate::analyzer::resolution::{
     CompanionTypeRelation, DeclarationAccessDecision, DeclarationAccessRequest,
@@ -99,11 +100,9 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
         };
         let mut endpoints = HashMap::<SemanticId, JvmAccessEndpoint>::default();
         for endpoint in jvm_endpoints {
-            if matches!(
-                endpoint.language,
-                brokk_bifrost_core::analyzer::Language::Java
-                    | brokk_bifrost_core::analyzer::Language::Scala
-            ) {
+            if nominal_language_rules(endpoint.language)
+                .is_some_and(|rules| rules.has_declaration_access_endpoints())
+            {
                 assert!(endpoints.insert(endpoint.semantic, endpoint).is_none());
             }
         }
@@ -157,7 +156,8 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
         }
         let templates = endpoints
             .values()
-            .filter(|endpoint| endpoint.language == brokk_bifrost_core::analyzer::Language::Scala)
+            .filter(|endpoint| nominal_language_rules(endpoint.language)
+                .is_some_and(|rules| rules.has_lexical_access_templates()))
             .flat_map(|endpoint| endpoint.enclosing_templates.iter().copied())
             .chain(visibilities.values().filter_map(|property| {
                 match property.boundary() {
@@ -316,7 +316,12 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
                     Some(target),
                     Some(DeclaredVisibility::Protected),
                     Some(JvmDeclarationAccessRules::Java),
-                ) if reference.language == brokk_bifrost_core::analyzer::Language::Java => {
+                ) if nominal_language_rules(reference.language).is_some_and(|rules| {
+                    rules
+                        .declaration_access_rules()
+                        .protected_access_requires_qualifier_subtype()
+                }) =>
+                {
                     visibility_applies = true;
                     if let Some(owner) = target.enclosing_templates.first().copied() {
                         subclass_access = Some(SubclassAccessContext {

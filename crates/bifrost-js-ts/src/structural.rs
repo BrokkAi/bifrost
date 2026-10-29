@@ -69,54 +69,51 @@ pub static TYPESCRIPT_STRUCTURAL_SPEC: JsTsStructuralSpec = JsTsStructuralSpec {
 /// context consumes it. `void` is the one explicit discard spelling accepted
 /// by the JS/TS adapter.
 pub fn js_ts_call_result_use(call: Node<'_>, _source: &str) -> CallResultUseSite {
-    let default = if call.kind() != "call_expression"
-        || call.has_error()
-        || has_recovery_ancestor(call)
-        || has_recovery_descendant(call)
-    {
-        CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
-    } else {
-        let mut expression = call;
-        loop {
-            let Some(parent) = expression.parent() else {
-                break CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax);
-            };
-            if parent.is_error() || parent.is_missing() {
-                break CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax);
+    let default =
+        if call.kind() != "call_expression" || call.has_error() || has_recovery_ancestor(call) {
+            CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+        } else {
+            let mut expression = call;
+            loop {
+                let Some(parent) = expression.parent() else {
+                    break CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax);
+                };
+                if parent.is_error() || parent.is_missing() {
+                    break CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax);
+                }
+                match parent.kind() {
+                    "parenthesized_expression"
+                        if parent.named_child_count() == 1
+                            && parent
+                                .named_child(0)
+                                .is_some_and(|child| child.id() == expression.id()) =>
+                    {
+                        expression = parent;
+                    }
+                    "unary_expression"
+                        if parent
+                            .child_by_field_name("argument")
+                            .is_some_and(|argument| argument.id() == expression.id())
+                            && parent
+                                .children(&mut parent.walk())
+                                .any(|child| child.kind() == "void") =>
+                    {
+                        break CallResultUse::IntentionalDiscard(
+                            IntentionalDiscardKind::JavaScriptVoid,
+                        );
+                    }
+                    "expression_statement"
+                        if parent.named_child_count() == 1
+                            && parent
+                                .named_child(0)
+                                .is_some_and(|child| child.id() == expression.id()) =>
+                    {
+                        break CallResultUse::Discarded;
+                    }
+                    _ => break CallResultUse::Consumed,
+                }
             }
-            match parent.kind() {
-                "parenthesized_expression"
-                    if parent.named_child_count() == 1
-                        && parent
-                            .named_child(0)
-                            .is_some_and(|child| child.id() == expression.id()) =>
-                {
-                    expression = parent;
-                }
-                "unary_expression"
-                    if parent
-                        .child_by_field_name("argument")
-                        .is_some_and(|argument| argument.id() == expression.id())
-                        && parent
-                            .children(&mut parent.walk())
-                            .any(|child| child.kind() == "void") =>
-                {
-                    break CallResultUse::IntentionalDiscard(
-                        IntentionalDiscardKind::JavaScriptVoid,
-                    );
-                }
-                "expression_statement"
-                    if parent.named_child_count() == 1
-                        && parent
-                            .named_child(0)
-                            .is_some_and(|child| child.id() == expression.id()) =>
-                {
-                    break CallResultUse::Discarded;
-                }
-                _ => break CallResultUse::Consumed,
-            }
-        }
-    };
+        };
     CallResultUseSite::new(call.start_byte(), call.end_byte(), default)
 }
 
@@ -126,19 +123,6 @@ fn has_recovery_ancestor(mut node: Node<'_>) -> bool {
             return true;
         }
         node = parent;
-    }
-    false
-}
-
-fn has_recovery_descendant(root: Node<'_>) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.id() != root.id() && (node.is_error() || node.is_missing()) {
-            return true;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            stack.push(node.named_child(index).expect("named child exists"));
-        }
     }
     false
 }
@@ -194,6 +178,7 @@ macro_rules! js_ts_kind_table {
             ("class", NormalizedKind::Class),
             ("class_declaration", NormalizedKind::Class),
             ("assignment_expression", NormalizedKind::Assignment),
+            ("augmented_assignment_expression", NormalizedKind::Assignment),
             ("variable_declarator", NormalizedKind::Assignment),
             ("import_statement", NormalizedKind::Import),
             ("identifier", NormalizedKind::Identifier),
@@ -276,6 +261,7 @@ pub const JS_TSX_ONLY_KINDS: &[&str] = &[
 ];
 
 pub const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
+    ("as_expression", NormalizedKind::Cast),
     ("abstract_class_declaration", NormalizedKind::Class),
     ("interface_declaration", NormalizedKind::Class),
     ("enum_declaration", NormalizedKind::Class),
@@ -335,7 +321,7 @@ fn js_ts_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLi
     }
     let text = node_text(literal, source)?;
     let text = text.strip_suffix('n').unwrap_or(text);
-    if text.is_empty() || text.contains('.') || text.contains('e') || text.contains('E') {
+    if text.is_empty() {
         return None;
     }
     let compact = text.replace('_', "");
@@ -784,6 +770,7 @@ fn js_ts_occurrence_role<'tree>(
             OccurrenceRole::DeclarationName
         }
         "catch_clause" if field == Some("parameter") => OccurrenceRole::Binder,
+        "arrow_function" if field == Some("parameter") => OccurrenceRole::Binder,
         "for_in_statement" if field == Some("left") => {
             if crate::syntax::for_in_declaration_kind(parent, anchor).is_some() {
                 OccurrenceRole::Binder
@@ -979,6 +966,19 @@ impl JsTsStructuralSpec {
             sink.occurrence_role(node, role);
         }
         match kind {
+            NormalizedKind::Cast => {
+                let mut cursor = node.walk();
+                let mut children = node
+                    .named_children(&mut cursor)
+                    .filter(|child| !child.is_extra());
+                if let Some(value) = children.next() {
+                    sink.role(Role::Value, value);
+                }
+                if let Some(ty) = children.next() {
+                    sink.role(Role::Type, ty);
+                }
+            }
+
             NormalizedKind::Call => {
                 let callee_field = if node.kind() == "new_expression" {
                     "constructor"
@@ -1048,7 +1048,7 @@ impl JsTsStructuralSpec {
                         );
                     }
                 }
-                "assignment_expression" => {
+                "assignment_expression" | "augmented_assignment_expression" => {
                     if let Some(operator) = js_ts_assignment_operator(node) {
                         sink.role(Role::Operator, operator);
                     }
@@ -1167,6 +1167,27 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn integer_literal_value(&self, node: Node<'_>, source: &str) -> Option<IntegerLiteralValue> {
         js_ts_integer_literal_value(node, source)
+    }
+
+    fn declaration_attributes(
+        &self,
+        node: Node<'_>,
+        source: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes> {
+        if !matches!(
+            node.kind(),
+            "method_definition"
+                | "method_signature"
+                | "abstract_method_signature"
+                | "field_definition"
+                | "public_field_definition"
+        ) {
+            return None;
+        }
+        Some(brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes {
+            modifiers: brokk_bifrost_core::analyzer::structural::adapter_helpers::declaration_modifier_words(node, source),
+            type_kind: None,
+        })
     }
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
@@ -1583,5 +1604,349 @@ mod qualified_path_tests {
                 .collect();
             assert_eq!(arities, expected_arities);
         }
+    }
+}
+
+#[cfg(test)]
+mod assignment_grammar_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: augmented assignment structural facts were missing"
+    )]
+    fn assignment_grammar_fields_and_normalized_kinds_agree() {
+        for language in [Language::JavaScript, Language::TypeScript] {
+            let spec = if language == Language::JavaScript {
+                &JAVASCRIPT_STRUCTURAL_SPEC
+            } else {
+                &TYPESCRIPT_STRUCTURAL_SPEC
+            };
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&crate::parse::tree_sitter_language_for(language).unwrap())
+                .unwrap();
+            for operator in [
+                "=", "+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "|=", "^=",
+                "&&=", "||=", "??=",
+            ] {
+                let source = format!("left {operator} right;");
+                let tree = parser.parse(&source, None).unwrap();
+                assert!(!tree.root_node().has_error());
+                let assignment = tree
+                    .root_node()
+                    .named_child(0)
+                    .unwrap()
+                    .named_child(0)
+                    .unwrap();
+                assert_eq!(
+                    assignment.kind(),
+                    if operator == "=" {
+                        "assignment_expression"
+                    } else {
+                        "augmented_assignment_expression"
+                    }
+                );
+                assert_eq!(
+                    node_text(assignment.child_by_field_name("left").unwrap(), &source),
+                    Some("left")
+                );
+                assert_eq!(
+                    node_text(assignment.child_by_field_name("right").unwrap(), &source),
+                    Some("right")
+                );
+                assert_eq!(
+                    spec.kind_table()
+                        .iter()
+                        .find(|(kind, _)| *kind == assignment.kind())
+                        .map(|(_, kind)| *kind),
+                    Some(NormalizedKind::Assignment),
+                    "{operator}"
+                );
+                assert_eq!(
+                    node_text(js_ts_assignment_operator(assignment).unwrap(), &source),
+                    Some(operator)
+                );
+                let file = brokk_bifrost_core::analyzer::ProjectFile::new(
+                    std::env::temp_dir(),
+                    if language == Language::JavaScript {
+                        "assignments.js"
+                    } else {
+                        "assignments.ts"
+                    },
+                );
+                let parsed = if language == Language::JavaScript {
+                    crate::javascript::parse_javascript_file(&file, &source, &tree)
+                } else {
+                    crate::typescript::parse_typescript_file(&file, &source, &tree)
+                };
+                let facts = parsed.source_facts.unwrap();
+                let (id, _) = facts
+                    .structural
+                    .nodes()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, node)| node.kind == NormalizedKind::Assignment)
+                    .unwrap();
+                let roles: Vec<_> = facts
+                    .structural
+                    .roles(id as u32)
+                    .iter()
+                    .map(|role| {
+                        let range = facts.occurrences.occurrence(role.occurrence).range;
+                        (role.role, &source[range.start_byte..range.end_byte])
+                    })
+                    .collect();
+                assert!(roles.contains(&(Role::Left, "left")), "{roles:?}");
+                assert!(roles.contains(&(Role::Right, "right")), "{roles:?}");
+                assert!(roles.contains(&(Role::Operator, operator)), "{roles:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: hexadecimal e digits were mistaken for decimal exponents"
+    )]
+    fn numeric_grammar_preserves_hexadecimal_exponent_letters() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        for (spelling, decimal) in [
+            ("0xDEAD", "57005"),
+            ("0xFE", "254"),
+            ("0Xbe_efn", "48879"),
+            ("0b1111", "15"),
+            ("0o17", "15"),
+        ] {
+            let source = format!("{spelling};");
+            let tree = parser.parse(&source, None).unwrap();
+            let literal = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            assert_eq!(literal.kind(), "number");
+            let file = brokk_bifrost_core::analyzer::ProjectFile::new(
+                std::env::temp_dir(),
+                "constants.js",
+            );
+            let parsed = crate::javascript::parse_javascript_file(&file, &source, &tree);
+            let facts = parsed.source_facts.unwrap();
+            let literal_fact = facts
+                .structural
+                .nodes()
+                .iter()
+                .find(|fact| fact.kind == NormalizedKind::NumericLiteral)
+                .unwrap();
+            assert_eq!(
+                literal_fact.integer_literal_value,
+                decode_integer_literal_digits(10, decimal.as_bytes()),
+                "{spelling}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lexical_grammar_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: bare arrow parameters were published as value references"
+    )]
+    fn binding_grammar_fields_keep_role_scope_and_activation() {
+        let source = "function* generate() {} function outer(){ { var hoisted=1; let local=2; } try {} catch(caught) { caught; } const single = item => item; }";
+        for language in [Language::JavaScript, Language::TypeScript] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&crate::parse::tree_sitter_language_for(language).unwrap())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mut stack = vec![tree.root_node()];
+            let mut binders = Vec::new();
+            while let Some(node) = stack.pop() {
+                if js_ts_occurrence_role(node, |node| node.parent()) == Some(OccurrenceRole::Binder)
+                {
+                    binders.push(node);
+                }
+                for i in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(i).unwrap());
+                }
+            }
+            for (name, form_kind, binding_kind) in [
+                ("hoisted", "variable_declarator", BindingKind::Local),
+                ("local", "variable_declarator", BindingKind::Local),
+                ("caught", "catch_clause", BindingKind::CatchOrResource),
+                ("item", "arrow_function", BindingKind::Parameter),
+            ] {
+                let binder = *binders
+                    .iter()
+                    .find(|node| node_text(**node, source) == Some(name))
+                    .unwrap_or_else(|| {
+                        panic!("missing binder {name}: {}", tree.root_node().to_sexp())
+                    });
+                assert_eq!(js_ts_binding_form(binder).unwrap().kind(), form_kind);
+                let scope = node_range(tree.root_node());
+                assert_eq!(
+                    js_ts_binding_activation(binder, scope).unwrap().kind,
+                    binding_kind
+                );
+                if name == "hoisted" || name == "local" {
+                    let block = nearest_ancestor(binder, |kind| kind == "statement_block").unwrap();
+                    assert_eq!(
+                        js_ts_binding_scope_selection(binder, BindingScopeCandidate::Syntax(block)),
+                        if name == "hoisted" {
+                            BindingScopeSelection::Continue
+                        } else {
+                            BindingScopeSelection::Use
+                        }
+                    );
+                }
+            }
+            let generator = tree.root_node().named_child(0).unwrap();
+            assert!(
+                TYPESCRIPT_STRUCTURAL_SPEC
+                    .declaration_binding_activation(
+                        generator.child_by_field_name("name").unwrap(),
+                        node_range(tree.root_node())
+                    )
+                    .is_some()
+            );
+            for (declaration, role) in [
+                ("let element", OccurrenceRole::Binder),
+                ("element", OccurrenceRole::ValueReference),
+            ] {
+                let source = format!("for ({declaration} of values) {{}}");
+                let tree = parser.parse(&source, None).unwrap();
+                let left = tree
+                    .root_node()
+                    .named_child(0)
+                    .unwrap()
+                    .child_by_field_name("left")
+                    .unwrap();
+                assert_eq!(
+                    js_ts_occurrence_role(left, |node| node.parent()),
+                    Some(role)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adapter_contract_matches_optional_paths_collections_and_routes() {
+        let source = "function f(optional?:string) {} namespace Namespace.Member {} [1]; ({key:1}); export {x} from 'package';";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let spec = &TYPESCRIPT_STRUCTURAL_SPEC;
+        assert!(spec.supports_kind(NormalizedKind::SyntaxError));
+        assert!(
+            spec.identity_route_support()
+                .supports_relation(RouteHopKind::ReExport)
+        );
+        let mut stack = vec![tree.root_node()];
+        let mut checked = 0;
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "optional_parameter" => {
+                    assert_eq!(
+                        node_text(parameter_name_node(node).unwrap(), source),
+                        Some("optional")
+                    );
+                    checked += 1;
+                }
+                "property_identifier" if node_text(node, source) == Some("Member") => {
+                    assert!(spec.qualified_path_root(node).is_some());
+                    checked += 1;
+                }
+                "array" => {
+                    assert_eq!(
+                        spec.generator_construct(node, NormalizedKind::CollectionLiteral, source),
+                        Some("array")
+                    );
+                    checked += 1;
+                }
+                "export_specifier" => {
+                    assert_eq!(
+                        spec.indirection_relation(
+                            node.child_by_field_name("name").unwrap(),
+                            source,
+                            &CuratedExportSurface::Absent
+                        ),
+                        Some(RouteHopKind::ReExport)
+                    );
+                    checked += 1;
+                }
+                _ => {}
+            }
+            for i in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(i).unwrap());
+            }
+        }
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
+    fn recovery_grammar_ancestors_and_missing_descendants_are_retained() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let mut ancestor_seen = false;
+        let mut descendant_seen = false;
+        // The nested call's immediate parent consumes its result, but its
+        // outer ERROR ancestor still makes that classification unreliable.
+        for source in [
+            "const x = f(1 2);",
+            "class X extends factory(inner()) ??? {}",
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "call_expression" {
+                    let mut parent = node.parent();
+                    let mut recovered_ancestor = false;
+                    while let Some(ancestor) = parent {
+                        recovered_ancestor |= ancestor.is_error() || ancestor.is_missing();
+                        parent = ancestor.parent();
+                    }
+                    if recovered_ancestor && !node.has_error() {
+                        ancestor_seen = true;
+                        assert!(
+                            matches!(
+                                js_ts_call_result_use(node, source).default_use(),
+                                CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+                            ),
+                            "{source}: {}",
+                            tree.root_node().to_sexp()
+                        );
+                    }
+                    if node.has_error() {
+                        descendant_seen = true;
+                        assert!(
+                            matches!(
+                                js_ts_call_result_use(node, source).default_use(),
+                                CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+                            ),
+                            "{source}: {}",
+                            tree.root_node().to_sexp()
+                        );
+                    }
+                }
+                for i in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(i).unwrap());
+                }
+            }
+        }
+        assert!(ancestor_seen && descendant_seen);
     }
 }

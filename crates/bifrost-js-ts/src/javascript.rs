@@ -89,7 +89,7 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                                 visit_js_export(file, source, child, parsed);
                             }
                             "class_declaration" => {
-                                visit_js_class(file, source, child, None, parsed, false);
+                                visit_js_class(file, source, child, parsed, false);
                             }
                             "function_declaration" => {
                                 visit_js_function(file, source, child, None, parsed, false);
@@ -149,7 +149,7 @@ fn visit_js_export(
                         export_is_default(node, source),
                         parsed,
                     );
-                    visit_js_class(file, source, node, None, parsed, true);
+                    visit_js_class(file, source, node, parsed, true);
                 }
             }
             "function_declaration" => {
@@ -266,7 +266,6 @@ fn visit_js_class(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-    parent: Option<&CodeUnit>,
     parsed: &mut JsTsParsedFile<'_>,
     exported: bool,
 ) -> Option<CodeUnit> {
@@ -281,16 +280,8 @@ fn visit_js_class(
         return None;
     }
 
-    let short_name = parent
-        .map(|parent| format!("{}.{}", parent.short_name(), name))
-        .unwrap_or_else(|| name.to_string());
-    let fq = match parent {
-        Some(parent) => parent
-            .fq()
-            .clone()
-            .with_pushed(segment_interner().intern(name, SegmentKind::Type)),
-        None => FqName::new().with_pushed(segment_interner().intern(name, SegmentKind::Type)),
-    };
+    let short_name = name.to_string();
+    let fq = FqName::new().with_pushed(segment_interner().intern(name, SegmentKind::Type));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
@@ -298,13 +289,13 @@ fn visit_js_class(
         short_name,
         fq,
     );
-    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    let top_level = code_unit.clone();
     let range_node = if exported { node } else { definition };
     parsed.add_code_unit(
         code_unit.clone(),
         range_node,
         source,
-        parent.cloned(),
+        None,
         Some(top_level.clone()),
     );
     parsed.add_signature(
@@ -876,19 +867,9 @@ fn js_source_function_preserves_parameter_shape(
     function_name: &str,
     parameter_index: usize,
 ) -> ShapePreservation {
-    let root = root_node(anchor);
-    let mut functions = Vec::new();
-    collect_function_nodes(root, source, function_name, &mut functions);
-    if functions.is_empty() {
-        return ShapePreservation::Unknown;
-    }
-    if functions.into_iter().any(|function| {
+    source_function_shape_preservation(anchor, source, function_name, |function| {
         js_function_node_preserves_parameter_shape(function, source, parameter_index)
-    }) {
-        ShapePreservation::Preserves
-    } else {
-        ShapePreservation::DoesNotPreserve
-    }
+    })
 }
 
 fn js_function_node_preserves_parameter_shape(
@@ -1119,7 +1100,6 @@ impl JsAssignmentDeclarations {
         parent_kind: Option<&str>,
         parsed: &mut JsTsParsedFile<'_>,
     ) {
-        register_js_assignment_declaration_name(node, source, &mut self.state);
         if let Some(scope) = js_assignment_scope_kind(node) {
             self.state.enter_scope(scope);
             register_js_assignment_parameters(node, source, &mut self.state);
@@ -1285,14 +1265,7 @@ impl JsAssignmentDeclarationState {
         name: &str,
         declarator: Node<'_>,
     ) -> JsAssignmentBindingKind {
-        if self.commonjs_exported_roots.contains(name)
-            || declarator
-                .child_by_field_name("value")
-                .is_some_and(|value| {
-                    js_assignment_value_is_declaration_root(value)
-                        || js_assignment_value_exports_commonjs_root(value, &self.commonjs)
-                })
-        {
+        if self.commonjs_exported_roots.contains(name) {
             JsAssignmentBindingKind::DeclarationRoot
         } else if declarator
             .child_by_field_name("value")
@@ -1316,23 +1289,6 @@ fn js_assignment_scope_kind(node: Node<'_>) -> Option<JsAssignmentScopeKind> {
         "statement_block" => Some(JsAssignmentScopeKind::Block),
         _ => None,
     }
-}
-
-fn register_js_assignment_declaration_name(
-    node: Node<'_>,
-    source: &str,
-    state: &mut JsAssignmentDeclarationState,
-) {
-    if !matches!(node.kind(), "class_declaration" | "function_declaration") {
-        return;
-    }
-    let Some(name) = node.child_by_field_name("name") else {
-        return;
-    };
-    state.declare_current(
-        node_text(name, source).trim(),
-        JsAssignmentBindingKind::DeclarationRoot,
-    );
 }
 
 fn register_js_assignment_parameters(
@@ -1376,32 +1332,6 @@ fn register_js_assignment_variable(
             state.declare_current(name, kind);
         }
     }
-}
-
-fn js_assignment_value_is_declaration_root(value: Node<'_>) -> bool {
-    matches!(
-        value.kind(),
-        "arrow_function" | "function_expression" | "generator_function" | "class"
-    )
-}
-
-fn js_assignment_value_exports_commonjs_root(
-    mut value: Node<'_>,
-    commonjs: &crate::commonjs::CommonJsObjects,
-) -> bool {
-    while value.kind() == "assignment_expression" {
-        if value
-            .child_by_field_name("left")
-            .is_some_and(|left| js_is_commonjs_export_assignment_target(left, commonjs))
-        {
-            return true;
-        }
-        let Some(right) = value.child_by_field_name("right") else {
-            return false;
-        };
-        value = right;
-    }
-    false
 }
 
 fn visit_js_assignment_expression(
@@ -1752,21 +1682,15 @@ fn js_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
     } else {
         node
     };
-    let mut signature = node_text(definition, source)
-        .split('{')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if exported && !signature.starts_with("export ") {
+    let mut signature = declaration_header(definition, source).trim().to_string();
+    if exported {
         signature = format!("export {signature}");
     }
     format!("{} {{", one_line(&signature))
 }
 
 fn js_default_export_class_signature(export: Node<'_>, source: &str) -> String {
-    let text = node_text(export, source);
-    let signature = text.split('{').next().unwrap_or(text).trim();
+    let signature = declaration_header(export, source).trim();
     format!("{} {{", one_line(signature))
 }
 
@@ -1777,11 +1701,7 @@ fn js_function_signature(
     exported: bool,
 ) -> (String, String) {
     let mut prefix = if exported { "export " } else { "" }.to_string();
-    let async_prefix = if node
-        .child_by_field_name("body")
-        .map(|_| node_text(node, source).contains("async "))
-        .unwrap_or(false)
-    {
+    let async_prefix = if is_async_callable(node) {
         "async "
     } else {
         ""
@@ -1804,10 +1724,7 @@ fn js_function_signature(
 }
 
 fn js_default_export_function_signature(function: Node<'_>, source: &str) -> (String, String) {
-    let async_prefix = if node_text(function, source)
-        .trim_start()
-        .starts_with("async ")
-    {
+    let async_prefix = if is_async_callable(function) {
         "async "
     } else {
         ""
@@ -1847,7 +1764,7 @@ fn js_variable_function_signature(
     let value = declarator
         .child_by_field_name("value")
         .unwrap_or(declarator);
-    let async_prefix = if node_text(value, source).trim_start().starts_with("async ") {
+    let async_prefix = if is_async_callable(value) {
         "async "
     } else {
         ""
@@ -1944,18 +1861,12 @@ fn collect_mutation_names(root: Node<'_>, source: &str, names: &mut BTreeSet<Str
 
 fn mutation_target_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
-        "identifier" | "property_identifier" => Some(node_text(node, source).trim().to_string()),
+        "identifier" | "property_identifier" | "private_property_identifier" => {
+            Some(node_text(node, source).trim().to_string())
+        }
         "member_expression" => node
             .child_by_field_name("property")
-            .and_then(|property| mutation_target_name(property, source))
-            .or_else(|| {
-                node_text(node, source)
-                    .split('.')
-                    .next_back()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-            }),
+            .and_then(|property| mutation_target_name(property, source)),
         _ => None,
     }
 }
@@ -1963,16 +1874,73 @@ fn mutation_target_name(node: Node<'_>, source: &str) -> Option<String> {
 pub fn extract_js_type_identifiers(source: &str) -> BTreeSet<String> {
     extract_js_ts_type_identifiers(source, tree_sitter_javascript::LANGUAGE.into())
 }
-fn node_returns_jsx(node: Node<'_>, source: &str) -> bool {
-    if matches!(
-        node.kind(),
-        "jsx_element" | "jsx_self_closing_element" | "jsx_fragment"
-    ) {
+fn node_returns_jsx(node: Node<'_>, _source: &str) -> bool {
+    if expression_returns_jsx(node)
+        || (node.kind() == "arrow_function"
+            && node
+                .child_by_field_name("body")
+                .is_some_and(expression_returns_jsx))
+    {
         return true;
     }
+    function_returns_parameter_shape(
+        node,
+        node.id(),
+        |kind| {
+            crate::syntax::is_function_like(kind) || matches!(kind, "class_declaration" | "class")
+        },
+        expression_returns_jsx,
+    )
+}
 
-    let text = node_text(node, source);
-    text.contains('<') && (text.contains("/>") || text.contains("</"))
+fn expression_returns_jsx(expression: Node<'_>) -> bool {
+    let mut pending = vec![expression];
+    while let Some(current) = pending.pop() {
+        if current.is_extra() {
+            // The shared return walker supplies the first named child. A
+            // comment before the return expression is trivia, not its value.
+            pending.extend(current.next_named_sibling());
+            continue;
+        }
+        match current.kind() {
+            "jsx_element" | "jsx_self_closing_element" | "jsx_fragment" => return true,
+            "parenthesized_expression" | "await_expression" => {
+                let mut cursor = current.walk();
+                pending.extend(
+                    current
+                        .named_children(&mut cursor)
+                        .filter(|child| !child.is_extra()),
+                );
+            }
+            "ternary_expression" => pending.extend(
+                ["consequence", "alternative"]
+                    .into_iter()
+                    .filter_map(|field| current.child_by_field_name(field)),
+            ),
+            "binary_expression"
+                if current
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| matches!(operator.kind(), "&&" | "||" | "??")) =>
+            {
+                pending.extend(
+                    ["left", "right"]
+                        .into_iter()
+                        .filter_map(|field| current.child_by_field_name(field)),
+                );
+            }
+            "sequence_expression" => {
+                let mut cursor = current.walk();
+                pending.extend(
+                    current
+                        .named_children(&mut cursor)
+                        .filter(|child| !child.is_extra())
+                        .last(),
+                );
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_component_like_name(name: &str) -> bool {
@@ -2195,5 +2163,313 @@ mod bundled_export_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod declaration_surface_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: unrelated lexical factories publish fictitious members"
+    )]
+    fn factory_shape_respects_lexical_binding() {
+        let mut failures = Vec::new();
+        for source in [
+            "function identity(x){return 0;} function unrelated(){function identity(x){return x;}} export const api=identity({ghost(){}});",
+            "function identity(x){return x;} function scope(){function identity(x){return 0;} const api=identity({ghost(){}});}",
+            "function identity(x){return x;} { const identity = 0; const api=identity({ghost(){}}); }",
+        ] {
+            let source_text = [source, " function preserve(control){return control;} export const control=preserve({present(){}});"].concat();
+            let source = source_text.as_str();
+            for (extension, tree) in [
+                ("js", crate::test_support::parse_javascript(source)),
+                ("ts", crate::test_support::parse_typescript(source)),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let file = ProjectFile::new(
+                    dir.path().canonicalize().unwrap(),
+                    format!("scope.{extension}"),
+                );
+                assert!(!tree.root_node().has_error());
+                let parsed = if extension == "js" {
+                    parse_javascript_file(&file, source, &tree)
+                } else {
+                    crate::typescript::parse_typescript_file(&file, source, &tree)
+                };
+                assert!(
+                    parsed
+                        .ranges
+                        .keys()
+                        .any(|unit| unit.terminal_name() == "present"),
+                    "positive shape-admission control: {parsed:#?}"
+                );
+                if parsed
+                    .ranges
+                    .keys()
+                    .chain(parsed.definition_lookup_units.iter())
+                    .any(|unit| unit.terminal_name() == "ghost")
+                {
+                    failures.push(format!("{extension}: {source}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: signatures scanned strings and nested callables for syntax"
+    )]
+    fn javascript_signature_syntax_boundaries() {
+        let mut failures = Vec::new();
+        for (source, expected) in [
+            (
+                "export function Panel(){return '<div/>';}",
+                "export function Panel() ...",
+            ),
+            (
+                "export function Panel(){function inner(){return <div/>;} return 1;}",
+                "export function Panel() ...",
+            ),
+            (
+                "export function Panel(){return String(<div/>);}",
+                "export function Panel() ...",
+            ),
+            (
+                "export function Panel(){return `text${<div/>}`;}",
+                "export function Panel() ...",
+            ),
+            (
+                "export function Panel(){return flag ? <div/> : null;}",
+                "export function Panel(): JSX.Element ...",
+            ),
+            (
+                "export function normal(){return 'async ';}",
+                "export function normal() ...",
+            ),
+            (
+                "export async/*comment*/function normal(){}",
+                "export async function normal() ...",
+            ),
+            (
+                "export default async/*comment*/function(){}",
+                "export default async function() ...",
+            ),
+            (
+                "export const normal=async/*comment*/()=>0;",
+                "export async normal() => ...",
+            ),
+            (
+                "export default class extends (function(){return Base;})() {run(){}}",
+                "export default class extends (function(){return Base;})() {",
+            ),
+        ] {
+            let tree = crate::test_support::parse_javascript(source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let dir = tempfile::tempdir().unwrap();
+            let file = ProjectFile::new(dir.path().canonicalize().unwrap(), "signature.js");
+            let parsed = parse_javascript_file(&file, source, &tree);
+            let signatures: Vec<_> = parsed
+                .signatures
+                .values()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            if !signatures.contains(&expected) {
+                failures.push(format!(
+                    "{source}: expected {expected:?}, got {signatures:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    pub(crate) fn javascript_declaration_snapshot(source: &str) -> String {
+        let tree = crate::test_support::parse_javascript(source);
+        assert!(
+            !tree.root_node().has_error(),
+            "{source}: {}",
+            tree.root_node().to_sexp()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(dir.path().canonicalize().unwrap(), "surface.js");
+        parsed_snapshot(parse_javascript_file(&file, source, &tree))
+    }
+
+    pub(crate) fn parsed_snapshot(parsed: ParsedFile) -> String {
+        let mut rows = Vec::new();
+        let mut units: Vec<_> = parsed
+            .ranges
+            .keys()
+            .chain(parsed.definition_lookup_units.iter())
+            .collect();
+        units.sort();
+        units.dedup();
+        for unit in units {
+            let lookup_only = parsed.definition_lookup_units.contains(unit);
+            let signatures = parsed.signatures.get(unit).cloned().unwrap_or_default();
+            let labels: Vec<_> = parsed
+                .signature_metadata
+                .get(unit)
+                .into_iter()
+                .flatten()
+                .map(|metadata| {
+                    (
+                        metadata
+                            .parameters()
+                            .iter()
+                            .map(|parameter| parameter.label())
+                            .collect::<Vec<_>>(),
+                        metadata.callable_is_static(),
+                        metadata.callable_is_constructor(),
+                    )
+                })
+                .collect();
+            let supers = parsed.raw_supertypes.get(unit).cloned().unwrap_or_default();
+            rows.push(format!("{:?} {:?} lookup={lookup_only} signatures={signatures:?} labels={labels:?} supers={supers:?}", unit.kind(), unit.fq_segments_debug()));
+        }
+        let facts = parsed
+            .source_facts
+            .as_ref()
+            .unwrap()
+            .js_ts
+            .as_ref()
+            .unwrap();
+        for export in &facts.exports {
+            rows.push(format!("export {:?} {:?}", export.name, export.kind));
+        }
+        for record in &parsed.materialization_records {
+            if let MaterializationRecord::Export {
+                form,
+                exported_name,
+                target,
+                ..
+            } = record
+            {
+                rows.push(format!(
+                    "materialized {form:?} {exported_name:?} target={:?}",
+                    target.as_ref().map(CodeUnit::fq_segments_debug)
+                ));
+            }
+        }
+        rows.sort();
+        rows.join("\n") + "\n"
+    }
+
+    pub(crate) fn assert_surface_golden(
+        name: &str,
+        sources: &[&str],
+        snapshot: fn(&str) -> String,
+    ) {
+        let mut actual = String::new();
+        for source in sources {
+            actual.push_str(&format!("SOURCE {source}\n{}", snapshot(source)));
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/declaration-surfaces")
+            .join(format!("{name}.txt"));
+        if std::env::var_os("BIFROST_BLESS").is_some() {
+            std::fs::write(&path, &actual).unwrap();
+        }
+        let expected = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(expected, actual, "{name}");
+    }
+
+    #[test]
+    fn js_declaration_surfaces() {
+        assert_surface_golden(
+            "js_declaration_surfaces",
+            &[
+                "export default class extends Base { constructor(){ function unrelated(){this.foreign=1;} this.own=1; } run(){} }",
+                "export default class\t extends  makeBase(1)\n {run(){}}",
+                "export default async function(value){return value;}",
+                "export default class {run(){}}",
+                "exports.run=function(input, options){return input;};",
+            ],
+            javascript_declaration_snapshot,
+        );
+    }
+
+    #[test]
+    fn js_factory_surfaces() {
+        assert_surface_golden(
+            "js_factory_surfaces",
+            &[
+                "export default function(){return {run(){}};}",
+                "import {defineConfig} from 'library'; export const api=defineConfig({run(){}});",
+                "const preserve=(x)=>x; export const api=preserve({run(){}});",
+                "const preserve=(x)=>{return x;}; export const api=preserve({run(){}});",
+                "function wrap(config,other){return config;} export const api=wrap({run(){}},0);",
+                "function wrap(other,config){return config;} export const api=wrap(0,{run(){}});",
+                "function wrap(config){const helper={m(){return config;}};return 0;} export const api=wrap({ghost(){}});",
+                "function wrap(config){return another;} export const api=wrap({ghost(){}});",
+                "function wrap(){return 0;} export const api=wrap(1,{ghost(){}});",
+            ],
+            javascript_declaration_snapshot,
+        );
+    }
+
+    #[test]
+    fn js_commonjs_assignment_scopes() {
+        assert_surface_golden(
+            "js_commonjs_assignment_scopes",
+            &[
+                "const impl={run(){}}; module.exports={run:impl.run};",
+                "var api=load(); module.exports=api; api.run=function(){};",
+                "const api=load(); module.exports=api; api.run=function(){};",
+                "const api=load(); module.exports=api; function f(api){api.run=function(){};}",
+                "if(flag){var api=load();} module.exports=api; api.run=function(){};",
+                "function f(){const local={run(){}};} const top={run(){}};",
+            ],
+            javascript_declaration_snapshot,
+        );
+    }
+
+    #[test]
+    fn js_jsx_signatures() {
+        assert_surface_golden(
+            "js_jsx_signatures",
+            &[
+                "export function Upper(){return <div/>;} export function lower(){return <div/>;}",
+                "export const Upper=()=> <div/>; export const lower=()=> <div/>;",
+                "class Yes {render(){return <div/>;}} class No {render(){return 42;}}",
+            ],
+            javascript_declaration_snapshot,
+        );
+    }
+
+    #[test]
+    fn js_mutation_summaries() {
+        assert_surface_golden(
+            "js_mutation_summaries",
+            &[
+                "export function update(){z.last=1; a.first++; function nested(){ghost=1;}}",
+                "class Counter {#value=0; update(){this.#value=1;}}",
+            ],
+            javascript_declaration_snapshot,
+        );
+    }
+
+    #[test]
+    fn js_callable_grammar() {
+        assert_surface_golden(
+            "js_callable_grammar",
+            &[
+                "export const identity=value=>value; export class Worker {async run(input){return input;} static runStatic(input){return input;} constructor(input){this.input=input;}}",
+            ],
+            javascript_declaration_snapshot,
+        );
+    }
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: unparenthesized identity arrows lose returned members"
+    )]
+    fn unparenthesized_arrow_preserves_object_shape() {
+        let source = "const preserve=x=>x; export const api=preserve({run(){}});";
+        let snapshot = javascript_declaration_snapshot(source);
+        assert!(snapshot.contains("\"Member\", \"run\""), "{snapshot}");
     }
 }

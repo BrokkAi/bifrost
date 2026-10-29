@@ -108,7 +108,7 @@ use brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder;
 use brokk_bifrost_core::hash::HashMap;
 
 use brokk_bifrost_core::hash::HashSet;
-use brokk_bifrost_go::{declarations::go_parameter_syntax, graph::ast::last_named_child};
+use brokk_bifrost_go::{declarations::go_parameter_syntax, syntax::last_named_child};
 use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -117,6 +117,10 @@ pub struct GoDependencyPackAdapter;
 impl DependencyPackAdapter for GoDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
         "bifrost-go-dependency"
+    }
+
+    fn adapter_version(&self) -> &str {
+        go_pack_producer_version()
     }
 
     fn producer(&self) -> Producer {
@@ -250,6 +254,8 @@ schema_version:
                     id: "declarations.external".to_owned(),
                     activation: request.activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -272,6 +278,19 @@ schema_version:
 /// into packages the spec names explicitly.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GoModulePackProducer;
+
+/// Bump when generated Go pack content changes for unchanged inputs.
+const GO_PACK_PRODUCER_VERSION: u32 = 1;
+
+fn go_pack_producer_version() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "{}+go-pack-{GO_PACK_PRODUCER_VERSION}",
+            env!("CARGO_PKG_VERSION")
+        )
+    });
+    VERSION.as_str()
+}
 
 impl GoModulePackProducer {
     pub fn produce_loaded_source_set(
@@ -348,7 +367,7 @@ schema_version:
                 version: request.pack_version.clone(),
                 producer: Producer {
                     name: "bifrost-go-module".to_owned(),
-                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                    version: go_pack_producer_version().to_owned(),
                 },
                 language: "go".to_owned(),
                 ecosystem: request.ecosystem.clone(),
@@ -364,6 +383,8 @@ schema_version:
                     id: "declarations.external".to_owned(),
                     activation,
                     payload: AuthoredPayload::DeclarationFacts {
+assembly_identity: None,
+type_forwards: Vec::new(),
                         types,
                         members,
                         relations: Vec::new(),
@@ -2038,8 +2059,8 @@ fn type_ref(
                                 node.named_children(&mut cursor)
                                     .find(|child| child.kind() == "type_arguments")
                             })?;
-                        let mut cursor = arguments.walk();
-                        let arguments = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+                        let arguments =
+                            brokk_bifrost_go::declarations::go_type_argument_nodes(arguments);
                         frames.push(TypeFrame::Generic {
                             argument_count: arguments.len(),
                         });
@@ -2612,6 +2633,121 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#7627: type_elem-wrapped generic arguments rendered as named text in generated Go packs"
+    )]
+    fn producer_generic_arguments_ignore_comments() {
+        let source = r#"package api
+type Box[T any] struct { Value T }
+type Local struct{}
+func Map[T any](value Box[int]) Box[T] { return Box[T]{} }
+func Sorted[E any](seq Box[E]) []E { return nil }
+func Pointers(seq Box[*Local]) {}
+func Declared(seq Box[Local]) {}
+func Slices(seq Box[[]byte]) {}
+"#;
+        let (plain_types, plain, plain_diagnostics) = facts(source);
+        let (commented_types, commented, commented_diagnostics) =
+            facts(&source.replace("Box[int]", "Box[/* c */ int]"));
+        assert!(plain_diagnostics.is_empty(), "{plain_diagnostics:#?}");
+        assert!(
+            commented_diagnostics.is_empty(),
+            "{commented_diagnostics:#?}"
+        );
+        assert_eq!(plain_types, commented_types);
+        let box_id = &plain_types
+            .iter()
+            .find(|fact| fact.name == "example.com/dep/api.Box")
+            .unwrap()
+            .id;
+        let local_id = &plain_types
+            .iter()
+            .find(|fact| fact.name == "example.com/dep/api.Local")
+            .unwrap()
+            .id;
+        let local = TypeRef::Declared {
+            id: local_id.clone(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        // These four argument shapes mirror the standard-library iterator
+        // signatures affected by flattening type_elem before type lowering.
+        for (name, argument) in [
+            (
+                "Sorted",
+                TypeRef::TypeParameter {
+                    name: "E".to_owned(),
+                },
+            ),
+            (
+                "Pointers",
+                TypeRef::Pointer {
+                    element: Box::new(local.clone()),
+                },
+            ),
+            ("Declared", local),
+            (
+                "Slices",
+                TypeRef::Slice {
+                    element: Box::new(TypeRef::Named {
+                        name: "byte".to_owned(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    }),
+                },
+            ),
+        ] {
+            let parameter = TypeRef::Declared {
+                id: box_id.clone(),
+                arguments: vec![argument],
+                nullable: false,
+            };
+            let returns = (name == "Sorted").then(|| TypeRef::Slice {
+                element: Box::new(TypeRef::TypeParameter {
+                    name: "E".to_owned(),
+                }),
+            });
+            for members in [&plain, &commented] {
+                let member = members.iter().find(|member| member.name == name).unwrap();
+                let signature = member.signature.as_ref().unwrap();
+                assert_eq!(signature.parameters.len(), 1, "{name}: {signature:?}");
+                assert_eq!(signature.parameters[0].r#type, parameter, "{name}");
+                assert_eq!(signature.returns, returns, "{name}");
+                let expected_id = member_declaration_id(MemberIdentity {
+                    owner_id: &member.owner,
+                    kind: MemberKind::Function,
+                    is_static: true,
+                    name,
+                    generic_arity: usize::from(name == "Sorted"),
+                    parameter_arity: 1,
+                    parameter_types: std::slice::from_ref(&parameter),
+                    parameter_variadics: &[false],
+                    return_type: returns.as_ref(),
+                });
+                assert_eq!(member.id, expected_id, "{name}");
+            }
+        }
+        let plain = plain.iter().find(|member| member.name == "Map").unwrap();
+        let commented = commented
+            .iter()
+            .find(|member| member.name == "Map")
+            .unwrap();
+        assert_eq!(plain.signature, commented.signature);
+        assert_eq!(plain.id, commented.id);
+        let parameter = &commented.signature.as_ref().unwrap().parameters[0].r#type;
+        let TypeRef::Declared { arguments, .. } = parameter else {
+            panic!("Map parameter must name the generated Box declaration: {parameter:?}");
+        };
+        assert_eq!(arguments.len(), 1, "{arguments:?}");
+        assert!(
+            matches!(&arguments[0], TypeRef::Named { name, arguments, .. }
+            if name == "int" && arguments.is_empty()),
+            "{arguments:?}"
+        );
+        eprintln!("plain member: {plain:?}\ncommented member: {commented:?}");
+    }
+
+    #[test]
     fn producer_preserves_exported_generics_embedding_and_receivers() {
         let (types, members, diagnostics) = facts(
             r#"
@@ -2710,6 +2846,8 @@ var privateValue int
                     artifact_sha256: None,
                 }],
                 payload: AuthoredPayload::DeclarationFacts {
+                    assembly_identity: None,
+                    type_forwards: Vec::new(),
                     types,
                     members,
                     relations: Vec::new(),

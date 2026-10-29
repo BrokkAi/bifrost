@@ -1755,10 +1755,12 @@ impl StructuralSpec for PythonStructuralSpec {
                 // extras (`comment`, `line_continuation`) can be interleaved
                 // between them, so select among the operands (#4797).
                 let test = if node.kind() == "conditional_expression" {
-                    Some(
+                    let [consequence, test, alternative] =
                         python_conditional_expression_operands(node)
-                            .expect("conditional expression operands")[1],
-                    )
+                            .expect("conditional expression operands");
+                    sink.role(Role::Consequence, consequence);
+                    sink.role(Role::Alternative, alternative);
+                    Some(test)
                 } else {
                     node.child_by_field_name("condition")
                 };

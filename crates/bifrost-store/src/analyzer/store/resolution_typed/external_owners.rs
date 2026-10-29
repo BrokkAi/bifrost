@@ -1,4 +1,5 @@
 //! Durable external inventories selected by the request's exact provider identities.
+use super::super::resolution_operation::nominal_rules::jvm_external_owner_relations;
 use super::*;
 use crate::analyzer::resolution::ExternalOwnerIdentity;
 use brokk_bifrost_core::analyzer::resolution_facts::{
@@ -11,6 +12,29 @@ pub(in crate::analyzer::store) const EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL: &s
 
 pub(in crate::analyzer::store) const INTRINSIC_MEMBER_OWNER_INDEXED_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2)";
+
+struct ExternalOwnerScopes {
+    callables_complete: bool,
+    values_complete: bool,
+    types_complete: bool,
+    supertypes_complete: bool,
+}
+
+fn decode_external_owner_scopes(
+    owner: &ExternalOwnerIdentity,
+    row: &Row<'_>,
+    enumerated: bool,
+) -> StoreResult<ExternalOwnerScopes> {
+    // Intrinsic specified inventories establish callable and supertype completeness.
+    let specified_inventory =
+        brokk_bifrost_jvm::intrinsics::specified_method_inventory(&owner.owner_fqn).is_some();
+    Ok(ExternalOwnerScopes {
+        callables_complete: specified_inventory || (enumerated && row.get(1)?),
+        values_complete: enumerated && row.get(2)?,
+        types_complete: enumerated && row.get(3)?,
+        supertypes_complete: specified_inventory || (enumerated && row.get(4)?),
+    })
+}
 
 fn decode_external_member_visibility(label: &str) -> StoreResult<DeclaredVisibility> {
     DeclaredVisibility::from_label(label)
@@ -29,7 +53,7 @@ pub(in crate::analyzer::store) fn intrinsic_member_inventory_for_owner(
     // Indexed artifacts own their ordinals. Never overlay intrinsic ordinals
     // onto an existing provider's rows; the fixed table fills an unindexed root.
     let indexed: bool = connection.query_row(
-        INTRINSIC_MEMBER_OWNER_INDEXED_SQL,
+        jvm_external_owner_relations().owner_indexed,
         rusqlite::params![owner.provider_id.as_ref(), owner.owner_fqn.as_ref()],
         |row| row.get(0),
     )?;
@@ -69,29 +93,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
         let providers = serde_json::to_string(&self.external_providers)
             .map_err(|error| StoreError::new(error.to_string()))?;
         let rows = self.read_statement(cancellation, |conn| {
-            let mut statement = conn.prepare_cached(
-                "WITH requested AS (
-                   SELECT json_extract(value, '$[0]') provider_id,
-                          json_extract(value, '$[1]') owner_fqn,
-                          json_extract(value, '$[2]') ordinal
-                   FROM json_each(?1)
-                 )
-                 SELECT member.provider_id,member.owner_fqn,member.ordinal,
-                        json_extract(member.return_type_jsonb, '$.name'),
-                        (SELECT CASE WHEN count(*)=1 THEN min(owner.provider_id) END
-                           FROM jvm_external_owners owner
-                          WHERE owner.owner_fqn=json_extract(member.return_type_jsonb, '$.name')
-                            AND owner.provider_id IN (SELECT value FROM json_each(?2)))
-                   FROM requested
-                   JOIN jvm_external_owner_members member
-                     ON member.provider_id=requested.provider_id
-                    AND member.owner_fqn=requested.owner_fqn
-                    AND member.ordinal=requested.ordinal
-                  WHERE member.member_kind IN ('method','function')
-                    AND json_extract(member.return_type_jsonb, '$.kind')='named'
-                    AND member.provider_id IN (SELECT value FROM json_each(?2))
-                  ORDER BY member.provider_id,member.owner_fqn,member.ordinal",
-            )?;
+            let mut statement =
+                conn.prepare_cached(jvm_external_owner_relations().callable_result_owners)?;
             let mut rows = statement.query([coordinates, providers])?;
             let mut result = Vec::new();
             while let Some(row) = rows.next()? {
@@ -225,6 +228,42 @@ impl SelectedResolutionTypedSource<'_, '_> {
         })
     }
 
+    pub(in crate::analyzer::store) fn external_owner_type_is_indexed(
+        &self,
+        owner: &ExternalOwnerIdentity,
+    ) -> StoreResult<bool> {
+        // Only a selected inventory provider can close an owner, and the
+        // scope query is restricted to those providers. Answer without a
+        // read for every other destination, which is every destination when
+        // no JVM inventory is selected.
+        if !self
+            .external_providers
+            .iter()
+            .any(|provider| provider == owner.provider_id.as_ref())
+            || !self.external_owner_family_is_enumerated(owner)
+        {
+            return Ok(false);
+        }
+        let providers = serde_json::to_string(&self.external_providers)
+            .map_err(|error| StoreError::new(error.to_string()))?;
+        let mut statement = self
+            .selection
+            .connection()
+            .prepare_cached(jvm_external_owner_relations().owner_scopes)?;
+        let mut rows = statement.query(rusqlite::params![
+            owner.provider_id.as_ref(),
+            owner.owner_fqn.as_ref(),
+            -1,
+            1,
+            providers
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        let scopes = decode_external_owner_scopes(owner, row, true)?;
+        Ok(scopes.types_complete && scopes.supertypes_complete)
+    }
+
     fn external_owner_family_is_enumerated(&self, owner: &ExternalOwnerIdentity) -> bool {
         let Some(models) = &self.external_models else {
             return true;
@@ -298,18 +337,29 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 }
             }
         }
-        self.visit_external_rows(definitions,
-            "SELECT 0,callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2 AND 0>?3 AND provider_id IN (SELECT value FROM json_each(?5)) LIMIT ?4",
-            cancellation, visitor, |owner, definition, row| {
+        self.visit_external_rows(
+            definitions,
+            jvm_external_owner_relations().owner_scopes,
+            cancellation,
+            visitor,
+            |owner, definition, row| {
                 let enumerated = self.external_owner_family_is_enumerated(owner);
-                Ok(SelectedTypedRow::external_owner(owner.clone(), LoweredMemberScopeProperty::external(definition, crate::analyzer::resolution::ExternalMemberCoverage {
-                    callables_complete: brokk_bifrost_jvm::intrinsics::specified_method_inventory(&owner.owner_fqn).is_some() || (enumerated && row.get::<_, bool>(1)?),
-                    values_complete: enumerated && row.get(2)?,
-                    types_complete: enumerated && row.get(3)?,
-                    supertypes_complete: brokk_bifrost_jvm::intrinsics::specified_method_inventory(&owner.owner_fqn).is_some() || (enumerated && row.get::<_, bool>(4)?),
-                    member_names_only: false,
-                })))
-            })
+                let scopes = decode_external_owner_scopes(owner, row, enumerated)?;
+                Ok(SelectedTypedRow::external_owner(
+                    owner.clone(),
+                    LoweredMemberScopeProperty::external(
+                        definition,
+                        crate::analyzer::resolution::ExternalMemberCoverage {
+                            callables_complete: scopes.callables_complete,
+                            values_complete: scopes.values_complete,
+                            types_complete: scopes.types_complete,
+                            supertypes_complete: scopes.supertypes_complete,
+                            member_names_only: false,
+                        },
+                    ),
+                ))
+            },
+        )
     }
 
     pub(super) fn visit_external_member_owners(
@@ -358,11 +408,15 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 }
             }
         }
-        self.visit_external_rows(definitions,
-            "SELECT member.ordinal,member.member_name,member.member_kind,member.visibility,member.is_static FROM jvm_external_owner_members member JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE member.provider_id=?1 AND member.owner_fqn=?2 AND member.ordinal>?3 AND member.provider_id IN (SELECT value FROM json_each(?5)) ORDER BY member.ordinal LIMIT ?4",
-            cancellation, visitor, |owner, definition, row| {
+        self.visit_external_rows(
+            definitions,
+            jvm_external_owner_relations().members,
+            cancellation,
+            visitor,
+            |owner, definition, row| {
                 self.decode_external_member_owner(owner, definition, row, &names)
-            })
+            },
+        )
     }
 
     pub(super) fn visit_external_member_owners_for_definitions(
@@ -418,7 +472,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 continue;
             }
             let Some(row) = self.read_statement(cancellation, |conn| {
-                let mut statement = conn.prepare_cached(EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL)?;
+                let mut statement =
+                    conn.prepare_cached(jvm_external_owner_relations().member_by_definition)?;
                 let mut rows = statement.query(rusqlite::params![
                     owner.provider_id.as_ref(),
                     owner.owner_fqn.as_ref(),
@@ -510,7 +565,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             ResolutionNamespace::Type,
             ResolutionNamespace::Type,
         ];
-        let languages = [Language::Java, Language::Kotlin, Language::Scala];
+        let languages = jvm_external_owner_relations().languages;
         let lookups = std::array::from_fn(|i| {
             crate::analyzer::resolution::lookup_semantic(
                 names,
@@ -556,16 +611,33 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .selection
             .shared_name_table()
             .interner(self.selection.connection());
-        self.visit_external_rows(definitions,
-            "SELECT edge.ordinal,edge.supertype_fqn,COALESCE((SELECT provider_id FROM jvm_external_owners WHERE owner_fqn=edge.supertype_fqn AND provider_id=?1),(SELECT CASE WHEN count(*)=1 THEN min(provider_id) END FROM jvm_external_owners WHERE owner_fqn=edge.supertype_fqn AND provider_id IN (SELECT value FROM json_each(?5))),?1) FROM jvm_external_owner_supertypes edge JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE edge.provider_id=?1 AND edge.owner_fqn=?2 AND edge.ordinal>?3 AND edge.provider_id IN (SELECT value FROM json_each(?5)) ORDER BY edge.ordinal LIMIT ?4",
-            cancellation, visitor, |owner, definition, row| {
+        self.visit_external_rows(
+            definitions,
+            jvm_external_owner_relations().supertypes,
+            cancellation,
+            visitor,
+            |owner, definition, row| {
                 let ordinal: u32 = row.get(0)?;
-                let target = ExternalOwnerIdentity { provider_id: Arc::<str>::from(row.get::<_, String>(2)?), owner_fqn: Arc::<str>::from(row.get::<_, String>(1)?) };
-                let target_semantic = self.context_identities.external_owner_semantic(&target, &names);
-                let reference = self.context_identities.external_supertype_reference(owner, ordinal, &names);
-                self.context_identities.record_external_hierarchy_reference(reference, target_semantic);
-                Ok(SelectedTypedRow::external_owner(owner.clone(), LoweredSupertypeProperty::external(definition, reference, reference, ordinal, target)))
-            })
+                let target = ExternalOwnerIdentity {
+                    provider_id: Arc::<str>::from(row.get::<_, String>(2)?),
+                    owner_fqn: Arc::<str>::from(row.get::<_, String>(1)?),
+                };
+                let target_semantic = self
+                    .context_identities
+                    .external_owner_semantic(&target, &names);
+                let reference = self
+                    .context_identities
+                    .external_supertype_reference(owner, ordinal, &names);
+                self.context_identities
+                    .record_external_hierarchy_reference(reference, target_semantic);
+                Ok(SelectedTypedRow::external_owner(
+                    owner.clone(),
+                    LoweredSupertypeProperty::external(
+                        definition, reference, reference, ordinal, target,
+                    ),
+                ))
+            },
+        )
     }
 }
 
@@ -653,7 +725,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
             let providers = serde_json::to_string(&self.external_providers)
                 .map_err(|error| StoreError::new(error.to_string()))?;
             let rows = self.read_statement(cancellation, |connection| {
-                let mut statement = connection.prepare_cached(EXTERNAL_CALLABLE_SIGNATURES_SQL)?;
+                let mut statement = connection
+                    .prepare_cached(jvm_external_owner_relations().callable_signatures)?;
                 let mut cursor = statement.query([coordinates, providers])?;
                 let mut rows = Vec::new();
                 while let Some(row) = cursor.next()? {
@@ -759,8 +832,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 let providers = serde_json::to_string(&self.external_providers)
                     .map_err(|error| StoreError::new(error.to_string()))?;
                 let owners = self.read_statement(cancellation, |connection| {
-                    let mut statement =
-                        connection.prepare_cached(EXTERNAL_SIGNATURE_TYPE_OWNERS_SQL)?;
+                    let mut statement = connection
+                        .prepare_cached(jvm_external_owner_relations().signature_type_owners)?;
                     let mut cursor = statement.query([names, providers])?;
                     let mut owners = Vec::new();
                     while let Some(row) = cursor.next()? {
@@ -822,6 +895,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     };
                     let Some(slot) = memo.lower_type_term(
                         &member,
+                        &crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(
+                            member.ordinal,
+                        ),
                         term,
                         &mut next_slot,
                         &names,
@@ -874,6 +950,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 if let Some(term) = result.as_ref() {
                     let Some(slot) = memo.lower_type_term(
                         &member,
+                        &crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(
+                            member.ordinal,
+                        ),
                         term,
                         &mut next_slot,
                         &names,
@@ -1042,9 +1121,11 @@ impl ExternalSignatureMemo {
     /// Lower the structured declaration term without parsing display text or
     /// erasing a generic variable to its bound. The explicit postorder stack
     /// also keeps deeply nested array signatures off the Rust call stack.
+    #[allow(clippy::too_many_arguments)]
     fn lower_type_term(
         &mut self,
         member: &crate::analyzer::resolution::ExternalMemberIdentity,
+        coordinate: &crate::analyzer::resolution::ExternalMemberCoordinate,
         term: &crate::analyzer::semantic_model::TypeRef,
         next_slot: &mut u32,
         names: &dyn SharedNameInterner,
@@ -1065,7 +1146,19 @@ impl ExternalSignatureMemo {
             let mut hash = CanonicalHasher::new(b"bifrost-jvm-external-signature-slot:v1");
             hash.field("provider", owner.provider_id.as_bytes());
             hash.field("owner", owner.owner_fqn.as_bytes());
-            hash.field("member", &member_ordinal.to_be_bytes());
+            match coordinate {
+                crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(
+                    ordinal,
+                ) => {
+                    hash.field("member", &ordinal.to_be_bytes());
+                }
+                crate::analyzer::resolution::ExternalMemberCoordinate::ModelMember(member) => {
+                    hash.field("pack-id", member.provider.pack_id.as_bytes());
+                    hash.field("pack-version", member.provider.pack_version.as_bytes());
+                    hash.field("pack-digest", member.provider.pack_digest.as_bytes());
+                    hash.field("symbol-id", member.symbol_id.as_bytes());
+                }
+            }
             hash.field("slot", &next_slot.to_be_bytes());
             *next_slot = next_slot
                 .checked_add(1)
@@ -1254,8 +1347,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
             let providers = serde_json::to_string(&self.external_providers)
                 .map_err(|error| StoreError::new(error.to_string()))?;
             let rows = self.read_statement(cancellation, |connection| {
-                let mut statement =
-                    connection.prepare_cached(EXTERNAL_INHERITANCE_DECLARATIONS_SQL)?;
+                let mut statement = connection
+                    .prepare_cached(jvm_external_owner_relations().inheritance_declarations)?;
                 let mut cursor = statement.query([coordinates, providers])?;
                 let mut rows = Vec::new();
                 while let Some(row) = cursor.next()? {

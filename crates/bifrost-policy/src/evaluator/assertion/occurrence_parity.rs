@@ -236,6 +236,7 @@ mod tests {
             analyzer: analyzer.as_ref(),
             workspace: None,
             flow_state: &flow_state,
+            root_memo: None,
             cancellation,
             cvss_overlays: &[],
             organizational_risk: &[],

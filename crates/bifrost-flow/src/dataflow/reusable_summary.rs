@@ -690,7 +690,9 @@ impl SummaryReadObserver for SummaryReadRecorder<'_> {
         content: StableDigest,
         dependencies: &[SummaryDependencyKey],
     ) {
-        if !self.analyzer.read_ledger_attached() {
+        if !brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+            self.analyzer.read_ledger_attached()
+        }) {
             return;
         }
         self.analyzer

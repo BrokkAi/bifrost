@@ -31,6 +31,7 @@ pub mod local_writes;
 pub mod model;
 #[doc(hidden)]
 pub mod mounted;
+pub(crate) mod precedence;
 #[doc(hidden)]
 pub mod remount;
 mod saturation;
@@ -110,6 +111,33 @@ pub fn callable_receiver_is_incomplete(
     completion: &ResolutionCompletion,
 ) -> bool {
     origin.is_some() && completion != &ResolutionCompletion::Complete
+}
+
+/// Whether a callable reference's forward confirmation failed to decide what
+/// the call names, rather than deciding against a reverse target.
+///
+/// An empty forward target set disproves a name-nominated reverse candidate
+/// only when the receiver was decided. A receiver that is an independent
+/// declared bound, or one the route could not type (a bare generic parameter,
+/// an inference failure), is more uncertain than a receiver whose named type
+/// simply lacks the member. Its structurally matching site must stay unproven
+/// instead of being dropped as a complete negative; dropping it published a
+/// false "dead" for the target.
+///
+/// The receiver origin keeps the incomplete arm narrow. Rust crate-root rows
+/// nominate every structured component of a qualified route, and forward
+/// confirmation rejects the prefix components with an unowned gap. Those
+/// components carry no callable receiver origin, so they stay disproved; only
+/// a site whose source syntax supplied a receiver that the route could not
+/// resolve is retained.
+#[doc(hidden)]
+pub fn undecided_callable_receiver(answer: &FactResolutionAnswer) -> bool {
+    answer.binding().targets().is_empty()
+        && (answer.type_bound_receiver()
+            || callable_receiver_is_incomplete(
+                answer.callable_receiver_origin(),
+                answer.binding().completion(),
+            ))
 }
 
 pub(super) fn assert_fresh_metrics_sink<T>(sink: &T, message: &str)
@@ -680,6 +708,7 @@ pub use fact_source::{
 
 pub use fact_source::DeferredMemberOwnerLookupName;
 pub use fact_source::DeferredMemberOwnerProof;
+pub use fact_source::ExternalMemberCoordinate;
 pub use fact_source::ExternalMemberIdentity;
 pub use fact_source::ExternalOwnerIdentity;
 pub use fact_source::FactPageVisitor;
@@ -869,6 +898,7 @@ pub use typed_fact_lowering::LoweredIntrinsicSeed;
 pub use typed_fact_lowering::LoweredMemberOwnerProperty;
 pub use typed_fact_lowering::LoweredMemberScopeProperty;
 pub use typed_fact_lowering::LoweredQualifiedSeededRoute;
+pub use typed_fact_lowering::LoweredSourceSupertypeProperty;
 pub use typed_fact_lowering::LoweredSupertypeProperty;
 pub use typed_fact_lowering::LoweredSupertypeTarget;
 pub use typed_fact_lowering::LoweredTypeArgument;
@@ -1096,7 +1126,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             metadata.end_byte() + 1,
             metadata.unqualified(),
             metadata.reference_owner(),
-            metadata.callable_receiver_origin(),
+            metadata.receiver_origin(),
         )
         .with_go_spelling_namespace(metadata.go_spelling_namespace())
         .with_go_package_qualifier(metadata.go_package_qualifier());
@@ -1514,3 +1544,5 @@ pub(crate) use fact_resolution::{
     DEFAULT_HIERARCHY_POLICY, HierarchyEdgeProvider, HierarchyLookupShape, HierarchyPolicy,
     HierarchyPolicyId, HierarchyRequestIdentity, ImplicitBaseFact, ImplicitBaseRead,
 };
+
+pub use selected_context::ExternalOwnerLanguage;

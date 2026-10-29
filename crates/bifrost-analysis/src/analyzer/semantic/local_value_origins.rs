@@ -139,7 +139,7 @@ pub fn derive_local_constant_origins(
             continue;
         };
         let valid = match row.kind {
-            SemanticValueKind::Constant => {
+            SemanticValueKind::Constant | SemanticValueKind::ConstantString(_) => {
                 if node.kind() == "string_literal" {
                     constants.insert(row.id);
                     true

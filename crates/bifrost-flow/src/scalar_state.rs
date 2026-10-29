@@ -1080,6 +1080,9 @@ pub struct ScalarEdgeWrite {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScalarCallEffects<'a> {
     pub modeled_address_calls: &'a [CallSiteId],
+    /// Query-proven receiver preparation passes the pointer value, never the
+    /// pointer variable's place. Unknown member selections remain writers.
+    pub reference_receiver_calls: &'a [CallSiteId],
     pub edge_writes: &'a [ScalarEdgeWrite],
     /// CFG edges whose execution is disproved by an exact call model, such as
     /// the normal continuation of a terminating procedure.
@@ -1134,7 +1137,8 @@ impl ScalarStateDerivation {
             procedure,
             binding_origins,
             modeled_address_calls: call_effects.modeled_address_calls,
-            closed_cells: closed_scalar_cells(procedure, call_effects.modeled_address_calls),
+            reference_receiver_calls: call_effects.reference_receiver_calls,
+            closed_cells: closed_scalar_cells(procedure, call_effects),
             address_taken_bindings,
             escaped_address_bindings,
             address_escape_bindings_by_point,
@@ -1145,6 +1149,15 @@ impl ScalarStateDerivation {
                     crate::analyzer::Language::Rust
                 )
             ),
+            pending_member_callees: semantics
+                .call_sites()
+                .iter()
+                .filter(|call| {
+                    call.member_selection.is_some()
+                        && !call_effects.reference_receiver_calls.contains(&call.id)
+                })
+                .map(|call| call.callee)
+                .collect(),
             typing,
         };
         let mut states = vec![None::<Box<[ScalarFact]>>; point_count];
@@ -1410,14 +1423,43 @@ fn guards_by_edge(procedure: &ProcedureHandle, typing: &ScalarTyping) -> GuardRe
     }
 }
 
+// An unresolved member can borrow an addressable value. A pointer operand
+// already refers to separate storage and never borrows its binding cell.
+fn deferred_member_borrowed_binding(
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    origins: &BindingOriginIndex,
+) -> Option<ValueId> {
+    let selection = call.member_selection.as_ref()?;
+    if selection
+        .receiver_pointer_depth
+        .is_some_and(|depth| depth > 0)
+    {
+        return None;
+    }
+    match selection.receiver_place.as_ref()? {
+        crate::analyzer::semantic::SemanticPlace::MemoryLocation(location) => {
+            match procedure.semantics().memory_location(*location)?.kind {
+                MemoryLocationKind::LexicalCell { binding } => Some(binding),
+                _ => None,
+            }
+        }
+        crate::analyzer::semantic::SemanticPlace::LocalBinding(_) => {
+            origins.unique_binding_origin(call.receiver?)
+        }
+    }
+}
+
 /// Local cells can reuse the binding lattice only while their payload has no
 /// writer outside this procedure's explicit assignments and stores. The check
 /// is procedure-wide: an escape keeps the cell open even before publication.
 fn closed_scalar_cells(
     procedure: &ProcedureHandle,
-    modeled_address_calls: &[CallSiteId],
+    call_effects: ScalarCallEffects<'_>,
 ) -> HashSet<ValueId> {
+    let modeled_address_calls = call_effects.modeled_address_calls;
     let semantics = procedure.semantics();
+    let origins = BindingOriginIndex::new(procedure);
     semantics
         .memory_locations()
         .iter()
@@ -1425,6 +1467,12 @@ fn closed_scalar_cells(
             let MemoryLocationKind::LexicalCell { binding } = location.kind else {
                 return None;
             };
+            if semantics.call_sites().iter().any(|call|
+                !call_effects.reference_receiver_calls.contains(&call.id)
+                    && deferred_member_borrowed_binding(procedure, call, &origins) == Some(binding))
+            {
+                return None;
+            }
             if semantics.captures().iter().any(|capture| {
                 matches!(capture.captured, CaptureSource::Location(captured) if captured == location.id)
                     || matches!(capture.captured, CaptureSource::Value(value) if value == binding)
@@ -1572,6 +1620,7 @@ struct ScalarTransferContext<'procedure, 'calls, 'typing> {
     procedure: &'procedure ProcedureHandle,
     binding_origins: BindingOriginIndex,
     modeled_address_calls: &'calls [CallSiteId],
+    reference_receiver_calls: &'calls [CallSiteId],
     closed_cells: HashSet<ValueId>,
     address_taken_bindings: HashSet<ValueId>,
     escaped_address_bindings: HashSet<ValueId>,
@@ -1580,6 +1629,7 @@ struct ScalarTransferContext<'procedure, 'calls, 'typing> {
     // Language fact: Rust method adjustment can implicitly borrow a receiver
     // mutably. Java, JS/TS and Python cannot; others stay false until checked.
     method_receivers_may_be_autoborrowed_mutably: bool,
+    pending_member_callees: HashSet<ValueId>,
     typing: &'typing ScalarTyping,
 }
 
@@ -1780,15 +1830,28 @@ fn transfer_point(
                     .expect("validated allocation effect resolves");
                 state[allocation.result.index()] = ScalarFact::NonNil;
             }
-            SemanticEffect::CallableCreation { result, .. }
-            | SemanticEffect::CallableReference { result, .. } => {
+            SemanticEffect::CallableCreation { result, .. } => {
                 state[result.index()] = ScalarFact::NonNil;
+            }
+            SemanticEffect::CallableReference { result, .. } => {
+                // An open member can be a nil function-valued field.
+                state[result.index()] = if context.pending_member_callees.contains(&result) {
+                    ScalarFact::Unknown
+                } else {
+                    ScalarFact::NonNil
+                };
             }
             SemanticEffect::Invoke { call_site } => {
                 release_external_writers(state);
                 let call = semantics
                     .call_site(call_site)
                     .expect("validated scalar call effect resolves");
+                if !context.reference_receiver_calls.contains(&call_site)
+                    && let Some(binding) =
+                        deferred_member_borrowed_binding(procedure, call, binding_origins)
+                {
+                    state[binding.index()] = ScalarFact::Unknown;
+                }
                 // #6409: autoref can write a Rust local without a recorded
                 // assignment, including an untyped literal-initialized local.
                 // A receiver place-read temporary retains its unique binding
@@ -3421,6 +3484,7 @@ func run() int {
             &fixture.procedure,
             ScalarCallEffects {
                 modeled_address_calls: &[call.id],
+                reference_receiver_calls: &[],
                 edge_writes: &[],
                 infeasible_edges: &[],
             },
@@ -3499,6 +3563,7 @@ func run(out chan **item) int {{
                 &fixture.procedure,
                 ScalarCallEffects {
                     modeled_address_calls: &modeled_calls,
+                    reference_receiver_calls: &[],
                     edge_writes: &[],
                     infeasible_edges: &[],
                 },

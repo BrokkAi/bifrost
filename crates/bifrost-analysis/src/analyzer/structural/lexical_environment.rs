@@ -631,6 +631,28 @@ fn binding_rows(
                 .map(BindingScopeCandidate::Syntax),
         })
         .collect();
+    // One file/query correspondence, dropped with the derived rows. Implicit
+    // binders keep the same token identity as the existing occurrence arena.
+    let mut binder_nodes_by_range = HashMap::new();
+    let make_row = |node, declaring_scope, activation: super::resolution::BindingActivation| {
+        let normalized = facts.node(node);
+        let raw = &source[normalized.range.start_byte..normalized.range.end_byte];
+        let name = spec.decode_spelling(raw).unwrap_or_else(|| raw.to_owned());
+        BindingRow {
+            file: file.clone(),
+            content_identity,
+            node: Some(node),
+            range: normalized.range,
+            name,
+            kind: activation.kind,
+            hoisting: activation.hoisting,
+            declaring_scope,
+            activation: activation.activation,
+            source_order: 0,
+            visibility: DeclaredVisibility::Unknown,
+            import: None,
+        }
+    };
     let mut rows = Vec::new();
     for node in 0..facts.nodes().len() {
         let node = u32::try_from(node).expect("facts arena node count fits in u32");
@@ -641,9 +663,16 @@ fn binding_rows(
             continue;
         }
         let normalized = facts.node(node);
-        let Some(binder) =
-            root.descendant_for_byte_range(normalized.range.start_byte, normalized.range.end_byte)
-        else {
+        binder_nodes_by_range.insert(
+            (normalized.range.start_byte, normalized.range.end_byte),
+            node,
+        );
+        // Facts select named syntax nodes. A contextual identifier can wrap an
+        // anonymous keyword at the same range; use the wrapper's binding role.
+        let Some(binder) = root.named_descendant_for_byte_range(
+            normalized.range.start_byte,
+            normalized.range.end_byte,
+        ) else {
             super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
             continue;
         };
@@ -693,22 +722,44 @@ fn binding_rows(
             }
             continue;
         };
-        let raw = &source[normalized.range.start_byte..normalized.range.end_byte];
-        let name = spec.decode_spelling(raw).unwrap_or_else(|| raw.to_owned());
-        rows.push(BindingRow {
-            file: file.clone(),
-            content_identity,
-            node: Some(node),
-            range: normalized.range,
-            name,
-            kind: activation.kind,
-            hoisting: activation.hoisting,
-            declaring_scope,
-            activation: activation.activation,
-            source_order: 0,
-            visibility: DeclaredVisibility::Unknown,
-            import: None,
-        });
+        rows.push(make_row(node, declaring_scope, activation));
+    }
+    for (scope, syntax) in scopes.iter().zip(scope_syntax) {
+        let Some(BindingScopeCandidate::Syntax(scope_node)) = syntax else {
+            continue;
+        };
+        // Member scopes stay excluded. A language supplies implicit binders
+        // for their executable owner rather than reopening member names.
+        if scope
+            .anchor
+            .kind()
+            .is_some_and(|kind| spec.scope_formation(kind) == ScopeFormation::MemberScope)
+        {
+            continue;
+        }
+        let Some(binders) = spec.implicit_scope_binders(scope_node) else {
+            super::note_once(
+                reasons,
+                EnvironmentIncompleteReason::BindingActivationUnknown,
+            );
+            continue;
+        };
+        for binder in binders {
+            let Some(&node) =
+                binder_nodes_by_range.get(&(binder.name.start_byte(), binder.name.end_byte()))
+            else {
+                super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
+                continue;
+            };
+            let Some(activation) = spec.binding_activation(binder.name, scope.range) else {
+                super::note_once(
+                    reasons,
+                    EnvironmentIncompleteReason::BindingActivationUnknown,
+                );
+                continue;
+            };
+            rows.push(make_row(node, scope.index, activation));
+        }
     }
     rows
 }
@@ -755,7 +806,11 @@ fn import_binder_rows(
         let node = declaration.and_then(|declaration| {
             import_binder_node(facts, declaration, local_name, import.binder_span)
         });
-        let range = node.map_or(scope.range, |node| facts.node(node).range);
+        // Tokenless binders (notably wildcard imports) are anchored to
+        // their declaration, so source ordering never uses the scope start.
+        let range = node
+            .or(declaration)
+            .map_or(scope.range, |node| facts.node(node).range);
         // Which bytes the imported name is in effect over is the adapter's
         // answer, not this layer's: a Scala block-local import starts at the
         // import statement where every other language's import is in effect
@@ -1135,4 +1190,155 @@ pub fn binding_of_occurrence(
 pub mod test_support;
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parsed_environment(source: &str) -> EnvironmentFileResult {
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let facts = super::super::extract::extract_file_facts(spec, &grammar, source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path(), "example.py");
+        let mut analyzer = super::super::identity_routes::tests::MetadataAnalyzer::new(temp.path());
+        let mut cursor = tree.root_node().walk();
+        for node in tree.root_node().named_children(&mut cursor) {
+            analyzer
+                .imports
+                .extend(brokk_bifrost_python::imports::python_import_infos_from_node(node, source));
+        }
+        let scopes = scope_rows(spec, &file, &facts);
+        let mut reasons = vec![];
+        let mut bindings =
+            binding_rows(spec, &file, &facts, &scopes, tree.root_node(), &mut reasons);
+        let query = AnalyzerQueryScope::new(&analyzer);
+        bindings.extend(import_binder_rows(
+            spec,
+            &analyzer,
+            query.token(),
+            &file,
+            &facts,
+            &scopes,
+            &mut reasons,
+        ));
+        assign_source_order(&mut bindings);
+        EnvironmentFileResult::new(
+            scopes,
+            bindings,
+            PackageClauseRow {
+                file,
+                package_fq: None,
+                syntactic: false,
+            },
+            completeness(spec.lexical_environment_support(), reasons),
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: wildcard imports sort before earlier locals"
+    )]
+    fn import_binders_follow_declaration_source_order() {
+        for comment in ["# comment\n", "# caf\u{e9}\n"] {
+            let source = format!(
+                "{comment}before = 1\nfrom pkg import *\nmiddle = 2\nimport named\nfrom other import *\nafter = 3\n"
+            );
+            let environment = parsed_environment(&source);
+            let mut bindings = environment.bindings.iter().collect::<Vec<_>>();
+            bindings.sort_by_key(|binding| binding.source_order);
+            assert_eq!(
+                bindings
+                    .iter()
+                    .map(|binding| binding.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["before", "*", "middle", "named", "*", "after"]
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_intervals_match_grammar_byte_boundaries() {
+        for source in [
+            "",
+            "# caf\u{e9}\ndef first(x):\n    return x\ndef second(y):\n    return y\n",
+        ] {
+            let environment = parsed_environment(source);
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            for scope in &environment.scopes {
+                let expected = if matches!(scope.anchor, ScopeAnchor::File) {
+                    0..source.len()
+                } else {
+                    let node = tree
+                        .root_node()
+                        .named_descendant_for_byte_range(
+                            scope.range.start_byte,
+                            scope.range.end_byte,
+                        )
+                        .unwrap();
+                    node.byte_range()
+                };
+                for position in 0..=source.len() {
+                    assert_eq!(scope.contains(position), expected.contains(&position));
+                }
+            }
+            for binding in &environment.bindings {
+                // Python parameters remain active through their function's body,
+                // whose end is the exact grammar scope boundary.
+                let scope = &environment.scopes[binding.declaring_scope as usize];
+                assert_eq!(binding.activation.end_byte, scope.range.end_byte);
+                assert!(!binding.is_active_at(scope.range.end_byte));
+                if binding.activation.start_byte < scope.range.end_byte {
+                    assert!(binding.is_active_at(scope.range.end_byte - 1));
+                }
+            }
+        }
+    }
+    #[test]
+    fn active_binder_ranking_is_invariant_under_leading_comment() {
+        use super::super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
+        use super::super::occurrences::OccurrenceClass;
+        for prefix in ["", "# comment\n"] {
+            let source = format!("{prefix}x = 1\nx = 2\n");
+            let env = parsed_environment(&source);
+            let binders: Vec<_> = env
+                .bindings
+                .iter()
+                .filter(|binding| binding.name == "x")
+                .collect();
+            assert_eq!(binders.len(), 2);
+            for binding in binders {
+                let occurrence = OccurrenceRow {
+                    file: binding.file.clone(),
+                    content_identity: binding.content_identity,
+                    node: binding.node.unwrap(),
+                    range: binding.range,
+                    role: OccurrenceRole::Binder,
+                    class: OccurrenceClass::Binding,
+                    namespace: Namespace::Value,
+                    enclosing: None,
+                    raw_spelling: "x".into(),
+                    decoded_spelling: None,
+                    resolution_status: None,
+                    target: OccurrenceTarget::None,
+                    candidates: None,
+                };
+                let positional =
+                    binding_of(&env, "x", binding.range.start_byte, Some(Namespace::Value));
+                let outcome = binding_of_occurrence(&env, &occurrence);
+                assert_eq!(outcome, positional);
+                let BindingOfOutcome::Shadowed { winner, shadowed } = outcome else {
+                    panic!("scope-wide assignments share ranking")
+                };
+                assert_eq!(env.bindings[winner].range.start_byte, prefix.len() + 6);
+                assert_eq!(shadowed.len(), 1);
+            }
+        }
+    }
+}

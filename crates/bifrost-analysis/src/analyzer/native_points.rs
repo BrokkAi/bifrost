@@ -48,6 +48,104 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWor
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 
+/// Borrow production model/declaration authority when a regression inspects raw
+/// selected answers instead of the source-only navigation projection.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn selected_analyzer_services_for_test(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+) -> impl crate::analyzer::store::resolution_operation::SelectedAnalyzerServices + '_ {
+    crate::analyzer::selected_services::AnalyzerSelectedServices(analyzer)
+}
+
+/// Select a proven carrier identity, excluding owner-only member projections.
+/// An explicit expression slot takes precedence over binding projections.
+#[doc(hidden)]
+pub fn selected_value_type_for_barrier(
+    answer: &FactResolutionAnswer,
+    query_result_slot: Option<SemanticId>,
+) -> Result<
+    Option<crate::analyzer::resolution::ResolutionTypeRef>,
+    crate::analyzer::semantic::ValueTypeBarrierReason,
+> {
+    let mut selection = BarrierValueTypeSelection::default();
+    selection.observe(answer, query_result_slot)?;
+    selection.finish()
+}
+
+/// Accumulate carrier candidates before rejecting incomplete type evidence.
+/// Ambiguity remains proven even when other resolution evidence is incomplete.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct BarrierValueTypeSelection {
+    selected: Option<crate::analyzer::resolution::ResolutionTypeRef>,
+    incomplete: bool,
+}
+
+impl BarrierValueTypeSelection {
+    /// Observe one selected answer, preserving ambiguity across answers and slots.
+    pub fn observe(
+        &mut self,
+        answer: &FactResolutionAnswer,
+        query_result_slot: Option<SemanticId>,
+    ) -> Result<
+        Option<crate::analyzer::resolution::ResolutionTypeRef>,
+        crate::analyzer::semantic::ValueTypeBarrierReason,
+    > {
+        use crate::analyzer::semantic::ValueTypeBarrierReason::{AmbiguousType, IncompleteType};
+        if answer.binding().targets().len() > 1 {
+            return Err(AmbiguousType);
+        }
+        self.incomplete |= answer.completion() != &ResolutionCompletion::Complete;
+        let (_, kind, _) =
+            crate::analyzer::usages::get_type::projection_target_kind(answer.projections());
+        let slots = answer
+            .projections()
+            .iter()
+            .filter(|projection| {
+                query_result_slot.is_none()
+                    && Some(projection.kind()) == kind
+                    && projection.kind() != BindingProjectionKind::TargetMemberOwnerType
+            })
+            .map(|projection| projection.output_slot())
+            .chain(
+                answer
+                    .observed_type_identity()
+                    .filter(|_| query_result_slot.is_none()),
+            )
+            .chain(query_result_slot);
+        for slot in slots {
+            let frontier = answer
+                .projected_frontiers()
+                .iter()
+                .find(|frontier| frontier.slot() == slot)
+                .ok_or(IncompleteType)?;
+            self.incomplete |= frontier.completion() != &ResolutionCompletion::Complete;
+            for value in frontier.possible_values() {
+                if self.selected.is_some_and(|previous| previous != value.ty()) {
+                    return Err(AmbiguousType);
+                }
+                self.selected = Some(value.ty());
+            }
+        }
+        Ok(self.selected)
+    }
+
+    /// An incomplete unique candidate is never sufficient to apply a kill.
+    pub fn finish(
+        self,
+    ) -> Result<
+        Option<crate::analyzer::resolution::ResolutionTypeRef>,
+        crate::analyzer::semantic::ValueTypeBarrierReason,
+    > {
+        if self.incomplete {
+            Err(crate::analyzer::semantic::ValueTypeBarrierReason::IncompleteType)
+        } else {
+            Ok(self.selected)
+        }
+    }
+}
+
 #[doc(hidden)]
 pub enum NativePointContext {
     Ready {
@@ -711,7 +809,10 @@ fn adapt_definition_answer_with_import_model(
             .any(|candidate| candidate.verdict() == ApplicabilityVerdict::Unknown);
     let ambiguous = (target_count > 1 || inconsistent_precedence) && !unproven_term_family;
     if ambiguous {
-        diagnostics.push(DefinitionLookupDiagnostic {
+        // An ambiguous binding has status `Ambiguous`, so its ambiguity is the
+        // primary diagnostic. Open evidence that also limits completeness,
+        // such as unproven cross-root source access, follows it.
+        diagnostics.insert(0, DefinitionLookupDiagnostic {
             claim: None,
             kind: if scala_type_ambiguity {
                 "ambiguous_scala_type"
@@ -1166,6 +1267,52 @@ pub fn resolve_native_type_bounded<A: LanguageAdapter>(
             },
         },
         unavailable_type,
+    )
+}
+
+/// Resolve a native type while retaining its complete public evidence for a
+/// language's carrier translation. Agreement remains in BarrierValueTypeSelection.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn resolve_native_observed_value_type_bounded<A: LanguageAdapter>(
+    inner: &TreeSitterAnalyzer<A>,
+    query: BoundedReceiverQuery<'_>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    translate: impl FnOnce(
+        &SelectedNativeReferenceTypes,
+    ) -> crate::analyzer::semantic::ObservedValueType,
+) -> BoundedResolution<crate::analyzer::semantic::ObservedValueType> {
+    use crate::analyzer::semantic::{ObservedValueType, ValueTypeBarrierReason};
+    resolve_native_point_bounded(
+        inner,
+        NativePointReference {
+            query,
+            namespace: None,
+            call_argument_ordinal: None,
+        },
+        prepare_context,
+        || {},
+        |operation, context, locator, cancellation, _| {
+            operation.resolve_native_type_site_bounded(
+                context,
+                locator,
+                query.budget,
+                cancellation,
+                &mut SelectedResolutionContextMetrics,
+            )
+        },
+        |answer, work, _| match answer.value_types {
+            SelectedNativeTypes::Cancelled => BoundedResolution::Cancelled { work },
+            _ => BoundedResolution::Complete {
+                value: translate(&answer),
+                work,
+            },
+        },
+        |_, _, _| ObservedValueType::Undecided(ValueTypeBarrierReason::IncompleteType),
     )
 }
 

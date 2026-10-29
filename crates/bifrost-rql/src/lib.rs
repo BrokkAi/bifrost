@@ -17,7 +17,8 @@ pub mod analyzer {
     };
 
     pub use brokk_bifrost_jvm_analysis::analyzer::{
-        JavaAnalyzer, JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, JavaCallResultUse,
+        JavaAnalyzer, JavaAnnotationArtifact, JavaAnnotationTypeResolution,
+        JavaAnnotationTypeRoute, JavaAnnotationTypeStatus, JavaCallResultUse,
         JavaCallResultUseIndex, JavaCallResultUseOpen, JavaCallResultUseRelationIndex,
         JavaJarPackProducer, JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence,
         JdkSourceArchiveLayout, JdkSourceArchivePackProducer, JdkVersion, JvmDependencyPackAdapter,

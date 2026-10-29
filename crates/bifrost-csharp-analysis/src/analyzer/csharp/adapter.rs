@@ -114,6 +114,12 @@ impl LanguageAdapter for CSharpAdapter {
         source: &str,
         tree: &Tree,
     ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
+        #[cfg(any(test, feature = "test-support"))]
+        if super::trial_native_csharp_selected() {
+            return brokk_bifrost_csharp::declarations::parse_csharp_file_with_native_facts(
+                file, source, tree,
+            );
+        }
         parse_csharp_file(file, source, tree)
     }
 

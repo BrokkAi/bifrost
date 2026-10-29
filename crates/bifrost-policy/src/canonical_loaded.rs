@@ -590,11 +590,36 @@ fn taint_sanitizer_to_json(
 ) -> Result<Value, LoadedModelError> {
     let selector = selector_by_path(selectors, &entry.selector_path)?;
     let definition = &entry.definition;
-    let mut definition_fields = taint_port_fields_to_json(
-        resolved_selector_to_json(selector),
-        policy_port_to_json(&definition.input),
-        policy_port_to_json(&definition.output),
-    );
+    let mut definition_fields = super::canonical::sanitizer_kind_to_json(&definition.kind)
+        .as_object()
+        .expect("sanitizer kind is an object")
+        .clone();
+    definition_fields.insert("selector".into(), resolved_selector_to_json(selector));
+    if let TaintSanitizerKind::Conditional { requires, .. } = &definition.kind {
+        let mut requirements = requires
+            .iter()
+            .enumerate()
+            .map(|(index, requirement)| {
+                let mut value = super::canonical::sanitizer_requirement_to_json(requirement);
+                if matches!(requirement.condition, TaintSanitizerCondition::ResultOf(_)) {
+                    let path = PolicySelectorPath::new(sanitizer_requirement_selector_path(
+                        entry.selector_path.as_str(),
+                        index,
+                    ))
+                    .expect("a derived selector path is valid");
+                    value["result_of"] =
+                        resolved_selector_to_json(selector_by_path(selectors, &path)?);
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<Value>, LoadedModelError>>()?;
+        if !requirements.is_empty() {
+            requirements.sort_by_cached_key(|value| {
+                serde_json_canonicalizer::to_vec(value).expect("requirements encode as JSON")
+            });
+            definition_fields.insert("requires".into(), Value::Array(requirements));
+        }
+    }
     definition_fields.insert(
         "removes".to_string(),
         json!(sorted_ids(&definition.removes)),

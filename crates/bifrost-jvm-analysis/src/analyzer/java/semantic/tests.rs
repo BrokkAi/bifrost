@@ -569,7 +569,19 @@ fn lambda_captures_relay_through_lambdas_and_keep_unsupported_binders_open() {
         siblings.captures()[0].captured,
         siblings.captures()[1].captured
     );
-    for name in ["pattern", "factory", "reassigned", "assignedParameter"] {
+    let pattern = method(&artifact, "pattern");
+    assert_eq!(
+        pattern.captures().len(),
+        1,
+        "visible effectively-final pattern is captured"
+    );
+    assert!(
+        pattern
+            .gaps()
+            .iter()
+            .all(|gap| gap.capability != SemanticCapability::Captures)
+    );
+    for name in ["factory", "reassigned", "assignedParameter"] {
         assert!(
             method(&artifact, name)
                 .gaps()
@@ -1234,8 +1246,8 @@ fn missing_yield_gap_remains_only_when_a_rule_or_group_can_fall_off_its_end() {
 }
 
 #[test]
-#[hardwon("#6523: an instanceof result had no flow and a pattern variable's value had no gap")]
-fn instanceof_derives_its_result_and_a_pattern_variable_reference_leaves_a_gap() {
+#[hardwon("#6523+#7369: instanceof results and visible pattern values need source flows")]
+fn instanceof_derives_its_result_and_establishes_visible_pattern_bindings() {
     let source = r#"class Fixture {
   void run(Object value) {
     boolean plain = value instanceof String;
@@ -1261,18 +1273,20 @@ fn instanceof_derives_its_result_and_a_pattern_variable_reference_leaves_a_gap()
             result
         ));
     }
-    // The tests themselves carry no gap, and neither does a binder nothing
-    // refers to. The reference to `shown` holds a value with no source.
-    let pattern_gaps = run
-        .gaps()
-        .iter()
-        .filter(|gap| gap.detail.contains("pattern variable"))
-        .collect::<Vec<_>>();
-    let [gap] = pattern_gaps[..] else {
-        panic!("expected one gap for the one reference: {pattern_gaps:?}");
-    };
-    assert_eq!(gap.capability, SemanticCapability::Values);
-    assert_eq!(mapping_text(run, source, gap.source), "shown");
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::Local,
+        "value",
+        "shown"
+    ));
+    assert!(
+        run.gaps()
+            .iter()
+            .all(|gap| gap.capability != SemanticCapability::Values),
+        "simple successful patterns now establish their values: {:?}",
+        run.gaps()
+    );
 }
 
 #[test]

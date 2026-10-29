@@ -51,6 +51,14 @@ pub fn supports_kind_from_table(
             .any(|(_, fact_kind)| fact_kind.satisfies(kind))
 }
 
+/// A binding whose name is written outside its owning scope.
+/// The name retains its source token identity; the consuming scope owns its
+/// activation, as for a parameter written directly in that scope.
+#[derive(Debug, Clone, Copy)]
+pub struct ImplicitScopeBinder<'tree> {
+    pub name: Node<'tree>,
+}
+
 /// One source-backed fact parsed from a structured value inside a primary node.
 ///
 /// The descriptor is owned because the secondary parse tree does not survive
@@ -245,6 +253,16 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
+    /// Conditional-compilation evidence for this file. It is query-time data,
+    /// not part of persisted structural rows.
+    fn conditional_regions(
+        &self,
+        _root: Node<'_>,
+        _source: &str,
+    ) -> super::conditional_regions::ConditionalRegions {
+        super::conditional_regions::ConditionalRegions::default()
+    }
+
     /// A tree re-parsed around syntax the bundled grammar cannot represent, or
     /// `None` when `tree` stands as parsed.
     ///
@@ -298,6 +316,14 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// variable declarators that are assignments only when they have values.
     fn should_extract(&self, _node: Node<'_>, _kind: NormalizedKind) -> bool {
         true
+    }
+
+    /// Source-local statement aggregation is unsupported unless the adapter
+    /// supplies grammar roles and the evidence absent from normalized kinds.
+    fn statement_fact_syntax(
+        &self,
+    ) -> Option<&dyn crate::analyzer::statement_facts::producer::StatementFactSyntax> {
+        None
     }
 
     /// A grammar-backed construct label for semantic generator rules.
@@ -470,6 +496,15 @@ pub trait StructuralSpec: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Source-written attributes of declarations supported by this adapter.
+    fn declaration_attributes(
+        &self,
+        _node: Node<'_>,
+        _source: &str,
+    ) -> Option<super::facts::DeclarationAttributes> {
+        None
+    }
+
     /// Whether this adapter records AST-backed async modifiers for callable facts.
     fn supports_async_callable_value(&self) -> bool {
         false
@@ -586,6 +621,19 @@ pub trait StructuralSpec: Send + Sync + 'static {
         _candidate: BindingScopeCandidate<'_>,
     ) -> BindingScopeSelection {
         BindingScopeSelection::Use
+    }
+
+    /// Source-backed binders implicitly introduced by this syntax scope.
+    ///
+    /// These tokens need not be descendants of `scope_node`. Their binding
+    /// kind and activation use [`Self::binding_activation`] with this scope's
+    /// range, just like ordinary binder tokens. `None` means the syntax does
+    /// not establish the implicit bindings and makes binding intervals incomplete.
+    fn implicit_scope_binders<'tree>(
+        &self,
+        _scope_node: Node<'tree>,
+    ) -> Option<Vec<ImplicitScopeBinder<'tree>>> {
+        Some(Vec::new())
     }
 
     /// What binding `binder` introduces into the scope whose range is `scope`,

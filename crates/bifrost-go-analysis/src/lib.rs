@@ -55,12 +55,10 @@ pub mod analyzer {
         pub mod get_definition {
             pub mod go;
         }
-        pub mod go_graph;
     }
 }
 
 pub use analyzer::go::*;
-pub use analyzer::usages::go_graph::GoUsageGraphStrategy;
 #[cfg(test)]
 #[unsafe(no_mangle)]
 fn __brokk_bifrost_language_supports_v1()
@@ -86,3 +84,6 @@ fn __brokk_bifrost_store_language_supports_v1()
 
 #[cfg(test)]
 mod registration_tests;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-10-01 (`query_code` schema version 1).
+> Last verified end to end: 2026-10-27 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
@@ -725,6 +725,335 @@ class QueryResource {
       "result_type": "declaration",
       "signature": "class QueryLeaf extends QueryRoot {",
       "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Query expression operands and branches
+
+A cast exposes its target `type` and its input `value`. An `instance_of`
+expression exposes its `operand`, tested `type`, and optional pattern
+`binding`. The conditional expression uses `if` with `test`, `consequence`,
+and `alternative` roles.
+
+<!-- code-query-fixture:java/Shapes.java -->
+```java
+class Shapes {
+    void inspect(Object value, int size, boolean flag) {
+        String text = (String) value;
+        if (value instanceof String match) {}
+        int picked = flag ? size : 0;
+        int[] values = new int[size];
+        int negative = -size;
+        outer: while (flag) {
+            continue outer;
+        }
+    }
+}
+```
+
+<!-- code-query-case:cast-type:rql -->
+```lisp
+(language java (cast :type (capture "target") :value (capture "input")))
+```
+
+<!-- code-query-case:cast-type:json -->
+```json
+{"languages":["java"],"match":{"kind":"cast","type":{"capture":"target"},"value":{"capture":"input"}}}
+```
+
+<!-- code-query-case:cast-type:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/Shapes.java",
+      "language": "java",
+      "kind": "cast",
+      "start_line": 3,
+      "end_line": 3,
+      "text": "(String) value",
+      "enclosing_symbol": "Shapes.inspect",
+      "captures": [
+        {
+          "name": "input",
+          "text": "value",
+          "start_line": 3
+        },
+        {
+          "name": "target",
+          "text": "String",
+          "start_line": 3
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+
+<!-- code-query-case:instance-binding:rql -->
+```lisp
+(language java (instance_of :operand (capture "input") :type (capture "target") :binding (capture "bound")))
+```
+
+<!-- code-query-case:instance-binding:json -->
+```json
+{"languages":["java"],"match":{"kind":"instance_of","operand":{"capture":"input"},"type":{"capture":"target"},"binding":{"capture":"bound"}}}
+```
+
+<!-- code-query-case:instance-binding:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/Shapes.java",
+      "language": "java",
+      "kind": "instance_of",
+      "start_line": 4,
+      "end_line": 4,
+      "text": "value instanceof String match",
+      "enclosing_symbol": "Shapes.inspect",
+      "captures": [
+        {
+          "name": "target",
+          "text": "String",
+          "start_line": 4
+        },
+        {
+          "name": "input",
+          "text": "value",
+          "start_line": 4
+        },
+        {
+          "name": "bound",
+          "text": "match",
+          "start_line": 4
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+
+<!-- code-query-case:conditional-branches:rql -->
+```lisp
+(language java (if :test (capture "condition") :consequence (capture "yes") :alternative (capture "no")))
+```
+
+<!-- code-query-case:conditional-branches:json -->
+```json
+{"languages":["java"],"match":{"kind":"if","test":{"capture":"condition"},"consequence":{"capture":"yes"},"alternative":{"capture":"no"}}}
+```
+
+<!-- code-query-case:conditional-branches:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/Shapes.java",
+      "language": "java",
+      "kind": "if",
+      "start_line": 5,
+      "end_line": 5,
+      "text": "flag ? size : 0",
+      "enclosing_symbol": "Shapes.inspect",
+      "captures": [
+        {
+          "name": "condition",
+          "text": "flag",
+          "start_line": 5
+        },
+        {
+          "name": "yes",
+          "text": "size",
+          "start_line": 5
+        },
+        {
+          "name": "no",
+          "text": "0",
+          "start_line": 5
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+
+Array creation separates the element `type` from its `dimensions`, whose
+spans include the brackets. Unary
+expressions expose their `operand`. A labeled jump exposes the destination
+through `label`.
+
+<!-- code-query-case:array-dimension:rql -->
+```lisp
+(language java (array_creation :type (capture "element") :dimensions [(capture "size")]))
+```
+
+<!-- code-query-case:array-dimension:json -->
+```json
+{"languages":["java"],"match":{"kind":"array_creation","type":{"capture":"element"},"dimensions":[{"capture":"size"}]}}
+```
+
+<!-- code-query-case:array-dimension:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/Shapes.java",
+      "language": "java",
+      "kind": "array_creation",
+      "start_line": 6,
+      "end_line": 6,
+      "text": "new int[size]",
+      "enclosing_symbol": "Shapes.inspect",
+      "captures": [
+        {
+          "name": "element",
+          "text": "int",
+          "start_line": 6
+        },
+        {
+          "name": "size",
+          "text": "[size]",
+          "start_line": 6
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+
+<!-- code-query-case:unary-operand:rql -->
+```lisp
+(language java (unary_expression :operand (capture "input")))
+```
+
+<!-- code-query-case:unary-operand:json -->
+```json
+{"languages":["java"],"match":{"kind":"unary_expression","operand":{"capture":"input"}}}
+```
+
+<!-- code-query-case:unary-operand:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/Shapes.java",
+      "language": "java",
+      "kind": "unary_expression",
+      "start_line": 7,
+      "end_line": 7,
+      "text": "-size",
+      "enclosing_symbol": "Shapes.inspect",
+      "captures": [
+        {
+          "name": "input",
+          "text": "size",
+          "start_line": 7
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+
+<!-- code-query-case:continue-label:rql -->
+```lisp
+(language java (continue :label (capture "destination")))
+```
+
+<!-- code-query-case:continue-label:json -->
+```json
+{"languages":["java"],"match":{"kind":"continue","label":{"capture":"destination"}}}
+```
+
+<!-- code-query-case:continue-label:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/Shapes.java",
+      "language": "java",
+      "kind": "continue",
+      "start_line": 9,
+      "end_line": 9,
+      "text": "continue outer;",
+      "enclosing_symbol": "Shapes.inspect",
+      "captures": [
+        {
+          "name": "destination",
+          "text": "outer",
+          "start_line": 9
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Select array indices
+
+A Java array access is a `subscript`. Its `object` is the indexed array and
+its `indices` are the index expressions.
+
+<!-- code-query-fixture:java/Indexing.java -->
+```java
+class Indexing {
+    int first(int[] values) {
+        return values[0];
+    }
+}
+```
+
+<!-- code-query-case:subscript-index:rql -->
+```lisp
+(language java (subscript :object (name "values") :indices [(capture "index")]))
+```
+
+<!-- code-query-case:subscript-index:json -->
+```json
+{"languages":["java"],"match":{"kind":"subscript","object":{"name":"values"},"indices":[{"capture":"index"}]}}
+```
+
+<!-- code-query-case:subscript-index:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "java/Indexing.java",
+      "language": "java",
+      "kind": "subscript",
+      "start_line": 3,
+      "end_line": 3,
+      "text": "values[0]",
+      "enclosing_symbol": "Indexing.first",
+      "captures": [
+        {
+          "name": "index",
+          "text": "0",
+          "start_line": 3
+        }
+      ]
     }
   ],
   "truncated": false

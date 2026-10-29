@@ -1,7 +1,12 @@
 //! Source-backed shape of native failure handlers.
 
 use crate::analyzer::Range;
+use crate::analyzer::read_ledger::{DerivationExecutionCause, reason as derivation_reason};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::structural::body_relations::{
+    BodyState, BodyStateAnswer, classify_body,
+};
+use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,14 +21,25 @@ pub enum HandlerBodyGap {
     SyntaxRecovery,
     MissingBody,
     MissingTryBody,
+    UnprovenActivation,
 }
 
 impl HandlerBodyGap {
+    pub const fn execution_cause(self) -> Option<DerivationExecutionCause> {
+        match self {
+            Self::SyntaxRecovery
+            | Self::MissingBody
+            | Self::MissingTryBody
+            | Self::UnprovenActivation => None,
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
-            Self::SyntaxRecovery => "syntax_recovery",
-            Self::MissingBody => "missing_body",
-            Self::MissingTryBody => "missing_try_body",
+            Self::SyntaxRecovery => derivation_reason::SYNTAX_RECOVERY,
+            Self::MissingBody => derivation_reason::MISSING_BODY,
+            Self::MissingTryBody => derivation_reason::MISSING_TRY_BODY,
+            Self::UnprovenActivation => derivation_reason::UNPROVEN_ACTIVATION,
         }
     }
 }
@@ -56,7 +72,7 @@ impl HandlerRethrowKind {
             Self::Bare => "bare",
             Self::CaughtVariable => "caught_variable",
             Self::Both => "both",
-            Self::Unknown => "unknown",
+            Self::Unknown => derivation_reason::UNKNOWN,
         }
     }
 }
@@ -68,15 +84,35 @@ pub struct CSharpCatchBodyFacts {
     pub rethrow: HandlerRethrowKind,
 }
 
+/// Proof that a candidate branch selects the language's failure representation.
+/// This is independent of the structural work performed by its body.
+/// An open identity is a content gap. Producers must record execution
+/// dependence separately if the proof stopped on an operational failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerIdentityProof {
+    Exact,
+    Open,
+}
+
+impl HandlerIdentityProof {
+    pub const fn gap(self) -> Option<&'static str> {
+        match self {
+            Self::Exact => None,
+            Self::Open => Some(derivation_reason::HANDLER_IDENTITY_UNPROVEN),
+        }
+    }
+}
+
 /// One failure branch selected by a language-native failure-handler hook.
 ///
 /// Native failure syntax does not necessarily have a normalized `Catch` node
 /// (Rust `match` arms are one example). The structural query engine keeps the
 /// shared result vocabulary while the language adapter supplies the exact
-/// branch range and its body shape.
+/// branch range, handler-identity proof, and independent body shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeFailureBranch {
     pub handler: Range,
+    pub identity: HandlerIdentityProof,
     pub shape: HandlerBodyShape,
 }
 
@@ -217,33 +253,31 @@ const RUBY: HandlerSyntax = HandlerSyntax {
 /// immediate handler body nonempty. Comments are never approval to suppress a
 /// finding; policy suppression is a separate reviewed decision.
 pub fn java_catch_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &JAVA)
+    handler_body_shape(syntax, catch, &JAVA, &ConditionalRegions::default())
 }
 
 /// Classify an exact JavaScript or TypeScript `catch` clause, including an
 /// optional-binding `catch {}`. Only the syntactic handler is classified; a
 /// promise rejection callback is not a `catch` clause.
 pub fn js_ts_catch_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &JS_TS)
+    handler_body_shape(syntax, catch, &JS_TS, &ConditionalRegions::default())
 }
 
 /// Classify an exact Python `except` or `except*` clause. A suite of only
 /// `pass`, `...` and comments is empty.
 pub fn python_except_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &PYTHON)
-}
-
-/// Classify an exact C# `catch` clause, including one with a `when` filter:
-/// a filter selects the exception but does not handle it.
-pub fn csharp_catch_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    csharp_catch_body_facts(syntax, catch).shape
+    handler_body_shape(syntax, catch, &PYTHON, &ConditionalRegions::default())
 }
 
 /// Classify the exact C# catch body and whether it propagates its caught
 /// exception. Nested catch clauses and nested callable bodies are separate
 /// handlers/scopes, so their throw statements do not count for this handler.
-pub fn csharp_catch_body_facts(syntax: &PreparedSyntaxTree, catch: Range) -> CSharpCatchBodyFacts {
-    let shape = handler_body_shape(syntax, catch, &CSHARP);
+pub fn csharp_catch_body_facts(
+    syntax: &PreparedSyntaxTree,
+    catch: Range,
+    regions: &ConditionalRegions,
+) -> CSharpCatchBodyFacts {
+    let shape = handler_body_shape(syntax, catch, &CSHARP, regions);
     let rethrow = match shape.state {
         HandlerBodyState::Open(_) => HandlerRethrowKind::Unknown,
         HandlerBodyState::Empty => HandlerRethrowKind::None,
@@ -312,25 +346,25 @@ fn csharp_catch_rethrow_kind(syntax: &PreparedSyntaxTree, catch: Range) -> Handl
 
 /// Classify an exact PHP `catch` clause.
 pub fn php_catch_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &PHP)
+    handler_body_shape(syntax, catch, &PHP, &ConditionalRegions::default())
 }
 
 /// Classify an exact C++ `catch` clause, including `catch (...)`.
 pub fn cpp_catch_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &CPP)
+    handler_body_shape(syntax, catch, &CPP, &ConditionalRegions::default())
 }
 
 /// Classify an exact Kotlin `catch` block. An expression-position `try`
 /// whose catch block is empty evaluates to `Unit` there; the handler is
 /// still empty.
 pub fn kotlin_catch_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &KOTLIN)
+    handler_body_shape(syntax, catch, &KOTLIN, &ConditionalRegions::default())
 }
 
 /// Classify an exact Ruby `rescue` clause of a `begin` or implicit-begin
 /// body. The `rescue` modifier (`value rescue nil`) is a different node.
 pub fn ruby_rescue_body_shape(syntax: &PreparedSyntaxTree, catch: Range) -> HandlerBodyShape {
-    handler_body_shape(syntax, catch, &RUBY)
+    handler_body_shape(syntax, catch, &RUBY, &ConditionalRegions::default())
 }
 
 /// Classify the case clauses in one exact Scala `catch_clause`.
@@ -482,6 +516,7 @@ fn handler_body_shape(
     syntax: &PreparedSyntaxTree,
     catch: Range,
     grammar: &HandlerSyntax,
+    regions: &ConditionalRegions,
 ) -> HandlerBodyShape {
     let open = |gap, body, try_body| HandlerBodyShape {
         state: HandlerBodyState::Open(gap),
@@ -561,15 +596,13 @@ fn handler_body_shape(
             try_body,
         };
     };
-    let mut cursor = body.walk();
-    let nonempty = body
-        .named_children(&mut cursor)
-        .any(|child| !child.is_extra() && !(grammar.is_no_op)(child));
     HandlerBodyShape {
-        state: if nonempty {
-            HandlerBodyState::Nonempty
-        } else {
-            HandlerBodyState::Empty
+        state: match classify_body(body, regions, grammar.is_no_op) {
+            BodyStateAnswer::Decided(BodyState::Code) => HandlerBodyState::Nonempty,
+            BodyStateAnswer::Decided(_) => HandlerBodyState::Empty,
+            BodyStateAnswer::Undecided => {
+                HandlerBodyState::Open(HandlerBodyGap::UnprovenActivation)
+            }
         },
         body: body_range,
         try_body,
@@ -630,6 +663,78 @@ mod tests {
             .into_iter()
             .map(|catch| java_catch_body_shape(&prepared, catch))
             .collect()
+    }
+
+    #[test]
+    fn csharp_rethrow_scan_excludes_nested_scopes_without_skipping_siblings() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        for (nested, tail, expected) in [
+            (
+                "void Local() { throw new Exception(); }",
+                "throw;",
+                HandlerRethrowKind::Bare,
+            ),
+            (
+                "void Local() { throw new Exception(); }",
+                "throw e;",
+                HandlerRethrowKind::CaughtVariable,
+            ),
+            (
+                "void Local() { throw new Exception(); }",
+                "",
+                HandlerRethrowKind::None,
+            ),
+            (
+                "try {} catch (Exception inner) { throw; }",
+                "throw e;",
+                HandlerRethrowKind::CaughtVariable,
+            ),
+            (
+                "try {} catch (Exception inner) { throw; }",
+                "",
+                HandlerRethrowKind::None,
+            ),
+        ] {
+            let source = format!(
+                "class A {{ void F() {{ try {{}} catch (Exception e) {{ {nested} {tail} }} }} }}"
+            );
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let catches = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                tree.root_node(),
+                "catch_clause",
+            );
+            let outer = catches.iter().min_by_key(|node| node.start_byte()).unwrap();
+            let range = node_range(*outer);
+            let body = outer.child_by_field_name("body").unwrap();
+            assert_eq!(
+                body.named_child(0).unwrap().kind(),
+                if nested.starts_with("void") {
+                    "local_function_statement"
+                } else {
+                    "try_statement"
+                }
+            );
+            if !tail.is_empty() {
+                assert_eq!(body.named_child(1).unwrap().kind(), "throw_statement");
+            }
+            let syntax = PreparedSyntaxTree::new(
+                PreparedSyntaxSource::Exact(Arc::from(source)),
+                tree,
+                vec![0],
+                LanguageDialect::Standard(Language::CSharp),
+                PreparedSourceOrigin::Disk,
+                None,
+            );
+            assert_eq!(csharp_catch_rethrow_kind(&syntax, range), expected);
+        }
     }
 
     #[test]
@@ -776,6 +881,48 @@ mod tests {
             let shapes = scala_shapes(source);
             assert_eq!(shapes.len(), 1, "{source}");
             assert_eq!(shapes[0].shape.state, Nonempty, "{source}");
+        }
+
+        for (source, bodies) in [
+            (
+                "object A { def f(): Unit = { try { work() } catch { case e: Exception => () } } }",
+                vec!["()"],
+            ),
+            (
+                "object A { def f(): Unit = { try { work() } catch { case e: Exception => report(\"caf\u{e9}\"); cleanup() } } }",
+                vec!["report(\"caf\u{e9}\"); cleanup()"],
+            ),
+            (
+                "object A:\n  def f(): Unit =\n    try work()\n    catch\n      case e: Exception => report(e)\n      case other => ()\n",
+                vec!["report(e)", "()"],
+            ),
+            (
+                "object A { def f(): Unit = { try { work() } catch { case e: Exception => e match { case _ => report(e) } } } }",
+                vec!["e match { case _ => report(e) }"],
+            ),
+        ] {
+            let shapes = scala_shapes(source);
+            assert_eq!(shapes.len(), bodies.len(), "{source}");
+            for (shape, expected) in shapes.iter().zip(bodies) {
+                let body = shape.shape.body.expect("case body span");
+                assert_eq!(&source[body.start_byte..body.end_byte], expected);
+                assert_eq!(
+                    body.start_line,
+                    source.as_bytes()[..body.start_byte]
+                        .iter()
+                        .filter(|&&byte| byte == b'\n')
+                        .count()
+                        + 1
+                );
+                assert_eq!(
+                    body.end_line,
+                    source.as_bytes()[..body.end_byte]
+                        .iter()
+                        .filter(|&&byte| byte == b'\n')
+                        .count()
+                        + 1
+                );
+            }
         }
 
         let expression =

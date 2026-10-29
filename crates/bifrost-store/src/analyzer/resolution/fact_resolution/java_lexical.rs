@@ -739,7 +739,9 @@ impl JavaLexicalReplay {
             )?;
             match construction {
                 SelectedContextOverlayFragmentSourceBlueprintConstruction::Ready(overlay) => {
-                    self.overlay = Some(overlay)
+                    self.overlay = Some(overlay.with_external_definitions(
+                        &evaluation.hierarchy.external_lexical_definitions,
+                    ))
                 }
                 SelectedContextOverlayFragmentSourceBlueprintConstruction::Cancelled {
                     cancellation_completion,
@@ -1130,12 +1132,16 @@ impl FactEvaluation<'_, '_> {
             let scope_read = self
                 .session
                 .member_scopes_for_definitions(&[selected.owner])?;
+            let scope_completion = match &scope_read {
+                SessionFactRead::Exhausted { evidence, .. }
+                | SessionFactRead::Cancelled(evidence) => evidence.clone(),
+            };
             let Some(scopes) = self.accept_session_read(scope_read) else {
                 break;
             };
             for scope in scopes {
                 let scope = scope.get(self.session).row();
-                if scope.external_coverage().is_some() {
+                if let Some(coverage) = scope.external_coverage() {
                     // The typed hierarchy owns external inventory routes. They
                     // carry provider-qualified identities, never source heads.
                     assert!(
@@ -1146,27 +1152,125 @@ impl FactEvaluation<'_, '_> {
                                 .external_owner_identity(scope.definition())
                                 .is_some())
                     );
-                    for definition in self.hierarchy.local_nodes[&HierarchyNodeKey {
-                        shape,
-                        owner: selected.owner,
-                    }]
-                        .direct_definitions
-                        .clone()
+                    // #7619: replay needs indexed-owner and complete-read
+                    // evidence. Qualified positive lookups still use the shared
+                    // family reader over partial inventories as before.
+                    let family = if shape.namespace == ResolutionNamespace::Callable
+                        && (coverage.supertypes_complete || coverage.member_names_only)
+                        && scope_completion == ResolutionCompletion::Complete
                     {
-                        self.record_member_owner_with_route_kind(
-                            definition,
-                            shape
-                                .inherited_member_kind()
-                                .unwrap_or(ResolutionMemberKind::Method),
+                        let Some(family) = self.external_member_family(
+                            selected.owner,
+                            shape,
+                            coverage,
                             selected.owner_path.clone(),
                             false,
-                            FactMemberRouteKind::Member,
+                        )?
+                        else {
+                            return Ok((additions, false));
+                        };
+                        family
+                    } else {
+                        ResolutionAnswer::new(Vec::new(), Vec::new(), scope_completion.clone())
+                    };
+                    if !family.targets().is_empty() {
+                        let direct = &self.hierarchy.local_nodes[&HierarchyNodeKey {
+                            shape,
+                            owner: selected.owner,
+                        }]
+                            .direct_definitions;
+                        assert!(
+                            family
+                                .targets()
+                                .iter()
+                                .all(|target| direct.contains(target)),
+                            "external replay materializes only the selected direct family"
                         );
+                        for &definition in family.targets() {
+                            let mut descriptor = CanonicalIdentityDescriptor::new(
+                                b"bifrost-jvm-lexical-external-member:v1",
+                                |key| self.session.identity_digest(self.hierarchy, key),
+                            );
+                            descriptor
+                                .field("target", CanonicalIdentityPart::identity(definition))?;
+                            let node = BindingNodeId::operation_local(
+                                self.hierarchy.operation_number(descriptor.finish()),
+                            );
+                            self.hierarchy
+                                .external_lexical_definitions
+                                .insert(node, definition);
+                            let mut steps = branch.witness().to_vec();
+                            steps.extend(selected.ancestry.iter().map(|&semantic| {
+                                WitnessStep::Candidate {
+                                    semantic,
+                                    outcome: CandidateOutcome::Selected,
+                                }
+                            }));
+                            steps.push(WitnessStep::Candidate {
+                                semantic: definition,
+                                outcome: CandidateOutcome::Selected,
+                            });
+                            let owner = self.fact_member_owner(
+                                definition,
+                                ResolutionMemberKind::Method,
+                                selected.owner_path.clone(),
+                                false,
+                            );
+                            let origins = self
+                                .hierarchy
+                                .java_lexical_member_owners
+                                .entry((reference, definition))
+                                .or_default();
+                            if !origins.iter().any(|origin| {
+                                origin.owner == owner && origin.steps.as_ref() == steps
+                            }) {
+                                origins.push(JavaLexicalMemberOrigin {
+                                    owner,
+                                    steps: steps.clone().into_boxed_slice(),
+                                });
+                            }
+                            let mut descriptor = CanonicalIdentityDescriptor::new(
+                                b"bifrost-jvm-lexical-external-member-route:v1",
+                                |key| self.session.identity_digest(self.hierarchy, key),
+                            );
+                            descriptor.field(
+                                "branch",
+                                CanonicalIdentityPart::identity(branch_identity.path()),
+                            )?;
+                            descriptor.field(
+                                "fragment",
+                                CanonicalIdentityPart::identity(branch_identity.fragment()),
+                            )?;
+                            descriptor
+                                .field("target", CanonicalIdentityPart::identity(definition))?;
+                            descriptor
+                                .field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                            descriptor.field(
+                                "receiver-root",
+                                CanonicalIdentityPart::identity(selected.root.owner),
+                            )?;
+                            let identity = CandidatePathIdentity::new(
+                                branch_identity.fragment(),
+                                self.hierarchy.operation_path(descriptor.finish()),
+                            );
+                            additions.push((
+                                identity,
+                                PartialPath::new(
+                                    closed_endpoint(branch.start().node(), [shape.lookup]),
+                                    closed_endpoint(node, []),
+                                    branch.precedence().to_vec(),
+                                    steps,
+                                    branch_completion
+                                        .combine(&completion)
+                                        .combine(family.completion()),
+                                ),
+                            ));
+                        }
+                        continue;
                     }
-                    // Inventory identity does not provide a source declaration
-                    // endpoint. Keep this exact external route open instead of
-                    // replaying it as a closed source-scope miss.
-                    let external_completion = branch_completion.combine(&completion).combine(
+                    // Without a proven callable family there is no external
+                    // terminal to publish. Retain this precise frontier.
+                    let external_completion = branch_completion.combine(&completion).combine(family.completion()).combine(
                         &ResolutionCompletion::incomplete([ResolutionIncompleteReason::OpenBoundary {
                             semantic: selected.owner,
                             status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,

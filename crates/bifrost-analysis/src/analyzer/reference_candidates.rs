@@ -8,7 +8,7 @@ use brokk_bifrost_csharp::graph::extractor::{
 use brokk_bifrost_csharp::syntax::{
     csharp_implicit_accessor_value, csharp_is_type_position, csharp_local_binder_name,
 };
-use brokk_bifrost_go::graph::ast::is_clause_binding_identifier as go_is_clause_binding_identifier;
+use brokk_bifrost_go::syntax::is_clause_binding_identifier as go_is_clause_binding_identifier;
 use brokk_bifrost_js_ts::syntax::{
     JsTsLexicalBindingIndex, is_catch_clause_binder as jsts_catch_clause_binder,
     is_declaration_identifier as jsts_declaration_identifier, is_export_alias_identifier,

@@ -1,12 +1,12 @@
 //! Source applicability only. Shared access/prefix cursors own all waits.
 use super::*;
-use crate::analyzer::store::python_member_rows::{
-    DIRECT_MEMBER_WRITES_SQL, LATE_OPERATIONS_SQL, OWNER_OPERATIONS_SQL,
-};
-use rusqlite::ToSql;
+use crate::analyzer::store::StoreError;
+use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 
 pub(in crate::analyzer::store::resolution_operation) struct OperationRow {
     mount: u32,
+    structural: bool,
     site: u32,
     form: u8,
     pub(super) callee: Option<SemanticId>,
@@ -22,6 +22,9 @@ impl OperationRow {
         rules: &PythonRules<'_, '_, '_>,
         answers: &[(DemandReferenceKey, &FactResolutionAnswer)],
     ) -> Result<Option<ModuleMutation>> {
+        if self.structural {
+            return Ok(Some(ModuleMutation::structurally_selected()));
+        }
         let Some(receiver) = self.receiver else {
             return Ok(None);
         };
@@ -97,11 +100,19 @@ impl OperationRow {
 
 // A source close keeps only the receiver's identity proof, never all forward
 // answers or a workspace owner index. Applicability cannot change this owner.
+#[derive(Clone)]
 pub(in crate::analyzer::store::resolution_operation) struct ModuleMutation {
     targets: Vec<SemanticId>,
     complete: bool,
 }
 impl ModuleMutation {
+    pub fn structurally_selected() -> Self {
+        Self {
+            targets: Vec::new(),
+            complete: false,
+        }
+    }
+
     pub fn namespace_completion(&self, reason: SemanticId) -> ResolutionCompletion {
         if self.complete && !self.targets.is_empty() {
             ResolutionCompletion::Complete
@@ -138,103 +149,131 @@ fn fixed_owner(ready: &ReadySelectedResolution<'_, '_>, owner: SemanticId) -> bo
 /// All rows die with the member/root request. No solved-owner index is built.
 pub(in crate::analyzer::store::resolution_operation) fn source_rows(
     rules: &super::super::python_demand::PythonRules<'_, '_, '_>,
-    reference: SemanticId,
     spelling: &str,
     owners: &[SemanticId],
-    queries: &[&str],
 ) -> Result<Read<Vec<OperationRow>>> {
-    super::super::super::resolution::with_resolution_read_progress_handler(
-        rules.ready.inventory.connection(),
-        rules.cancellation,
-        |connection| {
-            // Every candidate in this read has the same selected owners.
-            // Share that query-local snapshot instead of multiplying its heap.
-            let owners = std::rc::Rc::<[SemanticId]>::from(owners);
-            let mut operations = Vec::new();
-            for sql in queries {
-                let mut statement = connection.prepare_cached(sql)?;
-                let format = crate::analyzer::store::python_binding_rows::NATIVE_SOURCE_FORMAT;
-                let callable_result=crate::analyzer::store::resolution_prepare::resolution_rows::code(
-                    brokk_bifrost_core::analyzer::resolution_facts::ALL_BINDING_PROJECTION_KINDS,
-                    brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind::TargetCallableResultType);
-                let arguments: [&dyn ToSql; 4] =
-                    [&format, &spelling, &rules.summary, &callable_result];
-                let count = statement.parameter_count();
-                assert!(
-                    count <= arguments.len(),
-                    "operation reader parameters match SQL"
-                );
-                for row in statement.query_map(&arguments[..count], |row| {
-                    Ok((
-                        row.get::<_, u32>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, u8>(2)?,
-                        row.get::<_, Option<u32>>(3)?,
-                        row.get::<_, Option<u32>>(4)?,
-                    ))
-                })? {
-                    if !rules.session.scope_step() || rules.cancellation.is_cancelled() {
-                        return Ok(Read::Cancelled(if rules.cancellation.is_cancelled() {
-                            super::super::cancelled_completion()
-                        } else {
-                            ResolutionCompletion::incomplete([
-                                ResolutionIncompleteReason::TimeBudgetExceeded(reference),
-                            ])
-                        }));
-                    }
-                    let (mount, site, form, callee, receiver) = row?;
-                    operations.push(OperationRow {
-                        mount,
+    let inventory = rules.structural_inventory()?;
+    // A full result of this query, bounded by environment operations, lives
+    // only with PythonRules. Per-read selection never evaluates receivers.
+    let mut indices = Vec::new();
+    for owner in owners {
+        let space = Some(*owner);
+        let cached = rules.structural_spaces.borrow().get(&space).cloned();
+        let selected = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut containers = Vec::new();
+            if let Some(ordinal) = owner.ordinal() {
+                let selected_mount = super::super::SelectedMountTable::new(&rules.ready.inventory)
+                    .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+                let mount = rules
+                    .ready
+                    .inventory
+                    .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+                if super::super::python_demand::module_declaration_site(
+                    rules.ready.inventory.connection(),
+                    mount.blob_id(),
+                )?
+                .is_some_and(|site| {
+                    crate::analyzer::resolution::mounted_site_semantic(
+                        selected_mount.fragment(),
                         site,
-                        form,
-                        callee: callee.map(|key| SemanticId::local(mount, key)),
-                        receiver: receiver.map(|key| SemanticId::local(mount, key)),
-                        owners: std::rc::Rc::clone(&owners),
-                    });
+                    ) == *owner
+                }) {
+                    containers=rules.ready.inventory.connection().prepare_cached(
+                        "SELECT provider.container_path FROM python_unit_summary_providers provider
+                         JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+                         WHERE provider.summary_id=?1 AND member.blob_id=?2 AND provider.state IN ('selected','alternative')")?
+                        .query_map(rusqlite::params![rules.summary,mount.blob_id()],|row|row.get::<_,String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
                 }
             }
-            rules.observations.borrow_mut().push(format!(
-                "dynamic SQL name={spelling:?} statements={} rows={} owners={owners:?}",
-                queries.len(),
-                operations.len()
-            ));
-            Ok(Read::ready(operations))
-        },
-    )
+            let selected = inventory
+                .iter()
+                .enumerate()
+                .filter(|(_, mutation)| {
+                    mutation.classes.contains(owner)
+                        || mutation
+                            .containers
+                            .iter()
+                            .any(|container| containers.contains(container))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            rules
+                .structural_spaces
+                .borrow_mut()
+                .insert(space, selected.clone());
+            selected
+        };
+        indices.extend(selected);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    let operations = indices
+        .into_iter()
+        .map(|index| &inventory[index])
+        .filter(|mutation| mutation.matches_name(spelling))
+        .map(|mutation| mutation.operation(owners))
+        .collect::<Vec<_>>();
+    rules.observations.borrow_mut().push(format!(
+        "dynamic structural name={spelling:?} rows={} owners={owners:?}",
+        operations.len()
+    ));
+    Ok(Read::ready(operations))
 }
 
-/// Whole-space closure is independent of the spelling currently requested.
-/// Candidate receivers are still proved by the shared prerequisite pump.
+pub(super) fn lookup_spelling(rules: &PythonRules<'_, '_, '_>, name: SemanticId) -> Result<String> {
+    let identity = name
+        .shared_name_id()
+        .and_then(|id| rules.ready.shared_names().to_persisted(id))
+        .expect("selected member name is persisted");
+    Ok(rules.ready.inventory.connection().query_row(
+        "SELECT spelling FROM resolution_identities WHERE id=?1",
+        [identity.get()],
+        |row| row.get(0),
+    )?)
+}
+
+/// Only mutations of this owner and the requested spelling affect this read.
+/// The shared MRO cursor applies this at every visited ancestor.
 pub(super) fn attribute_rows(
     half: &PythonMemberContext<'_, '_, '_>,
     owner: SemanticId,
+    spelling: &str,
 ) -> Result<Read<Vec<OperationRow>>> {
     if fixed_owner(half.rules.ready, owner) {
         return Ok(Read::ready(Vec::new()));
     }
-    attribute_source_rows(half.rules, half.reference, &[owner])
+    source_rows(half.rules, spelling, &[owner])
 }
 
-pub(in crate::analyzer::store::resolution_operation) fn attribute_source_rows(
+pub(in crate::analyzer::store::resolution_operation) fn import_rows(
     rules: &PythonRules<'_, '_, '_>,
-    reference: SemanticId,
-    owners: &[SemanticId],
+    blob: i64,
+    site: u32,
 ) -> Result<Read<Vec<OperationRow>>> {
-    source_rows(
-        rules,
-        reference,
-        "",
-        owners,
-        &["SELECT mounts.mount_ordinal,op.site,op.form,callee.semantic_key,receiver.semantic_key
-           FROM temp.selected_resolution_mounts mounts
-           JOIN resolution_unit_summary_members member ON member.summary_id=?3 AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
-           JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?1
-           JOIN python_member_operations op ON op.blob_id=mounts.blob_id AND op.effect IN (1,2)
-           LEFT JOIN resolution_semantic_sites callee ON callee.blob_id=op.blob_id AND callee.source_site=op.callee_reference AND callee.semantic_role='reference'
-           LEFT JOIN resolution_semantic_sites receiver ON receiver.blob_id=op.blob_id AND receiver.source_site=op.receiver_reference AND receiver.semantic_role='reference'
-           WHERE mounts.storage_language='python'
-           ORDER BY mounts.mount_ordinal,op.site,op.form"],
-    )
+    let imports=rules.ready.inventory.connection().prepare_cached(
+        "SELECT imported.target_container,coalesce(imported.requested_name,'') FROM python_unit_summary_imports imported
+         JOIN resolution_unit_summary_members member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal
+         WHERE imported.summary_id=?1 AND member.blob_id=?2 AND imported.import_site=?3")?
+        .query_map(rusqlite::params![rules.summary,blob,site], |row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let inventory = rules.structural_inventory()?;
+    let operations = inventory
+        .iter()
+        .filter(|mutation| {
+            imports.iter().any(|(container, name)| {
+                if name.is_empty() || name == "*" {
+                    mutation.containers.contains(container)
+                } else {
+                    mutation.can_write(container, name)
+                }
+            })
+        })
+        .map(|mutation| mutation.operation(&[]))
+        .collect();
+    Ok(Read::ready(operations))
 }
 
 pub(super) fn owner_rows(
@@ -245,25 +284,17 @@ pub(super) fn owner_rows(
     if fixed_owner(half.rules.ready, owner) {
         return Ok(Read::ready(Vec::new()));
     }
-    Ok(
-        match source_rows(
-            half.rules,
-            half.reference,
-            spelling,
-            &[owner],
-            &[OWNER_OPERATIONS_SQL, DIRECT_MEMBER_WRITES_SQL],
-        )? {
-            Read::Ready {
-                mut value,
-                completion,
-            } => {
-                value.retain(|row| row.receiver.is_some());
-                Read::Ready { value, completion }
-            }
-            Read::Cancelled(completion) => Read::Cancelled(completion),
-            Read::Unavailable { reason, completion } => Read::Unavailable { reason, completion },
-        },
-    )
+    Ok(match source_rows(half.rules, spelling, &[owner])? {
+        Read::Ready {
+            mut value,
+            completion,
+        } => {
+            value.retain(|row| row.structural || row.receiver.is_some());
+            Read::Ready { value, completion }
+        }
+        Read::Cancelled(completion) => Read::Cancelled(completion),
+        Read::Unavailable { reason, completion } => Read::Unavailable { reason, completion },
+    })
 }
 
 pub(in crate::analyzer::store::resolution_operation) fn universe_rows(
@@ -271,13 +302,29 @@ pub(in crate::analyzer::store::resolution_operation) fn universe_rows(
     reference: SemanticId,
     spelling: &str,
 ) -> Result<Read<Vec<OperationRow>>> {
-    source_rows(
-        rules,
-        reference,
-        spelling,
-        &[],
-        &[LATE_OPERATIONS_SQL, DIRECT_MEMBER_WRITES_SQL],
-    )
+    let inventory = rules.structural_inventory()?;
+    if !rules.structural_spaces.borrow().contains_key(&None) {
+        let indices = inventory
+            .iter()
+            .enumerate()
+            .filter(|(_, mutation)| mutation.builtins)
+            .map(|(index, _)| index)
+            .collect();
+        rules.structural_spaces.borrow_mut().insert(None, indices);
+    }
+    let spaces = rules.structural_spaces.borrow();
+    let operations = spaces[&None]
+        .iter()
+        .map(|index| &inventory[*index])
+        .filter(|mutation| mutation.matches_name(spelling))
+        .map(|mutation| mutation.operation(&[]))
+        .collect::<Vec<_>>();
+    rules.observations.borrow_mut().push(format!(
+        "universe structural name={spelling:?} operations={}",
+        operations.len()
+    ));
+    let _ = reference;
+    Ok(Read::ready(operations))
 }
 
 pub(super) fn late_inventory(
@@ -310,22 +357,14 @@ pub(super) fn late_inventory(
         [identity.get()],
         |row| row.get(0),
     )?;
-    Ok(
-        match source_rows(
-            half.rules,
-            context.reference,
-            &spelling,
-            &owners,
-            &[LATE_OPERATIONS_SQL, DIRECT_MEMBER_WRITES_SQL],
-        )? {
-            Read::Ready { value, completion } => Read::Ready {
-                value: value.into_iter().map(PythonMemberRow::Operation).collect(),
-                completion,
-            },
-            Read::Cancelled(completion) => Read::Cancelled(completion),
-            Read::Unavailable { reason, completion } => Read::Unavailable { reason, completion },
+    Ok(match source_rows(half.rules, &spelling, &owners)? {
+        Read::Ready { value, completion } => Read::Ready {
+            value: value.into_iter().map(PythonMemberRow::Operation).collect(),
+            completion,
         },
-    )
+        Read::Cancelled(completion) => Read::Cancelled(completion),
+        Read::Unavailable { reason, completion } => Read::Unavailable { reason, completion },
+    })
 }
 
 pub(in crate::analyzer::store::resolution_operation) enum OperationProof {
@@ -345,6 +384,12 @@ pub(in crate::analyzer::store::resolution_operation) fn prove(
     row: &OperationRow,
     answers: &[(DemandReferenceKey, &FactResolutionAnswer)],
 ) -> Result<OperationProof> {
+    if row.structural {
+        return Ok(OperationProof::Possible {
+            class_object: true,
+            completion: ResolutionCompletion::Complete,
+        });
+    }
     let answer = |reference| {
         answers
             .iter()
@@ -558,4 +603,439 @@ pub(in crate::analyzer::store::resolution_operation) fn receipt(
     confirmed: bool,
 ) {
     rules.observations.borrow_mut().push(format!("dynamic operation mount={} site={} receiver={:?} possible-replacement=true class-object-confirmed={confirmed} target-retained=true",row.mount,row.site,row.receiver));
+}
+
+/// One query's retained reflective writes. Binding selection, rather than typed
+/// evaluation, identifies imports and direct assignment aliases of module objects.
+/// Nothing in this inventory survives the request.
+pub(in crate::analyzer::store::resolution_operation) struct StructuralMutation {
+    pub containers: Vec<String>,
+    classes: Vec<SemanticId>,
+    builtins: bool,
+    open_receiver: bool,
+    mount: u32,
+    site: u32,
+    form: u8,
+    pub receiver_kind: &'static str,
+    names: Vec<String>,
+    name_kind: u8,
+}
+impl StructuralMutation {
+    fn operation(&self, owners: &[SemanticId]) -> OperationRow {
+        OperationRow {
+            mount: self.mount,
+            site: self.site,
+            form: self.form,
+            structural: true,
+            callee: None,
+            receiver: None,
+            owners: std::rc::Rc::from(owners),
+        }
+    }
+
+    pub fn can_write(&self, container: &str, name: &str) -> bool {
+        self.containers
+            .iter()
+            .any(|candidate| candidate == container)
+            && self.matches_name(name)
+    }
+    fn matches_name(&self, name: &str) -> bool {
+        self.name_kind == 2
+            || self.names.iter().any(|candidate| {
+                if self.name_kind == 1 {
+                    name.starts_with(candidate)
+                } else {
+                    name == candidate
+                }
+            })
+    }
+}
+
+// Alternatives join by openness, independent of the alias worklist order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StructuralReceiverKind {
+    MethodReceiver,
+    Parameter,
+    Attribute,
+    UnresolvedName,
+}
+
+impl StructuralReceiverKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MethodReceiver => "method_receiver",
+            Self::Parameter => "parameter",
+            Self::Attribute => "attribute",
+            Self::UnresolvedName => "unresolved_name",
+        }
+    }
+}
+
+// Both authored references and imported module cells use the same bounded
+// binding-row walk. A module cell must select its reaching bindings too: an
+// old class declaration alone does not identify a subsequently rebound import.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum StructuralAlias {
+    Reference(i64, u32, u32),
+    ModuleCell(i64, u32, String),
+}
+
+pub(in crate::analyzer::store::resolution_operation) fn structural_mutations(
+    ready: &ReadySelectedResolution<'_, '_>,
+    summary: i64,
+    profile: super::super::python_lexical::PythonBindingProfile,
+    session: &ResolutionSession,
+    cancellation: &CancellationToken,
+) -> Result<Vec<StructuralMutation>> {
+    use super::super::python_lexical::{self, PythonBindingProofs};
+    use crate::analyzer::resolution::temporal_binding::SessionBudget;
+    use crate::analyzer::store::python_binding_rows::PythonBindingRows;
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBindingEventKind;
+    crate::analyzer::store::resolution::with_resolution_read_progress_handler(
+        ready.inventory.connection(),
+        cancellation,
+        |connection| {
+            let rows = connection.prepare_cached(
+        "SELECT mounts.blob_id,op.receiver_reference,op.receiver_slot,op.name_kind,
+                (SELECT json_group_array(spelling) FROM python_member_operation_names WHERE operation=op.id),
+                mounts.mount_ordinal,op.site,op.form
+         FROM temp.selected_resolution_mounts mounts
+         JOIN resolution_unit_summary_members member ON member.summary_id=?1
+          AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
+         JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?2
+         JOIN python_member_operations op ON op.blob_id=mounts.blob_id AND op.effect IN (1,2)
+         WHERE mounts.storage_language='python'
+         UNION
+         SELECT mounts.blob_id,receiver.source_site,writes.receiver,0,json_array(name.spelling),mounts.mount_ordinal,writes.site,7
+         FROM temp.selected_resolution_mounts mounts
+         JOIN resolution_unit_summary_members member ON member.summary_id=?1 AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
+         JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?2
+         JOIN python_member_receiver_writes writes ON writes.blob_id=mounts.blob_id
+         JOIN resolution_semantic_sites target ON target.blob_id=writes.blob_id AND target.source_site=writes.site AND target.semantic_role='reference'
+         JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=target.blob_id AND lookup.semantic_key=target.semantic_key
+         JOIN resolution_identities name ON name.id=lookup.identity_id
+         JOIN resolution_qualified_routes qualified ON qualified.blob_id=target.blob_id AND qualified.reference=target.semantic_key
+         LEFT JOIN resolution_binding_projections projection ON projection.blob_id=qualified.blob_id AND projection.output_slot=qualified.qualifier_slot AND projection.kind<>2
+         LEFT JOIN resolution_semantic_sites receiver ON receiver.blob_id=projection.blob_id AND receiver.semantic_key=projection.reference AND receiver.semantic_role='reference'
+         WHERE mounts.storage_language='python'
+         ORDER BY 6,7,8"
+    )?.query_map(rusqlite::params![summary, crate::analyzer::store::python_binding_rows::NATIVE_SOURCE_FORMAT], |row| {
+        Ok((row.get::<_,i64>(0)?,row.get::<_,Option<u32>>(1)?,row.get::<_,Option<u32>>(2)?,row.get::<_,u8>(3)?,row.get::<_,String>(4)?,row.get::<_,u32>(5)?,row.get::<_,u32>(6)?,row.get::<_,u8>(7)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut result = Vec::new();
+            // Full results of binding-row reads are held for this scan only.
+            let mut bindings = HashMap::default();
+            let mut parameter_owners = HashMap::default();
+            let mut parameter_classes = |blob: i64,
+                                         mount: u32,
+                                         parameter: u32|
+             -> Result<Vec<SemanticId>> {
+                let key = (blob, mount, parameter);
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    parameter_owners.entry(key)
+                {
+                    // kind=2 is StaticMethodCandidate: its first argument is not self/cls.
+                    let owners=connection.prepare_cached(
+                        "SELECT owner.semantic_key FROM python_member_member_roles role
+                         JOIN resolution_semantic_sites owner ON owner.blob_id=role.blob_id AND owner.source_site=role.owner AND owner.semantic_role='definition'
+                         WHERE role.blob_id=?1 AND role.receiver_parameter=?2 AND role.kind<>2")?
+                        .query_map(rusqlite::params![blob,parameter],|row|Ok(SemanticId::local(mount,row.get(0)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    entry.insert(owners);
+                }
+                Ok(parameter_owners[&key].clone())
+            };
+
+            for (blob, receiver, slot, name_kind, names, mount, site, form) in rows {
+                if cancellation.is_cancelled() {
+                    return Err(StoreError::cancelled("module mutation scan cancelled"));
+                }
+                let mut containers = Vec::new();
+                let mut classes = Vec::new();
+                let mut builtins = false;
+                let mut open_receiver = false;
+                let mut receiver_kind = None;
+                if let Some(receiver) = receiver {
+                    let mut pending = vec![StructuralAlias::Reference(blob, mount, receiver)];
+                    let mut visited = HashSet::default();
+                    while let Some(alias) = pending.pop() {
+                        // Bound alias traversal independently of the evaluator's round budget.
+                        if visited.len() >= 64 || !visited.insert(alias.clone()) {
+                            receiver_kind =
+                                receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                            open_receiver = true;
+                            continue;
+                        }
+                        let (blob, mount, reference, cell) = match alias {
+                            StructuralAlias::Reference(blob, mount, reference) => {
+                                (blob, mount, Some(reference), None)
+                            }
+                            StructuralAlias::ModuleCell(blob, mount, name) => {
+                                (blob, mount, None, Some(name))
+                            }
+                        };
+                        let lookup = if let Some(name) = &cell {
+                            Some((name.clone(), false))
+                        } else {
+                            connection.query_row(
+                    "SELECT name.spelling, EXISTS(SELECT 1 FROM resolution_qualified_routes q
+                      WHERE q.blob_id=site.blob_id AND q.reference=site.semantic_key)
+                     FROM resolution_semantic_sites site
+                     JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=site.blob_id AND lookup.semantic_key=site.semantic_key
+                     JOIN resolution_identities name ON name.id=lookup.identity_id
+                     WHERE site.blob_id=?1 AND site.source_site=?2 AND site.semantic_role='reference'",
+                    rusqlite::params![blob, reference], |row| Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?))
+                ).optional()?
+                        };
+                        let Some((name, qualified)) = lookup else {
+                            receiver_kind =
+                                receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                            open_receiver = true;
+                            continue;
+                        };
+                        if qualified {
+                            receiver_kind =
+                                receiver_kind.max(Some(StructuralReceiverKind::Attribute));
+                            open_receiver = true;
+                            continue;
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            bindings.entry(blob)
+                        {
+                            let Some(rows) = PythonBindingRows::load(
+                                connection,
+                                &ready.store.cache_budget,
+                                blob,
+                                None,
+                                cancellation,
+                            )?
+                            else {
+                                return Err(StoreError::cancelled(
+                                    "module mutation binding read cancelled",
+                                ));
+                            };
+                            entry.insert(rows);
+                        }
+                        let rows = &bindings[&blob];
+                        let proofs = PythonBindingProofs {
+                            conditional_imports: rows
+                                .imports
+                                .iter()
+                                .map(|import| import.import_site.get())
+                                .collect(),
+                            ..Default::default()
+                        };
+                        if let Some(parameter) = reference
+                            .and_then(|reference| {
+                                python_lexical::fixed_parameter(rows, reference, &name, &proofs)
+                            })
+                            .and_then(|event| event.authored)
+                        {
+                            let owners = parameter_classes(blob, mount, parameter)?;
+                            open_receiver |= owners.is_empty();
+                            receiver_kind = receiver_kind.max(Some(if owners.is_empty() {
+                                StructuralReceiverKind::Parameter
+                            } else {
+                                StructuralReceiverKind::MethodReceiver
+                            }));
+                            classes.extend(owners);
+                            continue;
+                        }
+                        let mut state = if let Some(reference) = reference {
+                            let Some(state) = python_lexical::lexical_selection(
+                                rows, reference, &name, profile, proofs,
+                            ) else {
+                                receiver_kind =
+                                    receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                                open_receiver = true;
+                                continue;
+                            };
+                            state
+                        } else {
+                            let scope = rows
+                                .scopes
+                                .iter()
+                                .find(|scope| scope.parent.is_none())
+                                .expect("module root")
+                                .scope;
+                            python_lexical::module_selection(rows, scope, &name, profile, proofs)
+                        };
+                        let mut budget = SessionBudget {
+                            session,
+                            cancellation,
+                        };
+                        if cell.is_some() {
+                            let scope = rows
+                                .scopes
+                                .iter()
+                                .find(|scope| scope.parent.is_none())
+                                .expect("module root")
+                                .scope;
+                            python_lexical::lexical_tier(&mut state, rows, scope, &mut budget);
+                        } else {
+                            python_lexical::select_lexical(
+                                &mut state,
+                                rows,
+                                &mut budget,
+                                cancellation,
+                            )?;
+                        }
+                        if state.selection.stopped.is_some() {
+                            receiver_kind =
+                                receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                            open_receiver = true;
+                            continue;
+                        }
+                        if state.selection.selected.is_empty() {
+                            if name == "__builtins__" {
+                                builtins = true;
+                            } else {
+                                receiver_kind =
+                                    receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                                open_receiver = true;
+                            }
+                        }
+                        if state.selection.open {
+                            receiver_kind =
+                                receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                            open_receiver = true;
+                        }
+                        for selected in &state.selection.selected {
+                            let Some(event) = rows
+                                .events
+                                .iter()
+                                .find(|event| event.event == selected.occurrence)
+                            else {
+                                receiver_kind =
+                                    receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                                open_receiver = true;
+                                continue;
+                            };
+                            match event.kind {
+                        ResolutionBindingEventKind::Import => {
+                            for import in rows.imports.iter().filter(|import| import.binding_event == Some(event.event)) {
+                                let selected = connection.prepare_cached(
+                                    "SELECT DISTINCT provider.container_path FROM python_unit_summary_imports imported
+                                     JOIN resolution_unit_summary_members member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal
+                                     JOIN python_binding_imports authored ON authored.blob_id=member.blob_id AND authored.import_site=imported.import_site
+                                     JOIN resolution_import_selectors selector ON selector.blob_id=authored.blob_id AND selector.site=authored.import_site
+                                     JOIN python_unit_summary_providers provider ON provider.summary_id=imported.summary_id AND provider.state IN ('selected','alternative')
+                                     WHERE imported.summary_id=?1 AND member.blob_id=?2 AND imported.import_site=?3 AND (
+                                      (authored.form=0 AND provider.module_name=CASE WHEN EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=authored.blob_id AND prefix.import_site=authored.import_site) THEN imported.module_name ELSE selector.source_name END)
+                                      OR (authored.form=1 AND provider.module_name=imported.module_name || '.' || imported.requested_name))"
+                                )?.query_map(rusqlite::params![summary,blob,import.import_site.get()], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                                let has_containers = !selected.is_empty();
+                                containers.extend(selected);
+                                let imported_builtins = connection.query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports imported
+                                     JOIN resolution_unit_summary_members member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal
+                                     WHERE imported.summary_id=?1 AND member.blob_id=?2 AND imported.import_site=?3 AND imported.module_name='builtins' AND imported.form='module')",
+                                    rusqlite::params![summary,blob,import.import_site.get()], |row|row.get::<_,bool>(0))?;
+                                let cells=connection.prepare_cached(
+                                    "SELECT DISTINCT mounted.blob_id,mounted.mount_ordinal,imported.requested_name
+                                     FROM python_unit_summary_imports imported
+                                     JOIN resolution_unit_summary_members importer ON importer.summary_id=imported.summary_id AND importer.member_ordinal=imported.member_ordinal
+                                     JOIN python_unit_summary_providers provider ON provider.summary_id=imported.summary_id AND provider.container_path=imported.target_container AND provider.state IN ('selected','alternative')
+                                     JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+                                     JOIN temp.selected_resolution_mounts mounted ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
+                                     WHERE imported.summary_id=?1 AND importer.blob_id=?2 AND imported.import_site=?3 AND imported.form='from'")?
+                                    .query_map(rusqlite::params![summary,blob,import.import_site.get()],|row|Ok(StructuralAlias::ModuleCell(row.get(0)?,row.get(1)?,row.get(2)?)))?
+                                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                                if !has_containers && !imported_builtins && cells.is_empty() {
+                                    receiver_kind = receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                                    open_receiver = true;
+                                }
+                                builtins |= imported_builtins;
+                                pending.extend(cells);
+                            }
+                        }
+                        ResolutionBindingEventKind::Assign => {
+                            if let Some(source) = connection.query_row(
+                                "SELECT source_reference FROM resolution_binding_events WHERE blob_id=?1 AND event=?2",
+                                rusqlite::params![blob,event.event], |row| row.get::<_,Option<u32>>(0)
+                            )? { pending.push(StructuralAlias::Reference(blob,mount,source)); }
+                            else {
+                                receiver_kind = receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                                open_receiver = true;
+                            }
+                        }
+                        ResolutionBindingEventKind::Class => {
+                            if let Some(authored)=event.authored
+                                && let Some(key)=connection.query_row(
+                                    "SELECT semantic_key FROM resolution_semantic_sites WHERE blob_id=?1 AND source_site=?2 AND semantic_role='definition'",
+                                    rusqlite::params![blob,authored],|row|row.get::<_,u32>(0)).optional()? {
+                                classes.push(SemanticId::local(mount,key));
+                            } else {
+                                receiver_kind = receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                                open_receiver = true;
+                            }
+                        }
+                        ResolutionBindingEventKind::Parameter => {
+                            let owners = if let Some(authored) = event.authored {
+                                parameter_classes(blob, mount, authored)?
+                            } else {
+                                Vec::new()
+                            };
+                            open_receiver |= owners.is_empty();
+                            receiver_kind = receiver_kind.max(Some(if owners.is_empty() {
+                                StructuralReceiverKind::Parameter
+                            } else {
+                                StructuralReceiverKind::MethodReceiver
+                            }));
+                            classes.extend(owners);
+                        },
+                        _ => {
+                            receiver_kind = receiver_kind.max(Some(StructuralReceiverKind::UnresolvedName));
+                            open_receiver = true;
+                        }
+                    }
+                        }
+                    }
+                }
+                containers.sort();
+                containers.dedup();
+                result.push(StructuralMutation {
+                    containers,
+                    classes,
+                    builtins,
+                    open_receiver,
+                    mount,
+                    site,
+                    form,
+                    receiver_kind: receiver_kind.map(StructuralReceiverKind::label).unwrap_or(
+                        if receiver.is_some() {
+                            "unresolved_name"
+                        } else if slot.is_some() {
+                            "expression"
+                        } else {
+                            "missing"
+                        },
+                    ),
+                    names: serde_json::from_str(&names).map_err(|error| {
+                        StoreError::corrupt(format!("invalid mutation names: {error}"))
+                    })?,
+                    name_kind,
+                });
+            }
+            Ok(result)
+        },
+    )
+}
+
+pub(in crate::analyzer::store::resolution_operation) fn dynamic_receiver_obligation(
+    mutations: &[StructuralMutation],
+) -> Option<String> {
+    let mut count = 0;
+    let mut kinds = std::collections::BTreeSet::new();
+    for mutation in mutations.iter().filter(|mutation| {
+        (mutation.containers.is_empty() && mutation.classes.is_empty() && !mutation.builtins)
+            || mutation.open_receiver
+            || mutation.receiver_kind == "method_receiver"
+    }) {
+        count += 1;
+        kinds.insert(mutation.receiver_kind);
+    }
+    (count != 0).then(|| {
+        format!("python_dynamic_receiver_mutation_open:operations={count}:receiver_kinds={kinds:?}")
+    })
 }

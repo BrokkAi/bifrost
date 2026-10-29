@@ -136,14 +136,6 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
         })
     }
 
-    pub fn len(&self) -> usize {
-        self.summaries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.summaries.is_empty()
-    }
-
     fn unique_summary_for(&self, procedure: &ProcedureHandle) -> Option<&SemanticProcedureSummary> {
         crate::semantic_summary::unique_semantic_summary(
             &self.by_artifact,
@@ -476,14 +468,6 @@ impl ProtocolFactKey {
             });
         }
         Err(ProtocolSummaryError::InvalidFact)
-    }
-
-    pub fn to_live(
-        &self,
-        protocol: &CompiledProtocol,
-        bindings: &TypestateBindingPlan,
-    ) -> Result<TypestateFact, ProtocolSummaryError> {
-        ProtocolLiveRemap::try_new(protocol, bindings)?.fact(self)
     }
 }
 
@@ -1034,12 +1018,6 @@ impl CompleteProtocolSummaryRepository {
 
     pub const fn limits(&self) -> ProtocolSummaryRepositoryLimits {
         self.limits
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.by_entry.clear();
-        self.retained_bytes = 0;
     }
 
     pub fn publish(

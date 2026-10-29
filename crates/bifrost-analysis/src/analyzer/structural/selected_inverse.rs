@@ -121,3 +121,67 @@ impl<A: SelectedInverseAdapter> SelectedInverseReferenceIndex for LazySelectedIn
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::reference_edges::EdgeCompleteness;
+    use super::*;
+
+    struct Uncovered;
+    impl SelectedInverseAdapter for Uncovered {
+        fn admit(
+            _: &dyn IAnalyzer,
+            _: &CancellationToken,
+        ) -> Result<(u64, Self), SelectedInverseFailure> {
+            Ok((7, Self))
+        }
+        fn current_generation(&self) -> u64 {
+            7
+        }
+        fn query(
+            &self,
+            _: &CodeUnit,
+            cancellation: &CancellationToken,
+        ) -> Result<Option<EdgeDerivationResult>, SelectedInverseFailure> {
+            if cancellation.is_cancelled() {
+                Err(SelectedInverseFailure::Cancelled)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    #[test]
+    fn uncovered_adapter_target_and_cancelled_request_have_distinct_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let analyzer = super::super::identity_routes::tests::MetadataAnalyzer::new(temp.path());
+        let target = CodeUnit::new(
+            crate::analyzer::ProjectFile::new(temp.path(), "example.py"),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "f",
+        );
+        let cancellation = CancellationToken::default();
+        let Ok(index) = LazySelectedInverse::<Uncovered>::build(&analyzer, &cancellation) else {
+            panic!("admitted")
+        };
+        let answer = index.inverse_for(&target);
+        assert!(answer.edges.is_empty());
+        assert_eq!(answer.generation, 7);
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Incomplete {
+                reasons: vec![EdgeIncompleteReason::InverseIndexTargetUncovered]
+            }
+        );
+        assert!(!cancellation.is_cancelled());
+        cancellation.cancel();
+        let answer = index.inverse_for(&target);
+        assert!(answer.edges.is_empty());
+        assert_eq!(
+            answer.completeness,
+            EdgeCompleteness::Incomplete {
+                reasons: vec![EdgeIncompleteReason::Cancelled]
+            }
+        );
+    }
+}

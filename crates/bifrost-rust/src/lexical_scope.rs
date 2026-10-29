@@ -1123,24 +1123,63 @@ where
     F: FnMut(usize) -> Result<(), E>,
 {
     use std::ops::ControlFlow;
+    let scopes = match rust_lexical_scope_chain_bounded(root, source, site, charge, &mut select)? {
+        ControlFlow::Continue(scopes) => scopes,
+        ControlFlow::Break(selection) => return Ok(selection),
+    };
+    for node in &scopes {
+        if !rust_scope_inner_attributes_known_bounded(*node, source, charge)? {
+            return Ok(RustLexicalSelection::Unknown);
+        }
+    }
+    for scope in scopes {
+        if let ControlFlow::Break(selection) =
+            visit_rust_lexical_scope_bounded(scope, source, charge, &mut select)?
+        {
+            return Ok(selection);
+        }
+        if rust_lexical_scope_is_module_boundary(scope) {
+            break;
+        }
+    }
+    charge(0)?;
+    Ok(RustLexicalSelection::Complete)
+}
+
+/// The site and its ancestors up to `root`, innermost first, after checking
+/// that none of them makes the selection opaque.
+fn rust_lexical_scope_chain_bounded<'tree, F, E, T>(
+    root: Node<'tree>,
+    source: &str,
+    site: Node<'tree>,
+    charge: &mut F,
+    select: &mut impl for<'projection> FnMut(
+        RustLexicalSelectionEvent<'tree, 'projection>,
+        &mut F,
+    ) -> Result<std::ops::ControlFlow<T>, E>,
+) -> Result<std::ops::ControlFlow<RustLexicalSelection<T>, Vec<Node<'tree>>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
     charge(0)?;
     let mut current = Some(site);
     let mut scopes = Vec::new();
     while let Some(node) = current {
         charge(1)?;
         if node.is_error() || node.is_missing() || (node.has_error() && node.id() == site.id()) {
-            return Ok(RustLexicalSelection::Unknown);
+            return Ok(ControlFlow::Break(RustLexicalSelection::Unknown));
         }
         if matches!(node.kind(), "macro_invocation" | "macro_definition") {
-            return Ok(RustLexicalSelection::Unknown);
+            return Ok(ControlFlow::Break(RustLexicalSelection::Unknown));
         }
         if !type_site_attributes_unconditional_bounded(node, source, charge)? {
-            return Ok(RustLexicalSelection::Unknown);
+            return Ok(ControlFlow::Break(RustLexicalSelection::Unknown));
         }
         if let ControlFlow::Break(value) =
             select(RustLexicalSelectionEvent::Ancestor(node), charge)?
         {
-            return Ok(RustLexicalSelection::Selected(value));
+            return Ok(ControlFlow::Break(RustLexicalSelection::Selected(value)));
         }
         scopes.push(node);
         if node.id() == root.id() {
@@ -1149,133 +1188,277 @@ where
         current = node.parent();
     }
     if scopes.last().is_none_or(|node| node.id() != root.id()) {
-        return Ok(RustLexicalSelection::Unknown);
+        return Ok(ControlFlow::Break(RustLexicalSelection::Unknown));
     }
-    for node in &scopes {
-        charge(1)?;
-        // Inner attributes belong to the actual owner body, including
-        // module declaration lists, not just the source-file root.
-        if matches!(node.kind(), "source_file" | "declaration_list") {
-            let mut cursor = node.walk();
-            for attribute in node.named_children(&mut cursor) {
-                charge(1)?;
-                if attribute.kind() != "inner_attribute_item" {
-                    continue;
-                }
-                let path = attribute
-                    .named_child(0)
-                    .and_then(|attribute| attribute.named_child(0));
-                if !path.is_some_and(|path| {
-                    matches!(
-                        crate::declarations::rust_node_text(path, source),
-                        "allow" | "warn" | "deny" | "forbid" | "doc"
-                    )
-                }) {
-                    return Ok(RustLexicalSelection::Unknown);
-                }
-            }
-        }
-    }
-    for scope in scopes {
-        charge(1)?;
-        if let Some(parameters) = scope.child_by_field_name("type_parameters") {
-            let mut cursor = parameters.walk();
-            for raw in parameters.named_children(&mut cursor) {
-                charge(1)?;
-                let parameter = unwrap_attributes(raw);
-                if raw.has_error()
-                    || raw.is_missing()
-                    || !type_site_attributes_unconditional_bounded(parameter, source, charge)?
-                {
-                    return Ok(RustLexicalSelection::Unknown);
-                }
-                if let ControlFlow::Break(value) =
-                    select(RustLexicalSelectionEvent::Parameter(parameter), charge)?
-                {
-                    return Ok(RustLexicalSelection::Selected(value));
-                }
-            }
-        }
-        if !matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
-            continue;
-        }
-        let mut cursor = scope.walk();
-        for raw in scope.named_children(&mut cursor) {
+    Ok(ControlFlow::Continue(scopes))
+}
+
+/// Whether the inner attributes of one node on the scope chain leave its
+/// body's selection known. The answer does not depend on the use site.
+fn rust_scope_inner_attributes_known_bounded<F, E>(
+    node: Node<'_>,
+    source: &str,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(1)?;
+    // Inner attributes belong to the actual owner body, including
+    // module declaration lists, not just the source-file root.
+    if matches!(node.kind(), "source_file" | "declaration_list") {
+        let mut cursor = node.walk();
+        for attribute in node.named_children(&mut cursor) {
             charge(1)?;
-            let item = unwrap_attributes(raw);
+            if attribute.kind() != "inner_attribute_item" {
+                continue;
+            }
+            let path = attribute
+                .named_child(0)
+                .and_then(|attribute| attribute.named_child(0));
+            if !path.is_some_and(|path| {
+                matches!(
+                    crate::declarations::rust_node_text(path, source),
+                    "allow" | "warn" | "deny" | "forbid" | "doc"
+                )
+            }) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Visit one scope's generic parameters, items and imports, then its end.
+/// The events depend only on the scope, not on the use site inside it.
+fn visit_rust_lexical_scope_bounded<'tree, F, E, T>(
+    scope: Node<'tree>,
+    source: &str,
+    charge: &mut F,
+    select: &mut impl for<'projection> FnMut(
+        RustLexicalSelectionEvent<'tree, 'projection>,
+        &mut F,
+    ) -> Result<std::ops::ControlFlow<T>, E>,
+) -> Result<std::ops::ControlFlow<RustLexicalSelection<T>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
+    charge(1)?;
+    if let Some(parameters) = scope.child_by_field_name("type_parameters") {
+        let mut cursor = parameters.walk();
+        for raw in parameters.named_children(&mut cursor) {
+            charge(1)?;
+            let parameter = unwrap_attributes(raw);
             if raw.has_error()
                 || raw.is_missing()
-                || item.kind() == "macro_invocation"
-                || (item.kind() == "expression_statement"
-                    && item
-                        .named_child(0)
-                        .is_some_and(|child| child.kind() == "macro_invocation"))
-                || !type_scope_attributes_known_bounded(item, source, charge)?
+                || !type_site_attributes_unconditional_bounded(parameter, source, charge)?
             {
-                return Ok(RustLexicalSelection::Unknown);
+                return Ok(ControlFlow::Break(RustLexicalSelection::Unknown));
             }
             if let ControlFlow::Break(value) =
-                select(RustLexicalSelectionEvent::Item(item), charge)?
+                select(RustLexicalSelectionEvent::Parameter(parameter), charge)?
             {
-                return Ok(RustLexicalSelection::Selected(value));
+                return Ok(ControlFlow::Break(RustLexicalSelection::Selected(value)));
             }
-            if item.kind() == "extern_crate_declaration" {
-                // Tree-local selection does not know Cargo crate identities.
-                return Ok(RustLexicalSelection::Unknown);
-            }
-            if item.kind() == "use_declaration" {
-                for leaf in
-                    crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
-                        item,
-                        source,
-                        &mut *charge,
-                    )?
+        }
+    }
+    if !matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+        return Ok(ControlFlow::Continue(()));
+    }
+    let mut cursor = scope.walk();
+    for raw in scope.named_children(&mut cursor) {
+        charge(1)?;
+        let item = unwrap_attributes(raw);
+        if raw.has_error()
+            || raw.is_missing()
+            || item.kind() == "macro_invocation"
+            || (item.kind() == "expression_statement"
+                && item
+                    .named_child(0)
+                    .is_some_and(|child| child.kind() == "macro_invocation"))
+            || !type_scope_attributes_known_bounded(item, source, charge)?
+        {
+            return Ok(ControlFlow::Break(RustLexicalSelection::Unknown));
+        }
+        if let ControlFlow::Break(value) = select(RustLexicalSelectionEvent::Item(item), charge)? {
+            return Ok(ControlFlow::Break(RustLexicalSelection::Selected(value)));
+        }
+        if item.kind() == "extern_crate_declaration" {
+            // Tree-local selection does not know Cargo crate identities.
+            return Ok(ControlFlow::Break(RustLexicalSelection::Unknown));
+        }
+        if item.kind() == "use_declaration" {
+            for leaf in crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+                item,
+                source,
+                &mut *charge,
+            )? {
+                charge(1)?;
+                charge(leaf.import.path().len())?;
+                if let ControlFlow::Break(value) =
+                    select(RustLexicalSelectionEvent::Import(item, &leaf), charge)?
                 {
-                    charge(1)?;
-                    charge(leaf.import.path().len())?;
-                    if let ControlFlow::Break(value) =
-                        select(RustLexicalSelectionEvent::Import(item, &leaf), charge)?
-                    {
-                        return Ok(RustLexicalSelection::Selected(value));
-                    }
+                    return Ok(ControlFlow::Break(RustLexicalSelection::Selected(value)));
                 }
             }
-        }
-        charge(0)?;
-        if let ControlFlow::Break(value) = select(RustLexicalSelectionEvent::ScopeEnd, charge)? {
-            return Ok(RustLexicalSelection::Selected(value));
-        }
-        if scope.kind() == "source_file"
-            || scope
-                .parent()
-                .is_some_and(|parent| parent.kind() == "mod_item")
-        {
-            // Parent module imports/items are not inherited implicitly.
-            break;
         }
     }
     charge(0)?;
-    Ok(RustLexicalSelection::Complete)
+    if let ControlFlow::Break(value) = select(RustLexicalSelectionEvent::ScopeEnd, charge)? {
+        return Ok(ControlFlow::Break(RustLexicalSelection::Selected(value)));
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// Parent module imports and items are not inherited implicitly.
+fn rust_lexical_scope_is_module_boundary(scope: Node<'_>) -> bool {
+    scope.kind() == "source_file"
+        || (scope.kind() == "declaration_list"
+            && scope
+                .parent()
+                .is_some_and(|parent| parent.kind() == "mod_item"))
+}
+
+/// Memo of the site-independent parts of [`rust_type_head_at_bounded`] for
+/// one syntax tree: each scope-chain node's inner-attribute check, and which
+/// scopes leave a name unbound or make it unknown. A caller asking about many
+/// sites in one module would otherwise rescan the module's items and reparse
+/// its imports at every site. A scope that selects a declaration is not
+/// memoized, so the memo holds no nodes. Each entry keeps the work its scan
+/// charged, and a hit charges that work again, so a capped caller runs out of
+/// budget exactly where it would without the memo. Keys are node ids of one
+/// tree, so the memo must not outlive or be shared beyond that tree.
+#[derive(Debug, Default)]
+pub(crate) struct RustTypeHeadMemo {
+    inner_attributes_known: std::cell::RefCell<HashMap<usize, (bool, usize)>>,
+    unselected_scopes: std::cell::RefCell<HashMap<(usize, String), (UnselectedScope, usize)>>,
+}
+
+/// A scope's outcome for a name when it selects no declaration.
+#[derive(Clone, Copy, Debug)]
+enum UnselectedScope {
+    /// The scope does not bind the name; the search continues outward.
+    Unbound,
+    Unknown,
+}
+
+/// Charges recorded by a memoized scan. The scan runs to completion and its
+/// total is charged to the caller afterwards.
+fn record_charges(
+    work: &mut usize,
+) -> impl FnMut(usize) -> Result<(), std::convert::Infallible> + '_ {
+    move |charged| {
+        *work += charged;
+        Ok(())
+    }
 }
 
 /// Select a type head in the existing lexical scope chain. Items have the
 /// whole containing scope (including before their declaration). Generic type
 /// parameters and unknown imports are barriers, never prelude evidence.
-/// No index is rebuilt and every inspected node is charged to the caller.
+/// Every inspected node is charged to the caller, including nodes whose scan
+/// `memo` answers.
 pub(crate) fn rust_type_head_at_bounded<'tree, F, E>(
     root: Node<'tree>,
     source: &str,
     site: Node<'tree>,
     name: &str,
+    memo: &RustTypeHeadMemo,
     charge: &mut F,
 ) -> Result<RustTypeHead<'tree>, E>
 where
     F: FnMut(usize) -> Result<(), E>,
 {
     use std::ops::ControlFlow;
+    let scopes = match rust_lexical_scope_chain_bounded(root, source, site, charge, &mut |_, _| {
+        Ok(ControlFlow::<RustTypeHead<'tree>>::Continue(()))
+    })? {
+        ControlFlow::Continue(scopes) => scopes,
+        ControlFlow::Break(_) => return Ok(RustTypeHead::Unknown),
+    };
+    for node in &scopes {
+        let cached = memo
+            .inner_attributes_known
+            .borrow()
+            .get(&node.id())
+            .copied();
+        let (known, work) = cached.unwrap_or_else(|| {
+            let mut work = 0;
+            let Ok(known) = rust_scope_inner_attributes_known_bounded(
+                *node,
+                source,
+                &mut record_charges(&mut work),
+            );
+            memo.inner_attributes_known
+                .borrow_mut()
+                .insert(node.id(), (known, work));
+            (known, work)
+        });
+        charge(work)?;
+        if !known {
+            return Ok(RustTypeHead::Unknown);
+        }
+    }
+    for scope in scopes {
+        let key = (scope.id(), name.to_string());
+        let cached = memo.unselected_scopes.borrow().get(&key).copied();
+        let head = match cached {
+            Some((unselected, work)) => {
+                charge(work)?;
+                match unselected {
+                    UnselectedScope::Unbound => None,
+                    UnselectedScope::Unknown => Some(RustTypeHead::Unknown),
+                }
+            }
+            None => {
+                let mut work = 0;
+                let Ok(head) = rust_scope_type_head_bounded(
+                    scope,
+                    source,
+                    name,
+                    &mut record_charges(&mut work),
+                );
+                let unselected = match head {
+                    None => Some(UnselectedScope::Unbound),
+                    Some(RustTypeHead::Unknown) => Some(UnselectedScope::Unknown),
+                    Some(_) => None,
+                };
+                if let Some(unselected) = unselected {
+                    memo.unselected_scopes
+                        .borrow_mut()
+                        .insert(key, (unselected, work));
+                }
+                charge(work)?;
+                head
+            }
+        };
+        if let Some(head) = head {
+            return Ok(head);
+        }
+        if rust_lexical_scope_is_module_boundary(scope) {
+            break;
+        }
+    }
+    charge(0)?;
+    Ok(RustTypeHead::Unbound)
+}
+
+/// The type head that one scope selects for `name`, or `None` when the scope
+/// does not bind it and the search continues outward.
+fn rust_scope_type_head_bounded<'tree, F, E>(
+    scope: Node<'tree>,
+    source: &str,
+    name: &str,
+    charge: &mut F,
+) -> Result<Option<RustTypeHead<'tree>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
     let mut candidates = Vec::new();
     let selection =
-        visit_rust_lexical_selection_bounded(root, source, site, charge, |event, charge| {
+        visit_rust_lexical_scope_bounded(scope, source, charge, &mut |event, charge| {
             match event {
                 RustLexicalSelectionEvent::Ancestor(_) => {}
                 RustLexicalSelectionEvent::Parameter(parameter) => {
@@ -1331,9 +1514,12 @@ where
             Ok(ControlFlow::Continue(()))
         })?;
     Ok(match selection {
-        RustLexicalSelection::Complete => RustTypeHead::Unbound,
-        RustLexicalSelection::Selected(head) => head,
-        RustLexicalSelection::Unknown => RustTypeHead::Unknown,
+        ControlFlow::Continue(()) => None,
+        ControlFlow::Break(RustLexicalSelection::Selected(head)) => Some(head),
+        ControlFlow::Break(RustLexicalSelection::Unknown) => Some(RustTypeHead::Unknown),
+        ControlFlow::Break(RustLexicalSelection::Complete) => {
+            unreachable!("a single scope visit never completes the chain")
+        }
     })
 }
 
@@ -2045,9 +2231,15 @@ mod ownership_lexical_boundary {
             let site = site.unwrap();
             assert_eq!(site.kind(), "type_identifier");
             assert_eq!(crate::declarations::rust_node_text(site, source), "Local");
-            let head =
-                rust_type_head_at_bounded(root, source, site, "Local", &mut |_| Ok::<_, ()>(()))
-                    .unwrap();
+            let head = rust_type_head_at_bounded(
+                root,
+                source,
+                site,
+                "Local",
+                &RustTypeHeadMemo::default(),
+                &mut |_| Ok::<_, ()>(()),
+            )
+            .unwrap();
             assert_eq!(
                 matches!(head, RustTypeHead::Item(_)),
                 selected,

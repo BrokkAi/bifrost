@@ -439,6 +439,14 @@ impl PolicyRegistry {
         bytes: &[u8],
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         let parsed = validate_and_parse_policy_source(identity, bytes)?;
+        self.register_parsed_policy_deferred(parsed, bytes)
+    }
+
+    pub(super) fn register_parsed_policy_deferred(
+        &mut self,
+        parsed: ParsedRqlpDocument,
+        bytes: &[u8],
+    ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         self.finish_policy_registration(parsed, bytes, LocatorResolution::Deferred)
     }
 
@@ -880,6 +888,19 @@ impl PolicyRegistry {
                 return Err(error.into());
             }
         }
+        if let Some(spec) = &resolved_taint {
+            for sanitizer in &spec.sanitizers {
+                let selector = fixed_selectors
+                    .get(&sanitizer.selector_path)
+                    .expect("a composed sanitizer has a resolved selector");
+                let (_, query) = selector.as_query().expect("sanitizers select RQL calls");
+                validate_sanitizer_query_arity(query, &sanitizer.definition.kind).map_err(
+                    |message| PolicyRegistryError::SelectorLoad {
+                        message: format!("sanitizer {:?}: {message}", sanitizer.identity),
+                    },
+                )?;
+            }
+        }
         let resolved_selectors = fixed_selectors.into_values().collect();
         let auxiliary_slots = if let Some(spec) = resolved_taint.as_ref() {
             spec.sanitizers
@@ -1069,6 +1090,25 @@ impl PolicyRegistry {
             insert_selector(dependency_selectors, selector)?;
             dependencies.push(dependency);
         }
+        for entry in &spec.sanitizers.entries {
+            let base = format!(
+                "/analysis/{}/entries/{}/selector",
+                segments.sanitizers,
+                json_pointer_segment(entry.id.as_str())
+            );
+            for (index, authored) in entry.kind.requirement_selectors() {
+                let path = selector_path(sanitizer_requirement_selector_path(&base, index))?;
+                let resolved = self.resolve_imported_selector(
+                    parsed,
+                    path,
+                    authored,
+                    retained_bytes,
+                    locators,
+                    imports,
+                )?;
+                insert_selector(fixed_selectors, resolved)?;
+            }
+        }
         let entries = spec
             .sanitizers
             .entries
@@ -1128,6 +1168,7 @@ impl PolicyRegistry {
         // canonical catalog projection per referenced identity per policy as
         // a conservative bound over every retained selector source and model.
         let mut charged_catalogs = HashSet::new();
+        let mut catalog_dependencies = BTreeMap::new();
         for reference in spec
             .sources
             .include_sets
@@ -1138,72 +1179,117 @@ impl PolicyRegistry {
             .chain(&spec.transforms.include_sets)
             .chain(&spec.external_models.include_sets)
         {
-            let catalog = self.catalogs.resolve(reference)?;
-            let identity = resolved_catalog_identity(catalog)?;
-            if charged_catalogs.insert(identity) {
-                self.charge_local(retained_bytes, catalog.canonical_json().len())?;
+            for catalog in self.catalogs.select(reference)? {
+                let identity = resolved_catalog_identity(catalog)?;
+                if charged_catalogs.insert(identity) {
+                    self.charge_local(retained_bytes, catalog.canonical_json().len())?;
+                }
             }
         }
         for reference in &spec.sources.include_sets {
-            let catalog = self.catalogs.resolve(reference)?;
-            for source in &catalog.definition().sources {
-                let (identity, selector) = catalog_selector(catalog, &source.id, locators)?;
-                let dependency = ResolvedEndpointDependency::from_composed_model(
-                    ResolvedEndpointIdentity::Catalog {
-                        catalog: identity.clone(),
-                        entry_id: source.id.clone(),
-                    },
-                    EndpointDefinitionSchemaResolution::CatalogDocument {
-                        schema_version: catalog.definition().schema_version,
-                    },
-                    &selector,
-                    ResolvedEndpointModel::new(
-                        EndpointRole::Source,
-                        source.display_name.clone(),
-                        source.categories.clone(),
-                        policy_port_to_endpoint_binding(&source.bind),
-                        Some(EndpointTaintSemantics::Source {
-                            labels: source.labels.clone(),
-                            threat_model: source.threat_model,
-                            evidence: source.evidence.clone(),
-                        }),
-                        Vec::new(),
-                    ),
-                    vec![EndpointOrigin::Catalog { catalog: identity }],
-                )?;
-                insert_selector(dependency_selectors, selector)?;
-                dependencies.push(dependency);
+            for catalog in self.catalogs.select(reference)? {
+                for source in catalog
+                    .definition()
+                    .sources
+                    .iter()
+                    .filter(|entry| reference.includes_categories(&entry.categories))
+                {
+                    let (identity, selector) = catalog_selector(catalog, &source.id, locators)?;
+                    let dependency = ResolvedEndpointDependency::from_composed_model(
+                        ResolvedEndpointIdentity::Catalog {
+                            catalog: identity.clone(),
+                            entry_id: source.id.clone(),
+                        },
+                        EndpointDefinitionSchemaResolution::CatalogDocument {
+                            schema_version: catalog.definition().schema_version,
+                        },
+                        &selector,
+                        ResolvedEndpointModel::new(
+                            EndpointRole::Source,
+                            source.display_name.clone(),
+                            source.categories.clone(),
+                            policy_port_to_endpoint_binding(&source.bind),
+                            Some(EndpointTaintSemantics::Source {
+                                labels: source.labels.clone(),
+                                threat_model: source.threat_model,
+                                evidence: source.evidence.clone(),
+                            }),
+                            Vec::new(),
+                        ),
+                        vec![EndpointOrigin::Catalog { catalog: identity }],
+                    )?;
+                    insert_selector(dependency_selectors, selector)?;
+                    merge_endpoint_dependency(&mut catalog_dependencies, dependency)?;
+                }
             }
         }
         for reference in &spec.sinks.include_sets {
-            let catalog = self.catalogs.resolve(reference)?;
-            for sink in &catalog.definition().sinks {
-                let (identity, selector) = catalog_selector(catalog, &sink.id, locators)?;
-                let dependency = ResolvedEndpointDependency::from_composed_model(
-                    ResolvedEndpointIdentity::Catalog {
-                        catalog: identity.clone(),
-                        entry_id: sink.id.clone(),
-                    },
-                    EndpointDefinitionSchemaResolution::CatalogDocument {
-                        schema_version: catalog.definition().schema_version,
-                    },
-                    &selector,
-                    ResolvedEndpointModel::new(
-                        EndpointRole::Sink,
-                        sink.display_name.clone(),
-                        sink.categories.clone(),
-                        policy_port_to_endpoint_binding(&sink.dangerous_operand),
-                        Some(EndpointTaintSemantics::Sink {
-                            accepts: sink.accepts.clone(),
-                            tags: sink.tags.clone(),
-                            impacts: sink.impacts.clone(),
-                        }),
-                        Vec::new(),
-                    ),
-                    vec![EndpointOrigin::Catalog { catalog: identity }],
-                )?;
-                insert_selector(dependency_selectors, selector)?;
-                dependencies.push(dependency);
+            for catalog in self.catalogs.select(reference)? {
+                for sink in catalog
+                    .definition()
+                    .sinks
+                    .iter()
+                    .filter(|entry| reference.includes_categories(&entry.categories))
+                {
+                    let (identity, selector) = catalog_selector(catalog, &sink.id, locators)?;
+                    let dependency = ResolvedEndpointDependency::from_composed_model(
+                        ResolvedEndpointIdentity::Catalog {
+                            catalog: identity.clone(),
+                            entry_id: sink.id.clone(),
+                        },
+                        EndpointDefinitionSchemaResolution::CatalogDocument {
+                            schema_version: catalog.definition().schema_version,
+                        },
+                        &selector,
+                        ResolvedEndpointModel::new(
+                            EndpointRole::Sink,
+                            sink.display_name.clone(),
+                            sink.categories.clone(),
+                            policy_port_to_endpoint_binding(&sink.dangerous_operand),
+                            Some(EndpointTaintSemantics::Sink {
+                                accepts: sink.accepts.clone(),
+                                tags: sink.tags.clone(),
+                                impacts: sink.impacts.clone(),
+                            }),
+                            Vec::new(),
+                        ),
+                        vec![EndpointOrigin::Catalog { catalog: identity }],
+                    )?;
+                    insert_selector(dependency_selectors, selector)?;
+                    merge_endpoint_dependency(&mut catalog_dependencies, dependency)?;
+                }
+            }
+        }
+        dependencies.extend(catalog_dependencies.into_values());
+        for reference in &spec.sanitizers.include_sets {
+            for catalog in self.catalogs.select(reference)? {
+                let identity = resolved_catalog_identity(catalog)?;
+                for entry in catalog
+                    .definition()
+                    .sanitizers
+                    .iter()
+                    .filter(|entry| reference.includes_categories(&entry.categories))
+                {
+                    let base = format!(
+                        "/dependencies/catalogs/{}@{}/{}/selector",
+                        json_pointer_segment(identity.name.as_str()),
+                        identity.version,
+                        json_pointer_segment(entry.id.as_str())
+                    );
+                    for (index, authored) in entry.kind.requirement_selectors() {
+                        let path =
+                            selector_path(sanitizer_requirement_selector_path(&base, index))?;
+                        let resolved = inline_selector(
+                            path,
+                            authored,
+                            SelectorOrigin::Catalog {
+                                catalog: identity.clone(),
+                            },
+                            locators,
+                        )?;
+                        insert_selector(fixed_selectors, resolved)?;
+                    }
+                }
             }
         }
         self.resolve_catalog_auxiliary_selectors(
@@ -1213,7 +1299,7 @@ impl PolicyRegistry {
                     .definition()
                     .sanitizers
                     .iter()
-                    .map(|entry| (&entry.id, &entry.selector))
+                    .map(|entry| (&entry.id, &entry.selector, entry.categories.as_slice()))
                     .collect()
             },
             fixed_selectors,
@@ -1226,7 +1312,7 @@ impl PolicyRegistry {
                     .definition()
                     .transforms
                     .iter()
-                    .map(|entry| (&entry.id, &entry.selector))
+                    .map(|entry| (&entry.id, &entry.selector, entry.categories.as_slice()))
                     .collect()
             },
             fixed_selectors,
@@ -1239,7 +1325,7 @@ impl PolicyRegistry {
                     .definition()
                     .external_models
                     .iter()
-                    .map(|entry| (&entry.id, &entry.selector))
+                    .map(|entry| (&entry.id, &entry.selector, entry.categories.as_slice()))
                     .collect()
             },
             fixed_selectors,
@@ -1253,29 +1339,34 @@ impl PolicyRegistry {
         references: &[CatalogRef],
         entries: impl for<'a> Fn(
             &'a RegisteredTaintCatalog,
-        ) -> Vec<(&'a TaintEntryId, &'a PolicySelector)>,
+        )
+            -> Vec<(&'a TaintEntryId, &'a PolicySelector, &'a [PolicyCategoryId])>,
         selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         locators: LocatorResolution<'_>,
     ) -> Result<(), PolicyRegistryError> {
         for reference in references {
-            let catalog = self.catalogs.resolve(reference)?;
-            let identity = resolved_catalog_identity(catalog)?;
-            for (id, authored) in entries(catalog) {
-                let path = selector_path(format!(
-                    "/dependencies/catalogs/{}@{}/{}/selector",
-                    json_pointer_segment(identity.name.as_str()),
-                    identity.version,
-                    json_pointer_segment(id.as_str())
-                ))?;
-                let selector = inline_selector(
-                    path,
-                    authored,
-                    SelectorOrigin::Catalog {
-                        catalog: identity.clone(),
-                    },
-                    locators,
-                )?;
-                insert_selector(selectors, selector)?;
+            for catalog in self.catalogs.select(reference)? {
+                let identity = resolved_catalog_identity(catalog)?;
+                for (id, authored, _) in entries(catalog)
+                    .into_iter()
+                    .filter(|(_, _, categories)| reference.includes_categories(categories))
+                {
+                    let path = selector_path(format!(
+                        "/dependencies/catalogs/{}@{}/{}/selector",
+                        json_pointer_segment(identity.name.as_str()),
+                        identity.version,
+                        json_pointer_segment(id.as_str())
+                    ))?;
+                    let selector = inline_selector(
+                        path,
+                        authored,
+                        SelectorOrigin::Catalog {
+                            catalog: identity.clone(),
+                        },
+                        locators,
+                    )?;
+                    insert_selector(selectors, selector)?;
+                }
             }
         }
         Ok(())
@@ -1425,7 +1516,7 @@ impl PolicyRegistry {
                 )?;
                 selected.push(ResolvedEndpointManifestEntry::from(&dependency));
                 insert_selector(dependency_selectors, selector)?;
-                merge_match_dependency(&mut dependencies, dependency)?;
+                merge_endpoint_dependency(&mut dependencies, dependency)?;
             }
             let manifest = ResolvedMatchDirectoryManifest::try_new(
                 usage.path.clone(),
@@ -1470,7 +1561,7 @@ impl PolicyRegistry {
                         },
                     )?;
                     insert_selector(dependency_selectors, selector)?;
-                    merge_match_dependency(&mut dependencies, dependency)?;
+                    merge_endpoint_dependency(&mut dependencies, dependency)?;
                 }
                 for closure in directories.values() {
                     for entry in &closure.endpoints {
@@ -1492,7 +1583,7 @@ impl PolicyRegistry {
                             },
                         )?;
                         insert_selector(dependency_selectors, selector)?;
-                        merge_match_dependency(&mut dependencies, dependency)?;
+                        merge_endpoint_dependency(&mut dependencies, dependency)?;
                     }
                 }
             }
@@ -1899,7 +1990,7 @@ fn insert_selector(
     Ok(())
 }
 
-fn merge_match_dependency(
+fn merge_endpoint_dependency(
     dependencies: &mut BTreeMap<ResolvedEndpointIdentity, ResolvedEndpointDependency>,
     mut incoming: ResolvedEndpointDependency,
 ) -> Result<(), PolicyRegistryError> {
@@ -1956,7 +2047,7 @@ fn checked_selector_path<T>(
     construct(path.as_ref()).map_err(Into::into)
 }
 
-fn validate_and_parse_policy_source(
+pub(super) fn validate_and_parse_policy_source(
     identity: PolicySourceIdentity,
     bytes: &[u8],
 ) -> Result<ParsedRqlpDocument, PolicyRegistryError> {

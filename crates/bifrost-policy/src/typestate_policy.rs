@@ -631,6 +631,7 @@ impl ProductionTypestatePolicyEvaluator {
         let cancellation = context.cancellation.unwrap_or(&uncancelled);
         let compiler = TypestatePolicyCompiler::new(
             workspace,
+            context.flow_resources(),
             budget.query_limits(),
             budget.max_selector_results(),
             cancellation,
@@ -1595,6 +1596,9 @@ fn evaluate_compiled_typestate(
         }
         // What this root's own solve takes out of the shared lanes, measured
         // here so the reuse path above can replay exactly it.
+        let solver_refusals_before = solver_budget.refusal_count();
+        let semantic_refusals_before = semantic_budget.as_ref().map(SemanticBudget::refusal_count);
+        let root_generation_before = workspace.analyzer().project().analysis_generation();
         let solver_before = solver_budget.used();
         let semantic_before = semantic_budget
             .as_mut()
@@ -1855,6 +1859,42 @@ fn evaluate_compiled_typestate(
                 root_work.retained_analysis_findings = root_retained_analysis_findings;
                 retained_analysis_findings =
                     retained_analysis_findings.saturating_add(root_retained_analysis_findings);
+                if root_ledger.is_some() && workspace.analyzer().degraded_persistent_fills() > 0 {
+                    brokk_bifrost_analysis::profiling::note_with(|| {
+                        format!(
+                            "policy.units unbounded origin={}:{} cause=degraded_persistent_fill count={}",
+                            file!(),
+                            line!(),
+                            workspace.analyzer().degraded_persistent_fills()
+                        )
+                    });
+                }
+                if let Some(ledger) = root_ledger.as_ref()
+                    && (workspace.analyzer().degraded_persistent_fills() > 0
+                        || cancellation.is_cancelled()
+                        || solver_budget.refusal_count() > solver_refusals_before
+                        || semantic_budget.as_ref().map(SemanticBudget::refusal_count)
+                            != semantic_refusals_before
+                        || evaluation_execution_budget.work().exhausted
+                        || workspace.analyzer().project().analysis_generation()
+                            != root_generation_before)
+                {
+                    brokk_bifrost_analysis::profiling::note_with(|| {
+                        format!(
+                            "policy.units unbounded origin={}:{} cause=root_boundary cancelled={} solver={} semantic={} execution={} snapshot={}",
+                            file!(),
+                            line!(),
+                            cancellation.is_cancelled(),
+                            solver_budget.refusal_count() > solver_refusals_before,
+                            semantic_budget.as_ref().map(SemanticBudget::refusal_count)
+                                != semantic_refusals_before,
+                            evaluation_execution_budget.work().exhausted,
+                            workspace.analyzer().project().analysis_generation()
+                                != root_generation_before
+                        )
+                    });
+                    ledger.mark_execution_dependent();
+                }
                 if let Some(units) = units.as_deref_mut() {
                     units.publish(
                         root_index,
@@ -2748,14 +2788,17 @@ const MAX_CLOSE_CONTRACT_REASONS: usize = 32;
 impl<'a> TypestatePolicyCompiler<'a> {
     pub(crate) fn new(
         workspace: &'a WorkspaceAnalyzer,
+        flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
         query_limits: CodeQueryExecutionLimits,
         max_selector_results: usize,
         cancellation: &'a CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Self {
+        let flow_state = flow_state.into();
         Self {
             selectors: super::selector_compiler::PolicySelectorSession::new(
                 workspace,
+                &flow_state,
                 "typestate",
                 query_limits,
                 max_selector_results,
@@ -6706,6 +6749,7 @@ mod tests {
         let compile = |units: Option<&PolicyIncrementalContext<'_>>| {
             let compiler = TypestatePolicyCompiler::new(
                 &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
                 budget.query_limits(),
                 budget.max_selector_results(),
                 &cancellation,
@@ -6898,6 +6942,7 @@ mod tests {
         );
         let (compiled, units) = TypestatePolicyCompiler::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             budget.query_limits(),
             budget.max_selector_results(),
             &cancellation,
@@ -7150,6 +7195,7 @@ func AmbiguousNearMiss(flag bool) {
         let budget = PolicyBudget::default();
         let compiled = TypestatePolicyCompiler::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             budget.query_limits(),
             budget.max_selector_results(),
             &cancellation,
@@ -7293,6 +7339,7 @@ func MissingClose() {
         let budget = PolicyBudget::default();
         let compiled = TypestatePolicyCompiler::new(
             &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             budget.query_limits(),
             budget.max_selector_results(),
             &cancellation,

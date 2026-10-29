@@ -478,7 +478,11 @@ pub(in crate::analyzer::java::semantic) fn java_local_binding(
             let name = node.child_by_field_name("name")?;
             (name, body.start_byte(), body.start_byte(), body.end_byte())
         }
-        _ => return None,
+        _ => {
+            let name = brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node)?;
+            let (start, end) = java_local_scope(node)?;
+            (name, name.end_byte(), start, end)
+        }
     };
     (name.kind() == "identifier").then_some(JavaLocalBindingSyntax {
         declaration: node,
@@ -489,7 +493,36 @@ pub(in crate::analyzer::java::semantic) fn java_local_binding(
     })
 }
 
+/// Simple patterns transport the tested value; record components require
+/// extraction and deliberately retain their value/capture gap.
+pub(in crate::analyzer::java::semantic) fn java_pattern_has_value(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "instanceof_expression" | "type_pattern")
+        || java_binding_type(node).is_none_or(|ty| brokk_bifrost_analysis::analyzer::java_integral_parameter::JavaScalarType::from_type(ty).is_some())
+    { return false; }
+
+    if node.kind() == "instanceof_expression" {
+        return node.child_by_field_name("name").is_some();
+    }
+    if node.kind() != "type_pattern" {
+        return false;
+    }
+    let mut owner = node.parent();
+    while let Some(parent) = owner {
+        match parent.kind() {
+            "switch_label" => return true,
+            "pattern" => owner = parent.parent(),
+            _ => return false,
+        }
+    }
+    false
+}
+
 pub(in crate::analyzer::java::semantic) fn java_binding_type(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(name) = brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node) {
+        return node
+            .child_by_field_name("right")
+            .or_else(|| name.prev_named_sibling());
+    }
     node.child_by_field_name("type")
         .or_else(|| {
             node.parent()
@@ -712,4 +745,23 @@ pub(in crate::analyzer::java::semantic) fn is_runtime_leaf(kind: &str) -> bool {
             | "line_comment"
             | "block_comment"
     )
+}
+
+// Negation must preserve structured branch lowering for patterns and boolean
+// control operators. Scalar comparisons keep normalize_condition's typed
+// predicate, original source anchor and negated polarity.
+pub(super) fn condition_requires_branch_lowering(node: Node<'_>) -> bool {
+    use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
+    let syntax = brokk_bifrost_jvm::JavaKnowledge
+        .guard_condition_syntax()
+        .expect("Java supplies guard grammar shapes");
+    let Ok((node, _)) = peel_guard_condition(node, syntax) else {
+        return false;
+    };
+    match node.kind() {
+        "binary_expression" => matches!(binary_operator(node), Some("&&" | "||")),
+        "ternary_expression" => true,
+        "instanceof_expression" => java_pattern_has_value(node),
+        _ => false,
+    }
 }

@@ -555,6 +555,200 @@ impl WorkspaceSemanticOracle<'_> {
 }
 
 impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
+    fn member_receiver_flow(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        context: &OracleCallContext,
+        place: Option<crate::analyzer::semantic::ValueFlowEndpoint>,
+        request: &mut SemanticRequest<'_>,
+        limits: crate::analyzer::semantic::OracleLimits,
+    ) -> Result<SemanticOutcome<crate::analyzer::semantic::MemberReceiverFlow>, SemanticProviderError>
+    {
+        use crate::analyzer::semantic::{
+            AccessPath, AccessPathAtPoint, AccessPathRoot, AccessPathTail, DispatchOracle,
+            HeapOracle, MemberReceiverFlow, MemberReceiverPreparation, ObservationPhase,
+            ProofStatus, ValueFlowEndpoint,
+        };
+        let dispatch = self.resolve_call(call, request)?;
+        let mut work = dispatch.work();
+        match &dispatch {
+            SemanticOutcome::Cancelled { .. } => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded: *exceeded,
+                    work,
+                });
+            }
+            _ => {}
+        }
+        let preparation = dispatch
+            .available_value()
+            .and_then(|result| result.member_receiver_preparation());
+        let mut storage = Vec::new();
+        match preparation {
+            Some(MemberReceiverPreparation::AddressOfPlace) => storage.extend(place),
+            Some(MemberReceiverPreparation::Reference | MemberReceiverPreparation::CopyPointee) => {
+                let row = call
+                    .procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("a live member call exists");
+                let receiver = call
+                    .procedure()
+                    .value_handle(row.receiver.expect("a member call has a receiver"))
+                    .expect("a member receiver exists");
+                let path = AccessPath::bounded(
+                    AccessPathRoot::Value(receiver),
+                    Vec::new(),
+                    AccessPathTail::Exact,
+                    limits,
+                )
+                .map_err(|error| internal_contract("invalid receiver path", error))?;
+                let access = AccessPathAtPoint::new(
+                    path,
+                    call.procedure()
+                        .point_handle(row.point)
+                        .expect("a member call point exists"),
+                    ObservationPhase::BeforeEffects,
+                    context.clone(),
+                )
+                .map_err(|error| internal_contract("invalid receiver observation", error))?;
+                let locations = self.locations(&access, request)?;
+                work = work.conservative_add(locations.work());
+                match &locations {
+                    SemanticOutcome::Cancelled { .. } => {
+                        return Ok(SemanticOutcome::Cancelled {
+                            partial: None,
+                            work,
+                        });
+                    }
+                    SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                        return Ok(SemanticOutcome::ExceededBudget {
+                            partial: None,
+                            exceeded: *exceeded,
+                            work,
+                        });
+                    }
+                    _ => {}
+                }
+                if let SemanticOutcome::Complete { value, .. } = locations
+                    && value.locations().coverage() == CandidateCoverage::Exhaustive
+                    && value.locations().candidates().iter().all(|candidate| {
+                        matches!(candidate.proof(), ProofStatus::Proven)
+                            && matches!(candidate.completeness(), EvidenceCompleteness::Complete)
+                    })
+                {
+                    for candidate in value.locations().candidates() {
+                        storage.push(
+                            ValueFlowEndpoint::for_path(candidate.value().path().clone()).map_err(
+                                |error| internal_contract("invalid receiver flow slot", error),
+                            )?,
+                        );
+                    }
+                }
+            }
+            Some(MemberReceiverPreparation::CopyValue) | None => {}
+        }
+        let mut value = MemberReceiverFlow::new(call.clone(), preparation, storage, limits)
+            .map_err(|error| internal_contract("invalid receiver flow", error))?;
+        if let Some(anchor) = dispatch
+            .available_value()
+            .and_then(|result| result.member_field_anchor())
+        {
+            use crate::analyzer::semantic::{
+                AbstractLocation, AbstractObject, AccessSelector, ObjectCardinality,
+                ScopedSemanticLocator,
+            };
+            let procedure = call.procedure();
+            let row = procedure
+                .semantics()
+                .call_site(call.id())
+                .expect("a member call exists");
+            let mut selected = None;
+            let mut selected_receiver = None;
+            let mut ambiguous = false;
+            for (point, index, event) in procedure.semantics().callable_selection_events(row.id) {
+                if request.cancellation.is_cancelled() {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+                let scan = SemanticWork {
+                    events: 1,
+                    ..SemanticWork::default()
+                };
+                work = work.conservative_add(scan);
+                if let Err(exceeded) = request.budget.admit(scan) {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                if selected.is_some_and(|(id, _)| id != point) {
+                    ambiguous = true;
+                }
+                selected.get_or_insert((point, index));
+                if let crate::analyzer::semantic::SemanticEffect::CallableReference {
+                    callable, ..
+                }
+                | crate::analyzer::semantic::SemanticEffect::CallableCreation {
+                    callable, ..
+                } = &event.effect
+                    && let Some(receiver) = callable.bound_receiver
+                {
+                    if selected_receiver.is_some_and(|previous| previous != receiver) {
+                        ambiguous = true;
+                    }
+                    selected_receiver = Some(receiver);
+                }
+            }
+            if let Some((point, event_index)) = selected.filter(|_| !ambiguous) {
+                let root =
+                    AccessPathRoot::Value(
+                        procedure
+                            .value_handle(selected_receiver.unwrap_or_else(|| {
+                                row.receiver.expect("a member call has a receiver")
+                            }))
+                            .expect("a receiver exists"),
+                    );
+                let field = ScopedSemanticLocator::new(
+                    Arc::clone(procedure.artifact()),
+                    procedure.semantics().locator().memory_location_at(anchor),
+                )
+                .map_err(|error| internal_contract("invalid selected field", error))?;
+                let path = AccessPath::bounded(
+                    root.clone(),
+                    vec![AccessSelector::Field(field)],
+                    AccessPathTail::Exact,
+                    limits,
+                )
+                .map_err(|error| internal_contract("invalid selected field path", error))?;
+                let object = AbstractObject::new(root, ObjectCardinality::Unknown)
+                    .map_err(|error| internal_contract("invalid selected field object", error))?;
+                let location = AbstractLocation::new(object, path)
+                    .map_err(|error| internal_contract("invalid selected field location", error))?;
+                value = value
+                    .with_field_read(
+                        procedure
+                            .point_handle(point)
+                            .expect("a selector point exists"),
+                        u32::try_from(event_index).expect("an event index fits u32"),
+                        ValueFlowEndpoint::Location(Box::new(location)),
+                    )
+                    .map_err(|error| internal_contract("invalid selected field read", error))?;
+            }
+        }
+        Ok(SemanticOutcome::Complete { value, work })
+    }
+
     fn runtime_refinements(
         &self,
         procedure: &ProcedureHandle,

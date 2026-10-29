@@ -299,8 +299,272 @@ pub struct GeneratedFunctionScope {
     pub local: Option<(usize, usize)>,
 }
 
+/// The defining provider; curated contributors remain on the composed symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModelProvider {
+    pub pack_id: String,
+    pub pack_version: String,
+    pub pack_digest: String,
+}
+
+impl From<&SemanticModelProvenance> for ModelProvider {
+    fn from(provenance: &SemanticModelProvenance) -> Self {
+        Self {
+            pack_id: provenance.pack_id.clone(),
+            pack_version: provenance.pack_version.clone(),
+            pack_digest: provenance.pack_digest.clone(),
+        }
+    }
+}
+
+/// One composed symbol pinned to its defining provider.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ModelSymbolRef {
+    pub symbol_id: String,
+    pub provider: ModelProvider,
+}
+
+impl std::fmt::Display for ModelSymbolRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}@{}:{}#{}",
+            self.symbol_id,
+            self.provider.pack_id,
+            self.provider.pack_version,
+            self.provider.pack_digest
+        )
+    }
+}
+
+impl std::fmt::Debug for ModelSymbolRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+/// Which owner a nominal model type reference names.
+///
+/// `D` is the declaration: borrowed while the candidates are being classified,
+/// owned once a caller returns it. There is no Absent answer yet: proving
+/// absence needs every selected provider that could declare the name to have
+/// answered completely (#7531), and no provider records that today, so an
+/// empty candidate set is Unknown.
+#[derive(Debug, Clone)]
+pub enum ModelTypeOwnerAnswer<D> {
+    Unique {
+        owner: ModelSymbolRef,
+        declaration: D,
+    },
+    Ambiguous(Vec<ModelSymbolRef>),
+    Unknown {
+        reason: ModelTypeOwnerUnknown,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTypeOwnerUnknown {
+    /// No candidate declaration names a type of the requested kind.
+    NoDeclaringProvider,
+    /// A candidate's pack marks its identity ambiguous.
+    AmbiguousProvenance,
+}
+
+impl<D> ModelTypeOwnerAnswer<D> {
+    pub fn map_declaration<E>(self, map: impl FnOnce(D) -> E) -> ModelTypeOwnerAnswer<E> {
+        match self {
+            Self::Unique { owner, declaration } => ModelTypeOwnerAnswer::Unique {
+                owner,
+                declaration: map(declaration),
+            },
+            Self::Ambiguous(owners) => ModelTypeOwnerAnswer::Ambiguous(owners),
+            Self::Unknown { reason } => ModelTypeOwnerAnswer::Unknown { reason },
+        }
+    }
+}
+
+/// Classify candidate declarations already restricted to one nominal
+/// reference. `is_type_owner` is the caller language's type-kind rule.
+///
+/// Candidates are one owner when they share the defining pack (by digest) and
+/// the qualified name; the first such candidate is the answer. Distinct packs
+/// or names make the answer Ambiguous. The callers differ only in which
+/// candidates they pass: the selected view passes provider-pinned groups, and
+/// the JVM's unselected lookup passes its folded view (#7605).
+pub fn classify_model_type_owner<'a>(
+    candidates: impl IntoIterator<Item = &'a SemanticModelSymbol>,
+    is_type_owner: impl Fn(SemanticModelSymbolKind) -> bool,
+) -> ModelTypeOwnerAnswer<&'a SemanticModelSymbol> {
+    let mut owners: Vec<&'a SemanticModelSymbol> = Vec::new();
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| is_type_owner(candidate.kind))
+    {
+        if candidate.provenance.ambiguous {
+            return ModelTypeOwnerAnswer::Unknown {
+                reason: ModelTypeOwnerUnknown::AmbiguousProvenance,
+            };
+        }
+        if !owners.iter().any(|owner| {
+            owner.provenance.pack_digest == candidate.provenance.pack_digest
+                && owner.qualified_name == candidate.qualified_name
+        }) {
+            owners.push(candidate);
+        }
+    }
+    let owner_ref = |declaration: &SemanticModelSymbol| ModelSymbolRef {
+        symbol_id: declaration.id.clone(),
+        provider: ModelProvider::from(&declaration.provenance),
+    };
+    match owners.as_slice() {
+        [] => ModelTypeOwnerAnswer::Unknown {
+            reason: ModelTypeOwnerUnknown::NoDeclaringProvider,
+        },
+        [declaration] => ModelTypeOwnerAnswer::Unique {
+            owner: owner_ref(declaration),
+            declaration,
+        },
+        _ => ModelTypeOwnerAnswer::Ambiguous(owners.iter().map(|owner| owner_ref(owner)).collect()),
+    }
+}
+
+/// Selected composition answer semantics. Bump when G1 composition changes.
+pub const MODEL_COMPOSITION_VERSION: u32 = 1;
+
+/// The caller compilation's providers, canonicalized before hashing.
+#[derive(Debug, Clone)]
+pub struct ModelProviderSelection {
+    providers: std::collections::BTreeSet<ModelProvider>,
+    digest: [u8; 32],
+}
+
+impl ModelProviderSelection {
+    /// Go passes every provider of the active model set
+    /// (ResolvedActiveSemanticModels::model_provider_selection); a per-compilation
+    /// caller passes only the providers its compilation selects.
+    pub fn new(providers: impl IntoIterator<Item = ModelProvider>) -> Self {
+        let providers = providers
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let digest = model_provider_selection_digest(&providers, MODEL_COMPOSITION_VERSION);
+        Self { providers, digest }
+    }
+
+    pub fn contains(&self, provider: &ModelProvider) -> bool {
+        self.providers.contains(provider)
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+fn model_provider_selection_digest(
+    providers: &std::collections::BTreeSet<ModelProvider>,
+    composition_version: u32,
+) -> [u8; 32] {
+    let mut hasher = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+        b"bifrost.model-provider-selection.v1",
+    );
+    hasher.field("composition_version", &composition_version.to_le_bytes());
+    for provider in providers {
+        hasher.field("pack_id", provider.pack_id.as_bytes());
+        hasher.field("pack_version", provider.pack_version.as_bytes());
+        hasher.field("pack_digest", provider.pack_digest.as_bytes());
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
+#[test]
+fn model_selection_digest_versions_composition() {
+    let providers = std::collections::BTreeSet::from([ModelProvider {
+        pack_id: "fixture.provider".into(),
+        pack_version: "1.0.0".into(),
+        pack_digest: "fixture-digest".into(),
+    }]);
+    assert_eq!(
+        ModelProviderSelection::new(providers.clone()).digest(),
+        model_provider_selection_digest(&providers, MODEL_COMPOSITION_VERSION),
+    );
+    assert_ne!(
+        model_provider_selection_digest(&providers, MODEL_COMPOSITION_VERSION),
+        model_provider_selection_digest(&providers, MODEL_COMPOSITION_VERSION + 1),
+    );
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelOwnerDeclarations {
+    pub owner: ModelSymbolRef,
+    pub declaration: SemanticModelSymbol,
+    /// Composed members excluding identified Go promotion copies. Consult
+    /// members_state before treating these as exact direct declarations.
+    pub members: Vec<ModelMemberDeclaration>,
+    pub members_state: ModelMembersState,
+}
+
+/// Additive amendment to #7509 issuecomment-6448637997, with the
+/// coordinator's structural-marking redesign: incomplete embedding or imprecise
+/// declaring sites cannot prove that every retained member is direct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelMembersState {
+    Exact,
+    MayIncludePromotionCopies,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelMemberDeclaration {
+    pub member: ModelSymbolRef,
+    pub declaration: SemanticModelSymbol,
+}
+
+/// Every unresolved forward is an open boundary, never an absence (#7534).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelForwardGap {
+    /// No selected provider declares the target.
+    NoSelectedTarget,
+    /// Selected providers tie at the highest admissible version (CS1703).
+    Tie,
+    /// Only versions below the referenced one are selected (CS1705).
+    OnlyLowerVersion,
+    /// The request-local walk revisited a provider within the selection.
+    Cycle,
+    /// The matching provider declares neither the owner nor a further forward.
+    TargetLacksOwner,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelOwnerAnswer {
+    Declared(ModelOwnerDeclarations),
+    /// Authored forward where the walk stopped, never a guessed declaration.
+    UnresolvedForward {
+        forward: ModelSymbolRef,
+        declaration: SemanticModelSymbol,
+        gap: ModelForwardGap,
+    },
+}
+
+/// Authored declaring coordinates, never a record-addressed model URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaringSite<'a> {
+    Artifact(&'a str, &'a str),
+    Authored(&'a SemanticModelLocation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedFrom {
+    pub declaring_member_id: String,
+    pub depth: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticModelSymbol {
+    /// Go promotion provenance reconstructed from the authored declaring site.
+    #[serde(skip)]
+    pub promoted_from: Option<PromotedFrom>,
+    /// Exactness of the Go embedding closure used to identify promotion copies.
+    #[serde(skip)]
+    pub members_state: ModelMembersState,
     /// Order key frozen before composition. semantic_symbol_source_key is its
     /// only reader; it must never serve as a lookup or presentation name.
     #[serde(skip)]
@@ -676,7 +940,7 @@ pub enum SemanticModelOverlayDisposition {
 #[doc(hidden)]
 pub enum SemanticModelOverlayBuildError {
     Cancelled,
-    RetainedBytesExceeded,
+    RetainedBytesExceeded(super::runtime::SemanticModelOverlayBudgetExceeded),
     GoSurfaceTraversalExceeded,
 }
 
@@ -1103,6 +1367,17 @@ pub fn semantic_symbol_source_key(symbol: &SemanticModelSymbol) -> (&str, &str, 
 }
 
 impl SemanticModelSymbol {
+    pub fn declaring_site(&self) -> Option<DeclaringSite<'_>> {
+        match &self.location {
+            SemanticModelLocation::Authored(_) => Some(DeclaringSite::Authored(&self.location)),
+            SemanticModelLocation::Model(_) => self
+                .locator_path
+                .as_deref()
+                .zip(self.locator_symbol.as_deref())
+                .map(|(path, symbol)| DeclaringSite::Artifact(path, symbol)),
+        }
+    }
+
     pub fn is_rule_generated_function(&self) -> bool {
         self.kind == SemanticModelSymbolKind::Function && self.provenance.rule_id.is_some()
     }
@@ -1348,6 +1623,79 @@ pub fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
     }
 }
 
+/// A language's final step over one selected group and its requested inputs.
+#[doc(hidden)]
+pub trait ModelCompositionLanguage: Sync {
+    fn group_dependencies<'a>(
+        &self,
+        _symbol: &'a SemanticModelSymbol,
+    ) -> Box<dyn Iterator<Item = &'a TypeRef> + 'a> {
+        Box::new(std::iter::empty())
+    }
+
+    fn augment_group(
+        &self,
+        _symbols: &mut Vec<SemanticModelSymbol>,
+        _relations: &mut Vec<SemanticModelRelation>,
+        _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<(), SemanticModelOverlayBuildError> {
+        Ok(())
+    }
+
+    /// Whether a nominal type reference in this language can name a
+    /// declaration of `kind` as its owner. Aliases, modules and members
+    /// cannot.
+    fn is_type_owner_kind(&self, kind: SemanticModelSymbolKind) -> bool {
+        use SemanticModelSymbolKind as Kind;
+        matches!(
+            kind,
+            Kind::Class
+                | Kind::Struct
+                | Kind::Interface
+                | Kind::Trait
+                | Kind::Enum
+                | Kind::Annotation
+                | Kind::Record
+        )
+    }
+}
+
+struct OrdinaryModelComposition;
+impl ModelCompositionLanguage for OrdinaryModelComposition {}
+
+struct GoModelComposition;
+impl ModelCompositionLanguage for GoModelComposition {
+    fn group_dependencies<'a>(
+        &self,
+        symbol: &'a SemanticModelSymbol,
+    ) -> Box<dyn Iterator<Item = &'a TypeRef> + 'a> {
+        Box::new(
+            symbol
+                .embedded_types
+                .iter()
+                .map(|embedded| &embedded.target),
+        )
+    }
+
+    fn augment_group(
+        &self,
+        symbols: &mut Vec<SemanticModelSymbol>,
+        relations: &mut Vec<SemanticModelRelation>,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<(), SemanticModelOverlayBuildError> {
+        augment_go_overlay_surface(symbols, relations, cancellation)
+    }
+}
+
+/// Language hook registry for selected composition.
+#[doc(hidden)]
+pub fn model_composition_language(language: &str) -> &'static dyn ModelCompositionLanguage {
+    match language {
+        "go" => &GoModelComposition,
+        _ => &OrdinaryModelComposition,
+    }
+}
+
 #[doc(hidden)]
 pub fn augment_go_overlay_surface(
     symbols: &mut Vec<SemanticModelSymbol>,
@@ -1374,111 +1722,198 @@ pub fn augment_go_overlay_surface(
         })
         .map(|(index, symbol)| (symbol.id.clone(), index))
         .collect::<HashMap<_, _>>();
-    let qualified_type_ids = type_indices
-        .iter()
-        .map(|(id, index)| (symbols[*index].qualified_name.clone(), id.clone()))
+    let qualified_type_indices = type_indices
+        .values()
+        .map(|index| (symbols[*index].qualified_name.clone(), *index))
         .collect::<HashMap<_, _>>();
+    let owners = symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.language == "go" && symbol.owner_id.is_none())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut provider_types = HashMap::<(ModelProvider, String), Vec<usize>>::default();
+    let mut provider_names = HashMap::<(ModelProvider, String), Vec<usize>>::default();
+    for &index in &owners {
+        let symbol = &symbols[index];
+        let provider = ModelProvider::from(&symbol.provenance);
+        provider_types
+            .entry((provider.clone(), symbol.id.clone()))
+            .or_default()
+            .push(index);
+        provider_names
+            .entry((provider, symbol.qualified_name.clone()))
+            .or_default()
+            .push(index);
+    }
+    let resolve_target = |reference: &TypeRef, embedding: &SemanticModelSymbol| {
+        let mut reference = reference;
+        while let TypeRef::Pointer { element } = reference {
+            reference = element;
+        }
+        if reference.contains_unknown() {
+            return None;
+        }
+        let (name, table) = match reference {
+            TypeRef::Declared { id, .. } => (id, &provider_types),
+            TypeRef::Named { name, .. } => (name, &provider_names),
+            _ => return None,
+        };
+        // An unexported embedded type is always in the same package, hence
+        // in the same pack. Resolve within the defining provider first.
+        if let Some(indices) =
+            table.get(&(ModelProvider::from(&embedding.provenance), name.clone()))
+        {
+            return (indices.len() == 1).then(|| indices[0]);
+        }
+        // Cross-provider targets retain the existing visible, unique admission.
+        match reference {
+            TypeRef::Declared { id, .. } => type_indices.get(id).copied(),
+            TypeRef::Named { name, .. } => qualified_type_indices.get(name).copied(),
+            _ => None,
+        }
+    };
     let direct_members = symbols
         .iter()
         .enumerate()
-        .filter_map(|(index, symbol)| symbol.owner_id.as_ref().map(|owner| (owner.clone(), index)))
+        .filter_map(|(index, symbol)| {
+            symbol.owner_id.as_ref().map(|owner| {
+                (
+                    (ModelProvider::from(&symbol.provenance), owner.clone()),
+                    index,
+                )
+            })
+        })
         .fold(
-            HashMap::<String, Vec<usize>>::default(),
+            HashMap::<(ModelProvider, String), Vec<usize>>::default(),
             |mut grouped, (owner, index)| {
                 grouped.entry(owner).or_default().push(index);
                 grouped
             },
         );
-
-    let mut promoted = Vec::new();
+    let owner_members = |index: usize| {
+        let symbol = &symbols[index];
+        direct_members
+            .get(&(ModelProvider::from(&symbol.provenance), symbol.id.clone()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
+    let mut promoted = Vec::<SemanticModelSymbol>::new();
+    let mut copy_owners = HashMap::<usize, usize>::default();
+    let mut reachable_depths = HashMap::<usize, HashMap<usize, usize>>::default();
+    let mut promoted_sources = Vec::new();
+    let mut promoted_owners = Vec::new();
+    let mut owner_states = Vec::new();
     let mut traversal_steps = 0usize;
-    for &owner_index in type_indices.values() {
+    for &owner_index in &owners {
         let owner = &symbols[owner_index];
         if cancellation.is_cancelled() {
             return Err(SemanticModelOverlayBuildError::Cancelled);
         }
+        let publish = type_indices.get(&owner.id) == Some(&owner_index);
         let mut incomplete_embedded_surface = false;
-        let mut resolved_names = direct_members
-            .get(&owner.id)
-            .into_iter()
-            .flatten()
+        let mut members_state = ModelMembersState::Exact;
+        let mut owner_depths = HashMap::<usize, usize>::default();
+        let mut resolved_names = owner_members(owner_index)
+            .iter()
             .map(|index| symbols[*index].name.clone())
             .collect::<HashSet<_>>();
-        let mut current = HashMap::<(String, bool), u8>::default();
+        // Each reachable member is compared only with the owner's members of
+        // the same name, not with every owner member.
+        let mut owned_by_name = HashMap::<&str, Vec<usize>>::default();
+        for &owned_index in owner_members(owner_index) {
+            owned_by_name
+                .entry(symbols[owned_index].name.as_str())
+                .or_default()
+                .push(owned_index);
+        }
+        let mut current = HashMap::<(usize, bool), u8>::default();
         for embedded in &owner.embedded_types {
-            if let Some(target) = overlay_declared_type_id(&embedded.target, &qualified_type_ids) {
-                if let Some(&target_index) = type_indices.get(&target) {
-                    if symbols[target_index].provenance.completeness
-                        != SemanticModelCompleteness::Complete
-                    {
-                        incomplete_embedded_surface = true;
-                    }
-                } else {
-                    incomplete_embedded_surface = true;
-                }
+            if let Some(target) = resolve_target(&embedded.target, owner) {
                 current
                     .entry((target, embedded.pointer))
                     .and_modify(|count| *count = 2)
                     .or_insert(1);
             } else {
                 incomplete_embedded_surface = true;
+                members_state = ModelMembersState::MayIncludePromotionCopies;
             }
         }
-        let mut seen_depth = HashMap::<(String, bool), usize>::default();
-        seen_depth.insert((owner.id.clone(), false), 0);
+        let mut seen_depth = HashMap::<(usize, bool), usize>::default();
+        seen_depth.insert((owner_index, false), 0);
         let mut depth = 1usize;
         while !current.is_empty() {
             let mut candidates = HashMap::<String, (Option<(usize, bool)>, u8)>::default();
-            let mut next = HashMap::<(String, bool), u8>::default();
-            for ((type_id, pointer_available), multiplicity) in current {
+            let mut next = HashMap::<(usize, bool), u8>::default();
+            for ((embedded_index, pointer_available), multiplicity) in current {
+                if cancellation.is_cancelled() {
+                    return Err(SemanticModelOverlayBuildError::Cancelled);
+                }
                 traversal_steps = traversal_steps.saturating_add(1);
                 if traversal_steps > MAX_GO_OVERLAY_TRAVERSAL_STEPS {
                     return Err(SemanticModelOverlayBuildError::GoSurfaceTraversalExceeded);
                 }
-                if let Some(member_indices) = direct_members.get(&type_id) {
-                    for &member_index in member_indices {
-                        let member = &symbols[member_index];
-                        if !member.externally_visible()
-                            || member.provenance.ambiguous
-                            || resolved_names.contains(&member.name)
-                        {
-                            continue;
-                        }
-                        let entry = candidates.entry(member.name.clone()).or_insert((None, 0));
-                        entry.1 = entry.1.saturating_add(multiplicity).min(2);
-                        if entry.1 == 1 {
-                            entry.0 = Some((member_index, pointer_available));
-                        } else {
-                            entry.0 = None;
-                        }
-                    }
-                }
-                let Some(&embedded_index) = type_indices.get(&type_id) else {
+                owner_depths
+                    .entry(embedded_index)
+                    .and_modify(|previous| *previous = (*previous).min(depth))
+                    .or_insert(depth);
+                let embedded_owner = &symbols[embedded_index];
+                // Preserve the legacy published coverage while the wider
+                // provider-first closure proves direct-member exactness.
+                if type_indices.get(&embedded_owner.id) != Some(&embedded_index)
+                    || embedded_owner.provenance.completeness != SemanticModelCompleteness::Complete
+                {
                     incomplete_embedded_surface = true;
-                    continue;
-                };
-                for embedded in &symbols[embedded_index].embedded_types {
-                    let Some(target) =
-                        overlay_declared_type_id(&embedded.target, &qualified_type_ids)
-                    else {
-                        incomplete_embedded_surface = true;
-                        continue;
-                    };
-                    let Some(&target_index) = type_indices.get(&target) else {
-                        incomplete_embedded_surface = true;
-                        continue;
-                    };
-                    if symbols[target_index].provenance.completeness
-                        != SemanticModelCompleteness::Complete
+                }
+                for &member_index in owner_members(embedded_index) {
+                    let member = &symbols[member_index];
+                    // Go has no overloads. A language with overloads must add
+                    // signature identity to (name, declaring site, provider).
+                    for &owned_index in owned_by_name
+                        .get(member.name.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
                     {
-                        incomplete_embedded_surface = true;
+                        let owned = &symbols[owned_index];
+                        let Some(site) = member.declaring_site() else {
+                            members_state = ModelMembersState::MayIncludePromotionCopies;
+                            continue;
+                        };
+                        if owned.declaring_site().is_none()
+                            || !matches!(site, DeclaringSite::Artifact(..))
+                        {
+                            members_state = ModelMembersState::MayIncludePromotionCopies;
+                        }
+                        if owned_index != member_index
+                            && owned.declaring_site() == Some(site)
+                            && ModelProvider::from(&owned.provenance)
+                                == ModelProvider::from(&member.provenance)
+                        {
+                            copy_owners.insert(owned_index, owner_index);
+                        }
                     }
+                    if !member.externally_visible()
+                        || member.provenance.ambiguous
+                        || resolved_names.contains(&member.name)
+                    {
+                        continue;
+                    }
+                    let entry = candidates.entry(member.name.clone()).or_insert((None, 0));
+                    entry.1 = entry.1.saturating_add(multiplicity).min(2);
+                    entry.0 = (entry.1 == 1).then_some((member_index, pointer_available));
+                }
+                for embedded in &embedded_owner.embedded_types {
+                    let Some(target) = resolve_target(&embedded.target, embedded_owner) else {
+                        incomplete_embedded_surface = true;
+                        members_state = ModelMembersState::MayIncludePromotionCopies;
+                        continue;
+                    };
                     let state = (target, pointer_available || embedded.pointer);
                     match seen_depth.get(&state).copied() {
                         Some(previous) if previous < depth + 1 => continue,
                         Some(_) => {}
                         None => {
-                            seen_depth.insert(state.clone(), depth + 1);
+                            seen_depth.insert(state, depth + 1);
                         }
                     }
                     next.entry(state)
@@ -1490,11 +1925,14 @@ pub fn augment_go_overlay_surface(
             candidate_names.sort_by(|left, right| left.0.cmp(&right.0));
             for (name, (member, multiplicity)) in candidate_names {
                 resolved_names.insert(name);
-                if multiplicity != 1 {
+                if multiplicity != 1 || !publish {
                     continue;
                 }
                 let (member_index, pointer_available) = member.expect("unique member has an index");
                 let mut member = symbols[member_index].clone();
+                promoted_sources.push((member_index, depth));
+                promoted_owners.push(owner_index);
+                member.promoted_from = None;
                 member.id = format!("go-promoted:{}:{}", owner.id, member.id);
                 member.owner_id = Some(owner.id.clone());
                 member.qualified_name = format!("{}.{}", owner.qualified_name, member.name);
@@ -1506,7 +1944,128 @@ pub fn augment_go_overlay_surface(
             current = next;
             depth += 1;
         }
-        if incomplete_embedded_surface {
+        reachable_depths.insert(owner_index, owner_depths);
+        owner_states.push((owner_index, members_state, incomplete_embedded_surface));
+    }
+    // The single embedding walk records shortest owner distances. Their total
+    // entries are bounded by its step limit; do not retain the Cartesian
+    // product of copied members and reachable member candidates.
+    let original_members = symbols
+        .iter()
+        .enumerate()
+        .filter(|(index, member)| {
+            member.language == "go" && member.owner_id.is_some() && !copy_owners.contains_key(index)
+        })
+        .fold(
+            HashMap::<(ModelProvider, String), Vec<usize>>::default(),
+            |mut grouped, (index, member)| {
+                grouped
+                    .entry((ModelProvider::from(&member.provenance), member.name.clone()))
+                    .or_default()
+                    .push(index);
+                grouped
+            },
+        );
+    let select_original = |member: &SemanticModelSymbol, owner_index: usize| {
+        let site = member.declaring_site()?;
+        let mut selected: Option<(usize, usize)> = None;
+        let key = (ModelProvider::from(&member.provenance), member.name.clone());
+        for &candidate_index in original_members.get(&key).into_iter().flatten() {
+            let candidate = &symbols[candidate_index];
+            if candidate.declaring_site() != Some(site.clone()) {
+                continue;
+            }
+            let owner_key = (
+                ModelProvider::from(&candidate.provenance),
+                candidate.owner_id.clone().expect("candidate is a member"),
+            );
+            for candidate_owner in provider_types.get(&owner_key).into_iter().flatten() {
+                let Some(&candidate_depth) = reachable_depths[&owner_index].get(candidate_owner)
+                else {
+                    continue;
+                };
+                if selected.is_none_or(|(previous, previous_depth)| {
+                    (candidate_depth, &candidate.id) < (previous_depth, &symbols[previous].id)
+                }) {
+                    selected = Some((candidate_index, candidate_depth));
+                }
+            }
+        }
+        selected.map(|(index, depth)| PromotedFrom {
+            declaring_member_id: symbols[index].id.clone(),
+            depth,
+        })
+    };
+    let marks = copy_owners
+        .iter()
+        .map(|(index, owner)| (*index, select_original(&symbols[*index], *owner)))
+        .collect::<Vec<_>>();
+    let promoted_marks = promoted
+        .iter()
+        .zip(&promoted_sources)
+        .zip(&promoted_owners)
+        .map(|((member, &(source, depth)), &owner)| {
+            if member.declaring_site().is_some() {
+                select_original(member, owner)
+            } else {
+                // A newly synthesized copy has an explicit source even when
+                // that source carries no precise authored coordinates.
+                assert!(!copy_owners.contains_key(&source));
+                Some(PromotedFrom {
+                    declaring_member_id: symbols[source].id.clone(),
+                    depth,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut uncertain_owners = HashSet::default();
+    for (index, mark) in marks {
+        if mark.is_none() {
+            let member = &symbols[index];
+            let key = (
+                ModelProvider::from(&member.provenance),
+                member.owner_id.clone().expect("member has owner"),
+            );
+            uncertain_owners.extend(provider_types.get(&key).into_iter().flatten().copied());
+        }
+        symbols[index].promoted_from = mark;
+    }
+    for ((member, mark), owner) in promoted.iter_mut().zip(promoted_marks).zip(promoted_owners) {
+        if mark.is_none() || !matches!(member.declaring_site(), Some(DeclaringSite::Artifact(..))) {
+            uncertain_owners.insert(owner);
+        }
+        member.promoted_from = mark;
+    }
+    for (owner_index, state, incomplete) in owner_states {
+        let owner = &symbols[owner_index];
+        // Go has no overloads, so in a well-formed pack (name, declaring site,
+        // provider) names one declaration per owner. Pack content is external
+        // input and can still carry conflicting declarations under one key
+        // (go_move_6 pins a model with two `Conflict` functions sharing a
+        // locator). Copy marking cannot tell those apart, so the owner fails
+        // closed instead of asserting.
+        let unmarked = direct_members
+            .get(&(ModelProvider::from(&owner.provenance), owner.id.clone()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|index| symbols[*index].promoted_from.is_none())
+            .collect::<Vec<_>>();
+        let duplicate_key = unmarked.iter().enumerate().any(|(position, &left)| {
+            symbols[left].declaring_site().is_some_and(|site| {
+                unmarked[position + 1..].iter().any(|right| {
+                    symbols[left].name == symbols[*right].name
+                        && symbols[*right].declaring_site() == Some(site.clone())
+                })
+            })
+        });
+        symbols[owner_index].members_state =
+            if duplicate_key || uncertain_owners.contains(&owner_index) {
+                ModelMembersState::MayIncludePromotionCopies
+            } else {
+                state
+            };
+        if incomplete && type_indices.get(&symbols[owner_index].id) == Some(&owner_index) {
             symbols[owner_index].provenance.completeness = SemanticModelCompleteness::Partial;
         }
     }
@@ -1573,6 +2132,9 @@ pub fn augment_go_overlay_surface(
             .map(Vec::as_slice)
             .unwrap_or_default();
         for (interface, required_methods) in &interfaces {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
             if candidate.id == interface.id
                 || existing.contains(&(
                     candidate.id.clone(),
@@ -1608,21 +2170,6 @@ pub fn augment_go_overlay_surface(
         }
     }
     Ok(())
-}
-
-fn overlay_declared_type_id(
-    reference: &TypeRef,
-    qualified_type_ids: &HashMap<String, String>,
-) -> Option<String> {
-    if reference.contains_unknown() {
-        return None;
-    }
-    match reference {
-        TypeRef::Declared { id, .. } => Some(id.clone()),
-        TypeRef::Named { name, .. } => qualified_type_ids.get(name).cloned(),
-        TypeRef::Pointer { element } => overlay_declared_type_id(element, qualified_type_ids),
-        _ => None,
-    }
 }
 
 #[doc(hidden)]

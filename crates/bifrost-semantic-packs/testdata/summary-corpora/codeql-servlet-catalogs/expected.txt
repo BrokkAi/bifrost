@@ -1,0 +1,234 @@
+{
+  "catalogs": {
+    "codeql-servlet-sinks-response-splitting": {
+      "categories": [
+        "response-splitting"
+      ],
+      "external_models": [],
+      "name": "codeql-servlet-sinks-response-splitting",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [
+        {
+          "accepts": [
+            "attacker-controlled"
+          ],
+          "categories": [
+            "response-splitting"
+          ],
+          "dangerous_operand": {
+            "index": 0,
+            "type": "argument_index"
+          },
+          "display_name": "javax.servlet.ServletResponse.setContentType(java.lang.String)",
+          "id": "codeql-ab514469d482c33e32828d5a8bb57ff943a307bb36aeb7f0acf4b1450052db5e",
+          "impacts": [],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "setContentType"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.ServletResponse.setContentType"
+                  }
+                },
+                {
+                  "formal_index": 0,
+                  "op": "call_argument"
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "tags": []
+        }
+      ],
+      "sources": [],
+      "transforms": [],
+      "version": 1
+    },
+    "codeql-servlet-sources-remote": {
+      "categories": [
+        "remote"
+      ],
+      "external_models": [],
+      "name": "codeql-servlet-sources-remote",
+      "sanitizers": [],
+      "schema_version": 1,
+      "sinks": [],
+      "sources": [
+        {
+          "bind": {
+            "type": "return_value"
+          },
+          "categories": [
+            "remote"
+          ],
+          "display_name": "javax.servlet.http.HttpServletRequest.getParameter(java.lang.String)",
+          "evidence": null,
+          "id": "codeql-814fe461be1f84b6a6817ecfc8e3fdd0a863a14fa4f0abccf826f3be2ae20ee2",
+          "labels": [
+            "attacker-controlled"
+          ],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "getParameter"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.HttpServletRequest.getParameter"
+                  }
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "threat_model": "remote"
+        },
+        {
+          "bind": {
+            "type": "return_value"
+          },
+          "categories": [
+            "remote"
+          ],
+          "display_name": "javax.servlet.ServletRequest.getParameter(java.lang.String)",
+          "evidence": null,
+          "id": "codeql-9b6a2b74f58706a9788ca86ee5d34f45b2e4bcb6e9580414ed27f047e0434d5b",
+          "labels": [
+            "attacker-controlled"
+          ],
+          "selector": {
+            "query": {
+              "languages": [
+                "java"
+              ],
+              "match": {
+                "callee": {
+                  "name": "getParameter"
+                },
+                "kind": "call"
+              },
+              "schema_version": 1,
+              "steps": [
+                {
+                  "op": "call_shape"
+                },
+                {
+                  "op": "call_bindings"
+                },
+                {
+                  "call_proof": "declared",
+                  "op": "resolved_call",
+                  "resolves_to": {
+                    "stable": "test.ServletRequest.getParameter"
+                  }
+                }
+              ]
+            },
+            "schema_version": 1,
+            "type": "inline"
+          },
+          "threat_model": "remote"
+        }
+      ],
+      "transforms": [],
+      "version": 1
+    }
+  },
+  "report": {
+    "catalog_version": 1,
+    "catalogs": {
+      "codeql-servlet-sinks-response-splitting": {
+        "entries": 1,
+        "semantic_hash": "71f2a5edde9dbdda03a456f9df95429820c259af99cbd6c5f09e25b6121bfa51"
+      },
+      "codeql-servlet-sources-remote": {
+        "entries": 2,
+        "semantic_hash": "b6e1cb7b6a03cdf1315c8bcf09a24d016d41ed7d70c4e901cce593a5c324a8d0"
+      }
+    },
+    "codeql_commit": "ae741615f3e178ce61289a651790dc67fcc18e19",
+    "collapsed_by_content_kind": {},
+    "conflicts": [],
+    "neutrals_by_kind": {},
+    "rows_by_catalog": {
+      "codeql-servlet-sinks-response-splitting": [
+        "Sink: javax.servlet; ServletResponse; false; setContentType; (String); ; Argument[0]; response-splitting; manual"
+      ],
+      "codeql-servlet-sources-remote": [
+        "Source: javax.servlet; ServletRequest; true; getParameter; (String); ; ReturnValue; remote; manual"
+      ]
+    },
+    "rows_by_extensible_and_kind": {
+      "sinkModel": {
+        "response-splitting": 1
+      },
+      "sourceModel": {
+        "remote": 2
+      }
+    },
+    "rows_by_provenance": {
+      "manual": 3
+    },
+    "skipped_by_reason": {
+      "unmatched_declaration": 1
+    },
+    "skipped_targets_by_reason": {},
+    "source_kinds_without_threat_model": [],
+    "translated_rows": 2,
+    "unmatched_declarations": [
+      {
+        "cells": [
+          "javax.servlet",
+          "ServletRequest",
+          "false",
+          "missing",
+          "()",
+          "",
+          "ReturnValue",
+          "remote",
+          "manual"
+        ],
+        "file": "servlet.model.yml",
+        "row": 2
+      }
+    ]
+  }
+}

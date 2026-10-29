@@ -83,39 +83,3 @@ pub trait PhpExternalSurface {
     /// An empty result means discovery evidence is present and complete.
     fn discovery_incomplete_reasons(&self) -> Vec<SemanticDiagnosticIncompleteReason>;
 }
-
-/// The surface a collector sees when no host ever activated dependency packs.
-///
-/// Every lookup is absent and no namespace is complete, so the ladder reports
-/// `ExternalUnknown` and publishes nothing. This is the honest answer for an
-/// analyzer that has not indexed its dependencies.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnindexedPhpExternalSurface;
-
-impl PhpExternalSurface for UnindexedPhpExternalSurface {
-    fn lookup_type(&self, _fqn: &str) -> PhpExternalSymbol {
-        PhpExternalSymbol::Absent
-    }
-
-    fn lookup_member(&self, _owner_id: &str, _member: &str) -> PhpExternalMember {
-        PhpExternalMember::Unproven {
-            detail: "no active semantic pack publishes a PHP surface".to_owned(),
-        }
-    }
-
-    fn namespace_surface_is_complete(&self, _namespace_fq: &str) -> bool {
-        false
-    }
-
-    fn declares_unindexed(&self, _fqn: &str) -> bool {
-        false
-    }
-
-    fn discovery_incomplete_reasons(&self) -> Vec<SemanticDiagnosticIncompleteReason> {
-        vec![
-            SemanticDiagnosticIncompleteReason::missing_dependency_discovery(
-                brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus::ExternalUnknown,
-            ),
-        ]
-    }
-}

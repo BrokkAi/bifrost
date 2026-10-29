@@ -250,9 +250,17 @@ impl ConfigurationFactsTraversalCache {
         let snapshot = match snapshot {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
-                self.report_file_incomplete(
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=provider:source_snapshot",
+                        file!(),
+                        line!()
+                    )
+                });
+                analyzer.mark_execution_dependent();
+                self.report_file_incomplete(analyzer,
                     file,
-                    CodeQueryDiagnosticCode::PipelineBudgetExhausted,
+                    (CodeQueryDiagnosticCode::PipelineBudgetExhausted, Some(DerivationExecutionCause::Budget)),
                     format!(
                         "configuration document {} exceeds the {}-byte ingestion cap; its facts are not available",
                         rel_path_string(file),
@@ -265,9 +273,21 @@ impl ConfigurationFactsTraversalCache {
                 return Some(snapshot);
             }
             Err(error) => {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=provider:source_snapshot detail={error:?}",
+                        file!(),
+                        line!()
+                    )
+                });
+                analyzer.mark_execution_dependent();
                 self.report_file_incomplete(
+                    analyzer,
                     file,
-                    CodeQueryDiagnosticCode::PathDerivationIncomplete,
+                    (
+                        CodeQueryDiagnosticCode::PathDerivationIncomplete,
+                        Some(DerivationExecutionCause::Provider),
+                    ),
                     format!(
                         "configuration ingestion could not read {}: {error}",
                         rel_path_string(file)
@@ -292,9 +312,9 @@ impl ConfigurationFactsTraversalCache {
                 if facts.completeness().is_complete() {
                     Some((Arc::new(*facts), Arc::clone(&source)))
                 } else {
-                    self.report_file_incomplete(
+                    self.report_file_incomplete(analyzer,
                         file,
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                         format!(
                             "configuration ingestion of {} retained facts from a partly recovered document ({}); its rows are not the whole set",
                             rel_path_string(file),
@@ -309,9 +329,9 @@ impl ConfigurationFactsTraversalCache {
                 let format = format
                     .map(|format| format.to_string())
                     .unwrap_or_else(|| "unknown configuration".to_string());
-                self.report_file_incomplete(
+                self.report_file_incomplete(analyzer,
                     file,
-                    CodeQueryDiagnosticCode::MissingStructuralAdapter,
+                    (CodeQueryDiagnosticCode::MissingStructuralAdapter, None),
                     format!(
                         "no configuration ingestion adapter for {format}: {} facts are not the whole set",
                         rel_path_string(file)
@@ -321,9 +341,9 @@ impl ConfigurationFactsTraversalCache {
                 None
             }
             ConfigurationIngestionOutcome::Incomplete { reason } => {
-                self.report_file_incomplete(
+                self.report_file_incomplete(analyzer,
                     file,
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!(
                         "configuration ingestion of {} is incomplete ({}); its rows are not the whole set",
                         rel_path_string(file),
@@ -360,25 +380,30 @@ impl ConfigurationFactsTraversalCache {
 
     fn report_file_incomplete(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
-        code: CodeQueryDiagnosticCode,
+        (code, cause): (CodeQueryDiagnosticCode, Option<DerivationExecutionCause>),
         message: String,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
         if !self.reported.insert((file.clone(), code)) {
             return;
         }
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
-            message,
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        });
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            analyzer,
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: None,
+                code,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message,
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+            cause,
+        ));
     }
 }
 
@@ -621,9 +646,18 @@ pub(super) fn configuration_seed_files(
     formats: &[crate::query::domain::ConfigurationFormat],
     where_globs: &crate::query::QueryPathScope,
 ) -> Result<Vec<ProjectFile>, std::io::Error> {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
     let project = state.analyzer.project();
     let mut files = Vec::new();
     for file in project.all_files()? {
+        if file.rel_path().components().any(|component| {
+            component
+                == Component::Normal(OsStr::new(brokk_bifrost_core::gitblob::PROJECT_DIR_NAME))
+        }) {
+            continue;
+        }
         let rel = rel_path_string(&file);
         if !where_globs.matches(&rel) {
             continue;
@@ -671,17 +705,29 @@ pub(super) fn execute_configuration_facts_seed(
     let files = match configuration_seed_files(state, &seed.filter.formats, &seed.where_globs) {
         Ok(files) => files,
         Err(error) => {
-            diagnostics.push(CodeQueryDiagnostic {
-                related: Vec::new(),
-                source: None,
-                code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
-                impact: CodeQueryDiagnosticImpact::Incomplete,
-                branch: Vec::new(),
-                language: "workspace",
-                message: format!("configuration seed could not list workspace files: {error}"),
-                exhausted_roots: Vec::new(),
-                withheld_rows_path: None,
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:configuration_files detail={error:?}",
+                    file!(),
+                    line!()
+                )
             });
+            state.analyzer.mark_execution_dependent();
+            diagnostics.push(super::QueryExecutionState::diagnostic(
+                state.analyzer,
+                CodeQueryDiagnostic {
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!("configuration seed could not list workspace files: {error}"),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                },
+                Some(DerivationExecutionCause::Provider),
+            ));
             return PlanExecution {
                 rows: Vec::new(),
                 truncated: true,
@@ -755,8 +801,9 @@ pub(super) fn execute_configuration_facts_seed(
             };
             if let Some(reason) = xml_reference_coverage(&document_value, &seed.filter) {
                 state.configuration_cache.report_file_incomplete(
+                    state.analyzer,
                     &file,
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!(
                         "XML configuration relation for {} is incomplete: {reason}",
                         rel_path_string(&file)

@@ -169,6 +169,137 @@ code_query_labeled_enum! {
     }
 }
 
+impl CodeQueryDiagnosticCode {
+    /// Unit admission is fail-closed even when an origin forgot to mark.
+    /// Collapsed content gaps are admitted only where operational causes mark
+    /// the request and capture/replay preserves that execution dependence.
+    pub const fn is_execution_state(self) -> bool {
+        match self {
+            Self::InvalidPlan
+            | Self::CrossDomainDocumentIncomplete
+            | Self::PythonHierarchyDerivationIncomplete
+            | Self::JsxProjectionIncomplete
+            | Self::CallShapeCoverageIncomplete
+            | Self::Cancelled
+            | Self::SemanticResultsOmitted
+            | Self::SemanticAnalysisPartial
+            | Self::CallBindingDispatchPartial
+            | Self::CallBindingSelectorRejected
+            | Self::SemanticBudgetExhausted
+            | Self::SemanticProviderFailed
+            | Self::SemanticPackAcquisitionPending
+            | Self::UnresolvedProtocolReference
+            | Self::TypestateRegistrationStale
+            | Self::TypestateHandleStale
+            | Self::TypestateRootMismatch
+            | Self::TypestateAnalysisPartial
+            | Self::TypestateProviderFailed
+            | Self::TypestateSolverBudgetExhausted
+            | Self::TypestateFindingBudgetExhausted
+            | Self::TypestateWitnessTruncated
+            | Self::UnresolvedValueFlowPlanReference
+            | Self::ValueFlowRegistrationStale
+            | Self::ValueFlowHandleStale
+            | Self::ValueFlowRootMismatch
+            | Self::ValueFlowAnalysisPartial
+            | Self::ValueFlowProviderFailed
+            | Self::ValueFlowSolverBudgetExhausted
+            | Self::ValueFlowWitnessTruncated
+            | Self::TypeFlowWitnessTruncated
+            | Self::TypeFlowWitnessUnavailable
+            | Self::UnresolvedTaintResultReference
+            | Self::TaintRegistrationStale
+            | Self::TaintHandleStale
+            | Self::TaintRootMismatch
+            | Self::TaintPlanReportMismatch
+            | Self::TaintProjectionFailed
+            | Self::TaintFindingTruncated
+            | Self::ReceiverAnalysisPartial
+            | Self::ReceiverAnalysisFailed
+            | Self::CallRelationBudgetExhausted
+            | Self::CallRelationParseFailed
+            | Self::CallRelationCandidatesOmitted
+            | Self::CallRelationCandidateLimit
+            | Self::CallRelationAnalysisFailed
+            | Self::ReferenceSourceBytesTruncated
+            | Self::ReferenceCandidateFilesTruncated
+            | Self::ReferenceCandidatesOmitted
+            | Self::ReferenceCallsiteLimit
+            | Self::ReferenceAnalysisFailed
+            | Self::UsesCandidateLimit
+            | Self::UsesCandidatesOmitted
+            | Self::ExecutionBudgetExhausted
+            | Self::PipelineBudgetExhausted
+            | Self::ImportGraphBudgetExhausted
+            | Self::OccurrenceResolutionIncomplete
+            | Self::OccurrenceRowBudgetExhausted
+            | Self::MaterializationDerivationIncomplete
+            | Self::MaterializationRowBudgetExhausted
+            | Self::EnvironmentDerivationIncomplete
+            | Self::EnvironmentRowBudgetExhausted
+            | Self::ResolutionTraceIncomplete
+            | Self::EdgeDerivationIncomplete
+            | Self::EffectBudgetExhausted
+            | Self::ResultLimitReached => true,
+            Self::UnsupportedStructuralFeature
+            | Self::MissingStructuralAdapter
+            | Self::RecoveredSyntaxIncomplete
+            | Self::UnsupportedImportAnalysis
+            | Self::DynamicImportTarget
+            | Self::SemanticWorkspaceRequired
+            | Self::NoEnclosingProcedure
+            | Self::SemanticCapabilityUnsupported
+            | Self::TypestateCapabilityUnsupported
+            | Self::ValueFlowCapabilityUnsupported
+            | Self::CallRelationTargetsAmbiguous
+            | Self::ReferenceTargetsAmbiguous
+            | Self::UsesParserUnsupported
+            | Self::UsesTargetsAmbiguous
+            | Self::OccurrenceRoleUnsupported
+            | Self::EnvironmentAxisUnsupported
+            | Self::MaterializationAxisUnsupported
+            | Self::EdgeAxisUnsupported
+            | Self::FlowStateAxisUnsupported
+            | Self::RewriteDomainUnsupported
+            | Self::IdentityAxisUnsupported
+            | Self::RewritePathDerivationIncomplete
+            | Self::ControlRelationDerivationIncomplete
+            | Self::BranchRelationDerivationIncomplete
+            | Self::LoopRelationDerivationIncomplete
+            | Self::FailureHandlerDerivationIncomplete
+            | Self::StatementReachabilityDerivationIncomplete
+            | Self::PendingCleanupFlowDerivationIncomplete
+            | Self::TopologyDerivationIncomplete
+            | Self::TopologyOwnershipAmbiguous
+            | Self::PathDerivationIncomplete
+            | Self::FlowStateDerivationIncomplete
+            | Self::EffectDerivationIncomplete
+            | Self::ResultContractDerivationIncomplete
+            | Self::ResultObligationDerivationIncomplete
+            | Self::ControlRelationExitPartitionPartial
+            | Self::CrossDomainBindingUnproven
+            | Self::CrossDomainKeyUnsupported
+            | Self::CrossDomainCorrelationAmbiguous
+            | Self::BroadQuery => false,
+        }
+    }
+
+    pub(crate) fn from_execution_reason(
+        family: Self,
+        reason: &str,
+    ) -> (
+        Self,
+        Option<brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause>,
+    ) {
+        (
+            family,
+            brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(
+                reason,
+            ),
+        )
+    }
+}
+
 code_query_labeled_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
     #[serde(rename_all = "snake_case")]
@@ -180,7 +311,7 @@ code_query_labeled_enum! {
     }
 }
 
-#[derive(Clone, Serialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 pub struct CodeQueryDiagnostic {
     pub code: CodeQueryDiagnosticCode,
     pub impact: CodeQueryDiagnosticImpact,
@@ -259,7 +390,7 @@ pub struct CodeQueryRelatedSource {
 }
 
 /// One root or file whose work stopped against a named limit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct CodeQueryExhaustedRoot {
     /// The workspace-relative path of the file the work belonged to.
     pub path: String,
@@ -287,7 +418,7 @@ pub struct CodeQueryExhaustedRoot {
 }
 
 /// The exact charge one lane refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct CodeQueryExhaustedCharge {
     pub attempted: usize,
     pub limit: usize,
@@ -994,6 +1125,15 @@ impl CodeQueryValueFlowWork {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeQueryTypeFlowWork {
+    /// Root products reused from this policy run, independent of query-local hits.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub root_memo_hits: u64,
+    /// Solver work attributed to shared products; never charged to completeness.
+    #[serde(skip_serializing_if = "brokk_bifrost_flow::dataflow::SolverWork::is_empty")]
+    pub root_memo_solver_work: brokk_bifrost_flow::dataflow::SolverWork,
+    /// Semantic work attributed to shared products; never replayed as query work.
+    #[serde(skip_serializing_if = "SemanticWork::is_empty")]
+    pub root_memo_semantic_work: SemanticWork,
     /// Fresh whole-workspace field-slot indexes built by this query.
     pub field_slot_builds: u64,
     /// Ready indexes reused through the workspace's in-memory acquisition path.
@@ -1058,7 +1198,10 @@ pub struct CodeQueryTypeFlowWork {
 
 impl CodeQueryTypeFlowWork {
     pub const fn is_empty(&self) -> bool {
-        self.field_slot_builds == 0
+        self.root_memo_hits == 0
+            && self.root_memo_solver_work.is_empty()
+            && self.root_memo_semantic_work.is_empty()
+            && self.field_slot_builds == 0
             && self.field_slot_memory_hits == 0
             && self.field_slot_persistence_hits == 0
             && self.field_slot_persistence_misses == 0
@@ -1098,12 +1241,12 @@ impl CodeQueryTypeFlowWork {
 
     pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
         let left = self;
-        saturating_sub_work!(left, earlier; [field_slot_builds, field_slot_memory_hits, field_slot_persistence_hits, field_slot_persistence_misses, field_slot_persistence_rejections, field_slot_publications, root_result_persistence_hits, root_result_persistence_misses, root_result_persistence_rejections, root_result_store_failures, root_result_publications, solves, cache_hits, snapshot_cache_hits, snapshot_cache_misses, dispatch_cache_hits, dispatch_cache_misses, binding_cache_hits, binding_cache_misses, summary_cache_hits, summary_cache_misses, root_summary_cache_hits, root_summary_observation_rejections, published_summaries, solver_attempts, summary_profile, class_set_rows, finding_rows, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, incomplete_roots, failed_solves]; [witness_truncated])
+        saturating_sub_work!(left, earlier; [root_memo_hits, root_memo_solver_work, root_memo_semantic_work, field_slot_builds, field_slot_memory_hits, field_slot_persistence_hits, field_slot_persistence_misses, field_slot_persistence_rejections, field_slot_publications, root_result_persistence_hits, root_result_persistence_misses, root_result_persistence_rejections, root_result_store_failures, root_result_publications, solves, cache_hits, snapshot_cache_hits, snapshot_cache_misses, dispatch_cache_hits, dispatch_cache_misses, binding_cache_hits, binding_cache_misses, summary_cache_hits, summary_cache_misses, root_summary_cache_hits, root_summary_observation_rejections, published_summaries, solver_attempts, summary_profile, class_set_rows, finding_rows, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, incomplete_roots, failed_solves]; [witness_truncated])
     }
 
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
         let left = self;
-        saturating_add_work!(left, other; [field_slot_builds, field_slot_memory_hits, field_slot_persistence_hits, field_slot_persistence_misses, field_slot_persistence_rejections, field_slot_publications, root_result_persistence_hits, root_result_persistence_misses, root_result_persistence_rejections, root_result_store_failures, root_result_publications, solves, cache_hits, snapshot_cache_hits, snapshot_cache_misses, dispatch_cache_hits, dispatch_cache_misses, binding_cache_hits, binding_cache_misses, summary_cache_hits, summary_cache_misses, root_summary_cache_hits, root_summary_observation_rejections, published_summaries, solver_attempts, summary_profile, class_set_rows, finding_rows, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, incomplete_roots, failed_solves]; [witness_truncated])
+        saturating_add_work!(left, other; [root_memo_hits, root_memo_solver_work, root_memo_semantic_work, field_slot_builds, field_slot_memory_hits, field_slot_persistence_hits, field_slot_persistence_misses, field_slot_persistence_rejections, field_slot_publications, root_result_persistence_hits, root_result_persistence_misses, root_result_persistence_rejections, root_result_store_failures, root_result_publications, solves, cache_hits, snapshot_cache_hits, snapshot_cache_misses, dispatch_cache_hits, dispatch_cache_misses, binding_cache_hits, binding_cache_misses, summary_cache_hits, summary_cache_misses, root_summary_cache_hits, root_summary_observation_rejections, published_summaries, solver_attempts, summary_profile, class_set_rows, finding_rows, witnesses, omitted_witnesses, witness_expansions, witness_steps, witness_bytes, incomplete_roots, failed_solves]; [witness_truncated])
     }
 }
 
@@ -1179,6 +1322,10 @@ impl Default for CodeQueryTaintLimits {
             max_witness_bytes: 4 * 1024 * 1024,
         }
     }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]

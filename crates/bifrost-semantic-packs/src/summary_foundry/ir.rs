@@ -487,7 +487,19 @@ impl FoundryEntry {
         if self.transfers.is_empty() {
             return None;
         }
-        Some(AuthoredProcedureSummary {
+        Some(self.summary_contract())
+    }
+
+    /// Declaration-expanded CodeQL contracts include explicit neutral claims.
+    pub fn authored_complete_summary(&self) -> AuthoredProcedureSummary {
+        let mut summary = self.summary_contract();
+        summary.completeness = Completeness::Complete;
+        summary.covers_overrides = self.boundary.has_receiver;
+        summary
+    }
+
+    fn summary_contract(&self) -> AuthoredProcedureSummary {
+        AuthoredProcedureSummary {
             id: self.id.clone(),
             target: AuthoredProcedureTarget {
                 path: self.target.artifact_path.clone(),
@@ -521,7 +533,7 @@ impl FoundryEntry {
             normal_return_refinements: Vec::new(),
             normal_return_type_refinements: Vec::new(),
             class_decorator_identity: None,
-        })
+        }
     }
 
     /// The entry's transfers rendered for the join report, sorted.
@@ -789,7 +801,7 @@ pub struct FoundryEntryBuilder {
 }
 
 impl FoundryEntryBuilder {
-    pub fn add_transfer(&mut self, transfer: AuthoredSummaryTransfer) {
+    pub fn add_transfer(&mut self, mut transfer: AuthoredSummaryTransfer) {
         if matches!(transfer.input, AuthoredSummaryInput::Receiver {})
             || matches!(transfer.output, AuthoredSummaryOutput::Receiver {})
         {
@@ -799,7 +811,25 @@ impl FoundryEntryBuilder {
             self.max_ordinal = Some(self.max_ordinal.map_or(ordinal, |seen| seen.max(ordinal)));
         }
         self.has_flow_rows = true;
-        self.transfers.insert(render_transfer(&transfer), transfer);
+        let key = render_transfer(&transfer);
+        if let Some(previous) = self.transfers.get(&key) {
+            match (&previous.value_transfer, &transfer.value_transfer) {
+                // None means unreviewed, so it cannot erase a reviewed claim.
+                (Some(classification), None) => {
+                    transfer.value_transfer = Some(classification.clone());
+                }
+                (Some(previous), Some(incoming)) => {
+                    // Current corpus translators emit only Conversion/Identity.
+                    // New translators must reject conflicting explicit claims.
+                    assert_eq!(
+                        previous, incoming,
+                        "conflicting explicit value_transfer classifications for {key}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        self.transfers.insert(key, transfer);
     }
 
     pub fn add_evidence(&mut self, evidence: FoundryEvidence) {
@@ -877,6 +907,41 @@ impl FoundryEntryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflicting_explicit_transfer_classifications_fail_closed_in_both_orders() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferOperation,
+        };
+        for kinds in [
+            [
+                SummaryValueTransferKind::Copy {},
+                SummaryValueTransferKind::AggregateCopy {},
+            ],
+            [
+                SummaryValueTransferKind::AggregateCopy {},
+                SummaryValueTransferKind::Copy {},
+            ],
+        ] {
+            let rejected = std::panic::catch_unwind(|| {
+                let mut builder = FoundryEntryBuilder::default();
+                for kind in kinds {
+                    let mut transfer =
+                        super::super::test_support::transfer(AuthoredSummaryInput::Receiver {});
+                    transfer.value_transfer = Some(SummaryValueTransfer {
+                        kind,
+                        operation: SummaryValueTransferOperation::None {},
+                    });
+                    builder.add_transfer(transfer);
+                }
+            });
+            let message = rejected.expect_err("conflicting explicit rows must reject the entry");
+            let message = message
+                .downcast_ref::<String>()
+                .expect("assertion has a message");
+            assert!(message.contains("conflicting explicit value_transfer classifications for receiver->normal_return@normal"), "{message}");
+        }
+    }
 
     #[test]
     fn long_signatures_stay_within_the_authored_id_limit() {

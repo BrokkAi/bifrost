@@ -457,6 +457,14 @@ impl LoweredSemanticSite {
         }
     }
 
+    /// The producer's receiver identity, including value member references.
+    pub const fn receiver_origin(&self) -> Option<ResolutionCallableReceiverOrigin> {
+        match self.site_metadata {
+            Some(metadata) => metadata.receiver_origin(),
+            None => None,
+        }
+    }
+
     /// The source-syntax route that supplied a callable receiver.
     ///
     /// A partial producer may omit this metadata. The fact does not classify
@@ -1994,7 +2002,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                     index.reference_owner(identifier.site).map(|owner| {
                         owner.map(|owner| identities.source_definition_semantic(owner))
                     }),
-                    index.callable_receiver_origin(identifier.site),
+                    index.receiver_origin(identifier.site),
                 )
                 .with_go_spelling_namespace(
                     (language == Language::Go
@@ -2152,12 +2160,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             let scoped_extension_receiver_call =
                 super::fact_resolution::call_applicability::adapter(language)
                     .has_scoped_receiver_extensions()
-                    && identifier.namespace == ResolutionNamespace::Callable
-                    && matches!(
-                        site.kind,
-                        ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
-                    )
-                    && index.callable_receiver_origin(identifier.site)
+                    && semantic.callable_receiver_origin()
                         == Some(ResolutionCallableReceiverOrigin::ExplicitExpression);
             if scoped_extension_receiver_call {
                 // Receiver extensions are lexically visible callables,
@@ -2871,7 +2874,7 @@ fn lower_root_import_paths(
             // binder at the scope head. Its destination can only compete at
             // this import's rank. Keep each demanded name and namespace on
             // the same branch so a nearer declaration can discharge it.
-            if open_destination && !import.named {
+            if open_destination && import.kind == ResolutionRootImportKind::Glob {
                 let sink = identities.node(structured_import_gap_sink_node_identity(
                     import.fact.site,
                     demand.namespace,
@@ -2988,47 +2991,24 @@ fn root_import_precedence(
     choice: SemanticId,
     namespace: ResolutionNamespace,
 ) -> Vec<PrecedenceStep> {
-    if language == Language::Go {
-        return go_spelling_precedence(identities, import.fact.root_scope, None, 0);
-    }
-    if language != Language::Rust {
-        let tier = if matches!(
-            language,
-            Language::Java | Language::Kotlin | Language::Scala
-        ) && import.named
-        {
-            PrecedenceTier::ExplicitImport
-        } else {
-            PrecedenceTier::WildcardImport
-        };
-        let mut precedence = vec![identities.register_precedence_namespace(
-            PrecedenceStep {
-                tier,
-                ordinal: 0,
-                semantic: choice,
-            },
-            namespace,
-        )];
-        let origin = if import.named {
-            BindingOrigin::ExplicitImport
-        } else {
-            BindingOrigin::WildcardImport
-        };
-        if let Some(ordinal) = binding_origin_rank(language, origin) {
-            precedence.push(identities.register_precedence_namespace(
-                PrecedenceStep {
-                    tier: PrecedenceTier::CandidateOriginRank,
-                    ordinal,
-                    semantic: choice,
-                },
-                namespace,
-            ));
-        }
-        return precedence;
-    }
-    let import_choice =
-        identities.semantic(import_choice_identity(import.fact.root_scope, namespace));
-    let import_token = identities.semantic(root_import_token_identity(import.fact.site, namespace));
+    super::precedence::precedence_rules(language).root_import_steps(
+        identities,
+        &import.fact,
+        import.kind,
+        choice,
+        namespace,
+    )
+}
+
+pub(super) fn rust_root_import_precedence(
+    identities: &mut ResolutionIdentityCatalogBuilder,
+    import: &ResolutionRootImportFact,
+    kind: ResolutionRootImportKind,
+    choice: SemanticId,
+    namespace: ResolutionNamespace,
+) -> Vec<PrecedenceStep> {
+    let import_choice = identities.semantic(import_choice_identity(import.root_scope, namespace));
+    let import_token = identities.semantic(root_import_token_identity(import.site, namespace));
     vec![
         registered_precedence_step(identities, choice, 1, namespace),
         // This source token guards the following import-choice rank. Selected
@@ -3037,7 +3017,7 @@ fn root_import_precedence(
         registered_precedence_step(
             identities,
             import_choice,
-            if import.named {
+            if kind == ResolutionRootImportKind::Named {
                 RUST_NAMED_IMPORT_RANK
             } else {
                 RUST_GLOB_IMPORT_RANK
@@ -3488,9 +3468,9 @@ struct IndexedRootImport {
     fact: ResolutionRootImportFact,
     segments: Vec<ResolutionNameId>,
     demands: Vec<ResolutionRootImportDemandFact>,
-    /// The producer stated this import names its leaves (`use a::B;`), not a
-    /// wildcard. See [`root_import_precedence`].
-    named: bool,
+    /// The producer's named or wildcard classification, including legacy route
+    /// metadata. See [`root_import_precedence`].
+    kind: ResolutionRootImportKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3652,7 +3632,7 @@ impl<'facts> FactIndex<'facts> {
                 let mut demands = demands_by_site.remove(&fact.site).unwrap_or_default();
                 demands.sort_unstable_by_key(|demand| (demand.namespace, demand.name));
                 IndexedRootImport {
-                    named: facts.root_import_kinds.iter().any(|kind| {
+                    kind: if facts.root_import_kinds.iter().any(|kind| {
                         kind.import_site == fact.site
                             && kind.kind == ResolutionRootImportKind::Named
                     }) || facts.import_routes.iter().any(|route| {
@@ -3663,7 +3643,11 @@ impl<'facts> FactIndex<'facts> {
                                     | ResolutionImportRouteKind::SingleStatic
                                     | ResolutionImportRouteKind::Named
                             )
-                    }),
+                    }) {
+                        ResolutionRootImportKind::Named
+                    } else {
+                        ResolutionRootImportKind::Glob
+                    },
                     fact,
                     segments: segments.into_iter().map(|segment| segment.name).collect(),
                     demands,
@@ -4194,23 +4178,13 @@ impl<'facts> FactIndex<'facts> {
                 ResolutionIdentifierRole::Reference,
                 "callable receiver origin must name a positioned reference: {receiver:?}"
             );
-            assert_eq!(
-                reference.namespace,
-                ResolutionNamespace::Callable,
-                "callable receiver origin must name the callable namespace: {receiver:?}"
-            );
             assert!(
-                matches!(
+                receiver.origin.is_reference_valid(
+                    reference.namespace,
                     sites[&receiver.reference].kind,
-                    ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
+                    reference.qualifier.is_none(),
                 ),
-                "callable receiver origin must name a terminal callable reference: {receiver:?}"
-            );
-            assert!(
-                receiver
-                    .origin
-                    .is_reference_qualification_valid(reference.qualifier.is_none()),
-                "callable receiver origin must agree with reference qualification: {receiver:?}"
+                "receiver origin must name a callable or field reference with matching qualification: {receiver:?}, {reference:?}"
             );
             assert!(
                 callable_receiver_origin_by_reference
@@ -4735,10 +4709,7 @@ impl<'facts> FactIndex<'facts> {
         self.reference_owner_by_reference.get(&site).copied()
     }
 
-    fn callable_receiver_origin(
-        &self,
-        site: ResolutionSiteId,
-    ) -> Option<ResolutionCallableReceiverOrigin> {
+    fn receiver_origin(&self, site: ResolutionSiteId) -> Option<ResolutionCallableReceiverOrigin> {
         self.callable_receiver_origin_by_reference
             .get(&site)
             .copied()
@@ -4845,6 +4816,15 @@ const fn root_prefix_rule(language: Language) -> Option<RootPrefixRule> {
             consume_prefix_segment: false,
             route_namespace: ResolutionNamespace::Type,
             unprefixed_type_or_value: false,
+            single_prefix_segment: false,
+        }),
+        // ECMA-334 12.8.4: an ambiguous name can denote a namespace, type or value.
+        Language::CSharp => Some(RootPrefixRule {
+            prefix_namespaces: BOTH,
+            terminal_namespace: Some(ResolutionNamespace::TypeOrValue),
+            consume_prefix_segment: false,
+            route_namespace: ResolutionNamespace::Type,
+            unprefixed_type_or_value: true,
             single_prefix_segment: false,
         }),
         Language::Go => Some(RootPrefixRule {
@@ -5337,7 +5317,10 @@ const fn package_member_namespaces(language: Language) -> &'static [ResolutionNa
         ],
         // A Java package holds only types: fields and methods belong to a
         // class, and a static import names a class member.
-        Language::Java => &[ResolutionNamespace::Type, ResolutionNamespace::TypeOrValue],
+        // ECMA-334 14.7: namespaces contain namespace and type declarations.
+        Language::CSharp | Language::Java => {
+            &[ResolutionNamespace::Type, ResolutionNamespace::TypeOrValue]
+        }
         Language::Go
         | Language::Rust
         | Language::Cpp
@@ -5345,7 +5328,6 @@ const fn package_member_namespaces(language: Language) -> &'static [ResolutionNa
         | Language::TypeScript
         | Language::Python
         | Language::Php
-        | Language::CSharp
         | Language::Ruby
         | Language::None => &[],
     }
@@ -7509,7 +7491,7 @@ mod tests {
             .next()
             .expect("root import fixture");
         let named = IndexedRootImport {
-            named: true,
+            kind: ResolutionRootImportKind::Named,
             ..star.clone()
         };
         let root_scope = ResolutionScopeId::new(1);

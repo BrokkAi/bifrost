@@ -12,7 +12,7 @@ use crate::analyzer::semantic_model::catalog::CatalogOpenMode;
 use brokk_bifrost_core::sqlite_template;
 
 pub(in crate::analyzer::semantic_model::catalog) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 26;
+pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 28;
 const PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 10;
 const NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 11;
 const UNKNOWN_TYPES_CATALOG_VERSION: i64 = 12;
@@ -90,6 +90,12 @@ pub(in crate::analyzer::semantic_model::catalog) const SEMANTIC_ROW_QUESTIONS_SQ
 pub(in crate::analyzer::semantic_model::catalog) const SEMANTIC_PAYLOAD_FAMILIES_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0026-semantic-payload-families.sql");
 
+const PACK_MANIFEST_OBJECTS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0027-pack-manifest-objects.sql");
+
+pub(in crate::analyzer::semantic_model::catalog) const ASSEMBLY_TYPE_FORWARDS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0028-assembly-type-forwards.sql");
+
 /// This build's empty-catalog template. The migrations are the schema inputs:
 /// on an empty catalog their Rust steps have no rows to change, so the SQL
 /// alone decides the bytes.
@@ -124,6 +130,8 @@ static CATALOG_TEMPLATE: LazyLock<sqlite_template::Template> = LazyLock::new(|| 
             SEMANTIC_ROWS_SQL.as_bytes(),
             SEMANTIC_ROW_QUESTIONS_SQL.as_bytes(),
             SEMANTIC_PAYLOAD_FAMILIES_SQL.as_bytes(),
+            PACK_MANIFEST_OBJECTS_SQL.as_bytes(),
+            ASSEMBLY_TYPE_FORWARDS_SQL.as_bytes(),
         ],
     )
 });
@@ -188,7 +196,7 @@ pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogErr
     }
     {
         let _scope = brokk_bifrost_core::profiling::scope("semantic_pack.catalog.migrate");
-        migrate(&mut connection, mode)?;
+        migrate(&mut connection, mode, root)?;
     }
     Ok(connection)
 }
@@ -206,7 +214,11 @@ fn build_fresh_catalog(path: &Path) -> Result<(), CatalogError> {
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| CatalogError::sqlite("configure busy timeout", error))?;
     configure_writer(&mut connection)?;
-    migrate(&mut connection, CatalogOpenMode::ReadWrite)?;
+    migrate(
+        &mut connection,
+        CatalogOpenMode::ReadWrite,
+        path.parent().expect("template has parent"),
+    )?;
     // Closing the only connection checkpoints the WAL into the main file and
     // removes the WAL, so the main file alone is the complete catalog.
     connection
@@ -296,7 +308,11 @@ fn configure_reader(connection: &Connection) -> Result<(), CatalogError> {
         .map_err(|error| CatalogError::sqlite("configure catalog reader", error))
 }
 
-fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), CatalogError> {
+fn migrate(
+    connection: &mut Connection,
+    mode: CatalogOpenMode,
+    root: &Path,
+) -> Result<(), CatalogError> {
     let version: i64 =
         retry_initialization(|| connection.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .map_err(|error| CatalogError::sqlite("read catalog schema version", error))?;
@@ -315,6 +331,14 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
             required: CURRENT_CATALOG_VERSION,
         });
     }
+    migrate_catalog_through_payload_families(connection)?;
+    migrate_pack_manifest_objects(connection, root)?;
+    migrate_manifest_schema(connection, 28, ASSEMBLY_TYPE_FORWARDS_SQL)
+}
+
+fn migrate_catalog_through_payload_families(
+    connection: &mut Connection,
+) -> Result<(), CatalogError> {
     migrate_legacy_catalog_versions(connection)?;
     migrate_native_compatibility(connection)?;
     migrate_unknown_types(connection)?;
@@ -1550,6 +1574,136 @@ fn migrate_semantic_model_schema_v18(connection: &mut Connection) -> Result<(), 
     )
 }
 
+fn migrate_pack_manifest_objects(
+    connection: &mut Connection,
+    root: &Path,
+) -> Result<(), CatalogError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| CatalogError::sqlite("read manifest-object migration version", error))?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= 27 {
+        return Ok(());
+    }
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            CatalogError::sqlite(
+                "disable catalog foreign keys for manifest-schema migration",
+                error,
+            )
+        })?;
+    let migration_result = migrate_pack_manifest_objects_transaction(connection, root);
+    let foreign_keys_result = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            CatalogError::sqlite(
+                "restore catalog foreign keys after manifest-schema migration",
+                error,
+            )
+        });
+    match (migration_result, foreign_keys_result) {
+        (Err(migration_error), Ok(())) => Err(migration_error),
+        (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
+            "catalog manifest-schema migration 27 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+        ))),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn migrate_pack_manifest_objects_transaction(
+    connection: &mut Connection,
+    root: &Path,
+) -> Result<(), CatalogError> {
+    use super::{insert_object, storage};
+    use crate::analyzer::semantic_model::{ArtifactEncoding, csmi::sha256_hex};
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CatalogError::sqlite("begin manifest-object migration", error))?;
+    let version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| {
+            CatalogError::sqlite("recheck manifest-object migration version", error)
+        })?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
+    if version >= 27 {
+        return transaction.commit().map_err(|error| {
+            CatalogError::sqlite("finish concurrent manifest-object migration", error)
+        });
+    }
+    if version != 26 {
+        return Err(CatalogError::Integrity(format!(
+            "manifest-object migration expected version 26, found {version}"
+        )));
+    }
+    transaction
+        .execute_batch("ALTER TABLE catalog_packs ADD COLUMN manifest_object_digest TEXT;")
+        .map_err(|error| CatalogError::sqlite("prepare manifest object links", error))?;
+    // Finish the scan before updates grow records containing overflow BLOBs.
+    let manifests = {
+        let mut statement = transaction
+            .prepare("SELECT manifest_digest, verified_at FROM catalog_packs")
+            .map_err(|error| {
+                CatalogError::sqlite("prepare manifest-object migration rows", error)
+            })?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| CatalogError::sqlite("query manifest-object migration rows", error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| CatalogError::sqlite("read manifest-object migration rows", error))?
+    };
+    // Keep only one manifest's bytes in memory at a time.
+    for (digest, verified_at) in manifests {
+        let bytes: Vec<u8> = transaction
+            .query_row(
+                "SELECT manifest_bytes FROM catalog_packs WHERE manifest_digest = ?1",
+                [&digest],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("read migrating manifest bytes", error))?;
+        let object_digest = sha256_hex(&bytes);
+        let (path, _) = storage::publish(root, &object_digest, &bytes)?;
+        insert_object(
+            &transaction,
+            &object_digest,
+            bytes.len() as u64,
+            bytes.len() as u64,
+            ArtifactEncoding::Raw,
+            &path,
+            verified_at,
+        )?;
+        transaction
+            .execute(
+                "UPDATE catalog_packs SET manifest_object_digest = ?2 WHERE manifest_digest = ?1",
+                rusqlite::params![digest, object_digest],
+            )
+            .map_err(|error| CatalogError::sqlite("link migrating manifest object", error))?;
+    }
+    transaction
+        .execute_batch(PACK_MANIFEST_OBJECTS_SQL)
+        .map_err(|error| CatalogError::sqlite("rebuild manifest-object catalog", error))?;
+    check_migration_foreign_keys(&transaction, 27)?;
+    transaction
+        .pragma_update(None, "user_version", 27)
+        .map_err(|error| CatalogError::sqlite("publish manifest-schema catalog version", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog manifest-schema migration", error))
+}
+
 fn migrate_manifest_schema(
     connection: &mut Connection,
     target_version: i64,
@@ -1641,6 +1795,19 @@ fn migrate_manifest_schema_transaction(
     transaction
         .execute_batch(sql)
         .map_err(|error| CatalogError::sqlite("apply manifest-schema catalog migration", error))?;
+    check_migration_foreign_keys(&transaction, target_version)?;
+    transaction
+        .pragma_update(None, "user_version", target_version)
+        .map_err(|error| CatalogError::sqlite("publish manifest-schema catalog version", error))?;
+    transaction
+        .commit()
+        .map_err(|error| CatalogError::sqlite("commit catalog manifest-schema migration", error))
+}
+
+fn check_migration_foreign_keys(
+    transaction: &rusqlite::Transaction<'_>,
+    target_version: i64,
+) -> Result<(), CatalogError> {
     let foreign_key_violations = {
         let mut statement = transaction
             .prepare("PRAGMA foreign_key_check")
@@ -1675,12 +1842,97 @@ fn migrate_manifest_schema_transaction(
             "catalog manifest-schema migration {target_version} found foreign-key violations: {foreign_key_violations:?}"
         )));
     }
-    transaction
-        .pragma_update(None, "user_version", target_version)
-        .map_err(|error| CatalogError::sqlite("publish manifest-schema catalog version", error))?;
-    transaction
-        .commit()
-        .map_err(|error| CatalogError::sqlite("commit catalog manifest-schema migration", error))
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+// Rebuild the actual pre-27 table and remove manifest objects, rather than
+// merely lowering user_version on a database that already has object links.
+pub fn restore_version_26_fixture(connection: &Connection) {
+    let root = Path::new(connection.path().unwrap()).parent().unwrap();
+    let foreign_keys: bool = connection
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    // Remove the actual v28 additions too; lowering user_version alone leaves
+    // those tables in place and makes the next real migration fail.
+    connection.execute_batch("DROP TRIGGER IF EXISTS catalog_semantic_rows_delete_forwards;
+        DROP TABLE IF EXISTS catalog_type_forwards;
+        DROP TABLE IF EXISTS catalog_assembly_identities;
+        DELETE FROM catalog_semantic_payload_families WHERE family='type_forwards';
+        ALTER TABLE catalog_semantic_payload_families RENAME TO catalog_semantic_payload_families_fixture_v28;").unwrap();
+    let family_schema = SEMANTIC_PAYLOAD_FAMILIES_SQL
+        .split_once("CREATE TABLE catalog_semantic_payload_families(")
+        .unwrap()
+        .1;
+    connection.execute_batch(&format!("CREATE TABLE catalog_semantic_payload_families({family_schema}
+        INSERT INTO catalog_semantic_payload_families SELECT * FROM catalog_semantic_payload_families_fixture_v28;
+        DROP TABLE catalog_semantic_payload_families_fixture_v28;")).unwrap();
+    let old_sql = SEMANTIC_MODEL_SCHEMA_V19_SQL;
+    let (create, rest) = old_sql
+        .split_once("INSERT INTO catalog_packs_v23(")
+        .unwrap();
+    connection.execute_batch(create).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT p.manifest_digest, o.relative_path, o.stored_digest
+        FROM catalog_packs p JOIN catalog_objects o ON o.stored_digest = p.manifest_object_digest",
+        )
+        .unwrap();
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    drop(statement);
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('catalog_packs_v23') ORDER BY cid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let select = columns
+        .iter()
+        .map(|column| {
+            if column == "manifest_bytes" {
+                "?2"
+            } else {
+                column.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (digest, path, _) in &objects {
+        let bytes = std::fs::read(root.join(path)).unwrap();
+        connection.execute(&format!("INSERT INTO catalog_packs_v23 SELECT {select} FROM catalog_packs WHERE manifest_digest = ?1"), rusqlite::params![digest, bytes]).unwrap();
+    }
+    let (_, swap) = rest
+        .split_once(
+            "-- Recreate the dependent view in the same transaction as the parent-table swap.
+",
+        )
+        .unwrap();
+    connection.execute_batch(swap).unwrap();
+    for (_, path, digest) in objects {
+        let deleted = connection.execute("DELETE FROM catalog_objects WHERE stored_digest = ?1 AND NOT EXISTS(SELECT 1 FROM catalog_pack_shards WHERE stored_digest = ?1)", [&digest]).unwrap();
+        if deleted != 0 {
+            std::fs::remove_file(root.join(path)).unwrap();
+        }
+    }
+    connection.pragma_update(None, "user_version", 26).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", foreign_keys)
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -1990,12 +2242,12 @@ mod tests {
             )
             .unwrap();
 
-        migrate(&mut migrated, CatalogOpenMode::ReadWrite).unwrap();
+        migrate_catalog_through_payload_families(&mut migrated).unwrap();
         assert_eq!(
             migrated
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            CURRENT_CATALOG_VERSION
+            26
         );
         assert_eq!(
             migrated
@@ -2096,7 +2348,7 @@ mod tests {
 
         let mut fresh = Connection::open_in_memory().unwrap();
         fresh.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        migrate(&mut fresh, CatalogOpenMode::ReadWrite).unwrap();
+        migrate_catalog_through_payload_families(&mut fresh).unwrap();
         assert_eq!(schema_objects(&migrated), schema_objects(&fresh));
     }
 
@@ -2122,7 +2374,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(migrate(&mut connection, CatalogOpenMode::ReadWrite).is_err());
+        assert!(migrate_catalog_through_payload_families(&mut connection).is_err());
 
         assert_eq!(
             connection
@@ -2196,7 +2448,11 @@ mod tests {
         insert_legacy_pack(&connection);
         migrate_native_compatibility(&mut connection).unwrap();
         assert!(matches!(
-            migrate(&mut connection, CatalogOpenMode::ReadOnly),
+            migrate(
+                &mut connection,
+                CatalogOpenMode::ReadOnly,
+                Path::new("unused-read-only")
+            ),
             Err(CatalogError::ReadOnlySchema {
                 found: NATIVE_COMPATIBILITY_CATALOG_VERSION,
                 required: CURRENT_CATALOG_VERSION,
@@ -2277,13 +2533,13 @@ mod tests {
             )
             .unwrap();
 
-        migrate(&mut connection, CatalogOpenMode::ReadWrite).unwrap();
+        migrate_catalog_through_payload_families(&mut connection).unwrap();
 
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            CURRENT_CATALOG_VERSION
+            26
         );
         assert!(table_rows(&connection, "catalog_exact_go_source_sets").is_empty());
         assert!(table_rows(&connection, "catalog_exact_go_source_files").is_empty());
@@ -2376,6 +2632,88 @@ mod tests {
                         |row| row.get::<_, i64>(0),
                     )
                     .unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_28_preserves_populated_catalog_and_adds_forward_foreign_keys() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("staging")).unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_schema_10(&mut connection);
+        insert_legacy_pack(&connection);
+        migrate_catalog_through_payload_families(&mut connection).unwrap();
+        migrate_pack_manifest_objects(&mut connection, root.path()).unwrap();
+        let manifest: String = connection
+            .query_row(
+                "SELECT manifest_digest FROM catalog_packs LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute("INSERT INTO catalog_pack_shards(manifest_digest,ordinal,shard_id,payload_kind,stored_digest,content_digest,semantic_digest,record_count,descriptor_json) SELECT manifest_digest,0,'s','declaration_facts',manifest_object_digest,manifest_digest,manifest_digest,0,X'7B7D' FROM catalog_packs WHERE manifest_digest=?1",[&manifest]).unwrap();
+        connection.execute("INSERT INTO catalog_semantic_rows_indexed_shards(manifest_digest,shard_id,index_version) VALUES(?1,'s',4)",[&manifest]).unwrap();
+        let shard = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO catalog_semantic_payload_families VALUES(?1,'callable_values')",
+                [shard],
+            )
+            .unwrap();
+        let tables: Vec<String>=connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+            .query_map([],|row|row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let before: Vec<_> = tables
+            .iter()
+            .map(|table| (table.clone(), table_rows(&connection, table)))
+            .collect();
+        migrate_manifest_schema(&mut connection, 28, ASSEMBLY_TYPE_FORWARDS_SQL).unwrap();
+        for (table, rows) in before {
+            assert_eq!(table_rows(&connection, &table), rows, "{table}");
+        }
+        connection.execute("INSERT INTO catalog_assembly_identities VALUES(?1,'s','Fixture.Defining','2.0.0.0',NULL,NULL)",[&manifest]).unwrap();
+        connection.execute("INSERT INTO catalog_type_forwards VALUES(?1,'s',0,'Fixture.Outer','Fixture',NULL,'Fixture.Defining','1.0.0.0',NULL,NULL)",[&manifest]).unwrap();
+        connection.execute("INSERT INTO catalog_type_forwards VALUES(?1,'s',1,'Fixture.Outer.Nested','Fixture',0,'Fixture.Defining','1.0.0.0',NULL,NULL)",[&manifest]).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert!(connection.execute("INSERT INTO catalog_type_forwards VALUES(?1,'s',2,'Fixture.Bad','Fixture',2,'Fixture.Defining','1.0.0.0',NULL,NULL)",[&manifest]).is_err());
+        assert!(connection.execute("UPDATE catalog_type_forwards SET target_version='9.0.0.0' WHERE manifest_digest=?1 AND ordinal=0",[&manifest]).is_err(),"a parent update cannot silently change a nested forward's target");
+        assert!(connection.execute("UPDATE catalog_type_forwards SET namespace='Other' WHERE manifest_digest=?1 AND ordinal=1",[&manifest]).is_err(),"nested namespace must match its root");
+        // An orphan outer is rejected at commit, not silently persisted.
+        {
+            let tx = connection.transaction().unwrap();
+            tx.execute("INSERT INTO catalog_type_forwards VALUES(?1,'s',3,'Fixture.Orphan','Fixture',42,'Fixture.Defining','1.0.0.0',NULL,NULL)",[&manifest]).unwrap();
+            assert!(tx.commit().is_err());
+        }
+        connection
+            .execute(
+                "DELETE FROM catalog_semantic_rows_indexed_shards WHERE shard_key=?1",
+                [shard],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM catalog_type_forwards", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM catalog_assembly_identities",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
     }
 
@@ -2487,7 +2825,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            CURRENT_CATALOG_VERSION
+            26
         );
         assert_eq!(
             table_rows(&connection, "catalog_packs"),

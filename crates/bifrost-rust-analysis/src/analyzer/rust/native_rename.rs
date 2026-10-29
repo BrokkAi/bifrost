@@ -16,7 +16,9 @@ use brokk_bifrost_analysis::analyzer::rename::RenameEdit;
 
 use brokk_bifrost_analysis::analyzer::rename::RenameResult;
 
-use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
+use brokk_bifrost_analysis::analyzer::resolution::model::{
+    ExactCompletionAccumulator, ResolutionCompletion,
+};
 
 use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
 
@@ -277,7 +279,7 @@ fn selected_rust_binding_world_with_candidates(
             Err(error) => return RustBindingWorldOutcome::StoreError(error.to_string()),
         };
     let mut sites = Vec::new();
-    let mut completion = ResolutionCompletion::Complete;
+    let mut completion = ExactCompletionAccumulator::default();
     for (root, locator) in candidates {
         if cancellation.is_cancelled() {
             return RustBindingWorldOutcome::Cancelled;
@@ -318,10 +320,21 @@ fn selected_rust_binding_world_with_candidates(
                 )),
             )) => {
                 for answer in answers {
-                    if let Some((_, enumeration)) = answer.enumeration {
-                        completion = completion.combine(&enumeration);
+                    if let Some((_, enumeration)) = answer.enumeration
+                        && completion
+                            .include(&enumeration, &mut || cancellation.is_cancelled())
+                            .is_none()
+                    {
+                        return RustBindingWorldOutcome::Cancelled;
                     }
-                    completion = completion.combine(answer.projection.completion());
+                    if completion
+                        .include(answer.projection.completion(), &mut || {
+                            cancellation.is_cancelled()
+                        })
+                        .is_none()
+                    {
+                        return RustBindingWorldOutcome::Cancelled;
+                    }
                     sites.push(answer.projection);
                 }
             }
@@ -357,6 +370,9 @@ fn selected_rust_binding_world_with_candidates(
             Err(error) => return RustBindingWorldOutcome::StoreError(error.to_string()),
         }
     }
+    let Some(completion) = completion.finish(&mut || cancellation.is_cancelled()) else {
+        return RustBindingWorldOutcome::Cancelled;
+    };
     match operation.finish_rust_row_binding_world(target, sites, completion, cancellation) {
         Ok(SelectedResolutionOperationOutcome::Native(world)) => {
             RustBindingWorldOutcome::Ready(world)

@@ -133,40 +133,43 @@ pub fn build_workspace_file_usage_graph_with_cancellation(
         .enumerate()
         .map(|(index, file)| (file, index))
         .collect();
+    let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     let adjacency = {
         let _scope = profiling::scope("file_usage_graph.resolve_relations");
         files
             .par_iter()
             .enumerate()
             .map(|(from, file)| {
-                if cancellation.is_cancelled() {
-                    return None;
-                }
-                let mut imported = import_infos.as_ref().map_or_else(
-                    || {
-                        let imports = provider.import_info_of(token, file);
-                        resolve_imported_files_from_infos(provider, file, &imports)
-                    },
-                    |infos_by_file| {
-                        infos_by_file
-                            .get(file)
-                            .map(|imports| {
-                                resolve_imported_files_from_infos(provider, file, imports)
-                            })
-                            .unwrap_or_default()
-                    },
-                );
-                if let Some(additional) = additional_dependencies.dependencies.get(file) {
-                    imported.extend(additional.iter().cloned());
-                }
-                let mut targets = imported
-                    .into_iter()
-                    .filter_map(|target| indices.get(&target).copied())
-                    .filter(|target| *target != from)
-                    .collect::<Vec<_>>();
-                targets.sort_unstable();
-                targets.dedup();
-                Some(targets)
+                context.run(|| {
+                    if cancellation.is_cancelled() {
+                        return None;
+                    }
+                    let mut imported = import_infos.as_ref().map_or_else(
+                        || {
+                            let imports = provider.import_info_of(token, file);
+                            resolve_imported_files_from_infos(provider, file, &imports)
+                        },
+                        |infos_by_file| {
+                            infos_by_file
+                                .get(file)
+                                .map(|imports| {
+                                    resolve_imported_files_from_infos(provider, file, imports)
+                                })
+                                .unwrap_or_default()
+                        },
+                    );
+                    if let Some(additional) = additional_dependencies.dependencies.get(file) {
+                        imported.extend(additional.iter().cloned());
+                    }
+                    let mut targets = imported
+                        .into_iter()
+                        .filter_map(|target| indices.get(&target).copied())
+                        .filter(|target| *target != from)
+                        .collect::<Vec<_>>();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    Some(targets)
+                })
             })
             .collect::<Option<Vec<_>>>()
     };

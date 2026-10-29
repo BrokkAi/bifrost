@@ -1098,6 +1098,7 @@ mod value_domain {
         "ambiguous_guard",
         "incomplete_condition",
         "unqualified_continuation",
+        "unproven_activation",
     ];
     pub(super) const BRANCH_ORIENTATION: &[&str] = &[
         "condition",
@@ -2499,6 +2500,10 @@ detailed_row_domains! {
                     CodeQueryRowField::required("decorator_name", Scalar::String),
                     CodeQueryRowField::optional("annotation_type_id", Scalar::StableId),
                     CodeQueryRowField::optional("annotation_type_name", Scalar::String),
+                    CodeQueryRowField::optional_enum(
+                        "annotation_route",
+                        crate::analyzer::JavaAnnotationTypeRoute::LABELS
+                    ),
                     CodeQueryRowField::optional("local_name", Scalar::String),
                     CodeQueryRowField::optional("imported_name", Scalar::String),
                     CodeQueryRowField::optional("module", Scalar::String),
@@ -2679,6 +2684,11 @@ detailed_row_domains! {
                     CodeQueryRowField::required("member_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("outcome", value_domain::MEMBER_FAMILY_OUTCOME),
                     CodeQueryRowField::optional_enum("reason", value_domain::MEMBER_FAMILY_REASON),
+                    CodeQueryRowField::required("unread_ancestors", Scalar::StringList),
+                    CodeQueryRowField::required_enum("ancestor_coverage", value_domain::MEMBER_FAMILY_COVERAGE),
+                    CodeQueryRowField::optional_enum("ancestor_reason", value_domain::MEMBER_FAMILY_REASON),
+                    CodeQueryRowField::required_enum("descendant_coverage", value_domain::MEMBER_FAMILY_COVERAGE),
+                    CodeQueryRowField::optional_enum("descendant_reason", value_domain::MEMBER_FAMILY_REASON),
                     CodeQueryRowField::required_enum(
                         "capability",
                         value_domain::MEMBER_FAMILY_CAPABILITY
@@ -3045,8 +3055,8 @@ detailed_row_domains! {
             CodeQueryRowField::optional_enum("reason", &[
                 "unsupported_language", "syntax_unavailable", "source_limit",
                 "snapshot_mismatch", "cancelled", "syntax_recovery", "missing_body",
-                "missing_try_body", "caught_type_unresolved", "caught_type_ambiguous",
-                "caught_type_hierarchy_unknown"
+                "missing_try_body", "handler_identity_unproven", "caught_type_unresolved", "caught_type_ambiguous",
+                "caught_type_hierarchy_unknown", "unproven_activation"
             ]),
             CodeQueryRowField::optional("caught_type", Scalar::DeclarationIdentity),
             CodeQueryRowField::optional_enum(
@@ -4527,10 +4537,12 @@ fn project_code_query_row_field<'a>(
             .as_ref()
             .and_then(|declaration| declaration.id.as_deref())
             .map(Scalar::StableId),
-        (CodeQueryResultValue::DecoratedParameter { value }, "annotation_type_name") => value
-            .annotation_type
-            .as_ref()
-            .map(|declaration| Scalar::String(&declaration.fq_name)),
+        (CodeQueryResultValue::DecoratedParameter { value }, "annotation_type_name") => {
+            value.annotation_fq_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "annotation_route") => value
+            .annotation_route
+            .map(|route| Scalar::ConstrainedEnum(route.label())),
         (CodeQueryResultValue::DecoratedParameter { value }, "local_name") => {
             value.local_name.as_deref().map(Scalar::String)
         }
@@ -5461,6 +5473,21 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::MemberFamily { value }, "reason") => {
             value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "unread_ancestors") => {
+            Some(Scalar::StringList(&value.unread_ancestors))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "ancestor_coverage") => {
+            Some(Scalar::ConstrainedEnum(value.ancestor_coverage))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "ancestor_reason") => {
+            value.ancestor_reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "descendant_coverage") => {
+            Some(Scalar::ConstrainedEnum(value.descendant_coverage))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "descendant_reason") => {
+            value.descendant_reason.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::MemberFamily { value }, "capability") => {
             Some(Scalar::ConstrainedEnum(value.capability))

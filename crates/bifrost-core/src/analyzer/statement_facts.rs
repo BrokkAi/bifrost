@@ -1,10 +1,6 @@
-//! C/C++ statement-level construct labels used by structural queries, with
-//! the nested-loop relation also shared by the C# adapter.
-//!
-//! The labels are deliberately separate from the language-neutral normalized
-//! kind vocabulary. A normalized kind identifies syntax such as a switch or a
-//! loop; these facts identify a bounded, rule-shaped aggregate derived from
-//! that syntax (for example, a long switch case or a repeated loop variable).
+//! Language-neutral, source-local statement facts.
+
+pub mod producer;
 
 use super::Range;
 
@@ -64,19 +60,19 @@ impl StatementFactKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppStatementFact {
+pub struct StatementFact {
     pub range: Range,
     pub kind: StatementFactKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppConditionFact {
+pub struct ConditionFact {
     pub range: Range,
     pub logical_operator_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppLoopFact {
+pub struct LoopFact {
     pub range: Range,
     pub variable: Option<String>,
     pub body_statement_count: usize,
@@ -84,7 +80,7 @@ pub struct CppLoopFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppSwitchFact {
+pub struct SwitchFact {
     pub range: Range,
     pub case_count: usize,
     pub default_present: bool,
@@ -93,54 +89,57 @@ pub struct CppSwitchFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppSwitchCaseFact {
+pub struct SwitchCaseFact {
     pub range: Range,
     pub value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppLabelFact {
+pub struct LabelFact {
     pub range: Range,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppGotoFact {
+pub struct GotoFact {
     pub range: Range,
     pub target: String,
     pub forward: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppEnumFact {
+pub struct EnumFact {
     pub range: Range,
     pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CppEnumeratorFact {
+pub struct EnumeratorFact {
     pub range: Range,
     pub enum_range: Range,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CppStatementFactRows {
-    pub statements: Vec<CppStatementFact>,
-    pub conditions: Vec<CppConditionFact>,
-    pub loops: Vec<CppLoopFact>,
-    pub switches: Vec<CppSwitchFact>,
-    pub switch_cases: Vec<CppSwitchCaseFact>,
-    pub labels: Vec<CppLabelFact>,
-    pub gotos: Vec<CppGotoFact>,
-    pub enums: Vec<CppEnumFact>,
-    pub enumerators: Vec<CppEnumeratorFact>,
+pub struct StatementFactRows {
+    pub statements: Vec<StatementFact>,
+    /// Owners whose conditional-compilation activation is unproven.
+    pub undecided: Vec<StatementFact>,
+    pub conditions: Vec<ConditionFact>,
+    pub loops: Vec<LoopFact>,
+    pub switches: Vec<SwitchFact>,
+    pub switch_cases: Vec<SwitchCaseFact>,
+    pub labels: Vec<LabelFact>,
+    pub gotos: Vec<GotoFact>,
+    pub enums: Vec<EnumFact>,
+    pub enumerators: Vec<EnumeratorFact>,
 }
 
-impl CppStatementFactRows {
+impl StatementFactRows {
     pub fn valid(&self) -> bool {
         let valid_range = |range: &Range| range.start_byte <= range.end_byte;
         self.statements.iter().all(|fact| valid_range(&fact.range))
+            && self.undecided.iter().all(|fact| valid_range(&fact.range))
             && self.conditions.iter().all(|fact| valid_range(&fact.range))
             && self.loops.iter().all(|fact| valid_range(&fact.range))
             && self.switches.iter().all(|fact| valid_range(&fact.range))
@@ -159,15 +158,16 @@ impl CppStatementFactRows {
     }
 
     pub fn estimated_retained_bytes(&self) -> usize {
-        let mut bytes = self.statements.capacity() * std::mem::size_of::<CppStatementFact>()
-            + self.conditions.capacity() * std::mem::size_of::<CppConditionFact>()
-            + self.loops.capacity() * std::mem::size_of::<CppLoopFact>()
-            + self.switches.capacity() * std::mem::size_of::<CppSwitchFact>()
-            + self.switch_cases.capacity() * std::mem::size_of::<CppSwitchCaseFact>()
-            + self.labels.capacity() * std::mem::size_of::<CppLabelFact>()
-            + self.gotos.capacity() * std::mem::size_of::<CppGotoFact>()
-            + self.enums.capacity() * std::mem::size_of::<CppEnumFact>()
-            + self.enumerators.capacity() * std::mem::size_of::<CppEnumeratorFact>();
+        let mut bytes = (self.statements.capacity() + self.undecided.capacity())
+            * std::mem::size_of::<StatementFact>()
+            + self.conditions.capacity() * std::mem::size_of::<ConditionFact>()
+            + self.loops.capacity() * std::mem::size_of::<LoopFact>()
+            + self.switches.capacity() * std::mem::size_of::<SwitchFact>()
+            + self.switch_cases.capacity() * std::mem::size_of::<SwitchCaseFact>()
+            + self.labels.capacity() * std::mem::size_of::<LabelFact>()
+            + self.gotos.capacity() * std::mem::size_of::<GotoFact>()
+            + self.enums.capacity() * std::mem::size_of::<EnumFact>()
+            + self.enumerators.capacity() * std::mem::size_of::<EnumeratorFact>();
         for loop_fact in &self.loops {
             bytes += loop_fact.variable.as_ref().map_or(0, String::capacity);
         }

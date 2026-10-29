@@ -591,6 +591,7 @@ fn help_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceHelp> {
         });
     }
     let mut index = 1;
+    let mut positional_index = 0_u8;
     while index < items.len() {
         let item = &items[index];
         let label = item.as_symbol().and_then(|symbol| symbol.strip_prefix(':'));
@@ -617,15 +618,9 @@ fn help_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceHelp> {
                     && let Some(descriptor) = records
                         .iter()
                         .find_map(|record| lookup_field(*record, label))
-                    && let Some(domain) = descriptor.value_shape.atom_domain()
-                    && let Some(spelling) = value.as_symbol()
-                    && let Some(atom) = lookup_atom(domain, spelling)
+                    && let Some(help) = help_for_atom_value(value, descriptor)
                 {
-                    return Some(PolicySourceHelp {
-                        range: value.range.clone(),
-                        signature: spelling.to_owned(),
-                        description: atom.description.to_owned(),
-                    });
+                    return Some(help);
                 }
                 if let Some(help) = help_in_expr(value, byte_offset) {
                     return Some(help);
@@ -633,6 +628,16 @@ fn help_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceHelp> {
             }
             index += 2;
         } else {
+            if item.range.contains(&byte_offset)
+                && let Some(descriptor) = records.iter().find_map(|record| {
+                    positional_field(*record, positional_index)
+                        .or_else(|| variadic_positional_field(*record))
+                })
+                && let Some(help) = help_for_atom_value(item, descriptor)
+            {
+                return Some(help);
+            }
+            positional_index = positional_index.saturating_add(1);
             if let Some(help) = help_in_expr(item, byte_offset) {
                 return Some(help);
             }
@@ -640,6 +645,20 @@ fn help_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceHelp> {
         }
     }
     None
+}
+
+fn help_for_atom_value(
+    value: &Expr,
+    descriptor: &super::schema::PolicyFieldDescriptor,
+) -> Option<PolicySourceHelp> {
+    let domain = descriptor.value_shape.atom_domain()?;
+    let spelling = value.as_symbol()?;
+    let atom = lookup_atom(domain, spelling)?;
+    Some(PolicySourceHelp {
+        range: value.range.clone(),
+        signature: spelling.to_owned(),
+        description: atom.description.to_owned(),
+    })
 }
 
 fn help_description(base_description: &str, record: PolicyRecord, items: &[Expr]) -> String {
@@ -995,6 +1014,15 @@ impl Decoder {
             path: path.into(),
             range: expr.range.clone(),
         });
+    }
+
+    /// Records a declared selector path so evidence references can name it.
+    ///
+    /// The insert stays outside the assertion: `debug_assert!` does not
+    /// evaluate its argument when debug assertions are off (#7404).
+    fn declare_selector_path(&mut self, path: &str) {
+        let inserted = self.selector_paths.insert(path.to_owned());
+        debug_assert!(inserted, "selector path {path} is declared twice");
     }
 
     fn decode_policy(&mut self, expr: &Expr) -> Result<PolicyDefinition, PolicySourceError> {
@@ -1576,7 +1604,7 @@ impl Decoder {
         .expect("the declaration-selection shape is a valid query in every language");
         self.map(format!("{path}/path"), path_expr);
         self.map(format!("{path}/language"), language_expr);
-        debug_assert!(self.selector_paths.insert(path.to_string()));
+        self.declare_selector_path(path);
         Ok(PolicySelector::DeclarationSelection(
             DeclarationSelectionReference {
                 path: workspace_path,
@@ -1658,7 +1686,7 @@ impl Decoder {
             }
         };
         self.map(format!("{path}/binding"), binding_expr);
-        debug_assert!(self.selector_paths.insert(path.to_string()));
+        self.declare_selector_path(path);
         Ok(derived)
     }
 
@@ -2100,13 +2128,16 @@ impl Decoder {
         let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
         let fields = RecordCursor::parse(expr, PolicyRecord::Kill, context)?;
         let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "kill ID")?;
-        let (selector, input, output) =
-            self.decode_selector_input_output(&fields, context, &selector_path)?;
+        let selector =
+            self.decode_selector(fields.required("selector"), context, &selector_path)?;
+        let kind = self.decode_sanitizer_kind(expr, &fields, context, &selector_path)?;
+        validate_sanitizer_arity(&selector, &kind)
+            .map_err(|message| source_error("sanitizer-arity", expr.range.clone(), message))?;
         Ok(TaintSanitizerSpec {
+            categories: Vec::new(),
             id,
             selector,
-            input,
-            output,
+            kind,
             removes: vec![flow_internal_label()],
         })
     }
@@ -2122,6 +2153,7 @@ impl Decoder {
         let (selector, input, output) =
             self.decode_selector_input_output(&fields, context, &selector_path)?;
         Ok(TaintTransformSpec {
+            categories: decode_optional_categories(&fields)?,
             id,
             selector,
             input,
@@ -2342,6 +2374,7 @@ impl Decoder {
                     "intrinsic value type",
                 )? {
                     PolicyAtomValue::IntrinsicBool => ValueTypePredicate::IntrinsicBool,
+                    PolicyAtomValue::IntrinsicNumeric => ValueTypePredicate::IntrinsicNumeric,
                     value => unreachable!("IntrinsicValueType registry returned {value:?}"),
                 }
             }
@@ -2666,6 +2699,39 @@ impl Decoder {
         context: DecodeContext,
     ) -> Result<CatalogRef, PolicySourceError> {
         let fields = RecordCursor::parse(expr, PolicyRecord::Catalog, context)?;
+        if let Some(any) = fields.get("any-registered") {
+            if !decode_boolean(any, "any-registered")?
+                || fields.get("name").is_some()
+                || fields.get("version").is_some()
+                || fields.get("sha256").is_some()
+            {
+                return Err(source_error(
+                    "invalid-catalog-reference",
+                    expr.range.clone(),
+                    "wildcard catalog requires :any-registered true and excludes :name, :version and :sha256",
+                ));
+            }
+            let categories = fields.get("categories").ok_or_else(|| {
+                source_error(
+                    "invalid-catalog-reference",
+                    expr.range.clone(),
+                    "wildcard catalog requires :categories",
+                )
+            })?;
+            return Ok(CatalogRef::AnyRegistered {
+                predicate: self.decode_category_predicate(categories, context)?,
+            });
+        }
+        if fields.get("categories").is_some()
+            || fields.get("name").is_none()
+            || fields.get("version").is_none()
+        {
+            return Err(source_error(
+                "invalid-catalog-reference",
+                expr.range.clone(),
+                "named catalog requires :name and :version; :categories requires :any-registered true",
+            ));
+        }
         let name = parse_identifier(fields.required("name"), "catalog name")?;
         let version = expect_u32(fields.required("version"), "catalog version", false)?;
         let sha256 = fields
@@ -2863,10 +2929,20 @@ impl Decoder {
             (Some(local), None, None, None) => Ok(EndpointRef::Local {
                 entry_id: parse_identifier(local, "local endpoint ID")?,
             }),
-            (None, Some(catalog), Some(entry), None) => Ok(EndpointRef::Catalog {
-                catalog: self.decode_catalog(catalog, context)?,
-                entry_id: parse_identifier(entry, "catalog endpoint ID")?,
-            }),
+            (None, Some(catalog), Some(entry), None) => {
+                let reference = self.decode_catalog(catalog, context)?;
+                if matches!(reference, CatalogRef::AnyRegistered { .. }) {
+                    return Err(source_error(
+                        "invalid-endpoint-reference",
+                        catalog.range.clone(),
+                        "an exact endpoint-ref requires a named catalog, not :any-registered",
+                    ));
+                }
+                Ok(EndpointRef::Catalog {
+                    catalog: reference,
+                    entry_id: parse_identifier(entry, "catalog endpoint ID")?,
+                })
+            }
             (None, None, None, Some(endpoint)) => Ok(EndpointRef::MatchEndpoint {
                 endpoint_id: parse_identifier(endpoint, "match endpoint ID")?,
             }),
@@ -2956,15 +3032,159 @@ impl Decoder {
         let context = DecodeContext::policy(PolicyAnalysisKind::Taint);
         let fields = RecordCursor::parse(expr, PolicyRecord::Sanitizer, context)?;
         let (id, selector_path) = self.decode_local_taint_entry(&fields, path, "sanitizer ID")?;
-        let (selector, input, output) =
-            self.decode_selector_input_output(&fields, context, &selector_path)?;
+        let selector =
+            self.decode_selector(fields.required("selector"), context, &selector_path)?;
+        let kind = self.decode_sanitizer_kind(expr, &fields, context, &selector_path)?;
+        validate_sanitizer_arity(&selector, &kind)
+            .map_err(|message| source_error("sanitizer-arity", expr.range.clone(), message))?;
         Ok(TaintSanitizerSpec {
+            categories: decode_optional_categories(&fields)?,
             id,
             selector,
-            input,
-            output,
+            kind,
             removes: decode_id_set(fields.required("removes"), "removed labels", 1, 64)?,
         })
+    }
+
+    fn decode_sanitizer_kind(
+        &mut self,
+        expr: &Expr,
+        fields: &RecordCursor<'_>,
+        context: DecodeContext,
+        path: &str,
+    ) -> Result<TaintSanitizerKind, PolicySourceError> {
+        match (
+            fields.get("input"),
+            fields.get("output"),
+            fields.get("when"),
+            fields.get("sanitizes"),
+            fields.get("requires"),
+        ) {
+            (Some(input), Some(output), None, None, None) => Ok(TaintSanitizerKind::Transfer {
+                input: decode_policy_port(input, context)?,
+                output: decode_policy_port(output, context)?,
+            }),
+            (None, None, Some(when), Some(sanitizes), requires) => {
+                let result = RecordCursor::parse(when, PolicyRecord::Result, context)?;
+                let value = result.positional(0).ok_or_else(|| {
+                    source_error(
+                        "missing-field",
+                        when.range.clone(),
+                        "a conditional result requires true, false, nil or non-nil",
+                    )
+                })?;
+                let result_value =
+                    match expect_atom(value, AtomDomain::SanitizerResult, "sanitizer result")? {
+                        PolicyAtomValue::SanitizerTrue => TaintSanitizerResult::True,
+                        PolicyAtomValue::SanitizerFalse => TaintSanitizerResult::False,
+                        PolicyAtomValue::SanitizerNil => TaintSanitizerResult::Nil,
+                        PolicyAtomValue::SanitizerNonNil => TaintSanitizerResult::NonNil,
+                        value => unreachable!("sanitizer result registry returned {value:?}"),
+                    };
+                let when = TaintSanitizerWhen {
+                    result: result_value,
+                    index: result
+                        .get("index")
+                        .map(|value| expect_u32(value, "result index", true))
+                        .transpose()?,
+                };
+                let sanitizes = decode_sanitizer_operand(sanitizes, context)?;
+                let mut decoded_requires = Vec::new();
+                if let Some(requires) = requires {
+                    for (index, requirement) in
+                        expect_vector(requires, "sanitizer requirements", 1, 64)?
+                            .iter()
+                            .enumerate()
+                    {
+                        let record = select_record(
+                            requirement,
+                            &[PolicyRecord::ReceiverRequirement, PolicyRecord::Argument],
+                            "sanitizer requirement",
+                        )?;
+                        let item = RecordCursor::parse(requirement, record, context)?;
+                        let operand = if record == PolicyRecord::ReceiverRequirement {
+                            TaintSanitizerOperand::Receiver
+                        } else {
+                            if item.get("name").is_some() {
+                                return Err(source_error(
+                                    "binding-not-allowed",
+                                    requirement.range.clone(),
+                                    "sanitizer arguments require an index",
+                                ));
+                            }
+                            TaintSanitizerOperand::Argument {
+                                index: expect_u32(
+                                    item.get("index").ok_or_else(|| {
+                                        source_error(
+                                            "missing-field",
+                                            requirement.range.clone(),
+                                            "argument requires :index",
+                                        )
+                                    })?,
+                                    "argument index",
+                                    true,
+                                )?,
+                            }
+                        };
+                        let condition = match (
+                            item.get("constant"),
+                            item.get("equals"),
+                            item.get("result-of"),
+                        ) {
+                            (Some(value), None, None) => {
+                                if !decode_boolean(value, "constant requirement")? {
+                                    return Err(source_error(
+                                        "invalid-requirement",
+                                        value.range.clone(),
+                                        ":constant requires true",
+                                    ));
+                                }
+                                TaintSanitizerCondition::Constant
+                            }
+                            (None, Some(value), None) => {
+                                TaintSanitizerCondition::Equals(decode_sanitizer_literal(value)?)
+                            }
+                            (None, None, Some(value)) => {
+                                TaintSanitizerCondition::ResultOf(self.decode_selector(
+                                    value,
+                                    context,
+                                    &format!("{path}/requires/{index}/result_of"),
+                                )?)
+                            }
+                            _ => {
+                                return Err(source_error(
+                                    "invalid-requirement",
+                                    requirement.range.clone(),
+                                    "requires items need exactly one of :constant, :equals or :result-of",
+                                ));
+                            }
+                        };
+                        let decoded = TaintSanitizerRequirement { operand, condition };
+                        let key = crate::canonical::sanitizer_requirement_to_json(&decoded);
+                        if decoded_requires.iter().any(|previous| {
+                            crate::canonical::sanitizer_requirement_to_json(previous) == key
+                        }) {
+                            return Err(source_error(
+                                "duplicate-requirement",
+                                requirement.range.clone(),
+                                "duplicate sanitizer requirement",
+                            ));
+                        }
+                        decoded_requires.push(decoded);
+                    }
+                }
+                Ok(TaintSanitizerKind::Conditional {
+                    when,
+                    sanitizes,
+                    requires: decoded_requires,
+                })
+            }
+            _ => Err(source_error(
+                "sanitizer-shape",
+                expr.range.clone(),
+                "use exactly one sanitizer shape: :input and :output, or :when and :sanitizes with optional :requires",
+            )),
+        }
     }
 
     fn decode_entry_point(
@@ -3011,6 +3231,7 @@ impl Decoder {
         let (selector, input, output) =
             self.decode_selector_input_output(&fields, context, &selector_path)?;
         Ok(TaintTransformSpec {
+            categories: decode_optional_categories(&fields)?,
             selector,
             id,
             input,
@@ -3048,6 +3269,7 @@ impl Decoder {
             transfers.push(transfer);
         }
         Ok(TaintExternalModelSpec {
+            categories: decode_optional_categories(&fields)?,
             selector: self.decode_selector(
                 fields.required("selector"),
                 context,
@@ -4573,7 +4795,7 @@ impl Decoder {
                     }),
                 );
                 self.map(format!("{path}/query"), query_expr);
-                debug_assert!(self.selector_paths.insert(path.to_string()));
+                self.declare_selector_path(path);
                 Ok(PolicySelector::Inline {
                     schema,
                     query,
@@ -4637,7 +4859,7 @@ impl Decoder {
                         range: expr.range.clone(),
                     });
                 self.map(format!("{path}/path"), path_expr);
-                debug_assert!(self.selector_paths.insert(path.to_string()));
+                self.declare_selector_path(path);
                 Ok(PolicySelector::File {
                     authored_schema_version,
                     analysis_schema_version: self
@@ -6011,6 +6233,17 @@ fn decode_binding(
     }
     let record = select_record(expr, value_shape.accepted_records(), "binding")?;
     let fields = RecordCursor::parse(expr, record, context)?;
+    if ["constant", "equals", "result-of"]
+        .iter()
+        .any(|field| fields.get(field).is_some())
+        || (record == PolicyRecord::Result && fields.positional(0).is_some())
+    {
+        return Err(source_error(
+            "binding-not-allowed",
+            expr.range.clone(),
+            "conditional sanitizer requirements are not ordinary ports",
+        ));
+    }
     if record == PolicyRecord::Field {
         let name = expect_string(fields.required("name"), "field name", MAX_HUMAN_NAME_BYTES)?;
         let of = fields.required("of");
@@ -6031,7 +6264,13 @@ fn decode_binding(
     }
     if record == PolicyRecord::Result {
         return Ok(DecodedBinding::ResultIndex(expect_u32(
-            fields.required("index"),
+            fields.get("index").ok_or_else(|| {
+                source_error(
+                    "missing-field",
+                    expr.range.clone(),
+                    "result port requires :index",
+                )
+            })?,
             "result index",
             true,
         )?));
@@ -6102,6 +6341,49 @@ fn decoded_binding_to_port(binding: DecodedBinding) -> PolicyPort {
             base: Box::new(decoded_binding_to_port(*base)),
             name,
         },
+    }
+}
+
+fn decode_sanitizer_literal(expr: &Expr) -> Result<serde_json::Value, PolicySourceError> {
+    Ok(match &expr.kind {
+        ExprKind::String(value) => serde_json::Value::String(value.clone()),
+        ExprKind::Number(value) => serde_json::json!(value),
+        ExprKind::Symbol(value) if value == "true" || value == "false" => {
+            serde_json::json!(value == "true")
+        }
+        // The S-expression lexer represents signed and fractional literals as atoms.
+        ExprKind::Symbol(value) => value
+            .parse::<serde_json::Number>()
+            .map(serde_json::Value::Number)
+            .map_err(|_| {
+                source_error(
+                    "invalid-literal",
+                    expr.range.clone(),
+                    ":equals requires a string, number or Boolean literal",
+                )
+            })?,
+        _ => {
+            return Err(source_error(
+                "invalid-literal",
+                expr.range.clone(),
+                ":equals requires a string, number or Boolean literal",
+            ));
+        }
+    })
+}
+
+fn decode_sanitizer_operand(
+    expr: &Expr,
+    context: DecodeContext,
+) -> Result<TaintSanitizerOperand, PolicySourceError> {
+    match decode_policy_port(expr, context)? {
+        PolicyPort::Receiver => Ok(TaintSanitizerOperand::Receiver),
+        PolicyPort::ArgumentIndex { index } => Ok(TaintSanitizerOperand::Argument { index }),
+        _ => Err(source_error(
+            "binding-not-allowed",
+            expr.range.clone(),
+            "a sanitized operand must be receiver or an indexed argument",
+        )),
     }
 }
 
@@ -7680,7 +7962,13 @@ fn cvss_metric_from_schema(metric: CvssBaseMetricSchema) -> CvssBaseMetric {
 }
 
 fn catalog_key(reference: &CatalogRef) -> String {
-    format!("{}:{}", reference.name, reference.version)
+    match reference {
+        CatalogRef::Named { name, version, .. } => format!("{name}:{version}"),
+        CatalogRef::AnyRegistered { predicate } => format!(
+            "any-registered:{}",
+            super::canonical::category_predicate_to_json(predicate)
+        ),
+    }
 }
 
 fn match_set_key(reference: &MatchEndpointSetRef) -> String {
@@ -7801,6 +8089,16 @@ fn validate_named_graph(values: &[NamedGraphNode], what: &str) -> Result<(), Pol
     Ok(())
 }
 
+fn decode_optional_categories(
+    fields: &RecordCursor<'_>,
+) -> Result<Vec<PolicyCategoryId>, PolicySourceError> {
+    fields
+        .get("categories")
+        .map(|value| decode_id_set(value, "categories", 0, 64))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7818,6 +8116,192 @@ mod tests {
                 :analysis (analysis :type taint :mode may
                   :sources (endpoint-set) :sinks (endpoint-set) {extra}))"#
         )
+    }
+
+    #[test]
+    fn conditional_sanitizers_decode_both_analysis_forms_and_offer_hover() {
+        for (when, operand, requires) in [
+            ("(result true)", "receiver", ""),
+            (
+                "(result false :index 1)",
+                "(argument :index 0)",
+                ":requires [(argument :index 1 :constant true) (receiver :result-of (rql (call)))]",
+            ),
+            (
+                "(result nil :index 0)",
+                "receiver",
+                ":requires [(argument :index 0 :equals \"..\")]",
+            ),
+            (
+                "(result non-nil)",
+                "(argument :index 1)",
+                ":requires [(receiver :equals false) (argument :index 0 :equals -1.5)]",
+            ),
+        ] {
+            let body = format!(":when {when} :sanitizes {operand} {requires}");
+            let source = taint_policy(&format!(
+                ":sanitizers (endpoint-set :entries [(sanitizer :id guard :selector (rql (call)) {body} :removes [secret])])"
+            ));
+            let parsed = parse(&source).unwrap();
+            let RqlpDocument::Policy { definition } = parsed.document() else {
+                panic!("expected policy")
+            };
+            let PolicyAnalysis::Taint { spec } = &definition.analysis else {
+                panic!("expected taint")
+            };
+            assert!(matches!(
+                &spec.sanitizers.entries[0].kind,
+                TaintSanitizerKind::Conditional { .. }
+            ));
+            parsed.to_inline_local_canonical_semantic_json().unwrap();
+            let loadable = source.replace(":sources (endpoint-set)", r#":sources (endpoint-set :entries [(source :id source :display-name "Source" :categories [input] :selector (rql (call)) :bind return-value :labels [secret])])"#)
+                .replace(":sinks (endpoint-set)", r#":sinks (endpoint-set :entries [(sink :id sink :display-name "Sink" :categories [output] :selector (rql (call)) :dangerous-operand (argument :index 0) :accepts [secret])])"#);
+            let registry = crate::test_support::registry_with_policy(
+                "test",
+                &loadable,
+                "a conditional sanitizer loads",
+            );
+            let policy = registry.policies().next().unwrap();
+            assert!(matches!(
+                &policy.resolved_taint().unwrap().sanitizers[0]
+                    .definition
+                    .kind,
+                TaintSanitizerKind::Conditional { .. }
+            ));
+
+            for keyword in [
+                ":when",
+                ":sanitizes",
+                ":requires",
+                ":constant",
+                ":equals",
+                ":result-of",
+            ] {
+                if let Some(offset) = source.find(keyword) {
+                    let help = rqlp_source_help_at(&source, offset + 2)
+                        .expect("conditional field has hover help");
+                    assert!(help.signature.contains(keyword), "{keyword}: {help:?}");
+                }
+            }
+            let flow = flow_policy(&format!(
+                ":kills (endpoint-set :entries [(kill :id guard :selector (rql (call)) {body})])"
+            ));
+            parse(&flow).unwrap();
+        }
+    }
+
+    #[test]
+    fn conditional_sanitizer_validation_reports_authored_ranges() {
+        for (body, code) in [
+            (
+                ":when (result true) :sanitizes receiver :input receiver :output return-value",
+                "sanitizer-shape",
+            ),
+            (":when (result true)", "sanitizer-shape"),
+            (":input receiver", "sanitizer-shape"),
+            (
+                ":when (result true) :sanitizes receiver :requires []",
+                "collection-size",
+            ),
+            (
+                ":when (result true) :sanitizes receiver :requires [(receiver :constant false)]",
+                "invalid-requirement",
+            ),
+            (
+                ":when (result true) :sanitizes receiver :requires [(receiver :constant true :equals true)]",
+                "invalid-requirement",
+            ),
+            (
+                ":when (result true) :sanitizes return-value",
+                "binding-not-allowed",
+            ),
+            (
+                ":when (result true) :sanitizes (argument :name \"x\")",
+                "binding-not-allowed",
+            ),
+            (
+                ":when (result true) :sanitizes receiver :requires [(receiver :equals nil)]",
+                "invalid-literal",
+            ),
+            (
+                ":when (result true) :sanitizes receiver :requires [(receiver :constant true) (receiver :constant true)]",
+                "duplicate-requirement",
+            ),
+            (
+                ":when (result true) :sanitizes receiver :requires [(argument :index 1 :constant true)]",
+                "sanitizer-arity",
+            ),
+        ] {
+            let source = taint_policy(&format!(
+                ":sanitizers (endpoint-set :entries [(sanitizer :id guard :selector (rql (call (arity 1))) {body} :removes [secret])])"
+            ));
+            let error = parse(&source).unwrap_err().diagnostic;
+            assert_eq!(error.code, code, "{body}: {error:?}");
+            if code == "invalid-literal" {
+                assert_eq!(&source[error.range.clone()], "nil");
+            }
+            if body.contains(":constant false") {
+                assert_eq!(&source[error.range.clone()], "false");
+            }
+            if code == "duplicate-requirement" {
+                let token = "(receiver :constant true)";
+                let start = source.rfind(token).unwrap();
+                assert_eq!(error.range, start..start + token.len());
+            }
+
+            assert!(!source[error.range.clone()].is_empty(), "{body}: {error:?}");
+        }
+        let source = taint_policy(
+            ":sanitizers (endpoint-set :entries [(sanitizer :id guard :selector (rql (call (arity 0))) :when (result true) :sanitizes (argument :index 0) :removes [secret])])",
+        );
+        assert_eq!(
+            parse(&source).unwrap_err().diagnostic.code,
+            "sanitizer-arity"
+        );
+    }
+
+    #[test]
+    fn transfer_sanitizer_loaded_policy_identity_is_unchanged() {
+        let source = taint_policy(r#":sanitizers (endpoint-set :entries [(sanitizer :id scrub :selector (rql (call)) :input (argument :index 0) :output return-value :removes [secret])])"#)
+            .replace(":sources (endpoint-set)", r#":sources (endpoint-set :entries [(source :id source :display-name "Source" :categories [input] :selector (rql (call)) :bind return-value :labels [secret])])"#)
+            .replace(":sinks (endpoint-set)", r#":sinks (endpoint-set :entries [(sink :id sink :display-name "Sink" :categories [output] :selector (rql (call)) :dangerous-operand (argument :index 0) :accepts [secret])])"#);
+        let registry = crate::test_support::registry_with_policy(
+            "test.transfer.identity",
+            &source,
+            "a transfer sanitizer loads",
+        );
+        let loaded = registry.policies().next().unwrap();
+        let value = crate::canonical_loaded::loaded_policy_to_json(loaded).unwrap();
+        let bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
+        use sha2::{Digest, Sha256};
+        assert_eq!(bytes.len(), 3556);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "852d262aadaf40cfbb3a6b0d7848ea2f6456bf51b34c56d3982da2431d6de40c"
+        );
+        assert_eq!(
+            loaded.semantic_hash().to_string(),
+            "cea454252123288426fe0388c0900a7120589b737bce49f9b84891425f6c287c"
+        );
+    }
+
+    #[test]
+    fn transfer_sanitizer_policy_identity_is_unchanged() {
+        let source = taint_policy(
+            r#":sanitizers (endpoint-set :entries [(sanitizer :id scrub :selector (rql (call)) :input (argument :index 0) :output return-value :removes [secret])])"#,
+        );
+        let parsed = parse(&source).unwrap();
+        let value = parsed
+            .document()
+            .to_inline_local_canonical_semantic_json()
+            .unwrap();
+        let bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
+        use sha2::{Digest, Sha256};
+        assert_eq!(bytes.len(), 1003);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "0420a24cd71ca9110162d7977d879c5d59e9f56af72d8c8983abe60721afdd21"
+        );
     }
 
     fn flow_policy(extra: &str) -> String {
@@ -8375,7 +8859,7 @@ mod tests {
 
         let result_offset = source.find("result").unwrap() + 2;
         let help = rqlp_source_help_at(source, result_offset).expect("result record hover help");
-        assert_eq!(help.signature, "(result :index N)");
+        assert!(help.signature.contains("(result :index N)"));
         assert!(help.description.contains("zero-based normal call result"));
     }
 

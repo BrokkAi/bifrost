@@ -96,17 +96,15 @@ impl<'a> PreparedSourceDispatchSession<'a> {
         // Only computed when a ledger will read it: the question names the
         // artifact, and an Arc bump on every dispatch is a cost runs that
         // record nothing should not pay.
-        let question = self
-            .oracle
-            .workspace
-            .analyzer()
-            .read_ledger_attached()
-            .then(|| {
-                self.materialized
-                    .available_value()
-                    .map(|artifact| dispatch_question(artifact, range))
-            })
-            .flatten();
+        let question = (crate::analyzer::read_attribution_records_reads(|| {
+            self.oracle.workspace.analyzer().read_ledger_attached()
+        }))
+        .then(|| {
+            self.materialized
+                .available_value()
+                .map(|artifact| dispatch_question(artifact, range))
+        })
+        .flatten();
         let outcome = self.resolve_at_source(range, request)?;
         if let Some(question) = question {
             self.oracle.workspace.analyzer().record_read(

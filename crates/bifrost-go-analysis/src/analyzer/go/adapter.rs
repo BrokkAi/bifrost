@@ -55,8 +55,11 @@ impl LanguageAdapter for GoAdapter {
     /// produces a prefix that neither the path nor the persisted qualifier
     /// contains as a substring, so Go declarations are never dropped by the
     /// symbol-search prefilter.
-    fn prefilter_path_package(&self, _file: &ProjectFile) -> Option<String> {
-        None
+    fn prefilter_path_package(
+        &self,
+        _file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<String>> {
+        Ok(None)
     }
 
     fn workspace_file_package_anchor(
@@ -164,8 +167,12 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for GoAdapter
         content_qualifier.to_string()
     }
 
-    fn hydrate_content_qualifier(&self, content_qualifier: &str, file: &ProjectFile) -> String {
-        canonical_go_package_name(file, content_qualifier)
+    fn hydrate_content_qualifier(
+        &self,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<String> {
+        Ok(canonical_go_package_name(file, content_qualifier))
     }
 
     fn default_package_anchor(&self) -> Option<brokk_bifrost_core::analyzer::model::PackageAnchor> {

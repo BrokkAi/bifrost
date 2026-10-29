@@ -119,6 +119,12 @@ fn callable_declaration_is_nameable(declaration: Node<'_>, source: &str) -> bool
             ancestor = node.parent().and_then(|parent| parent.parent());
             continue;
         }
+        // A member is named through its class, wherever that class is
+        // written: a member of a function-local class is as nameable as one
+        // at namespace scope.
+        if node.kind() == "field_declaration_list" {
+            return true;
+        }
         if matches!(
             node.kind(),
             "compound_statement" | "function_definition" | "lambda_expression"

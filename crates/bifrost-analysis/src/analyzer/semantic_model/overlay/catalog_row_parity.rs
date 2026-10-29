@@ -254,10 +254,36 @@ fn row_shards(
                     }).unwrap().map(Result::unwrap).filter(|row| row.0==*manifest && row.1==id && row.2=="relation_fact").collect::<Vec<_>>();
                     relations.sort_by_key(|row|row.3);
                     let relations=relations.into_iter().map(|row|row.4).collect::<Vec<_>>();
-                    json!({"kind":"declaration_facts",
+                    let mut payload = json!({"kind":"declaration_facts",
                     "types":records(connection,"catalog_declaration_types",manifest,id),
                     "members":records(connection,"catalog_declaration_members",manifest,id),
-                    "relations":relations})
+                    "relations":relations});
+                    // The assembly identity and type forwards are rows of their
+                    // own tables; both stay absent from the payload when empty.
+                    let identity = connection.prepare_cached(questions::ASSEMBLY_IDENTITY_BY_PROVIDER).unwrap()
+                        .query_map(rusqlite::named_params!{":manifest":manifest,":shard":id}, |row| {
+                            Ok(json!({"name":row.get::<_,String>("name")?,"version":row.get::<_,String>("version")?,
+                              "culture":row.get::<_,Option<String>>("culture")?,"public_key_token":row.get::<_,Option<String>>("public_key_token")?}))
+                        }).unwrap().map(Result::unwrap).collect::<Vec<_>>();
+                    assert!(identity.len() <= 1, "{identity:?}");
+                    if let Some(identity) = identity.into_iter().next() {
+                        payload["assembly_identity"] = identity;
+                    }
+                    let forwards = connection.prepare_cached(
+                        "SELECT f.name,f.namespace,o.name AS outer_name,f.target_name,f.target_version,f.target_culture,f.target_public_key_token
+                         FROM active_catalog_type_forwards f LEFT JOIN active_catalog_type_forwards o
+                         ON o.source_db=f.source_db AND o.manifest_digest=f.manifest_digest AND o.shard_id=f.shard_id AND o.ordinal=f.outer_ordinal
+                         WHERE f.manifest_digest=?1 AND f.shard_id=?2 ORDER BY f.ordinal").unwrap()
+                        .query_map(rusqlite::params![manifest, id], |row| {
+                            Ok(json!({"name":row.get::<_,String>("name")?,"namespace":row.get::<_,String>("namespace")?,
+                              "outer":row.get::<_,Option<String>>("outer_name")?,
+                              "target":{"name":row.get::<_,String>("target_name")?,"version":row.get::<_,String>("target_version")?,
+                                "culture":row.get::<_,Option<String>>("target_culture")?,"public_key_token":row.get::<_,Option<String>>("target_public_key_token")?}}))
+                        }).unwrap().map(Result::unwrap).collect::<Vec<_>>();
+                    if !forwards.is_empty() {
+                        payload["type_forwards"] = json!(forwards);
+                    }
+                    payload
                 }
                 CompiledPayload::GeneratorRules { .. } => json!({"kind":"generator_rules",
                 "rules":records(connection,"catalog_generator_rules",manifest,id)}),
@@ -843,7 +869,8 @@ fn assert_keyed_overlay_entries(
         SemanticModelOverlay::build(analyzer, &row_active, &CancellationToken::new(), u64::MAX)
             .unwrap();
     if let Some(rows) = &mut row_overlay.row_source {
-        rows.cache = Some(crate::analyzer::store::cache_budget::StoreCacheBudget::default());
+        Arc::make_mut(rows).cache =
+            Some(crate::analyzer::store::cache_budget::StoreCacheBudget::default());
     }
     assert_overlay_entry_parity(original, &row_active, before, &row_overlay, label);
     let mut entry_ids = BTreeSet::new();
@@ -2282,6 +2309,78 @@ fn metadata_only_active(
 
 #[cfg(test)]
 #[test]
+fn selected_external_descriptor_preserves_owner_member_ordinal_across_backings() {
+    use crate::analyzer::resolution::{ExternalMemberIdentity, ExternalOwnerIdentity};
+    use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+    use crate::analyzer::store::active_models::selected_external_descriptor;
+
+    // Test-only declaration fixture: public members precede additional inventory
+    // members, with guards excluded before assigning provider ordinals.
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    let payload = &mut source["shards"][0]["payload"];
+    let member = payload["members"][0].clone();
+    let mut second = member.clone();
+    second["id"] = json!("member.widget.z");
+    second["name"] = json!("second");
+    let mut additional = member.clone();
+    additional["id"] = json!("member.widget.a");
+    additional["name"] = json!("additional");
+    payload["members"] = json!([second, member]);
+    payload["types"][0]["jvm_inventory"] = json!({
+        "callables_complete": true, "values_complete": true,
+        "types_complete": true, "supertypes_complete": true,
+        "supertypes": [], "nested_types": [], "additional_members": [additional]
+    });
+    let pack = compile_source(
+        SourceFormat::Json,
+        &serde_json::to_vec(&source).unwrap(),
+        &CompilerOptions::default(),
+    )
+    .unwrap();
+    let (decoded, reader) = catalog_fixture_active(&[pack], "external-descriptor-order");
+    let mut rows = active(
+        decoded
+            .shards
+            .iter()
+            .map(|shard| ActiveSemanticModelShard {
+                metadata: Arc::clone(&shard.metadata),
+                decoded: None,
+            })
+            .collect(),
+    );
+    rows.source_reader = Some(reader);
+    assert!(decoded.shards.iter().all(|shard| shard.decoded.is_some()));
+    assert!(rows.shards.iter().all(|shard| shard.decoded.is_none()));
+    let shard = &decoded.shards[0];
+    let (types, members, _) = shard.decoded().payload().declaration_facts().unwrap();
+    let owner = &types[0];
+    let published = members
+        .iter()
+        .map(AsRef::as_ref)
+        .chain(&owner.jvm_inventory.as_ref().unwrap().additional_members)
+        .filter(|member| member.owner == owner.id && member.guard.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(published.len(), 3);
+    for (ordinal, member) in published.iter().enumerate() {
+        let selected = ExternalMemberIdentity {
+            owner: ExternalOwnerIdentity {
+                provider_id: shard.manifest.semantic_sha256.as_str().into(),
+                owner_fqn: owner.name.as_str().into(),
+            },
+            ordinal: u32::try_from(ordinal).unwrap(),
+        };
+        let expected = Some((shard.manifest.semantic_sha256.clone(), member.id.clone()));
+        assert_eq!(selected_external_descriptor(&decoded, &selected), expected);
+        assert_eq!(selected_external_descriptor(&rows, &selected), expected);
+    }
+}
+
+#[cfg(test)]
+#[test]
 #[brokk_bifrost_test_macros::hardwon(
     "#6685: summaries for a declaration followed HashMap bucket order"
 )]
@@ -2352,12 +2451,17 @@ fn catalog_presence_distinguishes_absent_and_present_empty_payloads() {
     )
     .unwrap();
     assert_pack_parity(&absent, "absent-companions");
-    for family in
-        brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily::ALL
-    {
-        if family != brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily::CallableValues {
-            source["shards"][0][family.as_str()] = json!({});
-        }
+    use brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily;
+    // These companions live on the shard and distinguish absence from an
+    // explicitly empty payload. Type forwards are a declaration vector;
+    // an empty vector is omitted, not a present-empty companion.
+    let present_empty = [
+        SemanticPayloadFamily::CollectionFlows,
+        SemanticPayloadFamily::ConditionalTypeRefinements,
+        SemanticPayloadFamily::DeferredYields,
+    ];
+    for family in present_empty {
+        source["shards"][0][family.as_str()] = json!({});
     }
     source["shards"][0]["runtime_values"] = json!({});
     let present = compile_source(
@@ -2371,7 +2475,11 @@ fn catalog_presence_distinguishes_absent_and_present_empty_payloads() {
     for family in
         brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily::ALL
     {
-        assert_eq!(family.is_present(&validated.shards[0].decoded), family != brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily::CallableValues, "{family:?} fixture route ran");
+        assert_eq!(
+            family.is_present(&validated.shards[0].decoded),
+            present_empty.contains(&family),
+            "{family:?} fixture route ran"
+        );
     }
     assert_pack_parity(&present, "present-empty-companions");
 }
@@ -2816,7 +2924,7 @@ fn catalog_row_search_preserves_renamed_curated_only_member() {
     let mut after =
         SemanticModelOverlay::build(&analyzer, &rows, &CancellationToken::new(), u64::MAX).unwrap();
     let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::default();
-    after.row_source.as_mut().unwrap().cache = Some(cache.clone());
+    Arc::make_mut(after.row_source.as_mut().unwrap()).cache = Some(cache.clone());
     // Group the terminal identifier so sigil normalization preserves '$' as an anchor.
     let patterns = crate::analyzer::SearchSymbolPatternBatch::compile(
         vec!["^com[.]acme[.]Widget[.](?:curated_only)$".into()],
@@ -2940,7 +3048,7 @@ fn catalog_row_single_contributor_search_preserves_exceptional_qualification() {
             SemanticModelOverlay::build(&analyzer, &rows, &CancellationToken::new(), u64::MAX)
                 .unwrap();
         let cache = StoreCacheBudget::default();
-        after.row_source.as_mut().unwrap().cache = Some(cache.clone());
+        Arc::make_mut(after.row_source.as_mut().unwrap()).cache = Some(cache.clone());
         let patterns = crate::analyzer::SearchSymbolPatternBatch::compile(
             vec!["^shared[.]curated[.](?:create)$".into()],
             false,
@@ -2980,11 +3088,56 @@ pub fn assert_active_entry_parity(
             .as_ref()
             .expect("activated catalog reader"),
     );
-    let before =
+    let mut before =
         SemanticModelOverlay::build(analyzer, active, &CancellationToken::new(), u64::MAX).unwrap();
-    let after =
+    let mut after =
         SemanticModelOverlay::build(analyzer, &row_active, &CancellationToken::new(), u64::MAX)
             .unwrap();
+    assert!(
+        active.shards.iter().all(|shard| shard.decoded.is_some()),
+        "the accounting regression must exercise an all-decoded set"
+    );
+    assert!(before.row_source.is_none());
+    let source = before
+        .selected_source
+        .take()
+        .expect("selected original inputs");
+    let [anchors, generated_symbols, generated_relations] = source.retained_owned_input_bytes();
+    assert!(
+        anchors > std::mem::size_of::<locations::SourceAnchors>(),
+        "authored anchors must be retained"
+    );
+    assert!(
+        generated_symbols > std::mem::size_of::<Vec<SemanticModelSymbol>>(),
+        "generated symbols must be retained"
+    );
+    assert!(
+        generated_relations > std::mem::size_of::<Vec<SemanticModelRelation>>(),
+        "generated relations must be retained"
+    );
+    let without_copies = before.retained_bytes_lower_bound();
+    before.selected_source = Some(source);
+    let with_copies = before.retained_bytes_lower_bound();
+    assert_eq!(
+        with_copies - without_copies,
+        (anchors + generated_symbols + generated_relations) as u64,
+        "all-decoded overlay must charge exactly the retained anchors and generated vectors"
+    );
+    eprintln!(
+        "D2_RETENTION live Rust generator/authored fixture: before={without_copies} after={with_copies} anchors={anchors} generated_symbols={generated_symbols} generated_relations={generated_relations}"
+    );
+    let both_sources = after.retained_bytes_lower_bound();
+    let row_source = after.row_source.take().expect("row reader alias");
+    assert!(Arc::ptr_eq(
+        &row_source,
+        after.selected_source.as_ref().unwrap()
+    ));
+    assert_eq!(
+        after.retained_bytes_lower_bound(),
+        both_sources,
+        "aliased row and selected sources are charged once"
+    );
+    after.row_source = Some(row_source);
     assert_overlay_entry_parity(
         active,
         &row_active,
@@ -3293,7 +3446,7 @@ fn catalog_row_search_parity_for_real_bundle() {
     let mut after =
         SemanticModelOverlay::build(&analyzer, &rows, &CancellationToken::new(), u64::MAX).unwrap();
     let cache = crate::analyzer::store::cache_budget::StoreCacheBudget::default();
-    after.row_source.as_mut().unwrap().cache = Some(cache.clone());
+    Arc::make_mut(after.row_source.as_mut().unwrap()).cache = Some(cache.clone());
     assert!(before.symbols().len() > 10_000, "real std corpus route ran");
     for (pattern, limit) in [
         (".*", 17),
@@ -3388,7 +3541,7 @@ fn catalog_row_composition_cache_eviction_preserves_answers() {
     let mut after =
         SemanticModelOverlay::build(&analyzer, &rows, &CancellationToken::new(), u64::MAX).unwrap();
     let cache = StoreCacheBudget::new(1);
-    after.row_source.as_mut().unwrap().cache = Some(cache.clone());
+    Arc::make_mut(after.row_source.as_mut().unwrap()).cache = Some(cache.clone());
     assert_overlay_entry_parity(
         &active,
         &rows,
@@ -3408,7 +3561,7 @@ fn catalog_row_composition_cache_eviction_preserves_answers() {
     assert_eq!(second.retained_bytes, 0);
 
     let shared = StoreCacheBudget::default();
-    after.row_source.as_mut().unwrap().cache = Some(shared.clone());
+    Arc::make_mut(after.row_source.as_mut().unwrap()).cache = Some(shared.clone());
     assert_overlay_entry_parity(&active, &rows, &before, &after, "retained groups");
     assert_overlay_entry_parity(&active, &rows, &before, &after, "retained search stream");
     let retained = shared.composition_cache_stats();
@@ -3444,7 +3597,7 @@ fn catalog_row_composition_cache_eviction_preserves_answers() {
         u64::MAX,
     )
     .unwrap();
-    actual.row_source.as_mut().unwrap().cache = Some(shared.clone());
+    Arc::make_mut(actual.row_source.as_mut().unwrap()).cache = Some(shared.clone());
     assert_ne!(
         before.symbols(),
         expected.symbols(),
@@ -3464,5 +3617,620 @@ fn catalog_row_composition_cache_eviction_preserves_answers() {
     assert!(
         shared.composition_cache_stats().group_hits > 0,
         "cross-question reuse ran"
+    );
+}
+
+#[cfg(test)]
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7560: G1 selected composition folded owners across providers"
+)]
+fn model_declarations_preserve_folded_provider_owner() {
+    use crate::analyzer::semantic_model::{
+        ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
+        compile_pack,
+    };
+    // Test-only extracted releases with identical owner structure. Activation
+    // deliberately has no exact artifact evidence to distinguish the releases.
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    source["schema_version"] =
+        json!(crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION);
+    source["pack_id"] = json!("fixture.provider-folding");
+    source["language"] = json!("rust");
+    source["ecosystem"] = json!("cargo");
+    source["compatibility"]["toolchains"] = json!([]);
+    source["compatibility"]
+        .as_object_mut()
+        .unwrap()
+        .remove("bifrost");
+    let mut owner = source["shards"][0]["payload"]["types"][0].clone();
+    owner["hierarchy"] = json!([]);
+    owner["aliases"] = json!([]);
+    source["shards"][0]["payload"] = json!({
+        "kind": "declaration_facts", "types": [owner], "members": [], "relations": []
+    });
+    let mut authored: AuthoredSemanticModelPack = serde_json::from_value(source).unwrap();
+    authored.extraction = Some(ArtifactExtraction::single(
+        ArtifactExtractionKind::RustdocJson,
+        &"a".repeat(64),
+    ));
+    let mut packs = Vec::new();
+    for version in ["1.0.0", "2.0.0"] {
+        authored.version = version.into();
+        let pack = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        packs.push(pack);
+    }
+    let (mut active, reader) = catalog_fixture_active(&packs, "provider-folding");
+    let selected = Arc::get_mut(&mut active).unwrap();
+    selected.source_reader = Some(reader);
+    for shard in &mut selected.shards {
+        Arc::get_mut(shard).unwrap().decoded = None;
+    }
+    assert_eq!(active.shards.len(), 2, "both extracted releases are active");
+    assert!(active.shards.iter().all(|shard| {
+        shard.manifest.extraction.is_some() && shard.matched_evidence.artifact_sha256.is_none()
+    }));
+    let providers = active
+        .shards
+        .iter()
+        .map(|shard| ModelProvider {
+            pack_id: shard.manifest.pack_id.clone(),
+            pack_version: shard.manifest.version.clone(),
+            pack_digest: shard.manifest.semantic_sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(providers[0], providers[1]);
+    let directory = TempDir::new().unwrap();
+    let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Rust)));
+    let overlay =
+        SemanticModelOverlay::build(&analyzer, &active, &CancellationToken::new(), u64::MAX)
+            .unwrap();
+    let composed = overlay.symbols_with_id("type.widget").records;
+    assert!(!composed.is_empty(), "fixture must publish the owner");
+    let representative = ModelProvider::from(&composed[0].provenance);
+    let provider = providers
+        .into_iter()
+        .find(|provider| provider != &representative)
+        .unwrap();
+    let selection = ModelProviderSelection::new([provider.clone()]);
+    let owner = ModelSymbolRef {
+        symbol_id: "type.widget".into(),
+        provider,
+    };
+    assert!(
+        matches!(overlay.model_member_declarations(&owner, &selection, &crate::CancellationToken::new()).unwrap(), Some(ModelOwnerAnswer::Declared(answer)) if answer.owner == owner),
+        "non-representative provider must retain its own owner: {owner}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7560: G1 selected composition folded owners across providers"
+)]
+fn model_selected_composition_keeps_member_surfaces_per_provider() {
+    use crate::analyzer::semantic_model::{
+        ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
+        compile_pack,
+    };
+    for (language, extracted) in [("rust", false), ("rust", true), ("go", false), ("go", true)] {
+        let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/semantic-model-packs/declarations-v1.json"
+        )))
+        .unwrap();
+        source["schema_version"] =
+            json!(crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION);
+        source["pack_id"] = json!("fixture.selected-providers");
+        source["language"] = json!(language);
+        source["ecosystem"] = json!(if language == "rust" {
+            "cargo"
+        } else {
+            "go-module"
+        });
+        source["compatibility"] = json!({});
+        let mut owner = source["shards"][0]["payload"]["types"][0].clone();
+        owner["hierarchy"] = json!([]);
+        owner["aliases"] = json!([]);
+        let template = source["shards"][0]["payload"]["members"][0].clone();
+        let mut packs = Vec::new();
+        for (version, name, result) in [
+            (
+                "1.0.0",
+                "First",
+                json!({"kind": "tuple", "elements": [
+                    {"kind": "unknown"}, {"kind": "named", "name": "example.Result"}
+                ]}),
+            ),
+            ("2.0.0", "Second", Value::Null),
+        ] {
+            let mut member = template.clone();
+            member["id"] = json!("member.shared");
+            member["name"] = json!(name);
+            member["signature"]["returns"] = result;
+            source["version"] = json!(version);
+            source["shards"][0]["payload"] = json!({
+                "kind": "declaration_facts", "types": [owner.clone()],
+                "members": [member], "relations": []
+            });
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_value(source.clone()).unwrap();
+            authored.extraction = extracted.then(|| {
+                ArtifactExtraction::single(ArtifactExtractionKind::RustdocJson, &"a".repeat(64))
+            });
+            packs.push(compile_pack(&authored, &CompilerOptions::default()).unwrap());
+        }
+        let (mut active, reader) = catalog_fixture_active(&packs, "selected-providers");
+        let providers = active.model_provider_selection();
+        let scope = Arc::get_mut(&mut active).unwrap();
+        scope.source_reader = Some(reader);
+        if language == "rust" {
+            for shard in &mut scope.shards {
+                Arc::get_mut(shard).unwrap().decoded = None;
+            }
+        }
+        let directory = TempDir::new().unwrap();
+        let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(
+            directory.path(),
+            if language == "rust" {
+                Language::Rust
+            } else {
+                Language::Go
+            },
+        )));
+        let mut overlay =
+            SemanticModelOverlay::build(&analyzer, &active, &CancellationToken::new(), u64::MAX)
+                .unwrap();
+        // Exercise hits and distinct selection contexts through the shared byte cap.
+        // Row and selected views share the source; mutate before installing either view.
+        let mut source = row_entry_points::RowOverlay::new(
+            &analyzer,
+            &active,
+            Vec::new(),
+            Vec::new(),
+            None,
+            &[],
+        );
+        source.cache = Some(crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+            1024 * 1024,
+        ));
+        overlay.selected_source = Some(Arc::new(source));
+        let mut selected_owners = Vec::new();
+        for (index, expected) in ["First", "Second"].into_iter().enumerate() {
+            let shard = &active.shards[index];
+            let provider = ModelProvider {
+                pack_id: shard.manifest.pack_id.clone(),
+                pack_version: shard.manifest.version.clone(),
+                pack_digest: shard.manifest.semantic_sha256.clone(),
+            };
+            let owner = ModelSymbolRef {
+                symbol_id: "type.widget".into(),
+                provider: provider.clone(),
+            };
+            let selection = ModelProviderSelection::new([provider.clone()]);
+            for selected in [&selection, &providers, &selection] {
+                let Some(ModelOwnerAnswer::Declared(answer)) = overlay
+                    .model_member_declarations(&owner, selected, &crate::CancellationToken::new())
+                    .unwrap()
+                else {
+                    panic!("{language}: selected owner {owner}");
+                };
+                assert_eq!(answer.owner, owner);
+                assert_eq!(
+                    answer
+                        .members
+                        .iter()
+                        .map(|m| m.declaration.name.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![expected],
+                    "{language}: provider must keep its own surface"
+                );
+                assert_eq!(answer.members[0].member.provider, provider);
+                let callable = ModelSymbolRef {
+                    symbol_id: "member.shared".into(),
+                    provider: provider.clone(),
+                };
+                let results = overlay
+                    .model_callable_results(&callable, selected, &crate::CancellationToken::new())
+                    .unwrap()
+                    .unwrap();
+                if index == 0 {
+                    assert_eq!(results.len(), 2);
+                    assert_eq!(results[0], None);
+                    assert!(
+                        matches!(&results[1], Some(TypeRef::Named { name, .. }) if name == "example.Result")
+                    );
+                } else {
+                    assert!(results.is_empty());
+                }
+            }
+            assert!(
+                overlay
+                    .model_member_declarations(
+                        &owner,
+                        &ModelProviderSelection::new([]),
+                        &crate::CancellationToken::new()
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            selected_owners.push(owner);
+        }
+        assert_ne!(selected_owners[0], selected_owners[1]);
+        let reference = TypeRef::Named {
+            name: "com.acme.Widget".into(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let groups = overlay
+            .model_selected_groups(
+                language,
+                &reference,
+                &providers,
+                &crate::CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].iter().filter(|s| s.owner_id.is_none()).count(), 2);
+        let authority: &dyn crate::analyzer::store::resolution_operation::SelectedModelAuthority =
+            &overlay;
+        assert_eq!(
+            authority
+                .model_selected_groups(
+                    language,
+                    &reference,
+                    &providers,
+                    &crate::CancellationToken::new()
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let cache = overlay
+            .selected_source
+            .as_ref()
+            .unwrap()
+            .cache
+            .as_ref()
+            .unwrap();
+        assert!(
+            cache.composition_cache_stats().group_hits > 0,
+            "selected group cache was exercised"
+        );
+        // D3: the ordinary view retains its original fold and member union.
+        let ordinary = overlay.symbols_with_id("type.widget").records;
+        assert_eq!(
+            ordinary.len(),
+            1,
+            "{language}: unselected owner still folds"
+        );
+        let members = overlay.members_of("type.widget").records;
+        assert!(members.iter().any(|m| m.name == "First"));
+        assert!(members.iter().any(|m| m.name == "Second"));
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7560: selected Go groups inherited whole-set promotion marks"
+)]
+fn model_selected_go_group_recomputes_promotion_state() {
+    use crate::analyzer::semantic_model::{
+        AuthoredSemanticModelPack, CompilerOptions, compile_pack,
+    };
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    source["schema_version"] =
+        json!(crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION);
+    source["language"] = json!("go");
+    source["ecosystem"] = json!("go-module");
+    source["compatibility"] = json!({});
+    let mut owner = source["shards"][0]["payload"]["types"][0].clone();
+    owner["type_kind"] = json!("struct");
+    owner["hierarchy"] = json!([]);
+    owner["type_parameters"] = json!([]);
+    owner["aliases"] = json!([]);
+    owner["extension_surfaces"] = json!([]);
+    let mut member = source["shards"][0]["payload"]["members"][0].clone();
+    member["name"] = json!("Ping");
+    member["receiver"] = json!({"pointer": false});
+    member["signature"] = json!({"parameters": [], "returns": null});
+    // Identical Artifact declaring coordinates identify the producer's copy.
+    member["locator"] =
+        json!({"kind": "artifact", "path": "base.go", "symbol": "example.Base.Ping"});
+    let mut packs = Vec::new();
+    for (pack_id, id, name) in [
+        ("fixture.go.outer", "type.outer", "example.Outer"),
+        ("fixture.go.base", "type.base", "example.Base"),
+    ] {
+        source["pack_id"] = json!(pack_id);
+        owner["id"] = json!(id);
+        owner["name"] = json!(name);
+        owner["embedded_types"] = if id == "type.outer" {
+            json!([{"target": {"kind": "named", "name": "example.Base"}, "pointer": false}])
+        } else {
+            json!([])
+        };
+        member["id"] = json!(format!("{id}.ping"));
+        member["owner"] = json!(id);
+        source["shards"][0]["payload"] = json!({
+            "kind": "declaration_facts", "types": [owner.clone()],
+            "members": [member.clone()], "relations": []
+        });
+        let authored: AuthoredSemanticModelPack = serde_json::from_value(source.clone()).unwrap();
+        packs.push(compile_pack(&authored, &CompilerOptions::default()).unwrap());
+    }
+    let (active, _reader) = catalog_fixture_active(&packs, "go-selected-promotion");
+    assert!(active.shards.iter().all(|s| s.decoded.is_some()));
+    let directory = TempDir::new().unwrap();
+    let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Go)));
+    let overlay =
+        SemanticModelOverlay::build(&analyzer, &active, &CancellationToken::new(), u64::MAX)
+            .unwrap();
+    let owner = overlay.symbols_with_id("type.outer").records[0].clone();
+    let provider = ModelProvider::from(&owner.provenance);
+    assert_eq!(
+        owner.members_state,
+        ModelMembersState::Exact,
+        "whole-set Go surface is exact"
+    );
+    let owner = ModelSymbolRef {
+        symbol_id: owner.id.clone(),
+        provider: provider.clone(),
+    };
+    let all = active.model_provider_selection();
+    let narrow = ModelProviderSelection::new([provider]);
+    let Some(ModelOwnerAnswer::Declared(broad)) = overlay
+        .model_member_declarations(&owner, &all, &crate::CancellationToken::new())
+        .unwrap()
+    else {
+        panic!("broad owner exists");
+    };
+    let Some(ModelOwnerAnswer::Declared(narrow)) = overlay
+        .model_member_declarations(&owner, &narrow, &crate::CancellationToken::new())
+        .unwrap()
+    else {
+        panic!("narrow owner exists");
+    };
+    // Cross-provider declaring sites cannot prove this authored member is a
+    // copy: both selections retain it, but only the full selection closes Base.
+    assert_eq!(broad.members_state, ModelMembersState::Exact);
+    assert_eq!(
+        narrow.members_state,
+        ModelMembersState::MayIncludePromotionCopies
+    );
+    assert_eq!(broad.members.len(), 1);
+    assert_eq!(narrow.members.len(), 1);
+    assert!(broad.members[0].declaration.promoted_from.is_none());
+}
+
+#[test]
+fn selected_go_embedding_bound_returns_an_error_and_preserves_cancellation() {
+    use crate::analyzer::semantic_model::{
+        AuthoredSemanticModelPack, CompilerOptions, compile_pack,
+    };
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    source["schema_version"] =
+        json!(crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION);
+    source["pack_id"] = json!("fixture.go.embedding-bound");
+    source["language"] = json!("go");
+    source["ecosystem"] = json!("go-module");
+    source["compatibility"] = json!({});
+    source["shards"][0]["activation"] = json!([{}]);
+    // Walking the reachable embeddings for all 2002 owners exceeds the
+    // shared hook's two-million-step bound without a large pack payload.
+    let types = (0..2002)
+        .map(|index| {
+            json!({
+                "id": format!("type.node.{index}"),
+                "name": format!("fixture.Node{index}"),
+                "type_kind": "struct", "visibility": "public",
+                "embedded_types": if index < 2001 {
+                    json!([{"target": {"kind": "declared",
+                        "id": format!("type.node.{}", index + 1), "arguments": [],
+                        "nullable": false}, "pointer": false}])
+                } else { json!([]) },
+                "locator": {"kind": "artifact", "path": "embedding.go",
+                    "symbol": format!("fixture.Node{index}")}
+            })
+        })
+        .collect::<Vec<_>>();
+    source["shards"][0]["payload"] = json!({
+        "kind": "declaration_facts", "types": types, "members": [], "relations": []
+    });
+    let authored: AuthoredSemanticModelPack = serde_json::from_value(source).unwrap();
+    let pack = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+    let (active, _reader) = catalog_fixture_active(&[pack], "go-selected-embedding-bound");
+    let directory = TempDir::new().unwrap();
+    let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Go)));
+    // Install the selected source directly: ordinary eager construction would
+    // reject this pack at its own traversal gate before a selected request.
+    let mut overlay = test_support::overlay(Vec::new(), Vec::new());
+    overlay.active_model_set_hash = active.active_model_set_hash().to_owned();
+    overlay.selected_source = Some(Arc::new(row_entry_points::RowOverlay::new(
+        &analyzer,
+        &active,
+        Vec::new(),
+        Vec::new(),
+        None,
+        &[],
+    )));
+    let selection = active.model_provider_selection();
+    let owner = ModelSymbolRef {
+        symbol_id: "type.node.0".into(),
+        provider: ModelProvider {
+            pack_id: active.shards[0].manifest.pack_id.clone(),
+            pack_version: active.shards[0].manifest.version.clone(),
+            pack_digest: active.shards[0].manifest.semantic_sha256.clone(),
+        },
+    };
+    assert!(matches!(
+        overlay.model_member_declarations(&owner, &selection, &CancellationToken::new()),
+        Err(SemanticModelOverlayBuildError::GoSurfaceTraversalExceeded)
+    ));
+    assert!(
+        overlay
+            .model_member_cache
+            .get(&overlay.model_declaration_request(&owner, &selection))
+            .is_none()
+    );
+    // Closure materialization polls fewer than 5000 times. This token reaches
+    // the shared Go walk before it cancels, so a fresh hook token would fail.
+    let cancellation = CancellationToken::cancel_after_checks_for_test(10_000);
+    let authority: &dyn crate::analyzer::store::resolution_operation::SelectedModelAuthority =
+        &overlay;
+    assert!(matches!(
+        authority.model_member_declarations(&owner, &selection, &cancellation),
+        Err(SemanticModelOverlayBuildError::Cancelled)
+    ));
+    assert!(cancellation.is_cancelled());
+    assert!(matches!(
+        overlay.model_selected_groups(
+            "go",
+            &TypeRef::Declared {
+                id: owner.symbol_id.clone(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            &selection,
+            &cancellation
+        ),
+        Err(SemanticModelOverlayBuildError::Cancelled)
+    ));
+    assert!(matches!(
+        authority.model_callable_results(&owner, &selection, &cancellation),
+        Err(SemanticModelOverlayBuildError::Cancelled)
+    ));
+}
+
+/// Two versions of one pack declare the same Java class, and both are selected.
+/// The JVM's unselected lookup folds them into one owner on purpose until #7605
+/// moves the JVM onto a selection; the selected view keeps each defining
+/// provider, so the same reference is Ambiguous there. Both answers come from
+/// the shared classify_model_type_owner core, fed different candidates.
+#[test]
+fn jvm_folded_owner_and_selected_type_owner_keep_their_contracts() {
+    use crate::analyzer::semantic_model::{
+        AuthoredSemanticModelPack, CompilerOptions, compile_pack,
+    };
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    source["schema_version"] =
+        json!(crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION);
+    source["pack_id"] = json!("fixture.jvm-owner-contracts");
+    source["compatibility"] = json!({});
+    source["shards"][0]["activation"] = json!([{}]);
+    let mut owner = source["shards"][0]["payload"]["types"][0].clone();
+    owner["hierarchy"] = json!([]);
+    owner["aliases"] = json!([]);
+    source["shards"][0]["payload"] = json!({
+        "kind": "declaration_facts", "types": [owner], "members": [], "relations": []
+    });
+    let mut packs = Vec::new();
+    for version in ["1.0.0", "2.0.0"] {
+        source["version"] = json!(version);
+        let authored: AuthoredSemanticModelPack = serde_json::from_value(source.clone()).unwrap();
+        packs.push(compile_pack(&authored, &CompilerOptions::default()).unwrap());
+    }
+    let (mut active, reader) = catalog_fixture_active(&packs, "jvm-owner-contracts");
+    Arc::get_mut(&mut active).unwrap().source_reader = Some(reader);
+    let directory = TempDir::new().unwrap();
+    let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+    let cancellation = CancellationToken::new();
+    let overlay = SemanticModelOverlay::build(&analyzer, &active, &cancellation, u64::MAX).unwrap();
+    let fqn = "com.acme.Widget";
+
+    let selected = overlay
+        .model_type_owner(
+            "java",
+            &TypeRef::Named {
+                name: fqn.into(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            &active.model_provider_selection(),
+            &cancellation,
+        )
+        .unwrap();
+    let ModelTypeOwnerAnswer::Ambiguous(owners) = selected else {
+        panic!("each selected provider stays a separate owner: {selected:?}");
+    };
+    let versions: BTreeSet<_> = owners
+        .iter()
+        .map(|owner| owner.provider.pack_version.as_str())
+        .collect();
+    assert_eq!(versions, BTreeSet::from(["1.0.0", "2.0.0"]));
+
+    // The JVM's folded lookup, reached through the shared authority trait.
+    let authority: &dyn crate::analyzer::store::resolution_operation::SelectedModelAuthority =
+        &overlay;
+    let folded = authority
+        .declared_jvm_owner(fqn)
+        .expect("the unselected view folds both versions into one owner (#7605)");
+    let first = owners
+        .iter()
+        .find(|owner| owner.provider.pack_version == "1.0.0")
+        .expect("version 1.0.0 is selected");
+    assert_eq!(&*folded.provider_id, first.provider.pack_digest.as_str());
+    assert_eq!(&*folded.owner_fqn, fqn);
+}
+
+#[test]
+fn relation_ranking_includes_other_origins_before_filtering() {
+    use crate::analyzer::semantic_model::{
+        AuthoredSemanticModelPack, CompilerOptions, compile_pack,
+    };
+    let mut source: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/semantic-model-packs/declarations-v1.json"
+    )))
+    .unwrap();
+    source["schema_version"] =
+        json!(crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION);
+    source["language"] = json!("rust");
+    source["ecosystem"] = json!("cargo");
+    source["compatibility"] = json!({});
+    let template = source["shards"][0]["payload"]["types"][0].clone();
+    let mut packs = Vec::new();
+    for name in ["first", "second"] {
+        source["pack_id"] = json!(format!("fixture.relation-{name}"));
+        let mut owner = template.clone();
+        owner["id"] = json!(name);
+        owner["name"] = json!(format!("example.{name}"));
+        owner["hierarchy"] = json!([]);
+        owner["aliases"] = json!([]);
+        source["shards"][0]["payload"] = json!({
+            "kind": "declaration_facts", "types": [owner], "members": [],
+            "relations": [{"id": "shared", "relation_kind": "navigates_to", "from": name, "to": name}]
+        });
+        let authored: AuthoredSemanticModelPack = serde_json::from_value(source.clone()).unwrap();
+        packs.push(compile_pack(&authored, &CompilerOptions::default()).unwrap());
+    }
+    let (active, reader) = catalog_fixture_active(&packs, "relation-origin-ranking");
+    let active = metadata_only_active(&active, &reader);
+    let directory = TempDir::new().unwrap();
+    let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Rust)));
+    let reads = composition::RowCompositionReads::new(&active, &reader, &[], &[]);
+    let origins = HashSet::from_iter(["first".to_owned()]);
+    let relations = reads.relations_for_origins(&analyzer, &origins).unwrap();
+    assert_eq!(relations.len(), 1);
+    assert_eq!(relations[0].from, "first");
+    assert!(
+        relations[0].provenance.ambiguous,
+        "same-id records from both origins must participate in ranking: {relations:?}"
     );
 }

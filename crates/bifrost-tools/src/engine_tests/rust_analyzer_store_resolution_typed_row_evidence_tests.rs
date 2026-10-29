@@ -279,4 +279,60 @@ mod rust_departing_row_evidence_tests_tests {
                 .is_empty()
         );
     }
+    #[test]
+    #[hardwon(
+        "#5658: Django call-result refinement sent a shared semantic reason to ordinary gap provenance"
+    )]
+    fn gap_reason_provenance_preserves_mixed_completion_reason_identities() {
+        use brokk_bifrost_analysis::analyzer::resolution::SharedNameInterner;
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
+        let fixture = SelectionFixture::shared_rust_source(
+            1,
+            "pub trait Service { fn run<T>(&self, value: T); } fn main() { missing(); }",
+        );
+        let selection = fixture.open_ready(&[]);
+        let source = SelectedResolutionTypedSource::new_on_demand(&selection);
+        let mut reasons = selection
+            .connection()
+            .prepare(
+                "SELECT gap.reason FROM temp.selected_resolution_mounts mount
+             JOIN resolution_gap_reasons gap ON gap.blob_id=mount.blob_id
+             WHERE mount.mount_ordinal=0 ORDER BY gap.reason",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, u32>(0))
+            .unwrap()
+            .map(|reason| SemanticId::local(0, reason.unwrap()))
+            .collect::<Vec<_>>();
+        let cancellation = CancellationToken::new();
+        let read = |reasons: &[SemanticId]| {
+            let mut rows = Vec::new();
+            let outcome = source
+                .visit_gap_reason_provenance_pages_for_reasons(
+                    TypedFactRequest::new(reasons),
+                    &cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        rows.extend_from_slice(page);
+                        Ok(true)
+                    }),
+                )
+                .unwrap();
+            (outcome, rows)
+        };
+        let expected = read(&reasons);
+        assert!(expected.0.is_exhausted());
+        assert!(
+            !expected.1.is_empty(),
+            "the persisted provenance reader must run"
+        );
+        let shared = SemanticId::shared_name(selection.shared_names().intern([59; 32]));
+        reasons.push(shared);
+        assert_eq!(read(&reasons), expected);
+        let (outcome, rows) = read(&[shared]);
+        assert!(outcome.is_exhausted());
+        assert!(
+            rows.is_empty(),
+            "shared completion reasons have no persisted gap provenance"
+        );
+    }
 }

@@ -48,10 +48,7 @@ impl WorkspaceConfigurationInput {
         ) {
             support.include_native_metadata_paths(project, files, inputs)?;
         }
-        if matches!(
-            language,
-            Language::Java | Language::Kotlin | Language::Scala
-        ) {
+        if super::resolution_operation::nominal_rules::jvm_package_rules().admits(language) {
             // The toolchain selector is read explicitly even when .bifrost is
             // excluded from the project's ordinary source listing.
             let toolchains = ProjectFile::new(
@@ -271,6 +268,35 @@ pub enum NativeConfigurationOverlayAuthority {
 }
 
 impl super::AnalyzerStore {
+    /// The canonical OwnModule identity already published with this file version.
+    pub fn selected_module_name(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        relative_path: &str,
+    ) -> Result<Option<String>> {
+        self.read_conn()?
+            .query_row(
+                "SELECT anchors.package_name FROM workspace_file_versions versions
+             JOIN workspace_file_anchor_rows anchors USING(file_version_id)
+             WHERE versions.workspace_id=?1 AND versions.lang=?2
+               AND versions.generation=?3 AND versions.rel_path=?4
+               AND versions.input_kind='source'
+               AND versions.valid_from<=?5
+               AND (versions.valid_until IS NULL OR ?5<versions.valid_until)
+               AND anchors.anchor_kind='own_module' AND anchors.anchor_pop=0",
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.lang,
+                    snapshot.generation.get(),
+                    relative_path,
+                    snapshot.revision
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Exact configuration bytes, including absence, selected by this revision.
     #[doc(hidden)]
     pub fn selected_configuration_source(

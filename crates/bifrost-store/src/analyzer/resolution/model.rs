@@ -45,37 +45,8 @@ pub enum BindingOrigin {
 
 /// Lower is stronger. Language-specific order is supplied here; path
 /// comparison remains shared and independent of language.
-pub(crate) const fn binding_origin_rank(language: Language, origin: BindingOrigin) -> Option<u32> {
-    use BindingOrigin as Origin;
-    match language {
-        Language::Scala => match origin {
-            Origin::LocalOrInherited | Origin::SameCompilationUnitPackage => Some(0),
-            Origin::ExplicitImport => Some(1),
-            Origin::WildcardImport | Origin::StarImport => Some(2),
-            Origin::OtherCompilationUnitPackage => Some(3),
-            Origin::RootPackage | Origin::DefaultImport => Some(4),
-            Origin::SingleTypeImport | Origin::OnDemandImport | Origin::SamePackage => None,
-        },
-        Language::Java => match origin {
-            Origin::DefaultImport => Some(4),
-            Origin::RootPackage => None,
-            Origin::LocalOrInherited => Some(0),
-            Origin::SingleTypeImport | Origin::ExplicitImport => Some(1),
-            Origin::SamePackage
-            | Origin::SameCompilationUnitPackage
-            | Origin::OtherCompilationUnitPackage => Some(2),
-            Origin::OnDemandImport | Origin::WildcardImport | Origin::StarImport => Some(3),
-        },
-        Language::Kotlin => match origin {
-            Origin::DefaultImport | Origin::RootPackage => Some(4),
-            Origin::LocalOrInherited => Some(0),
-            Origin::ExplicitImport => Some(1),
-            Origin::SamePackage | Origin::SameCompilationUnitPackage => Some(2),
-            Origin::WildcardImport | Origin::StarImport | Origin::OnDemandImport => Some(3),
-            Origin::OtherCompilationUnitPackage | Origin::SingleTypeImport => None,
-        },
-        _ => None,
-    }
+pub(crate) fn binding_origin_rank(language: Language, origin: BindingOrigin) -> Option<u32> {
+    super::precedence::precedence_rules(language).origin_rank(origin)
 }
 
 /// Which of the four spaces one runtime identity's payload lives in, read
@@ -1827,6 +1798,161 @@ impl ResolutionCompletionAccumulator {
     }
 }
 
+/// Exact request-local union. A single raw operand retains its public order and
+/// duplicates; two or more incomplete operands have canonical set semantics.
+/// Shared source bases stay shared, and no accumulated set is rebuilt per input.
+/// Discard the accumulator when inclusion is cancelled; no partial union is
+/// published. This is the streaming form of `combine_all_with_poll`.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ExactCompletionAccumulator {
+    pub(super) state: ExactCompletionState,
+}
+
+#[derive(Debug, Default)]
+pub(super) enum ExactCompletionState {
+    #[default]
+    Complete,
+    Single(Vec<ResolutionIncompleteReason>),
+    Union(BTreeSet<ResolutionIncompleteReason>),
+    Shared(CompletionReasonUnion),
+}
+
+impl ExactCompletionAccumulator {
+    #[doc(hidden)]
+    pub fn include<P>(&mut self, completion: &ResolutionCompletion, cancelled: &mut P) -> Option<()>
+    where
+        P: FnMut() -> bool,
+    {
+        if cancelled() {
+            return None;
+        }
+        let ResolutionCompletion::Incomplete(incoming) = completion else {
+            return Some(());
+        };
+        if let ExactCompletionState::Shared(reasons) = &mut self.state {
+            return reasons.include_with_poll(incoming, cancelled);
+        }
+        if incoming.is_shared() {
+            let mut reasons = CompletionReasonUnion::from_shared_with_poll(incoming, cancelled)?;
+            match std::mem::take(&mut self.state) {
+                ExactCompletionState::Complete => {}
+                ExactCompletionState::Single(previous) => {
+                    for reason in previous {
+                        reasons.include_reason_with_poll(reason, cancelled)?;
+                    }
+                }
+                ExactCompletionState::Union(previous) => {
+                    for reason in previous {
+                        reasons.include_reason_with_poll(reason, cancelled)?;
+                    }
+                }
+                ExactCompletionState::Shared(_) => unreachable!("shared union was handled above"),
+            }
+            self.state = ExactCompletionState::Shared(reasons);
+            return Some(());
+        }
+        let state = std::mem::take(&mut self.state);
+        self.state = match state {
+            ExactCompletionState::Complete => {
+                if cancelled() {
+                    return None;
+                }
+                let mut reasons = Vec::with_capacity(incoming.len());
+                for &reason in incoming.iter() {
+                    if cancelled() {
+                        return None;
+                    }
+                    reasons.push(reason);
+                }
+                ExactCompletionState::Single(reasons)
+            }
+            ExactCompletionState::Single(existing) => {
+                assert!(
+                    !existing.is_empty() || !incoming.is_empty(),
+                    "incomplete resolution requires a reason"
+                );
+                let mut reasons = BTreeSet::new();
+                for reason in existing {
+                    if cancelled() {
+                        return None;
+                    }
+                    reasons.insert(reason);
+                }
+                for &reason in incoming.iter() {
+                    if cancelled() {
+                        return None;
+                    }
+                    reasons.insert(reason);
+                }
+                ExactCompletionState::Union(reasons)
+            }
+            ExactCompletionState::Union(mut reasons) => {
+                for &reason in incoming.iter() {
+                    if cancelled() {
+                        return None;
+                    }
+                    reasons.insert(reason);
+                }
+                ExactCompletionState::Union(reasons)
+            }
+            ExactCompletionState::Shared(_) => {
+                unreachable!("shared completion operands use the factored union")
+            }
+        };
+        Some(())
+    }
+
+    pub(crate) fn include_reason<P>(
+        &mut self,
+        reason: ResolutionIncompleteReason,
+        cancelled: &mut P,
+    ) -> Option<()>
+    where
+        P: FnMut() -> bool,
+    {
+        self.include(
+            &ResolutionCompletion::Incomplete(vec![reason].into_boxed_slice().into()),
+            cancelled,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn finish<P>(self, cancelled: &mut P) -> Option<ResolutionCompletion>
+    where
+        P: FnMut() -> bool,
+    {
+        if cancelled() {
+            return None;
+        }
+        match self.state {
+            ExactCompletionState::Complete => Some(ResolutionCompletion::Complete),
+            ExactCompletionState::Shared(reasons) => reasons
+                .finish_with_poll(cancelled)
+                .map(ResolutionCompletion::Incomplete),
+            ExactCompletionState::Single(reasons) => Some(ResolutionCompletion::Incomplete(
+                reasons.into_boxed_slice().into(),
+            )),
+            ExactCompletionState::Union(mut reasons) => {
+                let mut canonical = Vec::with_capacity(reasons.len());
+                while let Some(reason) = reasons.pop_first() {
+                    if cancelled() {
+                        return None;
+                    }
+                    canonical.push(reason);
+                }
+                assert!(
+                    !canonical.is_empty(),
+                    "combining incomplete completions requires at least one reason"
+                );
+                Some(ResolutionCompletion::Incomplete(
+                    canonical.into_boxed_slice().into(),
+                ))
+            }
+        }
+    }
+}
+
 impl ResolutionCompletion {
     pub const fn kind(&self) -> ResolutionCompletionKind {
         match self {
@@ -1837,6 +1963,19 @@ impl ResolutionCompletion {
 
     pub fn incomplete(reasons: impl IntoIterator<Item = ResolutionIncompleteReason>) -> Self {
         Self::Incomplete(CompletionReasons::from_reasons(reasons))
+    }
+
+    /// Reduce a batch with exactly the semantics of folding `combine` from
+    /// `Complete`. Cancellation abandons the unpublished query-local union.
+    pub fn combine_all_with_poll<'a>(
+        completions: impl IntoIterator<Item = &'a Self>,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Option<Self> {
+        let mut union = ExactCompletionAccumulator::default();
+        for completion in completions {
+            union.include(completion, cancelled)?;
+        }
+        union.finish(cancelled)
     }
 
     pub fn combine(&self, other: &Self) -> Self {
@@ -2447,13 +2586,14 @@ fn value_obligation_completion(
     }
 }
 
-/// A request-local external frontier with no authoritative package clause or
-/// nominal type. A member lookup is a structured recipe, not an inventory row.
+/// A request-local external frontier with no selected source declarations or
+/// nominal type. Package identity and name may still be authoritative.
+/// A member lookup is a structured recipe, not an inventory row.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[doc(hidden)]
 pub struct UnindexedExternalFrontier {
     pub(crate) provider_path: std::sync::Arc<str>,
-    /// A nameless provider row is evidence, not package-name authority.
+    /// Provider identity is independent of source member coverage.
     pub(crate) provider_package_id: Option<i64>,
     pub(crate) member: Option<(BindingFragmentId, SemanticId)>,
 }
@@ -3992,6 +4132,101 @@ mod tests {
                 assert!(retained.is_shared());
                 assert_eq!(retained.clone_work_len(), 3);
             }
+        }
+    }
+
+    #[test]
+    #[hardwon("#7352: repeated pairwise completion unions rebuilt growing reason sets")]
+    fn completion_batch_matches_pairwise_shape_and_polls_cancellation() {
+        let a = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(b"a"));
+        let b = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::for_test(b"b"));
+        let raw = ResolutionCompletion::Incomplete(vec![b, a, b].into());
+        let shared = ResolutionCompletion::Incomplete(
+            CompletionReasons::from(vec![a, b])
+                .to_shared_with_poll(&mut || false)
+                .unwrap(),
+        );
+        let operands = [ResolutionCompletion::Complete, raw, shared];
+        for length in 0..=5_u32 {
+            for mut permutation in 0..3_usize.pow(length) {
+                let batch = (0..length)
+                    .map(|_| {
+                        let operand = &operands[permutation % 3];
+                        permutation /= 3;
+                        operand
+                    })
+                    .collect::<Vec<_>>();
+                let expected = batch
+                    .iter()
+                    .fold(ResolutionCompletion::Complete, |sum, value| {
+                        sum.combine(value)
+                    });
+                let mut polls = 0;
+                let actual =
+                    ResolutionCompletion::combine_all_with_poll(batch.iter().copied(), &mut || {
+                        polls += 1;
+                        false
+                    })
+                    .unwrap();
+                // Equality of the reason slices also checks raw duplicate/order shape.
+                assert_eq!(actual, expected);
+                for stop in 1..=polls {
+                    let mut seen = 0;
+                    assert!(
+                        ResolutionCompletion::combine_all_with_poll(
+                            batch.iter().copied(),
+                            &mut || {
+                                seen += 1;
+                                seen == stop
+                            }
+                        )
+                        .is_none()
+                    );
+                    assert_eq!(seen, stop);
+                }
+            }
+        }
+        let completions = (0..4_096_usize)
+            .map(|index| {
+                ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                    SemanticId::for_test(index.to_le_bytes()),
+                )])
+            })
+            .collect::<Vec<_>>();
+        let mut work = 0;
+        let combined = ResolutionCompletion::combine_all_with_poll(&completions, &mut || {
+            work += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(
+            combined,
+            ResolutionCompletion::incomplete(completions.iter().flat_map(|completion| {
+                let ResolutionCompletion::Incomplete(reasons) = completion else {
+                    unreachable!()
+                };
+                reasons.iter().copied()
+            }))
+        );
+        assert!(
+            work <= 4 * completions.len() + 8,
+            "batch union revisited accumulated reasons: {work}"
+        );
+        let empty = ResolutionCompletion::Incomplete(Vec::new().into());
+        for batch in [
+            vec![&empty],
+            vec![&empty, &operands[1]],
+            vec![&operands[1], &empty],
+        ] {
+            let expected = batch
+                .iter()
+                .fold(ResolutionCompletion::Complete, |sum, value| {
+                    sum.combine(value)
+                });
+            assert_eq!(
+                ResolutionCompletion::combine_all_with_poll(batch, &mut || false),
+                Some(expected)
+            );
         }
     }
 

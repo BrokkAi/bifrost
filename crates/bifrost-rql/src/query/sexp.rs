@@ -2034,6 +2034,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::Async
         | RqlForm::UnsafeContext
         | RqlForm::Modifier
+        | RqlForm::TypeKind
         | RqlForm::StringValueRegex
         | RqlForm::Not
         | RqlForm::All
@@ -2521,7 +2522,9 @@ fn decorator_binding_filter_to_json(
             .ok_or_else(|| {
                 lower_error(
                     &pair[0],
-                    format!("({head} ...) accepts only :module and :imported-name"),
+                    format!(
+                        "({head} ...) accepts only :module, :imported-name and :annotation-type"
+                    ),
                 )
             })?;
         let value = symbol_or_string(&pair[1])?;
@@ -2769,14 +2772,20 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
             expect_len(expr, items, 2, "async")?;
             insert_unique(&mut object, "async", Value::Bool(boolean_arg(&items[1])?)).at(expr)?;
         }
+        RqlForm::TypeKind => {
+            expect_len(expr, items, 2, "type-kind")?;
+            insert_unique(
+                &mut object,
+                "type_kind",
+                Value::String(symbol_or_string(&items[1])?),
+            )
+            .at(expr)?;
+        }
         RqlForm::Modifier => {
             expect_len(expr, items, 2, "modifier")?;
             let label = symbol_or_string(&items[1])?;
             if DeclarationModifier::from_label(&label).is_none() {
-                return Err(lower_error(
-                    &items[1],
-                    "modifier must be static or abstract",
-                ));
+                return Err(lower_error(&items[1], "unknown declaration modifier"));
             }
             insert_unique(&mut object, "modifier", Value::String(label)).at(expr)?;
         }
@@ -3292,10 +3301,14 @@ fn insert_keyword(
             RqlProperty::Async => {
                 insert_unique(object, "async", Value::Bool(boolean_arg(value)?)).at(key_expr)
             }
+            RqlProperty::TypeKind => {
+                insert_unique(object, "type_kind", Value::String(symbol_or_string(value)?))
+                    .at(key_expr)
+            }
             RqlProperty::Modifier => {
                 let label = symbol_or_string(value)?;
                 if DeclarationModifier::from_label(&label).is_none() {
-                    return Err(lower_error(value, ":modifier must be static or abstract"));
+                    return Err(lower_error(value, ":unknown declaration modifier"));
                 }
                 insert_unique(object, "modifier", Value::String(label)).at(key_expr)
             }

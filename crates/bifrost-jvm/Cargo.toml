@@ -19,7 +19,7 @@ exclude = [
 name = "brokk_bifrost_jvm"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3" }
 brokk-tree-sitter-kotlin = "=0.4.6"
 brokk-tree-sitter-scala = "=0.26.3"
 moka = { version = "0.12.11", features = ["sync"] }
@@ -34,6 +34,7 @@ tree-sitter = "0.25.10"
 # tree-sitter-php 0.23.11 and tree-sitter-ruby 0.23.1.
 tree-sitter-java = "0.23.5"
 tree-sitter-javadoc = "=0.3.1"
+workspace-hack.workspace = true
 
 [features]
 default = []
@@ -48,7 +49,7 @@ brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes core's test-support surface exist
 # while this crate's unit tests are built.
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3", features = ["test-support"] }
 
 [lints]
 workspace = true

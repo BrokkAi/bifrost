@@ -929,7 +929,9 @@ fn acquire_usage_ranking_graph_from_builder<E>(
             })
     };
     let workspace_content = ecosystem_content(analyzer);
-    if analyzer.read_ledger_attached() {
+    if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        analyzer.read_ledger_attached()
+    }) {
         // The graph spans whole languages; nothing narrower than the ecosystem
         // scope's content identity bounds what it answered.
         let languages = analyzer
@@ -2003,7 +2005,9 @@ fn referencing_files_for(
         .import_analysis_provider()
         .map(|provider| provider.referencing_files_of(file).into_iter().collect())
         .unwrap_or_default();
-    if analyzer.read_ledger_attached() {
+    if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        analyzer.read_ledger_attached()
+    }) {
         analyzer.record_read(
             brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::lookup(
                 brokk_bifrost_analysis::analyzer::read_ledger::LookupKind::Importers,
@@ -3386,8 +3390,6 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate;
 
-    use brokk_bifrost_go_analysis::analyzer::go::GoAnalyzer;
-
     use brokk_bifrost_core::analyzer::model::Language;
 
     use brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer;
@@ -3405,6 +3407,8 @@ mod tests {
     use brokk_bifrost_core::analyzer::project::TestProject;
 
     use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+    use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
     use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
@@ -3445,13 +3449,39 @@ func run() {
 "#,
             )
             .build();
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
         let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
-        let analyzer = GoAnalyzer::new(overlay.clone() as Arc<dyn Project>);
+        let mut config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
+        config.go.dependency_discovery.mode =
+            brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryMode::FullProduction;
+        let workspace =
+            brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun(
+                overlay.clone() as Arc<dyn Project>,
+                config.clone(),
+            )
+            .unwrap();
+        let discovery = workspace.resolve_dependency_discovery(
+            brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystem::Go,
+            &config,
+            &brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+        );
+        assert!(
+            discovery.complete,
+            "Go build selection failed: {discovery:#?}"
+        );
+        let analyzer = workspace.analyzer();
         let seed_weights = hash_map([(project.file("main.go"), 1.0)]);
         let selected_ecosystems = std::collections::BTreeSet::from([
             brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem::Go,
         ]);
-        let build = |analyzer: &GoAnalyzer| {
+        let build = |analyzer: &dyn IAnalyzer| {
             let scope = AnalyzerQueryScope::new(analyzer);
             crate::relevance::build_usage_ranking_graph_uncached(
                 analyzer,
@@ -3463,7 +3493,7 @@ func run() {
             )
         };
 
-        let initial = build(&analyzer);
+        let initial = build(analyzer);
         let crate::relevance::Cancellable::Complete(initial) = initial else {
             panic!("initial Go ranking graph must be complete");
         };
@@ -3478,12 +3508,12 @@ func run() {
             "module example.com/renamed\n\ngo 1.24\n".to_owned(),
         ));
         assert!(matches!(
-            build(&analyzer),
+            build(analyzer),
             crate::relevance::Cancellable::Incomplete(_)
         ));
 
         assert!(overlay.clear(&module.abs_path()));
-        let recovered = build(&analyzer);
+        let recovered = build(analyzer);
         let crate::relevance::Cancellable::Complete(recovered) = recovered else {
             panic!("clearing the module overlay must recover Go ranking");
         };

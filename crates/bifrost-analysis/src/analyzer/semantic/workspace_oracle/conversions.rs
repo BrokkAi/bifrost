@@ -177,6 +177,7 @@ impl WorkspaceSemanticOracle<'_> {
             // Java receivers do not consume an ordinary parameter slot. The
             // semantic binder retains their separate receiver evidence.
             let mut report = call_binding_report(
+                analyzer,
                 file,
                 &shape,
                 CallBindingTarget::Resolved {
@@ -184,6 +185,7 @@ impl WorkspaceSemanticOracle<'_> {
                     layout,
                     receiver: CallReceiverBinding::Absent,
                 },
+                Some(request.cancellation),
             );
             CallConversionCache::default().populate(
                 analyzer,

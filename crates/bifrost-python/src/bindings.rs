@@ -573,7 +573,10 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                 comprehensions: Vec::new(),
             },
         };
-        let body = if callable.kind() == "module" {
+        // Recovery can replace the module grammar node with an ERROR root.
+        // Its declarations still belong to the source file's module scope.
+        let module_scope = callable.parent().is_none();
+        let body = if module_scope {
             callable
         } else if let Some(body) = callable.child_by_field_name("body") {
             body
@@ -608,7 +611,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
 
             match node.kind() {
                 "global_statement" => {
-                    if callable.kind() == "module" {
+                    if module_scope {
                         continue;
                     }
                     collect_direct_identifier_names(node, source, &mut scope_step, |name| {

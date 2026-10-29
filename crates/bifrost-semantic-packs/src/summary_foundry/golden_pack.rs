@@ -843,6 +843,8 @@ fn build_pack(
             id: format!("declarations.{}", realm.ecosystem),
             activation: realm_activation(realm),
             payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
                 types: declarations.types,
                 members: declarations.members,
                 relations: declarations.relations,

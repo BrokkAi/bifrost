@@ -211,9 +211,7 @@ impl<'a> RubySemanticIndex<'a> {
         max_files: usize,
     ) -> Option<HashSet<ProjectFile>> {
         let mut visible = HashSet::default();
-        visible.insert(file.clone());
-        let mut stack =
-            crate::imports::ruby_required_files_checked(self.ruby, self.graph.token, file)?;
+        let mut stack = vec![file.clone()];
         while let Some(next) = stack.pop() {
             if !visible.insert(next.clone()) {
                 continue;
@@ -574,18 +572,6 @@ impl<'a> RubySemanticIndex<'a> {
             .ancestors
     }
 
-    /// The mixins `owner` composes in through `kind`, in the order the method
-    /// lookup considers them.
-    pub fn mixin_owners_of(
-        &self,
-        support: &dyn BoundedDefinitionLookup,
-        visible_files: &[ProjectFile],
-        owner: &str,
-        kind: TypeRelationKind,
-    ) -> Vec<String> {
-        self.mixin_owners(support, visible_files, owner, kind)
-    }
-
     /// The class or module declaration `owner` names, as the lookup resolves
     /// it: an indexed class or module of that exact fq name, visible from the
     /// referencing file.
@@ -686,14 +672,19 @@ impl<'a> RubySemanticIndex<'a> {
         if let Some(cached) = self.forward_owner_facts.borrow().get(owner) {
             return cached.clone();
         }
-        let Some(owner_unit) = self.owner_unit(support, visible_files, owner) else {
-            self.forward_owner_facts
-                .borrow_mut()
-                .insert(owner.to_string(), RubyForwardOwnerFacts::default());
-            return RubyForwardOwnerFacts::default();
-        };
-
-        let specs = ruby_forward_mixin_specs(self.ruby, &owner_unit);
+        let owner_units = support
+            .fqn(owner)
+            .into_iter()
+            .filter(|unit| {
+                (unit.is_class() || unit.is_module())
+                    && unit.fq_name() == owner
+                    && visible_files.contains(unit.source())
+            })
+            .collect::<Vec<_>>();
+        let specs = owner_units
+            .iter()
+            .flat_map(|unit| ruby_forward_mixin_specs(self.ruby, unit))
+            .collect::<Vec<_>>();
         let mixin_names: HashSet<String> =
             specs.iter().map(|spec| spec.raw_target.clone()).collect();
         let mut facts = RubyForwardOwnerFacts::default();
@@ -710,7 +701,10 @@ impl<'a> RubySemanticIndex<'a> {
                 _ => {}
             }
         }
-        for raw in ruby_forward_superclass_targets(self.ruby, &owner_unit) {
+        for raw in owner_units
+            .iter()
+            .flat_map(|unit| ruby_forward_superclass_targets(self.ruby, unit))
+        {
             if mixin_names.contains(&raw) {
                 continue;
             }
@@ -730,7 +724,41 @@ impl<'a> RubySemanticIndex<'a> {
         facts
     }
 
-    fn resolve_forward_owner_name(
+    /// The `include`/`prepend`/`extend` targets every visible declaration of
+    /// `owner` writes, each resolved from that owner's own forward facts the
+    /// way method lookup resolves them. `None` when any written mixin does not
+    /// resolve to exactly one visible class or module. Unlike the analyzer's
+    /// workspace mixin graph, this reads only `owner`'s declarations, so a
+    /// warm per-call query stays bounded by the ancestry it asks about.
+    pub fn forward_mixin_targets(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        owner: &str,
+    ) -> Option<Vec<String>> {
+        let mut owner_units = support
+            .fqn(owner)
+            .into_iter()
+            .filter(|unit| {
+                (unit.is_class() || unit.is_module())
+                    && unit.fq_name() == owner
+                    && visible_files.contains(unit.source())
+            })
+            .collect::<Vec<_>>();
+        owner_units.sort();
+        owner_units.dedup();
+        owner_units
+            .iter()
+            .flat_map(|unit| ruby_forward_mixin_specs(self.ruby, unit))
+            .map(|spec| {
+                self.resolve_forward_owner_name(support, visible_files, owner, &spec.raw_target)
+            })
+            .collect()
+    }
+
+    /// Resolve one superclass or mixin name `lexical_owner` writes, among the
+    /// visible files, the way method lookup resolves it.
+    pub fn resolve_forward_owner_name(
         &self,
         support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
@@ -751,19 +779,23 @@ impl<'a> RubySemanticIndex<'a> {
                 (unit.is_class() || unit.is_module()) && visible_files.contains(unit.source())
             });
             matches.sort();
-            matches.dedup();
+            matches.dedup_by(|left, right| left.fq_name() == right.fq_name());
             if matches.len() == 1 {
                 return Some(matches.remove(0).fq_name());
             }
         }
 
+        // A missing qualified prefix cannot nominate an unrelated same-leaf type.
+        if raw.contains('$') {
+            return None;
+        }
         let identifier = raw.rsplit('$').next().unwrap_or(raw); // fqname-M4: leaf of a `$`-joined reference string (no CodeUnit here)
         let mut matches = support.file_identifier_in_files(visible_files, identifier);
         matches.retain(|unit| {
             (unit.is_class() || unit.is_module()) && unit.identifier() == identifier
         });
-        matches.sort();
-        matches.dedup();
+        matches.sort_by_key(CodeUnit::fq_name);
+        matches.dedup_by(|left, right| left.fq_name() == right.fq_name());
         (matches.len() == 1).then(|| matches.remove(0).fq_name())
     }
 }
@@ -869,34 +901,24 @@ fn constant_lookup_candidates(
         return None;
     }
 
+    let (constant_name, owner_segments) = segments.split_last().expect("nonempty path");
     let name = segments.join("$");
     let mut candidates = Vec::new();
     if !absolute {
         for owner in lexical_stack.iter().rev() {
             candidates.push(format!("{owner}${name}"));
+            let field_owner = if owner_segments.is_empty() {
+                owner.clone()
+            } else {
+                format!("{owner}${}", owner_segments.join("$"))
+            };
+            candidates.push(format!("{field_owner}.{constant_name}"));
         }
     }
     candidates.push(name);
-
-    let Some((constant_name, owner_segments)) = segments.split_last() else {
-        return Some(candidates);
-    };
-    if owner_segments.is_empty() {
-        if !absolute {
-            for owner in lexical_stack.iter().rev() {
-                candidates.push(format!("{owner}.{constant_name}"));
-            }
-        }
-        return Some(candidates);
+    if !owner_segments.is_empty() {
+        candidates.push(format!("{}.{constant_name}", owner_segments.join("$")));
     }
-
-    let owner_name = owner_segments.join("$");
-    if !absolute {
-        for owner in lexical_stack.iter().rev() {
-            candidates.push(format!("{owner}${owner_name}.{constant_name}"));
-        }
-    }
-    candidates.push(format!("{owner_name}.{constant_name}"));
 
     Some(candidates)
 }
@@ -919,8 +941,476 @@ pub fn resolve_constant_reference(
     if !matches!(node.kind(), "constant" | "scope_resolution") || is_declaration_constant(node) {
         return None;
     }
+    let mut current = node;
+    let mut in_superclass = false;
+    let mut type_scopes = 0;
+    while let Some(parent) = current.parent() {
+        in_superclass |= parent.kind() == "superclass";
+        if matches!(parent.kind(), "class" | "module") {
+            type_scopes += 1;
+        }
+        current = parent;
+    }
+    // Both graph walks visit the superclass before entering the class and
+    // again during ordinary descent. The superclass belongs to the outer cref.
+    let lexical_stack = if in_superclass && lexical_stack.len() == type_scopes {
+        &lexical_stack[..lexical_stack.len() - 1]
+    } else {
+        lexical_stack
+    };
     Some(RubyConstantReference {
         unit: semantic.resolve_constant(file, visible_files, lexical_stack, node, source)?,
         is_autoload_symbol: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::capabilities::{
+        ImportAnalysisProvider, TypeHierarchyProvider,
+    };
+    use brokk_bifrost_core::analyzer::model::Range;
+    use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+    use brokk_bifrost_core::analyzer::project::Project;
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+    use brokk_bifrost_core::analyzer::ruby_facts::RubyFileSourceInfo;
+    use brokk_bifrost_core::analyzer::{CodeUnitIndex, Language};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    // The parser and the persisted relation reader evolve independently. The
+    // fixture reads the actual parser projection, including reopenings; unused
+    // services panic so a new dependency cannot silently pass with fake data.
+    #[derive(Default)]
+    struct Fixture {
+        files: Vec<(ProjectFile, ParsedFile)>,
+        autoload: HashMap<String, HashSet<ProjectFile>>,
+        empty: HashSet<ProjectFile>,
+        types: HashMap<String, Vec<CodeUnit>>,
+    }
+
+    impl Fixture {
+        fn add(&mut self, name: &str, source: &str) -> ProjectFile {
+            let file = ProjectFile::new(std::env::temp_dir().join("ruby-resolution"), name);
+            let tree = crate::declarations::parse_ruby_tree(source).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let parsed = crate::adapter::parse_ruby_file(&file, source, &tree);
+            for unit in parsed
+                .declarations()
+                .iter()
+                .filter(|unit| unit.is_class() || unit.is_module())
+            {
+                self.types
+                    .entry(unit.identifier().into())
+                    .or_default()
+                    .push(unit.clone());
+            }
+            self.files.push((file.clone(), parsed));
+            file
+        }
+        fn parsed(&self, file: &ProjectFile) -> &ParsedFile {
+            &self.files.iter().find(|(path, _)| path == file).unwrap().1
+        }
+    }
+
+    impl CodeUnitIndex for Fixture {
+        fn project(&self) -> &dyn Project {
+            unimplemented!()
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            [Language::Ruby].into_iter().collect()
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(
+                self.files
+                    .iter()
+                    .flat_map(|(_, parsed)| parsed.declarations().iter().cloned()),
+            )
+        }
+        fn definitions(&self, name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            let name = name.to_string();
+            Box::new(
+                self.all_declarations()
+                    .filter(move |unit| unit.fq_name() == name),
+            )
+        }
+        fn parent_of(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+            self.parsed(unit.source())
+                .children
+                .iter()
+                .find(|(_, children)| children.contains(unit))
+                .map(|(owner, _)| owner.clone())
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+            None
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            None
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+    impl TypeHierarchyProvider for Fixture {
+        fn get_direct_ancestors(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+            crate::hierarchy::ruby_direct_ancestors(self, unit)
+        }
+        fn get_direct_descendants(&self, _: &CodeUnit) -> HashSet<CodeUnit> {
+            unimplemented!()
+        }
+    }
+    impl ImportAnalysisProvider for Fixture {
+        fn imported_code_units_of(&self, _: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+            unimplemented!()
+        }
+        fn referencing_files_of(&self, _: &ProjectFile) -> HashSet<ProjectFile> {
+            unimplemented!()
+        }
+    }
+    impl RubySource for Fixture {
+        fn all_files(&self) -> Vec<ProjectFile> {
+            self.files.iter().map(|(file, _)| file.clone()).collect()
+        }
+        fn source_files(&self) -> Option<Vec<ProjectFile>> {
+            Some(self.all_files())
+        }
+        fn source_facts(&self, _: &ProjectFile) -> Option<RubyFileSourceInfo> {
+            Some(RubyFileSourceInfo {
+                loads: Vec::new(),
+                source_bytes: 0,
+                has_parse_errors: false,
+                runtime_boundary: None,
+            })
+        }
+        fn autoload_constant_files(&self) -> Option<&HashMap<String, HashSet<ProjectFile>>> {
+            Some(&self.autoload)
+        }
+        fn has_zeitwerk_autoload_conventions(&self) -> bool {
+            false
+        }
+        fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile> {
+            &self.empty
+        }
+        fn zeitwerk_consumer_files(&self) -> &HashSet<ProjectFile> {
+            &self.empty
+        }
+        fn zeitwerk_autoload_code_units(&self) -> &HashSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+            unimplemented!()
+        }
+        fn mixin_relations(&self) -> &[brokk_bifrost_core::analyzer::type_relations::TypeRelation] {
+            unimplemented!()
+        }
+        fn semantic_facts(&self) -> &crate::graph_support::RubySemanticFacts {
+            unimplemented!()
+        }
+        fn types_by_identifier(&self) -> &HashMap<String, Vec<CodeUnit>> {
+            &self.types
+        }
+        fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
+            self.parsed(unit.source())
+                .ruby_method_dispatch_modes
+                .get(unit)
+                .copied()
+                .unwrap_or(RubyMethodDispatchMode::Instance)
+        }
+        fn forward_owner_relation_facts(
+            &self,
+            unit: &CodeUnit,
+        ) -> Vec<crate::mixins::RubyOwnerRelationFact> {
+            let parsed = self.parsed(unit.source());
+            parsed
+                .raw_supertypes
+                .get(unit)
+                .into_iter()
+                .flatten()
+                .zip(
+                    parsed
+                        .supertype_lookup_paths
+                        .get(unit)
+                        .into_iter()
+                        .flatten(),
+                )
+                .filter_map(|(raw, encoded)| crate::mixins::decode_owner_relation(encoded, raw))
+                .collect()
+        }
+    }
+    impl BoundedDefinitionLookup for Fixture {
+        fn fqn(&self, name: &str) -> Vec<CodeUnit> {
+            self.definitions(name).collect()
+        }
+        fn fqn_in_language(&self, name: &str, _: Language) -> Vec<CodeUnit> {
+            self.fqn(name)
+        }
+        fn file_identifier(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+            self.parsed(file)
+                .declarations()
+                .iter()
+                .filter(|unit| unit.identifier() == name)
+                .cloned()
+                .collect()
+        }
+        fn members_for_owner_name(&self, owner: &str, _: &str, name: &str) -> Vec<CodeUnit> {
+            self.fqn(&format!("{owner}.{name}"))
+        }
+        fn fqn_direct_children(&self, _: &str) -> Vec<CodeUnit> {
+            unimplemented!()
+        }
+        fn package_exists(&self, _: &str) -> bool {
+            unimplemented!()
+        }
+        fn package_exists_in_language(&self, _: &str, _: Language) -> bool {
+            unimplemented!()
+        }
+        fn fqn_prefix_exists(&self, _: &str) -> bool {
+            unimplemented!()
+        }
+    }
+
+    // No storage is involved in this grammar/reader fixture. The scope still
+    // bounds the lifetime of every graph view, like the production scope.
+    impl QueryScope for Fixture {}
+
+    fn with_semantic(fixture: &Fixture, read: impl FnOnce(&RubySemanticIndex<'_>)) {
+        let definitions =
+            |consumer: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| consumer(fixture);
+        let graph = RubyGraphSource {
+            token: fixture.token(),
+            index: fixture,
+            definitions: &definitions,
+        };
+        read(&RubySemanticIndex::build_for_lookup(graph, fixture));
+    }
+
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: lexical scalar constants must precede root classes"
+    )]
+    fn lexical_constant_and_qualified_prefix_resolution() {
+        let mut fixture = Fixture::default();
+        let file = fixture.add(
+            "names.rb",
+            "class Token; end; module Outer; Token = 7; end; module Left; class Same; end; end",
+        );
+        with_semantic(&fixture, |semantic| {
+            let visible = [file.clone()].into_iter().collect();
+            assert_eq!(
+                semantic
+                    .resolve_constant_name(&file, &visible, &["Outer".into()], "Token")
+                    .unwrap()
+                    .fq_name(),
+                "Outer.Token"
+            );
+            let tree = crate::declarations::parse_ruby_tree("::Token").unwrap();
+            assert_eq!(
+                semantic
+                    .resolve_constant(
+                        &file,
+                        &visible,
+                        &["Outer".into()],
+                        tree.root_node().named_child(0).unwrap(),
+                        "::Token"
+                    )
+                    .unwrap()
+                    .fq_name(),
+                "Token"
+            );
+            assert_eq!(
+                semantic.resolve_forward_owner_name(&fixture, &[file], "Client", "Missing$Same"),
+                None
+            );
+            assert_eq!(
+                crate::hierarchy::ruby_resolve_supertype(&fixture, "Missing$Same"),
+                None
+            );
+        });
+    }
+
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: superclass usages must not resolve again inside the new class scope"
+    )]
+    fn superclass_reference_uses_enclosing_scope_only() {
+        let source = "module Outer; class Base; end; class Child < Base; class Base; end; end; end";
+        let mut fixture = Fixture::default();
+        let file = fixture.add("superclass.rb", source);
+        with_semantic(&fixture, |semantic| {
+            let visible = [file.clone()].into_iter().collect();
+            let tree = crate::declarations::parse_ruby_tree(source).unwrap();
+            let mut stack = vec![tree.root_node()];
+            let mut visited = 0;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "class" && node.child_by_field_name("superclass").is_some() {
+                    crate::graph::syntax::for_each_ruby_superclass_constant(node, |constant| {
+                        if constant.kind() == "constant" {
+                            visited += 1;
+                            for lexical in [
+                                vec!["Outer".into()],
+                                vec!["Outer".into(), "Outer$Child".into()],
+                            ] {
+                                assert_eq!(
+                                    resolve_constant_reference(
+                                        semantic, &file, &visible, &lexical, constant, source
+                                    )
+                                    .unwrap()
+                                    .unit
+                                    .fq_name(),
+                                    "Outer$Base"
+                                );
+                            }
+                        }
+                    });
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(index).unwrap());
+                }
+            }
+            assert_eq!(visited, 1);
+        });
+    }
+
+    #[test]
+    #[ignore = "finds real bug: persisted superclass facts lose absolute and lexical context, so ::Base and a nested Base resolve alike"]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: absolute and relative superclasses must retain distinct facts"
+    )]
+    fn superclass_facts_preserve_absolute_lookup() {
+        let mut fixture = Fixture::default();
+        fixture.add("parents.rb", "class Base; end; module Outer; class Base; end; class Relative < Base; end; class Absolute < ::Base; end; end");
+        with_semantic(&fixture, |semantic| {
+            let files = fixture.all_files();
+            assert_eq!(
+                semantic.forward_ancestor_lookup_order(&fixture, &files, "Outer$Relative"),
+                ["Outer$Base"]
+            );
+            assert_eq!(
+                semantic.forward_ancestor_lookup_order(&fixture, &files, "Outer$Absolute"),
+                ["Base"]
+            );
+        });
+    }
+
+    #[test]
+    fn project_local_visibility_excludes_autoload() {
+        let mut fixture = Fixture::default();
+        let file = fixture.add("consumer.rb", "module Widget; end");
+        let lazy = fixture.add("lazy.rb", "module Widget; class Lazy; end; end");
+        fixture
+            .autoload
+            .insert("Widget$Lazy".into(), [lazy].into_iter().collect());
+        with_semantic(&fixture, |semantic| {
+            let tree = crate::declarations::parse_ruby_tree("Widget::Lazy").unwrap();
+            let node = tree.root_node().named_child(0).unwrap();
+            let visible = [file.clone()].into_iter().collect();
+            assert!(
+                semantic
+                    .resolve_constant(&file, &visible, &[], node, "Widget::Lazy")
+                    .is_some()
+            );
+            assert!(
+                semantic
+                    .resolve_project_local_constant(&file, &visible, &[], node, "Widget::Lazy")
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: same-FQN reopenings share owner identity and relations"
+    )]
+    fn reopening_relation_reader_and_dispatch() {
+        let mut fixture = Fixture::default();
+        let first = fixture.add(
+            "first.rb",
+            "module M; def first; end; end; class Client; include M; end",
+        );
+        fixture.add(
+            "second.rb",
+            "module Helper; def extra; end; end; module M; include Helper; def second; end; end",
+        );
+        with_semantic(&fixture, |semantic| {
+            let files = fixture.all_files();
+            assert_eq!(
+                semantic.resolve_forward_owner_name(&fixture, &files, "Client", "M"),
+                Some("M".into())
+            );
+            let visible = files.into_iter().collect();
+            let receiver = ReceiverType {
+                owner_fq_name: "Client".into(),
+                mode: ReceiverMode::Instance,
+            };
+            for (member, owner) in [("first", "M"), ("second", "M"), ("extra", "Helper")] {
+                let mut find = None;
+                let lookup_receiver = if member == "extra" {
+                    ReceiverType {
+                        owner_fq_name: "M".into(),
+                        mode: ReceiverMode::Instance,
+                    }
+                } else {
+                    receiver.clone()
+                };
+                let found = semantic.resolve_bare_method_candidates_traced(
+                    &fixture,
+                    &visible,
+                    &lookup_receiver,
+                    member,
+                    &mut find,
+                );
+                assert_eq!(
+                    found.iter().map(CodeUnit::fq_name).collect::<Vec<_>>(),
+                    [format!("{owner}.{member}")]
+                );
+                assert_eq!(find.unwrap().owner, owner);
+            }
+            let target = fixture.fqn("M").pop().unwrap();
+            let spec = RubyTargetSpec::from_target(&semantic.graph, &fixture, &target).unwrap();
+            let for_target = RubySemanticIndex::build(semantic.graph, &fixture, &spec);
+            for unit in fixture.fqn("M") {
+                assert!(for_target.target_matches_constant(&unit));
+            }
+            assert!(
+                semantic.declares_constant_anywhere(
+                    &[],
+                    crate::declarations::parse_ruby_tree("M")
+                        .unwrap()
+                        .root_node()
+                        .named_child(0)
+                        .unwrap(),
+                    "M"
+                )
+            );
+            assert!(
+                !semantic.declares_constant_anywhere(
+                    &[],
+                    crate::declarations::parse_ruby_tree("NeverDefined")
+                        .unwrap()
+                        .root_node()
+                        .named_child(0)
+                        .unwrap(),
+                    "NeverDefined"
+                )
+            );
+            assert!(semantic.visible_files_from_bounded(&first, 1).is_some());
+            assert!(semantic.visible_files_from_bounded(&first, 0).is_none());
+        });
+    }
 }

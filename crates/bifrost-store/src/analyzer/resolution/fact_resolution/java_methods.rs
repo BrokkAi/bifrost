@@ -355,7 +355,9 @@ impl FactEvaluation<'_, '_> {
                 supertypes
                     .iter()
                     .map(|row| row.get(self.session).row())
-                    .filter(|row| row.kind() == ResolutionSupertypeKind::ImplicitSuperclass)
+                    .filter(|row| {
+                        row.source_kind() == Some(ResolutionSupertypeKind::ImplicitSuperclass)
+                    })
                     .map(|row| row.reference()),
             );
         }
@@ -1578,9 +1580,9 @@ impl FactEvaluation<'_, '_> {
             for row in rows {
                 let (kind, frontier) = {
                     let row = row.get(self.session).row();
-                    (row.kind(), row.frontier())
+                    (row.source_kind(), row.frontier())
                 };
-                if kind == ResolutionSupertypeKind::SelfType {
+                if kind == Some(ResolutionSupertypeKind::SelfType) {
                     continue;
                 }
                 self.demand_slot(frontier);
@@ -1595,7 +1597,7 @@ impl FactEvaluation<'_, '_> {
                 });
                 match resolved {
                     Some(supertype) => pending.push(supertype),
-                    None if kind == ResolutionSupertypeKind::ImplicitSuperclass => {}
+                    None if kind == Some(ResolutionSupertypeKind::ImplicitSuperclass) => {}
                     None => known = false,
                 }
             }

@@ -105,6 +105,10 @@ mod jvm_registry_tests {
             "class Sample { volatile boolean ready; int f() { if (ready == true) return 1; else if (ready == true) return 2; return 0; } }",
         );
         assert!(
+            !verdicts(&volatile_boolean, BranchRelationKind::RepeatedCondition).is_empty(),
+            "{volatile_boolean:#?}"
+        );
+        assert!(
             verdicts(&volatile_boolean, BranchRelationKind::RepeatedCondition)
                 .iter()
                 .all(|verdict| matches!(verdict, BranchRelationVerdict::Open(_))),

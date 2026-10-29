@@ -25,6 +25,7 @@ use crate::graph::resolver::{
 };
 use crate::graph_support::CppSource;
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
+use crate::template_heads::cpp_out_of_line_owner_names;
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableLinkage, Range, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -1271,8 +1272,14 @@ fn cpp_single_owner_context(
         if qualified.names.len() != 1 || qualified.names != fact.written_owner {
             return None;
         }
+        // A specialization member names its specialization (`Box<T*>`), not
+        // the primary the bare written name would confirm.
+        let owner = match cpp_out_of_line_owner_names(callable, source) {
+            Some(mut names) if names.len() == 1 => names.pop()?,
+            _ => qualified.names.into_iter().next()?,
+        };
         let proof = CppSingleOwnerContext {
-            owner: qualified.names.into_iter().next()?,
+            owner,
             global: qualified.global,
             lexical: scopes.enclosing_namespace_components(selected, source),
         };

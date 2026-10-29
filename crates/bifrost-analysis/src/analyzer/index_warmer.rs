@@ -36,7 +36,10 @@ struct IndexWarmerState {
 }
 
 fn spawn_index_warm(task: impl FnOnce() + Send + 'static) {
-    spawn_on_dedicated_build_pool(task);
+    spawn_on_dedicated_build_pool(move || {
+        let _attribution = crate::analyzer::ReadAttribution::broadcast().install();
+        task();
+    });
 }
 
 impl IndexWarmer {
@@ -99,9 +102,11 @@ impl IndexWarmer {
                     // (`BIFROST_PARALLELISM=1`). Joined branches instead run
                     // on the workers there are, concurrently when the pool has
                     // several and one after the other when it has one.
+                    let context =
+                        brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
                     rayon::join(
-                        || current.warm_structural_indexes(),
-                        || current.warm_query_indexes(),
+                        || context.run(|| current.warm_structural_indexes()),
+                        || context.run(|| current.warm_query_indexes()),
                     );
                 }));
                 // Release the snapshot before publishing idle. On Windows,

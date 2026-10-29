@@ -192,25 +192,46 @@ impl AttributedResolutionCompletion {
     }
 
     #[doc(hidden)]
+    pub fn completion_with_poll(
+        &self,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Option<ResolutionCompletion> {
+        self.completion_for_with_poll(|_| true, cancelled)
+    }
+
+    #[doc(hidden)]
     pub fn completion_for(
         &self,
         include: impl Fn(&ReverseObligation) -> bool,
     ) -> ResolutionCompletion {
-        let discharged = self
-            .discharges
-            .iter()
-            .map(|row| {
-                self.assert_obligation(&row.obligation);
-                row.obligation.ordinal
-            })
-            .collect::<HashSet<_>>();
-        self.obligations
-            .iter()
-            .enumerate()
-            .filter(|(index, row)| !discharged.contains(index) && include(row))
-            .fold(ResolutionCompletion::Complete, |completion, (_, row)| {
-                completion.combine(&row.completion)
-            })
+        self.completion_for_with_poll(include, &mut || false)
+            .expect("non-cancellable obligation reduction cannot abort")
+    }
+
+    #[doc(hidden)]
+    pub fn completion_for_with_poll(
+        &self,
+        include: impl Fn(&ReverseObligation) -> bool,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Option<ResolutionCompletion> {
+        let mut discharged = HashSet::default();
+        for row in &self.discharges {
+            if cancelled() {
+                return None;
+            }
+            self.assert_obligation(&row.obligation);
+            discharged.insert(row.obligation.ordinal);
+        }
+        let mut union = crate::analyzer::resolution::model::ExactCompletionAccumulator::default();
+        for (index, row) in self.obligations.iter().enumerate() {
+            if cancelled() {
+                return None;
+            }
+            if !discharged.contains(&index) && include(row) {
+                union.include(&row.completion, cancelled)?;
+            }
+        }
+        union.finish(cancelled)
     }
 }
 
@@ -1530,21 +1551,27 @@ pub(crate) fn translate_reverse_proof<C: Eq + std::hash::Hash>(
 pub(crate) fn reverse_completion_for_obligations(
     evidence: &ReverseEvidence,
     handles: &[ReverseObligationId],
-) -> ResolutionCompletion {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Option<ResolutionCompletion> {
+    let mut selected = HashSet::default();
     for handle in handles {
+        if cancelled() {
+            return None;
+        }
         match handle.axis {
             ReverseEvidenceAxis::Enumeration => &evidence.enumeration,
             ReverseEvidenceAxis::Binding => &evidence.binding,
             ReverseEvidenceAxis::Metadata => &evidence.metadata,
         }
         .assert_obligation(handle);
+        selected.insert(handle);
     }
-    let handles = handles.iter().collect::<HashSet<_>>();
-    [&evidence.enumeration, &evidence.binding, &evidence.metadata]
-        .into_iter()
-        .fold(ResolutionCompletion::Complete, |completion, axis| {
-            completion.combine(&axis.completion_for(|row| handles.contains(&row.id)))
-        })
+    let mut completions = Vec::new();
+    for axis in [&evidence.enumeration, &evidence.binding, &evidence.metadata] {
+        completions
+            .push(axis.completion_for_with_poll(|row| selected.contains(&row.id), cancelled)?);
+    }
+    ResolutionCompletion::combine_all_with_poll(&completions, cancelled)
 }
 
 /// Render only request evidence; language-specific names are supplied by its hook.

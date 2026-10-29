@@ -1,4 +1,5 @@
 use super::source_admission::{AdmissionStop, SourceAdmissionPolicy, SourceAdmissionRefusal};
+use crate::analyzer::read_ledger::reason as derivation_reason;
 use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 // The traversal primitives and the two byte-range readers below them are pure
 // tree-sitter node arithmetic, so they live in `brokk-bifrost-core` and are
@@ -555,9 +556,15 @@ pub fn parse_complete_file_with_tree_ranges<A: LanguageAdapter + ?Sized>(
         BoundedParse::Complete(tree) => tree,
         incomplete => return incomplete,
     };
-    if proof
-        && let Err(stop) =
-            super::source_admission::validate_tree(adapter, source, &tree, cancellation, deadline)
+    if proof.any()
+        && let Err(stop) = super::source_admission::validate_tree(
+            proof,
+            adapter,
+            source,
+            &tree,
+            cancellation,
+            deadline,
+        )
     {
         return admission_stop(stop);
     }
@@ -582,8 +589,9 @@ pub fn parse_complete_file_with_tree_ranges<A: LanguageAdapter + ?Sized>(
     }
     match parse_complete_file_bounded(parser, source, cancellation, deadline) {
         BoundedParse::Complete(tree) => {
-            if proof
+            if proof.any()
                 && let Err(stop) = super::source_admission::validate_tree(
+                    proof,
                     adapter,
                     source,
                     &tree,
@@ -654,7 +662,8 @@ pub fn parse_admitted_source_with_policy<A: LanguageAdapter + ?Sized>(
     }
     match policy.requires_proof(adapter, source) {
         Err(reason) => BoundedParse::Refused(reason),
-        Ok(true) => match super::source_admission::validate_tree(
+        Ok(proof) if proof.any() => match super::source_admission::validate_tree(
+            proof,
             adapter,
             source,
             &tree,
@@ -664,7 +673,7 @@ pub fn parse_admitted_source_with_policy<A: LanguageAdapter + ?Sized>(
             Ok(()) => BoundedParse::Complete(tree),
             Err(stop) => admission_stop(stop),
         },
-        Ok(false) => BoundedParse::Complete(tree),
+        Ok(_) => BoundedParse::Complete(tree),
     }
 }
 
@@ -1321,6 +1330,15 @@ pub trait LanguageAdapter:
         None
     }
 
+    /// Grammar node kinds whose bytes are string, comment or text payload and
+    /// may contain a raw NUL. Shared source admission requires the smallest
+    /// node covering each NUL to have one of these kinds, with no error or
+    /// missing node around it. Empty, the default, refuses every NUL-bearing
+    /// file as binary without parsing it.
+    fn nul_payload_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Opt into bounded AST-proven data exclusion from default line accounting.
     fn supports_structural_line_data(&self) -> bool {
         false
@@ -1526,8 +1544,8 @@ pub trait LanguageAdapter:
     /// `None` means hydration blends the qualifier into a path-derived prefix,
     /// so the reachable prefixes are not enumerable from the path and no
     /// prefilter may drop this file's declarations.
-    fn prefilter_path_package(&self, file: &ProjectFile) -> Option<String> {
-        Some(self.hydrate_content_qualifier("", file))
+    fn prefilter_path_package(&self, file: &ProjectFile) -> Result<Option<String>, StoreError> {
+        Ok(Some(self.hydrate_content_qualifier("", file)?))
     }
     /// The anchor used to publish a parsed file's package membership even when
     /// the file contains no persisted declarations. `None` means declaration
@@ -2313,14 +2331,18 @@ fn source_admission_for_oid<A: LanguageAdapter>(
     cancellation: Option<&CancellationToken>,
 ) -> Option<Result<(), AdmissionStop>> {
     let bytes = source_bytes_for_oid(project, file, oid)?;
-    if bytes.contains(&0) {
-        return Some(Err(AdmissionStop::Refused(SourceAdmissionRefusal::Binary)));
-    }
-    let source = std::str::from_utf8(&bytes).ok()?;
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        // As in `decode_source_bytes`: only exact text can carry a NUL proof.
+        Err(_) if bytes.contains(&0) => {
+            return Some(Err(AdmissionStop::Refused(SourceAdmissionRefusal::Binary)));
+        }
+        Err(_) => return None,
+    };
     match SourceAdmissionPolicy::current().requires_proof(adapter, source) {
         Err(reason) => Some(Err(AdmissionStop::Refused(reason))),
-        Ok(false) => Some(Ok(())),
-        Ok(true) => {
+        Ok(proof) if !proof.any() => Some(Ok(())),
+        Ok(_) => {
             let mut parser = Parser::new();
             if !set_parser_for_file(&mut parser, adapter, file, source) {
                 return None;
@@ -3149,9 +3171,8 @@ impl QueryFileStateCache {
 
     #[doc(hidden)]
     pub fn retain(&mut self, key: FileStateCacheKey, state: Arc<FileState>) -> bool {
-        if let Some(existing) = self.entries.get_mut(&key) {
-            *existing = state;
-            return true;
+        if let Some(existing) = self.entries.remove(&key) {
+            self.retained_bytes -= existing.estimated_retained_bytes();
         }
         let estimated_bytes = state.estimated_retained_bytes();
         if estimated_bytes > self.max_bytes
@@ -3411,12 +3432,9 @@ struct DefinitionSortCandidate {
 
 /// The recorder a read funnel pushes its [`ReadKey`]s into.
 ///
-/// It holds the request boundaries that were open when the funnel was crossed,
-/// so one push reaches every unrelated ledger while an explicit nested capture
-/// replaces only its own enclosing ledger. Constructing one is the only work a
-/// ledger-free run would have to do, which is why
-/// [`TreeSitterAnalyzer::record_reads`] refuses to build it at all in that
-/// case.
+/// Pushes use the current thread's attribution frame. Only Broadcast and the
+/// empty-stack fallback need the analyzer contexts captured here; request-local
+/// recording avoids cloning that registry. Ledger-free runs skip construction.
 #[doc(hidden)]
 pub struct ReadKeySink<'a> {
     contexts: &'a [Arc<crate::analyzer::AnalyzerQueryContext>],
@@ -3812,6 +3830,8 @@ pub struct TreeSitterAnalyzer<A> {
     pub blob_oids: Arc<SourceBlobOidMemo>,
     /// Parse-safety verdicts for source blobs whose required fact publication
     /// is absent. The explicit entry cap bounds this across requests.
+    /// Shared with clones that share persistent products; rebuilds start clean.
+    degraded_persistent_fills: Arc<AtomicUsize>,
     source_parseability:
         moka::sync::Cache<SourceParseabilityCacheKey, Result<(), SourceAdmissionRefusal>>,
     #[doc(hidden)]
@@ -3955,6 +3975,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             statement_assessments_by_procedure: self.statement_assessments_by_procedure.clone(),
             semantic_source_digests: self.semantic_source_digests.clone(),
             blob_oids: Arc::clone(&self.blob_oids),
+            degraded_persistent_fills: Arc::clone(&self.degraded_persistent_fills),
             source_parseability: self.source_parseability.clone(),
             store_context: self.store_context.clone(),
             indexed_live_snapshot: Arc::clone(&self.indexed_live_snapshot),
@@ -4402,6 +4423,7 @@ where
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             blob_oids: Arc::new(SourceBlobOidMemo::default()),
+            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
             source_parseability: moka::sync::Cache::builder()
                 .max_capacity(SOURCE_PARSEABILITY_MEMO_ENTRIES)
                 .build(),
@@ -4878,7 +4900,7 @@ where
     fn admitted_tree_for_read(&self, file: &ProjectFile, source: &str) -> Option<Tree> {
         let needs_proof =
             match SourceAdmissionPolicy::current().requires_proof(self.adapter.as_ref(), source) {
-                Ok(needs_proof) => needs_proof,
+                Ok(proof) => proof.any(),
                 Err(reason) => {
                     self.record_admission_refusal(file, reason);
                     return None;
@@ -5204,6 +5226,7 @@ where
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             blob_oids: Arc::new(SourceBlobOidMemo::default()),
+            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
             source_parseability: moka::sync::Cache::builder()
                 .max_capacity(SOURCE_PARSEABILITY_MEMO_ENTRIES)
                 .build(),
@@ -5504,12 +5527,13 @@ where
                 })
             })
         };
-        let parent = if self.read_ledger_attached() {
-            crate::analyzer::i_analyzer::capture_nested_reads(self, resolve).0
-        } else {
-            resolve()
-        };
-        if self.read_ledger_attached() {
+        let parent =
+            if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+                crate::analyzer::i_analyzer::capture_nested_reads(self, resolve).0
+            } else {
+                resolve()
+            };
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             self.record_read_key(ReadKey::lookup(
                 LookupKind::DeclarationFacts,
                 LookupQuestion::declaration(code_unit),
@@ -8324,9 +8348,32 @@ where
         // parses the retained source again.
         let syntax = match reparse_retained_source(self.adapter.as_ref(), &file, &state, None) {
             PreparedSyntaxPreparation::Complete(Some(syntax)) => syntax,
-            PreparedSyntaxPreparation::Complete(None)
+            outcome @ (PreparedSyntaxPreparation::Complete(None)
             | PreparedSyntaxPreparation::Refused(_)
-            | PreparedSyntaxPreparation::TimedOut => {
+            | PreparedSyntaxPreparation::TimedOut) => {
+                let description = match outcome {
+                    PreparedSyntaxPreparation::Complete(None) => {
+                        "no parser for retained source".to_owned()
+                    }
+                    PreparedSyntaxPreparation::Refused(reason) => {
+                        format!("retained source refused: {reason:?}")
+                    }
+                    PreparedSyntaxPreparation::TimedOut => {
+                        "retained source parse timed out".to_owned()
+                    }
+                    _ => unreachable!("only failed parse outcomes reach this arm"),
+                };
+                let mut dirty_file_states = self
+                    .state
+                    .dirty_file_states
+                    .lock()
+                    .expect("dirty file-state mutex poisoned");
+                if let Some(dirty) = dirty_file_states.get_mut(key) {
+                    dirty.attempts = dirty.attempts.saturating_add(1);
+                    dirty.next_retry_at = Instant::now() + Self::dirty_retry_delay(dirty.attempts);
+                    dirty._last_error = description;
+                    return Some(Arc::clone(&dirty.state));
+                }
                 return Some(state);
             }
             PreparedSyntaxPreparation::Cancelled => {
@@ -8864,9 +8911,18 @@ where
             Ok(Some(resolved)) => resolved,
             Ok(None) => return PreparedSyntaxLimitedOutcome::Unavailable,
             Err(PreparedSourceFailure::Exceeded(exceeded)) => {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=budget:source",
+                        file!(),
+                        line!()
+                    )
+                });
+                crate::analyzer::IAnalyzer::mark_execution_dependent(self);
                 return PreparedSyntaxLimitedOutcome::Exceeded(exceeded);
             }
             Err(PreparedSourceFailure::Refused(reason)) => {
+                self.record_admission_refusal(file, reason.clone());
                 return PreparedSyntaxLimitedOutcome::Refused(reason);
             }
         };
@@ -9205,19 +9261,19 @@ where
         self.attached_read_ledgers.load(Ordering::Relaxed) > 0
     }
 
-    /// Record the inputs `build` names on every unshadowed read ledger open
-    /// around this analyzer, and nothing at all when none is.
-    ///
-    /// The active contexts are cloned out from under the coarse
-    /// `query_read_cache` read lock before they are touched, exactly as
-    /// `record_tier_access` and `record_store_error` do, so this adds no
-    /// lock-order edge.
+    /// Record the inputs `build` names through the current attribution frame.
+    /// Empty request frames build no keys. Broadcast clones active contexts
+    /// outside the cache lock before touching their ledgers.
     #[doc(hidden)]
     pub fn record_reads(&self, build: impl FnOnce(&mut ReadKeySink<'_>)) {
-        if !self.read_ledger_attached() {
+        if !crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             return;
         }
-        let contexts = self.query_read_cache_lock().contexts.clone();
+        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.query_read_cache_lock().contexts.clone()
+        };
         let mut sink = ReadKeySink {
             contexts: &contexts,
         };
@@ -9231,14 +9287,18 @@ where
         self.record_reads(move |sink| sink.push(key));
     }
 
-    /// Record one crossing this analyzer could not name on every unshadowed
-    /// ledger open around it. This follows [`Self::record_reads`] and is just
-    /// as free when no ledger is attached.
+    /// Record one crossing this analyzer could not name through the current
+    /// attribution frame. Empty request frames skip recording; broadcast uses
+    /// the analyzer's attached-ledger count, as in [`Self::record_reads`].
     pub(crate) fn record_unattributed_read(&self) {
-        if !self.read_ledger_attached() {
+        if !crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             return;
         }
-        let contexts = self.query_read_cache_lock().contexts.clone();
+        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.query_read_cache_lock().contexts.clone()
+        };
         crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts);
     }
 
@@ -10894,7 +10954,11 @@ where
         {
             return None;
         }
-        let unit = self.adapter.path_synthetic_module_unit(&file)?;
+        let unit = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
+            self.adapter.hydrate_path_synthetic_module_unit(&file),
+            "hydrating live path symbol",
+        )??;
         (unit.kind() == row.kind
             && unit.package_name() == row.package_name
             && unit.short_name() == row.short_name
@@ -10990,7 +11054,15 @@ where
             if !self.adapter_owns_file(&project_file, &snapshot) {
                 continue;
             }
-            let Some(module) = self.adapter.path_synthetic_module_unit(&project_file) else {
+            let module = self
+                .store_query_or_record(
+                    |sink| sink.push(self.scope_read_key()),
+                    self.adapter
+                        .hydrate_path_synthetic_module_unit(&project_file),
+                    "hydrating workspace module",
+                )
+                .ok_or(inspected)?;
+            let Some(module) = module else {
                 continue;
             };
             let Some(oid) = snapshot.oid_for_path(file) else {
@@ -11228,14 +11300,10 @@ where
         }
 
         for file in snapshot.overlay_files() {
-            if states.contains_key(file) || !self.adapter_owns_file(file, &snapshot) {
+            if states.contains_key(file) {
                 continue;
             }
-            let Some(oid) = snapshot.validated_oid_for_path(file) else {
-                continue;
-            };
-            let key = Self::transient_cache_key(oid, file);
-            let Some(state) = self.retained_overlay_file_state(&key) else {
+            let Some(state) = self.retained_overlay_file_state_for_path(file, &snapshot) else {
                 continue;
             };
             states.insert(file.clone(), state);
@@ -11245,6 +11313,18 @@ where
             .fetch_add(states.len(), Ordering::Relaxed);
         let paths = states.keys().cloned().collect();
         (states.into_iter().collect(), paths)
+    }
+
+    fn retained_overlay_file_state_for_path(
+        &self,
+        file: &ProjectFile,
+        snapshot: &LiveSnapshot,
+    ) -> Option<Arc<FileState>> {
+        if !self.adapter_owns_file(file, snapshot) {
+            return None;
+        }
+        let oid = snapshot.validated_oid_for_path(file)?;
+        self.retained_overlay_file_state(&Self::transient_cache_key(oid, file))
     }
 
     /// `key`'s already-materialized state in the two caches a request overlay
@@ -11296,21 +11376,25 @@ where
         out
     }
 
-    fn dirty_units_matching_limited(
+    fn authoritative_units_matching_limited(
         &self,
         include_definition_lookup_units: bool,
         limit: usize,
         mut keep: impl FnMut(&CodeUnit) -> bool,
         mut continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
+    ) -> (LimitedQueryRows<CodeUnit>, HashSet<ProjectFile>) {
+        let mut paths = HashSet::default();
         if limit == 0 {
-            return LimitedQueryRows::incomplete(Vec::new(), 0);
+            return (LimitedQueryRows::incomplete(Vec::new(), 0), paths);
         }
 
-        let snapshot = self.live_snapshot();
         if !continue_query() {
-            return LimitedQueryRows::incomplete(Vec::new(), 0);
+            return (LimitedQueryRows::incomplete(Vec::new(), 0), paths);
         }
+        if !self.hydrate_overlay_file_states() {
+            return (LimitedQueryRows::complete(Vec::new(), 0), paths);
+        }
+        let snapshot = self.live_snapshot();
         let dirty = self
             .state
             .dirty_file_states
@@ -11318,13 +11402,34 @@ where
             .expect("dirty file-state mutex poisoned");
         let mut rows = Vec::new();
         let mut inspected = 0usize;
+        let mut visit_units =
+            |state: &FileState,
+             rows: &mut Vec<CodeUnit>,
+             inspected: &mut usize,
+             continue_query: &mut dyn FnMut() -> bool| {
+                let declaration_sets = std::iter::once(&state.declarations).chain(
+                    include_definition_lookup_units.then_some(&state.definition_lookup_units),
+                );
+                for declarations in declaration_sets {
+                    for unit in declarations {
+                        if *inspected == limit || !continue_query() {
+                            return false;
+                        }
+                        *inspected += 1;
+                        if !unit.is_file_scope() && keep(unit) {
+                            rows.push(unit.clone());
+                        }
+                    }
+                }
+                true
+            };
         for (key, dirty) in dirty.iter() {
             // Scanning a dirty-state entry is real provider work even when the
             // entry belongs to another language or no longer matches the live
             // OID. Charge it so a small caller limit cannot hide an unbounded
             // workspace-wide map walk.
             if inspected == limit || !continue_query() {
-                return LimitedQueryRows::incomplete(rows, inspected);
+                return (LimitedQueryRows::incomplete(rows, inspected), paths);
             }
             inspected += 1;
             let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path.clone());
@@ -11333,23 +11438,31 @@ where
             {
                 continue;
             }
-
-            let declaration_sets = std::iter::once(&dirty.state.declarations).chain(
-                include_definition_lookup_units.then_some(&dirty.state.definition_lookup_units),
-            );
-            for declarations in declaration_sets {
-                for unit in declarations {
-                    if inspected == limit || !continue_query() {
-                        return LimitedQueryRows::incomplete(rows, inspected);
-                    }
-                    inspected += 1;
-                    if !unit.is_file_scope() && keep(unit) {
-                        rows.push(unit.clone());
-                    }
-                }
+            paths.insert(file);
+            if !visit_units(&dirty.state, &mut rows, &mut inspected, &mut continue_query) {
+                return (LimitedQueryRows::incomplete(rows, inspected), paths);
             }
         }
-        LimitedQueryRows::complete(rows, inspected)
+        drop(dirty);
+
+        // Overlay cache reads must not nest under the dirty-state mutex.
+        for file in snapshot.overlay_files() {
+            if paths.contains(file) {
+                continue;
+            }
+            if inspected == limit || !continue_query() {
+                return (LimitedQueryRows::incomplete(rows, inspected), paths);
+            }
+            inspected += 1;
+            let Some(state) = self.retained_overlay_file_state_for_path(file, &snapshot) else {
+                continue;
+            };
+            paths.insert(file.clone());
+            if !visit_units(&state, &mut rows, &mut inspected, &mut continue_query) {
+                return (LimitedQueryRows::incomplete(rows, inspected), paths);
+            }
+        }
+        (LimitedQueryRows::complete(rows, inspected), paths)
     }
 
     fn finish_limited_declaration_lookup(
@@ -11376,14 +11489,14 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
 
-        let dirty = self.dirty_units_matching_limited(
+        let (authoritative, paths) = self.authoritative_units_matching_limited(
             include_definition_lookup_units,
             limit - inspected,
             &mut keep,
             &mut continue_query,
         );
-        inspected = inspected.saturating_add(dirty.inspected);
-        if !dirty.complete {
+        inspected = inspected.saturating_add(authoritative.inspected);
+        if !authoritative.complete {
             return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
 
@@ -11395,8 +11508,12 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), inspected);
         }
 
-        let mut rows: BTreeSet<_> = resolved.rows.into_iter().collect();
-        rows.extend(dirty.rows);
+        let mut rows: BTreeSet<_> = resolved
+            .rows
+            .into_iter()
+            .filter(|unit| !paths.contains(unit.source()))
+            .collect();
+        rows.extend(authoritative.rows);
         LimitedQueryRows::complete(rows.into_iter().collect(), inspected)
     }
 
@@ -11947,39 +12064,20 @@ where
         let (authoritative_states, authoritative_paths) =
             self.authoritative_file_states_for_queries();
         let storage_languages = self.storage_language_keys_for_queries();
-        let workspace_is_current = self.store_query_or_record(
+        let rows = self.store_query_or_record(
             |sink| sink.push(self.scope_read_key()),
-            self.relational_workspace_is_current(),
-            "reading relational workspace identities",
+            self.store_context.store.mounted_declaration_rows_for_langs(
+                self.selected_workspace_snapshots().as_ref(),
+                &storage_languages,
+                self.store_context.generations.as_ref(),
+            ),
+            "scanning all mounted declarations",
         )?;
-        let units = if workspace_is_current {
-            let rows = self.store_query_or_record(
-                |sink| sink.push(self.scope_read_key()),
-                self.store_context.store.mounted_declaration_rows_for_langs(
-                    self.selected_workspace_snapshots().as_ref(),
-                    &storage_languages,
-                    self.store_context.generations.as_ref(),
-                ),
-                "scanning all mounted declarations",
-            )?;
-            self.store_query_or_record(
-                |sink| sink.push(self.scope_read_key()),
-                self.resolve_mounted_candidate_rows(rows),
-                "hydrating mounted declarations",
-            )?
-        } else {
-            let rows = self.store_query_or_record(
-                |sink| sink.push(self.scope_read_key()),
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_for_langs(
-                        &storage_languages,
-                        self.store_context.generations.as_ref(),
-                    ),
-                "scanning declarations for a retained workspace snapshot",
-            )?;
-            self.resolve_candidate_rows(rows)
-        };
+        let units = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
+            self.resolve_mounted_candidate_rows(rows),
+            "hydrating mounted declarations",
+        )?;
         let mut overlay_rows = authoritative_states
             .iter()
             .flat_map(|state| {
@@ -12006,10 +12104,6 @@ where
             .map(|(unit, ())| unit)
             .collect(),
         )
-    }
-
-    fn relational_workspace_is_current(&self) -> std::result::Result<bool, StoreError> {
-        Ok(true)
     }
 
     fn merge_workspace_declaration_rows<T>(
@@ -12150,13 +12244,10 @@ where
         cancellation: &CancellationToken,
     ) -> crate::analyzer::store::Result<SelectedResolutionOverlayInputsOutcome> {
         let language = self.adapter.language();
-        // Admitting Python starts production publication of Python native source rows.
-        // The same change must raise NATIVE_SOURCE_FORMAT once and carry its rejection test (#6108).
+        let admitted = crate::analyzer::languages::language_support(language)
+            .is_some_and(|support| support.supports_selected_resolution_overlays());
         assert!(
-            matches!(
-                language,
-                Language::Rust | Language::Java | Language::Go | Language::Scala | Language::Kotlin
-            ),
+            admitted,
             "selected native overlays require an admitted row-backed frontend: {language:?}"
         );
         let storage_language = language.config_label();
@@ -12508,7 +12599,10 @@ where
                 },
             )
             .collect::<Vec<_>>();
-        for state in self.dirty_file_states_for_queries() {
+        let (authoritative_states, authoritative_paths) =
+            self.authoritative_file_states_for_queries();
+        facts.retain(|fact| !authoritative_paths.contains(fact.declaration.source()));
+        for state in authoritative_states {
             facts.extend(
                 state
                     .declarations
@@ -13244,12 +13338,13 @@ where
             return BTreeSet::new();
         }
         let read = || self.lookup_declarations_by_identifier_unrecorded(identifier);
-        let matches = if self.read_ledger_attached() {
-            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
-        } else {
-            read()
-        };
-        if self.read_ledger_attached() {
+        let matches =
+            if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+                crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+            } else {
+                read()
+            };
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             self.record_read_key(
                 crate::analyzer::read_ledger::declaration_candidates_lookup_key(
                     LookupKind::IdentifierCandidates,
@@ -14206,7 +14301,14 @@ where
         let mut package_literals = String::new();
         let mut prefilter_exempt = false;
         for file in snapshot.paths_for_oid(oid) {
-            let Some(package) = self.adapter.prefilter_path_package(file) else {
+            let package = self
+                .store_query_or_record(
+                    |sink| sink.push(self.scope_read_key()),
+                    self.adapter.prefilter_path_package(file),
+                    "hydrating search prefilter package",
+                )
+                .flatten();
+            let Some(package) = package else {
                 prefilter_exempt = true;
                 continue;
             };
@@ -14319,14 +14421,20 @@ where
         let mut inspected = name_rows.inspected;
         let mut matched = {
             let _scope = profiling::scope("search_symbols.candidates.match_names");
-            resolver.match_candidate_names_cancellable(
-                &langs,
-                &name_rows.rows,
-                |package_name, short_name| {
-                    self.fq_name_matches(package_name, short_name, |name| patterns.is_match(name))
-                },
-                cancellation,
-            )
+            self.store_query_or_record(
+                |sink| sink.push(self.scope_read_key()),
+                resolver.match_candidate_names_cancellable(
+                    &langs,
+                    &name_rows.rows,
+                    |package_name, short_name| {
+                        self.fq_name_matches(package_name, short_name, |name| {
+                            patterns.is_match(name)
+                        })
+                    },
+                    cancellation,
+                ),
+                "matching symbol candidate names",
+            )?
         };
         complete &= matched.complete;
         let mut seen_keys = HashSet::default();
@@ -14409,7 +14517,7 @@ where
             }
         }
 
-        let dirty = self.dirty_units_matching_limited(
+        let (dirty, authoritative_paths) = self.authoritative_units_matching_limited(
             false,
             usize::MAX,
             |unit| {
@@ -14420,6 +14528,8 @@ where
         );
         inspected = inspected.saturating_add(dirty.inspected);
         complete &= dirty.complete;
+        candidates
+            .retain(|_, candidate| !authoritative_paths.contains(candidate.code_unit.source()));
         for code_unit in dirty.rows {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 complete = false;
@@ -15652,7 +15762,7 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return LimitedQueryRows::complete(Vec::new(), 0);
         }
-        if !self.read_ledger_attached() {
+        if !crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             return self.signature_metadata_limited_unrecorded(code_unit, limit);
         }
         let (metadata, reads) = crate::analyzer::i_analyzer::capture_nested_reads(self, || {
@@ -15793,74 +15903,99 @@ where
             .map(str::to_string)
     }
 
-    fn render_skeleton_recursive(
+    fn render_skeleton_tree(
         &self,
         code_unit: &CodeUnit,
         indent: &str,
         header_only: bool,
         out: &mut String,
     ) {
-        for signature in self.signatures_vec_of(code_unit) {
-            if signature.is_empty() {
-                continue;
-            }
-            for line in signature.lines() {
-                out.push_str(indent);
-                out.push_str(line);
-                out.push('\n');
-            }
+        enum Action {
+            Unit(CodeUnit, String),
+            HeaderEllipsis(String),
+            Close(String),
         }
 
-        let all_children: Vec<_> =
-            <Self as crate::analyzer::CodeUnitIndex>::direct_children(self, code_unit)
-                .into_iter()
-                .filter(|child| {
-                    !child.is_synthetic()
-                        || !<Self as crate::analyzer::CodeUnitIndex>::ranges(self, child).is_empty()
-                })
-                .collect();
-        let field_children: Vec<_> = all_children
-            .iter()
-            .filter(|child| child.is_field())
-            .cloned()
-            .collect();
-        let parent_start = <Self as crate::analyzer::CodeUnitIndex>::ranges(self, code_unit)
-            .into_iter()
-            .map(|range| range.start_byte)
-            .min()
-            .unwrap_or(usize::MAX);
-        let non_field_children: Vec<_> = all_children
-            .iter()
-            .filter(|child| !child.is_field())
-            .cloned()
-            .collect();
-        let children = if header_only {
-            field_children.clone()
-        } else {
-            field_children
-                .iter()
-                .chain(non_field_children.iter().filter(|child| {
-                    crate::analyzer::i_analyzer::child_first_start(self, child) >= parent_start
-                }))
-                .chain(non_field_children.iter().filter(|child| {
-                    crate::analyzer::i_analyzer::child_first_start(self, child) < parent_start
-                }))
-                .cloned()
-                .collect()
-        };
+        let mut pending = vec![Action::Unit(code_unit.clone(), indent.to_owned())];
+        while let Some(action) = pending.pop() {
+            let (code_unit, indent) = match action {
+                Action::HeaderEllipsis(indent) => {
+                    out.push_str(&indent);
+                    out.push_str("[...]\n");
+                    continue;
+                }
+                Action::Close(indent) => {
+                    out.push_str(&indent);
+                    out.push_str("}\n");
+                    continue;
+                }
+                Action::Unit(code_unit, indent) => (code_unit, indent),
+            };
 
-        if !children.is_empty() || code_unit.is_class() {
-            let child_indent = format!("{indent}  ");
-            for child in children {
-                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
+            for signature in self.signatures_vec_of(&code_unit) {
+                if signature.is_empty() {
+                    continue;
+                }
+                for line in signature.lines() {
+                    out.push_str(&indent);
+                    out.push_str(line);
+                    out.push('\n');
+                }
             }
-            if header_only && !non_field_children.is_empty() {
-                out.push_str(&child_indent);
-                out.push_str("[...]\n");
-            }
-            if code_unit.is_class() {
-                out.push_str(indent);
-                out.push_str("}\n");
+
+            let all_children: Vec<_> =
+                <Self as crate::analyzer::CodeUnitIndex>::direct_children(self, &code_unit)
+                    .into_iter()
+                    .filter(|child| {
+                        !child.is_synthetic()
+                            || !<Self as crate::analyzer::CodeUnitIndex>::ranges(self, child)
+                                .is_empty()
+                    })
+                    .collect();
+            let field_children: Vec<_> = all_children
+                .iter()
+                .filter(|child| child.is_field())
+                .cloned()
+                .collect();
+            let parent_start = <Self as crate::analyzer::CodeUnitIndex>::ranges(self, &code_unit)
+                .into_iter()
+                .map(|range| range.start_byte)
+                .min()
+                .unwrap_or(usize::MAX);
+            let non_field_children: Vec<_> = all_children
+                .iter()
+                .filter(|child| !child.is_field())
+                .cloned()
+                .collect();
+            let children = if header_only {
+                field_children.clone()
+            } else {
+                field_children
+                    .iter()
+                    .chain(non_field_children.iter().filter(|child| {
+                        crate::analyzer::i_analyzer::child_first_start(self, child) >= parent_start
+                    }))
+                    .chain(non_field_children.iter().filter(|child| {
+                        crate::analyzer::i_analyzer::child_first_start(self, child) < parent_start
+                    }))
+                    .cloned()
+                    .collect()
+            };
+
+            if !children.is_empty() || code_unit.is_class() {
+                let child_indent = format!("{indent}  ");
+                if code_unit.is_class() {
+                    pending.push(Action::Close(indent));
+                }
+                if header_only && !non_field_children.is_empty() {
+                    pending.push(Action::HeaderEllipsis(child_indent.clone()));
+                }
+                pending.extend(
+                    children
+                        .into_iter()
+                        .rev()
+                        .map(|child| Action::Unit(child, child_indent.clone())),
+                );
             }
         }
     }
@@ -16714,12 +16849,13 @@ where
                 Vec::new()
             }
         };
-        let definitions = if self.read_ledger_attached() {
-            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
-        } else {
-            read()
-        };
-        if self.read_ledger_attached() {
+        let definitions =
+            if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+                crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+            } else {
+                read()
+            };
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             self.record_read_key(ReadKey::lookup(
                 LookupKind::Definitions,
                 LookupQuestion::Name {
@@ -16831,7 +16967,7 @@ where
             return None;
         }
         let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
+        self.render_skeleton_tree(code_unit, "", false, &mut rendered);
         crate::analyzer::common::normalize_skeleton(rendered)
     }
 
@@ -16840,7 +16976,7 @@ where
             return None;
         }
         let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
+        self.render_skeleton_tree(code_unit, "", true, &mut rendered);
         crate::analyzer::common::normalize_skeleton(rendered)
     }
 
@@ -16905,12 +17041,13 @@ where
             self.sql_lookup_candidates_by_short_name(symbol)
                 .unwrap_or_default()
         };
-        let matches = if self.read_ledger_attached() {
-            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
-        } else {
-            read()
-        };
-        if self.read_ledger_attached() {
+        let matches =
+            if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+                crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+            } else {
+                read()
+            };
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             self.record_read_key(ReadKey::lookup(
                 LookupKind::ShortNameCandidates,
                 LookupQuestion::Name {
@@ -16940,12 +17077,13 @@ where
             return Vec::new();
         }
         let read = || self.signature_metadata_vec_of(code_unit);
-        let metadata = if self.read_ledger_attached() {
-            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
-        } else {
-            read()
-        };
-        if self.read_ledger_attached() {
+        let metadata =
+            if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+                crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+            } else {
+                read()
+            };
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             self.record_read_key(ReadKey::lookup(
                 LookupKind::SignatureMetadata,
                 LookupQuestion::declaration(code_unit),
@@ -16966,21 +17104,51 @@ where
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&crate::CancellationToken>,
     ) -> Result<Arc<crate::analyzer::LoopCandidates>, crate::analyzer::QueryReadIncomplete> {
+        enum FailedFill {
+            Read(crate::analyzer::QueryReadIncomplete),
+            Execution(Arc<crate::analyzer::LoopCandidates>),
+        }
+        let generation_before = self.project().analysis_generation();
         let key = (procedure.artifact().materialization_id(), procedure.id());
         match self
             .loop_candidates_by_procedure
             .try_get_with_by_ref(&key, || {
-                let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-                let value =
-                    crate::analyzer::build_loop_candidates(workspace, procedure, cancellation);
-                scope.read_completion()?;
-                Ok::<_, crate::analyzer::QueryReadIncomplete>(Arc::new(value))
+                let ((value, completion), reads) =
+                    crate::analyzer::i_analyzer::capture_query_reads(self, || {
+                        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+                        let value = crate::analyzer::build_loop_candidates(
+                            workspace,
+                            procedure,
+                            cancellation,
+                        );
+                        (value, scope.read_completion())
+                    });
+                completion.map_err(FailedFill::Read)?;
+                let execution_reason = value.reason.is_some_and(|reason| {
+                    crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason)
+                        .is_some()
+                });
+                if execution_reason
+                    || self.project().analysis_generation() != generation_before
+                    || reads.execution_dependences() > 0
+                    || cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                {
+                    self.mark_execution_dependent();
+                    return Err(FailedFill::Execution(Arc::new(value)));
+                }
+                Ok::<_, FailedFill>(Arc::new(value))
             }) {
             Ok(value) => Ok(value),
-            Err(reason) => {
-                self.record_query_incomplete((*reason).clone());
-                Err((*reason).clone())
-            }
+            Err(attempt) => match attempt.as_ref() {
+                FailedFill::Read(reason) => {
+                    self.record_query_incomplete(reason.clone());
+                    Err(reason.clone())
+                }
+                FailedFill::Execution(value) => {
+                    self.mark_execution_dependent();
+                    Ok(Arc::clone(value))
+                }
+            },
         }
     }
 
@@ -16990,28 +17158,56 @@ where
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&crate::CancellationToken>,
     ) -> Arc<crate::analyzer::semantic::StatementAssessments> {
+        let generation_before = self.project().analysis_generation();
         let key = (procedure.artifact().materialization_id(), procedure.id());
         match self
             .statement_assessments_by_procedure
             .try_get_with_by_ref(&key, || {
-                let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-                let value =
-                    crate::analyzer::semantic::statement_entries::build_statement_assessments(
-                        workspace,
-                        procedure,
-                        cancellation,
-                    );
-                scope.read_completion()?;
-                Ok::<_, crate::analyzer::QueryReadIncomplete>(Arc::new(value))
+                let ((value, completion), reads) = crate::analyzer::i_analyzer::capture_query_reads(self, || {
+                    let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+                    let value = crate::analyzer::semantic::statement_entries::build_statement_assessments(
+                        workspace, procedure, cancellation);
+                    (Arc::new(value), scope.read_completion())
+                });
+                let execution_reason = value.reason.into_iter().chain(value.rows.iter().filter_map(|row| {
+                    match row.verdict {
+                        crate::analyzer::semantic::StatementVerdict::Open(reason) => Some(reason),
+                        _ => None,
+                    }
+                })).any(|reason| crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some());
+                if let Err(reason) = completion {
+                    if reason.is_execution_dependent() {
+                        self.mark_execution_dependent();
+                    }
+                    return Err(Err(reason));
+                }
+                if execution_reason || self.project().analysis_generation() != generation_before || reads.execution_dependences() > 0
+                    || cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                {
+                    self.mark_execution_dependent();
+                    return Err(Ok(value));
+                }
+                Ok::<_, Result<Arc<crate::analyzer::semantic::StatementAssessments>, crate::analyzer::QueryReadIncomplete>>(value)
             }) {
             Ok(value) => value,
-            Err(reason) => {
-                self.record_query_incomplete((*reason).clone());
-                Arc::new(crate::analyzer::semantic::StatementAssessments {
-                    rows: Vec::new(),
-                    complete: false,
-                    reason: Some("query_incomplete"),
-                })
+            Err(attempt) => {
+                match attempt.as_ref() {
+                    Ok(value) => {
+                        self.mark_execution_dependent();
+                        Arc::clone(value)
+                    }
+                    Err(reason) => {
+                        if reason.is_execution_dependent() {
+                            self.mark_execution_dependent();
+                        }
+                        self.record_query_incomplete(reason.clone());
+                        Arc::new(crate::analyzer::semantic::StatementAssessments {
+                            rows: Vec::new(),
+                            complete: false,
+                            reason: Some(derivation_reason::QUERY_INCOMPLETE),
+                        })
+                    }
+                }
             }
         }
     }
@@ -17052,6 +17248,40 @@ where
                 .dependency_file_evidence(&self.selected_workspace_snapshots()),
             Err(error) => Err(error.clone()),
         }
+    }
+
+    fn reference_names_in_files(
+        &self,
+        request: crate::analyzer::i_analyzer::ReferenceNamesInFilesRequest<'_>,
+    ) -> crate::analyzer::store::Result<crate::analyzer::i_analyzer::ReferenceNamesInFilesResult>
+    {
+        if request.files.is_empty() || request.names.is_empty() {
+            return Ok(crate::analyzer::i_analyzer::ReferenceNamesInFilesResult::default());
+        }
+        let snapshots = self.selected_workspace_snapshots();
+        let files = request
+            .files
+            .iter()
+            .map(|file| {
+                let language = self.adapter.storage_language_key_for_file(file);
+                let snapshot = snapshots.get(language).ok_or_else(|| {
+                    StoreError::new(format!(
+                        "reference names in files: no selected snapshot for {file}"
+                    ))
+                })?;
+                Ok((
+                    snapshot.clone(),
+                    brokk_bifrost_core::path_utils::rel_path_string(file),
+                ))
+            })
+            .collect::<crate::analyzer::store::Result<Vec<_>>>()?;
+        let by_name = self
+            .analyzer_store()
+            .reference_names_in_files(&files, request.names)?
+            .into_iter()
+            .map(|(name, ordinal)| (name, request.files[ordinal].clone()))
+            .collect();
+        Ok(crate::analyzer::i_analyzer::ReferenceNamesInFilesResult { by_name })
     }
 
     fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
@@ -17207,15 +17437,45 @@ where
         TreeSitterAnalyzer::record_unattributed_read(self);
     }
 
+    #[track_caller]
+    fn record_degraded_persistent_fill(&self, cache: &str, cause: &str) {
+        let count = self
+            .degraded_persistent_fills
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let origin = std::panic::Location::caller();
+        profiling::note_with(|| {
+            format!(
+                "policy.units degraded_persistent_fill origin={}:{} cache={cache} cause={cause} count={count}",
+                origin.file(),
+                origin.line()
+            )
+        });
+        self.mark_execution_dependent();
+    }
+
+    fn degraded_persistent_fills(&self) -> usize {
+        self.degraded_persistent_fills.load(Ordering::Relaxed)
+    }
+
+    fn mark_execution_dependent(&self) {
+        if !crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+            return;
+        }
+        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.query_read_cache_lock().contexts.clone()
+        };
+        crate::analyzer::i_analyzer::record_execution_dependence_on_active_ledgers(&contexts);
+    }
+
     fn read_ledger_attached(&self) -> bool {
         TreeSitterAnalyzer::read_ledger_attached(self)
     }
 
     fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
-        let cache = self.query_read_cache_lock();
-        crate::analyzer::i_analyzer::innermost_query_context_value(&cache.contexts, |context| {
-            context.current_thread_read_ledger().cloned()
-        })
+        crate::analyzer::i_analyzer::current_thread_read_ledger()
     }
 
     fn active_query_cancellation(&self) -> Option<CancellationToken> {
@@ -17663,21 +17923,23 @@ where
         };
         let root = tree.root_node();
 
-        // Walk the declared code-unit hierarchy to enumerate every function
+        // Walk the declared code-unit hierarchy in preorder to enumerate functions
         // in this file in source order (top-level + nested under classes /
         // modules / impls). Mirrors brokk-shared's
         // `functionCodeUnitsInFile`.
         let mut functions: Vec<CodeUnit> = Vec::new();
-        let mut work: VecDeque<CodeUnit> =
-            file_state.top_level_declarations.iter().cloned().collect();
-        while let Some(cu) = work.pop_front() {
+        let mut work: Vec<CodeUnit> = file_state
+            .top_level_declarations
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        while let Some(cu) = work.pop() {
             if cu.is_function() {
                 functions.push(cu.clone());
             }
             if let Some(children) = file_state.children.get(&cu) {
-                for child in children {
-                    work.push_back(child.clone());
-                }
+                work.extend(children.iter().rev().cloned());
             }
         }
 
@@ -17908,18 +18170,30 @@ fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
     if code_unit.is_file_scope() { 1 } else { 0 }
 }
 
+/// Preference order among declarations that contain one site: the innermost
+/// range first, then named declarations before file scopes, then identity.
+/// The usage graph's per-file declaration index uses the same order, so both
+/// name one declaration when several share a span, such as a Java record
+/// component's field and implicit accessor.
+pub(crate) fn enclosing_code_unit_order(
+    (left_range, left): (&Range, &CodeUnit),
+    (right_range, right): (&Range, &CodeUnit),
+) -> std::cmp::Ordering {
+    (left_range.end_byte - left_range.start_byte)
+        .cmp(&(right_range.end_byte - right_range.start_byte))
+        .then_with(|| enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right)))
+        .then_with(|| left.fq_name().cmp(&right.fq_name()))
+        .then_with(|| left.kind().cmp(&right.kind()))
+        .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
+}
+
 fn select_enclosing_code_unit(
     candidates: impl IntoIterator<Item = (Range, CodeUnit)>,
 ) -> Option<CodeUnit> {
     candidates
         .into_iter()
         .min_by(|(left_range, left), (right_range, right)| {
-            (left_range.end_byte - left_range.start_byte)
-                .cmp(&(right_range.end_byte - right_range.start_byte))
-                .then_with(|| enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right)))
-                .then_with(|| left.fq_name().cmp(&right.fq_name()))
-                .then_with(|| left.kind().cmp(&right.kind()))
-                .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
+            enclosing_code_unit_order((left_range, left), (right_range, right))
         })
         .map(|(_, code_unit)| code_unit)
 }
@@ -18234,3 +18508,12 @@ pub mod js_ts_source_admission_support;
 pub mod tree_sitter_resolution_producer_tests_go_support;
 
 pub use crate::analyzer::store::file_state::{FileState, PreparedSyntaxPreparation};
+
+#[cfg(test)]
+mod declaration_limit_tests;
+
+#[cfg(test)]
+mod declaration_candidate_tests;
+
+#[cfg(test)]
+mod build_state_tests;

@@ -35,27 +35,56 @@ pub(super) fn initializer_relation_expansions(
     }
     let candidates = cpp_initializer_candidates(workspace, &procedure.handle, cancellation);
     if !candidates.complete {
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: procedure
-                .handle
-                .artifact()
-                .key()
-                .language()
-                .language()
-                .config_label(),
-            message: format!(
-                "{} has incomplete C/C++ initializer syntax qualification ({})",
-                procedure.wire_id(),
-                candidates.reason.unwrap_or("unknown")
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        });
+        if DerivationExecutionCause::from_reason(
+            candidates
+                .reason
+                .unwrap_or(brokk_bifrost_analysis::analyzer::read_ledger::reason::UNKNOWN),
+        )
+        .is_some()
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=candidate_derivation detail={:?}",
+                    file!(),
+                    line!(),
+                    candidates.reason
+                )
+            });
+            workspace.analyzer().mark_execution_dependent();
+        }
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            workspace.analyzer(),
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: procedure
+                    .handle
+                    .artifact()
+                    .key()
+                    .language()
+                    .language()
+                    .config_label(),
+                message: format!(
+                    "{} has incomplete C/C++ initializer syntax qualification ({})",
+                    procedure.wire_id(),
+                    candidates
+                        .reason
+                        .unwrap_or(brokk_bifrost_analysis::analyzer::read_ledger::reason::UNKNOWN)
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+            CodeQueryDiagnosticCode::from_execution_reason(
+                CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+                candidates
+                    .reason
+                    .unwrap_or(brokk_bifrost_analysis::analyzer::read_ledger::reason::UNKNOWN),
+            )
+            .1,
+        ));
     }
     if candidates.rows.is_empty() {
         return Vec::new();

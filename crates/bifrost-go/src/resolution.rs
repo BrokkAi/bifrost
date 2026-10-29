@@ -52,14 +52,14 @@ use brokk_bifrost_core::analyzer::source_facts::{
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child;
 use brokk_bifrost_core::analyzer::structural::resolution::HoistingClass;
-use brokk_bifrost_core::analyzer::tree_walk::TreeWalkAction;
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, first_named_child_matching};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::marker::PhantomData;
 use tree_sitter::Node;
 
 use crate::declarations::{
     GoImportSpecSyntax, children_by_field, go_embedded_field_name_node, go_identifier_is_exported,
-    go_node_text, named_children, sole_spec_declaration_node,
+    go_node_text, go_type_argument_nodes, named_children, sole_spec_declaration_node,
 };
 use crate::source_properties::{GoSourcePropertyCollector, callable_parameters, result_parameters};
 
@@ -1051,21 +1051,40 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         let alias = self.type_switch_alias(node);
         let scope_start = alias.map_or(node.start_byte(), |alias| alias.start_byte());
         let scope = self.push_block_scope_from(node, scope_start);
-        // Repeated type fields include comma separators; only named AST nodes are types.
-        let types = children_by_field(node, "type")
+        // Repeated type fields include comma separators; only named AST nodes
+        // are entries. A `nil` entry is not a type and publishes no type
+        // reference, but it still counts: as in go/types, the alias has the
+        // case type only when the case lists exactly one entry and it is a
+        // type, and the guard's type otherwise. A type declared as `nil` in
+        // scope would make `case nil` a real type; that shadowing is not
+        // modeled.
+        let entries = children_by_field(node, "type")
             .into_iter()
             .filter(|type_node| type_node.is_named())
+            .map(|entry| {
+                (
+                    entry,
+                    crate::declarations::go_is_nil_case_entry(entry, self.source),
+                )
+            })
             .collect::<Vec<_>>();
-        for &case_type in &types {
-            self.lower_type(case_type);
+        for &(entry, is_nil) in &entries {
+            if !is_nil {
+                self.lower_type(entry);
+            }
         }
         if let Some(alias) = alias {
-            let case_type = (types.len() == 1).then_some(types[0]);
+            let case_type = crate::declarations::go_single_type_switch_case_type(node, self.source);
             if let Some(declaration) =
                 self.add_clause_binder(alias, alias, scope, node.start_byte(), case_type)
             {
-                let input = self.attach_unknown_clause_initializer(declaration, node);
-                if case_type.is_none() {
+                if case_type.is_some() {
+                    self.attach_unknown_clause_initializer(declaration, node);
+                } else if let Some(input) = self.type_switch_guard_operand_slot(node) {
+                    self.attach_clause_initializer(declaration, input);
+                    self.attach_initializer_type(declaration, input);
+                } else {
+                    let input = self.attach_unknown_clause_initializer(declaration, node);
                     self.attach_initializer_type(declaration, input);
                 }
             }
@@ -1081,10 +1100,29 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             && let Some(declaration) =
                 self.add_clause_binder(alias, alias, scope, node.start_byte(), None)
         {
-            let input = self.attach_unknown_clause_initializer(declaration, node);
-            self.attach_initializer_type(declaration, input);
+            if let Some(input) = self.type_switch_guard_operand_slot(node) {
+                self.attach_clause_initializer(declaration, input);
+                self.attach_initializer_type(declaration, input);
+            } else {
+                let input = self.attach_unknown_clause_initializer(declaration, node);
+                self.attach_initializer_type(declaration, input);
+            }
         }
         TreeWalkAction::DescendWithExit
+    }
+
+    fn type_switch_guard_operand_slot(
+        &self,
+        case_clause: Node<'tree>,
+    ) -> Option<ResolutionTypeSlotId> {
+        let type_switch = case_clause.parent().expect("type-switch case has a parent");
+        let operand = type_switch.child_by_field_name("value")?;
+        Some(
+            *self
+                .expression_slots_by_node
+                .get(&operand.id())
+                .expect("type-switch guard operand was lowered before its clauses"),
+        )
     }
 
     fn type_switch_alias(&self, case_clause: Node<'tree>) -> Option<Node<'tree>> {
@@ -1122,13 +1160,15 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     });
                     if short_declaration {
                         for name in bindings {
-                            let _declaration = self.add_clause_binder(
+                            if let Some(declaration) = self.add_clause_binder(
                                 communication,
                                 name,
                                 scope,
                                 communication.end_byte(),
                                 None,
-                            );
+                            ) {
+                                self.add_gap(declaration, ResolutionGapKind::InferredType);
+                            }
                         }
                     } else {
                         for target in bindings {
@@ -1208,8 +1248,6 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         });
         if let Some(type_node) = declared_type {
             self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Value, true);
-        } else {
-            self.add_gap(declaration, ResolutionGapKind::InferredType);
         }
         self.record_value_name(scope, name);
         Some(declaration)
@@ -1223,6 +1261,15 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         let unknown_site = self.add_site(clause, ResolutionSiteKind::UnsupportedExpression);
         self.add_gap(unknown_site, ResolutionGapKind::UnsupportedExpressionType);
         let input = self.add_slot(unknown_site, ResolutionTypeSlotRole::ExpressionValue);
+        self.attach_clause_initializer(declaration, input);
+        input
+    }
+
+    fn attach_clause_initializer(
+        &mut self,
+        declaration: ResolutionSiteId,
+        input: ResolutionTypeSlotId,
+    ) {
         let observed = self.add_slot(declaration, ResolutionTypeSlotRole::AssignmentValue);
         self.add_transfer(
             input,
@@ -1231,7 +1278,6 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             0,
             ResolutionTypeTransferValueTransform::ToRuntime { addressable: true },
         );
-        input
     }
 
     pub(crate) fn exit(&mut self) {
@@ -1297,7 +1343,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             );
         };
         if !self.expression_slots_by_node.contains_key(&node.id()) {
-            self.lower_unsupported_expression_type(node);
+            self.lower_function_literal(node);
         }
         let callable = self.slot(self.expression_slot(node)).site;
         let scope = self.allocate_scope(
@@ -2328,7 +2374,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         declaration: ResolutionSiteId,
         type_node: Node<'tree>,
     ) {
-        if type_node.kind() != "function_type" {
+        if !matches!(type_node.kind(), "function_type" | "func_literal") {
             return;
         }
         let Some(parameters) = type_node.child_by_field_name("parameters") else {
@@ -2625,15 +2671,13 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     activation_start: callable.activation_start,
                     activation_end: callable.activation_end,
                 });
-                let value_type = self.attach_declaration_type(
+                let parameter_type = self.lower_parameter_type(node, type_node, repeated);
+                let value_type = self.attach_declaration_type_syntax(
                     declaration,
-                    type_node,
+                    parameter_type,
                     DeclarationTypeRole::Parameter,
                     true,
                 );
-                if repeated {
-                    self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
-                }
                 self.record_value_name(callable.scope, name);
                 if is_receiver {
                     let receiver_name = self.intern_name(go_node_text(name, self.source).trim());
@@ -2649,7 +2693,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     ResolutionSiteKind::ValueDeclaration,
                     callable.scope,
                 );
-                let syntax = self.lower_type(type_node);
+                let syntax = self.lower_parameter_type(node, type_node, repeated);
                 let value_type = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
                 self.add_transfer(
                     syntax.input,
@@ -2658,9 +2702,6 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     syntax.indirection_delta,
                     ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
                 );
-                if repeated {
-                    self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
-                }
                 (declaration, value_type)
             };
             if !is_receiver {
@@ -2817,15 +2858,13 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     activation_start: literal.activation_start,
                     activation_end: literal.activation_end,
                 });
-                self.attach_declaration_type(
+                let parameter_type = self.lower_parameter_type(node, type_node, repeated);
+                self.attach_declaration_type_syntax(
                     declaration,
-                    type_node,
+                    parameter_type,
                     DeclarationTypeRole::Parameter,
                     true,
                 );
-                if repeated {
-                    self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
-                }
                 self.record_value_name(literal.scope, name);
             } else {
                 let declaration = self.add_site_in_scope(
@@ -2833,7 +2872,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     ResolutionSiteKind::ValueDeclaration,
                     literal.scope,
                 );
-                let syntax = self.lower_type(type_node);
+                let syntax = self.lower_parameter_type(node, type_node, repeated);
                 let value_type = self.add_slot(declaration, ResolutionTypeSlotRole::DeclaredValue);
                 self.add_transfer(
                     syntax.input,
@@ -2842,10 +2881,30 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     syntax.indirection_delta,
                     ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
                 );
-                if repeated {
-                    self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
-                }
             }
+        }
+    }
+
+    fn lower_parameter_type(
+        &mut self,
+        parameter: Node<'tree>,
+        type_node: Node<'tree>,
+        repeated: bool,
+    ) -> LoweredTypeSyntax {
+        let element = self.lower_type(type_node);
+        if !repeated {
+            return element;
+        }
+        let (_, container) = self.begin_structural_type(parameter, "variadic-slice");
+        self.push_type_component(
+            container,
+            ResolutionTypeConstructorKind::Slice,
+            ResolutionTypeComponentKind::Element,
+            element,
+        );
+        LoweredTypeSyntax {
+            input: container,
+            indirection_delta: 0,
         }
     }
 
@@ -3383,6 +3442,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             0,
             ResolutionTypeTransferValueTransform::AddressableRuntimeOnly,
         );
+        self.publish_function_type_signature(declaration, input);
     }
 
     fn attach_constant_initializer_type(
@@ -3836,7 +3896,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             match self.source_properties.type_shape(current_type_id) {
                 GoSourceTypeShape::Pointer(inner) => {
                     pointer_depth = pointer_depth.saturating_add(1);
-                    let Some(inner_node) = first_named_child(current) else {
+                    let Some(inner_node) =
+                        first_named_child_matching(current, |child| !child.is_extra())
+                    else {
                         return self.lower_gap_type(root, ResolutionGapKind::MalformedSyntax);
                     };
                     current = inner_node;
@@ -3846,7 +3908,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     kind: GoTypeCompoundKind::Parenthesized,
                     children,
                 } if children.len() == 1 => {
-                    let Some(inner) = first_named_child(current) else {
+                    let Some(inner) =
+                        first_named_child_matching(current, |child| !child.is_extra())
+                    else {
                         return self.lower_gap_type(root, ResolutionGapKind::MalformedSyntax);
                     };
                     current = inner;
@@ -4029,42 +4093,67 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         constructor: ResolutionTypeConstructorKind,
         components: [(ResolutionTypeComponentKind, &'static str); N],
     ) -> LoweredTypeSyntax {
-        let site = self.add_site(node, ResolutionSiteKind::TypeReference);
-        let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
         // This spelling is presentation for native type lookup only. The
         // constructor and component rows remain the structured type shape.
         let spelling = go_node_text(node, self.source).trim();
-        let name = self.intern_name(if spelling.is_empty() {
-            "structural-type"
-        } else {
-            spelling
-        });
-        self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
-            output: container,
-            name,
-            kind: IntrinsicTypeKind::Structural,
-            indirection: 0,
-        });
+        let (site, container) = self.begin_structural_type(
+            node,
+            if spelling.is_empty() {
+                "structural-type"
+            } else {
+                spelling
+            },
+        );
         for (kind, field) in components {
             let Some(component_node) = node.child_by_field_name(field) else {
                 self.add_gap(site, ResolutionGapKind::MalformedSyntax);
                 continue;
             };
             let syntax = self.lower_type(component_node);
-            let component = self.materialize_type_syntax(syntax);
-            self.facts
-                .type_components
-                .push(ResolutionTypeComponentFact {
-                    container,
-                    constructor,
-                    kind,
-                    component,
-                });
+            self.push_type_component(container, constructor, kind, syntax);
         }
         LoweredTypeSyntax {
             input: container,
             indirection_delta: 0,
         }
+    }
+
+    /// The TypeReference site and identity slot of a structural type at
+    /// `node`, seeded with `spelling`. The seed name is presentation; the
+    /// structural identity comes from the slot.
+    fn begin_structural_type(
+        &mut self,
+        node: Node<'tree>,
+        spelling: &str,
+    ) -> (ResolutionSiteId, ResolutionTypeSlotId) {
+        let site = self.add_site(node, ResolutionSiteKind::TypeReference);
+        let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+        let name = self.intern_name(spelling);
+        self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+            output: container,
+            name,
+            kind: IntrinsicTypeKind::Structural,
+            indirection: 0,
+        });
+        (site, container)
+    }
+
+    fn push_type_component(
+        &mut self,
+        container: ResolutionTypeSlotId,
+        constructor: ResolutionTypeConstructorKind,
+        kind: ResolutionTypeComponentKind,
+        syntax: LoweredTypeSyntax,
+    ) {
+        let component = self.materialize_type_syntax(syntax);
+        self.facts
+            .type_components
+            .push(ResolutionTypeComponentFact {
+                container,
+                constructor,
+                kind,
+                component,
+            });
     }
 
     fn lower_generic_type(&mut self, node: Node<'tree>) -> LoweredTypeSyntax {
@@ -4097,14 +4186,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         owner: ResolutionTypeSlotId,
         arguments: Node<'tree>,
     ) {
-        let mut positional = Vec::new();
-        for element in named_children(arguments) {
-            if element.kind() == "type_elem" {
-                positional.extend(named_children(element));
-            } else {
-                positional.push(element);
-            }
-        }
+        let positional = go_type_argument_nodes(arguments);
         if positional.is_empty() {
             let site = self.add_site(arguments, ResolutionSiteKind::UnsupportedExpression);
             self.add_gap(site, ResolutionGapKind::MalformedSyntax);
@@ -4128,13 +4210,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         receiver_type: Node<'tree>,
         callable: CallableContext,
     ) -> Option<LoweredTypeSyntax> {
-        let mut generic = receiver_type;
-        while matches!(generic.kind(), "pointer_type" | "parenthesized_type") {
-            generic = first_named_child(generic)?;
-        }
-        if generic.kind() != "generic_type" {
-            return None;
-        }
+        let generic = crate::declarations::go_generic_receiver_type(receiver_type)?;
         let (Some(base), Some(arguments)) = (
             generic.child_by_field_name("type"),
             generic.child_by_field_name("type_arguments"),
@@ -4143,14 +4219,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             return None;
         };
         let owner = self.lower_type(base);
-        let mut positional = Vec::new();
-        for element in named_children(arguments) {
-            if element.kind() == "type_elem" {
-                positional.extend(named_children(element));
-            } else {
-                positional.push(element);
-            }
-        }
+        let positional = go_type_argument_nodes(arguments);
         if positional.is_empty() {
             self.add_gap(callable.declaration, ResolutionGapKind::MalformedSyntax);
             return None;
@@ -4290,6 +4359,26 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             kind: BindingProjectionKind::TargetTypeOrDeclaredValueType,
         });
         self.expression_slots_by_node.insert(node.id(), output);
+    }
+
+    fn is_package_import_qualifier(&self, operand: Node<'_>) -> bool {
+        let spelling = go_node_text(operand, self.source).trim();
+        let shadowed = self
+            .visible_value_scope(self.current_scope(), spelling)
+            .is_some()
+            || self
+                .visible_type_scope(self.current_scope(), spelling, operand.start_byte())
+                .is_some();
+        let has_named_import = self
+            .facts
+            .go_package_imports
+            .iter()
+            .any(|import| import.kind == ResolutionGoPackageImportKind::Named);
+        has_named_import
+            && !shadowed
+            && (operand.kind() == "package_identifier"
+                || self.is_explicit_package_import_qualifier(operand)
+                || operand.kind() == "identifier")
     }
 
     fn is_explicit_package_import_qualifier(&self, node: Node<'_>) -> bool {
@@ -4555,9 +4644,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 | "true"
                 | "false"
                 | "nil" => self.finish_expression(node),
-                "func_literal" => {
-                    self.lower_unsupported_expression_as(node, ResolutionGapKind::InferredType)
-                }
+                "func_literal" => self.finish_expression(node),
                 _ => self.lower_unsupported_expression(node),
             }
         }
@@ -4708,7 +4795,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 self.expression_slots_by_node.insert(node.id(), slot);
             }
             "type_instantiation_expression" => self.finish_type_instantiation_expression(node),
-            "func_literal" => self.lower_unsupported_expression_type(node),
+            "func_literal" => self.lower_function_literal(node),
             "unary_expression" => {
                 if node
                     .child_by_field_name("operator")
@@ -5034,7 +5121,11 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
             return;
         }
-        let reference = self.add_site(field, ResolutionSiteKind::MemberReference);
+        let reference = self.add_site_in_scope(
+            field,
+            ResolutionSiteKind::MemberReference,
+            self.lexical_scope_for_reference(field),
+        );
         let receiver = self.add_slot(reference, ResolutionTypeSlotRole::Receiver);
         let type_or_value = self.is_ambiguous_callee_operand(node);
         self.add_transfer(
@@ -5057,6 +5148,14 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         ) {
             self.lower_unsupported_expression_as(node, ResolutionGapKind::MalformedSyntax);
             return;
+        }
+        if !self.is_package_import_qualifier(operand) {
+            self.facts
+                .callable_receiver_origins
+                .push(ResolutionCallableReceiverOriginFact {
+                    reference,
+                    origin: self.member_receiver_origin(operand),
+                });
         }
         if operand.kind() == "identifier" && is_spelled_identifier(operand) {
             self.add_qualified_root_reference(operand, reference);
@@ -5157,7 +5256,11 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     self.add_gap(site, ResolutionGapKind::MalformedSyntax);
                     return;
                 }
-                let callee = self.add_site(name, ResolutionSiteKind::MemberReference);
+                let callee = self.add_site_in_scope(
+                    name,
+                    ResolutionSiteKind::MemberReference,
+                    self.lexical_scope_for_reference(name),
+                );
                 let receiver = self.add_slot(callee, ResolutionTypeSlotRole::Receiver);
                 self.add_transfer(
                     self.expression_slot(package),
@@ -5270,6 +5373,11 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 // Expression lowering has already preserved the terminal name's
                 // type-or-value category. It now serves as the invocation endpoint.
                 self.facts.sites[callee.index()].kind = ResolutionSiteKind::CallableReference;
+                // This type-or-value invocation endpoint is no longer a field
+                // reference. Its binding still uses the original qualifier.
+                self.facts
+                    .callable_receiver_origins
+                    .retain(|origin| origin.reference != callee);
                 (callee, None)
             }
             Some(function) if is_spelled_identifier(function) => {
@@ -5532,7 +5640,11 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     self.lower_expression(operand);
                 }
             }
-            let reference = self.add_site(field, ResolutionSiteKind::MemberReference);
+            let reference = self.add_site_in_scope(
+                field,
+                ResolutionSiteKind::MemberReference,
+                self.lexical_scope_for_reference(field),
+            );
             let receiver = self.add_slot(reference, ResolutionTypeSlotRole::Receiver);
             self.add_transfer(
                 self.expression_slot(operand),
@@ -5631,23 +5743,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             0,
             ResolutionTypeTransferValueTransform::Preserve,
         );
-        let spelling = go_node_text(operand, self.source).trim();
-        let shadowed = self
-            .visible_value_scope(self.current_scope(), spelling)
-            .is_some()
-            || self
-                .visible_type_scope(self.current_scope(), spelling, operand.start_byte())
-                .is_some();
-        let has_named_import = self
-            .facts
-            .go_package_imports
-            .iter()
-            .any(|import| import.kind == ResolutionGoPackageImportKind::Named);
-        let package_qualified = has_named_import
-            && !shadowed
-            && (operand.kind() == "package_identifier"
-                || self.is_explicit_package_import_qualifier(operand)
-                || operand.kind() == "identifier");
+        let package_qualified = self.is_package_import_qualifier(operand);
         let callee = if package_qualified {
             self.add_go_call_or_conversion_reference(
                 field,
@@ -5655,11 +5751,11 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 Some(receiver),
             )?
         } else {
-            let origin = self.callable_receiver_origin(operand);
+            let origin = self.member_receiver_origin(operand);
             let callee = self.add_identifier_site(
                 field,
                 ResolutionSiteKind::MemberReference,
-                self.current_scope(),
+                self.lexical_scope_for_reference(field),
                 ResolutionIdentifierRole::Reference,
                 ResolutionNamespace::Callable,
                 Some(receiver),
@@ -5694,7 +5790,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         )
     }
 
-    fn callable_receiver_origin(&self, operand: Node<'_>) -> ResolutionCallableReceiverOrigin {
+    fn member_receiver_origin(&self, operand: Node<'_>) -> ResolutionCallableReceiverOrigin {
         if operand.kind() == "identifier"
             && is_spelled_identifier(operand)
             && let Some(callable) = self.callable_contexts.last()
@@ -5822,7 +5918,11 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     self.add_gap(site, ResolutionGapKind::MalformedSyntax);
                     return;
                 }
-                let callee = self.add_site(name, ResolutionSiteKind::MemberReference);
+                let callee = self.add_site_in_scope(
+                    name,
+                    ResolutionSiteKind::MemberReference,
+                    self.lexical_scope_for_reference(name),
+                );
                 let receiver = self.add_slot(callee, ResolutionTypeSlotRole::Receiver);
                 self.add_transfer(
                     self.expression_slot(package),
@@ -6199,6 +6299,24 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     fn mark_unsupported_literal_element(&mut self, node: Node<'tree>) {
         let site = self.add_site(node, ResolutionSiteKind::UnsupportedExpression);
         self.add_gap(site, ResolutionGapKind::UnsupportedExpression);
+    }
+
+    fn lower_function_literal(&mut self, node: Node<'tree>) {
+        if self.expression_slots_by_node.contains_key(&node.id()) {
+            return;
+        }
+        let site = self.add_site(node, ResolutionSiteKind::Literal);
+        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+        let syntax = self.lower_function_type(node);
+        self.add_transfer(
+            syntax.input,
+            output,
+            ResolutionTypeTransferKind::Construction,
+            0,
+            ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+        );
+        self.expression_slots_by_node.insert(node.id(), output);
+        assert!(self.function_types_by_slot.insert(output, node).is_none());
     }
 
     fn lower_intrinsic_literal(&mut self, node: Node<'_>, spelling: &str, kind: IntrinsicTypeKind) {
@@ -6660,18 +6778,6 @@ fn explicit_type_argument_count(node: Node<'_>) -> u32 {
         })
 }
 
-fn go_type_argument_nodes(arguments: Node<'_>) -> Vec<Node<'_>> {
-    let mut positional = Vec::new();
-    for element in named_children(arguments) {
-        if element.kind() == "type_elem" {
-            positional.extend(named_children(element));
-        } else {
-            positional.push(element);
-        }
-    }
-    positional
-}
-
 fn type_instantiation_argument_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     if let Some(arguments) = node.child_by_field_name("type_arguments") {
         return go_type_argument_nodes(arguments);
@@ -6679,10 +6785,13 @@ fn type_instantiation_argument_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     let base = node.child_by_field_name("type");
     named_children(node)
         .into_iter()
-        .filter(|child| base.is_none_or(|base| child.id() != base.id()))
+        .filter(|child| !child.is_extra() && base.is_none_or(|base| child.id() != base.id()))
         .flat_map(|element| {
             if element.kind() == "type_elem" {
                 named_children(element)
+                    .into_iter()
+                    .filter(|child| !child.is_extra())
+                    .collect()
             } else {
                 vec![element]
             }
@@ -7621,10 +7730,16 @@ func namedResult() (result string) {
             .collect::<Vec<_>>();
         assert_eq!(repeated_parameters.len(), 2);
         for parameter in repeated_parameters {
-            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            assert!(!facts.gaps.contains(&ResolutionGapFact::new(
                 parameter.parameter,
                 ResolutionGapKind::UnsupportedExpressionType
             )));
+            let value = transfer_to(&facts, parameter.value_type);
+            assert!(facts.type_components.iter().any(|component| {
+                component.container == value.input
+                    && component.constructor == ResolutionTypeConstructorKind::Slice
+                    && component.kind == ResolutionTypeComponentKind::Element
+            }));
             assert!(
                 !facts
                     .reference_enumeration_gaps
@@ -7983,7 +8098,7 @@ func use(values []int, outer int) {
                     .sites
                     .iter()
                     .find(|site| {
-                        site.kind == ResolutionSiteKind::UnsupportedExpression
+                        site.kind == ResolutionSiteKind::Literal
                             && site.start_byte == literal.start_byte()
                             && site.end_byte == literal.end_byte()
                     })
@@ -9592,6 +9707,73 @@ func use(rows map[*Box]*Box, items []*Box, channel chan *Box, replacement *Box) 
         }
     }
 
+    /// tree-sitter-go parses `nil` in a case label as a type_identifier, so
+    /// this pins the parse-backed rule: a `nil` entry publishes no type
+    /// reference, and an alias whose case is not exactly one type transfers
+    /// from the guard operand's slot.
+    #[test]
+    fn type_switch_nil_entries_take_the_guard_slot_without_a_type_reference() {
+        let source = r#"package p
+func one(value interface{}) {
+    switch selected := value.(type) {
+    case nil:
+        _ = selected
+    }
+}
+func two(value interface{}) {
+    switch other := value.(type) {
+    case error, nil:
+        _ = other
+    }
+}
+"#;
+        let facts = facts(source);
+        let type_references_in = |start: usize, end: usize| {
+            facts
+                .identifiers
+                .iter()
+                .filter(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Reference
+                        && identifier.namespace == ResolutionNamespace::Type
+                        && (start..end).contains(&facts.sites[identifier.site.index()].start_byte)
+                })
+                .map(|identifier| name(&facts, identifier.name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for (alias, case_label, expected_type_references) in [
+            ("selected", "case nil:", Vec::<&str>::new()),
+            ("other", "case error, nil:", vec!["error"]),
+        ] {
+            let label_start = source.find(case_label).expect("case label");
+            assert_eq!(
+                type_references_in(label_start, label_start + case_label.len()),
+                expected_type_references,
+                "{case_label}"
+            );
+            let guard_start = source[..label_start]
+                .rfind("value.(type)")
+                .expect("guard operand");
+            let guard_site = facts
+                .identifiers
+                .iter()
+                .find(|identifier| {
+                    identifier.role == ResolutionIdentifierRole::Reference
+                        && facts.sites[identifier.site.index()].start_byte == guard_start
+                })
+                .expect("guard operand reference")
+                .site;
+            let declaration = declaration(&facts, alias);
+            let value = declaration_slot(&facts, declaration, DeclarationTypeRole::Value);
+            let transfer = transfer_to(&facts, value);
+            assert_eq!(transfer.kind, ResolutionTypeTransferKind::Initialization);
+            assert_eq!(
+                facts.type_slots[transfer.input.index()].site,
+                guard_site,
+                "{alias} takes the guard operand slot"
+            );
+        }
+    }
+
     #[test]
     #[hardwon(
         "#5015: Go type-switch writes hid the unknown runtime value of a typed clause binder"
@@ -10466,21 +10648,33 @@ func use(x *Typ) {
     }
 
     #[test]
-    #[hardwon("#2771: named Go method receiver calls were counted as external usages")]
-    fn method_receiver_origin_respects_lexical_shadowing() {
+    #[hardwon("#7517: named Go receiver field reads lost identity across lexical shadows")]
+    fn member_receiver_origin_respects_lexical_shadowing() {
         let facts = facts(
             r#"package p
-type Foo struct{}
+import pkg "example.test/package"
+type Foo struct { field int; Const int; Callback func() }
 func (f *Foo) target() {}
 func (f *Foo) caller(other *Foo) {
     f.target()
+    _ = f.field
     other.target()
+    _ = other.field
     {
         f := other
         f.target()
+        _ = f.field
     }
-    func(f *Foo) { f.target() }(other)
+    func(f *Foo) { f.target(); _ = f.field }(other)
     f.target()
+    _ = f.field
+    _ = pkg.Const
+    {
+        pkg := other
+        _ = pkg.Const
+    }
+    (f.Callback)()
+    _ = f.Callback
 }
 "#,
         );
@@ -10493,11 +10687,75 @@ func (f *Foo) caller(other *Foo) {
             origins,
             vec![
                 ResolutionCallableReceiverOrigin::CurrentInstance,
+                ResolutionCallableReceiverOrigin::CurrentInstance,
+                ResolutionCallableReceiverOrigin::ExplicitExpression,
+                ResolutionCallableReceiverOrigin::ExplicitExpression,
+                ResolutionCallableReceiverOrigin::ExplicitExpression,
                 ResolutionCallableReceiverOrigin::ExplicitExpression,
                 ResolutionCallableReceiverOrigin::ExplicitExpression,
                 ResolutionCallableReceiverOrigin::ExplicitExpression,
                 ResolutionCallableReceiverOrigin::CurrentInstance,
+                ResolutionCallableReceiverOrigin::CurrentInstance,
+                ResolutionCallableReceiverOrigin::ExplicitExpression,
+                ResolutionCallableReceiverOrigin::CurrentInstance,
             ],
+        );
+        let package_or_shadow_origins = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && name(&facts, identifier.name) == "Const"
+            })
+            .map(|identifier| {
+                facts
+                    .callable_receiver_origins
+                    .iter()
+                    .find(|origin| origin.reference == identifier.site)
+                    .map(|origin| origin.origin)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            package_or_shadow_origins,
+            [
+                None,
+                Some(ResolutionCallableReceiverOrigin::ExplicitExpression),
+            ]
+        );
+        let callback_references = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && name(&facts, identifier.name) == "Callback"
+            })
+            .map(|identifier| {
+                let origin = facts
+                    .callable_receiver_origins
+                    .iter()
+                    .find(|origin| origin.reference == identifier.site)
+                    .map(|origin| origin.origin);
+                (
+                    facts.sites[identifier.site.index()].kind,
+                    identifier.namespace,
+                    origin,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            callback_references,
+            [
+                (
+                    ResolutionSiteKind::CallableReference,
+                    ResolutionNamespace::TypeOrValue,
+                    None
+                ),
+                (
+                    ResolutionSiteKind::MemberReference,
+                    ResolutionNamespace::Value,
+                    Some(ResolutionCallableReceiverOrigin::CurrentInstance)
+                ),
+            ]
         );
     }
 
@@ -11870,10 +12128,16 @@ func U(...int) {}
                 .collect::<Vec<_>>();
             assert_eq!(parameters.len(), 1);
             assert!(parameters[0].repeated);
-            assert!(facts.gaps.contains(&ResolutionGapFact::new(
+            assert!(!facts.gaps.contains(&ResolutionGapFact::new(
                 parameters[0].parameter,
                 ResolutionGapKind::UnsupportedExpressionType
             )));
+            let value = transfer_to(&facts, parameters[0].value_type);
+            assert!(facts.type_components.iter().any(|component| {
+                component.container == value.input
+                    && component.constructor == ResolutionTypeConstructorKind::Slice
+                    && component.kind == ResolutionTypeComponentKind::Element
+            }));
             assert!(
                 !facts
                     .reference_enumeration_gaps

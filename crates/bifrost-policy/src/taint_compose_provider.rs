@@ -1592,6 +1592,7 @@ impl PolicyCompositionProvider<'_> {
         call: &CallSiteHandle,
         answer: &SemanticOutcome<DispatchResult>,
     ) -> Result<CallModels, TaintPolicyCompileError> {
+        let receiver_storage_available = self.plan.value_flow().receiver_storage_is_available(call);
         let key = call.durable_key();
         let group = self
             .external_models
@@ -1612,6 +1613,7 @@ impl PolicyCompositionProvider<'_> {
                 curated,
                 summaries: None,
                 resolved_external: false,
+                receiver_storage_available,
             });
         };
         let mut targets = Vec::new();
@@ -1652,6 +1654,7 @@ impl PolicyCompositionProvider<'_> {
             curated,
             summaries,
             resolved_external,
+            receiver_storage_available,
         })
     }
 
@@ -1990,14 +1993,14 @@ fn covering_model(
     result: Option<&DispatchResult>,
 ) -> Option<CallModel> {
     if let Some(curated) = &models.curated {
-        return Some(call_model(
+        return Some(models.with_receiver_storage(call_model(
             call,
             curated.transfers(),
             curated.effects(),
             SummaryCallBinding::default(),
             curated.is_proven_complete(),
             None,
-        ));
+        )));
     }
     let result = result?;
     if !result.candidates().is_empty() {
@@ -2048,14 +2051,14 @@ fn covering_model(
             .expect("a covering summary is one of the call's bound summaries");
         authored_call_closures(call, &kinds, summaries, models.resolved_external).into_boxed_slice()
     });
-    Some(call_model(
+    Some(models.with_receiver_storage(call_model(
         call,
         summary.transfers(),
         summary.effects(),
         mapping,
         true,
         authored,
-    ))
+    )))
 }
 
 /// The models of one call (`PolicyCompositionProvider::call_models`).
@@ -2069,9 +2072,25 @@ struct CallModels {
     /// Whether dispatch proves one exhaustive external target, independently
     /// of an authored override-coverage claim or the language of the receiver.
     resolved_external: bool,
+    receiver_storage_available: bool,
 }
 
 impl CallModels {
+    fn with_receiver_storage(&self, mut model: CallModel) -> CallModel {
+        if !self.receiver_storage_available
+            && model
+                .transfers
+                .iter()
+                .any(|transfer| matches!(transfer.actual, PartialFlowPort::CallReceiver { .. }))
+        {
+            model.completeness = incomplete("the member receiver storage is not proven");
+            model.transfers.retain(|transfer| {
+                !matches!(transfer.actual, PartialFlowPort::CallReceiver { .. })
+            });
+        }
+        model
+    }
+
     /// The authored summary that closes one of the call's dispatch
     /// boundaries, with its actual-to-formal mapping.
     fn summary_for_boundary(

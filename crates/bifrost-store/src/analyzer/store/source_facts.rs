@@ -897,6 +897,19 @@ fn encode_structural_facts(
             Some(value) => node_json.push_str(if value { "true" } else { "false" }),
             None => node_json.push_str("null"),
         }
+        node_json.push(',');
+        if let Some(attributes) = &node.declaration_attributes {
+            node_json.push_str(
+                &serde_json::to_string(&attributes.modifiers).expect("modifier words encode"),
+            );
+            node_json.push(',');
+            node_json.push_str(
+                &serde_json::to_string(&attributes.type_kind)
+                    .expect("declaration type kind encodes"),
+            );
+        } else {
+            node_json.push_str("null,null");
+        }
         node_json.push(']');
     }
     node_json.push(']');
@@ -975,6 +988,20 @@ pub fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
     }
 }
 
+/// Insert one source table's typed rows and retain the source cancellation error.
+pub(super) fn insert_rows<R: super::row_batch::RowBindings>(
+    tx: &Transaction<'_>,
+    insert_prefix: &str,
+    row_sql: &str,
+    rows: &[R],
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    if !super::row_batch::insert_typed_rows(tx, insert_prefix, row_sql, rows, cancellation)? {
+        return Err(cancelled());
+    }
+    check_cancelled(cancellation)
+}
+
 /// A language's paired accounting and insertion operations for canonical source facts.
 ///
 /// Adapters bind this capability in their language-owned publication module. The
@@ -1041,7 +1068,16 @@ pub fn source_fact_cost(
         .nodes()
         .iter()
         // Integer kind and call codes carry no text payload.
-        .map(|node| node.construct.as_ref().map_or(0, String::len))
+        .map(|node| {
+            node.construct.as_ref().map_or(0, String::len)
+                + node
+                    .declaration_attributes
+                    .as_ref()
+                    .map_or(0, |attributes| {
+                        attributes.modifiers.iter().map(String::len).sum::<usize>()
+                            + attributes.type_kind.as_ref().map_or(0, String::len)
+                    })
+        })
         .fold(0usize, usize::saturating_add);
     let lexical_declaration_payload = facts
         .occurrences
@@ -1284,15 +1320,7 @@ pub(super) fn insert_source_facts_tx(
     drop(scopes);
     drop(prefixes);
 
-    let mut declarations = tx.prepare_cached(
-        "INSERT INTO source_declarations(
-           blob_id, declaration_id, occurrence_id, name_occurrence_id,
-           lexical_kind, lexical_identifier,
-           start_byte, end_byte, start_line, end_line,
-           name_start_byte, name_end_byte, name_start_line, name_end_line,
-           provenance
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-    )?;
+    let mut declarations = Vec::new();
     for (index, declaration) in facts.occurrences.declarations().iter().enumerate() {
         check_cancelled(cancellation)?;
         let declaration_id = SourceDeclarationId::try_from_index(index)
@@ -1305,7 +1333,7 @@ pub(super) fn insert_source_facts_tx(
         let name_range = declaration
             .name
             .map(|name| facts.occurrences.occurrence(name).range);
-        declarations.execute(params![
+        declarations.push((
             blob_id,
             usize_to_i64(index)?,
             i64::from(declaration.occurrence.get()),
@@ -1329,14 +1357,23 @@ pub(super) fn insert_source_facts_tx(
                 .map(|range| usize_to_i64(range.end_line))
                 .transpose()?,
             i64::from(provenance_code(occurrence.provenance)),
-        ])?;
+        ));
     }
-    drop(declarations);
-
-    let mut declaration_units_statement = tx.prepare_cached(
-        "INSERT INTO source_declaration_units(blob_id, declaration_id, unit_key)
-         VALUES(?1, ?2, ?3)",
+    insert_rows(
+        tx,
+        "INSERT INTO source_declarations(
+           blob_id, declaration_id, occurrence_id, name_occurrence_id,
+           lexical_kind, lexical_identifier,
+           start_byte, end_byte, start_line, end_line,
+           name_start_byte, name_end_byte, name_start_line, name_end_line,
+           provenance
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &declarations,
+        cancellation,
     )?;
+
+    let mut declaration_units_statement = Vec::new();
     for &(declaration_id, unit_key) in declaration_units {
         check_cancelled(cancellation)?;
         assert!(
@@ -1347,13 +1384,15 @@ pub(super) fn insert_source_facts_tx(
             unit_key >= 0,
             "source declaration-unit link has a negative unit key"
         );
-        declaration_units_statement.execute(params![
-            blob_id,
-            i64::from(declaration_id.get()),
-            unit_key,
-        ])?;
+        declaration_units_statement.push((blob_id, i64::from(declaration_id.get()), unit_key));
     }
-    drop(declaration_units_statement);
+    insert_rows(
+        tx,
+        "INSERT INTO source_declaration_units(blob_id, declaration_id, unit_key) VALUES",
+        "(?, ?, ?)",
+        &declaration_units_statement,
+        cancellation,
+    )?;
 
     if let Some(storage) = storage {
         (storage.insert)(tx, blob_id, facts, cancellation)?;
@@ -1421,6 +1460,100 @@ pub(super) fn insert_source_facts_tx(
 #[cfg(test)]
 mod kotlin_publication_tests;
 
+// One statement checks publication even for a file with no matching references.
+// Lookup headers can use shared lookup keys rather than positioned reference
+// keys (Go root paths), so the reference-name inventory is joined by blob.
+// File ordinals retain the caller's exact ProjectFile identities and snapshots.
+pub(crate) const REFERENCE_NAMES_IN_FILES_SQL: &str = r#"
+WITH files AS MATERIALIZED (
+ SELECT request.key AS ordinal, blob.id AS blob_id,
+        EXISTS (SELECT 1 FROM source_fact_readiness visibility
+                WHERE visibility.blob_id=blob.id AND visibility.available=1) AS available
+ FROM json_each(?1) request
+ LEFT JOIN workspace_file_versions source
+   ON source.workspace_id=json_extract(request.value,'$[0]')
+  AND source.lang=json_extract(request.value,'$[1]')
+  AND source.generation=json_extract(request.value,'$[2]')
+  AND source.rel_path=json_extract(request.value,'$[4]') AND source.input_kind='source'
+  AND source.valid_from<=json_extract(request.value,'$[3]')
+  AND (source.valid_until IS NULL OR json_extract(request.value,'$[3]')<source.valid_until)
+ LEFT JOIN blobs blob ON blob.blob_oid=source.blob_oid
+  AND blob.lang=source.lang AND blob.generation=source.generation
+), references_by_name AS (
+ SELECT files.ordinal,
+        CASE WHEN substr(name.spelling,1,2)='r#' THEN substr(name.spelling,3)
+             ELSE name.spelling END AS spelling
+ FROM files
+ JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=files.blob_id
+ JOIN resolution_identities name ON name.id=lookup.identity_id
+ WHERE EXISTS (SELECT 1 FROM resolution_semantic_sites site
+               WHERE site.blob_id=files.blob_id AND site.semantic_role='reference')
+)
+SELECT ordinal, NULL, available FROM files
+UNION ALL
+SELECT min(ordinal), spelling, 1 FROM references_by_name
+WHERE spelling IN (SELECT value FROM json_each(?2)) GROUP BY spelling
+"#;
+
+impl super::AnalyzerStore {
+    /// Match normalized terminal names against source-owned references in one batch.
+    #[doc(hidden)]
+    pub fn reference_names_in_files(
+        &self,
+        files: &[(super::WorkspaceSnapshotId, String)],
+        names: &[String],
+    ) -> Result<HashMap<String, usize>> {
+        let requests: Vec<_> = files
+            .iter()
+            .map(|(snapshot, path)| {
+                (
+                    snapshot.workspace_id.as_str(),
+                    snapshot.lang.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision,
+                    path.as_str(),
+                )
+            })
+            .collect();
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare_cached(REFERENCE_NAMES_IN_FILES_SQL)?;
+        let rows = statement.query_map(
+            params![
+                serde_json::to_string(&requests).expect("source file selections serialize"),
+                serde_json::to_string(names).expect("reference names serialize")
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, usize>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )?;
+        let mut result = HashMap::default();
+        let mut unavailable = Vec::new();
+        for row in rows {
+            let (ordinal, name, available) = row?;
+            // Build constraints do not suppress facts: Go publishes canonical facts
+            // for every source, including files excluded by GOOS, GOARCH or build
+            // tags. A file can still lack them for other reasons, and then it may
+            // reference any name, so the caller must not read an empty answer.
+            if !available {
+                unavailable.push(&files[ordinal]);
+            }
+            if let Some(name) = name {
+                result.insert(name, ordinal);
+            }
+        }
+        if !unavailable.is_empty() {
+            return Err(StoreError::new(format!(
+                "reference names in files: source facts are not published for {unavailable:?}"
+            )));
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod roundtrip_properties {
     use super::super::{AnalyzerStore, decode_structural_nodes, decode_structural_roles};
@@ -1475,6 +1608,12 @@ mod roundtrip_properties {
                 duplicate_key: None,
                 is_async: None,
                 unsafe_context: None,
+                declaration_attributes: (index == 0).then(|| {
+                    brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes {
+                        modifiers: vec!["public".to_owned(), "final".to_owned()],
+                        type_kind: Some("class".to_owned()),
+                    }
+                }),
                 string_value: None,
                 construct: None,
                 occurrence: id(0),
@@ -1634,7 +1773,28 @@ mod roundtrip_properties {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        let storage: (String, bool, String) = tx
+            .query_row(
+                "SELECT typeof(nodes), json_valid(nodes, 8), json_type(nodes)
+                 FROM source_structural_facts WHERE blob_id=?1",
+                [blob_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(storage, ("blob".to_owned(), true, "array".to_owned()));
+        let encoded: serde_json::Value = serde_json::from_str(&nodes).unwrap();
+        for node in encoded.as_array().unwrap() {
+            assert_eq!(node.as_array().unwrap().len(), 26);
+        }
+        assert_eq!(encoded[0][24], serde_json::json!(["public", "final"]));
+        assert_eq!(encoded[0][25], serde_json::json!("class"));
+        assert!(encoded[1][24].is_null());
+        assert!(encoded[1][25].is_null());
         let nodes = decode_structural_nodes(&nodes).unwrap();
+        let attributes = nodes[0].declaration_attributes.as_ref().unwrap();
+        assert_eq!(attributes.modifiers, ["public", "final"]);
+        assert_eq!(attributes.type_kind.as_deref(), Some("class"));
+        assert!(nodes[1].declaration_attributes.is_none());
         assert_eq!(
             nodes
                 .iter()

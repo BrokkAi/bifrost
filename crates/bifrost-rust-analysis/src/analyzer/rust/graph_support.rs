@@ -47,6 +47,12 @@ impl RustAnalyzer {
         file: &ProjectFile,
         progress: &dyn Fn() -> bool,
     ) -> ReferenceContextResult<Arc<ExportIndex>> {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-rust-analysis/src/analyzer/rust/graph_support.rs",
+            );
+
         if !progress() {
             return Err(brokk_bifrost_rust::graph_support::ReferenceContextError::Interrupted);
         }
@@ -63,7 +69,12 @@ impl RustAnalyzer {
                 progress,
             )?,
         );
-        self.export_indexes.insert(file.clone(), index.clone());
+        {
+            let cache_key = file.clone();
+            let cache_value = index.clone();
+            persistent_fill_guard.installed("export_indexes");
+            self.export_indexes.insert(cache_key, cache_value);
+        };
         Ok(index)
     }
 

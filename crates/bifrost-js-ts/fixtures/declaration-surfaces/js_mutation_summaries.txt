@@ -1,0 +1,9 @@
+SOURCE export function update(){z.last=1; a.first++; function nested(){ghost=1;}}
+Field [("Member", "z"), ("Member", "last")] lookup=false signatures=["z.last = 1"] labels=[] supers=[]
+Function [("Member", "update")] lookup=false signatures=["// mutates: first, last\nexport function update() ..."] labels=[([], true, false)] supers=[]
+export Some("update") Local { local_name: "update" }
+materialized Named "update" target=None
+SOURCE class Counter {#value=0; update(){this.#value=1;}}
+Class [("Type", "Counter")] lookup=false signatures=["class Counter {"] labels=[] supers=[]
+Field [("Type", "Counter"), ("Member", "#value")] lookup=false signatures=["#value=0"] labels=[] supers=[]
+Function [("Type", "Counter"), ("Member", "update")] lookup=false signatures=["function update() ..."] labels=[([], false, false)] supers=[]

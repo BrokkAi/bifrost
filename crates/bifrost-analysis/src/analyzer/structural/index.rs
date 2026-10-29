@@ -1306,9 +1306,10 @@ fn build_index(
             metrics.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             return Err(BuildFailure::Cancelled { metrics });
         }
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let acquired: Vec<(Option<Arc<FileFacts>>, StructuralFactsCacheOutcome)> = chunk
             .par_iter()
-            .map(|file| provider.structural_facts_with_outcome(file))
+            .map(|file| context.run(|| provider.structural_facts_with_outcome(file)))
             .collect();
         for (file, (facts, outcome)) in chunk.iter().zip(acquired) {
             metrics.files = metrics.files.saturating_add(1);
@@ -1689,11 +1690,17 @@ fn boxed_kind_name_rows(
 ) -> Option<KindNamePostings> {
     let mut boxed = map_with_capacity(rows.len());
     let mut observed = 0usize;
+    let mut next_poll = 0usize;
     for (name, combinations) in rows {
         let mut boxed_combinations = Vec::with_capacity(combinations.len());
         for (kind, values) in combinations {
-            if observed.is_multiple_of(FACT_CANCELLATION_BATCH) && cancellation.is_cancelled() {
-                return None;
+            if observed >= next_poll {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                next_poll = observed
+                    .saturating_sub(observed % FACT_CANCELLATION_BATCH)
+                    .saturating_add(FACT_CANCELLATION_BATCH);
             }
             observed = observed.saturating_add(values.len().max(1));
             debug_assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
@@ -1782,10 +1789,34 @@ fn retained_bytes(
 }
 
 fn hash_table_allocation_bytes<K, V>(capacity: usize) -> u64 {
-    // std/hashbrown stores a control byte alongside every raw bucket. Using
-    // the public element capacity is conservative enough for admission while
-    // avoiding dependence on the private raw-table bucket count.
-    (capacity as u64).saturating_mul((size_of::<(K, V)>() + 1) as u64)
+    // hashbrown-0.16.1/src/raw/mod.rs in the Cargo registry:
+    // bucket_mask_to_capacity reserves one bucket below eight buckets and
+    // 1/8 of larger tables. TableLayout::calculate_layout_for aligns the
+    // control array and appends one control byte per bucket plus Group::WIDTH.
+    // Sixteen bounds the SSE2 group as well as the smaller portable groups.
+    if capacity == 0 {
+        return 0;
+    }
+    let capacity = capacity as u64;
+    let buckets = if capacity < 8 {
+        (capacity + 1).checked_next_power_of_two()
+    } else {
+        capacity
+            .checked_mul(8)
+            .and_then(|value| (value / 7).checked_next_power_of_two())
+    };
+    let Some(buckets) = buckets else {
+        return u64::MAX;
+    };
+    let alignment = (std::mem::align_of::<(K, V)>() as u64).max(16);
+    let Some(data_bytes) = buckets
+        .checked_mul(size_of::<(K, V)>() as u64)
+        .and_then(|bytes| bytes.checked_add(alignment - 1))
+    else {
+        return u64::MAX;
+    };
+    let control_offset = data_bytes & !(alignment - 1);
+    control_offset.saturating_add(buckets).saturating_add(16)
 }
 
 #[cfg(test)]
@@ -1922,6 +1953,7 @@ mod tests {
                 duplicate_key: None,
                 is_async: None,
                 unsafe_context: None,
+                declaration_attributes: None,
                 string_value: None,
                 construct: None,
                 range: Range {
@@ -1999,6 +2031,7 @@ mod tests {
                     duplicate_key: None,
                     is_async: None,
                     unsafe_context: None,
+                    declaration_attributes: None,
                     string_value: None,
                     construct: None,
                     range: Range {
@@ -2034,6 +2067,88 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: retained bytes omitted reserved buckets and control trailer"
+    )]
+    fn table_admission_counts_reserved_buckets_and_control_trailer() {
+        // hashbrown 0.16.1 raw/mod.rs: capacity 7 means 8 raw buckets;
+        // TableLayout::calculate_layout_for appends buckets + Group::WIDTH.
+        // A pair of u64s has no control-alignment padding at these sizes.
+        assert!(super::hash_table_allocation_bytes::<u64, u64>(7) >= 8 * 16 + 8 + 16);
+        assert!(super::hash_table_allocation_bytes::<u64, u64>(112) >= 128 * 16 + 128 + 16);
+        assert_eq!(super::hash_table_allocation_bytes::<u64, u64>(0), 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: posting lengths skipped cancellation polling boundaries"
+    )]
+    fn posting_boxing_polls_after_crossing_a_work_boundary() {
+        let combinations = [1, FACT_CANCELLATION_BATCH, FACT_CANCELLATION_BATCH, 1]
+            .into_iter()
+            .map(|len| {
+                (
+                    NormalizedKind::Class,
+                    (0..len)
+                        .map(|node| FactAddress {
+                            file: 0,
+                            fact: node as u32,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let rows = HashMap::from_iter([(Box::from("Shared"), combinations)]);
+        // The old modulo check polled only at zero and on return. Three
+        // polls require seeing a crossed boundary inside the posting loop.
+        assert!(
+            boxed_kind_name_rows(rows, &CancellationToken::cancel_after_checks_for_test(3))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn combined_postings_match_the_scan_for_alternative_kinds() {
+        let provider = ambiguous_name_provider();
+        let (index, _) = build_index_for_test(&provider, 1024 * 1024, content(1)).unwrap();
+        for kinds in [
+            vec![NormalizedKind::Class, NormalizedKind::Function],
+            vec![NormalizedKind::Function, NormalizedKind::Class],
+            vec![NormalizedKind::Function],
+        ] {
+            let requirements = StructuralAccessRequirements::new_for_test(vec![
+                StructuralPostingTerm::Kinds(kinds.clone()),
+                StructuralPostingTerm::ExactName(vec!["Shared".to_string()]),
+            ]);
+            for scope in [None, Some(provider.files.as_slice()), Some(&[][..])] {
+                let selected = index
+                    .select(
+                        &requirements,
+                        scope,
+                        false,
+                        false,
+                        &CancellationToken::default(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                for file in &provider.files {
+                    let expected = provider.facts[file]
+                        .nodes()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, fact)| {
+                            scope.is_none_or(|files| files.contains(file))
+                                && kinds.iter().any(|kind| fact.kind.satisfies(*kind))
+                        })
+                        .map(|(i, _)| i as u32)
+                        .collect::<Vec<_>>();
+                    assert_eq!(selected.facts_for(file), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn non_redundant_kind_name_posting_is_selected() {
         let provider = ambiguous_name_provider();
         let (index, _) =
@@ -2062,6 +2177,92 @@ mod tests {
             selected.facts_for(&provider.files[0]),
             (0..MIN_KIND_NAME_POSTING_ROWS as u32 / 2).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn alternative_anchor_groups_never_prune_literal_matches() {
+        let mut provider = provider();
+        let file = provider.files[0].clone();
+        let source = "class App: # caf\u{e9}\n    pass\n";
+        let old = &provider.facts[&file];
+        let facts = FileFacts::new(
+            source.into(),
+            vec![0, 19],
+            old.nodes().to_vec(),
+            CompactRows::from_parts(vec![0, 0], vec![]),
+            CompactRows::from_parts(vec![0, 0], vec![]),
+            vec![],
+        );
+        provider.facts.insert(file.clone(), Arc::new(facts));
+        let (index, _) = build_index_for_test(&provider, 1024 * 1024, content(1)).unwrap();
+        for first in [["caf\u{e9}", "unseen-xyz"], ["unseen-xyz", "caf\u{e9}"]] {
+            for second in [["class", "absent-abc"], ["absent-abc", "class"]] {
+                for groups in [[first, second], [second, first]] {
+                    assert!(
+                        groups
+                            .iter()
+                            .all(|group| group.iter().any(|literal| source.contains(literal)))
+                    );
+                    let groups =
+                        groups.map(|g| SourceAnchorGroup::new(g.map(str::to_owned).to_vec()));
+                    assert_eq!(index.source_may_contain(&file, &groups), Some(true));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cumulative_role_key_allocations_obey_the_construction_cap() {
+        use super::super::facts::{RoleTarget, Span};
+        let mut provider = provider();
+        let file = provider.files[0].clone();
+        let mut source = String::new();
+        let mut targets = vec![];
+        for id in 0..8 {
+            let start_byte = source.len();
+            source.push_str(&format!("{id}{}", "x".repeat(32767)));
+            let span = Span {
+                start_byte,
+                end_byte: source.len(),
+            };
+            let target = RoleTarget {
+                role: Role::Callee,
+                spread: false,
+                keyword: None,
+                node: None,
+                span,
+                name: Some(span),
+            };
+            targets.push(target.clone());
+            targets.push(target);
+        }
+        // Independently count the distinct retained string payload, excluding
+        // repeated role references, tables, postings and temporary capacity.
+        let distinct_key_bytes = source.len() as u64;
+        let mut node = provider.facts[&file].nodes()[0].clone();
+        node.range = Range {
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 1,
+            end_line: 1,
+        };
+        node.name = None;
+        let roles_end = targets.len();
+        let facts = FileFacts::new(
+            source,
+            vec![0],
+            vec![node],
+            CompactRows::from_parts(vec![0, roles_end as u32], targets),
+            CompactRows::from_parts(vec![0, 0], vec![]),
+            vec![],
+        );
+        provider.facts.insert(file, Arc::new(facts));
+        for budget in [60 * 1024, 64 * 1024, 68 * 1024] {
+            assert!(distinct_key_bytes > budget * BUILD_WORKING_BYTES_MULTIPLIER);
+            let failure = build_index_for_test(&provider, budget, content(1)).unwrap_err();
+            assert!(matches!(failure, BuildFailure::Unavailable { reason, .. }
+                if &*reason == "structural index construction-byte limit exceeded"));
+        }
     }
 
     #[test]
@@ -2407,6 +2608,7 @@ mod tests {
                 duplicate_key: None,
                 is_async: None,
                 unsafe_context: None,
+                declaration_attributes: None,
                 string_value: None,
                 construct: None,
                 range: Range {

@@ -5845,11 +5845,13 @@ class CodeQueryResult:
     def _codes_with_impact(
         self, impact: CodeQueryDiagnosticImpact
     ) -> tuple[CodeQueryDiagnosticCode, ...]:
-        codes: list[CodeQueryDiagnosticCode] = []
-        for diagnostic in self.diagnostics:
-            if diagnostic.impact is impact and diagnostic.code not in codes:
-                codes.append(diagnostic.code)
-        return tuple(codes)
+        codes = {
+            diagnostic.code
+            for diagnostic in self.diagnostics
+            if diagnostic.impact is impact
+        }
+        # Generated enum order mirrors Rust's declaration order (Ord).
+        return tuple(code for code in CodeQueryDiagnosticCode if code in codes)
 
     def render_text(self) -> str:
         if self.rendered_text is not None:
@@ -6301,6 +6303,9 @@ class CodeQueryValueFlowWork:
 
 @dataclass(frozen=True)
 class CodeQueryTypeFlowWork:
+    root_memo_hits: int = 0
+    root_memo_solver_work: dict[str, int] = field(default_factory=dict)
+    root_memo_semantic_work: dict[str, int] = field(default_factory=dict)
     field_slot_builds: int = 0
     field_slot_memory_hits: int = 0
     field_slot_persistence_hits: int = 0
@@ -6341,6 +6346,7 @@ class CodeQueryTypeFlowWork:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQueryTypeFlowWork:
         numeric = {
+            "root_memo_hits",
             "field_slot_builds",
             "field_slot_memory_hits",
             "field_slot_persistence_hits",
@@ -6379,8 +6385,15 @@ class CodeQueryTypeFlowWork:
         summary_profile = data.get("summary_profile", {})
         if not isinstance(summary_profile, dict):
             raise TypeError("summary_profile must be an object")
+        attributed = {}
+        for key in ("root_memo_solver_work", "root_memo_semantic_work"):
+            work = data.get(key, {})
+            if not isinstance(work, dict):
+                raise TypeError(f"{key} must be an object")
+            attributed[key] = {name: int(value) for name, value in work.items()}
         return cls(
             **{key: int(data.get(key, 0)) for key in numeric},
+            **attributed,
             witness_truncated=bool(data.get("witness_truncated", False)),
             summary_profile=dict(summary_profile),
         )

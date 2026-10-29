@@ -809,20 +809,32 @@ pub(super) fn scan_outbound_reference_hits(
     }
     let language = crate::analyzer::common::language_for_file(file);
     let Some(source) = analyzer.indexed_source(file) else {
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: language.config_label(),
-            message: format!(
-                "uses could not inspect {} because its indexed source snapshot was unavailable",
-                rel_path_string(file)
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=provider:indexed_source",
+                file!(),
+                line!()
+            )
         });
+        analyzer.mark_execution_dependent();
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            analyzer,
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: language.config_label(),
+                message: format!(
+                    "uses could not inspect {} because its indexed source snapshot was unavailable",
+                    rel_path_string(file)
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            },
+            Some(DerivationExecutionCause::Provider),
+        ));
         return (Vec::new(), true);
     };
     let remaining_source_bytes = limits

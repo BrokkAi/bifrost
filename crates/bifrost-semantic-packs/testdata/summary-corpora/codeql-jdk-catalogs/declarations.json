@@ -1,0 +1,159 @@
+[
+  {
+    "name": "java.lang.String",
+    "path": "java.base/java/lang/String.java",
+    "supertypes": [],
+    "methods": [
+      {
+        "name": "concat",
+        "parameters": [
+          "java.lang.String"
+        ],
+        "has_receiver": true,
+        "id": "test.java.lang.String.concat.0"
+      },
+      {
+        "name": "join",
+        "parameters": [
+          "java.lang.CharSequence",
+          "java.lang.CharSequence[]"
+        ],
+        "has_receiver": false,
+        "id": "test.java.lang.String.join.1"
+      },
+      {
+        "name": "join",
+        "parameters": [
+          "java.lang.CharSequence",
+          "java.lang.Iterable"
+        ],
+        "has_receiver": false,
+        "id": "test.java.lang.String.join.2"
+      },
+      {
+        "name": "format",
+        "parameters": [
+          "java.lang.String",
+          "java.lang.Object[]"
+        ],
+        "has_receiver": false,
+        "id": "test.java.lang.String.format.3"
+      },
+      {
+        "name": "getBytes",
+        "parameters": [],
+        "has_receiver": true,
+        "id": "test.java.lang.String.getBytes.4"
+      },
+      {
+        "name": "isEmpty",
+        "parameters": [],
+        "has_receiver": true,
+        "id": "test.java.lang.String.isEmpty.5"
+      },
+      {
+        "name": "length",
+        "parameters": [],
+        "has_receiver": true,
+        "id": "test.java.lang.String.length.6"
+      }
+    ]
+  },
+  {
+    "name": "java.lang.AbstractStringBuilder",
+    "path": "java.base/java/lang/AbstractStringBuilder.java",
+    "supertypes": [],
+    "methods": [
+      {
+        "name": "<init>",
+        "parameters": [
+          "java.lang.String"
+        ],
+        "has_receiver": true,
+        "id": "test.java.lang.AbstractStringBuilder.<init>.0"
+      }
+    ]
+  },
+  {
+    "name": "java.lang.Iterable",
+    "path": "java.base/java/lang/Iterable.java",
+    "supertypes": [],
+    "methods": [
+      {
+        "name": "iterator",
+        "parameters": [],
+        "has_receiver": true,
+        "id": "test.java.lang.Iterable.iterator.0"
+      }
+    ]
+  },
+  {
+    "name": "java.util.ArrayList",
+    "path": "java.base/java/util/ArrayList.java",
+    "supertypes": [
+      "java.lang.Iterable"
+    ],
+    "methods": [
+      {
+        "name": "iterator",
+        "parameters": [],
+        "has_receiver": true,
+        "id": "test.java.util.ArrayList.iterator.0"
+      }
+    ]
+  },
+  {
+    "name": "java.lang.ProcessBuilder",
+    "path": "java.base/java/lang/ProcessBuilder.java",
+    "supertypes": [],
+    "methods": [
+      {
+        "name": "<init>",
+        "parameters": [
+          "java.lang.String[]"
+        ],
+        "has_receiver": true,
+        "id": "test.java.lang.ProcessBuilder.<init>.0"
+      }
+    ]
+  },
+  {
+    "name": "java.util.Map",
+    "path": "java.base/java/util/Map.java",
+    "supertypes": [],
+    "methods": [
+      {
+        "name": "computeIfAbsent",
+        "parameters": [
+          "java.lang.Object",
+          "java.util.function.Function"
+        ],
+        "has_receiver": true,
+        "id": "test.java.util.Map.computeIfAbsent.0"
+      },
+      {
+        "name": "copyOf",
+        "parameters": [
+          "java.util.Map"
+        ],
+        "has_receiver": false,
+        "id": "test.java.util.Map.copyOf.1"
+      }
+    ]
+  },
+  {
+    "name": "java.lang.Runtime",
+    "path": "java.base/java/lang/Runtime.java",
+    "supertypes": [],
+    "methods": [
+      {
+        "name": "exec",
+        "parameters": [
+          "java.lang.String[]"
+        ],
+        "has_receiver": true,
+        "id": "test.runtime.exec"
+      }
+    ]
+  }
+]

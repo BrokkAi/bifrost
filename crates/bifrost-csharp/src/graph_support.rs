@@ -130,10 +130,6 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
         candidate: &ProjectFile,
     ) -> Option<CSharpCompilationVisibility>;
 
-    /// An owned handle to this source, for a view that must outlive the
-    /// borrow it was reached through.
-    fn shared_source(&self) -> Arc<dyn CSharpSource>;
-
     /// `code_unit`'s direct logical ancestors with every input read through
     /// `view`: its partial parts, each part's base list and the candidates
     /// of the base names. A view that filters declarations then decides each
@@ -1342,32 +1338,6 @@ pub fn usage_visible_type_candidates(
     visible_type_candidates_inner(source, token, file, name, &mut type_candidates)
 }
 
-/// Visible candidates for an AST-proven arity-free type-name role. The scope
-/// ladder is identical to ordinary C# lookup; only each fully qualified probe
-/// is allowed to widen from an absent arity-zero declaration to generic
-/// declarations with the same normalized identity.
-pub fn arity_free_visible_type_candidates(
-    source: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    name: &str,
-) -> Vec<CodeUnit> {
-    let mut type_candidates =
-        |fqn: &str| arity_free_declaration_type_candidates_by_fqn(source, fqn);
-    visible_type_candidates_inner(source, token, file, name, &mut type_candidates)
-}
-
-pub fn usage_arity_free_visible_type_candidates(
-    source: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    name: &str,
-) -> Vec<CodeUnit> {
-    let mut type_candidates =
-        |fqn: &str| usage_arity_free_type_candidates_by_fqn(source, token, fqn);
-    visible_type_candidates_inner(source, token, file, name, &mut type_candidates)
-}
-
 fn visible_type_candidates_inner<Candidates>(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
@@ -1572,6 +1542,11 @@ impl CSharpLookupContext {
         scopes.push(compilation_scope);
 
         Some(Self { scopes })
+    }
+
+    /// The namespace declared nearest the node; empty in the global namespace.
+    pub fn namespace(&self) -> &str {
+        &self.scopes[0].namespace
     }
 }
 
@@ -1939,10 +1914,11 @@ where
             );
         }
 
-        if scope.namespace.is_empty() {
-            // Both compilation-unit imports and workspace global usings have
-            // compilation-wide scope. Keep them in one ambiguity tier instead
-            // of returning the first group's candidates early.
+        if scope.namespace.is_empty() && visible.is_empty() {
+            // Global usings come from the whole workspace, not from the
+            // reference's compilation, so they may not apply here. A
+            // compilation-unit import that names the type therefore wins
+            // rather than being made ambiguous by them (#2060).
             if !continue_lookup() {
                 return None;
             }
@@ -2710,6 +2686,71 @@ mod lookup_context_tests {
     }
 
     #[test]
+    fn namespace_grammar_boundaries_preserve_relative_and_global_imports() {
+        // The reference node is the class itself: a file namespace can end
+        // exactly at its start, and a compilation using can end at the
+        // namespace's start. Whitespace has no semantic significance.
+        let inventory = "namespace Lib { class T {} } namespace App.Lib { class T {} } namespace App { class T {} }";
+        let file = ProjectFile::new(std::env::temp_dir(), "Types.cs");
+        let tree = parsed_tree(inventory);
+        let declarations = crate::declarations::parse_csharp_file(&file, inventory, &tree);
+        let mut by_fqn: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        for declaration in declarations.declarations() {
+            by_fqn
+                .entry(declaration.fq_name())
+                .or_default()
+                .push(declaration.clone());
+        }
+        let namespaces = ["Lib", "App.Lib", "App"];
+        for (source, spelling, expected) in [
+            ("namespace App;class C{T field;}", "T", "App.T"),
+            ("using Lib;namespace Other;class C{T field;}", "T", "Lib.T"),
+            (
+                "namespace App{using Lib;class C{T field;}}",
+                "T",
+                "App.Lib.T",
+            ),
+            (
+                "namespace App{using A=Lib.T;class C{A field;}}",
+                "A",
+                "App.Lib.T",
+            ),
+            (
+                "namespace App{using A=global::Lib.T;class C{A field;}}",
+                "A",
+                "Lib.T",
+            ),
+        ] {
+            for separator in ["", "\n "] {
+                let source = source.replace(';', &format!(";{separator}"));
+                let tree = parsed_tree(&source);
+                assert!(!tree.root_node().has_error(), "{source}");
+                let mut pending = vec![tree.root_node()];
+                let class = loop {
+                    let node = pending.pop().expect("class declaration exists");
+                    if node.kind() == "class_declaration" {
+                        break node;
+                    }
+                    pending.extend(node.named_children(&mut node.walk()));
+                };
+                let context =
+                    CSharpLookupContext::at(&source, class, || true).expect("context completes");
+                let mut candidates = by_fqn.clone();
+                if expected != "App.T" {
+                    candidates.remove("App.T");
+                }
+                let actual =
+                    lookup(&context, spelling, &candidates, &namespaces).expect("lookup completes");
+                assert_eq!(
+                    actual.iter().map(CodeUnit::fq_name).collect::<Vec<_>>(),
+                    vec![expected],
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn context_keeps_nested_and_sibling_using_scopes_separate() {
         let source = r#"
 namespace Outer {
@@ -2860,7 +2901,7 @@ namespace Nested {
     }
 
     #[test]
-    fn compilation_imports_keep_one_ambiguity_tier_after_global_namespace_types() {
+    fn compilation_imports_precede_global_usings_after_global_namespace_types() {
         let source = r#"
 using FileImport;
 namespace Outer { class Current { Service field; } }
@@ -2897,9 +2938,12 @@ namespace GlobalImport { class Service {} }
         .map(|types| types.declarations)
         .expect("lookup completes");
         assert_eq!(
-            imported.len(),
-            2,
-            "ordinary and global usings share an ambiguity tier"
+            imported
+                .iter()
+                .map(CodeUnit::package_name)
+                .collect::<Vec<_>>(),
+            ["FileImport"],
+            "a compilation-unit using precedes a workspace global using (#2060)"
         );
 
         by_fqn.insert(

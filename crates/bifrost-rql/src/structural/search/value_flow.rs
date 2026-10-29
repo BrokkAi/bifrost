@@ -127,6 +127,14 @@ impl ValueFlowQueryState {
         ) {
             Ok(registration) => registration,
             Err(error) => {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=session:value_flow detail={error:?}",
+                        file!(),
+                        line!()
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
                 self.push_context_error(error);
                 return Vec::new();
             }
@@ -172,6 +180,14 @@ impl ValueFlowQueryState {
                     Ok(solved) => solved,
                     Err(error) => {
                         self.work.failed_solves = self.work.failed_solves.saturating_add(1);
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=provider:value_flow_solver detail={error:?}",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        workspace.analyzer().mark_execution_dependent();
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::ValueFlowProviderFailed,
@@ -206,6 +222,14 @@ impl ValueFlowQueryState {
                     SolverTermination::ExceededBudget(exceeded) => {
                         self.work.budget_exhausted_solves =
                             self.work.budget_exhausted_solves.saturating_add(1);
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=budget:solver",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        workspace.analyzer().mark_execution_dependent();
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted,
@@ -452,6 +476,14 @@ impl ValueFlowQueryState {
                 self.work.witness_truncated = true;
             }
             if removed_steps > 0 {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=budget:witness_steps",
+                        file!(),
+                        line!()
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
@@ -460,6 +492,14 @@ impl ValueFlowQueryState {
                     ),
                 );
             } else if witness.truncated() {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=budget:witness",
+                        file!(),
+                        line!()
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,

@@ -1414,6 +1414,52 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
                     },
                 );
             }
+            // Retain qualified paths only after selected resolution proved
+            // that their prefix left the workspace. In particular a local
+            // module named std never supplies a standard-root proof.
+            if !self.source.is_import {
+                let mut paths = Vec::new();
+                if let Some(resolved) = &self.resolved {
+                    if let ResolutionCompletion::Incomplete(reasons) = &resolved.completion {
+                        for reason in reasons.iter() {
+                            if let ResolutionIncompleteReason::OpenBoundary { semantic, .. } =
+                                reason
+                            {
+                                paths.extend(
+                                    self.rows
+                                        .ready
+                                        .context_identities
+                                        .external_type_import_paths(*semantic),
+                                );
+                            }
+                        }
+                    }
+                    if paths.is_empty()
+                        && let Some(root) = self.prefix_spelling.as_deref()
+                        && matches!(root, "std" | "core" | "alloc")
+                    {
+                        paths.push(vec![root.to_owned()]);
+                    }
+                } else if route
+                    .first()
+                    .is_some_and(|root| matches!(root.spelling(), "std" | "core" | "alloc"))
+                    || (route.is_empty() && matches!(demand.spelling(), "std" | "core" | "alloc"))
+                {
+                    paths.push(Vec::new());
+                }
+                for path in &mut paths {
+                    path.extend(route.iter().map(|segment| segment.spelling().to_owned()));
+                    path.push(demand.spelling().to_owned());
+                }
+                if !paths.is_empty() {
+                    associations.push(
+                        super::super::demand_closure::ContextAssociation::ExternalTypeImport {
+                            boundary: self.source.token,
+                            paths,
+                        },
+                    );
+                }
+            }
             if self.external_root_bindings.is_empty() {
                 self.external_root_bindings.push(self.source.token);
             }

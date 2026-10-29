@@ -26,8 +26,6 @@ use brokk_bifrost_analysis::analyzer::store::Result;
 
 use brokk_bifrost_analysis::analyzer::store::StoreError;
 
-use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::NativeWorkspaceGraphBuilder;
-
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
 
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
@@ -194,12 +192,13 @@ pub fn build_go_native_workspace_graph_for_files(
         // stage. Filtering here would lose the requested caller's evidence.
         admitted_callers.insert(file.clone());
     }
-    let Some(mut builder) = NativeWorkspaceGraphBuilder::new(go, &admitted_callers, cancellation)
-    else {
-        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-    };
     let mut receiver_type_file = None::<(ProjectFile, Box<[(usize, usize)]>)>;
 
+    let mut completion =
+        brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete;
+    let projection = brokk_bifrost_analysis::analyzer::store_bridge::native_graph::project_native_workspace_graph(
+        go, &mut operation, &admitted_callers, UsageEcosystem::Go, cancellation,
+        |operation, builder| {
     let staged = operation.stage_go_graph_reference_edge_batches_in_files(
         go,
         base_profile,
@@ -256,43 +255,33 @@ pub fn build_go_native_workspace_graph_for_files(
             Ok(())
         },
     )?;
-    let (summary, skipped) = match staged {
-        SelectedResolutionOperationOutcome::Native(result) => (result.summary, result.skipped),
-        SelectedResolutionOperationOutcome::Cancelled(_) => {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-        }
-        SelectedResolutionOperationOutcome::Stale(_) => {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale);
-        }
-        SelectedResolutionOperationOutcome::Unavailable(reason) => {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
-                format!("{reason:?}"),
-            ));
-        }
-    };
-    let completion = summary
-        .completion()
-        .combine(summary.reference_enumeration_completion());
-    let projection = builder.finish(
-        &mut operation,
-        summary,
-        skipped,
-        admitted_callers,
-        UsageEcosystem::Go,
-        cancellation,
+            if let SelectedResolutionOperationOutcome::Native(result) = &staged {
+                completion = result.summary.completion().combine(result.summary.reference_enumeration_completion());
+            }
+            Ok(staged)
+        },
     )?;
     let mut domain_failures = BTreeSet::new();
+    let mut import_failures = BTreeSet::new();
     for publication in operation.bound_go_context_publications() {
         if let Some(failure) = operation.go_domain_discovery_failure(publication.context_id)? {
             domain_failures.insert(failure);
         }
+        import_failures
+            .extend(operation.go_import_discovery_failures(publication.context_id, caller_files)?);
     }
+    let unknown_domain_inventory = !domain_failures.is_empty();
+    domain_failures.extend(import_failures);
     let projection = if !domain_failures.is_empty() {
         match projection {
             SelectedWorkspaceUsageGraphProjectionOutcome::Complete(mut graph)
             | SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(mut graph) => {
                 graph.domain_discovery_failures = domain_failures.into_iter().collect();
-                graph.unresolved_names = None;
+                // A failed import has known withheld sites; only a failed
+                // whole-domain listing leaves the inbound name domain open.
+                if unknown_domain_inventory {
+                    graph.unresolved_names = None;
+                }
                 SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph)
             }
             other => other,

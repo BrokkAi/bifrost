@@ -31,8 +31,12 @@ pub fn overlay(
     super::composition::freeze_symbol_order(&mut symbols);
     super::composition::freeze_relation_order(relations.iter_mut());
     let mut overlay = SemanticModelOverlay {
+        active_models: None,
         row_source: None,
+        selected_source: None,
         active_model_set_hash: "test".to_string(),
+        model_member_cache: moka::sync::Cache::new(128),
+        model_result_cache: moka::sync::Cache::new(128),
         composition_diagnostics: Vec::new(),
         extraction_gaps: Vec::new(),
         extraction_gap_by_declaration: HashMap::default(),
@@ -151,6 +155,8 @@ pub fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
         locator_path: None,
         locator_symbol: None,
         rust_generated_scope: None,
+        promoted_from: None,
+        members_state: brokk_bifrost_semantic::analyzer::semantic_model::ModelMembersState::Exact,
         location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
             uri: format!("bifrost-model://v1/{qualified_name}"),
             range: SemanticModelRange {
@@ -212,6 +218,8 @@ pub fn method(
         locator_path: None,
         locator_symbol: None,
         rust_generated_scope: None,
+        promoted_from: None,
+        members_state: brokk_bifrost_semantic::analyzer::semantic_model::ModelMembersState::Exact,
         location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
             uri: format!("bifrost-model://v1/{}", owner.qualified_name),
             range: SemanticModelRange {
@@ -245,4 +253,63 @@ pub fn extends(from: &SemanticModelSymbol, to: &str) -> SemanticModelRelation {
         declaration_ordinal: Some(0),
         provenance: provenance(SemanticModelCompleteness::Complete),
     }
+}
+
+/// The record-only test constructor has no active shards to decode. Treat its
+/// explicitly supplied projected symbols as the test input; production eager
+/// overlays always retain their decoded-shard source.
+pub(super) fn selected_fixture_groups(
+    symbols: &[std::sync::Arc<SemanticModelSymbol>],
+    language: &str,
+    reference: &super::TypeRef,
+    selection: &super::ModelProviderSelection,
+    cancellation: &crate::CancellationToken,
+) -> Result<Vec<Vec<SemanticModelSymbol>>, super::SemanticModelOverlayBuildError> {
+    let mut symbols = symbols
+        .iter()
+        .filter(|s| {
+            s.language == language && selection.contains(&super::ModelProvider::from(&s.provenance))
+        })
+        .map(|s| (**s).clone())
+        .collect::<Vec<_>>();
+    super::model_composition_language(language).augment_group(
+        &mut symbols,
+        &mut Vec::new(),
+        cancellation,
+    )?;
+    let groups = super::composition::alias_groups(&symbols, cancellation)?;
+    Ok(groups
+        .into_iter()
+        .filter_map(|owners| {
+            let selected = owners.iter().any(|&index| match reference {
+                super::TypeRef::Named { name, .. } => {
+                    symbols[index].qualified_name == *name || symbols[index].aliases.contains(name)
+                }
+                super::TypeRef::Declared { id, .. } => {
+                    symbols[index].id == *id
+                        || symbols.iter().any(|member| {
+                            member.id == *id
+                                && member.owner_id.as_deref() == Some(symbols[index].id.as_str())
+                                && super::ModelProvider::from(&member.provenance)
+                                    == super::ModelProvider::from(&symbols[index].provenance)
+                        })
+                }
+                _ => false,
+            });
+            selected.then(|| {
+                symbols
+                    .iter()
+                    .filter(|s| {
+                        owners.iter().any(|&index| {
+                            let owner = &symbols[index];
+                            (s.id == owner.id || s.owner_id.as_deref() == Some(owner.id.as_str()))
+                                && super::ModelProvider::from(&s.provenance)
+                                    == super::ModelProvider::from(&owner.provenance)
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+        })
+        .collect())
 }

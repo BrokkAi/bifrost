@@ -194,6 +194,9 @@ pub(super) struct DispatchArm {
 
 #[derive(Debug, Clone)]
 pub(super) struct DispatchCallContext {
+    /// Internal oracle proof; not a public row field.
+    pub(super) member_receiver_preparation:
+        Option<crate::analyzer::semantic::MemberReceiverPreparation>,
     /// Stable identity of the semantic procedure that owns this call site.
     /// Anonymous procedures share their enclosing declaration, so this is
     /// required when a query is scoped to one exact procedure row.

@@ -1,0 +1,25 @@
+SOURCE export default class extends Base { constructor(){ function unrelated(){this.foreign=1;} this.own=1; } run(){} }
+Class [("Type", "default")] lookup=false signatures=["export default class extends Base {"] labels=[] supers=["Base"]
+Field [("Type", "default"), ("Member", "own")] lookup=false signatures=["this.own=1"] labels=[] supers=[]
+Function [("Type", "default"), ("Member", "constructor")] lookup=false signatures=["function constructor() ..."] labels=[([], false, true)] supers=[]
+Function [("Type", "default"), ("Member", "run")] lookup=false signatures=["function run() ..."] labels=[([], false, false)] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Type", "default")])
+SOURCE export default class	 extends  makeBase(1)
+ {run(){}}
+Class [("Type", "default")] lookup=false signatures=["export default class extends makeBase(1) {"] labels=[] supers=[]
+Function [("Type", "default"), ("Member", "run")] lookup=false signatures=["function run() ..."] labels=[([], false, false)] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Type", "default")])
+SOURCE export default async function(value){return value;}
+Function [("Member", "default")] lookup=false signatures=["export default async function(value) ..."] labels=[(["value"], true, false)] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Member", "default")])
+SOURCE export default class {run(){}}
+Class [("Type", "default")] lookup=false signatures=["export default class {"] labels=[] supers=[]
+Function [("Type", "default"), ("Member", "run")] lookup=false signatures=["function run() ..."] labels=[([], false, false)] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Type", "default")])
+SOURCE exports.run=function(input, options){return input;};
+Function [("Member", "run")] lookup=false signatures=["exports.run = function(input, options) ..."] labels=[(["input", "options"], true, false)] supers=[]
+export Some("run") Local { local_name: "run" }

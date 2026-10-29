@@ -257,7 +257,26 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             owner: None,
             type_owner: None,
         }];
+        // A template's TypeBody scope spans its whole declaration, header
+        // included. A qualified parent's type-constructor path (`replica.Base` in
+        // `extends replica.Base`) cannot name the template's own members,
+        // inherited or declared, nor its type or value parameters, so it is
+        // looked up in the scope enclosing the template. Looking it up in the
+        // template's own scope made a qualified parent wait on the hierarchy
+        // that the parent itself establishes (#5104). Type arguments and
+        // parent constructor arguments keep the template scope. The path still
+        // belongs to the template whose header contains it, so its references
+        // carry explicit containment rows instead of the enclosing scope's
+        // owner.
+        let mut parent_path_scopes = HashMap::<usize, ResolutionScopeId>::default();
+        let mut parent_paths = Vec::new();
         while let Some(item) = stack.pop() {
+            let item = WalkItem {
+                scope: parent_path_scopes
+                    .remove(&item.node.id())
+                    .unwrap_or(item.scope),
+                ..item
+            };
             let node = item.node;
             if node.is_error() || node.is_missing() {
                 let site =
@@ -372,6 +391,24 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
 
             let (child_scope, child_owner, child_type_owner) =
                 self.scope_for_children(node, item.scope, child_owner, child_type_owner);
+            if child_scope != item.scope {
+                for (_, lookup) in scala_supertype_lookup_nodes(node) {
+                    // A bare parent name is resolved by the hierarchy's local
+                    // lexical batch, which never waits on the owner's own
+                    // inherited branch, so it keeps the template scope until
+                    // the enclosing scope ranks same-unit definitions above a
+                    // positioned wildcard import (#7814).
+                    if lookup.kind() == "type_identifier" {
+                        continue;
+                    }
+                    parent_path_scopes.insert(lookup.id(), item.scope);
+                    let template = self
+                        .scope(child_scope)
+                        .owner
+                        .expect("a template scope has its declaration owner");
+                    parent_paths.push((lookup, template));
+                }
+            }
             let mut cursor = node.walk();
             let children = node.named_children(&mut cursor).collect::<Vec<_>>();
             for child in children.into_iter().rev() {
@@ -381,6 +418,43 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     owner: child_owner,
                     type_owner: child_type_owner,
                 });
+            }
+        }
+        let mut owned = self
+            .facts
+            .reference_owners
+            .iter()
+            .map(|row| row.reference)
+            .collect::<HashSet<_>>();
+        for (lookup, template) in parent_paths {
+            let mut nodes = vec![lookup];
+            while let Some(node) = nodes.pop() {
+                nodes.extend(node.named_children(&mut node.walk()));
+                for site in [
+                    self.sites_by_node.get(&node.id()),
+                    self.qualified_type_prefixes.get(&node.id()),
+                ]
+                .into_iter()
+                .flatten()
+                .copied()
+                {
+                    let is_reference = self
+                        .facts
+                        .identifiers
+                        .iter()
+                        .find(|identifier| identifier.site == site)
+                        .is_some_and(|identifier| {
+                            identifier.role == ResolutionIdentifierRole::Reference
+                        });
+                    if is_reference && owned.insert(site) {
+                        self.facts
+                            .reference_owners
+                            .push(ResolutionReferenceOwnerFact {
+                                reference: site,
+                                owner: Some(template),
+                            });
+                    }
+                }
             }
         }
     }

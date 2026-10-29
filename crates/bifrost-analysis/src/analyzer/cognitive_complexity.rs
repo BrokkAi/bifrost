@@ -203,7 +203,9 @@ fn walk(root: Node<'_>, source: &str, config: &Config, mode: WalkMode) -> WalkRe
                 &mut work,
                 node,
                 child_nesting,
-                frame.root && !named_boundary,
+                // Only the callable itself is exempt from ownership boundaries.
+                // The legacy scorer retains its historical wrapper traversal.
+                mode == WalkMode::Legacy && frame.root && !named_boundary,
             );
         }
     }
@@ -228,7 +230,13 @@ fn push_if_children<'tree>(
     // Iterate in reverse so children pop in source order from the stack.
     for child in children.into_iter().rev() {
         let kind = child.kind();
-        if slice_contains(config.else_clause_types, kind) {
+        // A grammar may use the same wrapper kind for both arms. A
+        // consequence wrapper cannot continue an else-if chain.
+        if slice_contains(config.else_clause_types, kind)
+            && node
+                .child_by_field_name("consequence")
+                .is_none_or(|consequence| !same_node(consequence, child))
+        {
             if let Some(else_if) = direct_named_child_matching(child, |k| config.is_any_if(k)) {
                 work.push(Frame {
                     node: else_if,
@@ -323,10 +331,10 @@ fn is_labeled_jump(node: Node<'_>) -> bool {
 /// same operator (`a && b && c`) collapse to one; alternations (`a && b || c`)
 /// count once per distinct adjacent operator. Mirrors brokk-shared exactly.
 fn logical_operator_sequence_count(node: Node<'_>, source: &str, config: &Config) -> u32 {
-    // Operators are recorded in reverse-source order during the DFS below,
-    // then read back in reverse to recover source order. Keep that
-    // invariant — flipping the traversal order changes the alternation
-    // counting on chains like `a && b || c`.
+    // Preserve brokk-shared's traversal order: parent operators are recorded
+    // before queued binary operands, then the collection is read in reverse.
+    // This compatibility ordering differs from infix source order on trees
+    // with binary operands on both sides.
     let mut operators: Vec<String> = Vec::new();
     let mut work: Vec<Node<'_>> = vec![node];
     while let Some(current) = work.pop() {
@@ -384,4 +392,86 @@ where
     brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
         pred(child.kind())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive as first_node;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: callable metrics included lambda bodies and omitted straight-line spans"
+    )]
+    fn callable_metrics_own_only_the_root_callable_body() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let config = &brokk_bifrost_jvm::java::adapter::JAVA_COGNITIVE_CONFIG;
+        let source = "class A { void f() {\nRunnable r = () -> {\nif (ready) { if (again) ping(); }\n};\nping();\n} }";
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let method = first_node(tree.root_node(), "method_declaration").unwrap();
+        let metrics = compute_metrics(method, source, config);
+        assert_eq!(metrics.cognitive_complexity, Some(0));
+        assert_eq!(metrics.max_nesting, Some(0));
+        assert_eq!(metrics.owned_body_span_lines, Some(4));
+        // The legacy MCP scorer deliberately includes the lambda at nesting 1.
+        assert_eq!(compute(method, source, config), 5);
+        let lambda = first_node(method, "lambda_expression").unwrap();
+        let nested = compute_metrics(lambda, source, config);
+        assert_eq!(nested.cognitive_complexity, Some(3));
+        assert_eq!(nested.max_nesting, Some(2));
+        assert_eq!(nested.owned_body_span_lines, Some(1));
+        // Executable lines are numbered independently of the scorer. These
+        // cover inclusive spans on either side of the 50-line policy boundary.
+        for lines in [1, 50, 51] {
+            let source = format!(
+                "class A {{ void f() {{\n{}\n}} }}",
+                vec!["ping();"; lines].join("\n")
+            );
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let method = first_node(tree.root_node(), "method_declaration").unwrap();
+            let metrics = compute_metrics(method, &source, config);
+            assert_eq!(metrics.coverage, CallableMetricsCoverage::Exact);
+            assert_eq!(metrics.owned_body_span_lines, Some(lines as u32));
+            assert_eq!(metrics.cognitive_complexity, Some(0));
+            assert_eq!(metrics.max_nesting, Some(0));
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: an unbraced Kotlin consequence was flattened as an else-if"
+    )]
+    fn kotlin_consequence_and_alternative_wrappers_have_distinct_nesting() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::kotlin::language::LANGUAGE.into())
+            .unwrap();
+        let config = &brokk_bifrost_jvm::kotlin::adapter::KOTLIN_COGNITIVE_CONFIG;
+        for (source, expected) in [
+            ("fun f() { if (a) if (b) ping() }", 3),
+            ("fun f() { if (a) ping() else if (b) ping() }", 2),
+            ("fun f() { if (a) { if (b) ping() } }", 3),
+            ("fun f() { if (a) ping() else while (b) ping() }", 3),
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let callable = first_node(tree.root_node(), "function_declaration").unwrap();
+            assert_eq!(
+                compute(callable, source, config),
+                expected,
+                "{source}: {}",
+                callable.to_sexp()
+            );
+        }
+    }
 }

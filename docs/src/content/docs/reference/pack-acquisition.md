@@ -224,3 +224,20 @@ Do not publish caches containing private content to a shared cache.
 is sent in the authorization header for GitHub API and asset requests. Never
 put the token in a URL or request document. Receipts, outcomes, and log messages
 must not contain the token.
+
+### Catalogs in policy bundles
+
+A schema-1 `policy-bundle.json` index may include an optional `catalogs` array:
+
+```json
+{"catalogs": [{"path": "catalogs/sinks.json", "semantic_hash": "<64-lowercase-hex>"}]}
+```
+
+Each path must also appear in `files`, whose SHA-256 and size are verified
+before registration. `semantic_hash` separately pins the canonical typed catalog
+content, using the same entry format as a rule pack manifest's `catalogs` array.
+Omission means no catalogs, preserving existing bundles. Catalogs are registered
+for each coordinator run, including catalogs from bundles whose policies were
+not selected. Bundle policies retain their explicit-selection behavior.
+Catalog category declarations and wildcard selection are described in the
+[policy reference](./policies/#catalog).

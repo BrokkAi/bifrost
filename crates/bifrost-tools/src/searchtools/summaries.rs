@@ -813,23 +813,26 @@ pub(crate) fn skim_files_for_files(
     let total_files = files.len();
     let truncated = total_files > FILE_SKIM_LIMIT;
     let selected = select_files_for_display(analyzer, files, FILE_SKIM_LIMIT);
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let mut files: Vec<_> = selected
         .into_par_iter()
         .map(|file| {
-            let lines: Vec<_> = analyzer
-                .list_symbols(&file)
-                .lines()
-                .map(str::to_string)
-                .collect();
-            let path = rel_path_string(&file);
-            // Line count is rendering metadata alongside `list_symbols`,
-            // which already reads the analyzed snapshot; use the same
-            // snapshot here instead of a fresh disk read for consistency.
-            let loc = analyzer
-                .indexed_source(&file)
-                .map(|content| line_count(&content))
-                .unwrap_or(0);
-            SkimFile { path, loc, lines }
+            attribution.run(|| {
+                let lines: Vec<_> = analyzer
+                    .list_symbols(&file)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                let path = rel_path_string(&file);
+                // Line count is rendering metadata alongside `list_symbols`,
+                // which already reads the analyzed snapshot; use the same
+                // snapshot here instead of a fresh disk read for consistency.
+                let loc = analyzer
+                    .indexed_source(&file)
+                    .map(|content| line_count(&content))
+                    .unwrap_or(0);
+                SkimFile { path, loc, lines }
+            })
         })
         .collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -906,9 +909,13 @@ fn summarize_files_with_cancellation(
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> SummaryResult {
     let _scope = profiling::scope("searchtools::summarize_files");
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let mut summaries: Vec<_> = files
         .into_par_iter()
-        .filter_map(|file| summary_block_for_file_with_cancellation(analyzer, &file, cancellation))
+        .filter_map(|file| {
+            attribution
+                .run(|| summary_block_for_file_with_cancellation(analyzer, &file, cancellation))
+        })
         .collect();
     summaries.sort_by(|left, right| {
         left.path

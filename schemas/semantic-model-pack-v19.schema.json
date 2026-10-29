@@ -1970,7 +1970,7 @@
           "$ref": "#/$defs/AuthoredSummaryOutput"
         },
         "value_transfer": {
-          "description": "Optional identity-separating value-transfer semantics for this core\ntransfer. The endpoints remain the core transfer's ports; this field\nonly classifies the value/identity relationship and selected\noperation. Omission means this profile was not reviewed.",
+          "description": "Optional value/identity relationship and selected operation for this\ntransfer's ports. Omission is unreviewed and supplies taint dependency\nonly, without object identity. On a receiver-to-normal-return transfer,\nConversion with Identity means the result denotes the receiver object.\nSummary transfers are never lowered to IR Transfer edges; the IR rule\nthat separates storage identity does not apply here.",
           "anyOf": [
             {
               "$ref": "#/$defs/SummaryValueTransfer"
@@ -6968,6 +6968,7 @@
           }
         },
         "returns": {
+          "description": "None means the callable declares no results. A producer that cannot\ndecode a declared result writes TypeRef::Unknown; it never omits\n`returns`. Several producers do not conform yet (#7570).",
           "anyOf": [
             {
               "$ref": "#/$defs/TypeRef"
@@ -7142,16 +7143,24 @@
       ]
     },
     "SummaryValuePreservation": {
-      "type": "string",
-      "enum": [
-        "identity",
-        "preserving",
-        "changing",
-        "unknown"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "preserving",
+            "changing",
+            "unknown"
+          ]
+        },
+        {
+          "description": "On a receiver-to-normal-return summary transfer, the result denotes\nthe receiver object. Summary transfers are never lowered to IR Transfer\nedges, whose storage-separating rule does not apply here.",
+          "type": "string",
+          "const": "identity"
+        }
       ]
     },
     "SummaryValueTransfer": {
-      "description": "Typed identity-separating semantics attached to one procedure-summary\ntransfer. This is intentionally separate from the core transfer endpoints\nso a consumer can distinguish value-flow coverage from profile coverage.",
+      "description": "Typed value/identity semantics attached to one procedure-summary\ntransfer. This is intentionally separate from the core transfer endpoints\nso a consumer can distinguish value-flow coverage from profile coverage.",
       "type": "object",
       "properties": {
         "kind": {

@@ -2193,7 +2193,9 @@ fn record_unresolved_module_specifier(
     module: &str,
     aliases: Option<&AliasResolver>,
 ) {
-    if !analyzer.read_ledger_attached() {
+    if !brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        analyzer.read_ledger_attached()
+    }) {
         return;
     }
     for candidate in js_ts_module_specifier_probed_paths(file, module, language, aliases) {

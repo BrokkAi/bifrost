@@ -61,11 +61,10 @@ use super::resolution::{
 
 use super::resolution_prepare::resolution_rows::{
     ParsedEndpointCells, ParsedPathBody, PathBodyContext, RESOLUTION_FORWARD_CANDIDATE_MATCH_SQL,
-    RESOLUTION_IDENTITY_RECIPES_SQL, RESOLUTION_PATHS_BY_KEY_SQL,
-    RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL, RESOLUTION_ROOT_TERMINAL_PATHS_SQL,
-    RESOLUTION_SITES_BY_KEY_SQL, RootKeyBuilder, covers_candidate_endpoint,
-    covers_candidate_inventory, decode_lookup_recipe, decode_path_row, decode_selected_endpoint,
-    decode_stored_lookup_recipe, parse_endpoint_cells, parse_path_body,
+    RESOLUTION_PATHS_BY_KEY_SQL, RESOLUTION_REVERSE_CANDIDATE_MATCH_SQL,
+    RESOLUTION_ROOT_TERMINAL_PATHS_SQL, RESOLUTION_SITES_BY_KEY_SQL, RootKeyBuilder,
+    covers_candidate_endpoint, covers_candidate_inventory, decode_lookup_recipe, decode_path_row,
+    decode_selected_endpoint, parse_endpoint_cells, parse_path_body,
 };
 
 use super::resolution_selection::{
@@ -1268,6 +1267,62 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         )))
     }
 
+    /// Exact binding-target and authored-definition identities for one batch.
+    /// The semantic-sites crosswalk is published from aligned lexical semantics;
+    /// source site numbers alone are not runtime semantic keys.
+    #[doc(hidden)]
+    pub fn binding_declaration_projection_facts(
+        &self,
+        batch: &crate::analyzer::resolution::FactReferenceBatchAnswer,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<(SemanticId, SemanticId)>> {
+        let mut ordinary = BTreeMap::<SelectedResolutionMountOrdinal, Vec<u32>>::new();
+        for answer in batch.answers() {
+            if let (Some(ordinal), Some(key)) =
+                (answer.reference().ordinal(), answer.reference().local_key())
+            {
+                let ordinal = SelectedResolutionMountOrdinal::new(ordinal);
+                if self.selected_position(ordinal).is_some() {
+                    ordinary.entry(ordinal).or_default().push(key);
+                }
+            }
+        }
+        let mut declarations = Vec::new();
+        for (ordinal, keys) in ordinary {
+            let Some(mount) = self.selected_mount(ordinal)? else {
+                continue;
+            };
+            let rows = self.authority.read_authority(&mount, cancellation, |connection| {
+                let mut statement = connection.prepare_cached(
+                    "SELECT reference.semantic_key, authored.semantic_key \
+                     FROM json_each(?2) requested \
+                     CROSS JOIN resolution_semantic_sites reference ON reference.blob_id=?1 \
+                      AND reference.semantic_role='reference' AND reference.semantic_key=requested.value \
+                     CROSS JOIN resolution_binding_events event INDEXED BY resolution_binding_events_target ON event.blob_id=reference.blob_id AND event.target=reference.source_site \
+                     LEFT JOIN resolution_semantic_sites authored ON authored.blob_id=event.blob_id \
+                      AND authored.source_site=event.authored AND authored.semantic_role='definition' \
+                     WHERE event.authored IS NOT NULL"
+                )?;
+                Ok(statement.query_map(params![mount.blob_id(), serde_json::to_string(&keys).expect("reference keys serialize")], |row| {
+                    Ok((row.get::<_, u32>(0)?, row.get::<_, Option<u32>>(1)?))
+                })?.collect::<rusqlite::Result<Vec<_>>>()?)
+            })?;
+            let Some(rows) = rows else {
+                return Ok(Vec::new());
+            };
+            for (reference, authored) in rows {
+                let authored = authored.ok_or_else(|| StoreError::corrupt(format!(
+                    "binding target {reference} lacks an aligned authored definition in {mount:?}"
+                )))?;
+                declarations.push((
+                    SemanticId::local(ordinal.get(), reference),
+                    SemanticId::local(ordinal.get(), authored),
+                ));
+            }
+        }
+        Ok(declarations)
+    }
+
     /// Query-local projection input. Names come from native lookup recipes;
     /// internal Rust references recover their source span through the existing
     /// reference-context/occurrence join, without publishing them as usages.
@@ -2337,7 +2392,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             .filter_map(|name| shared_names.to_persisted(name))
             .map(|name| i64::from(name.get()))
             .collect::<Vec<_>>();
-        let id_array = json_array(names);
+
         let stage_requests = serde_json::to_string(
             &requests
                 .iter()
@@ -2350,26 +2405,17 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
         )
         .expect("lookup recipe coordinates serialize");
         let Some(stored) = self.read_statement(cancellation, |conn| {
-            let mut statement = conn.prepare_cached(RESOLUTION_IDENTITY_RECIPES_SQL)?;
-            let mut rows = statement.query([&id_array])?;
-            let mut stored: HashMap<SemanticId, ResolutionLookupSemanticRecipe> =
-                HashMap::default();
-            while let Some(row) = rows.next()? {
-                let stored_id = SharedNameId::interned(row.get::<_, i64>(0)?);
+            let Some(recipes) = super::resolution_prepare::resolution_rows::read_stored_lookup_recipes(self.selection, &names, cancellation)? else { return Ok(None); };
+            let mut stored: HashMap<SemanticId, ResolutionLookupSemanticRecipe> = HashMap::default();
+            for (id, recipe) in recipes {
+                let stored_id = SharedNameId::interned(id);
                 let name = SemanticId::shared_name(shared_names.from_persisted(stored_id));
-                let Some(language) = row.get::<_, Option<i64>>(1)? else {
-                    continue;
-                };
-                let digest = row.get::<_, [u8; 32]>(4)?;
                 self.selection.shared_name_table().remember_stored_identity(
-                    digest,
+                    recipe.name_digest,
                     stored_id,
                     name.shared_name_id().expect("a persisted recipe has a shared name"),
                 );
-                stored.insert(
-                    name,
-                    decode_stored_lookup_recipe(language, row.get(2)?, &row.get::<_, String>(3)?, digest),
-                );
+                stored.insert(name, recipe);
             }
             if !self.selection.stage_family_is_empty(super::resolution_stage::StageFamily::Recipes)? {
             let mut statement = conn.prepare_cached(r#"
@@ -5927,8 +5973,11 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         reference: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<bool> {
-        Ok(self.semantic_language_of(reference, cancellation)?
-            == Some(crate::analyzer::Language::Java))
+        let Some(language) = self.semantic_language_of(reference, cancellation)? else {
+            return Ok(false);
+        };
+        Ok(crate::analyzer::store::store_language_support(language)
+            .is_some_and(|support| support.supports_direct_type_shapes()))
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -8689,22 +8738,11 @@ fn reference_site_metadata(
             "reference source range is reversed: {start_byte}..{end_byte}"
         )));
     }
-    if callable_receiver_origin.is_some()
-        && (namespace != ResolutionNamespace::Callable
-            || !matches!(
-                site_kind,
-                ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
-            ))
-    {
-        return Err(invalid_fact(
-            "callable receiver origin belongs to a non-callable reference",
-        ));
-    }
     if callable_receiver_origin
-        .is_some_and(|origin| !origin.is_reference_qualification_valid(unqualified))
+        .is_some_and(|origin| !origin.is_reference_valid(namespace, site_kind, unqualified))
     {
         return Err(invalid_fact(
-            "reference qualification disagrees with callable receiver origin",
+            "receiver origin belongs to an invalid callable or field reference",
         ));
     }
     Ok(Some(FactReferenceSiteMetadata::new(

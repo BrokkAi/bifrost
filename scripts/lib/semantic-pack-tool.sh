@@ -8,7 +8,7 @@ run_semantic_pack_tool() {
     }
     "${BIFROST_SEMANTIC_PACK_BIN}" "$@"
   else
-    cargo run --locked --release --features release-tooling \
+    cargo run --locked --profile measure --features release-tooling \
       -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- "$@"
   fi
 }

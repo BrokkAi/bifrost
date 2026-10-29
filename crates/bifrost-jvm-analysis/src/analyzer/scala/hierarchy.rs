@@ -65,10 +65,19 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/scala/hierarchy.rs",
+            );
 
         let ancestors = self.resolve_direct_ancestors(token, code_unit);
-        self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        {
+            let cache_key = code_unit.clone();
+            let cache_value = Arc::new(ancestors.clone());
+            persistent_fill_guard.installed("direct_ancestors");
+            self.direct_ancestors.insert(cache_key, cache_value);
+        };
         ancestors
     }
 
@@ -103,7 +112,13 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
             return None;
         }
         self.lazy_hierarchy_index
-            .get_or_init(|| self.build_lazy_hierarchy_index())
+            .get_or_init(|| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "scala.lazy_hierarchy_index",
+                    || self.build_lazy_hierarchy_index(),
+                )
+            })
             .direct_descendants_while(token, self, code_unit, scope)
     }
 }
@@ -311,7 +326,13 @@ impl ScalaAnalyzer {
     #[allow(dead_code)]
     pub(crate) fn type_relations(&self, token: QueryToken<'_>) -> &[TypeRelation] {
         self.type_relations
-            .get_or_init(|| self.collect_type_relations(token))
+            .get_or_init(|| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "scala.type_relations",
+                    || self.collect_type_relations(token),
+                )
+            })
             .as_slice()
     }
 

@@ -284,14 +284,13 @@ the completed graph unpublished.
 > **Current:** Rust and Go target-directed references resolve through the
 > [Name Resolution Engine](../name-resolution/), which stores immutable
 > file-local facts by content identity and composes them with build-unit
-> context in each query. Go's rooted and whole-workspace graphs retain the
-> incumbent backend; `BIFROST_TRIAL_NATIVE_GO_GRAPH=1` selects their native
-> provider for trial runs. Other languages persist declaration and identifier
+> context in each query. Go's rooted and whole-workspace graphs use the same
+> native engine. Other languages persist declaration and identifier
 > projections, own language-specific indexes and prepared facts, and build
 > target-directed or bulk usage products on demand. Only complete workspace
 > ranking graphs are retained under exact content keys.
 
-Languages other than Rust assemble workspace graphs by revisiting their
+Languages other than Rust and Go assemble workspace graphs by revisiting their
 resolution process. Some analyzers cache or persist file-derived inputs, and the
 declaration catalog reads persisted summary projections.
 
@@ -305,7 +304,7 @@ entry is the roadmap-level summary. The related
 [compositional resolution fragments](../storage-and-cache/#compositional-resolution-fragments)
 section covers what is stored and what is recomputed per query.
 
-The engine meets these requirements for Rust, and each language that moves onto
+The engine meets these requirements for Rust and Go, and each language that moves onto
 it must meet them too:
 
 1. A source blob and extraction-semantics version identify an immutable local

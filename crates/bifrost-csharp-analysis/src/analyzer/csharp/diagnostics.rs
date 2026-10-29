@@ -18,8 +18,9 @@
 //! discovery evidence is published on the analyzer a host ran discovery
 //! against, which in a workspace is the composite one and not the C# delegate.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use brokk_bifrost_analysis::analyzer::semantic_model::CatalogError;
 use brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryEvidence;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::producer::ProducerDiagnosticSeverity;
@@ -45,10 +46,13 @@ use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_csharp::diagnostics::{
-    CSharpExternalEvidence, CSharpExternalTypes, CSharpMemberSurface,
+    CSharpExternalEvidence, CSharpExternalNamespace, CSharpExternalTypes, CSharpMemberSurface,
 };
 
-use crate::analyzer::csharp::external::CSharpExternalDeclarationIndex;
+use crate::analyzer::csharp::external::{
+    CSharpExternalDeclarationIndex, csharp_type_reference_keys,
+};
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
@@ -73,6 +77,8 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
     let external = RetainedCSharpExternal {
         csharp,
         index: csharp.retained_external_index(),
+        overlay: analyzer.semantic_model_overlay(),
+        forward_sources_complete: OnceLock::new(),
         evidence: analyzer.dependency_discovery_evidence(Language::CSharp),
     };
     let report = brokk_bifrost_csharp::diagnostics::collect_csharp_semantic_diagnostics(
@@ -90,8 +96,14 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
 struct RetainedCSharpExternal<'a> {
     csharp: &'a CSharpAnalyzer,
     index: Option<&'a CSharpExternalDeclarationIndex>,
+    overlay: Option<Arc<SemanticModelOverlay>>,
+    forward_sources_complete: OnceLock<Result<(), SemanticDiagnosticIncompleteReason>>,
     evidence: Option<Arc<DependencyDiscoveryEvidence>>,
 }
+
+/// Constructed only after the complete retained index and readable forward
+/// rows have both ruled out every candidate. No missing-reader empty default.
+struct CompleteCSharpExternalMiss;
 
 impl RetainedCSharpExternal<'_> {
     /// Why an index that was never built cannot answer.
@@ -108,6 +120,55 @@ impl RetainedCSharpExternal<'_> {
                     boundary: BoundaryStatus::ExternalDeclaredUnindexed,
                 },
             )
+    }
+    fn complete_miss(
+        &self,
+        forwards: Result<Option<Vec<String>>, CatalogError>,
+    ) -> Result<CompleteCSharpExternalMiss, SemanticDiagnosticIncompleteReason> {
+        if let Some(reason) = self.unreadable() {
+            return Err(reason);
+        }
+        let index = self.index.expect("readable index was built");
+        let detail = match forwards {
+            Ok(Some(reasons)) if reasons.is_empty() => {
+                let coverage = self.forward_sources_complete.get_or_init(|| {
+                    let packs = index.forwarding_packs();
+                    if packs.is_empty() {
+                        return Ok(());
+                    }
+                    let complete = self.overlay.as_ref().map_or(Ok(None), |overlay| {
+                        overlay.type_forward_sources_complete(packs)
+                    });
+                    let detail = match complete {
+                        Ok(Some(true)) => return Ok(()),
+                        Ok(Some(false)) => format!(
+                            "the activated semantic-pack catalog has not read every \
+                             forwarding pack: {packs:?}"
+                        ),
+                        Ok(None) => index
+                            .unreadable_type_forwards()
+                            .expect("forwarding packs are present"),
+                        Err(error) => {
+                            format!("forwarding assembly identities are unreadable: {error}")
+                        }
+                    };
+                    Err(SemanticDiagnosticIncompleteReason::TypeForwardBoundary { detail })
+                });
+                coverage.clone()?;
+                return Ok(CompleteCSharpExternalMiss);
+            }
+            Ok(Some(reasons)) => reasons.join("; "),
+            Ok(None) => match index.unreadable_type_forwards() {
+                Some(detail) => detail,
+                // Every artifact was read and none carries forward rows, so
+                // absence does not depend on an activated catalog reader.
+                None => return Ok(CompleteCSharpExternalMiss),
+            },
+            Err(error) => format!(
+                "forward rows are unreadable in the activated semantic-pack catalog: {error}"
+            ),
+        };
+        Err(SemanticDiagnosticIncompleteReason::TypeForwardBoundary { detail })
     }
 }
 
@@ -139,16 +200,42 @@ impl CSharpExternalEvidence for RetainedCSharpExternal<'_> {
             .is_some_and(|index| index.is_complete() && index.has_dependency_inputs())
     }
 
-    fn declares_namespace(&self, namespace: &str) -> bool {
-        self.index
+    fn declares_namespace(&self, namespace: &str) -> CSharpExternalNamespace {
+        if self
+            .index
             .is_some_and(|index| index.declares_namespace(namespace))
+        {
+            return CSharpExternalNamespace::Declared;
+        }
+        let forwards = self
+            .overlay
+            .as_ref()
+            .map_or(Ok(None), |overlay| {
+                overlay.namespace_type_forward_boundaries(namespace)
+            })
+            .map(|pairs| {
+                pairs.map(|pairs| {
+                    if pairs.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![format!(
+                            "namespace {namespace} crosses forwarding assemblies: {pairs:?}"
+                        )]
+                    }
+                })
+            });
+        // The only construction of Absent requires complete-answer evidence.
+        match self.complete_miss(forwards) {
+            Ok(CompleteCSharpExternalMiss) => CSharpExternalNamespace::Absent,
+            Err(reason) => CSharpExternalNamespace::Unknown(reason),
+        }
     }
 
     fn resolve_type(&self, file: &ProjectFile, identity: &str) -> CSharpExternalTypes {
         let scope = AnalyzerQueryScope::new(self.csharp);
         let token = scope.token();
         let Some(index) = self.index else {
-            return CSharpExternalTypes::None;
+            return CSharpExternalTypes::Unknown(self.unbuilt_reason());
         };
         // The same four inputs `CSharpAnalyzer::external_type_candidates`
         // resolves with, read from the analyzer's memo cells rather than
@@ -164,7 +251,28 @@ impl CSharpExternalEvidence for RetainedCSharpExternal<'_> {
         let distinct: HashSet<&str> = matched.iter().map(|ty| ty.fqn()).collect();
         let mut identities = distinct.into_iter();
         match (identities.next(), identities.len()) {
-            (None, _) => CSharpExternalTypes::None,
+            (None, _) => {
+                let namespace = self.csharp.namespace_of_file(file);
+                let usings = self.csharp.using_namespaces_of(token, file);
+                let aliases = self.csharp.using_aliases_of(token, file);
+                let forwards = self.overlay.as_ref().map_or(Ok(None), |overlay| {
+                    let mut reasons = Vec::new();
+                    for name in csharp_type_reference_keys(identity, &namespace, &usings, &aliases)
+                    {
+                        let Some(found) = overlay.type_forward_miss_boundaries(&name)? else {
+                            return Ok(None);
+                        };
+                        reasons.extend(found);
+                    }
+                    reasons.sort();
+                    reasons.dedup();
+                    Ok(Some(reasons))
+                });
+                match self.complete_miss(forwards) {
+                    Ok(CompleteCSharpExternalMiss) => CSharpExternalTypes::None,
+                    Err(reason) => CSharpExternalTypes::Unknown(reason),
+                }
+            }
             (Some(fqn), 0) => CSharpExternalTypes::One {
                 fqn: fqn.to_string(),
             },

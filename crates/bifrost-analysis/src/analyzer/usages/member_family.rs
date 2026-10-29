@@ -166,23 +166,43 @@ pub struct MemberFamilyEdge {
     pub arity_unique: bool,
 }
 
-/// One member's complete family answer.
+/// One member's family answer.
 ///
-/// `outcome` is the whole answer. `proven` and `no_family` are complete;
-/// `incomplete` and `unsupported` never carry edges or a family id.
+/// `outcome` summarizes both directions. Ancestors close forward edges and
+/// roots; descendants close inverse edges. Incomplete answers retain established
+/// edges, but never carry a family id.
 #[derive(Debug, Clone)]
 pub struct MemberFamilyAnswer {
     pub capability: MemberFamilyCapability,
     pub outcome: MemberFamilyOutcome,
     pub reason: Option<MemberFamilyReason>,
+    pub ancestors: MemberFamilyCompleteness,
+    pub descendants: MemberFamilyCompleteness,
+    pub unread_ancestors: Vec<String>,
     /// The forward edges first, each ordered by target identity, then the
     /// bounded inversion of the same relation, likewise ordered. One vector
     /// because one walk produced both under one budget.
     pub edges: Vec<MemberFamilyEdge>,
-    /// The deterministically ordered exact roots of this member's family: the
+    /// The deterministically ordered established roots of this member's family: the
     /// members reachable by following forward edges that themselves override
     /// or implement nothing. A member with no forward edges is its own root.
     pub roots: Vec<CodeUnit>,
+}
+
+/// Completeness and its reason for one direction of a nominal family.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberFamilyCompleteness {
+    pub outcome: MemberFamilyOutcome,
+    pub reason: Option<MemberFamilyReason>,
+}
+
+impl MemberFamilyCompleteness {
+    pub fn is_proven(self) -> bool {
+        matches!(
+            self.outcome,
+            MemberFamilyOutcome::Proven | MemberFamilyOutcome::NoFamily
+        )
+    }
 }
 
 impl MemberFamilyAnswer {
@@ -199,6 +219,15 @@ impl MemberFamilyAnswer {
             capability,
             outcome,
             reason: Some(reason),
+            ancestors: MemberFamilyCompleteness {
+                outcome,
+                reason: Some(reason),
+            },
+            descendants: MemberFamilyCompleteness {
+                outcome,
+                reason: Some(reason),
+            },
+            unread_ancestors: Vec::new(),
             edges: Vec::new(),
             roots: Vec::new(),
         }
@@ -212,6 +241,21 @@ impl MemberFamilyAnswer {
 
     pub fn incomplete(capability: MemberFamilyCapability, reason: MemberFamilyReason) -> Self {
         Self::not_proven(capability, MemberFamilyOutcome::Incomplete, reason)
+    }
+
+    /// An open family whose retained edges meet the same proof standard as a
+    /// proven family's edges. The roots are those established by the walk.
+    pub fn incomplete_with_edges(
+        capability: MemberFamilyCapability,
+        reason: MemberFamilyReason,
+        edges: Vec<MemberFamilyEdge>,
+        roots: Vec<CodeUnit>,
+    ) -> Self {
+        Self {
+            edges,
+            roots,
+            ..Self::incomplete(capability, reason)
+        }
     }
 
     /// The answer for a member whose language exposes no family provider at
@@ -230,7 +274,7 @@ impl MemberFamilyAnswer {
     }
 
     pub fn is_proven(&self) -> bool {
-        self.outcome == MemberFamilyOutcome::Proven
+        self.ancestors.is_proven() && self.descendants.is_proven()
     }
 }
 
@@ -278,6 +322,15 @@ pub fn proven_member_family_answer(
         capability,
         outcome: MemberFamilyOutcome::Proven,
         reason: None,
+        ancestors: MemberFamilyCompleteness {
+            outcome: MemberFamilyOutcome::Proven,
+            reason: None,
+        },
+        descendants: MemberFamilyCompleteness {
+            outcome: MemberFamilyOutcome::Proven,
+            reason: None,
+        },
+        unread_ancestors: Vec::new(),
         edges,
         roots,
     }
@@ -362,8 +415,7 @@ pub trait MemberFamilyProvider: CapabilityProvider + Send + Sync {
     /// would pay for the forward relation twice and could cap neither.
     /// `cancellation` is checked at every visit, and a cancelled or exhausted
     /// walk answers `incomplete` with
-    /// [`MemberFamilyReason::HierarchyTruncated`] rather than a partial edge
-    /// set.
+    /// [`MemberFamilyReason::HierarchyTruncated`], retaining established edges.
     fn member_family(
         &self,
         member: &CodeUnit,
@@ -432,11 +484,10 @@ impl<'a> FamilyWalk<'a> {
 
 /// What one member's ancestor walk found.
 ///
-/// `Edges` is the only outcome the closure and the inversion continue from.
-/// `Answer` is a complete statement about that member on its own -- an
-/// exclusion, an unsupported language, or a fact the analyzer never recorded --
-/// and it is returned to the caller unchanged when the member is the queried
-/// one, or treated as "no forward edges to follow" when it is not.
+/// `Edges` carries a closed forward enumeration. `Answer` states an
+/// exclusion, an unsupported language, or an incomplete enumeration retaining
+/// established edges. Inversion can consume those edges while preserving the
+/// gap; exact root discovery requires a closed forward enumeration.
 enum ForwardStep {
     Edges {
         owner: CodeUnit,
@@ -456,12 +507,8 @@ enum ForwardStep {
 /// Bifrost parses while the file is being edited -- alternated frames until the
 /// stack overflowed.
 ///
-/// `Err` is a walk-level failure that ends the whole answer: the shared budget
-/// ran out, or the request was cancelled.
-fn forward_edges(
-    walk: &mut FamilyWalk<'_>,
-    member: &CodeUnit,
-) -> Result<ForwardStep, MemberFamilyReason> {
+/// A stopped walk returns an incomplete answer retaining the established edges.
+fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
     let language = language_for_file(member.source());
     // Two gates, and they are different questions. The first is whether this
     // rule answers for this member's language at all; the second is whether
@@ -469,31 +516,29 @@ fn forward_edges(
     // table here is what gives it teeth: removing a language from it disables
     // the provider rather than leaving a stale claim beside live code.
     if language != walk.rules.language() || !member_family_support(language).is_supported() {
-        return Ok(ForwardStep::Answer(MemberFamilyAnswer::unsupported()));
+        return ForwardStep::Answer(MemberFamilyAnswer::unsupported());
     }
     let Some(facts) = MemberFacts::read(walk.analyzer, member) else {
-        return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
+        return ForwardStep::Answer(MemberFamilyAnswer::incomplete(
             MemberFamilyCapability::Unsupported,
             MemberFamilyReason::ModifiersUnrecorded,
-        )));
+        ));
     };
     let capability = facts.capability;
     if !member.is_function() {
-        return Ok(ForwardStep::Answer(MemberFamilyAnswer::no_family(
+        return ForwardStep::Answer(MemberFamilyAnswer::no_family(
             capability,
             MemberFamilyReason::NotAMethod,
-        )));
+        ));
     }
     if let Some(reason) = walk.rules.exclusion(&facts) {
-        return Ok(ForwardStep::Answer(MemberFamilyAnswer::no_family(
-            capability, reason,
-        )));
+        return ForwardStep::Answer(MemberFamilyAnswer::no_family(capability, reason));
     }
     let Some(owner) = walk.analyzer.parent_of(member).filter(CodeUnit::is_class) else {
-        return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
+        return ForwardStep::Answer(MemberFamilyAnswer::incomplete(
             capability,
             MemberFamilyReason::OwnerUnknown,
-        )));
+        ));
     };
 
     // Breadth-first over the analyzer's own ancestor edges. A branch stops at
@@ -501,21 +546,41 @@ fn forward_edges(
     // relation is to the nearest redeclaration on that route; deeper members of
     // the same chain are reached transitively through that one's own edges.
     let mut edges: Vec<MemberFamilyEdge> = Vec::new();
+    let mut unread_ancestors = Vec::new();
     let mut seen = vec![owner.clone()];
     let mut frontier = VecDeque::from([(owner.clone(), 0_usize)]);
     while let Some((type_unit, depth)) = frontier.pop_front() {
-        for ancestor in walk.hierarchy.get_direct_ancestors(&type_unit) {
+        let ancestors = walk.hierarchy.member_family_ancestors(&type_unit);
+        for ancestor in ancestors.unread {
+            if ancestor.inventory.is_none_or(|inventory| {
+                walk.hierarchy
+                    .member_family_inventory_matches(member, inventory)
+            }) {
+                unread_ancestors.push(ancestor.name);
+            }
+        }
+        for ancestor in ancestors.resolved {
             if seen.contains(&ancestor) {
                 continue;
             }
-            walk.spend()?;
+            if let Err(reason) = walk.spend() {
+                return ForwardStep::Answer(MemberFamilyAnswer::incomplete_with_edges(
+                    capability,
+                    reason,
+                    edges,
+                    Vec::new(),
+                ));
+            }
             seen.push(ancestor.clone());
             match matching_member(walk.rules, walk.analyzer, &ancestor, &facts) {
                 AncestorMatch::None => frontier.push_back((ancestor, depth + 1)),
                 AncestorMatch::Unproven(reason) => {
-                    return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
-                        capability, reason,
-                    )));
+                    return ForwardStep::Answer(MemberFamilyAnswer::incomplete_with_edges(
+                        capability,
+                        reason,
+                        edges,
+                        Vec::new(),
+                    ));
                 }
                 AncestorMatch::One {
                     target,
@@ -531,32 +596,23 @@ fn forward_edges(
             }
         }
     }
-    if edges.is_empty() && facts.override_modifier() == Some(CallableOverrideModifier::Override) {
-        // The declaration states that it redefines an inherited member and the
-        // walk, which saw every ancestor the workspace indexes, found none. The
-        // hierarchy above this owner is therefore short: the base lives in a
-        // dependency the workspace does not index -- the .NET `object.ToString`
-        // a C# `public override string ToString()` redefines, say. That is
-        // missing evidence, not a proven empty family, so the answer is
-        // incomplete and carries no id (#1721).
-        //
-        // Stated gap: a language that records no override modifier cannot
-        // reach this. Java is the one that matters, because `@Override` is an
-        // annotation the compiler checks rather than a modifier that creates
-        // the relation, and because every Java class implicitly extends
-        // `java.lang.Object` without writing an `extends` clause the walk can
-        // see. A Java `toString` therefore still answers `proven` with no
-        // edges. Closing that needs the activated dependency-pack overlay's
-        // universal root, which is tracked as the next tranche of this issue
-        // and pinned by
-        // `java_tostring_over_an_unindexed_jdk_is_a_stated_gap`.
-        return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
+    unread_ancestors.sort();
+    unread_ancestors.dedup();
+    if !unread_ancestors.is_empty()
+        || (edges.is_empty()
+            && facts.override_modifier() == Some(CallableOverrideModifier::Override))
+    {
+        let mut answer = MemberFamilyAnswer::incomplete_with_edges(
             capability,
             MemberFamilyReason::AncestorExternalUnindexed,
-        )));
+            edges,
+            Vec::new(),
+        );
+        answer.unread_ancestors = unread_ancestors;
+        return ForwardStep::Answer(answer);
     }
     edges.sort_by(|left, right| left.target.cmp(&right.target));
-    Ok(ForwardStep::Edges { owner, edges })
+    ForwardStep::Edges { owner, edges }
 }
 
 /// One member's family in both directions for a language whose overriding is
@@ -589,23 +645,53 @@ pub fn nominal_member_family(
 ) -> MemberFamilyAnswer {
     let capability = nominal_member_family_capability(analyzer, rules, member);
     let mut walk = FamilyWalk::new(analyzer, hierarchy, rules, cancellation);
-    let (owner, mut edges) = match forward_edges(&mut walk, member) {
-        Err(reason) => return MemberFamilyAnswer::incomplete(capability, reason),
-        Ok(ForwardStep::Answer(answer)) => return answer,
-        Ok(ForwardStep::Edges { owner, edges }) => (owner, edges),
-    };
-    let roots = match family_roots(&mut walk, member, &edges) {
-        Ok(roots) => roots,
-        Err(reason) => return MemberFamilyAnswer::incomplete(capability, reason),
-    };
-    match inverse_edges(&mut walk, member, owner) {
-        Ok(inverse) => edges.extend(inverse),
-        Err(reason) => return MemberFamilyAnswer::incomplete(capability, reason),
+    let (owner, mut edges, mut reason, mut unread_ancestors) =
+        match forward_edges(&mut walk, member) {
+            ForwardStep::Answer(answer) if answer.outcome == MemberFamilyOutcome::Incomplete => {
+                let Some(owner) = analyzer.parent_of(member).filter(CodeUnit::is_class) else {
+                    return answer;
+                };
+                (owner, answer.edges, answer.reason, answer.unread_ancestors)
+            }
+            ForwardStep::Answer(answer) => return answer,
+            ForwardStep::Edges { owner, edges } => (owner, edges, None, Vec::new()),
+        };
+    let mut roots = Vec::new();
+    if (reason.is_none() || !edges.is_empty())
+        && let Err(stopped) =
+            family_roots(&mut walk, member, &edges, &mut roots, &mut unread_ancestors)
+    {
+        reason.get_or_insert(stopped);
     }
+    edges.sort_by(|left, right| left.target.cmp(&right.target));
+    roots.sort();
+    let mut inverse = Vec::new();
+    // Unresolved supertype names can still hide inverse hierarchy edges;
+    // detecting those requires the relational hierarchy work in #7449.
+    let descendant_reason = inverse_edges(&mut walk, member, owner, &mut inverse).err();
+    inverse.sort_by(|left, right| left.target.cmp(&right.target));
+    edges.extend(inverse);
+    unread_ancestors.sort();
+    unread_ancestors.dedup();
+    let direction = |reason: Option<MemberFamilyReason>| MemberFamilyCompleteness {
+        outcome: if reason.is_some() {
+            MemberFamilyOutcome::Incomplete
+        } else {
+            MemberFamilyOutcome::Proven
+        },
+        reason,
+    };
     MemberFamilyAnswer {
         capability,
-        outcome: MemberFamilyOutcome::Proven,
-        reason: None,
+        outcome: if reason.is_some() || descendant_reason.is_some() {
+            MemberFamilyOutcome::Incomplete
+        } else {
+            MemberFamilyOutcome::Proven
+        },
+        reason: reason.or(descendant_reason),
+        ancestors: direction(reason),
+        descendants: direction(descendant_reason),
+        unread_ancestors,
         edges,
         roots,
     }
@@ -628,8 +714,8 @@ fn inverse_edges(
     walk: &mut FamilyWalk<'_>,
     member: &CodeUnit,
     owner: CodeUnit,
-) -> Result<Vec<MemberFamilyEdge>, MemberFamilyReason> {
-    let mut edges = Vec::new();
+    edges: &mut Vec<MemberFamilyEdge>,
+) -> Result<(), MemberFamilyReason> {
     let mut seen = vec![owner.clone()];
     let mut frontier = VecDeque::from([owner]);
     while let Some(type_unit) = frontier.pop_front() {
@@ -642,16 +728,20 @@ fn inverse_edges(
             frontier.push_back(descendant.clone());
             let candidates = walk.analyzer.direct_children(&descendant);
             for candidate in candidates {
-                if !candidate.is_function() {
+                if !candidate.is_function() || candidate.identifier() != member.identifier() {
                     continue;
                 }
                 walk.spend()?;
-                // A candidate the analyzer cannot state a family for simply
-                // holds no forward edge to invert; that is its own row's
-                // problem, not this member's.
-                let ForwardStep::Edges { edges: below, .. } = forward_edges(walk, &candidate)?
-                else {
-                    continue;
+                // Invert established edges even when this candidate's family
+                // is open, and retain the enumeration gap for our own answer.
+                let (below, stopped) = match forward_edges(walk, &candidate) {
+                    ForwardStep::Edges { edges, .. } => (edges, None),
+                    ForwardStep::Answer(answer) => (
+                        answer.edges,
+                        answer
+                            .reason
+                            .filter(|_| answer.outcome == MemberFamilyOutcome::Incomplete),
+                    ),
                 };
                 for edge in below.into_iter().filter(|edge| &edge.target == member) {
                     edges.push(MemberFamilyEdge {
@@ -662,11 +752,15 @@ fn inverse_edges(
                         arity_unique: edge.arity_unique,
                     });
                 }
+                if let Some(reason) = stopped
+                    .filter(|reason| *reason != MemberFamilyReason::AncestorExternalUnindexed)
+                {
+                    return Err(reason);
+                }
             }
         }
     }
-    edges.sort_by(|left, right| left.target.cmp(&right.target));
-    Ok(edges)
+    Ok(())
 }
 
 /// The family id: a domain-separated digest over the deterministically ordered
@@ -730,8 +824,10 @@ fn family_roots(
     walk: &mut FamilyWalk<'_>,
     member: &CodeUnit,
     edges: &[MemberFamilyEdge],
-) -> Result<Vec<CodeUnit>, MemberFamilyReason> {
-    let mut roots = Vec::new();
+    roots: &mut Vec<CodeUnit>,
+    unread_ancestors: &mut Vec<String>,
+) -> Result<(), MemberFamilyReason> {
+    let mut stopped = None;
     let mut seen = vec![member.clone()];
     let mut stack: Vec<(CodeUnit, Vec<MemberFamilyEdge>)> = vec![(member.clone(), edges.to_vec())];
     while let Some((current, current_edges)) = stack.pop() {
@@ -747,19 +843,37 @@ fn family_roots(
             }
             walk.spend()?;
             seen.push(edge.target.clone());
-            let ForwardStep::Edges { edges: above, .. } = forward_edges(walk, &edge.target)? else {
-                // A root the analyzer cannot canonicalize makes the whole id
-                // inexact, so the family reports incomplete instead.
-                return Err(MemberFamilyReason::FamilyRootNotCanonical);
+            let above = match forward_edges(walk, &edge.target) {
+                ForwardStep::Edges { edges, .. } => edges,
+                ForwardStep::Answer(answer) => {
+                    if answer.unread_ancestors.is_empty() {
+                        // Preserve the legacy root-canonicalization failure for
+                        // providers that do not report named unread ancestors.
+                        return Err(MemberFamilyReason::FamilyRootNotCanonical);
+                    }
+                    unread_ancestors.extend(answer.unread_ancestors);
+                    stopped.get_or_insert(
+                        answer
+                            .reason
+                            .unwrap_or(MemberFamilyReason::FamilyRootNotCanonical),
+                    );
+                    if answer.edges.is_empty() {
+                        continue;
+                    }
+                    answer.edges
+                }
             };
             stack.push((edge.target, above));
         }
+    }
+    if let Some(reason) = stopped {
+        return Err(reason);
     }
     if roots.is_empty() {
         return Err(MemberFamilyReason::FamilyRootNotCanonical);
     }
     roots.sort();
-    Ok(roots)
+    Ok(())
 }
 
 /// The declaration facts one member states about itself, as its adapter

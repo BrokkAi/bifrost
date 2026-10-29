@@ -20,7 +20,7 @@ You can print some of these lists from a binary:
 ## Schema versions
 
 Every authored pack declares `schema_version`. This build reads versions `2`
-through `19`, inclusive. Its newest version is `19`. Version `1` and
+through `20`, inclusive. Its newest version is `20`. Version `1` and
 any other value fail with `schema.unsupported_version`. The field is
 required; there is no default.
 
@@ -30,7 +30,8 @@ the table below that the content meets, and never below `8`. A pack that uses
 no field newer than version 8 is written as version 8, so a reader that predates
 later fields still accepts it. A pack loaded from an `authored_semantic_model`
 spec keeps the version its author declared. Current artifact producers supply
-schema-19 extraction authority, so their output requires version 19.
+schema-19 extraction authority, so their output requires at least version 19.
+C# assembly packs also carry assembly identities, requiring version 20.
 
 A field is accepted only in a pack whose `schema_version` is at least the
 version that introduced it. A pack that declares an earlier version and uses
@@ -56,16 +57,30 @@ of an older version parse every pack that it accepts by number.
 | 17 | Ordered, exhaustive `runtime_bases` on Python class facts. | `declaration.runtime_bases_schema_version` |
 | 18 | Rust generic defaults, implemented-trait facts and associated bindings, generic forwarding impls, self forms, and associated-type projections. | `declaration.rust_contract_schema_version` |
 | 19 | Rust implementation-inventory coverage, negative impls and conditional bounds; producer-only extraction authority in compiled manifests and shards. | `declaration.impl_inventory_schema_version`, `declaration.impl_conditions_schema_version`, `declaration.impl_self_schema_version`, `extraction.schema_version` |
+| 20 | `assembly_identity` and non-empty `type_forwards` on declaration payloads. | `schema.assembly_identity_version`, `schema.type_forwards_version` |
+
+A declaration payload can record its provider's `assembly_identity` and a
+`type_forwards` vector. Forward names retain CLR spelling, including generic
+arity. Their required `namespace` comes from the root ExportedType row (the
+empty string denotes the global namespace); nested exports inherit that
+namespace, and `outer` links their containing exports. Catalog lookup follows
+forwards within the
+caller's selected providers and checks visibility on the defining type. It
+matches assembly name, culture, and any requested public key token, selecting
+the highest four-component CLI version at least as new as the reference.
+Missing or inaccessible targets and cycles remain open boundaries. A complete
+facade proves absence only on its own external surface, after consulting its
+forward rows.
 
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v19.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v19.schema.json).
-`cargo run --example generate_semantic_model_schema` writes it from the Rust
+[`schemas/semantic-model-pack-v20.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v20.schema.json).
+`cargo run --profile measure --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `19`. It requires `compatibility.bifrost` for versions `2` through
+`2` through `20`. It requires `compatibility.bifrost` for versions `2` through
 `7` and forbids it for versions `8` and newer. It does not express the other
 per-field version gates in the table above; the validator enforces them.
 
@@ -80,7 +95,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 19 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 20 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -102,7 +117,7 @@ Compiled schema-19 manifests and shard envelopes may contain `extraction`:
 paths supply this claim in memory; authored documents reject the field. Every
 shard must agree with its manifest. Both semantic digests include the claim,
 and older or curated packs without it have no extraction authority. The
-[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v19.schema.json)
+[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v20.schema.json)
 describes this envelope separately from the authoring format.
 
 A **stable ID** is 1 to 256 bytes of lowercase ASCII letters, digits, `.`,
@@ -1277,9 +1292,19 @@ arguments. Source files must end in `.json`, `.yaml`, or `.yml`.
 | `sanitizer-pack` | `CANDIDATES_DIR OUTPUT_ROOT` | no | Convert sanitizer candidates into procedure-summary packs and an audit report. |
 | `framework-decl-pack` | `CANDIDATES_DIR OUTPUT_ROOT` | no | Convert framework declaration candidates into declaration packs and an audit report. |
 | `golden-summary-pack` | `CANDIDATES_DIR OUTPUT_ROOT REALM` | no | Convert one realm's flow-through candidates into a procedure-summary pack. `REALM` is `jdk`, `python`, `rust`, `javascript`, or `typescript`. |
+| `codeql-jdk-summaries` | `EXT_DIRECTORY CODEQL_COMMIT JAVA_HOME PACK.json REPORT.json` | no | Translate CodeQL's Java models-as-data (`java/ql/lib/ext`) at a pinned commit into one JDK 21 procedure-summary pack, expanding each row to concrete JDK methods read from `JAVA_HOME`'s JMODs, and write a report of translated, collapsed and skipped rows. |
 
-The last nine commands are release tooling. They print human-readable text
+The last ten commands are release tooling. They print human-readable text
 only, and `--format json` makes them fail with status 2.
+
+In the pack `codeql-jdk-summaries` writes, `completeness: complete` means each
+summary it carries is a complete contract; it does not mean every JDK callable
+is modeled, and `require-model` handles absent summaries per call. Transfers
+carry no `value_transfer`, so they make no result-identity claim. The report's
+`value_rows_demoted` counts value rows whose content steps were collapsed onto
+their root port, and `targets_with_neutral_and_flow` counts targets that
+received both a summary-kind neutral row and a flow row; the flow wins, as in
+CodeQL.
 
 ### Exit status
 

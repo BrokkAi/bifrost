@@ -974,7 +974,7 @@ query_step_ops! {
     Project { shape: RowLocal, label: "project", signature: "row -> projected_row", description: "Publish selected public row fields, optionally under new field names, while preserving the row's source and evidence anchor." }
     CaptureAnchor { shape: RowLocal, label: "anchor", signature: "structural_match -> structural_match", description: "For each distinct node bound to the named positive pattern capture, retain the structural match with that node's source range as its reported anchor." }
     ConfigurationAbsence { shape: RowLocal, label: "configuration_absence", signature: "configuration_fact -> configuration_fact", description: "Apply a document-scoped anti-join to configuration facts. The inner configuration-facts query must select document roots; the result is retained only when no authored fact in that same document matches the filter. Incomplete ingestion is never treated as absence." }
-    StatementFacts { shape: RowLocal, label: "statement_facts", signature: "structural_match -> structural_match", description: "Retain structural matches for one registered CodeQL statement fact. C/C++-only kinds return no matches for other languages; nested-loops-with-same-variable is supplied by C++ and C# adapters." }
+    StatementFacts { shape: RowLocal, label: "statement_facts", signature: "structural_match -> structural_match", description: "Retain structural matches for one registered CodeQL statement fact. Shared shapes are supplied by C++ and Java; goto and alloca require C++. Nested-loop binding proofs are shared by C++, C# and Java." }
     CppFacts { shape: RowLocal, label: "cpp_facts", signature: "structural_match -> structural_match", description: "Retain C++ structural matches that satisfy one registered CodeQL class-rule fact." }
     EnclosingDecl { shape: RowLocal, label: "enclosing_decl", signature: "structural_match|dispatch_target -> declaration", description: "Map source-backed matches and dispatch targets to their smallest real enclosing declarations." }
     ProcedureOf { shape: RowLocal, label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures] }
@@ -1092,8 +1092,8 @@ query_step_ops! {
     MemberSelection { shape: DerivedValue, label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
     DispatchOutcome { shape: DerivedValue, label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
     DispatchTargets { shape: DerivedValue, label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
-    MemberFamily { shape: DerivedValue, label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason when it cannot, the per-relation edge counts, and the coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
-    FamilyEdges { shape: DerivedValue, label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Emitted only from a proven family, so an unproven or unsupported member yields no edge row and its outcome row says why." }
+    MemberFamily { shape: DerivedValue, label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason and unread ancestors when it cannot, the per-relation edge counts, and whole-family plus directional coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
+    FamilyEdges { shape: DerivedValue, label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Retains established edges of incomplete families. Edge coverage follows its direction: ancestors for overrides/implements and descendants for overridden_by/implemented_by." }
     OccurrencesOf { shape: DerivedValue, label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
     OccurrencesIn { shape: RowLocal, label: "occurrences_in", signature: "structural_match|call_shape|lexical_scope|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or call shape, in the exact innermost lexical scope, or in the file." }
     OccurrenceTarget { shape: DerivedValue, label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
@@ -1119,7 +1119,7 @@ query_step_ops! {
     FlowRelationsOf { shape: RowLocal, label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     FlowSource { shape: RowLocal, label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
     FlowTarget { shape: RowLocal, label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
-    FailureHandlerState { shape: RowLocal, label: "failure_handler_state", signature: "structural_match -> failure_handler_state", description: "Classify the exact Java, JavaScript, TypeScript, C#, PHP, C++, Kotlin or Scala catch body, Python except body, Ruby rescue body, Rust-native Result::Err failure branch, or Go error/nil and recover failure branch from prepared syntax. Catch languages use catch seeds; Rust and Go use callable seeds and language-native branch hooks. Comments, empty statements, Python pass or ellipsis, Scala unit literals, Rust unit expressions, and direct discarded Go recover calls are no-ops. Scala catch expressions outside case blocks remain open. Rust branches are selected only when the resolver proves the standard Result variant; Go branches are selected only when the adapter proves predeclared error or recover identities; Option arms, unproven Go bindings, and unresolved or macro token-tree shapes remain outside the exact result or open. Other languages produce an explicit unsupported unknown row. Empty and nonempty verdicts are structural facts with exact proof and exhaustive coverage. Recovered, unresolved, or unavailable syntax produces an explicit unknown row and incomplete coverage; this step makes no reachability claim." }
+    FailureHandlerState { shape: RowLocal, label: "failure_handler_state", signature: "structural_match -> failure_handler_state", description: "Classify the exact Java, JavaScript, TypeScript, C#, PHP, C++, Kotlin or Scala catch body, Python except body, Ruby rescue body, Rust-native Result::Err failure branch, or Go error/nil and recover failure branch from prepared syntax. Catch languages use catch seeds; Rust and Go use callable seeds and language-native branch hooks. Comments, empty statements, Python pass or ellipsis, Scala unit literals, Rust unit expressions, and direct discarded Go recover calls are no-ops. Scala catch expressions outside case blocks remain open. Exact Rust handler identities require the resolver to prove the standard Result variant; exact Go handler identities require the adapter to prove predeclared error or recover identities; Option arms, unproven Go bindings, and unresolved or macro token-tree shapes remain outside the exact result or open. Other languages produce an explicit unsupported unknown row. Empty verdicts require exact handler identity. A structurally nonempty native candidate with unproven handler identity has unknown proof, exhaustive coverage, and reason handler_identity_unproven. Empty candidates with unproven identity, recovered syntax, or unavailable bodies produce an explicit unknown row and incomplete coverage; this step makes no reachability claim." }
     BranchRelations { shape: RowLocal, label: "branch_relations", signature: "structural_match -> branch_relation", description: "Compare ordered arms of one structural if fact using exact parsed syntax and lexical binding identities. Rows state proven, distinct, or open with an explicit reason. Relation filtering applies before completeness is assessed, so unrelated open relations do not taint a selected family." }
     CppExpressions { shape: RowLocal, label: "cpp_expressions", signature: "structural_match -> cpp_expression", description: "Project typed, occurrence-keyed C++ expression facts from the exact source range, retaining scalar type, literal, array, bit-field, enum, signature, loop, and sizeof evidence with explicit open completeness." }
     CppInconsistentLoopDirection { shape: RowLocal, label: "cpp_inconsistent_loop_direction", signature: "structural_match -> structural_match", description: "Retain C/C++ for-loop matches whose structured comparison direction and update direction disagree for the same loop variable. Missing syntax is incomplete; no source-text loop parser or general range analysis is used." }
@@ -1487,6 +1487,7 @@ macro_rules! rql_forms {
                     Self::Async => Some(RqlProperty::Async),
                     Self::UnsafeContext => Some(RqlProperty::UnsafeContext),
                     Self::Modifier => Some(RqlProperty::Modifier),
+                    Self::TypeKind => Some(RqlProperty::TypeKind),
                     Self::Parenthesized => Some(RqlProperty::Parenthesized),
                     Self::IntegerValue => Some(RqlProperty::IntegerValue),
                     Self::DuplicateKey => Some(RqlProperty::DuplicateKey),
@@ -2500,7 +2501,7 @@ rql_forms! {
         labels: ["decorator-bindings", "decorator_bindings"],
         class: Wrapper,
         shape: Query,
-        signature: "(decorator-bindings [:module module] [:imported-name name] query)",
+        signature: "(decorator-bindings [:module module] [:imported-name name] [:annotation-type fq-name] query)",
         description: (QueryStepOp::DecoratorBindings),
         step: DecoratorBindings,
     }
@@ -3140,11 +3141,18 @@ rql_forms! {
         signature: "(async true|false)",
         description: "Match a callable by its AST-backed async modifier.",
     }
+    TypeKind {
+        labels: ["type-kind", "type_kind"],
+        class: Predicate,
+        shape: String,
+        signature: "(type-kind class|interface|enum|record|annotation)",
+        description: "Match the persisted source form of a type declaration.",
+    }
     Modifier {
         labels: ["modifier"],
         class: Predicate,
         shape: String,
-        signature: "(modifier static|abstract)",
+        signature: "(modifier static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private)",
         description: "Match a declaration by a modifier read from its structured modifier nodes.",
     }
     DuplicateKey {
@@ -3473,10 +3481,16 @@ rql_properties! {
         signature: ":async true|false",
         description: "Match a callable by its AST-backed async modifier.",
     }
+    TypeKind {
+        labels: ["type-kind", "type_kind"],
+        shape: String,
+        signature: ":type-kind class|interface|enum|record|annotation",
+        description: "Match the persisted source form of a type declaration.",
+    }
     Modifier {
         labels: ["modifier"],
         shape: String,
-        signature: ":modifier static|abstract",
+        signature: ":modifier static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private",
         description: "Match a declaration by a modifier read from its structured modifier nodes.",
     }
     DuplicateKey {
@@ -3767,7 +3781,7 @@ json_fields! {
     QueryStepField,
     ALL_QUERY_STEP_FIELDS,
     Op { label: "op", shape: String, signature: "\"op\": \"step_name\"", description: "Select the typed pipeline transformation." }
-    StatementFactKind { label: "statement_fact_kind", shape: String, signature: "\"statement_fact_kind\": \"alloca-in-loop\" | \"complex-block\" | \"complex-condition\" | \"empty-block\" | \"long-switch\" | \"missing-case-in-switch\" | \"nested-loops-with-same-variable\" | \"use-of-goto\"", description: "Select one registered CodeQL statement fact. C/C++-only kinds return no matches for other languages; nested-loops-with-same-variable is supplied by C++ and C# adapters. The RQL spelling remains :kind." }
+    StatementFactKind { label: "statement_fact_kind", shape: String, signature: "\"statement_fact_kind\": \"alloca-in-loop\" | \"complex-block\" | \"complex-condition\" | \"empty-block\" | \"long-switch\" | \"missing-case-in-switch\" | \"nested-loops-with-same-variable\" | \"use-of-goto\"", description: "Select one registered CodeQL statement fact. Shared shapes are supplied by C++ and Java; goto and alloca require C++. Nested-loop binding proofs are shared by C++, C# and Java. The RQL spelling remains :kind." }
     CppFactKind { label: "cpp_fact_kind", shape: String, signature: "\"kind\": \"assignment-does-not-return-this\" | \"catch-by-value\" | \"constructor-delegation\" | \"constructor-used-as-copy-constructor\" | \"rule-of-three\" | \"rule-of-two\" | \"throwing-pointer\" | \"undisciplined-multiple-inheritance\"", description: "Select the registered C++ CodeQL class-rule fact." }
     Depth { label: "depth", shape: PositiveInteger, signature: "\"depth\": positive integer", description: "Traverse all hierarchy edges from distance one through this depth." }
     Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
@@ -3806,6 +3820,7 @@ json_fields! {
     BindingHoisting { label: "hoisting", shape: HoistingClassList, signature: "\"hoisting\": [\"scope_wide\", ...]", description: "Restrict binding rows to one or more hoisting classes." }
     DecoratorModule { label: "module", shape: String, signature: "\"module\": \"@scope/package\"", description: "Restrict decorator-binding rows to one exact imported module target." }
     DecoratorImportedName { label: "imported_name", shape: String, signature: "\"imported_name\": \"Query\"", description: "Restrict decorator-binding rows to one exact imported symbol name." }
+    DecoratorAnnotationType { label: "annotation_type", shape: String, signature: "\"annotation_type\": \"org.example.Input\"", description: "Restrict decorator-binding rows to one exact resolved Java annotation type qualified name." }
     IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the binding-of answer shadows, instead of the winner alone." }
     Resolved { label: "resolved", shape: TrueBoolean, signature: "\"resolved\": true", description: "Derive each path segment's own prefix resolution so rows carry a status, targets, and a resolution-decided namespace." }
     CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
@@ -4144,6 +4159,10 @@ pub const DECORATOR_BINDING_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(
         QueryStepField::DecoratorImportedName,
         &[":imported-name", ":imported_name"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::DecoratorAnnotationType,
+        &[":annotation-type", ":annotation_type"],
     ),
 ];
 
@@ -4958,7 +4977,8 @@ json_fields! {
     Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
     UnsafeContext { label: "unsafe_context", shape: Boolean, signature: "\"unsafe_context\": true | false", description: "Match Rust calls inside unsafe blocks or unsafe functions; unsupported on non-call patterns and other languages." }
     Async { label: "async", shape: Boolean, signature: "\"async\": true | false", description: "Match a callable by its AST-backed async modifier." }
-    Modifier { label: "modifier", shape: String, signature: "\"modifier\": \"static\" | \"abstract\"", description: "Match a declaration by a modifier read from its structured modifier nodes." }
+    TypeKind { label: "type_kind", shape: String, signature: "\"type_kind\": \"class\" | \"interface\" | \"enum\" | \"record\" | \"annotation\"", description: "Match the persisted source form of a type declaration." }
+    Modifier { label: "modifier", shape: String, signature: "\"modifier\": static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private", description: "Match a declaration by a modifier read from its structured modifier nodes." }
     StringValue { label: "string_value", shape: StringPredicate, signature: "\"string_value\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a normalized string literal by its decoded value." }
     Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
     CommentBlockText { label: "comment_block_text", shape: RegexPredicate, signature: "\"comment_block_text\": { \"regex\": \"pattern\" }", description: "Match a comment using the source text of its maximal consecutive comment block." }
@@ -5184,3 +5204,7 @@ pub fn dependency_evidence_field_for_rql_label(
         _ => None,
     }
 }
+
+/// Source forms accepted by the declaration type-kind property.
+pub(crate) const DECLARATION_TYPE_KINDS: &[&str] =
+    &["class", "interface", "enum", "record", "annotation"];

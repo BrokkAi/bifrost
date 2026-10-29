@@ -63,6 +63,12 @@ jobs:
       - name: Check workspace metadata
         run: cargo metadata --locked --no-deps --format-version 1
 
+      - name: Install cargo-hakari
+        run: cargo install --locked cargo-hakari --version 0.9.39
+
+      - name: Check workspace feature union
+        run: node scripts/public/workspace-hack.mjs --check
+
       - name: Run source-owned unit tests
         env:
           JAVA_HOME: ''

@@ -485,6 +485,16 @@ pub struct BuiltInPolicyPackManifest {
     pub name: String,
     pub description: String,
     pub policies: Vec<BuiltInPolicyManifestEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalogs: Vec<PolicyCatalogFile>,
+}
+
+/// A catalog document with its canonical typed semantic content pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyCatalogFile {
+    pub path: String,
+    pub semantic_hash: String,
 }
 
 /// The deterministic multi-pack catalog returned by CLI and MCP policy
@@ -690,9 +700,14 @@ impl<'a> SelectedBuiltInPolicy<'a> {
         self,
         analyzer: &dyn IAnalyzer,
     ) -> Result<ResolvedBuiltInPolicy<'a>, BuiltInPolicyError> {
-        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
-            CatalogRegistryLimits::default(),
-        ));
+        let mut catalogs =
+            TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
+        let parsed = super::parse_rqlp_source(self.source, self.source_identity())
+            .map_err(|error| BuiltInPolicyError::new(error.to_string()))?;
+        if policy_needs_catalog_registry(parsed.document()) {
+            register_run_catalogs(&mut catalogs)?;
+        }
+        let catalogs = Arc::new(catalogs);
         let mut registry =
             PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
         let loaded = registry
@@ -980,7 +995,7 @@ impl BuiltInPolicyCatalog {
                     Err(rejection) if is_deferred_rejection(&rejection) => {
                         if entry.resolved_semantic_hash.is_some() {
                             return Err(BuiltInPolicyError::new(format!(
-                                "built-in policy `{path}` defers a qualified locator and cannot \
+                                "built-in policy `{path}` defers catalog or workspace resolution and cannot \
                                  record a resolved semantic hash before activation"
                             )));
                         }
@@ -1193,6 +1208,25 @@ fn load_external_policy_catalog(root: &Path) -> Result<BuiltInPolicyCatalog, Bui
 }
 
 fn load_external_policy_packs(root: &Path) -> Result<Vec<EmbeddedPolicyPack>, BuiltInPolicyError> {
+    let (workspace_root, manifests) = load_external_policy_manifests(root)?;
+    let mut packs = Vec::with_capacity(manifests.len());
+    for (manifest_source, manifest) in manifests {
+        let mut pack = EmbeddedPolicyPack::new(manifest_source);
+        for policy in &manifest.policies {
+            validate_external_policy_path(&policy.path)?;
+            let source_path = PathBuf::from(&manifest.id).join(&policy.path);
+            let policy_source =
+                read_external_policy_document(&workspace_root, &source_path, "rqlp")?;
+            pack = pack.with_source(policy.path.clone(), policy_source);
+        }
+        packs.push(pack);
+    }
+    Ok(packs)
+}
+
+fn load_external_policy_manifests(
+    root: &Path,
+) -> Result<(WorkspaceRoot, Vec<(String, BuiltInPolicyPackManifest)>), BuiltInPolicyError> {
     let metadata = fs::symlink_metadata(root).map_err(|error| {
         BuiltInPolicyError::new(format!(
             "cannot inspect configured policy pack root `{}`: {error}",
@@ -1247,7 +1281,7 @@ fn load_external_policy_packs(root: &Path) -> Result<Vec<EmbeddedPolicyPack>, Bu
         )));
     }
 
-    let mut packs = Vec::with_capacity(directories.len());
+    let mut manifests = Vec::with_capacity(directories.len());
     for directory in directories {
         let pack_id = directory.file_name().into_string().map_err(|_| {
             BuiltInPolicyError::new(format!(
@@ -1286,18 +1320,10 @@ fn load_external_policy_packs(root: &Path) -> Result<Vec<EmbeddedPolicyPack>, Bu
             )));
         }
 
-        let mut pack = EmbeddedPolicyPack::new(manifest_source);
-        for policy in &manifest.policies {
-            validate_external_policy_path(&policy.path)?;
-            let source_path = PathBuf::from(&pack_id).join(&policy.path);
-            let policy_source =
-                read_external_policy_document(&workspace_root, &source_path, "rqlp")?;
-            pack = pack.with_source(policy.path.clone(), policy_source);
-        }
-        packs.push(pack);
+        manifests.push((manifest_source, manifest));
     }
 
-    Ok(packs)
+    Ok((workspace_root, manifests))
 }
 
 fn validate_external_policy_path(value: &str) -> Result<(), BuiltInPolicyError> {
@@ -1394,7 +1420,7 @@ pub enum PolicySourceIdentityResolution {
     /// The source has a complete analyzer-free executable identity.
     Available { semantic_hash: PolicySemanticHash },
     /// The authored identity is available, but executable identity needs a
-    /// workspace model or workspace-authored endpoint-set closure.
+    /// run catalog registry, workspace model, or workspace-authored endpoint-set closure.
     WorkspaceRequired {
         diagnostic_code: &'static str,
         message: String,
@@ -1444,13 +1470,58 @@ pub fn policy_source_identity(
     })
 }
 
+pub(crate) fn policy_needs_catalog_registry(document: &super::RqlpDocument) -> bool {
+    if policy_uses_catalogs(document) {
+        return true;
+    }
+    match document {
+        super::RqlpDocument::Policy { definition } => match &definition.analysis {
+            super::PolicyAnalysis::Taint { spec } => [
+                &spec.sources.include_files,
+                &spec.sinks.include_files,
+                &spec.sanitizers.include_files,
+                &spec.transforms.include_files,
+                &spec.external_models.include_files,
+            ]
+            .iter()
+            .any(|references| !references.is_empty()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn policy_uses_catalogs(document: &super::RqlpDocument) -> bool {
+    match document {
+        super::RqlpDocument::Policy { definition } => match &definition.analysis {
+            super::PolicyAnalysis::Taint { spec } => [
+                &spec.sources.include_sets,
+                &spec.sinks.include_sets,
+                &spec.sanitizers.include_sets,
+                &spec.transforms.include_sets,
+                &spec.external_models.include_sets,
+            ]
+            .iter()
+            .any(|references| !references.is_empty()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn authored_semantic_hash(
     identity: &PolicySourceIdentity,
     source: &[u8],
 ) -> Result<PolicySemanticHash, PolicyRegistryError> {
+    let parsed = super::registry::validate_and_parse_policy_source(identity.clone(), source)?;
+    if policy_uses_catalogs(parsed.document()) {
+        return Ok(PolicySemanticHash::from_authored_catalog_policy(
+            parsed.document(),
+        ));
+    }
     let mut registry = builtin_policy_registry();
     registry
-        .register_policy_bytes_deferred(identity.clone(), source)
+        .register_parsed_policy_deferred(parsed, source)
         .map(|loaded| loaded.semantic_hash())
 }
 
@@ -1458,6 +1529,20 @@ fn resolved_semantic_hash(
     identity: &PolicySourceIdentity,
     source: &[u8],
 ) -> Result<PolicySemanticHash, PolicyRegistryError> {
+    let parsed = super::parse_rqlp_source(
+        std::str::from_utf8(source).map_err(|error| PolicyRegistryError::InvalidUtf8 {
+            source: identity.clone(),
+            valid_up_to: error.valid_up_to(),
+        })?,
+        identity.clone(),
+    )?;
+    if policy_uses_catalogs(parsed.document()) {
+        return Err(PolicyRegistryError::from(super::source::source_error(
+            "catalogs-require-policy-run",
+            0..source.len(),
+            "catalog policy identity requires the run's registered catalogs",
+        )));
+    }
     let mut registry = builtin_policy_registry();
     registry
         .register_policy_bytes(identity.clone(), source)
@@ -1504,7 +1589,8 @@ fn is_deferred_rejection(error: &PolicyRegistryError) -> bool {
 fn workspace_required_resolution(error: &PolicyRegistryError) -> Option<(&'static str, &str)> {
     match error {
         PolicyRegistryError::Source(source)
-            if is_qualified_locator_code(source.diagnostic.code) =>
+            if is_qualified_locator_code(source.diagnostic.code)
+                || source.diagnostic.code == "catalogs-require-policy-run" =>
         {
             Some((source.diagnostic.code, source.diagnostic.message.as_str()))
         }
@@ -1534,12 +1620,23 @@ fn validate_manifest_shape(manifest: &BuiltInPolicyPackManifest) -> Result<(), B
             "built-in manifest version, name, and description must be non-empty",
         ));
     }
-    if manifest.policies.is_empty() {
+    if manifest.policies.is_empty() && manifest.catalogs.is_empty() {
         return Err(BuiltInPolicyError::new(
-            "built-in manifest must contain at least one policy",
+            "built-in manifest must contain at least one policy or catalog",
         ));
     }
 
+    let mut catalog_paths = HashSet::new();
+    for catalog in &manifest.catalogs {
+        validate_policy_bundle_path(&catalog.path)?;
+        if !catalog.path.ends_with(".json") || !catalog_paths.insert(&catalog.path) {
+            return Err(BuiltInPolicyError::new(format!(
+                "invalid or duplicate catalog path `{}`",
+                catalog.path
+            )));
+        }
+        validate_sha256_field(&catalog.path, "semantic_hash", &catalog.semantic_hash)?;
+    }
     let mut paths = HashSet::new();
     let mut ids = HashSet::new();
     for entry in &manifest.policies {
@@ -1666,6 +1763,8 @@ struct PolicyBundleIndex {
     bifrost_pin: serde_json::Value,
     files: Vec<PolicyBundleFile>,
     policies: Vec<PolicyBundlePolicy>,
+    #[serde(default)]
+    catalogs: Vec<PolicyCatalogFile>,
 }
 
 #[derive(Deserialize)]
@@ -1712,58 +1811,7 @@ impl PolicyBundles {
     }
 
     fn load_bundle(&mut self, root: &Path) -> Result<(), BuiltInPolicyError> {
-        let workspace_root = WorkspaceRoot::open(root).map_err(|error| {
-            BuiltInPolicyError::new(format!(
-                "cannot open policy bundle root `{}`: {error}",
-                root.display()
-            ))
-        })?;
-        let index_source =
-            read_external_policy_document(&workspace_root, Path::new(POLICY_BUNDLE_INDEX), "json")?;
-        let index = serde_json::from_str::<PolicyBundleIndex>(&index_source).map_err(|error| {
-            BuiltInPolicyError::new(format!(
-                "invalid policy bundle index `{}`: {error}",
-                root.join(POLICY_BUNDLE_INDEX).display()
-            ))
-        })?;
-        if index.schema_version != POLICY_BUNDLE_SCHEMA_VERSION {
-            return Err(BuiltInPolicyError::new(format!(
-                "unsupported policy bundle schema version {} in `{}`",
-                index.schema_version,
-                root.display()
-            )));
-        }
-        let mut verified = HashMap::with_capacity(index.files.len());
-        for file in &index.files {
-            validate_policy_bundle_path(&file.path)?;
-            let path = Path::new(&file.path);
-            let extension = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .ok_or_else(|| {
-                    BuiltInPolicyError::new(format!(
-                        "policy bundle file `{}` has no extension",
-                        file.path
-                    ))
-                })?;
-            let source = read_external_policy_document(&workspace_root, path, extension)?;
-            let digest = {
-                use sha2::{Digest, Sha256};
-                format!("{:x}", Sha256::digest(source.as_bytes()))
-            };
-            if digest != file.sha256 || source.len() as u64 != file.size {
-                return Err(BuiltInPolicyError::new(format!(
-                    "policy bundle file `{}` does not match its indexed SHA-256 and size",
-                    file.path
-                )));
-            }
-            if verified.insert(file.path.as_str(), source).is_some() {
-                return Err(BuiltInPolicyError::new(format!(
-                    "policy bundle file `{}` is indexed more than once",
-                    file.path
-                )));
-            }
-        }
+        let (index, verified) = read_verified_policy_bundle(root)?;
         for policy in &index.policies {
             let source = verified.get(policy.path.as_str()).ok_or_else(|| {
                 BuiltInPolicyError::new(format!(
@@ -1838,6 +1886,140 @@ impl PolicyBundles {
         selection.policy_ids = remaining;
         Ok(inputs)
     }
+}
+
+fn read_verified_policy_bundle(
+    root: &Path,
+) -> Result<(PolicyBundleIndex, HashMap<String, String>), BuiltInPolicyError> {
+    let workspace_root = WorkspaceRoot::open(root).map_err(|error| {
+        BuiltInPolicyError::new(format!(
+            "cannot open policy bundle root `{}`: {error}",
+            root.display()
+        ))
+    })?;
+    let index_source =
+        read_external_policy_document(&workspace_root, Path::new(POLICY_BUNDLE_INDEX), "json")?;
+    let index = serde_json::from_str::<PolicyBundleIndex>(&index_source).map_err(|error| {
+        BuiltInPolicyError::new(format!(
+            "invalid policy bundle index `{}`: {error}",
+            root.join(POLICY_BUNDLE_INDEX).display()
+        ))
+    })?;
+    if index.schema_version != POLICY_BUNDLE_SCHEMA_VERSION {
+        return Err(BuiltInPolicyError::new(format!(
+            "unsupported policy bundle schema version {} in `{}`",
+            index.schema_version,
+            root.display()
+        )));
+    }
+    let mut verified = HashMap::with_capacity(index.files.len());
+    for file in &index.files {
+        validate_policy_bundle_path(&file.path)?;
+        let path = Path::new(&file.path);
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .ok_or_else(|| {
+                BuiltInPolicyError::new(format!(
+                    "policy bundle file `{}` has no extension",
+                    file.path
+                ))
+            })?;
+        let source = read_external_policy_document(&workspace_root, path, extension)?;
+        let digest = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        };
+        if digest != file.sha256 || source.len() as u64 != file.size {
+            return Err(BuiltInPolicyError::new(format!(
+                "policy bundle file `{}` does not match its indexed SHA-256 and size",
+                file.path
+            )));
+        }
+        if verified.insert(file.path.clone(), source).is_some() {
+            return Err(BuiltInPolicyError::new(format!(
+                "policy bundle file `{}` is indexed more than once",
+                file.path
+            )));
+        }
+    }
+    Ok((index, verified))
+}
+
+/// Read catalog documents through capabilities rooted at the installed pack,
+/// independently for every policy run. No catalog bytes enter process caches.
+pub(crate) fn register_run_catalogs(
+    registry: &mut TaintCatalogRegistry,
+) -> Result<(), BuiltInPolicyError> {
+    if let Some(roots) = policy_pack_roots_from_env()? {
+        for root in std::env::split_paths(&roots) {
+            let (capability, manifests) = load_external_policy_manifests(&root)?;
+            for (_, manifest) in manifests {
+                for catalog in &manifest.catalogs {
+                    let path = Path::new(&manifest.id).join(&catalog.path);
+                    let document =
+                        brokk_bifrost_analysis::workspace_document::read_workspace_document(
+                            &capability,
+                            &path,
+                            &["json"],
+                            super::catalog::MAX_CATALOG_JSON_BYTES as u64,
+                        )
+                        .map_err(|error| BuiltInPolicyError::new(error.to_string()))?;
+                    register_pack_catalog(
+                        registry,
+                        catalog,
+                        &format!("pack:{}/{}", manifest.id, catalog.path),
+                        document.source(),
+                    )?;
+                }
+            }
+        }
+    }
+    if let Some(roots) = std::env::var_os(POLICY_BUNDLE_ROOT_ENV) {
+        for root in std::env::split_paths(&roots) {
+            let (index, verified) = read_verified_policy_bundle(&root)?;
+            for catalog in &index.catalogs {
+                validate_policy_bundle_path(&catalog.path)?;
+                let source = verified.get(&catalog.path).ok_or_else(|| {
+                    BuiltInPolicyError::new(format!(
+                        "policy bundle catalog names unindexed file `{}`",
+                        catalog.path
+                    ))
+                })?;
+                register_pack_catalog(
+                    registry,
+                    catalog,
+                    &format!(
+                        "{}@{}/{}",
+                        index.repository, index.source_commit, catalog.path
+                    ),
+                    source,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn register_pack_catalog(
+    registry: &mut TaintCatalogRegistry,
+    entry: &PolicyCatalogFile,
+    identity: &str,
+    source: &str,
+) -> Result<(), BuiltInPolicyError> {
+    validate_sha256_field(&entry.path, "semantic_hash", &entry.semantic_hash)?;
+    let identity = super::catalog::CatalogSourceIdentity::new(identity)
+        .map_err(|error| BuiltInPolicyError::new(error.to_string()))?;
+    let actual = registry
+        .register_json_bytes(identity, source.as_bytes())
+        .map_err(|error| BuiltInPolicyError::new(error.to_string()))?;
+    if actual.to_string() != entry.semantic_hash {
+        return Err(BuiltInPolicyError::new(format!(
+            "catalog `{}` semantic hash mismatch: expected {}, actual {actual}",
+            entry.path, entry.semantic_hash
+        )));
+    }
+    Ok(())
 }
 
 /// The policy bundles named by `BIFROST_POLICY_BUNDLE_ROOT`, verified once

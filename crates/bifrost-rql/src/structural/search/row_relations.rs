@@ -746,7 +746,13 @@ pub(super) fn inverse_edge_expansions(
 ) -> Vec<PipelineExpansion> {
     let result = edge_cache.inverse_for(analyzer, &declaration.unit, cancellation);
     let language = crate::analyzer::common::language_for_file(declaration.unit.source());
-    edge_cache.report_inverse_completeness(&declaration.unit, language, &result, diagnostics);
+    edge_cache.report_inverse_completeness(
+        analyzer,
+        &declaration.unit,
+        language,
+        &result,
+        diagnostics,
+    );
     edge_row_expansions(analyzer, indexed, &result, filter, None, diagnostics)
 }
 
@@ -980,6 +986,7 @@ fn report_selected_property_completeness(
 /// author is asking what serves (or is served by) exactly that event, so both
 /// ends are matched rather than the read end alone.
 pub(super) fn flow_relations_of_event(
+    analyzer: &dyn IAnalyzer,
     value: &StateEventValue,
     filter: &FlowRelationFilter,
     flow_state_cache: &mut FlowStateTraversalCache,
@@ -989,6 +996,7 @@ pub(super) fn flow_relations_of_event(
         let subject = rel_path_string(&value.file);
         let language = crate::analyzer::common::language_for_file(&value.file);
         flow_state_cache.report_completeness(
+            analyzer,
             &subject,
             Some(&value.diagnostic_procedure),
             language,
@@ -998,6 +1006,7 @@ pub(super) fn flow_relations_of_event(
             diagnostics,
         );
         flow_state_cache.report_completeness(
+            analyzer,
             &subject,
             Some(&value.diagnostic_procedure),
             language,
@@ -1385,6 +1394,7 @@ pub(super) fn seed_derivation(
     let language = crate::analyzer::common::language_for_file(&file);
     let file_state = flow_state_cache.for_file(workspace, &file, cancellation);
     flow_state_cache.report_completeness(
+        workspace.analyzer(),
         &rel_path_string(&file),
         Some(procedure),
         language,
@@ -1399,6 +1409,7 @@ pub(super) fn seed_derivation(
         .iter()
         .position(|derivation| derivation.procedure == wanted)?;
     flow_state_cache.report_completeness(
+        workspace.analyzer(),
         &rel_path_string(&file),
         Some(procedure),
         language,
@@ -1418,6 +1429,7 @@ pub(super) fn seed_derivation(
 /// filter runs, so a `:relation postdominates` filter that drops every row
 /// still leaves the reason the answer is partial on the response.
 pub(super) fn control_relation_expansions(
+    analyzer: &dyn IAnalyzer,
     control_relation_cache: &mut ControlRelationTraversalCache,
     procedure: &SemanticProcedureValue,
     generation: u64,
@@ -1429,6 +1441,7 @@ pub(super) fn control_relation_expansions(
     let language = crate::analyzer::common::language_for_file(&file);
     let relations = control_relation_cache.for_procedure(procedure, generation, cancellation);
     control_relation_cache.report_completeness(
+        analyzer,
         &procedure.wire_id(),
         language,
         &relations,
@@ -1481,6 +1494,7 @@ pub(super) fn rewrite_path_expansions(
     let language = crate::analyzer::common::language_for_file(file);
     let file_paths = rewrite_path_cache.for_file(analyzer, file, cancellation);
     rewrite_path_cache.report_completeness(
+        analyzer,
         &rel_path_string(file),
         language,
         &file_paths.completeness,
@@ -1537,11 +1551,12 @@ pub(super) fn source_set_expansions(
 /// The dependencies one build target declares on other targets of the same
 /// workspace (#2448).
 pub(super) fn topology_edge_expansions(
+    analyzer: &dyn IAnalyzer,
     topology_cache: &mut TopologyTraversalCache,
     target: &TopologyEntityValue,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
-    topology_rows::topology_edges_of_target(topology_cache, target, diagnostics)
+    topology_rows::topology_edges_of_target(analyzer, topology_cache, target, diagnostics)
         .into_iter()
         .map(|value| pipeline_expansion(PipelineValue::TopologyEdge(Box::new(value))))
         .collect()
@@ -1566,7 +1581,13 @@ pub(super) fn forward_edge_expansions(
         return Vec::new();
     };
     let language = crate::analyzer::common::language_for_file(&row.file);
-    edge_cache.report_completeness(&rel_path_string(&row.file), language, &result, diagnostics);
+    edge_cache.report_completeness(
+        analyzer,
+        &rel_path_string(&row.file),
+        language,
+        &result,
+        diagnostics,
+    );
     let site_ast_id = row.ast_id();
     edge_row_expansions(
         analyzer,

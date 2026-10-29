@@ -310,6 +310,66 @@ mod tests {
     }
 
     #[test]
+    fn malformed_utf8_projection_preserves_exact_byte_positions() {
+        assert_eq!(malformed_byte_positions(&[0xff, b'A']), vec![0]);
+        for scalar in [0x100000, 0x10ffff] {
+            let character = char::from_u32(scalar).unwrap();
+            let mut buffer = [0; 4];
+            let encoded = character.encode_utf8(&mut buffer);
+            assert_eq!(std::str::from_utf8(encoded.as_bytes()).unwrap(), encoded);
+            assert_eq!(
+                MalformedUtf8Decoder::decode(encoded.as_bytes()),
+                (character as i32, 4)
+            );
+        }
+        for invalid in [[0xf4, 0x90, 0x80, 0x80], [0xf5, 0x80, 0x80, 0x80]] {
+            assert!(std::str::from_utf8(&invalid).is_err());
+            assert_eq!(
+                MalformedUtf8Decoder::decode(&invalid),
+                ('\u{fffd}' as i32, 1)
+            );
+        }
+        let mut crlf = b"x\r\ny".to_vec();
+        erase_preserving_newlines(&mut crlf);
+        assert_eq!(crlf, b" \r\n ");
+        for (bytes, character, width) in [
+            (&[0xc2, 0xa2][..], 0xa2, 2),
+            (&[0xe2, 0x82, 0xac][..], 0x20ac, 3),
+            (&[0xf0, 0x9f, 0x8c, 0x8d][..], 0x1f30d, 4),
+        ] {
+            assert_eq!(MalformedUtf8Decoder::decode(bytes), (character, width));
+        }
+    }
+
+    #[test]
+    fn nul_source_line_limit_is_inclusive() {
+        let limit = super::super::common::max_line_length_limit().unwrap();
+        let prefix = b"<?php $payload = '";
+        let suffix = b"';";
+        let mut exact = prefix.to_vec();
+        exact.push(0);
+        exact.extend(std::iter::repeat_n(
+            b'x',
+            limit - prefix.len() - suffix.len() - 1,
+        ));
+        exact.extend_from_slice(suffix);
+        assert_eq!(exact.len(), limit);
+        let ingested = ingest_source_bytes(Path::new("boundary.php"), &exact).unwrap();
+        assert_eq!(ingested.kind(), SourceIngestionKind::Projected);
+        assert_eq!(ingested.as_str().len(), exact.len());
+
+        let mut over = prefix.to_vec();
+        over.push(0);
+        over.extend(std::iter::repeat_n(
+            b'x',
+            limit - prefix.len() - suffix.len(),
+        ));
+        over.extend_from_slice(suffix);
+        assert_eq!(over.len(), limit + 1);
+        assert!(ingest_source_bytes(Path::new("boundary.php"), &over).is_err());
+    }
+
+    #[test]
     #[hardwon(
         "#1553: NUL bytes outside grammar-recognized opaque syntax must remain a parse error"
     )]

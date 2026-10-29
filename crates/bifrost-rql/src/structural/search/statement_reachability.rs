@@ -5,6 +5,7 @@ use super::results::{
 };
 use super::*;
 use crate::analyzer::semantic::LengthDelimitedDigest;
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_analysis::analyzer::semantic::{
     StatementAssessment, StatementCoordinates, StatementVerdict, statement_assessments,
 };
@@ -84,24 +85,33 @@ pub(super) fn result_ref(value: &StatementReachabilityValue) -> CodeQueryResultR
 }
 
 fn report_open(
+    analyzer: &dyn IAnalyzer,
     procedure: &semantic::SemanticProcedureValue,
     reason: &str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    let mut diagnostic = super::incomplete_diagnostic(
+    let (code, cause) = CodeQueryDiagnosticCode::from_execution_reason(
         CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete,
-        procedure
-            .handle
-            .artifact()
-            .key()
-            .language()
-            .language()
-            .config_label(),
-        format!(
-            "{} has open statement reachability evidence: {reason}",
-            procedure.wire_id()
+        reason,
+    );
+    let mut diagnostic = super::QueryExecutionState::diagnostic(
+        analyzer,
+        super::incomplete_diagnostic(
+            code,
+            procedure
+                .handle
+                .artifact()
+                .key()
+                .language()
+                .language()
+                .config_label(),
+            format!(
+                "{} has open statement reachability evidence: {reason}",
+                procedure.wire_id()
+            ),
+            Vec::new(),
         ),
-        Vec::new(),
+        cause,
     );
     // Every statement row of a procedure is a row of the procedure's file.
     diagnostic.withheld_rows_path = Some(rel_path_string(procedure.file()));
@@ -117,8 +127,11 @@ pub(super) fn statement_reachability_expansions(
     let assessments = statement_assessments(workspace, &procedure.handle, cancellation);
     if !assessments.complete {
         report_open(
+            workspace.analyzer(),
             procedure,
-            assessments.reason.unwrap_or("assessment_incomplete"),
+            assessments
+                .reason
+                .unwrap_or(derivation_reason::ASSESSMENT_INCOMPLETE),
             diagnostics,
         );
         return Vec::new();
@@ -126,7 +139,7 @@ pub(super) fn statement_reachability_expansions(
     let mut rows = Vec::with_capacity(assessments.rows.len());
     for assessment in assessments.rows {
         if let StatementVerdict::Open(reason) = assessment.verdict {
-            report_open(procedure, reason, diagnostics);
+            report_open(workspace.analyzer(), procedure, reason, diagnostics);
         }
         rows.push(row(procedure, assessment));
     }

@@ -6,6 +6,7 @@ use crate::syntax::{
     python_keyword_argument_label, python_node_is_in_annotation, python_parameter_node,
 };
 use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::model::DeclarationKind;
 use brokk_bifrost_core::analyzer::resolution_facts::*;
 use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceId,
@@ -163,10 +164,14 @@ pub(super) fn produce<'source, 'unit>(
         let mut child_containment = containing;
         if creates {
             let id = ResolutionScopeId::new(dense_ordinal(scopes.len(), "Python scopes"));
-            let kind = match node.kind() {
-                "module" => ResolutionScopeKind::CompilationUnit,
-                "class_definition" => ResolutionScopeKind::TypeBody,
-                _ => ResolutionScopeKind::Executable,
+            // A recovered file can have an ERROR root rather than a module.
+            // File identity determines its module scope, independent of grammar recovery.
+            let kind = if containing.is_none() {
+                ResolutionScopeKind::CompilationUnit
+            } else if node.kind() == "class_definition" {
+                ResolutionScopeKind::TypeBody
+            } else {
+                ResolutionScopeKind::Executable
             };
             p.facts.scopes.push(ResolutionScopeFact {
                 id,
@@ -232,7 +237,7 @@ pub(super) fn produce<'source, 'unit>(
             }
         }
         for child in children.into_iter().rev() {
-            let scope = if node.kind() == "module"
+            let scope = if node == root
                 || is_comprehension(node.kind())
                 || is_field_child(node, child, "body")
             {
@@ -431,6 +436,10 @@ pub(super) fn produce<'source, 'unit>(
                         unit: (*unit).clone(),
                     });
                 } else {
+                    if kind == ResolutionBindingEventKind::Function {
+                        p.collector
+                            .mark_lexical(declaration, DeclarationKind::BlockLocalItem);
+                    }
                     p.facts
                         .add_gap(authored, ResolutionGapKind::UnsupportedScopeOrBinder);
                 }
@@ -465,6 +474,9 @@ pub(super) fn produce<'source, 'unit>(
                         unit: (*unit).clone(),
                     });
                 } else {
+                    // An authored write is distinct from its binding slot.
+                    p.collector
+                        .mark_lexical(declaration, binding_presentation_kind(token));
                     p.facts
                         .add_gap(authored, ResolutionGapKind::UnsupportedScopeOrBinder);
                 }
@@ -710,6 +722,18 @@ pub(super) fn produce<'source, 'unit>(
     (p.facts, p.occurrences, p.declarations)
 }
 
+fn binding_presentation_kind(token: Node<'_>) -> DeclarationKind {
+    match binding_operation(token) {
+        (ResolutionBindingEventKind::Parameter, parameter)
+            if parameter.kind() == "lambda_parameters" =>
+        {
+            DeclarationKind::LambdaParameter
+        }
+        (ResolutionBindingEventKind::Parameter, _) => DeclarationKind::Parameter,
+        _ => DeclarationKind::LocalVariable,
+    }
+}
+
 fn make_slot(
     p: &mut Producer<'_, '_>,
     token: Node<'_>,
@@ -723,6 +747,8 @@ fn make_slot(
         ResolutionNamespace::Value,
     );
     let declaration = p.collector.declare_node(token, Some(token));
+    p.collector
+        .mark_lexical(declaration, binding_presentation_kind(token));
     p.declarations.push((site, declaration));
     let fact = p.facts.scopes[scope.index()];
     let lookup = if fact.kind == ResolutionScopeKind::Executable {

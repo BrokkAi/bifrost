@@ -1,3 +1,4 @@
+use super::DerivationExecutionCause;
 use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
@@ -545,6 +546,12 @@ impl<'a> SemanticQueryContext<'a> {
             active_semantic_model_snapshot,
             None,
             None,
+            super::type_flow::CodeQueryRootAllotment::from_execution_limits(
+                &super::CodeQueryExecutionLimits {
+                    semantic: limits,
+                    ..Default::default()
+                },
+            ),
         )
     }
 
@@ -560,7 +567,8 @@ impl<'a> SemanticQueryContext<'a> {
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
-        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
+        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryPartitions>,
+        root_allotment: super::type_flow::CodeQueryRootAllotment,
     ) -> Self {
         debug_assert!(limits.all_positive());
         let budget = SemanticBudget::new(semantic_budget_limits(limits))
@@ -577,6 +585,7 @@ impl<'a> SemanticQueryContext<'a> {
             active_semantic_model_snapshot,
             value_flow_cache,
             type_flow_summaries,
+            root_allotment,
             budget,
             None,
             None,
@@ -595,9 +604,10 @@ impl<'a> SemanticQueryContext<'a> {
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
-        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
+        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryPartitions>,
         parent_scope: &SemanticBudgetScopeSnapshot,
         child_semantic_limits: SemanticWork,
+        root_allotment: super::type_flow::CodeQueryRootAllotment,
         execution_before: SemanticExecutionBudgetSnapshot,
         execution_child: SemanticExecutionBudget,
         artifact_leases: SemanticArtifactLeaseSnapshot,
@@ -615,6 +625,7 @@ impl<'a> SemanticQueryContext<'a> {
             active_semantic_model_snapshot,
             value_flow_cache,
             type_flow_summaries,
+            root_allotment,
             budget,
             Some((execution_before, execution_child)),
             Some(artifact_leases),
@@ -633,7 +644,8 @@ impl<'a> SemanticQueryContext<'a> {
         analysis_context: Option<&'a QueryAnalysisContext>,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         value_flow_cache: Option<brokk_bifrost_flow::value_flow::ValueFlowCache>,
-        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryState>,
+        type_flow_summaries: Option<brokk_bifrost_flow::type_flow::TypeFlowSummaryPartitions>,
+        root_allotment: super::type_flow::CodeQueryRootAllotment,
         budget: SemanticBudget,
         receipt_execution: Option<(SemanticExecutionBudgetSnapshot, SemanticExecutionBudget)>,
         artifact_leases: Option<SemanticArtifactLeaseSnapshot>,
@@ -688,8 +700,13 @@ impl<'a> SemanticQueryContext<'a> {
             type_flow: super::type_flow::TypeFlowQueryState::new(
                 value_flow_cache.unwrap_or_default(),
                 type_flow_summaries.unwrap_or_default(),
+                root_allotment,
             ),
         }
+    }
+
+    pub(super) fn set_root_memo(&mut self, memo: Option<super::TypeFlowRootMemo>) {
+        self.type_flow.set_root_memo(memo);
     }
 
     pub(super) fn cfg(&mut self) -> CfgQueryAdapter<'_, 'a> {
@@ -967,6 +984,47 @@ impl<'a> SemanticQueryContext<'a> {
     /// The result is total: a gate, a provider failure, or an interrupted
     /// dispatch still returns a typed answer, because the mandatory outcome
     /// row must exist for every input site.
+    /// Carry the oracle's exact receiver preparation into scalar mutation
+    /// effects without inferring method kind from an open selector row.
+    pub(super) fn reference_receiver_calls(
+        &mut self,
+        file: &ProjectFile,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> Vec<crate::analyzer::semantic::CallSiteId> {
+        let procedure_id = procedure_wire_id(procedure);
+        let mut calls = Vec::new();
+        for call in procedure.semantics().call_sites() {
+            if call.member_selection.is_none() {
+                continue;
+            }
+            let Some(source) = procedure.semantics().source_mapping(call.source) else {
+                continue;
+            };
+            let span = source.locator.anchor().span();
+            let range = crate::analyzer::Range {
+                start_byte: span.start_byte() as usize,
+                end_byte: span.end_byte() as usize,
+                start_line: span.start().line() as usize + 1,
+                end_line: span.end().line() as usize + 1,
+            };
+            let answer = self.dispatch_at_source(file, range);
+            let contexts = answer
+                .call_contexts
+                .iter()
+                .filter(|context| context.procedure_id == procedure_id)
+                .collect::<Vec<_>>();
+            if !contexts.is_empty()
+                && contexts.iter().all(|context| {
+                    context.member_receiver_preparation
+                        == Some(crate::analyzer::semantic::MemberReceiverPreparation::Reference)
+                })
+            {
+                calls.push(call.id);
+            }
+        }
+        calls
+    }
+
     pub(super) fn dispatch_at_source(
         &mut self,
         file: &ProjectFile,
@@ -1082,6 +1140,7 @@ impl<'a> SemanticQueryContext<'a> {
                 .is_some_and(|unit| self.locator_exactly_names_unit(caller_locator, unit));
             let call_context = call_contexts.len();
             call_contexts.push(super::dispatch::DispatchCallContext {
+                member_receiver_preparation: observation.dispatch().member_receiver_preparation(),
                 procedure_id: procedure_wire_id(call.procedure()),
                 caller,
                 caller_is_exact,
@@ -1302,6 +1361,36 @@ impl<'a> SemanticQueryContext<'a> {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// The logical actual count already recorded by the file producer. This
+    /// lookup neither infers a result arity nor materializes result slots.
+    pub(super) fn call_argument_count_at_source(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+    ) -> Option<usize> {
+        let (artifact, _, _) = self.materialize(file)?;
+        let index = self.source_call_index(file, &artifact)?;
+        let key = (range.start_byte, range.end_byte);
+        let start = index
+            .candidates
+            .partition_point(|candidate| (candidate.span.start, candidate.span.end) < key);
+        let end = index
+            .candidates
+            .partition_point(|candidate| (candidate.span.start, candidate.span.end) <= key);
+        if end.saturating_sub(start) != 1 {
+            return None;
+        }
+        let candidate = &index.candidates[start];
+        Some(
+            candidate
+                .procedure
+                .semantics()
+                .call_site(candidate.call.id())?
+                .arguments
+                .len(),
+        )
     }
 
     /// Correlate an exact source call occurrence with its semantic invoke
@@ -1706,7 +1795,7 @@ impl<'a> SemanticQueryContext<'a> {
         let Some(receiver_range) = outcome.receiver_range else {
             return false;
         };
-        let Some(source) = shape.source.as_deref() else {
+        let Some(source) = shape.source() else {
             return false;
         };
         let Some(form) = javascript_exact_receiver_form(source, receiver_range) else {
@@ -2069,8 +2158,8 @@ impl<'a> SemanticQueryContext<'a> {
             }
         };
         if !outcome.is_complete() {
-            self.push_diagnostic(
-                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            self.push_diagnostic_with_cause(
+                Self::partial_outcome_code(&outcome),
                 CodeQueryDiagnosticImpact::Incomplete,
                 file,
                 "procedure identity inventory did not complete",
@@ -2383,6 +2472,20 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     pub(super) fn take_diagnostics(&mut self) -> Vec<CodeQueryDiagnostic> {
+        // These query-local ledgers disappear before the enclosing unit closes.
+        // Observe their sticky state while it is still available.
+        if self.budget.refusal_count() > 0 || self.work().budget_exhausted {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=budget:semantic refusals={} exhausted={}",
+                    file!(),
+                    line!(),
+                    self.budget.refusal_count(),
+                    self.work().budget_exhausted
+                )
+            });
+            self.workspace.analyzer().mark_execution_dependent();
+        }
         self.reported.clear();
         let mut diagnostics = std::mem::take(&mut self.diagnostics);
         diagnostics.extend(self.typestate.take_diagnostics());
@@ -2533,7 +2636,7 @@ impl<'a> SemanticQueryContext<'a> {
             };
             let Some((identity, has_receiver, parameter_count)) = exact_target else {
                 pending_diagnostics.push((
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!("task spawn has no unique exact external target: {dispatch:#?}"),
                 ));
                 continue;
@@ -2544,7 +2647,7 @@ impl<'a> SemanticQueryContext<'a> {
                 .map(|snapshot| snapshot.active_models())
             else {
                 pending_diagnostics.push((
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!(
                         "task spawn model lookup has no active model snapshot for {}.{}",
                         identity.owner_fqn(),
@@ -2563,7 +2666,7 @@ impl<'a> SemanticQueryContext<'a> {
                 ));
             if matched.disposition == SemanticModelMatchDisposition::Conflict {
                 pending_diagnostics.push((
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!(
                         "task spawn model lookup is ambiguous for {}.{} (receiver={has_receiver}, parameter_count={parameter_count})",
                         identity.owner_fqn(),
@@ -2574,7 +2677,7 @@ impl<'a> SemanticQueryContext<'a> {
             }
             let Some(selected) = matched.records.first() else {
                 pending_diagnostics.push((
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!(
                         "task spawn has no reviewed model for {}.{} (receiver={has_receiver}, parameter_count={parameter_count})",
                         identity.owner_fqn(),
@@ -2585,7 +2688,7 @@ impl<'a> SemanticQueryContext<'a> {
             };
             if selected.record.completeness != Completeness::Complete {
                 pending_diagnostics.push((
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!(
                         "task spawn model is incomplete for {}.{}",
                         identity.owner_fqn(),
@@ -2611,7 +2714,7 @@ impl<'a> SemanticQueryContext<'a> {
                 };
                 let Some(callable) = callable else {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                         format!(
                             "task spawn model input is not bound at {}.{} (receiver={has_receiver}, parameter_count={parameter_count}): {effect:#?}",
                             identity.owner_fqn(),
@@ -2627,7 +2730,7 @@ impl<'a> SemanticQueryContext<'a> {
             }
             if !found_task_spawn {
                 pending_diagnostics.push((
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                     format!(
                         "exact model has no TaskSpawn effect for {}.{}",
                         identity.owner_fqn(),
@@ -2637,7 +2740,7 @@ impl<'a> SemanticQueryContext<'a> {
             }
         }
         for (code, message) in pending_diagnostics {
-            self.push_diagnostic(
+            self.push_diagnostic_with_cause(
                 code,
                 CodeQueryDiagnosticImpact::Incomplete,
                 &procedure.file,
@@ -2749,7 +2852,7 @@ impl<'a> SemanticQueryContext<'a> {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticProviderFailed,
+                        (CodeQueryDiagnosticCode::SemanticProviderFailed, None),
                         format!("callback dispatch resolution failed: {error}"),
                     ));
                     continue;
@@ -2758,7 +2861,7 @@ impl<'a> SemanticQueryContext<'a> {
             let Some(dispatch) = dispatch_outcome.available_value() else {
                 if !dispatch_outcome.is_complete() {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        Self::partial_outcome_code(&dispatch_outcome),
                         "callback dispatch resolution produced no available target set".to_owned(),
                     ));
                 }
@@ -2768,7 +2871,12 @@ impl<'a> SemanticQueryContext<'a> {
                 quality_from_oracle_outcome(&dispatch_outcome, "callback dispatch resolution");
             if !dispatch.coverage().is_exhaustive() || !dispatch.boundaries().is_empty() {
                 pending_diagnostics.push((
-                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    (
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        (dispatch.coverage()
+                            == crate::analyzer::semantic::CandidateCoverage::Truncated)
+                            .then_some(DerivationExecutionCause::Budget),
+                    ),
                     format!(
                         "callback dispatch has open target coverage: coverage={}, boundaries={:?}",
                         dispatch.coverage().label(),
@@ -2780,7 +2888,7 @@ impl<'a> SemanticQueryContext<'a> {
             for candidate in &dispatch_candidates {
                 if !matches!(candidate.proof(), ProofStatus::Proven) {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        (CodeQueryDiagnosticCode::SemanticAnalysisPartial, None),
                         "callback callee body has no proven dispatch candidate".to_owned(),
                     ));
                     continue;
@@ -2800,7 +2908,7 @@ impl<'a> SemanticQueryContext<'a> {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         pending_diagnostics.push((
-                            CodeQueryDiagnosticCode::SemanticProviderFailed,
+                            (CodeQueryDiagnosticCode::SemanticProviderFailed, None),
                             format!("callback body value-flow query failed: {error}"),
                         ));
                         continue;
@@ -2808,7 +2916,7 @@ impl<'a> SemanticQueryContext<'a> {
                 };
                 let Some(relations) = relations_outcome.available_value() else {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        Self::partial_outcome_code(&relations_outcome),
                         "callback callee body has no available value-flow snapshot".to_owned(),
                     ));
                     continue;
@@ -2817,7 +2925,12 @@ impl<'a> SemanticQueryContext<'a> {
                     quality_from_oracle_outcome(&relations_outcome, "callback body value flow");
                 if !relations.coverage().is_exhaustive() {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        (
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            (relations.coverage()
+                                == crate::analyzer::semantic::CandidateCoverage::Truncated)
+                                .then_some(DerivationExecutionCause::Budget),
+                        ),
                         format!(
                             "callback body value-flow coverage is {}",
                             relations.coverage().label()
@@ -2833,7 +2946,7 @@ impl<'a> SemanticQueryContext<'a> {
                         Ok(outcome) => outcome,
                         Err(error) => {
                             pending_diagnostics.push((
-                                CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                (CodeQueryDiagnosticCode::SemanticProviderFailed, None),
                                 format!("callback call-binding query failed: {error}"),
                             ));
                             continue;
@@ -2841,7 +2954,7 @@ impl<'a> SemanticQueryContext<'a> {
                     };
                 let Some(bindings) = bindings_outcome.available_value() else {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        Self::partial_outcome_code(&bindings_outcome),
                         "callback call binding produced no available argument mapping".to_owned(),
                     ));
                     continue;
@@ -2850,7 +2963,12 @@ impl<'a> SemanticQueryContext<'a> {
                     quality_from_oracle_outcome(&bindings_outcome, "callback call bindings");
                 if !bindings.coverage().is_exhaustive() {
                     pending_diagnostics.push((
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        (
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            (bindings.coverage()
+                                == crate::analyzer::semantic::CandidateCoverage::Truncated)
+                                .then_some(DerivationExecutionCause::Budget),
+                        ),
                         format!(
                             "callback call-binding coverage is {}",
                             bindings.coverage().label()
@@ -2913,7 +3031,7 @@ impl<'a> SemanticQueryContext<'a> {
                             Ok(outcome) => outcome,
                             Err(error) => {
                                 pending_diagnostics.push((
-                                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                    (CodeQueryDiagnosticCode::SemanticProviderFailed, None),
                                     format!("callback invocation points-to query failed: {error}"),
                                 ));
                                 continue;
@@ -2921,7 +3039,7 @@ impl<'a> SemanticQueryContext<'a> {
                         };
                     let Some(invoked_objects) = invoked_objects_outcome.available_value() else {
                         pending_diagnostics.push((
-                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            Self::partial_outcome_code(&invoked_objects_outcome),
                             "callback invocation points-to query produced no candidate set"
                                 .to_owned(),
                         ));
@@ -2968,7 +3086,7 @@ impl<'a> SemanticQueryContext<'a> {
                                 Ok(outcome) => outcome,
                                 Err(error) => {
                                     pending_diagnostics.push((
-                                        CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                        (CodeQueryDiagnosticCode::SemanticProviderFailed, None),
                                         format!("callback actual points-to query failed: {error}"),
                                     ));
                                     continue;
@@ -2976,7 +3094,7 @@ impl<'a> SemanticQueryContext<'a> {
                             };
                         let Some(actual_objects) = actual_objects_outcome.available_value() else {
                             pending_diagnostics.push((
-                                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                                Self::partial_outcome_code(&actual_objects_outcome),
                                 "callback actual points-to query produced no candidate set"
                                     .to_owned(),
                             ));
@@ -3089,7 +3207,7 @@ impl<'a> SemanticQueryContext<'a> {
         }
         drop(request);
         for (code, message) in pending_diagnostics {
-            self.push_diagnostic(
+            self.push_diagnostic_with_cause(
                 code,
                 CodeQueryDiagnosticImpact::Incomplete,
                 &caller.file,
@@ -3100,6 +3218,16 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     pub(super) fn typestate_witness_truncated(&mut self, count: usize) {
+        if count > 0 {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=budget:typestate_witness",
+                    file!(),
+                    line!()
+                )
+            });
+            self.workspace.analyzer().mark_execution_dependent();
+        }
         self.typestate.witness_truncated(count);
     }
 
@@ -3178,7 +3306,7 @@ impl<'a> SemanticQueryContext<'a> {
     pub(super) fn python_iterator_return_sets(
         &mut self,
         procedure: &SemanticProcedureValue,
-    ) -> Vec<brokk_bifrost_flow::type_flow::ReceiverClassSet> {
+    ) -> Vec<crate::structural::search::type_flow::OwnedReceiverClassSet> {
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         self.type_flow.python_iterator_return_sets(
             self.workspace,
@@ -4006,6 +4134,21 @@ impl<'a> SemanticQueryContext<'a> {
         }
     }
 
+    fn partial_outcome_code<T>(
+        outcome: &SemanticOutcome<T>,
+    ) -> (CodeQueryDiagnosticCode, Option<DerivationExecutionCause>) {
+        let cause = match outcome {
+            SemanticOutcome::Cancelled { .. } => Some(DerivationExecutionCause::Cancelled),
+            SemanticOutcome::ExceededBudget { .. } => Some(DerivationExecutionCause::Budget),
+            SemanticOutcome::Complete { .. }
+            | SemanticOutcome::Ambiguous { .. }
+            | SemanticOutcome::Unknown { .. }
+            | SemanticOutcome::Unsupported { .. }
+            | SemanticOutcome::Unproven { .. } => None,
+        };
+        (CodeQueryDiagnosticCode::SemanticAnalysisPartial, cause)
+    }
+
     fn exact_source(
         &mut self,
         file: &ProjectFile,
@@ -4032,8 +4175,8 @@ impl<'a> SemanticQueryContext<'a> {
         if ContentIdentity::hash_bytes(source.source.as_bytes())
             != artifact.key().revision().content()
         {
-            self.push_diagnostic(
-                CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            self.push_diagnostic_with_cause(
+                (CodeQueryDiagnosticCode::SemanticResultsOmitted, Some(DerivationExecutionCause::Snapshot)),
                 CodeQueryDiagnosticImpact::Incomplete,
                 file,
                 "source generation changed before semantic result projection; retry the query for a coherent snapshot",
@@ -4044,8 +4187,16 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     fn push_source_generation_changed(&mut self, file: &ProjectFile) {
-        self.push_diagnostic(
-            CodeQueryDiagnosticCode::SemanticResultsOmitted,
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=snapshot",
+                file!(),
+                line!()
+            )
+        });
+        self.workspace.analyzer().mark_execution_dependent();
+        self.push_diagnostic_with_cause(
+            (CodeQueryDiagnosticCode::SemanticResultsOmitted, Some(DerivationExecutionCause::Snapshot)),
             CodeQueryDiagnosticImpact::Incomplete,
             file,
             "source generation changed between structural matching and semantic projection; retry the query for a coherent snapshot",
@@ -4113,6 +4264,14 @@ impl<'a> SemanticQueryContext<'a> {
         lane: &str,
         charge: Option<CodeQueryExhaustedCharge>,
     ) {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=budget:semantic lane={lane} detail={reason}",
+                file!(),
+                line!()
+            )
+        });
+        self.workspace.analyzer().mark_execution_dependent();
         let entry = CodeQueryExhaustedRoot {
             path: crate::path_utils::rel_path_string(file),
             procedure: None,
@@ -4128,6 +4287,7 @@ impl<'a> SemanticQueryContext<'a> {
             file,
             message,
             vec![entry],
+            Some(DerivationExecutionCause::Budget),
         );
     }
 
@@ -4138,7 +4298,17 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         message: &str,
     ) {
-        self.record_diagnostic(code, impact, file, message.to_string(), Vec::new());
+        self.push_diagnostic_with_cause((code, None), impact, file, message);
+    }
+
+    fn push_diagnostic_with_cause(
+        &mut self,
+        (code, cause): (CodeQueryDiagnosticCode, Option<DerivationExecutionCause>),
+        impact: CodeQueryDiagnosticImpact,
+        file: &ProjectFile,
+        message: &str,
+    ) {
+        self.record_diagnostic(code, impact, file, message.to_string(), Vec::new(), cause);
     }
 
     fn record_diagnostic(
@@ -4148,22 +4318,28 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         message: String,
         exhausted_roots: Vec<CodeQueryExhaustedRoot>,
+        cause: Option<DerivationExecutionCause>,
     ) {
         let key = (code, file.clone(), message.clone());
+        let diagnostic = super::QueryExecutionState::diagnostic(
+            self.workspace.analyzer(),
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: None,
+                code,
+                impact,
+                branch: Vec::new(),
+                language: crate::analyzer::common::language_for_file(file).config_label(),
+                message,
+                exhausted_roots,
+                withheld_rows_path: None,
+            },
+            cause,
+        );
         if !self.reported.insert(key) {
             return;
         }
-        self.diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code,
-            impact,
-            branch: Vec::new(),
-            language: crate::analyzer::common::language_for_file(file).config_label(),
-            message,
-            exhausted_roots,
-            withheld_rows_path: None,
-        });
+        self.diagnostics.push(diagnostic);
     }
 }
 
@@ -5448,6 +5624,12 @@ mod tests {
             None,
             &parent_scope,
             parent_semantic.remaining(),
+            super::super::CodeQueryRootAllotment::from_execution_limits(
+                &super::super::CodeQueryExecutionLimits {
+                    semantic: limits,
+                    ..Default::default()
+                },
+            ),
             execution_before,
             execution_child,
             leases.snapshot(),

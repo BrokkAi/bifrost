@@ -6,6 +6,67 @@ pub(super) fn child_guards(
     scope: ResolutionScopeId,
     parent: Option<u32>,
 ) -> HashMap<usize, u32> {
+    let mut children = control_child_guards(p, node, scope, parent);
+    let comprehension = is_comprehension(node.kind());
+    let mut previous = parent;
+    // Register every clause before the traversal visits it. Recovery can leave
+    // a clause under an ERROR node instead of its comprehension owner.
+    for clause in named_children_iter(node).filter(|child| child.kind() == "for_in_clause") {
+        let enclosing = if comprehension {
+            if let Some(previous) = previous {
+                children.insert(clause.id(), previous);
+            }
+            previous
+        } else {
+            children.get(&clause.id()).copied().or(parent)
+        };
+        let site = p.site(clause, scope, ResolutionSiteKind::UnsupportedExpression);
+        let id = dense_ordinal(
+            p.facts.python_guards.len(),
+            "comprehension iteration guards",
+        );
+        p.facts.python_guards.push(PythonNativeGuardFact {
+            id,
+            parent: enclosing,
+            site,
+            execution_scope: scope,
+            // An orphan's target writes have no proven iteration semantics.
+            kind: if comprehension {
+                PythonNativeGuardKind::LoopBody
+            } else {
+                PythonNativeGuardKind::UnknownControl
+            },
+            arm_ordinal: 0,
+            predicate: None,
+        });
+        assert!(p.iteration_guards.insert(clause.id(), id).is_none());
+        previous = Some(id);
+    }
+    if comprehension {
+        if let (Some(body), Some(last)) = (node.child_by_field_name("body"), previous) {
+            children.insert(body.id(), last);
+        }
+        // Filters after a clause execute after that clause's target binding.
+        let mut active = parent;
+        for child in named_children_iter(node) {
+            if child.kind() == "for_in_clause" {
+                active = p.iteration_guards.get(&child.id()).copied();
+            } else if child.kind() == "if_clause"
+                && let Some(active) = active
+            {
+                children.insert(child.id(), active);
+            }
+        }
+    }
+    children
+}
+
+fn control_child_guards(
+    p: &mut Producer<'_, '_>,
+    node: Node<'_>,
+    scope: ResolutionScopeId,
+    parent: Option<u32>,
+) -> HashMap<usize, u32> {
     let mut children = HashMap::default();
     if matches!(
         node.kind(),
@@ -70,45 +131,6 @@ pub(super) fn child_guards(
                 predicate: Some(predicate),
             });
             children.insert(branch.id(), id);
-        }
-        return children;
-    }
-    if is_comprehension(node.kind()) {
-        let mut previous = parent;
-        for clause in named_children_iter(node).filter(|child| child.kind() == "for_in_clause") {
-            if let Some(previous) = previous {
-                children.insert(clause.id(), previous);
-            }
-            let site = p.site(clause, scope, ResolutionSiteKind::UnsupportedExpression);
-            let id = dense_ordinal(
-                p.facts.python_guards.len(),
-                "comprehension iteration guards",
-            );
-            p.facts.python_guards.push(PythonNativeGuardFact {
-                id,
-                parent: previous,
-                site,
-                execution_scope: scope,
-                kind: PythonNativeGuardKind::LoopBody,
-                arm_ordinal: 0,
-                predicate: None,
-            });
-            assert!(p.iteration_guards.insert(clause.id(), id).is_none());
-            previous = Some(id);
-        }
-        if let (Some(body), Some(last)) = (node.child_by_field_name("body"), previous) {
-            children.insert(body.id(), last);
-        }
-        // Filters after a clause execute after that clause's target binding.
-        let mut active = parent;
-        for child in named_children_iter(node) {
-            if child.kind() == "for_in_clause" {
-                active = p.iteration_guards.get(&child.id()).copied();
-            } else if child.kind() == "if_clause"
-                && let Some(active) = active
-            {
-                children.insert(child.id(), active);
-            }
         }
         return children;
     }

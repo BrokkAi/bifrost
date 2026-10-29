@@ -1,0 +1,30 @@
+SOURCE const impl={run(){}}; module.exports={run:impl.run};
+Field [("Path", "surface.js"), ("Member", "impl")] lookup=false signatures=["const impl"] labels=[] supers=[]
+Function [("Path", "surface.js"), ("Member", "impl"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+export Some("run") Local { local_name: "impl.run" }
+materialized CommonJsMember "run" target=None
+materialized CommonJsRoot "module.exports" target=None
+SOURCE var api=load(); module.exports=api; api.run=function(){};
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["var api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=false signatures=["api.run = function() ..."] labels=[([], true, false)] supers=[]
+export Some("default") Default { local_name: Some("api") }
+export Some("run") Local { local_name: "api.run" }
+SOURCE const api=load(); module.exports=api; api.run=function(){};
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=false signatures=["api.run = function() ..."] labels=[([], true, false)] supers=[]
+export Some("default") Default { local_name: Some("api") }
+export Some("run") Local { local_name: "api.run" }
+SOURCE const api=load(); module.exports=api; function f(api){api.run=function(){};}
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=true signatures=["api.run = function() ..."] labels=[([], true, false)] supers=[]
+Function [("Member", "f")] lookup=false signatures=["// mutates: run\nfunction f(api) ..."] labels=[(["api"], true, false)] supers=[]
+export Some("default") Default { local_name: Some("api") }
+SOURCE if(flag){var api=load();} module.exports=api; api.run=function(){};
+Function [("Member", "api"), ("Member", "run")] lookup=false signatures=["api.run = function() ..."] labels=[([], true, false)] supers=[]
+export Some("default") Default { local_name: Some("api") }
+export Some("run") Local { local_name: "api.run" }
+SOURCE function f(){const local={run(){}};} const top={run(){}};
+Field [("Member", "top")] lookup=false signatures=["const top"] labels=[] supers=[]
+Function [("Member", "f"), ("Member", "local"), ("Member", "run")] lookup=true signatures=["run(){}"] labels=[] supers=[]
+Function [("Member", "f")] lookup=false signatures=["function f() ..."] labels=[([], true, false)] supers=[]
+Function [("Member", "top"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]

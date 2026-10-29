@@ -1859,6 +1859,13 @@ impl NativeWorkspaceGraphBuilder {
         })
     }
 
+    /// Graph-wide evidence does not alter any concrete edge's proof.
+    pub fn note_incomplete_reason(&mut self, reason: EdgeIncompleteReason) {
+        if !self.reasons.contains(&reason) {
+            self.reasons.push(reason);
+        }
+    }
+
     pub fn stage_batch(
         &mut self,
         analyzer: &dyn IAnalyzer,

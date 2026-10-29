@@ -189,7 +189,7 @@ pub(crate) enum CompositionError {
         identity: ResolvedEndpointIdentity,
     },
     EmptyResolvedEndpointSet {
-        role: EndpointRole,
+        role: &'static str,
     },
     UnsupportedMatchComposition {
         set: &'static str,
@@ -335,10 +335,7 @@ impl fmt::Display for CompositionError {
                 )
             }
             Self::EmptyResolvedEndpointSet { role } => {
-                write!(
-                    formatter,
-                    "resolved {role:?} endpoint set must not be empty"
-                )
+                write!(formatter, "resolved {role} endpoint set must not be empty")
             }
             Self::UnsupportedMatchComposition { set } => {
                 write!(

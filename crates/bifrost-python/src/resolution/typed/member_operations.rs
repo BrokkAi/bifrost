@@ -1,6 +1,8 @@
 //! Narrow dynamic member observations. Syntax nominates; consumers prove API authority.
 use super::*;
-use crate::syntax::python_plain_string_literal;
+use crate::structural::PYTHON_STRUCTURAL_SPEC;
+use crate::syntax::is_python_member_path;
+use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 use std::collections::VecDeque;
 
 fn named_form(node: Node<'_>, source: &str) -> Option<PythonMemberForm> {
@@ -101,7 +103,7 @@ fn callee_binding_reference(t: &mut Typed<'_, '_, '_>, node: Node<'_>) -> Option
 }
 
 fn names(t: &mut Typed<'_, '_, '_>, node: Node<'_>) -> PythonMemberNames {
-    let literal = python_plain_string_literal(node, t.p.source).map(str::to_owned);
+    let literal = PYTHON_STRUCTURAL_SPEC.string_literal_value(node, t.p.source);
     if let Some(literal) = literal {
         return PythonMemberNames::Exact(vec![t.p.facts.intern_name(&mut t.p.names, &literal)]);
     }
@@ -111,9 +113,8 @@ fn names(t: &mut Typed<'_, '_, '_>, node: Node<'_>) -> PythonMemberNames {
             .is_some_and(|op| op.utf8_text(t.p.source.as_bytes()) == Ok("+"))
         && let Some(prefix) = node
             .child_by_field_name("left")
-            .and_then(|left| python_plain_string_literal(left, t.p.source))
+            .and_then(|left| PYTHON_STRUCTURAL_SPEC.string_literal_value(left, t.p.source))
             .filter(|prefix| !prefix.is_empty())
-            .map(str::to_owned)
     {
         return PythonMemberNames::Prefix(t.p.facts.intern_name(&mut t.p.names, &prefix));
     }
@@ -131,6 +132,37 @@ fn call_arguments(call: Node<'_>) -> Vec<Node<'_>> {
             .filter(|argument| !argument.is_extra())
             .collect()
     }
+}
+
+// A later option cannot change an earlier positional actual. A spread before
+// the requested position can, so only explicit keywords can identify it then.
+fn actual<'tree>(
+    args: &[Node<'tree>],
+    index: usize,
+    keyword: Option<&str>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if let Some(argument) = args.get(index)
+        && args[..=index].iter().all(|arg| {
+            !matches!(
+                arg.kind(),
+                "keyword_argument" | "list_splat" | "dictionary_splat"
+            )
+        })
+    {
+        return Some(*argument);
+    }
+    let keyword = keyword?;
+    args.iter().find_map(|arg| {
+        (arg.kind() == "keyword_argument"
+            && arg
+                .child_by_field_name("name")?
+                .utf8_text(source.as_bytes())
+                .ok()?
+                == keyword)
+            .then(|| arg.child_by_field_name("value"))
+            .flatten()
+    })
 }
 
 fn dictionary_owner<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
@@ -169,11 +201,13 @@ fn mapping_names(t: &mut Typed<'_, '_, '_>, args: &[Node<'_>]) -> PythonMemberNa
                     let Some(key) = (pair.kind() == "pair")
                         .then(|| pair.child_by_field_name("key"))
                         .flatten()
-                        .and_then(|key| python_plain_string_literal(key, t.p.source))
+                        .and_then(|key| {
+                            PYTHON_STRUCTURAL_SPEC.string_literal_value(key, t.p.source)
+                        })
                     else {
                         return PythonMemberNames::Any;
                     };
-                    let key = t.p.facts.intern_name(&mut t.p.names, key);
+                    let key = t.p.facts.intern_name(&mut t.p.names, &key);
                     if seen.insert(key) {
                         keys.push(key);
                     }
@@ -414,37 +448,44 @@ pub(super) fn produce(t: &mut Typed<'_, '_, '_>, nodes: &[Node<'_>], events: &Ha
             };
             for form in forms {
                 let path = form == PythonMemberForm::PatchPath;
-                // Spread/keyword argument binding is not guessed. Keep its operation
-                // and unknown name rather than fabricating the second actual.
-                let positional = args.iter().all(|arg| {
-                    !matches!(
-                        arg.kind(),
-                        "keyword_argument" | "list_splat" | "dictionary_splat"
-                    )
-                });
-                let name = positional
-                    .then(|| args.get(usize::from(!path)).copied())
+                let name_keyword = match form {
+                    PythonMemberForm::PatchPath => Some("target"),
+                    PythonMemberForm::PatchObject => Some("attribute"),
+                    _ => None,
+                };
+                let name = actual(&args, usize::from(!path), name_keyword, t.p.source);
+                let receiver = (!path)
+                    .then(|| {
+                        actual(
+                            &args,
+                            0,
+                            (form == PythonMemberForm::PatchObject).then_some("target"),
+                            t.p.source,
+                        )
+                    })
                     .flatten();
-                let receiver = (!path && positional)
-                    .then(|| args.first().copied())
-                    .flatten();
-                let set = match (form, name) {
-                    (PythonMemberForm::PatchPath, Some(name)) => {
-                        // This is a decoded API string value, not Python source
-                        // syntax. Index the member; name_site retains the full
-                        // target literal for selected-owner confirmation.
-                        python_plain_string_literal(name, t.p.source)
-                            .and_then(|value| value.rsplit_once('.'))
-                            .filter(|(owner, member)| !owner.is_empty() && !member.is_empty())
-                            .map_or(PythonMemberNames::Any, |(_, member)| {
-                                PythonMemberNames::Exact(vec![
-                                    t.p.facts.intern_name(&mut t.p.names, member),
-                                ])
-                            })
+                let set = if path {
+                    match name.and_then(|name| {
+                        PYTHON_STRUCTURAL_SPEC.string_literal_value(name, t.p.source)
+                    }) {
+                        Some(target) => {
+                            // This is a decoded API value, not source syntax.
+                            // A constant URL or bare name cannot nominate a
+                            // module/member path; computed targets stay open.
+                            if !is_python_member_path(&target) {
+                                continue;
+                            }
+                            let (_, member) = target
+                                .rsplit_once('.')
+                                .expect("validated module/member path");
+                            PythonMemberNames::Exact(vec![
+                                t.p.facts.intern_name(&mut t.p.names, member),
+                            ])
+                        }
+                        None => PythonMemberNames::Any,
                     }
-                    (PythonMemberForm::PatchPath, None) => PythonMemberNames::Any,
-                    (_, Some(name)) => names(t, name),
-                    (_, None) => PythonMemberNames::Any,
+                } else {
+                    name.map_or(PythonMemberNames::Any, |name| names(t, name))
                 };
                 observations.push((form, receiver, name.unwrap_or(node), set));
             }
@@ -483,52 +524,47 @@ pub(super) fn produce(t: &mut Typed<'_, '_, '_>, nodes: &[Node<'_>], events: &Ha
                 t.scopes[&name.id()],
                 ResolutionSiteKind::UnsupportedExpression,
             );
-            if form == PythonMemberForm::PatchPath {
-                use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
-                if let Some(value) =
-                    crate::structural::PYTHON_STRUCTURAL_SPEC.string_literal_value(name, t.p.source)
-                    && let Some((owner, member)) = value.rsplit_once('.')
-                    && !owner.is_empty()
-                    && !member.is_empty()
-                    && owner.split('.').all(|part| !part.is_empty())
-                {
-                    // A selected API string value denotes an absolute module/
-                    // attribute route, not Python expression syntax. Its real
-                    // literal site is a prerequisite, never a proved operation.
-                    let mut parts = owner.split('.').collect::<Vec<_>>();
-                    let terminal = parts.pop().expect("nonempty owner");
-                    let name_id = t.p.facts.intern_name(&mut t.p.names, terminal);
-                    let reference = t.p.site(
-                        name,
-                        t.scopes[&name.id()],
-                        ResolutionSiteKind::ModuleReference,
-                    );
-                    t.p.facts.identifiers.push(PositionedIdentifierFact {
-                        site: reference,
-                        name: name_id,
-                        role: ResolutionIdentifierRole::Reference,
-                        namespace: ResolutionNamespace::Value,
-                        qualifier: None,
-                    });
-                    t.p.facts.root_references.push(ResolutionRootReferenceFact {
-                        reference,
-                        root_scope: ResolutionScopeId::new(0),
-                        anchor: ResolutionRootImportAnchor::Absolute,
-                        prefix_reference: None,
-                        owner_continued: false,
-                    });
-                    for (position, part) in parts.into_iter().enumerate() {
-                        let name = t.p.facts.intern_name(&mut t.p.names, part);
-                        t.p.facts.root_reference_segments.push(
-                            ResolutionRootReferenceSegmentFact {
-                                reference,
-                                position: dense_ordinal(position, "Python patch target route"),
-                                name,
-                            },
-                        );
-                    }
-                    receiver_reference = Some(reference);
+            if form == PythonMemberForm::PatchPath
+                && let Some(value) = PYTHON_STRUCTURAL_SPEC.string_literal_value(name, t.p.source)
+                && is_python_member_path(&value)
+                && let Some((owner, _)) = value.rsplit_once('.')
+            {
+                // A selected API string value denotes an absolute module/
+                // attribute route, not Python expression syntax. Its real
+                // literal site is a prerequisite, never a proved operation.
+                let mut parts = owner.split('.').collect::<Vec<_>>();
+                let terminal = parts.pop().expect("nonempty owner");
+                let name_id = t.p.facts.intern_name(&mut t.p.names, terminal);
+                let reference = t.p.site(
+                    name,
+                    t.scopes[&name.id()],
+                    ResolutionSiteKind::ModuleReference,
+                );
+                t.p.facts.identifiers.push(PositionedIdentifierFact {
+                    site: reference,
+                    name: name_id,
+                    role: ResolutionIdentifierRole::Reference,
+                    namespace: ResolutionNamespace::Value,
+                    qualifier: None,
+                });
+                t.p.facts.root_references.push(ResolutionRootReferenceFact {
+                    reference,
+                    root_scope: ResolutionScopeId::new(0),
+                    anchor: ResolutionRootImportAnchor::Absolute,
+                    prefix_reference: None,
+                    owner_continued: false,
+                });
+                for (position, part) in parts.into_iter().enumerate() {
+                    let name = t.p.facts.intern_name(&mut t.p.names, part);
+                    t.p.facts
+                        .root_reference_segments
+                        .push(ResolutionRootReferenceSegmentFact {
+                            reference,
+                            position: dense_ordinal(position, "Python patch target route"),
+                            name,
+                        });
                 }
+                receiver_reference = Some(reference);
             }
             // Literal member observations use the operation's existing receiver
             // value, exactly as an attribute reference does. Unknown names keep

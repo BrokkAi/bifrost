@@ -4,6 +4,7 @@
 //! halves, candidate export halves and compiled bridges die with the query.
 
 use super::file_context::RootHalfRequest;
+use super::placement_access::read_placement_rows;
 use super::root_bridges::{RootBridgePair, RootBridgeRules, assemble_root_bridges};
 use super::*;
 use crate::analyzer::resolution::{
@@ -82,6 +83,12 @@ JOIN main.source_go_manifests AS predecessor ON predecessor.blob_id = predecesso
 WHERE mask.storage_language = 'go' AND mounted.file_version_id IS NULL
   AND replacement.membership_digest = predecessor.membership_digest;
 "#;
+
+pub(crate) const CALLER_CONTEXT_PUBLISHES_FILE: &str = "
+SELECT EXISTS(SELECT 1 FROM main.go_package_files source
+ JOIN main.go_package_instances package ON package.package_id=source.package_id
+ WHERE source.rel_path=?1 AND package.context_id=?2)
+";
 
 const TRANSIENT_PLACEMENT: &str =
     "SELECT file_version_id FROM temp.selected_go_transient_placements WHERE mount_ordinal = ?1";
@@ -262,14 +269,6 @@ pub enum GoDotImportContext {
     Cancelled,
 }
 
-/// A file-to-context lookup at one snapshot, in the provider or the owner role.
-type GoContextsForFileLookup = fn(
-    &rusqlite::Connection,
-    &crate::analyzer::store::WorkspaceSnapshotId,
-    &[u8; 32],
-    &str,
-) -> Result<Vec<(super::super::GoContextIdentity, [u8; 32])>>;
-
 impl SelectedResolutionOperation<'_, '_> {
     /// Failure metadata is independent of whether package membership admits a file.
     #[doc(hidden)]
@@ -291,6 +290,37 @@ impl SelectedResolutionOperation<'_, '_> {
             .map_err(Into::into)
     }
 
+    /// Report the Go tool's errors for failed imports of these callers. A
+    /// package elsewhere in the domain must not open an unrelated rooted graph.
+    /// These are discovery failures, even though Go returned partial JSON and
+    /// the graph can still retain the callers' proven same-package edges.
+    #[doc(hidden)]
+    pub fn go_import_discovery_failures(
+        &self,
+        context_id: i64,
+        caller_files: &[ProjectFile],
+    ) -> Result<Vec<super::graph_stage::GraphDomainDiscoveryFailure>> {
+        let paths = caller_files
+            .iter()
+            .map(crate::path_utils::rel_path_string)
+            .collect::<Vec<_>>();
+        let paths = serde_json::to_string(&paths).expect("caller paths are JSON strings");
+        let mut statement = self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(GO_IMPORT_DISCOVERY_FAILURES_SQL)?;
+        Ok(statement
+            .query_map(rusqlite::params![context_id, paths], |row| {
+                Ok(super::graph_stage::GraphDomainDiscoveryFailure {
+                    domain_dir: row.get(0)?,
+                    gowork_path: row.get(1)?,
+                    discovery_error: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Select the publication(s) containing this workspace source at R.
     /// Results and bound identities live only for this request.
     #[doc(hidden)]
@@ -302,7 +332,7 @@ impl SelectedResolutionOperation<'_, '_> {
         self.bound_go_contexts_for_file(
             base,
             path,
-            super::super::go_package_context::go_contexts_for_file_on,
+            super::super::go_package_context::CONTEXTS_FOR_FILE_SQL,
         )
     }
 
@@ -317,7 +347,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let mut contexts = self.bound_go_contexts_for_file(
             base,
             path,
-            super::super::go_package_context::go_owner_context_for_file_on,
+            super::super::go_package_context::OWNER_CONTEXT_FOR_FILE_SQL,
         )?;
         assert!(
             contexts.len() <= 1,
@@ -341,13 +371,29 @@ impl SelectedResolutionOperation<'_, '_> {
         &self,
         base: &[u8; 32],
         path: &str,
-        lookup: GoContextsForFileLookup,
+        sql: &'static str,
     ) -> Result<Vec<(super::super::GoContextIdentity, [u8; 32])>> {
         let Some(snapshot) = self.captured_input.snapshots.get("go") else {
             return Ok(Vec::new());
         };
         self.initialize_go_base_profile(base);
-        let contexts = lookup(self.ready.inventory.connection(), snapshot, base, path)?;
+        let contexts = read_placement_rows(
+            &self.ready.inventory,
+            sql,
+            rusqlite::params![
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.get(),
+                snapshot.revision,
+                base,
+                super::super::go_package_context::DERIVATION_VERSION,
+                path
+            ],
+            |row: &rusqlite::Row<'_>| {
+                Ok(super::super::go_package_context::context_for_file_row(
+                    row, snapshot,
+                )?)
+            },
+        )?;
         for (context, _) in &contexts {
             self.bind_go_context_publication(context.clone());
         }
@@ -858,6 +904,42 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
+pub(crate) const GO_IMPORT_DISCOVERY_FAILURES_SQL: &str = r#"
+SELECT DISTINCT selection.domain_dir, selection.gowork_path,
+       json_extract(error.value, '$.evidence.error')
+FROM json_each(?2) requested
+CROSS JOIN temp.selected_resolution_mounts mounted
+  ON mounted.storage_language='go' AND mounted.persisted_relative_path=requested.value
+ AND NOT EXISTS(SELECT 1 FROM temp.selected_resolution_overlay_masks mask
+                WHERE mask.masked_file_version_id=mounted.file_version_id)
+CROSS JOIN main.source_imports source_import ON source_import.blob_id=mounted.blob_id
+CROSS JOIN main.go_package_files source ON source.rel_path=requested.value
+CROSS JOIN main.go_package_instances caller
+  ON caller.package_id=source.package_id AND caller.context_id=?1
+ AND ((source.source_role='go' AND caller.for_test='')
+   OR (source.source_role IN ('test','xtest') AND caller.for_test<>'')
+   OR (source.source_role='test' AND caller.for_test='' AND caller.complete=0
+       AND NOT EXISTS(SELECT 1 FROM main.go_package_files test_source
+         JOIN main.go_package_instances test_package ON test_package.package_id=test_source.package_id
+         WHERE test_package.context_id=caller.context_id AND test_source.rel_path=source.rel_path
+           AND test_source.source_role='test' AND test_package.for_test<>''))
+   OR (source.source_role IN ('test','xtest') AND caller.provider_provenance='source_inventory'))
+CROSS JOIN main.go_package_imports imported
+  ON imported.context_id=caller.context_id AND imported.importer_package_id=caller.package_id
+ AND imported.import_role=source.source_role AND imported.complete=0
+ AND imported.source_spelling=(
+   SELECT group_concat(segment.segment, '/' ORDER BY segment.ordinal)
+   FROM main.source_import_segments segment
+   WHERE segment.blob_id=source_import.blob_id AND segment.import_id=source_import.import_id)
+CROSS JOIN main.go_package_instances provider
+  ON provider.context_id=imported.context_id AND provider.package_id=imported.target_package_id
+CROSS JOIN main.go_context_publications publication ON publication.context_id=caller.context_id
+CROSS JOIN main.go_context_selections selection ON selection.selection_id=publication.selection_id
+CROSS JOIN json_each(provider.gaps) error
+WHERE json_extract(error.value, '$.code')='tool_package_error'
+ORDER BY selection.domain_dir, selection.gowork_path, json_extract(error.value, '$.evidence.error')
+"#;
+
 pub(crate) const DOMAIN_DISCOVERY_FAILURE_SQL: &str = r#"
 SELECT s.domain_dir, s.gowork_path, json_extract(gap.value, '$.evidence')
 FROM go_context_publications c JOIN go_context_selections s ON s.selection_id=c.selection_id,
@@ -882,11 +964,21 @@ struct GoDefinitionContextAuthority {
 pub(super) struct GoDefinitionContextMemo {
     authority: Option<GoDefinitionContextAuthority>,
     contexts: Vec<Option<Option<super::super::GoContextIdentity>>>,
+    // Whether a caller context publishes a file. A context's package files are
+    // written once, in the transaction that creates its id, so these answers
+    // need no authority. Keyed by path because an ordinal changes with scope.
+    caller_context_files: HashMap<i64, HashMap<String, bool>>,
 }
 
 impl super::super::resolution_typed::GoDefinitionContextBinder
     for super::ReadySelectedResolution<'_, '_>
 {
+    fn active_package(&self) -> Option<(i64, Option<&'static str>)> {
+        self.go_active_package
+            .get()
+            .map(|(_, package, role)| (package, role))
+    }
+
     // The caller has already selected this request's base profile. Candidate
     // declarations can belong to other domains under that same profile.
     fn bind_context(
@@ -895,6 +987,47 @@ impl super::super::resolution_typed::GoDefinitionContextBinder
         path: &str,
         candidates: &[SemanticId],
     ) -> Result<Option<super::super::GoContextIdentity>> {
+        // A file that the caller's context publishes, in any of its package
+        // variants, takes the caller's publication: that build is the authority
+        // for this caller. A file outside the caller's context still needs its
+        // owner publication to prove exclusion (for example, a Windows-only
+        // Execute method in another module).
+        if let Some((context_id, _, _)) = self.go_active_package.get() {
+            let known = self
+                .go_definition_contexts
+                .borrow()
+                .caller_context_files
+                .get(&context_id)
+                .and_then(|files| files.get(path).copied());
+            let publishes = match known {
+                Some(publishes) => publishes,
+                None => {
+                    let publishes = self
+                        .inventory
+                        .connection()
+                        .prepare_cached(CALLER_CONTEXT_PUBLISHES_FILE)?
+                        .query_row(rusqlite::params![path, context_id], |row| {
+                            row.get::<_, bool>(0)
+                        })?;
+                    self.go_definition_contexts
+                        .borrow_mut()
+                        .caller_context_files
+                        .entry(context_id)
+                        .or_default()
+                        .insert(path.to_owned(), publishes);
+                    publishes
+                }
+            };
+            if publishes {
+                return Ok(Some(
+                    self.go_publications
+                        .borrow()
+                        .get(&context_id)
+                        .expect("the active Go package has a bound publication")
+                        .clone(),
+                ));
+            }
+        }
         let Some(snapshot) = &self.go_snapshot else {
             return Ok(None);
         };

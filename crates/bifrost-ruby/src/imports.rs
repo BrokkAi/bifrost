@@ -8,9 +8,11 @@
 
 use crate::declarations::ruby_node_text as node_text;
 use crate::graph_support::RubySource;
+use crate::structural::RUBY_STRUCTURAL_SPEC;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::ruby_facts::{RubyLoadInfo, RubyLoadKind};
+use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -44,15 +46,12 @@ pub(crate) fn parse_ruby_load_syntax<'tree>(
         "autoload" => RubyLoadKind::Autoload,
         _ => return None,
     };
-    let arguments = node.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let (argument, path) = arguments
-        .named_children(&mut cursor)
-        .find_map(|arg| string_literal_value(arg, source).map(|path| (arg, path)))?;
+    let arguments = crate::syntax::ruby_call_arguments(node);
+    let path_index = usize::from(kind == RubyLoadKind::Autoload);
+    let argument = *arguments.get(path_index)?;
+    let path = string_literal_value(argument, source)?;
     let constant = if kind == RubyLoadKind::Autoload {
-        arguments
-            .named_child(0)
-            .and_then(|node| symbol_name(node, source))
+        literal_constant_name(*arguments.first()?, source)
     } else {
         None
     };
@@ -76,12 +75,9 @@ pub(crate) fn parse_ruby_load_syntax<'tree>(
 
 /// Extracts the contents of a string literal node (`"foo"` -> `foo`).
 fn string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() != "string" {
-        return None;
-    }
-    let content = crate::syntax::single_static_string_content_node(node)?;
-    let path = node_text(content, source);
-    (!path.is_empty()).then(|| path.to_owned())
+    RUBY_STRUCTURAL_SPEC
+        .string_literal_value(node, source)
+        .filter(|value| !value.is_empty())
 }
 
 fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -171,11 +167,9 @@ pub fn parse_ruby_autoload_call(node: Node<'_>, source: &str) -> Option<(String,
     if node_text(method, source).trim() != "autoload" {
         return None;
     }
-    let arguments = node.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let mut args = arguments.named_children(&mut cursor);
-    let constant = symbol_name(args.next()?, source)?;
-    let path = args.find_map(|arg| string_literal_value(arg, source))?;
+    let args = crate::syntax::ruby_call_arguments(node);
+    let constant = literal_constant_name(*args.first()?, source)?;
+    let path = string_literal_value(*args.get(1)?, source)?;
     Some((constant, path))
 }
 
@@ -203,28 +197,34 @@ pub fn ruby_symbol_name(node: Node<'_>, source: &str) -> Option<String> {
     symbol_name(node, source)
 }
 
+fn literal_constant_name(node: Node<'_>, source: &str) -> Option<String> {
+    symbol_name(node, source).or_else(|| string_literal_value(node, source))
+}
+
 pub fn gemfile_declares_zeitwerk_autoloading(contents: &str) -> bool {
-    contents.lines().any(|line| {
-        let line = line
-            .split_once('#')
-            .map_or(line, |(before, _)| before)
-            .trim();
-        let Some(after_gem) = line.strip_prefix("gem") else {
-            return false;
-        };
-        if !after_gem
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_whitespace() || ch == '(')
+    let Some(tree) = crate::declarations::parse_ruby_tree(contents) else {
+        return false;
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call"
+            && node.child_by_field_name("receiver").is_none()
+            && node
+                .child_by_field_name("method")
+                .is_some_and(|method| node_text(method, contents) == "gem")
+            && crate::syntax::ruby_first_call_argument(node)
+                .and_then(|arg| string_literal_value(arg, contents))
+                .is_some_and(|name| is_zeitwerk_autoload_gem(&name))
         {
-            return false;
+            return true;
         }
-        let args = after_gem
-            .trim_start()
-            .strip_prefix('(')
-            .unwrap_or(after_gem);
-        gem_args_name(args.trim_start()).is_some_and(is_zeitwerk_autoload_gem)
-    })
+        brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+            node,
+            &mut stack,
+            |child| child,
+        );
+    }
+    false
 }
 
 pub fn gemfile_lock_declares_zeitwerk_autoloading(contents: &str) -> bool {
@@ -235,15 +235,6 @@ pub fn gemfile_lock_declares_zeitwerk_autoloading(contents: &str) -> bool {
         };
         is_zeitwerk_autoload_gem(gem) && rest.trim_start().starts_with('(')
     })
-}
-
-fn gem_args_name(args: &str) -> Option<&str> {
-    let quote = args.chars().next()?;
-    if !matches!(quote, '"' | '\'') {
-        return None;
-    }
-    let rest = &args[quote.len_utf8()..];
-    rest.find(quote).map(|end| &rest[..end])
 }
 
 fn gemfile_lock_gem_line(line: &str) -> Option<(&str, &str)> {
@@ -299,27 +290,6 @@ pub fn ruby_required_files_checked(
             .filter_map(|load| resolve_generic_load(file, load))
             .collect(),
     )
-}
-
-/// Whether a supported load directive cannot be closed over project files.
-///
-/// A bare `require` can load a gem or a caller-provided load-path entry at
-/// runtime. Navigation can still offer best-effort indexed results, but a
-/// diagnostic must not claim that a constant is absent while that boundary
-/// remains open.
-pub fn ruby_has_unresolved_load_directive(
-    ruby: &dyn RubySource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-) -> bool {
-    let _ = token;
-    ruby.source_facts(file).is_none_or(|facts| {
-        facts
-            .loads
-            .iter()
-            .filter(|load| load.generic)
-            .any(|load| resolve_required_file(file, load).is_none())
-    })
 }
 
 pub fn ruby_autoload_visible_files_for_constant(
@@ -465,4 +435,53 @@ pub fn ruby_imported_files_from_infos(
             .filter_map(|load| resolve_generic_load(file, load))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod load_syntax_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: string autoload names were mistaken for paths"
+    )]
+    fn ruby_load_argument_grammar() {
+        for source in [
+            "autoload :Widget, 'widget'",
+            "autoload \"Widget\", \"widget\"",
+        ] {
+            let tree = crate::declarations::parse_ruby_tree(source).unwrap();
+            let call = tree.root_node().named_child(0).unwrap();
+            let load = parse_ruby_load_syntax(call, source).unwrap();
+            assert_eq!(load.constant.as_deref(), Some("Widget"));
+            assert_eq!(load.import.identifier.as_deref(), Some("widget"));
+            assert_eq!(
+                parse_ruby_autoload_call(call, source),
+                Some(("Widget".into(), "widget".into()))
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "826c41013fe0: quicksilver round 10 on brokk-bifrost-ruby: Gemfile line scanning missed multiline calls and admitted heredoc text"
+    )]
+    fn ruby_gemfile_call_grammar() {
+        for (source, expected) in [
+            ("gem(\n \"zeitwerk\"\n)\n", true),
+            ("group :default do\n gem 'rails'\nend", true),
+            ("gem ENV.fetch(\"GEM\")", false),
+            ("gem 'rack'", false),
+            ("# gem 'zeitwerk'", false),
+            ("text = <<~TEXT\ngem \"zeitwerk\"\nTEXT\n", false),
+            ("other.gem 'zeitwerk'", false),
+        ] {
+            assert_eq!(
+                gemfile_declares_zeitwerk_autoloading(source),
+                expected,
+                "{source}"
+            );
+        }
+    }
 }

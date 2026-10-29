@@ -153,9 +153,17 @@ impl KotlinAnalyzer {
         if file_language(file) != Language::Kotlin {
             return Arc::new(HashSet::default());
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "kotlin.imported_code_units_in_realm",
+            );
         let imports = self.inner.import_info_of(token, file);
         let resolved = Arc::new(resolve_kotlin_import_infos(self, token, &imports, realm));
-        cache.insert(file.clone(), Arc::clone(&resolved));
+        let cache_key = file.clone();
+        let cache_value = Arc::clone(&resolved);
+        persistent_fill_guard.installed("kotlin.imported_code_units_in_realm");
+        cache.insert(cache_key, cache_value);
         resolved
     }
 
@@ -163,8 +171,20 @@ impl KotlinAnalyzer {
     /// the same package and spell one another's names.
     fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.same_package_reference_index.get_or_build(
-            || compute_kotlin_same_package_reference_index(self, true),
-            || compute_kotlin_same_package_reference_index(self, false),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "kotlin.same_package_reference_index",
+                    || compute_kotlin_same_package_reference_index(self, true),
+                )
+            },
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "kotlin.same_package_reference_index",
+                    || compute_kotlin_same_package_reference_index(self, false),
+                )
+            },
         )
     }
 }
@@ -235,7 +255,12 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) {
         if self.file_dependency_index.get().is_none()
-            && let Some(index) = KotlinFileDependencyIndex::build(self, files, cancellation)
+            && let Some(index) =
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                    KotlinFileDependencyIndex::build(self, files, cancellation)
+                })
+                .ok()
+                .flatten()
         {
             let _ = self.file_dependency_index.set(index);
         }
@@ -321,14 +346,31 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/kotlin/imports.rs",
+            );
         if file_language(file) != Language::Kotlin {
             return HashSet::default();
         }
         let reverse_index =
             brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
                 &self.reverse_import_index,
-                || self.inner.all_files(),
-                |candidate| self.imported_code_units_of(candidate),
+                || {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "kotlin.reverse_file_index",
+                        || self.inner.all_files(),
+                    )
+                },
+                |candidate| {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "kotlin.reverse_file_index",
+                        || self.imported_code_units_of(candidate),
+                    )
+                },
             );
         let mut result = reverse_index
             .get(file)
@@ -338,8 +380,12 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
             result.extend(files.iter().cloned());
         }
 
-        self.referencing_files
-            .insert(file.clone(), Arc::new(result.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(result.clone());
+            persistent_fill_guard.installed("referencing_files");
+            self.referencing_files.insert(cache_key, cache_value);
+        };
         result
     }
 

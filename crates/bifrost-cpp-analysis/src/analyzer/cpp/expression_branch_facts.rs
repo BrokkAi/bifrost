@@ -5,6 +5,7 @@
 //! prepared tree, then publishes only the syntax/storage classification that
 //! language-neutral flow analysis cannot recover from the IR.
 
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_analysis::analyzer::assignment_facts::OverwrittenLocalCandidate;
@@ -134,7 +135,7 @@ pub(crate) fn build_c_assignment_candidates(
         };
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
 
     let file = ProjectFile::new(
@@ -152,11 +153,13 @@ pub(crate) fn build_c_assignment_candidates(
     let syntax = match syntax {
         Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax,
         Some(StructuralSyntaxLimitedOutcome::Exceeded { .. }) => {
-            return unavailable("source_budget_exhausted");
+            return unavailable(derivation_reason::SOURCE_BUDGET_EXHAUSTED);
         }
-        Some(StructuralSyntaxLimitedOutcome::Cancelled) => return unavailable("cancelled"),
+        Some(StructuralSyntaxLimitedOutcome::Cancelled) => {
+            return unavailable(derivation_reason::CANCELLED);
+        }
         Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
-            return unavailable("prepared_syntax_unavailable");
+            return unavailable(derivation_reason::PREPARED_SYNTAX_UNAVAILABLE);
         }
     };
     let Ok(syntax) = validate_prepared_syntax_source_for_procedure(
@@ -165,28 +168,28 @@ pub(crate) fn build_c_assignment_candidates(
         &file,
         syntax.into_inner(),
     ) else {
-        return unavailable("source_identity_mismatch");
+        return unavailable(derivation_reason::SOURCE_IDENTITY_MISMATCH);
     };
     let semantics = procedure.semantics();
     let Some(procedure_mapping) = semantics.source_mapping(semantics.source()) else {
-        return unavailable("procedure_mapping_missing");
+        return unavailable(derivation_reason::PROCEDURE_MAPPING_MISSING);
     };
     let procedure_span = procedure_mapping.locator.anchor().span();
     let Some(procedure_node) = syntax.tree().root_node().named_descendant_for_byte_range(
         procedure_span.start_byte() as usize,
         procedure_span.end_byte() as usize,
     ) else {
-        return unavailable("procedure_syntax_missing");
+        return unavailable(derivation_reason::PROCEDURE_SYNTAX_MISSING);
     };
     if procedure_node.start_byte() != procedure_span.start_byte() as usize
         || procedure_node.end_byte() != procedure_span.end_byte() as usize
         || procedure_node.has_error()
     {
-        return unavailable("procedure_syntax_inexact");
+        return unavailable(derivation_reason::PROCEDURE_SYNTAX_INEXACT);
     }
 
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()) else {
-        return unavailable("cpp_analyzer_unavailable");
+        return unavailable(derivation_reason::CPP_ANALYZER_UNAVAILABLE);
     };
     let is_c_source = file
         .rel_path()
@@ -207,7 +210,7 @@ pub(crate) fn build_c_assignment_candidates(
     let mut stack = vec![procedure_node];
     while let Some(node) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
+            return unavailable(derivation_reason::CANCELLED);
         }
         if node.id() != procedure_node.id()
             && matches!(node.kind(), "function_definition" | "lambda_expression")
@@ -254,7 +257,7 @@ pub(crate) fn build_c_assignment_candidates(
     let mut rows = Vec::with_capacity(assignments.len());
     for assignment in assignments {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
+            return unavailable(derivation_reason::CANCELLED);
         }
         let row = classify_assignment(
             semantics,
@@ -267,16 +270,16 @@ pub(crate) fn build_c_assignment_candidates(
         has_macro_hazard |= row.reason == "object_like_macro";
         rows.push(row);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
+            return unavailable(derivation_reason::CANCELLED);
         }
     }
     CAssignmentCandidates {
         rows,
         complete: !(has_preprocessing || has_macro_hazard),
         reason: if has_preprocessing {
-            Some("preprocessing_present")
+            Some(derivation_reason::PREPROCESSING_PRESENT)
         } else {
-            has_macro_hazard.then_some("macro_possible")
+            has_macro_hazard.then_some(derivation_reason::MACRO_POSSIBLE)
         },
     }
 }
@@ -315,10 +318,10 @@ pub(crate) fn build_cpp_overwritten_local_candidates(
         procedure.artifact().key().language(),
         LanguageDialect::CppC | LanguageDialect::Standard(Language::Cpp)
     ) {
-        return overwritten_unavailable("unsupported_language");
+        return overwritten_unavailable(derivation_reason::UNSUPPORTED_LANGUAGE);
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return overwritten_unavailable("cancelled");
+        return overwritten_unavailable(derivation_reason::CANCELLED);
     }
 
     let file = ProjectFile::new(
@@ -336,13 +339,13 @@ pub(crate) fn build_cpp_overwritten_local_candidates(
     let syntax = match syntax {
         Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax,
         Some(StructuralSyntaxLimitedOutcome::Exceeded { .. }) => {
-            return overwritten_unavailable("source_budget_exhausted");
+            return overwritten_unavailable(derivation_reason::SOURCE_BUDGET_EXHAUSTED);
         }
         Some(StructuralSyntaxLimitedOutcome::Cancelled) => {
-            return overwritten_unavailable("cancelled");
+            return overwritten_unavailable(derivation_reason::CANCELLED);
         }
         Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
-            return overwritten_unavailable("prepared_syntax_unavailable");
+            return overwritten_unavailable(derivation_reason::PREPARED_SYNTAX_UNAVAILABLE);
         }
     };
     let Ok(syntax) = validate_prepared_syntax_source_for_procedure(
@@ -351,28 +354,28 @@ pub(crate) fn build_cpp_overwritten_local_candidates(
         &file,
         syntax.into_inner(),
     ) else {
-        return overwritten_unavailable("source_identity_mismatch");
+        return overwritten_unavailable(derivation_reason::SOURCE_IDENTITY_MISMATCH);
     };
     let semantics = procedure.semantics();
     let Some(procedure_mapping) = semantics.source_mapping(semantics.source()) else {
-        return overwritten_unavailable("procedure_mapping_missing");
+        return overwritten_unavailable(derivation_reason::PROCEDURE_MAPPING_MISSING);
     };
     let procedure_span = procedure_mapping.locator.anchor().span();
     let Some(procedure_node) = syntax.tree().root_node().named_descendant_for_byte_range(
         procedure_span.start_byte() as usize,
         procedure_span.end_byte() as usize,
     ) else {
-        return overwritten_unavailable("procedure_syntax_missing");
+        return overwritten_unavailable(derivation_reason::PROCEDURE_SYNTAX_MISSING);
     };
     if procedure_node.start_byte() != procedure_span.start_byte() as usize
         || procedure_node.end_byte() != procedure_span.end_byte() as usize
         || procedure_node.has_error()
     {
-        return overwritten_unavailable("procedure_syntax_inexact");
+        return overwritten_unavailable(derivation_reason::PROCEDURE_SYNTAX_INEXACT);
     }
 
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()) else {
-        return overwritten_unavailable("cpp_analyzer_unavailable");
+        return overwritten_unavailable(derivation_reason::CPP_ANALYZER_UNAVAILABLE);
     };
     let is_c_source = file
         .rel_path()
@@ -398,7 +401,7 @@ pub(crate) fn build_cpp_overwritten_local_candidates(
     let mut stack = vec![procedure_node];
     while let Some(node) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return overwritten_unavailable("cancelled");
+            return overwritten_unavailable(derivation_reason::CANCELLED);
         }
         if node.id() != procedure_node.id()
             && matches!(node.kind(), "function_definition" | "lambda_expression")
@@ -507,7 +510,7 @@ pub(crate) fn build_cpp_overwritten_local_candidates(
     let mut rows = Vec::with_capacity(writes.len());
     for write in writes {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return overwritten_unavailable("cancelled");
+            return overwritten_unavailable(derivation_reason::CANCELLED);
         }
         let row = |node: Node<'_>, source_kind, verdict, reason| OverwrittenLocalCandidate {
             points: Vec::new(),
@@ -617,9 +620,9 @@ pub(crate) fn build_cpp_overwritten_local_candidates(
         rows,
         complete: !(has_preprocessing || has_macro_hazard),
         reason: if has_preprocessing {
-            Some("preprocessing_present")
+            Some(derivation_reason::PREPROCESSING_PRESENT)
         } else {
-            has_macro_hazard.then_some("macro_possible")
+            has_macro_hazard.then_some(derivation_reason::MACRO_POSSIBLE)
         },
     }
 }
@@ -1641,6 +1644,100 @@ mod tests {
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7278: C++ content hazards were marked as provider failures and refused from candidate memos"
+    )]
+    fn content_hazard_reasons_do_not_poison_candidate_memos() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, ReadLedger};
+        use std::sync::Arc;
+
+        for (source, expected) in [
+            (
+                "#define VALUE 1\nvoid sample() {\n#if 1\nint value = VALUE; value = VALUE;\n#endif\n}\n",
+                derivation_reason::PREPROCESSING_PRESENT,
+            ),
+            (
+                "#define VALUE 1\nvoid sample() { int value = VALUE; value = VALUE; }\n",
+                derivation_reason::MACRO_POSSIBLE,
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("main.cpp", source)]);
+            let file = ProjectFile::new(fixture.project_root(), "main.cpp");
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let outcome = fixture
+                .analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("C++ artifact");
+            let artifact = outcome.available_value().expect("available C++ semantics");
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(DeclarationSegment::name)
+                        == Some("sample")
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("sample handle");
+            let cpp =
+                resolve_analyzer::<CppAnalyzer>(fixture.analyzer.analyzer()).expect("C++ analyzer");
+            let ledger = Arc::new(ReadLedger::new());
+            let _scope = AnalyzerQueryScope::with_read_ledger(
+                fixture.analyzer.analyzer(),
+                Arc::clone(&ledger),
+            );
+            let assignments = cpp.c_assignment_candidates_for(&fixture.analyzer, &procedure, None);
+            let overwritten =
+                cpp.cpp_overwritten_candidates_for(&fixture.analyzer, &procedure, None);
+            let initializers = crate::analyzer::cpp::initializer_facts::cpp_initializer_candidates(
+                &fixture.analyzer,
+                &procedure,
+                None,
+            );
+            assert!(
+                !assignments.rows.is_empty()
+                    && !overwritten.rows.is_empty()
+                    && !initializers.rows.is_empty(),
+                "all three producers must run: {assignments:#?} {overwritten:#?} {initializers:#?}"
+            );
+            for reason in [assignments.reason, overwritten.reason, initializers.reason] {
+                assert_eq!(reason, Some(expected));
+                let reason = reason.expect("hazard is present");
+                assert_eq!(derivation_reason::classify_known(reason), Some(None));
+                assert_eq!(DerivationExecutionCause::from_reason(reason), None);
+            }
+            assert_eq!(
+                ledger.execution_dependences(),
+                0,
+                "content hazards cannot mark execution"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &assignments,
+                    &cpp.c_assignment_candidates_for(&fixture.analyzer, &procedure, None)
+                ),
+                "content-only partial assignment candidates must be retained"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &overwritten,
+                    &cpp.cpp_overwritten_candidates_for(&fixture.analyzer, &procedure, None)
+                ),
+                "content-only partial overwritten candidates must be retained"
+            );
+        }
+    }
+
+    #[test]
     fn c_assignment_candidates_reports_source_budget_exhaustion() {
         // Keep the padding volume while bounded lines let materialization reach
         // the downstream assignment-candidate source budget.
@@ -1689,7 +1786,7 @@ mod tests {
         assert!(!candidates.complete, "{candidates:#?}");
         assert_eq!(
             candidates.reason,
-            Some("source_budget_exhausted"),
+            Some(derivation_reason::SOURCE_BUDGET_EXHAUSTED),
             "{candidates:#?}"
         );
     }

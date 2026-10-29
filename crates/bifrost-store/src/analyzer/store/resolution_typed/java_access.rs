@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::analyzer::resolution::{JavaAccessEndpoint, JvmAccessEndpoint};
+use crate::analyzer::store::resolution_operation::nominal_rules::nominal_language_rules;
 use crate::hash::{HashMap, HashSet};
 
 // Each seed and parent lookup is keyed by one selected blob and semantic. UNION
@@ -279,7 +280,10 @@ pub(super) fn read_jvm(
                 .selection
                 .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?
                 .semantic_language();
-            if !matches!(language, Language::Java | Language::Scala) {
+            let Some(rules) = nominal_language_rules(language) else {
+                continue;
+            };
+            if !rules.has_declaration_access_endpoints() {
                 continue;
             }
             let Some(provenance) = source
@@ -291,7 +295,7 @@ pub(super) fn read_jvm(
             let Some(SelectedSemanticProvenance::FragmentLocal(local)) = provenance else {
                 continue;
             };
-            has_scala |= language == Language::Scala;
+            has_scala |= rules.has_lexical_access_templates();
             coordinates.insert((local.mount().ordinal(), local.local_key().get()), semantic);
         }
         if coordinates.is_empty() {
@@ -312,11 +316,12 @@ pub(super) fn read_jvm(
                 }
                 let ordinal = SelectedResolutionMountOrdinal::new(row.get(0)?);
                 let semantic = coordinates[&(ordinal, row.get::<_, i64>(1)?)];
-                let language = match row.get::<_, String>(2)?.as_str() {
-                    "java" => Language::Java,
-                    "scala" => Language::Scala,
-                    other => panic!("JVM access query returned unexpected language {other:?}"),
-                };
+                let language = Language::from_config_label(&row.get::<_, String>(2)?)
+                    .expect("JVM access query returned a known language");
+                assert!(
+                    nominal_language_rules(language)
+                        .is_some_and(|rules| rules.has_declaration_access_endpoints())
+                );
                 let seed_owner = row
                     .get::<_, Option<u32>>(4)?
                     .map(|key| SemanticId::local(ordinal.get(), key));

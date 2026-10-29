@@ -252,8 +252,16 @@ impl KotlinAnalyzer {
         if let Some(cached) = cache.get(code_unit) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "kotlin.direct_ancestors",
+            );
         let ancestors = kotlin_resolve_direct_ancestors(self, token, code_unit, realm);
-        cache.insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        let cache_key = code_unit.clone();
+        let cache_value = Arc::new(ancestors.clone());
+        persistent_fill_guard.installed("kotlin.direct_ancestors");
+        cache.insert(cache_key, cache_value);
         ancestors
     }
 
@@ -269,7 +277,11 @@ impl KotlinAnalyzer {
             None => &self.direct_descendant_index,
         };
         descendants_from_variant_index(index, scope, code_unit, || {
-            self.build_direct_descendant_index(token, realm, scope)
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                self.build_direct_descendant_index(token, realm, scope)
+            })
+            .ok()
+            .flatten()
         })
     }
 

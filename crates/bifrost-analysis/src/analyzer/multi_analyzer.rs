@@ -68,6 +68,14 @@ pub trait LanguageAnalyzer:
         language_for_file(file) == language
             || self.analyzer().is_analyzed(file)
             || is_language_configuration_input(language, file)
+            || self.read_configuration_file(file)
+    }
+    /// Whether this snapshot read `file` as configuration while answering
+    /// queries, under a name the fixed configuration inputs do not cover (a
+    /// tsconfig reached through `extends`, for example). A change to such a
+    /// file can leave the snapshot's cached state stale.
+    fn read_configuration_file(&self, _file: &ProjectFile) -> bool {
+        false
     }
     fn update_all_with_progress(
         &self,
@@ -546,6 +554,7 @@ pub struct MultiAnalyzer {
     /// `query_contexts`, which a clone starts empty, so it is minted fresh per
     /// clone rather than shared.
     attached_read_ledgers: AtomicUsize,
+    degraded_persistent_fills: Arc<AtomicUsize>,
     /// One delegate's own file list is already sorted and single-language;
     /// `analyzed_files_for_language`'s override only has to look it up, but
     /// still re-sorted it on every call until this memoized it (bifrost#15).
@@ -579,6 +588,7 @@ impl Clone for MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            degraded_persistent_fills: Arc::clone(&self.degraded_persistent_fills),
             analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
             resolve_definition_batch_with_source_call_count: Arc::clone(
                 &self.resolve_definition_batch_with_source_call_count,
@@ -683,6 +693,7 @@ impl MultiAnalyzer {
             derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
             analyzed_files_by_language: Arc::new(
                 brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
             ),
@@ -727,6 +738,7 @@ impl MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
             analyzed_files_by_language: Arc::new(
                 brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
             ),
@@ -860,11 +872,12 @@ impl MultiAnalyzer {
             }
             return merged;
         }
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         self.delegates
             .values()
             .collect::<Vec<_>>()
             .into_par_iter()
-            .map(|delegate| query(delegate.analyzer()))
+            .map(|delegate| context.run(|| query(delegate.analyzer())))
             .reduce(BTreeSet::new, |mut acc, found| {
                 acc.extend(found);
                 acc
@@ -920,7 +933,7 @@ fn record_importer_lookup(
     targets: &[ProjectFile],
     referencing: &HashSet<ProjectFile>,
 ) {
-    if !analyzer.read_ledger_attached() {
+    if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
     }
     let digest = crate::analyzer::read_ledger::file_set_digest(referencing);
@@ -978,7 +991,8 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             }
             referencing.extend(provider.referencing_files_of_targets(targets, cancellation));
         }
-        if IAnalyzer::read_ledger_attached(self) {
+        if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
+        {
             let targets = targets.iter().cloned().collect::<Vec<_>>();
             record_importer_lookup(self, &targets, &referencing);
         }
@@ -1237,6 +1251,29 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .unwrap_or_default()
     }
 
+    fn member_family_ancestors(
+        &self,
+        owner: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::MemberFamilyAncestors {
+        let mut ancestors = self
+            .delegate_for_code_unit(owner)
+            .and_then(AnalyzerDelegate::type_hierarchy_provider)
+            .map(|provider| provider.member_family_ancestors(owner))
+            .unwrap_or_default();
+        ancestors.resolved = self.get_direct_ancestors(owner);
+        ancestors
+    }
+
+    fn member_family_inventory_matches(
+        &self,
+        member: &CodeUnit,
+        inventory: &[brokk_bifrost_core::analyzer::capabilities::PlatformInventoryMethod],
+    ) -> bool {
+        self.delegate_for_code_unit(member)
+            .and_then(AnalyzerDelegate::type_hierarchy_provider)
+            .is_none_or(|provider| provider.member_family_inventory_matches(member, inventory))
+    }
+
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         crate::analyzer::whole_workspace_descendants(|scope| {
             self.get_direct_descendants_within(code_unit, scope)
@@ -1292,7 +1329,8 @@ impl TypeHierarchyProvider for MultiAnalyzer {
                 support.workspace_additional_direct_descendants(self, token, code_unit, scope)?,
             );
         }
-        if IAnalyzer::read_ledger_attached(self) {
+        if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
+        {
             // Descendants are a cross-file answer: a subclass added in a file
             // the reader never mentions changes it, and no per-file key the
             // reader recorded moves.
@@ -1463,13 +1501,19 @@ impl CodeUnitIndex for MultiAnalyzer {
         }
         let cell = self.analyzed_files_by_language.cell(&language);
         let build = || {
-            let mut files = self
-                .delegates
-                .get(&language)
-                .map(|delegate| delegate.analyzer().analyzed_files())
-                .unwrap_or_default();
-            files.sort();
-            files
+            crate::analyzer::common::persistent_cache_fill(
+                self,
+                "multi.analyzed_files_by_language",
+                || {
+                    let mut files = self
+                        .delegates
+                        .get(&language)
+                        .map(|delegate| delegate.analyzer().analyzed_files())
+                        .unwrap_or_default();
+                    files.sort();
+                    files
+                },
+            )
         };
         (*cell.get_or_build(build, build)).clone()
     }
@@ -1631,7 +1675,8 @@ impl CodeUnitIndex for MultiAnalyzer {
                 delegate.analyzer().definitions(fq_name)
             })
             .collect();
-        if IAnalyzer::read_ledger_attached(self) {
+        if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
+        {
             self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
                 crate::analyzer::read_ledger::LookupKind::Definitions,
                 crate::analyzer::read_ledger::LookupQuestion::Name {
@@ -1737,7 +1782,8 @@ impl CodeUnitIndex for MultiAnalyzer {
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         let matches =
             self.merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_short_name(symbol));
-        if IAnalyzer::read_ledger_attached(self) {
+        if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
+        {
             self.record_read(
                 crate::analyzer::read_ledger::declaration_candidates_lookup_key(
                     crate::analyzer::read_ledger::LookupKind::ShortNameCandidates,
@@ -1763,7 +1809,8 @@ impl CodeUnitIndex for MultiAnalyzer {
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         let matches = self
             .merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_identifier(identifier));
-        if IAnalyzer::read_ledger_attached(self) {
+        if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
+        {
             self.record_read(
                 crate::analyzer::read_ledger::declaration_candidates_lookup_key(
                     crate::analyzer::read_ledger::LookupKind::IdentifierCandidates,
@@ -1872,14 +1919,12 @@ impl IAnalyzer for MultiAnalyzer {
             .and_then(|delegate| delegate.analyzer().cpp_expression_source_facts(file))
     }
 
-    fn cpp_statement_source_facts(
+    fn statement_source_facts(
         &self,
         file: &ProjectFile,
-    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>> {
-        (language_for_file(file) == Language::Cpp)
-            .then(|| self.delegate_for_file(file))
-            .flatten()
-            .and_then(|delegate| delegate.analyzer().cpp_statement_source_facts(file))
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().statement_source_facts(file))
     }
 
     fn cpp_class_source_facts(
@@ -1952,6 +1997,38 @@ impl IAnalyzer for MultiAnalyzer {
                 .then_with(|| left.message.cmp(&right.message))
         });
         result.gaps.dedup();
+        Ok(result)
+    }
+
+    fn reference_names_in_files(
+        &self,
+        request: crate::analyzer::i_analyzer::ReferenceNamesInFilesRequest<'_>,
+    ) -> crate::analyzer::store::Result<crate::analyzer::i_analyzer::ReferenceNamesInFilesResult>
+    {
+        let mut groups: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in request.files {
+            let language = self.dispatch_language(file);
+            if !self.delegates.contains_key(&language) {
+                return Err(crate::analyzer::store::StoreError::new(format!(
+                    "reference names in files: unsupported file {file}"
+                )));
+            }
+            groups.entry(language).or_default().push(file.clone());
+        }
+        let mut result = crate::analyzer::i_analyzer::ReferenceNamesInFilesResult::default();
+        for (language, files) in groups {
+            let contribution = self.delegates[&language]
+                .analyzer()
+                .reference_names_in_files(
+                    crate::analyzer::i_analyzer::ReferenceNamesInFilesRequest {
+                        files: &files,
+                        names: request.names,
+                    },
+                )?;
+            for (name, file) in contribution.by_name {
+                result.by_name.entry(name).or_insert(file);
+            }
+        }
         Ok(result)
     }
 
@@ -2069,32 +2146,85 @@ impl IAnalyzer for MultiAnalyzer {
     /// Record one input read through this facade.
     ///
     /// The delegates keep their own registries and record their own funnels;
-    /// this reaches every unshadowed ledger opened against the composite so a
-    /// key formed above the delegates is not lost. Forwarding to the delegates
+    /// this follows the current attribution frame so a key formed above the
+    /// delegates is not lost. Broadcast uses the composite registry. Forwarding
     /// as well would only re-record the same key, which a set-valued ledger
     /// would drop anyway.
     fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
-        if !IAnalyzer::read_ledger_attached(self) {
+        if !crate::analyzer::read_attribution_records_reads(|| {
+            IAnalyzer::read_ledger_attached(self)
+        }) {
             return;
         }
-        let contexts = self
-            .query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .clone();
+        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.query_contexts
+                .lock()
+                .expect("multi-analyzer query context mutex poisoned")
+                .clone()
+        };
         crate::analyzer::i_analyzer::record_read_on_active_ledgers(&contexts, key);
     }
 
     fn record_unattributed_read(&self) {
-        if !IAnalyzer::read_ledger_attached(self) {
+        if !crate::analyzer::read_attribution_records_reads(|| {
+            IAnalyzer::read_ledger_attached(self)
+        }) {
             return;
         }
-        let contexts = self
-            .query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .clone();
+        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.query_contexts
+                .lock()
+                .expect("multi-analyzer query context mutex poisoned")
+                .clone()
+        };
         crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts);
+    }
+
+    #[track_caller]
+    fn record_degraded_persistent_fill(&self, cache: &str, cause: &str) {
+        let count = self
+            .degraded_persistent_fills
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let origin = std::panic::Location::caller();
+        crate::profiling::note_with(|| {
+            format!(
+                "policy.units degraded_persistent_fill origin={}:{} cache={cache} cause={cause} count={count}",
+                origin.file(),
+                origin.line()
+            )
+        });
+        self.mark_execution_dependent();
+    }
+
+    fn degraded_persistent_fills(&self) -> usize {
+        self.degraded_persistent_fills.load(Ordering::Relaxed)
+            + self
+                .delegates()
+                .values()
+                .map(|delegate| delegate.analyzer().degraded_persistent_fills())
+                .sum::<usize>()
+    }
+
+    fn mark_execution_dependent(&self) {
+        if !crate::analyzer::read_attribution_records_reads(|| {
+            IAnalyzer::read_ledger_attached(self)
+        }) {
+            return;
+        }
+        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.query_contexts
+                .lock()
+                .expect("multi-analyzer query context mutex poisoned")
+                .clone()
+        };
+        crate::analyzer::i_analyzer::record_execution_dependence_on_active_ledgers(&contexts);
     }
 
     fn read_ledger_attached(&self) -> bool {
@@ -2102,13 +2232,7 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
-        let contexts = self
-            .query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned");
-        crate::analyzer::i_analyzer::innermost_query_context_value(&contexts, |context| {
-            context.current_thread_read_ledger().cloned()
-        })
+        crate::analyzer::i_analyzer::current_thread_read_ledger()
     }
 
     fn prefetch_definitions(&self, fq_names: &[String]) {
@@ -2281,11 +2405,12 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn warm_query_indexes(&self) {
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         self.delegates
             .values()
             .collect::<Vec<_>>()
             .into_par_iter()
-            .for_each(|delegate| delegate.analyzer().warm_query_indexes());
+            .for_each(|delegate| context.run(|| delegate.analyzer().warm_query_indexes()));
     }
 
     fn query_indexes_warm(&self) -> bool {
@@ -2406,6 +2531,7 @@ impl IAnalyzer for MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            degraded_persistent_fills: Arc::clone(&self.degraded_persistent_fills),
             analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
             resolve_definition_batch_with_source_call_count: Arc::clone(
                 &self.resolve_definition_batch_with_source_call_count,
@@ -2600,14 +2726,17 @@ impl IAnalyzer for MultiAnalyzer {
         patterns: &SearchSymbolPatternBatch,
         cancellation: Option<&crate::CancellationToken>,
     ) -> SearchSymbolCandidates {
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         self.delegates
             .values()
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .search_symbol_candidates(patterns, cancellation)
+                context.run(|| {
+                    delegate
+                        .analyzer()
+                        .search_symbol_candidates(patterns, cancellation)
+                })
             })
             .reduce(
                 || SearchSymbolCandidates::complete(Vec::new(), 0),
@@ -2761,15 +2890,6 @@ impl IAnalyzer for MultiAnalyzer {
             }
             None => Ok(None),
         }
-    }
-
-    fn publish_persisted_import_graph(
-        &self,
-        _content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
-        _sources: &[ProjectFile],
-        _edges: &[crate::analyzer::PersistedImportEdge],
-    ) -> Result<bool, crate::analyzer::store::StoreError> {
-        Ok(false)
     }
 
     fn refresh_persisted_import_graph(

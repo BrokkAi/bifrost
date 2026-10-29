@@ -61,7 +61,7 @@ use super::{
     ProductionTaintPolicyEvaluator, RefusalNotice, StoreWriteEvidenceByRead, TaintBatchError,
     TaintExecutionBudget, TaintPolicyCompilation, TaintPolicyCompileError, TaintPolicyCompiler,
     compiled_payload, policy_sink_files, prepared_failure_payload, record_exhausted_lane,
-    solve_and_project_batch, taint_witness_step_kind,
+    selector_endpoint_label, solve_and_project_batch, taint_witness_step_kind,
 };
 use crate::budget::PolicyBudget;
 use crate::explain::{
@@ -386,8 +386,10 @@ impl Resolution {
 /// `spec` is the policy's resolved specification or a copy of it with fewer
 /// kills; everything else, including the semantic-model snapshot, is the
 /// caller's pinned configuration for the whole question.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_flow_candidate(
     policy: &LoadedPolicy,
+    flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
     spec: &ResolvedTaintPolicySpec,
     workspace: &WorkspaceAnalyzer,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
@@ -395,6 +397,7 @@ pub(crate) fn solve_flow_candidate(
     budget: &PolicyBudget,
     candidate: &FlowExplanationCandidate,
 ) -> CandidatePass {
+    let flow_state = flow_state.into();
     #[cfg(test)]
     CANDIDATE_PASSES.with(|count| count.set(count.get() + 1));
     if !spec.store_writes.is_empty() || !spec.store_reads.is_empty() {
@@ -414,6 +417,7 @@ pub(crate) fn solve_flow_candidate(
     let compilation_started = Instant::now();
     let compilation = TaintPolicyCompiler::new(
         workspace,
+        &flow_state,
         active_semantic_model_snapshot
             .as_ref()
             .map(|snapshot| Arc::clone(snapshot.active_models())),
@@ -491,9 +495,11 @@ pub(crate) fn solve_flow_candidate(
                 None,
                 authored_selector_summary,
                 incomplete_selectors,
+                |path| selector_endpoint_label(spec, path),
             );
             solve_candidate_regions(
                 policy,
+                &flow_state,
                 workspace,
                 active_semantic_model_snapshot,
                 cancellation,
@@ -524,6 +530,7 @@ fn invalid_plan(message: String) -> CandidateBoundary {
 #[allow(clippy::too_many_arguments)]
 fn solve_candidate_regions(
     policy: &LoadedPolicy,
+    flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
     workspace: &WorkspaceAnalyzer,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     cancellation: &CancellationToken,
@@ -535,6 +542,7 @@ fn solve_candidate_regions(
     selection_gaps: Vec<CandidateBoundary>,
     compilation_elapsed: std::time::Duration,
 ) -> Result<CandidatePass, String> {
+    let flow_state = flow_state.into();
     let compiled_regions = roots.len();
     let policy_id = policy.definition().metadata.id.clone();
     let icfg_provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
@@ -574,6 +582,7 @@ fn solve_candidate_regions(
                 store_writes: root.store_writes,
                 store_reads: root.store_reads,
                 call_resolution_evidence: root.call_resolution_evidence,
+                sanitizer_declines: root.sanitizer_declines,
                 external_models: root.external_models,
                 compilation_elapsed,
                 engine: root.engine.clone(),
@@ -609,6 +618,7 @@ fn solve_candidate_regions(
     for batch in &batches {
         let Err(failure) = solve_and_project_batch(
             batch,
+            &flow_state,
             &[],
             &metadata,
             &[policy],

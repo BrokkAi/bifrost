@@ -323,14 +323,17 @@ fn incomplete_macro_composed_fields_are_cached_and_replayed() {
     analyzer.reset_macro_composed_fields_build_count_for_test();
 
     let first = {
-        let scope = AnalyzerQueryScope::new(&analyzer);
+        let ledger = Arc::new(brokk_bifrost_analysis::analyzer::ReadLedger::new());
+        let scope = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&ledger));
         let fields = analyzer.macro_composed_fields(&owner);
         assert!(
             matches!(scope.read_completion(), Err(QueryReadIncomplete::StructureUnavailable(file)) if file == unavailable)
         );
+        assert_eq!(ledger.execution_dependences(), 0);
         fields
     };
-    let scope = AnalyzerQueryScope::new(&analyzer);
+    let ledger = Arc::new(brokk_bifrost_analysis::analyzer::ReadLedger::new());
+    let scope = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&ledger));
     assert!(
         scope.read_completion().is_ok(),
         "the second reader starts clean"
@@ -341,6 +344,7 @@ fn incomplete_macro_composed_fields_are_cached_and_replayed() {
         matches!(scope.read_completion(), Err(QueryReadIncomplete::StructureUnavailable(file)) if file == unavailable)
     );
     assert_eq!(analyzer.macro_composed_fields_build_count_for_test(), 1);
+    assert_eq!(ledger.execution_dependences(), 0);
 }
 
 #[test]
@@ -1882,7 +1886,7 @@ namespace api {
 /**
 * Doc comment
 */
-class PROJECT_PUBLIC_API(2, 0) RecoveryOwner : public virtual BaseKey {
+class PROJECT_PUBLIC_API RecoveryOwner : public virtual BaseKey {
    public:
       /** Construct from a point. */
       RecoveryOwner(const Group& group, const Point& point) : BaseKey(group, point) {}

@@ -71,7 +71,7 @@ pub use ir::{
     ValueFlowTraversal, WitnessTraversal, compile_path_glob, exact_path_globs,
     intersect_language_scopes,
 };
-pub use partition::PlanPartitioning;
+pub use partition::{PlanPartitioning, PlanWidenDetail};
 pub use schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode,
     ConfigurationFactsFilterField, QueryStepOp, QueryStepShape, RuntimeKeyKind,

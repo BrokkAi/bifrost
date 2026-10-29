@@ -54,8 +54,9 @@ use brokk_bifrost_rust::usage::direct_import_scope_for_module_with_identity;
 // Version 18 keeps scoped ambiguity out of member name-inventory obligations.
 // Version 19 adds the published binding-authority rows to the surface digest.
 // Version 20 separates module inventories from binding gaps at colliding paths.
+// Version 23 preserves resolved subjects of otherwise unresolved trait impls.
 #[doc(hidden)]
-pub const RUST_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 22;
+pub const RUST_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 23;
 
 pub(crate) const IMPORTING_FILES_FOR_MEMBER_SQL: &str = r#"
 WITH target_declarations AS (
@@ -3471,24 +3472,36 @@ fn write_rust_trait_endpoints(
     summary_id: i64,
     dependency_ordinal_for: &impl Fn([u8; 32]) -> Option<usize>,
 ) -> Result<usize> {
-    const RESOLVED_ENDPOINTS_SQL: &str = "WITH impl_placements AS (
+    const RESOLVED_ENDPOINTS_SQL: &str = "WITH impl_endpoints AS (
+        SELECT topology_id, impl_blob_id, impl_site, impl_rel_path, impl_declaration_id,
+               'subject' AS endpoint_role, subject_declaration_blob_id AS target_blob_id,
+               subject_declaration_site AS target_site, subject_rel_path AS target_rel_path,
+               NULL AS impl_owner_module_path
+          FROM rust_crate_trait_impls WHERE topology_id = ?2
+        UNION ALL
+        SELECT topology_id, impl_blob_id, impl_site, impl_rel_path, impl_declaration_id,
+               'trait', trait_declaration_blob_id, trait_declaration_site, trait_rel_path, NULL
+          FROM rust_crate_trait_impls WHERE topology_id = ?2
+        UNION ALL
+        -- A subject can be named independently of its trait. Keep incomplete
+        -- trait rows unresolved so reverse trait enumeration retains its gap.
+        SELECT topology_id, impl_blob_id, impl_site, impl_rel_path, impl_declaration_id,
+               side, declaration_blob_id, declaration_site, declaration_rel_path, owner_module_path
+          FROM rust_crate_unresolved_trait_impls
+         WHERE topology_id = ?2 AND side = 'subject' AND reason = 'resolved'
+      ), endpoints AS (
         SELECT impls.*, owners.container_path AS owner_module_path,
-               members.member_ordinal, relation.relation_key,
-               relation.impl_start_byte, relation.impl_end_byte,
-               relation.terminal_spelling AS subject_spelling,
-               (SELECT trait_side.terminal_spelling
-                  FROM resolution_trait_implementations AS trait_side
-                 WHERE trait_side.blob_id = relation.blob_id
-                   AND trait_side.relation_key = relation.relation_key
-                   AND trait_side.side = 'trait'
-                   AND trait_side.terminal_spelling IS NOT NULL) AS trait_spelling
-          FROM rust_crate_trait_impls AS impls
+               members.member_ordinal, relation.relation_key AS source_relation_key,
+               relation.terminal_spelling AS spelling
+          FROM impl_endpoints AS impls
           JOIN resolution_trait_implementations AS relation
             ON relation.blob_id = impls.impl_blob_id AND relation.impl_site = impls.impl_site
-           AND relation.side = 'subject' AND relation.terminal_spelling IS NOT NULL
+           AND relation.side = impls.endpoint_role AND relation.terminal_spelling IS NOT NULL
           JOIN rust_crate_container_sources AS owners
             ON owners.topology_id = impls.topology_id
            AND owners.blob_id = impls.impl_blob_id AND owners.rel_path = impls.impl_rel_path
+           AND (impls.impl_owner_module_path IS NULL
+                OR owners.container_path = impls.impl_owner_module_path)
           JOIN resolution_unit_summary_members AS members
             ON members.summary_id = ?1 AND members.blob_id = owners.blob_id
            AND members.rel_path = owners.rel_path AND members.source_role = owners.source_kind
@@ -3511,18 +3524,6 @@ fn write_rust_trait_endpoints(
                  AND child_scopes.parent_ordinal = scopes.ordinal
                  AND child_declarations.body_start_byte <= relation.impl_start_byte
                  AND relation.impl_end_byte <= child_declarations.body_end_byte)
-      ), endpoints AS (
-        SELECT owner_module_path, member_ordinal, relation_key AS source_relation_key,
-               'subject' AS endpoint_role, impl_site, impl_declaration_id,
-               subject_declaration_blob_id AS target_blob_id,
-               subject_declaration_site AS target_site, subject_rel_path AS target_rel_path,
-               subject_spelling AS spelling
-          FROM impl_placements
-        UNION ALL
-        SELECT owner_module_path, member_ordinal, relation_key,
-               'trait', impl_site, impl_declaration_id, trait_declaration_blob_id,
-               trait_declaration_site, trait_rel_path, trait_spelling
-          FROM impl_placements
       )
       SELECT endpoints.owner_module_path, endpoints.member_ordinal,
              endpoints.source_relation_key, endpoints.endpoint_role, endpoints.impl_site,
@@ -3587,6 +3588,7 @@ fn write_rust_trait_endpoints(
           ON owners.topology_id = unresolved.topology_id
          AND owners.blob_id = unresolved.impl_blob_id
          AND owners.rel_path = unresolved.impl_rel_path
+         AND owners.container_path = unresolved.owner_module_path
         JOIN resolution_unit_summary_members AS members
           ON members.summary_id = ?1 AND members.blob_id = owners.blob_id
          AND members.rel_path = owners.rel_path AND members.source_role = owners.source_kind
@@ -3595,7 +3597,9 @@ fn write_rust_trait_endpoints(
         LEFT JOIN source_rust_module_declarations AS scope_declarations
           ON scope_declarations.blob_id = scopes.blob_id
          AND scope_declarations.declaration_id = scopes.declaration_id
-       WHERE unresolved.topology_id = ?2 AND owners.scope_ordinal IS NOT NULL
+       WHERE unresolved.topology_id = ?2
+         AND (unresolved.side = 'trait' OR unresolved.reason != 'resolved')
+         AND owners.scope_ordinal IS NOT NULL
          AND (scopes.declaration_id IS NULL OR
               (scope_declarations.body_start_byte IS NOT NULL
                AND scope_declarations.body_start_byte <= relation.impl_start_byte

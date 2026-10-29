@@ -18,7 +18,10 @@ use crate::analyzer::semantic::{
     DurablePortIdentity, ProcedurePortHandle, SemanticValueKind, StructuralNodeIdentity,
 };
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-use crate::analyzer::{JavaAnnotationTypeStatus, resolve_java_annotation_type};
+use crate::analyzer::{
+    JavaAnnotationArtifact, JavaAnnotationTypeRoute, JavaAnnotationTypeStatus,
+    resolve_java_annotation_type,
+};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
 pub(super) const BINDING_STATUS: &[&str] = &[
@@ -178,6 +181,9 @@ pub(super) fn expansions_for_seed(
                 decorator_name,
                 annotation_type: binding.annotation_type,
                 annotation_status: binding.annotation_status,
+                annotation_fq_name: binding.annotation_fq_name,
+                annotation_route: binding.annotation_route,
+                annotation_artifact: binding.annotation_artifact,
                 local_name: binding.local_name,
                 imported_name: binding.imported_name,
                 module: binding.module,
@@ -209,6 +215,9 @@ struct DecoratorBinding {
     reason: Option<String>,
     annotation_type: Option<Box<CodeQueryDeclaration>>,
     annotation_status: Option<JavaAnnotationTypeStatus>,
+    annotation_fq_name: Option<String>,
+    annotation_route: Option<JavaAnnotationTypeRoute>,
+    annotation_artifact: Option<JavaAnnotationArtifact>,
 }
 
 fn java_annotation_binding(
@@ -225,39 +234,45 @@ fn java_annotation_binding(
         range,
         cancellation.unwrap_or(&local_cancellation),
     );
-    let annotation_type = if resolved.status == JavaAnnotationTypeStatus::Resolved {
-        let unit = resolved
-            .source_declaration
-            .expect("resolved annotation has a declaration");
+    let annotation_type = resolved.source_declaration.map(|unit| {
         let range = resolved
             .declaration_range
-            .expect("resolved annotation has an exact range");
+            .expect("a source annotation declaration has an exact range");
         let declaration = DeclarationValue::new(unit, range);
-        Some(Box::new(render_declaration(
+        Box::new(render_declaration(
             analyzer,
             &declaration,
             CodeQueryResultDetail::Full,
             &mut PipelineRenderCache::default(),
-        )))
-    } else {
-        None
-    };
+        ))
+    });
+    let resolved_route = (resolved.status == JavaAnnotationTypeStatus::Resolved).then(|| {
+        resolved
+            .route
+            .expect("a resolved annotation records the tier that decided it")
+    });
     DecoratorBinding {
-        status: match resolved.status {
-            JavaAnnotationTypeStatus::Resolved => "local",
-            JavaAnnotationTypeStatus::Ambiguous => "ambiguous",
-            JavaAnnotationTypeStatus::Unsupported => "unsupported",
+        status: match (resolved.status, resolved_route) {
+            (_, Some(JavaAnnotationTypeRoute::SourceDeclaration)) => "local",
+            (_, Some(_)) => "imported",
+            (JavaAnnotationTypeStatus::Ambiguous, None) => "ambiguous",
+            (JavaAnnotationTypeStatus::Unsupported, None) => "unsupported",
             _ => "incomplete",
         },
-        boundary: if annotation_type.is_some() {
-            BoundaryStatus::WorkspaceLocal.label()
-        } else {
-            BoundaryStatus::ExternalUnknown.label()
+        boundary: match resolved_route {
+            Some(JavaAnnotationTypeRoute::SourceDeclaration) => {
+                BoundaryStatus::WorkspaceLocal.label()
+            }
+            Some(_) if resolved.artifact.is_some() => BoundaryStatus::ExternalIndexed.label(),
+            _ => BoundaryStatus::ExternalUnknown.label(),
         },
-        complete: annotation_type.is_some(),
+        complete: resolved_route.is_some(),
         reason: resolved.reason,
         annotation_type,
         annotation_status: Some(resolved.status),
+        annotation_fq_name: resolved.fq_name,
+        annotation_route: resolved_route,
+        annotation_artifact: resolved.artifact,
         ..DecoratorBinding::default()
     }
 }

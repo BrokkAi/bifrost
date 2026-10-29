@@ -7,22 +7,25 @@ use super::{CatalogError, SessionSemanticCatalog};
 
 pub const SEMANTIC_ROWS_INDEX_VERSION: i64 = 4;
 
-/// Optional companions whose child rows cannot distinguish absent from empty.
-/// The schema boundary test keeps this vocabulary equal to the table CHECK.
+/// Payload families recorded beside their child rows. Optional companions
+/// distinguish absent from present-empty; declaration vectors such as forwards
+/// publish presence only when nonempty. The schema boundary test pins the CHECK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticPayloadFamily {
     CallableValues,
     CollectionFlows,
     ConditionalTypeRefinements,
     DeferredYields,
+    TypeForwards,
 }
 
 impl SemanticPayloadFamily {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::CallableValues,
         Self::CollectionFlows,
         Self::ConditionalTypeRefinements,
         Self::DeferredYields,
+        Self::TypeForwards,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -31,6 +34,7 @@ impl SemanticPayloadFamily {
             Self::CollectionFlows => "collection_flows",
             Self::ConditionalTypeRefinements => "conditional_type_refinements",
             Self::DeferredYields => "deferred_yields",
+            Self::TypeForwards => "type_forwards",
         }
     }
 
@@ -40,6 +44,9 @@ impl SemanticPayloadFamily {
             Self::CollectionFlows => shard.collection_flows().is_some(),
             Self::ConditionalTypeRefinements => shard.conditional_type_refinements().is_some(),
             Self::DeferredYields => shard.deferred_yields().is_some(),
+            Self::TypeForwards => {
+                matches!(shard.payload(), crate::analyzer::semantic_model::CompiledPayload::DeclarationFacts { type_forwards, .. } if !type_forwards.is_empty())
+            }
         }
     }
 }
@@ -71,6 +78,8 @@ pub fn attach_session_rows(
     for table in [
         "catalog_semantic_rows_indexed_shards",
         "catalog_semantic_payload_families",
+        "catalog_assembly_identities",
+        "catalog_type_forwards",
         "catalog_declaration_types",
         "catalog_declaration_members",
         "catalog_declaration_names",
@@ -91,8 +100,12 @@ pub fn attach_session_rows(
         "catalog_anonymous_callable_identity_anchors",
         "catalog_anonymous_callable_signature_shapes",
     ] {
-        let legacy =
-            table.starts_with("catalog_callable_") || table.starts_with("catalog_anonymous_");
+        let legacy = table.starts_with("catalog_callable_")
+            || table.starts_with("catalog_anonymous_")
+            || matches!(
+                table,
+                "catalog_assembly_identities" | "catalog_type_forwards"
+            );
         let mut branches = Vec::new();
         for (schema, source) in [("main", "durable"), ("session", "session")] {
             let join = if legacy {
@@ -244,6 +257,29 @@ pub fn publish_semantic_rows(
                 "INSERT INTO catalog_semantic_payload_families(shard_key, family) VALUES(?1, ?2)",
                 params![shard_key, family.as_str()],
             ).map_err(|error| CatalogError::sqlite("publish semantic payload family", error))?;
+        }
+    }
+    if let crate::analyzer::semantic_model::CompiledPayload::DeclarationFacts {
+        assembly_identity,
+        type_forwards,
+        ..
+    } = shard.payload()
+    {
+        if let Some(identity) = assembly_identity {
+            transaction.execute("INSERT INTO catalog_assembly_identities(manifest_digest,shard_id,name,version,culture,public_key_token) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![manifest.content_sha256,shard.shard_id(),identity.name,identity.version,identity.culture,identity.public_key_token])
+                .map_err(|error| CatalogError::sqlite("publish assembly identity",error))?;
+        }
+        let ordinals: std::collections::HashMap<_, _> = type_forwards
+            .iter()
+            .enumerate()
+            .map(|(ordinal, forward)| (forward.name.as_str(), ordinal as i64))
+            .collect();
+        for (ordinal, forward) in type_forwards.iter().enumerate() {
+            let outer = forward.outer.as_ref().map(|name| ordinals[name.as_str()]);
+            transaction.execute("INSERT INTO catalog_type_forwards(manifest_digest,shard_id,ordinal,name,namespace,outer_ordinal,target_name,target_version,target_culture,target_public_key_token) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![manifest.content_sha256,shard.shard_id(),ordinal as i64,forward.name,forward.namespace,outer,forward.target.name,forward.target.version,forward.target.culture,forward.target.public_key_token])
+                .map_err(|error| CatalogError::sqlite("publish type forward",error))?;
         }
     }
     if let Some((types, members, relations)) = shard.payload().declaration_facts() {
@@ -885,7 +921,9 @@ mod tests {
                          behavior_ordinal, exposure_id, container_member)
                          VALUES({shard}, 1, 0, 'e' , 'get' ); INSERT INTO
                          catalog_runtime_contract_payloads(shard_key, record_json)
-                         VALUES({shard}, '{{}}' );"#
+                         VALUES({shard}, '{{}}' );
+                         INSERT INTO catalog_assembly_identities VALUES('{manifest}','schema-boundary','Fixture.Defining','2.0.0.0',NULL,NULL);
+                         INSERT INTO catalog_type_forwards VALUES('{manifest}','schema-boundary',0,'Fixture.Visible','Fixture',NULL,'Fixture.Defining','1.0.0.0',NULL,NULL);"#
             ))
             .unwrap();
         let tables = connection
@@ -905,9 +943,13 @@ mod tests {
                 connection
                     .prepare(&format!("SELECT shard_key FROM {table} LIMIT 0"))
                     .is_ok()
+                    || matches!(
+                        table.as_str(),
+                        "catalog_assembly_identities" | "catalog_type_forwards"
+                    )
             })
             .collect::<Vec<_>>();
-        assert_eq!(families.len(), 16);
+        assert_eq!(families.len(), 18);
         for table in &families {
             // Deleting one parent must probe each child through a leading key,
             // rather than scanning a pack-sized family once per parent.
@@ -939,7 +981,7 @@ mod tests {
                     .join(" AND ");
                 let plan = connection
                     .prepare(&format!(
-                        "EXPLAIN QUERY PLAN SELECT rowid FROM {table} WHERE {predicates}"
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE {predicates}"
                     ))
                     .unwrap()
                     .query_map([], |row| row.get::<_, String>(3))
@@ -1197,7 +1239,10 @@ mod payload_family_tests {
                 [],
             )
             .unwrap();
-        for family in SemanticPayloadFamily::ALL {
+        for family in SemanticPayloadFamily::ALL
+            .into_iter()
+            .filter(|family| *family != SemanticPayloadFamily::TypeForwards)
+        {
             connection
                 .execute(
                     "INSERT INTO catalog_semantic_payload_families VALUES(1,?1)",

@@ -50,7 +50,10 @@ use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v30";
+// v32: #7578 publishes shared direct-call-result condition guards.
+// v33: compose #7348/#7349/#7369 compound/static/pattern lowering with v32.
+// v35: compose #7578 decoded string-literal ConstantString values with v33.
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v35";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -210,6 +213,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
 fn java_capabilities() -> SemanticCapabilities {
     brokk_bifrost_analysis::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities()
         .complete(SemanticCapability::SwitchFacts)
+        .partial(SemanticCapability::StaticMemory)
         .build()
 }
 
@@ -353,7 +357,8 @@ struct LoweringContext<'tree, 'targets> {
     expression_values: HashMap<usize, ValueId>,
     constant_index_values: HashMap<Box<str>, ValueId>,
     field_declaration_anchors:
-        HashMap<(Box<str>, Box<str>), Option<values::FieldDeclarationAnchor>>,
+        HashMap<(usize, Box<str>), Option<values::FieldDeclarationAnchor<'tree>>>,
+    source_type_nodes: HashMap<(usize, Box<str>), Option<Node<'tree>>>,
     type_name_roots: HashSet<Box<str>>,
     local_types: HashMap<ValueId, Box<str>>,
     local_type_nodes: HashMap<ValueId, Node<'tree>>,
@@ -364,9 +369,9 @@ struct LoweringContext<'tree, 'targets> {
     /// point its `yield` completions end at. A `yield` resolves its
     /// completion route and reads the result it feeds from here.
     yield_results: HashMap<ProgramPointId, ValueId>,
-    /// The names `instanceof` and record patterns bind in this procedure.
-    /// The lowering has no binding for them, so a bare reference to one of
-    /// these names that resolves to no local or parameter carries a gap.
+    /// Query-local filter for pattern spellings in this file. The shared
+    /// lexical resolver proves each reference; missing value establishments
+    /// and record-component extraction keep explicit gaps.
     pattern_variable_names: HashSet<Box<str>>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
@@ -397,4 +402,182 @@ fn java_capture_destination(
         index,
         "Java",
     )
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+    use brokk_bifrost_analysis::analyzer::store::semantic_ir::{
+        PreparedSemanticIr, SemanticIrLoweringOutcome, SemanticIrMountScope, insert_semantic_ir_tx,
+        semantic_ir_producer_epoch,
+    };
+    use brokk_bifrost_core::analyzer::model::LanguageDialect;
+    use brokk_bifrost_core::analyzer::prepared_syntax::{
+        PreparedSourceOrigin, PreparedSyntaxSource,
+    };
+    use brokk_bifrost_core::text_utils::compute_line_starts;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::Arc;
+
+    #[test]
+    #[hardwon("#7369: Java pattern captures and compound writes must retain their row provenance")]
+    fn java_pattern_capture_and_static_write_rows_survive_epoch_miss_and_reopen() {
+        // Java does not register a production parse-time IR writer. Publish
+        // real lowering output explicitly to exercise the existing SQL codec
+        // without activating a new product producer as a side effect of a fix.
+        let source: Arc<str> = r#"class C {
+            interface Supplier { Object get(); }
+            static int count;
+            static Supplier make(Object obj, int n) {
+                count >>= n;
+                if (obj instanceof C other) return () -> other;
+                return () -> null;
+            }
+        }"#
+        .into();
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("C.java", source.as_ref())
+            .build();
+        let file = fixture.file("C.java");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source.as_ref(), None).unwrap();
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::clone(&source)),
+            tree,
+            compute_line_starts(&source),
+            LanguageDialect::for_path(Language::Java, file.rel_path()),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let lowerer = JavaSemanticLowerer;
+        let cancellation = CancellationToken::default();
+        let parts = match lowerer
+            .lower(&file, &prepared, &SemanticBudget::default(), &cancellation)
+            .unwrap()
+        {
+            SemanticOutcome::Complete { value, .. } => value,
+            other => panic!("fixture lowering must complete: {other:?}"),
+        };
+        let identity = lowerer.identity();
+        let content = ContentIdentity::hash_bytes(source.as_bytes());
+        let key = brokk_bifrost_semantic::analyzer::semantic::service::semantic_artifact_key_from_content(
+            &file, prepared.dialect(), content, None, identity.clone(),
+        ).unwrap();
+        let cold =
+            SemanticArtifact::try_new(key.clone(), lowerer.capabilities(), parts.clone()).unwrap();
+        assert!(
+            cold.procedures()
+                .iter()
+                .any(|procedure| !procedure.captures().is_empty()),
+            "real pattern capture must run"
+        );
+        assert!(
+            cold.procedures()
+                .iter()
+                .flat_map(|procedure| procedure.points())
+                .flat_map(|point| &point.events)
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Static,
+                        ..
+                    }
+                )),
+            "real compound static write must run"
+        );
+        let database = fixture.root().join("semantic-rows.sqlite");
+        let epoch = semantic_ir_producer_epoch(&identity);
+        let rows = PreparedSemanticIr::prepare(
+            SemanticIrLoweringOutcome::Complete { parts },
+            None,
+            &epoch,
+            content,
+            source.len(),
+        );
+        let oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap();
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        store
+            .ensure_semantic_ir_producer_epoch("java", &epoch)
+            .unwrap();
+        let blob_id = store.conn.execute(move |conn| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 1)",
+                [oid.to_string()],
+            )
+            .unwrap();
+            let blob_id = conn.last_insert_rowid();
+            let tx = conn.transaction().unwrap();
+            assert!(insert_semantic_ir_tx(&tx, blob_id, "java", &rows, &cancellation).unwrap());
+            tx.commit().unwrap();
+            blob_id
+        });
+        assert!(
+            store
+                .semantic_ir_publication(oid, "java")
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+        let old = SemanticAdapterIdentity {
+            adapter: AdapterSemanticsVersion::hash_bytes("java", b"java-value-semantics-v30")
+                .unwrap(),
+            ..identity
+        };
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE semantic_ir_publications SET producer_epoch = ?1 WHERE blob_id = ?2",
+                    rusqlite::params![semantic_ir_producer_epoch(&old), blob_id]
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        assert!(
+            store
+                .semantic_ir_publication(oid, "java")
+                .unwrap()
+                .is_none(),
+            "old adapter publication must miss under current producer"
+        );
+        drop(store);
+        // Simulate republishing identical source under the current producer,
+        // then decode from a fresh store instance as a consumer would.
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE semantic_ir_publications SET producer_epoch = ?1 WHERE blob_id = ?2",
+                    rusqlite::params![epoch, blob_id]
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        let publication = store
+            .semantic_ir_publication(oid, "java")
+            .unwrap()
+            .expect("current publication");
+        let scope =
+            SemanticIrMountScope::new(key.mount(), key.path().clone(), key.language(), content);
+        let replay = SemanticArtifact::try_new(
+            key,
+            lowerer.capabilities(),
+            store.read_semantic_ir(publication.blob_id, &scope).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cold.materialization_id(),
+            replay.materialization_id(),
+            "all capture, value, write, guard and evidence rows must survive the codec and remount"
+        );
+        assert_eq!(cold.work(), replay.work());
+    }
 }

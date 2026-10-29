@@ -562,8 +562,8 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::CallRelationBudgetExhausted, Impact::Incomplete),
         (Code::CallRelationParseFailed, Impact::Incomplete),
         (Code::CallRelationCandidatesOmitted, Impact::Incomplete),
-        (Code::CallRelationTargetsAmbiguous, Impact::Advisory),
         (Code::CallRelationCandidateLimit, Impact::Incomplete),
+        (Code::CallRelationTargetsAmbiguous, Impact::Advisory),
         (Code::CallRelationAnalysisFailed, Impact::Incomplete),
         (Code::ReferenceSourceBytesTruncated, Impact::Incomplete),
         (Code::ReferenceCandidateFilesTruncated, Impact::Incomplete),
@@ -1479,4 +1479,118 @@ fn call_result_obligation_keeps_model_and_query_provenance_distinct() {
         obligation["properties"]["obligation_provenance"]["type"],
         serde_json::json!(["string", "null"])
     );
+}
+
+#[test]
+fn member_family_direction_and_unread_ancestor_fields_have_public_schema() {
+    let schema = super::super::results::code_query_result_json_schema();
+    let family = schema["$defs"]["CodeQueryResultItem"]["oneOf"]
+        .as_array()
+        .expect("typed result variants")
+        .iter()
+        .find(|variant| variant["properties"]["result_type"]["const"] == "member_family")
+        .expect("member family result schema");
+    let required = family["required"]
+        .as_array()
+        .expect("family required fields");
+    for field in [
+        "unread_ancestors",
+        "ancestor_coverage",
+        "descendant_coverage",
+    ] {
+        assert!(required.contains(&json!(field)), "{family}");
+    }
+    assert_eq!(family["properties"]["unread_ancestors"]["type"], "array");
+    assert_eq!(
+        family["properties"]["unread_ancestors"]["items"]["type"],
+        "string"
+    );
+    for field in ["ancestor_reason", "descendant_reason"] {
+        assert!(!required.contains(&json!(field)), "{family}");
+        assert!(family["properties"].get(field).is_some(), "{family}");
+    }
+    let query = crate::query::CodeQuery::from_json(&json!({
+        "match": {"kind": "method"},
+        "steps": [
+            {"op": "enclosing_decl"},
+            {"op": "member_family"},
+            {"op": "project", "columns": [
+                {"source": "unread_ancestors", "name": "unread"},
+                {"source": "ancestor_coverage", "name": "forward"},
+                {"source": "descendant_coverage", "name": "inverse"},
+                {"source": "ancestor_reason", "name": "forward_reason"},
+                {"source": "descendant_reason", "name": "inverse_reason"}
+            ]}
+        ]
+    }))
+    .expect("all directional fields are queryable");
+    query.validate_steps().expect("family projection validates");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7278: final RQL assembly repeated exact diagnostics while distinct evidence must survive"
+)]
+fn final_diagnostic_dedup_preserves_every_field_and_first_occurrence() {
+    let base = diagnostic(
+        CodeQueryDiagnosticCode::FlowStateAxisUnsupported,
+        CodeQueryDiagnosticImpact::Incomplete,
+    );
+    let mut variants = Vec::new();
+    let mut other = base.clone();
+    other.code = CodeQueryDiagnosticCode::FlowStateDerivationIncomplete;
+    variants.push(other);
+    let mut other = base.clone();
+    other.impact = CodeQueryDiagnosticImpact::Advisory;
+    variants.push(other);
+    let mut other = base.clone();
+    other.branch = vec![1];
+    variants.push(other);
+    let mut other = base.clone();
+    other.language = "java";
+    variants.push(other);
+    let mut other = base.clone();
+    other.message.push_str(" distinct");
+    variants.push(other);
+    let source = CodeQuerySourceSpan {
+        path: "src/a.js".to_string(),
+        range: CodeQueryRange {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+        },
+        start_byte: 0,
+        end_byte: 1,
+    };
+    let mut other = base.clone();
+    other.source = Some(source.clone());
+    variants.push(other);
+    let mut other = base.clone();
+    other.related = vec![CodeQueryRelatedSource {
+        source,
+        label: "unsupported gap".to_string(),
+    }];
+    variants.push(other);
+    let mut other = base.clone();
+    other.exhausted_roots = vec![CodeQueryExhaustedRoot {
+        path: "src/a.js".to_string(),
+        procedure: None,
+        lane: "rows".to_string(),
+        stage: None,
+        charge: None,
+        feedback_iteration: None,
+    }];
+    variants.push(other);
+    let mut other = base.clone();
+    other.withheld_rows_path = Some("src/a.js".to_string());
+    variants.push(other);
+    let expected = std::iter::once(base.clone())
+        .chain(variants)
+        .collect::<Vec<_>>();
+    let input = expected
+        .iter()
+        .flat_map(|value| [value.clone(), base.clone(), value.clone()])
+        .collect();
+    assert_eq!(normalize_query_diagnostics(input), expected);
 }

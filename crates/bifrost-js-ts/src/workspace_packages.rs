@@ -368,4 +368,58 @@ mod tests {
         std::fs::write(&manifest, r#"{"private": true, "main": "index.js"}"#).unwrap();
         assert!(read_manifest(&manifest).is_none());
     }
+    #[test]
+    fn manifest_reader_and_decoder_obey_inclusive_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        let json = r#"{"name":"boundary","main":"index.js"}"#;
+        for length in [
+            MAX_MANIFEST_BYTES - 1,
+            MAX_MANIFEST_BYTES,
+            MAX_MANIFEST_BYTES + 1,
+        ] {
+            let text = format!("{json}{}", " ".repeat(length as usize - json.len()));
+            std::fs::write(&path, &text).unwrap();
+            let expected = length <= MAX_MANIFEST_BYTES;
+            assert_eq!(
+                decode_package_manifest(text.as_bytes(), MAX_MANIFEST_BYTES).is_ok(),
+                expected,
+                "decoder {length}"
+            );
+            assert_eq!(read_manifest(&path).is_some(), expected, "reader {length}");
+        }
+    }
+
+    #[test]
+    fn condition_depth_and_source_priority_cross_manifest_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        for depth in [7, 8, 9] {
+            let mut export = serde_json::json!("./deep.ts");
+            for _ in 0..depth {
+                export = serde_json::json!({"default":export});
+            }
+            let manifest =
+                serde_json::json!({"name":"boundary","exports":export,"main":"./fallback.js"});
+            std::fs::write(&path, manifest.to_string()).unwrap();
+            let (_, targets) = read_manifest(&path).unwrap();
+            assert_eq!(
+                targets,
+                if depth <= 8 {
+                    vec!["./deep.ts", "./fallback.js"]
+                } else {
+                    vec!["./fallback.js"]
+                }
+            );
+        }
+        std::fs::write(
+            &path,
+            r#"{"name":"boundary","exports":{"types":"./index.d.ts","import":"./index.js"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_manifest(&path).unwrap().1,
+            ["./index.js", "./index.d.ts"]
+        );
+    }
 }

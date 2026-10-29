@@ -6,6 +6,7 @@ use rusqlite::{OptionalExtension, params};
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct GoFamilyInterface {
+    pub(crate) owner: SemanticId,
     #[doc(hidden)]
     pub name: String,
     pub(crate) package_id: i64,
@@ -66,7 +67,7 @@ impl GoMethodFamily {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
-    fn go_method_identity(
+    pub(crate) fn go_method_identity(
         &self,
         context_id: i64,
         method: SemanticId,
@@ -221,6 +222,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .find(|interface| interface.0 == owner)
                         .expect("checked interface belongs to the selected inventory");
                     Some(GoFamilyInterface {
+                        owner,
                         name: name.clone(),
                         package_id: *package_id,
                         methods,

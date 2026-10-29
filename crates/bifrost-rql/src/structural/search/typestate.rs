@@ -127,6 +127,14 @@ impl TypestateQueryState {
         ) {
             Ok(registration) => registration,
             Err(error) => {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=session:typestate detail={error:?}",
+                        file!(),
+                        line!()
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
                 self.push_context_error(error);
                 return Vec::new();
             }
@@ -184,6 +192,14 @@ impl TypestateQueryState {
                     Ok(solved) => solved,
                     Err(error) => {
                         self.work.failed_solves = self.work.failed_solves.saturating_add(1);
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=provider:typestate_solver detail={error:?}",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        workspace.analyzer().mark_execution_dependent();
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
@@ -215,6 +231,14 @@ impl TypestateQueryState {
                     SolverTermination::ExceededBudget(exceeded) => {
                         self.work.budget_exhausted_solves =
                             self.work.budget_exhausted_solves.saturating_add(1);
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=budget:solver",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        workspace.analyzer().mark_execution_dependent();
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted,
@@ -245,6 +269,14 @@ impl TypestateQueryState {
                     Ok(report) => report,
                     Err(TypestateFlowProblemError::FindingBudgetExceeded) => {
                         self.work.finding_budget_exhausted = true;
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=budget:findings",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        workspace.analyzer().mark_execution_dependent();
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
@@ -267,6 +299,14 @@ impl TypestateQueryState {
                     }
                     Err(error) => {
                         self.work.failed_solves = self.work.failed_solves.saturating_add(1);
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "policy.units unbounded origin={}:{} cause=provider:typestate_findings detail={error:?}",
+                                file!(),
+                                line!()
+                            )
+                        });
+                        workspace.analyzer().mark_execution_dependent();
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
@@ -306,6 +346,14 @@ impl TypestateQueryState {
                     }
                 }
                 if report.omitted() > 0 {
+                    brokk_bifrost_core::profiling::note_with(|| {
+                        format!(
+                            "policy.units unbounded origin={}:{} cause=budget:findings",
+                            file!(),
+                            line!()
+                        )
+                    });
+                    workspace.analyzer().mark_execution_dependent();
                     push_deduplicated_diagnostic(
                         &mut self.diagnostics,
                         CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,

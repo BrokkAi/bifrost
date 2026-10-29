@@ -122,7 +122,7 @@ impl<T: Any> CapabilityProvider for T {
     }
 }
 
-pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
+pub trait ImportAnalysisProvider: Send + Sync {
     /// Shared, not owned: every memoizing implementation already stores the set
     /// behind an `Arc` in its per-file cache, and the hottest consumers only
     /// read it (a membership test in candidate discovery, a projection to
@@ -608,12 +608,15 @@ where
     F: Fn(&ProjectFile) -> I + Sync,
     I: IntoIterator<Item = ProjectFile>,
 {
+    let context = super::carried_context::CarriedContext::current();
     let collect_edges = |file: &ProjectFile| {
-        let source = file.clone();
-        resolve_targets(file)
-            .into_iter()
-            .filter_map(move |target| (target != source).then(|| (target, source.clone())))
-            .collect::<Vec<_>>()
+        context.run(|| {
+            let source = file.clone();
+            resolve_targets(file)
+                .into_iter()
+                .filter_map(move |target| (target != source).then(|| (target, source.clone())))
+                .collect::<Vec<_>>()
+        })
     };
     let edges: Vec<_> = if parallel {
         files.par_iter().flat_map(collect_edges).collect()
@@ -737,9 +740,49 @@ fn query_within_scope<T>(scope: &DescendantIndexScope<'_>, query: impl FnOnce() 
     (!scope.cancellation().is_cancelled()).then(query)
 }
 
-pub trait TypeHierarchyProvider: CapabilityProvider + Send + Sync {
+/// One member shape fixed by a platform language specification.
+#[derive(Debug, Clone, Copy)]
+pub struct PlatformInventoryMethod {
+    pub name: &'static str,
+    pub parameters: &'static [&'static str],
+    pub returns: &'static str,
+}
+
+/// An ancestor whose member declarations the workspace did not read.
+#[derive(Debug, Clone)]
+pub struct UnreadMemberFamilyAncestor {
+    pub name: String,
+    pub inventory: Option<&'static [PlatformInventoryMethod]>,
+}
+
+#[derive(Debug, Default)]
+pub struct MemberFamilyAncestors {
+    pub resolved: Vec<CodeUnit>,
+    pub unread: Vec<UnreadMemberFamilyAncestor>,
+}
+
+pub trait TypeHierarchyProvider: Send + Sync {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
+
+    /// The nominal member walk also needs the ancestors not represented by
+    /// workspace declarations. Languages opt in without changing type lookup.
+    fn member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
+        MemberFamilyAncestors {
+            resolved: self.get_direct_ancestors(owner),
+            unread: Vec::new(),
+        }
+    }
+
+    /// Resolve and erase source parameter types before comparing an inventory.
+    /// A provider without such evidence conservatively leaves the side open.
+    fn member_family_inventory_matches(
+        &self,
+        _member: &CodeUnit,
+        _inventory: &[PlatformInventoryMethod],
+    ) -> bool {
+        true
+    }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
         code_unit.is_class()

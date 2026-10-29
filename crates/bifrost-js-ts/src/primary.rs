@@ -1042,6 +1042,116 @@ mod tests {
     }
 
     #[test]
+    fn exported_destructured_receiver_declarations() {
+        for (source, member) in [
+            (
+                "const {api}=factory(); module.exports=api; api.member=function(){};",
+                "member",
+            ),
+            (
+                "const {root:api}=factory(); module.exports=api; api.member=function(){};",
+                "member",
+            ),
+            (
+                "const api={}; module.exports=api; api.member=function(){};",
+                "member",
+            ),
+        ] {
+            for extension in ["js", "ts"] {
+                let parsed = parse(source, extension);
+                let members: Vec<_> = parsed
+                    .declarations()
+                    .iter()
+                    .filter(|u| u.owner_identifier() == Some("api"))
+                    .map(|u| u.identifier())
+                    .collect();
+                assert!(
+                    members.contains(&member),
+                    "{extension}: {source}: {members:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_property_declaration_names() {
+        let source = "const key=1; export const Tools={key, other:2, method(){}}; Tools.assigned=function(){};";
+        for extension in ["js", "ts", "tsx"] {
+            let parsed = parse(source, extension);
+            let facts = parsed.source_facts.unwrap();
+            let rows = &facts.occurrences;
+            let names: Vec<_> = rows
+                .declarations()
+                .iter()
+                .filter_map(|d| {
+                    let occurrence = rows.occurrence(d.occurrence).range;
+                    let definition = &source[occurrence.start_byte..occurrence.end_byte];
+                    if [
+                        "key",
+                        "other:2",
+                        "method(){}",
+                        "Tools.assigned=function(){}",
+                    ]
+                    .contains(&definition)
+                    {
+                        let name = d.name.map(|id| {
+                            let range = rows.occurrence(id).range;
+                            &source[range.start_byte..range.end_byte]
+                        });
+                        Some((definition, name))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (definition, name) in [
+                ("key", "key"),
+                ("other:2", "other"),
+                ("method(){}", "method"),
+                ("Tools.assigned=function(){}", "assigned"),
+            ] {
+                assert!(
+                    names.contains(&(definition, Some(name))),
+                    "{extension}: {names:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_import_binding_vocabulary() {
+        let source = "require('./side'); import './esm'; const bound=require('./bound'); import * as M from './module'; const Typed=load<typeof M>('./module'); const {original:alias}=load<typeof M>('./module');";
+        let parsed = parse(source, "ts");
+        let facts = parsed.source_facts.unwrap();
+        let js = facts.js_ts.as_ref().unwrap();
+        let bindings: Vec<_> = js.bindings.iter().map(|b| b.kind).collect();
+        assert_eq!(bindings.len(), 4, "{bindings:?}");
+        assert!(
+            bindings.contains(&brokk_bifrost_core::analyzer::usages::model::ImportKind::Namespace),
+            "{bindings:?}"
+        );
+        assert!(
+            bindings.contains(&brokk_bifrost_core::analyzer::usages::model::ImportKind::Named),
+            "{bindings:?}"
+        );
+        let binder = crate::syntax::compute_import_binder(source, &{
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+                .unwrap();
+            parser.parse(source, None).unwrap()
+        });
+        assert_eq!(
+            binder.binding("Typed").unwrap().kind,
+            brokk_bifrost_core::analyzer::usages::model::ImportKind::Namespace
+        );
+        assert_eq!(
+            binder.binding("alias").unwrap().imported_name.as_deref(),
+            Some("original")
+        );
+    }
+
+    #[test]
     #[hardwon("#5295: escaped object keys were indexed under raw spellings")]
     fn decoded_object_keys_only_publish_representable_nonempty_member_names() {
         let source = r#"export const keys = {

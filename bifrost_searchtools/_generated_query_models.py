@@ -1344,6 +1344,9 @@ class CodeQueryDeclarationState:
 
 @dataclass(frozen=True)
 class CodeQueryDecoratedParameter:
+    annotation_artifact: JavaAnnotationArtifactVariant1 | JavaAnnotationArtifactVariant2 | JavaAnnotationArtifactVariant3 | None
+    annotation_fq_name: str | None
+    annotation_route: str | None
     annotation_status: JavaAnnotationTypeStatus | None
     annotation_type: CodeQueryDeclaration2 | None
     binding_status: str
@@ -2276,8 +2279,12 @@ class CodeQueryLoopRelation:
 
 @dataclass(frozen=True)
 class CodeQueryMemberFamily:
+    ancestor_coverage: str
+    ancestor_reason: str | None
     capability: str
     coverage: str
+    descendant_coverage: str
+    descendant_reason: str | None
     edge_count: int
     family_id: str | None
     id: str
@@ -2293,6 +2300,7 @@ class CodeQueryMemberFamily:
     range: CodeQueryRange
     reason: str | None
     root_count: int
+    unread_ancestors: list[str]
     provenance: list[CodeQueryProvenance]
     provenance_truncated: bool
 
@@ -5126,6 +5134,36 @@ class ConfigurationRouteSelectorVariant2:
     @classmethod
     def from_dict(cls, data: Any) -> ConfigurationRouteSelectorVariant2:
         return _decode_configuration_route_selector_variant2(data, 'ConfigurationRouteSelectorVariant2')
+
+
+@dataclass(frozen=True)
+class JavaAnnotationArtifactVariant1:
+    artifact_path: str
+    source_path: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> JavaAnnotationArtifactVariant1:
+        return _decode_java_annotation_artifact_variant1(data, 'JavaAnnotationArtifactVariant1')
+
+
+@dataclass(frozen=True)
+class JavaAnnotationArtifactVariant2:
+    artifact_path: str
+    class_entry: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> JavaAnnotationArtifactVariant2:
+        return _decode_java_annotation_artifact_variant2(data, 'JavaAnnotationArtifactVariant2')
+
+
+@dataclass(frozen=True)
+class JavaAnnotationArtifactVariant3:
+    declaration_id: str
+    pack_id: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> JavaAnnotationArtifactVariant3:
+        return _decode_java_annotation_artifact_variant3(data, 'JavaAnnotationArtifactVariant3')
 
 
 @dataclass(frozen=True)
@@ -9185,6 +9223,9 @@ def _decode_code_query_decorated_parameter(value: Any, prefix: str = 'CodeQueryD
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'annotation_artifact',
+        'annotation_fq_name',
+        'annotation_route',
         'annotation_status',
         'annotation_type',
         'binding_status',
@@ -9233,6 +9274,18 @@ def _decode_code_query_decorated_parameter(value: Any, prefix: str = 'CodeQueryD
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'annotation_artifact' in value:
+        annotation_artifact_value = _decode_defs_code_query_result_item_union_47_properties_annotation_artifact(value['annotation_artifact'], f"{prefix}.annotation_artifact")
+    else:
+        annotation_artifact_value = None
+    if 'annotation_fq_name' in value:
+        annotation_fq_name_value = _decode_defs_code_query_result_item_union_47_properties_annotation_fq_name(value['annotation_fq_name'], f"{prefix}.annotation_fq_name")
+    else:
+        annotation_fq_name_value = None
+    if 'annotation_route' in value:
+        annotation_route_value = _decode_defs_code_query_result_item_union_47_properties_annotation_route(value['annotation_route'], f"{prefix}.annotation_route")
+    else:
+        annotation_route_value = None
     if 'annotation_status' in value:
         annotation_status_value = _decode_defs_code_query_result_item_union_47_properties_annotation_status(value['annotation_status'], f"{prefix}.annotation_status")
     else:
@@ -9302,6 +9355,9 @@ def _decode_code_query_decorated_parameter(value: Any, prefix: str = 'CodeQueryD
     else:
         provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
     return CodeQueryDecoratedParameter(
+        annotation_artifact=annotation_artifact_value,
+        annotation_fq_name=annotation_fq_name_value,
+        annotation_route=annotation_route_value,
         annotation_status=annotation_status_value,
         annotation_type=annotation_type_value,
         binding_status=binding_status_value,
@@ -12366,8 +12422,12 @@ def _decode_code_query_member_family(value: Any, prefix: str = 'CodeQueryMemberF
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'ancestor_coverage',
+        'ancestor_reason',
         'capability',
         'coverage',
+        'descendant_coverage',
+        'descendant_reason',
         'edge_count',
         'family_id',
         'id',
@@ -12383,6 +12443,7 @@ def _decode_code_query_member_family(value: Any, prefix: str = 'CodeQueryMemberF
         'range',
         'reason',
         'root_count',
+        'unread_ancestors',
         'provenance',
         'provenance_truncated',
     }
@@ -12391,8 +12452,10 @@ def _decode_code_query_member_family(value: Any, prefix: str = 'CodeQueryMemberF
     if unexpected:
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
+        'ancestor_coverage',
         'capability',
         'coverage',
+        'descendant_coverage',
         'edge_count',
         'id',
         'implemented_by_count',
@@ -12405,12 +12468,23 @@ def _decode_code_query_member_family(value: Any, prefix: str = 'CodeQueryMemberF
         'path',
         'range',
         'root_count',
+        'unread_ancestors',
     }
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    ancestor_coverage_value = _decode_string(value['ancestor_coverage'], f"{prefix}.ancestor_coverage")
+    if 'ancestor_reason' in value:
+        ancestor_reason_value = _decode_defs_code_query_result_item_union_53_properties_ancestor_reason(value['ancestor_reason'], f"{prefix}.ancestor_reason")
+    else:
+        ancestor_reason_value = None
     capability_value = _decode_string(value['capability'], f"{prefix}.capability")
     coverage_value = _decode_string(value['coverage'], f"{prefix}.coverage")
+    descendant_coverage_value = _decode_string(value['descendant_coverage'], f"{prefix}.descendant_coverage")
+    if 'descendant_reason' in value:
+        descendant_reason_value = _decode_defs_code_query_result_item_union_53_properties_descendant_reason(value['descendant_reason'], f"{prefix}.descendant_reason")
+    else:
+        descendant_reason_value = None
     edge_count_value = _decode_defs_code_query_result_item_union_53_properties_edge_count(value['edge_count'], f"{prefix}.edge_count")
     if 'family_id' in value:
         family_id_value = _decode_defs_code_query_result_item_union_53_properties_family_id(value['family_id'], f"{prefix}.family_id")
@@ -12435,6 +12509,7 @@ def _decode_code_query_member_family(value: Any, prefix: str = 'CodeQueryMemberF
     else:
         reason_value = None
     root_count_value = _decode_defs_code_query_result_item_union_53_properties_root_count(value['root_count'], f"{prefix}.root_count")
+    unread_ancestors_value = _decode_defs_code_query_result_item_union_53_properties_unread_ancestors(value['unread_ancestors'], f"{prefix}.unread_ancestors")
     if 'provenance' in value:
         provenance_value = _decode_defs_code_query_result_item_union_53_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
@@ -12444,8 +12519,12 @@ def _decode_code_query_member_family(value: Any, prefix: str = 'CodeQueryMemberF
     else:
         provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
     return CodeQueryMemberFamily(
+        ancestor_coverage=ancestor_coverage_value,
+        ancestor_reason=ancestor_reason_value,
         capability=capability_value,
         coverage=coverage_value,
+        descendant_coverage=descendant_coverage_value,
+        descendant_reason=descendant_reason_value,
         edge_count=edge_count_value,
         family_id=family_id_value,
         id=id_value,
@@ -12461,6 +12540,7 @@ def _decode_code_query_member_family(value: Any, prefix: str = 'CodeQueryMemberF
         range=range_value,
         reason=reason_value,
         root_count=root_count_value,
+        unread_ancestors=unread_ancestors_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
     )
@@ -27696,6 +27776,40 @@ def _decode_defs_code_query_result_item_union_46_properties_result_type(value: A
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_code_query_result_item_union_47_properties_annotation_artifact(value: Any, prefix: str = "union") -> JavaAnnotationArtifactVariant1 | JavaAnnotationArtifactVariant2 | JavaAnnotationArtifactVariant3 | None:
+    errors = []
+    try:
+        return _decode_defs_java_annotation_artifact(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_47_properties_annotation_fq_name(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_47_properties_annotation_route(value: Any, prefix: str = "union") -> str | None:
+    errors = []
+    try:
+        return _decode_defs_java_annotation_type_route(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_47_properties_annotation_status(value: Any, prefix: str = "union") -> JavaAnnotationTypeStatus | None:
     errors = []
     try:
@@ -28112,6 +28226,26 @@ def _decode_defs_code_query_result_item_union_52_properties_target_fq_name(value
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_item_union_53_properties_ancestor_reason(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_53_properties_descendant_reason(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_53_properties_edge_count(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
@@ -28193,6 +28327,14 @@ def _decode_defs_code_query_result_item_union_53_properties_root_count(value: An
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
+
+def _decode_defs_code_query_result_item_union_53_properties_unread_ancestors(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
 def _decode_defs_code_query_result_item_union_54_properties_family_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
@@ -33524,6 +33666,74 @@ def _decode_defs_conversion_unknown_union_1(value: Any, prefix: str = "const") -
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+class JavaAnnotationArtifact(metaclass=_TaggedUnionMeta):
+    @classmethod
+    def from_dict(cls, data: Any) -> JavaAnnotationArtifact:
+        if not isinstance(data, dict):
+            raise TypeDecoderError("expected tagged object")
+        if 'source' not in data:
+            raise DecoderError(f"missing discriminator 'source'")
+        tag_value = data['source']
+        decoder = _java_annotation_artifact_decoders.get(tag_value)
+        if decoder is None:
+            raise DecoderError(f"unknown discriminator {tag_value!r}")
+        return decoder(data)
+
+def _decode_defs_java_annotation_artifact(value: Any, prefix: str = 'JavaAnnotationArtifact') -> JavaAnnotationArtifactVariant1 | JavaAnnotationArtifactVariant2 | JavaAnnotationArtifactVariant3:
+    return JavaAnnotationArtifact.from_dict(value)
+
+def _decode_defs_java_annotation_artifact_union_0_properties_source(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'source_jar'"
+    if value != 'source_jar':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_java_annotation_artifact_union_1_properties_source(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'class_file'"
+    if value != 'class_file':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_java_annotation_artifact_union_2_properties_source(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'semantic_pack'"
+    if value != 'semantic_pack':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_java_annotation_type_route(value: Any, prefix: str = "union") -> str:
+    errors = []
+    try:
+        return _decode_defs_java_annotation_type_route_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_defs_java_annotation_type_route_union_1(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_defs_java_annotation_type_route_union_2(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_java_annotation_type_route_union_0(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'source_declaration'"
+    if value != 'source_declaration':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_java_annotation_type_route_union_1(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'single_type_import'"
+    if value != 'single_type_import':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_java_annotation_type_route_union_2(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'qualified_name'"
+    if value != 'qualified_name':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
 def _decode_defs_java_annotation_type_status(value: Any, prefix: str = 'JavaAnnotationTypeStatus') -> JavaAnnotationTypeStatus:
     values_repr = "['resolved', 'ambiguous', 'blocked', 'incomplete', 'unsupported', 'cancelled']"
     if value not in ('resolved', 'ambiguous', 'blocked', 'incomplete', 'unsupported', 'cancelled'):
@@ -33927,6 +34137,81 @@ def _decode_defs_wildcard_variance(value: Any, prefix: str = 'WildcardVariance')
     if value not in ('any', 'extends', 'super'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return WildcardVariance(value)
+
+def _decode_java_annotation_artifact_variant1(value: Any, prefix: str = 'JavaAnnotationArtifactVariant1') -> JavaAnnotationArtifactVariant1:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'artifact_path',
+        'source_path',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'artifact_path',
+        'source_path',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    artifact_path_value = _decode_string(value['artifact_path'], f"{prefix}.artifact_path")
+    source_path_value = _decode_string(value['source_path'], f"{prefix}.source_path")
+    return JavaAnnotationArtifactVariant1(
+        artifact_path=artifact_path_value,
+        source_path=source_path_value,
+    )
+
+def _decode_java_annotation_artifact_variant2(value: Any, prefix: str = 'JavaAnnotationArtifactVariant2') -> JavaAnnotationArtifactVariant2:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'artifact_path',
+        'class_entry',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'artifact_path',
+        'class_entry',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    artifact_path_value = _decode_string(value['artifact_path'], f"{prefix}.artifact_path")
+    class_entry_value = _decode_string(value['class_entry'], f"{prefix}.class_entry")
+    return JavaAnnotationArtifactVariant2(
+        artifact_path=artifact_path_value,
+        class_entry=class_entry_value,
+    )
+
+def _decode_java_annotation_artifact_variant3(value: Any, prefix: str = 'JavaAnnotationArtifactVariant3') -> JavaAnnotationArtifactVariant3:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'declaration_id',
+        'pack_id',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'declaration_id',
+        'pack_id',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    declaration_id_value = _decode_string(value['declaration_id'], f"{prefix}.declaration_id")
+    pack_id_value = _decode_string(value['pack_id'], f"{prefix}.pack_id")
+    return JavaAnnotationArtifactVariant3(
+        declaration_id=declaration_id_value,
+        pack_id=pack_id_value,
+    )
 
 def _decode_parameter(value: Any, prefix: str = 'Parameter') -> Parameter:
     if not isinstance(value, dict):
@@ -35307,6 +35592,21 @@ TAGGED_UNION_VARIANTS['CodeQueryTypestateWitnessStepKind'] = (
         'seed': CodeQueryTypestateWitnessStepKindVariant1,
         'edge': CodeQueryTypestateWitnessStepKindVariant2,
         'end_summary_gap': CodeQueryTypestateWitnessStepKindVariant3,
+    },
+)
+
+_java_annotation_artifact_decoders = {
+    'source_jar': lambda data: _decode_tagged_variant(_decode_java_annotation_artifact_variant1, data, 'source', 'JavaAnnotationArtifactVariant1'),
+    'class_file': lambda data: _decode_tagged_variant(_decode_java_annotation_artifact_variant2, data, 'source', 'JavaAnnotationArtifactVariant2'),
+    'semantic_pack': lambda data: _decode_tagged_variant(_decode_java_annotation_artifact_variant3, data, 'source', 'JavaAnnotationArtifactVariant3'),
+}
+JavaAnnotationArtifact._variant_types = (JavaAnnotationArtifactVariant1, JavaAnnotationArtifactVariant2, JavaAnnotationArtifactVariant3,)
+TAGGED_UNION_VARIANTS['JavaAnnotationArtifact'] = (
+    'source',
+    {
+        'source_jar': JavaAnnotationArtifactVariant1,
+        'class_file': JavaAnnotationArtifactVariant2,
+        'semantic_pack': JavaAnnotationArtifactVariant3,
     },
 )
 

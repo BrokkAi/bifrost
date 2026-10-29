@@ -407,6 +407,7 @@ struct PreparedKotlinEdgeFile {
 fn clone_file_declarations(declarations: &FileDeclarations) -> FileDeclarations {
     FileDeclarations {
         enclosers: declarations.enclosers.clone(),
+        enclosing_units: declarations.enclosing_units.clone(),
         definitions: declarations.definitions.clone(),
     }
 }

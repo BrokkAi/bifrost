@@ -13,6 +13,7 @@ pub fn authored_declaration_facts(
             types,
             members,
             relations,
+            ..
         } => Some((types, members, relations)),
         AuthoredPayload::GeneratorRules { .. } | AuthoredPayload::ProcedureSummaries { .. } => None,
     }

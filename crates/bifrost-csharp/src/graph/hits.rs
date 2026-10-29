@@ -2,7 +2,7 @@ use crate::graph::extractor::ScanCtx;
 use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, external_usage_hit_count, insert_unproven_hit,
+    SNIPPET_CONTEXT_LINES, classify_recursive_hit, external_usage_hit_count, insert_unproven_hit,
     reclassify_self_receiver_hit_at, usage_hit,
 };
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
@@ -45,20 +45,13 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(hit) = node_hit(node, ctx) else {
         return;
     };
-    // A reference whose enclosing declaration is a *callable* target is a
-    // recursive call (#1638): recorded, then classified `SelfReceiver`, so
-    // editor find-references lists it while the external usage surface omits
-    // it. For any other target the site is the declaration itself, not a use
-    // of it, and stays dropped.
-    if hit.enclosing == ctx.spec.target && !ctx.spec.target.is_function() {
-        return;
-    }
-    let recursive = hit.enclosing == ctx.spec.target;
-    let start = hit.range.start_byte;
-    let end = hit.range.end_byte;
-    ctx.hits.insert(hit.usage_hit(ctx));
-    if recursive {
-        reclassify_self_receiver_hit_at(ctx.hits, ctx.file, start, end);
+    if let Some(hit) = classify_recursive_hit(
+        hit.usage_hit(ctx),
+        &ctx.spec.target,
+        Some(node),
+        &crate::CSharpKnowledge,
+    ) {
+        ctx.hits.insert(hit);
     }
     refresh_usage_limit(ctx);
 }

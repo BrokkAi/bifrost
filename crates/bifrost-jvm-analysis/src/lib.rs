@@ -15,7 +15,8 @@ pub mod analyzer {
         JavaSelectedReverseOutcome, java_selected_inverse_for,
     };
     pub use java::{
-        JavaAnalyzer, JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, JavaCallResultUse,
+        JavaAnalyzer, JavaAnnotationArtifact, JavaAnnotationTypeResolution,
+        JavaAnnotationTypeRoute, JavaAnnotationTypeStatus, JavaCallResultUse,
         JavaCallResultUseIndex, JavaCallResultUseOpen, JavaCallResultUseRelationIndex,
         JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence,
         java_call_result_use_site, java_plain_string_literal, resolve_java_annotation_type,

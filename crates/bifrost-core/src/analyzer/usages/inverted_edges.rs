@@ -18,14 +18,17 @@
 //! every accounting rule -- only the key type differs.
 
 use crate::analyzer::code_unit_index::CodeUnitIndex;
-use crate::analyzer::model::Range;
+use crate::analyzer::language_knowledge::LanguageKnowledge;
+use crate::analyzer::model::{CodeUnitType, Range};
 use crate::analyzer::symbol_path::rendered_terminal_segment;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 /// The precise binding for `name`. Shared by the per-language receiver typing.
@@ -409,6 +412,16 @@ impl NodeKey for UsageNodeKey {
     }
 }
 
+/// One unresolved structured reference, addressed within its scanned file.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnprovenCallSite {
+    pub path: Arc<str>,
+    pub range: Range,
+    pub enclosing: Option<CodeUnit>,
+    /// Source or declared spelling, independent of the normalized group key.
+    pub name: String,
+}
+
 /// Aggregated result of an inverted edge build, keyed by node-key type `K`.
 ///
 /// `BTreeMap` rather than `HashMap`, deliberately: the maps are consumed at
@@ -428,6 +441,15 @@ pub struct UsageEdges<K = String> {
     /// Per-callee count of structurally matching call/member sites whose receiver
     /// could not be resolved to a proven edge.
     pub unproven_inbound: BTreeMap<K, usize>,
+    /// Unresolved sites grouped by optional enclosing caller and terminal name.
+    /// No indexed enclosing declaration is represented by a `None` caller.
+    /// Evidence belongs to this query, just like drawn edge sites.
+    pub unproven_sites: BTreeMap<(Option<K>, String), Vec<UnprovenCallSite>>,
+    /// False only when one `(caller, terminal name)` group exceeds MAX_CALLSITES;
+    /// sites without an enclosing declaration share the no-caller group.
+    /// Drawn edges instead cap by callee across callers. Native routes have no
+    /// numeric call-site cap.
+    pub unproven_sites_complete: bool,
 }
 
 // Hand-written so the bound is `K: Ord` (BTreeMap), not `K: Default` that
@@ -438,6 +460,8 @@ impl<K: Ord> Default for UsageEdges<K> {
             edges: BTreeMap::new(),
             truncated: BTreeMap::new(),
             unproven_inbound: BTreeMap::new(),
+            unproven_sites: BTreeMap::new(),
+            unproven_sites_complete: true,
         }
     }
 }
@@ -508,6 +532,9 @@ pub struct FileDeclarations<K = String> {
     /// `(start_byte, end_byte, key)` for every declaration -- attribute a reference
     /// to its smallest enclosing declaration (the caller).
     pub enclosers: Vec<(usize, usize, K)>,
+    /// Exact identities alongside the legacy keys, including overloads and
+    /// synthetic declarations that share enclosing spans.
+    pub enclosing_units: HashMap<(usize, usize, K), CodeUnit>,
     /// `key -> declaration byte spans in *this* file` -- exclude a reference that
     /// falls inside the callee's own declaration. Keyed per file (not globally) so
     /// a callee declared in a *different* file can never spuriously match a
@@ -515,14 +542,27 @@ pub struct FileDeclarations<K = String> {
     pub definitions: HashMap<K, Vec<(usize, usize)>>,
 }
 
-impl<K> FileDeclarations<K> {
+impl<K: NodeKey> FileDeclarations<K> {
     /// Add a whole-file caller span for a graph-specific synthetic scope.
     ///
     /// Public declaration APIs omit file scopes. A language edge pass can use
     /// this narrow hook when a file-level construct has no named declaration.
-    pub fn add_file_scope(&mut self, key: K, source_len: usize) {
-        self.enclosers.push((0, source_len, key));
+    pub fn add_file_scope(&mut self, unit: CodeUnit, source_len: usize) {
+        let entry = (0, source_len, K::from_unit(&unit));
+        let previous = self.enclosing_units.insert(entry.clone(), unit.clone());
+        debug_assert!(
+            previous.as_ref().is_none_or(|previous| previous == &unit),
+            "conflicting enclosing declarations: previous={previous:?}, incoming={unit:?}"
+        );
+        self.enclosers.push(entry);
     }
+}
+
+/// Borrowed syntax for one parsed file's edge scan.
+pub struct FileEdgeSyntax<'a> {
+    pub tree: &'a Tree,
+    pub source: &'a str,
+    pub line_starts: &'a [usize],
 }
 
 /// Everything one file's edge scan reads: the parsed tree and its source text,
@@ -537,6 +577,8 @@ pub struct FileEdgeScanInput<'a, K = String> {
     pub tree: &'a Tree,
     pub source: &'a str,
     pub line_starts: &'a [usize],
+    language: Language,
+    knowledge: &'a dyn LanguageKnowledge,
     /// Only keys in this set may become callers. A rooted graph supplies its
     /// current breadth-first frontier; a whole-workspace graph supplies every
     /// eligible node. `None` admits any indexed enclosing declaration, which
@@ -548,90 +590,31 @@ pub struct FileEdgeScanInput<'a, K = String> {
     /// endpoint hydration by its analysis-owned caller.
     callees: Option<&'a HashSet<K>>,
     pub declarations: &'a FileDeclarations<K>,
-    /// `terminal name -> the callees spelling it`, borrowed from the callee
-    /// set. Empty for a rooted scan, whose callee domain is open.
-    nodes_by_terminal: HashMap<&'a str, Vec<&'a K>>,
+    /// `normalized terminal name -> callees`, borrowing unchanged names from
+    /// the callee set. Empty for a rooted scan, whose callee domain is open.
+    nodes_by_terminal: &'a TerminalCatalog<'a, K>,
 }
 
 impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
+    /// Construct one scan with an explicit caller/callee domain and terminal catalog.
+    /// The shared driver supplies callable-only defaults; a language query may
+    /// borrow a catalog built once from its indexed declaration kinds.
     pub fn new(
-        tree: &'a Tree,
-        source: &'a str,
-        line_starts: &'a [usize],
-        language: Language,
-        nodes: &'a HashSet<K>,
-        declarations: &'a FileDeclarations<K>,
-    ) -> Self {
-        Self::with_callees(
-            tree,
-            source,
-            line_starts,
-            Some(nodes),
-            Some((language, nodes)),
-            declarations,
-        )
-    }
-
-    /// Construct an open-callee scan rooted at `callers`.
-    ///
-    /// Language resolvers may record an exact callee without first enumerating
-    /// the workspace. The analysis layer must hydrate and validate those
-    /// endpoints before exposing them as graph nodes.
-    pub fn new_rooted(
-        tree: &'a Tree,
-        source: &'a str,
-        line_starts: &'a [usize],
-        callers: &'a HashSet<K>,
-        declarations: &'a FileDeclarations<K>,
-    ) -> Self {
-        Self::with_callees(tree, source, line_starts, Some(callers), None, declarations)
-    }
-
-    /// Construct an inbound scan over every indexed caller in the workspace
-    /// while admitting only the requested callee set.
-    ///
-    /// This is the efficient shape for a report that needs to prove a bounded
-    /// candidate list from all possible callers. The caller set is deliberately
-    /// not materialized: the declaration index already contains the exact
-    /// enclosing caller for each structured reference.
-    pub fn new_inbound(
-        tree: &'a Tree,
-        source: &'a str,
-        line_starts: &'a [usize],
-        language: Language,
-        callees: &'a HashSet<K>,
-        declarations: &'a FileDeclarations<K>,
-    ) -> Self {
-        Self::with_callees(
-            tree,
-            source,
-            line_starts,
-            None,
-            Some((language, callees)),
-            declarations,
-        )
-    }
-
-    /// `language` travels with the callee set because it is the callee names'
-    /// own spelling rules that decide where each one's terminal segment
-    /// starts. A rooted scan has no callee set and so needs no language.
-    fn with_callees(
-        tree: &'a Tree,
-        source: &'a str,
-        line_starts: &'a [usize],
+        syntax: FileEdgeSyntax<'a>,
+        knowledge: &'a dyn LanguageKnowledge,
         callers: Option<&'a HashSet<K>>,
-        callees: Option<(Language, &'a HashSet<K>)>,
+        callees: Option<&'a HashSet<K>>,
         declarations: &'a FileDeclarations<K>,
+        nodes_by_terminal: &'a TerminalCatalog<'a, K>,
     ) -> Self {
-        let nodes_by_terminal = callees.map_or_else(HashMap::default, |(language, callees)| {
-            terminal_index(language, callees)
-        });
         Self {
-            tree,
-            source,
-            line_starts,
+            tree: syntax.tree,
+            source: syntax.source,
+            line_starts: syntax.line_starts,
             callers,
-            callees: callees.map(|(_, callees)| callees),
+            language: knowledge.language(),
+            knowledge,
+            callees,
             declarations,
             nodes_by_terminal,
         }
@@ -650,7 +633,20 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
     /// possible match; closed and inbound scans can reject names before a
     /// language resolver performs its more expensive work.
     pub fn may_match_terminal(&self, name: &str) -> bool {
-        self.callees.is_none() || self.nodes_by_terminal.contains_key(name)
+        self.callees.is_none()
+            || self.nodes_by_terminal.iter().any(|(kind, index)| {
+                index.contains_key(self.knowledge.normalize_terminal_name(name, *kind).as_ref())
+            })
+    }
+
+    /// Borrow the requested callee catalog only for a reverse (inbound) scan.
+    /// Computed member names may remain candidates for these explicit targets;
+    /// graph scans must not nominate their entire node catalog for an open name.
+    pub fn inbound_callees(&self) -> impl Iterator<Item = &K> {
+        self.callees
+            .into_iter()
+            .filter(|_| self.callers.is_none())
+            .flat_map(|callees| callees.iter())
     }
 
     pub fn is_caller(&self, key: &K) -> bool {
@@ -664,12 +660,15 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
     /// The key of the smallest declaration whose byte span contains `[start, end)`
     /// -- the call site's enclosing caller. Mirrors `IAnalyzer::enclosing_code_unit`.
     pub fn enclosing(&self, start: usize, end: usize) -> Option<&K> {
+        self.enclosing_entry(start, end).map(|(_, _, key)| key)
+    }
+
+    fn enclosing_entry(&self, start: usize, end: usize) -> Option<&(usize, usize, K)> {
         self.declarations
             .enclosers
             .iter()
             .filter(|(unit_start, unit_end, _)| *unit_start <= start && end <= *unit_end)
             .min_by_key(|(unit_start, unit_end, _)| unit_end - unit_start)
-            .map(|(_, _, key)| key)
     }
 
     fn cloned_enclosing(&self, start: usize, end: usize) -> Option<K>
@@ -687,15 +686,60 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
     }
 }
 
-/// Group a callee set by [`NodeKey::terminal`], borrowing both the terminal
-/// slice and the keys from the set the scan input already holds for its
-/// lifetime.
-fn terminal_index<K: NodeKey>(language: Language, callees: &HashSet<K>) -> HashMap<&str, Vec<&K>> {
-    let mut index: HashMap<&str, Vec<&K>> = HashMap::default();
+/// Declaration kinds already read by a graph's indexed node inventory.
+pub type DeclarationKinds = HashMap<String, Vec<CodeUnitType>>;
+
+/// Retain every kind for a rendered name, including names shared across kinds.
+/// This consumes indexed facts without resolving the names a second time.
+pub fn declaration_kind_index<'a>(
+    declarations: impl IntoIterator<Item = &'a CodeUnit>,
+) -> DeclarationKinds {
+    let mut kinds = DeclarationKinds::default();
+    for unit in declarations {
+        let entry = kinds.entry(unit.fq_name()).or_default();
+        if !entry.contains(&unit.kind()) {
+            entry.push(unit.kind());
+        }
+    }
+    kinds
+}
+
+/// Query-local terminals grouped by declaration kind and normalized name.
+pub type TerminalCatalog<'a, K> = HashMap<CodeUnitType, HashMap<Cow<'a, str>, Vec<&'a K>>>;
+
+/// Group callees by the language-normalized [`NodeKey::terminal`], borrowing
+/// names when normalization leaves their spelling unchanged.
+pub fn terminal_index<'a, K: NodeKey>(
+    knowledge: &dyn LanguageKnowledge,
+    callees: &'a HashSet<K>,
+    kinds: impl Fn(&K) -> Vec<CodeUnitType>,
+) -> TerminalCatalog<'a, K> {
+    let mut index: TerminalCatalog<'a, K> = HashMap::default();
     for node in callees {
-        index.entry(node.terminal(language)).or_default().push(node);
+        let mut kinds = kinds(node);
+        assert!(
+            !kinds.is_empty(),
+            "callee has no indexed definition: {}",
+            node.fqn()
+        );
+        kinds.sort_unstable();
+        kinds.dedup();
+        for kind in kinds {
+            index
+                .entry(kind)
+                .or_default()
+                .entry(knowledge.normalize_terminal_name(node.terminal(knowledge.language()), kind))
+                .or_default()
+                .push(node);
+        }
     }
     index
+}
+
+/// Display and enclosing declaration for one unresolved source range.
+pub struct UnprovenSiteEvidence {
+    pub name: String,
+    pub enclosing: Option<CodeUnit>,
 }
 
 /// One file's edge contributions -- what a language scan returns and the driver
@@ -717,6 +761,8 @@ pub struct PerFileEdges<K = String> {
     pub callsites: BTreeMap<K, HashSet<usize>>,
     /// `callee -> distinct unresolved structural member offsets`.
     pub unproven_inbound: BTreeMap<K, HashSet<usize>>,
+    /// `(optional enclosing caller, terminal name) -> unresolved structured ranges`.
+    pub unproven_sites: BTreeMap<(Option<K>, String), BTreeMap<Range, UnprovenSiteEvidence>>,
 }
 
 impl<K: Ord> Default for PerFileEdges<K> {
@@ -726,6 +772,7 @@ impl<K: Ord> Default for PerFileEdges<K> {
             edge_lines: BTreeMap::new(),
             callsites: BTreeMap::new(),
             unproven_inbound: BTreeMap::new(),
+            unproven_sites: BTreeMap::new(),
         }
     }
 }
@@ -854,11 +901,28 @@ impl<K: NodeKey> PerFileEdges<K> {
         start: usize,
         end: usize,
     ) {
-        let Some(candidates) = input.nodes_by_terminal.get(name) else {
+        self.record_unproven_name_kind(input, name, CodeUnitType::Function, start, end);
+    }
+
+    /// Record a structurally selected terminal using its language namespace kind.
+    pub fn record_unproven_name_kind(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        name: &str,
+        kind: CodeUnitType,
+        start: usize,
+        end: usize,
+    ) {
+        let normalized = input.knowledge.normalize_terminal_name(name, kind);
+        let Some(candidates) = input
+            .nodes_by_terminal
+            .get(&kind)
+            .and_then(|index| index.get(normalized.as_ref()))
+        else {
             return;
         };
         for &callee in candidates {
-            self.record_unproven(input, callee.clone(), start, end);
+            self.record_unproven_target(input, callee.clone(), name, kind, start, end);
         }
     }
 
@@ -881,22 +945,73 @@ impl<K: NodeKey> PerFileEdges<K> {
         start: usize,
         end: usize,
     ) {
+        let name = callee.terminal(input.language).to_owned();
+        self.record_unproven_target(input, callee, &name, CodeUnitType::Function, start, end);
+    }
+
+    fn record_unproven_target(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        callee: K,
+        name: &str,
+        kind: CodeUnitType,
+        start: usize,
+        end: usize,
+    ) {
         if !input.accepts_callee(&callee) {
             return;
         }
-        let Some(caller) = input.enclosing(start, end).cloned() else {
-            return;
-        };
-        if caller == callee {
+        if input
+            .enclosing(start, end)
+            .is_some_and(|caller| caller == &callee)
+        {
             return;
         }
         if input.overlaps_definition(&callee, start, end) {
             return;
         }
+        self.record_unproven_site(input, name, kind, start, end);
         self.unproven_inbound
             .entry(callee)
             .or_default()
             .insert(start);
+    }
+
+    fn record_unproven_site(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        name: &str,
+        kind: CodeUnitType,
+        start: usize,
+        end: usize,
+    ) {
+        let entry = input.enclosing_entry(start, end);
+        if entry.is_some_and(|(_, _, caller)| !input.is_caller(caller)) {
+            return;
+        }
+        self.unproven_sites
+            .entry((
+                entry.map(|(_, _, caller)| caller.clone()),
+                input
+                    .knowledge
+                    .normalize_terminal_name(name, kind)
+                    .into_owned(),
+            ))
+            .or_default()
+            .insert(
+                Range {
+                    start_byte: start,
+                    end_byte: end,
+                    start_line: find_line_index_for_offset(input.line_starts, start) + 1,
+                    end_line: find_line_index_for_offset(input.line_starts, end) + 1,
+                },
+                UnprovenSiteEvidence {
+                    name: name.to_owned(),
+                    enclosing: entry
+                        .and_then(|entry| input.declarations.enclosing_units.get(entry))
+                        .cloned(),
+                },
+            );
     }
 }
 
@@ -906,6 +1021,32 @@ mod tests {
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::model::CodeUnitType;
     use brokk_bifrost_test_macros::hardwon;
+
+    struct ScalaKnowledge;
+
+    impl LanguageKnowledge for ScalaKnowledge {
+        fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+            false
+        }
+
+        fn language(&self) -> Language {
+            Language::Scala
+        }
+        fn parser_language(
+            &self,
+            _: crate::analyzer::language_knowledge::ParserFlavor,
+        ) -> tree_sitter::Language {
+            unimplemented!()
+        }
+        fn structural_spec(
+            &self,
+        ) -> &'static dyn crate::analyzer::structural::spec::StructuralSpec {
+            unimplemented!()
+        }
+        fn highlight_query(&self) -> Option<&'static str> {
+            None
+        }
+    }
 
     /// A Scala declaration whose name is `package.terminal`, with `terminal`
     /// interned verbatim as one segment -- exactly what the Scala declaration
@@ -977,7 +1118,9 @@ mod tests {
         let plain = String::from_unit(&scala_class("scalaz", "Plain"));
         let callees: HashSet<String> = HashSet::from_iter([quoted.clone(), plain.clone()]);
 
-        let index = terminal_index(Language::Scala, &callees);
+        let index = terminal_index(&ScalaKnowledge, &callees, |_| vec![CodeUnitType::Function])
+            .remove(&CodeUnitType::Function)
+            .expect("callable catalog");
         assert_eq!(index.get("`zio.ZIO`"), Some(&vec![&quoted]));
         assert_eq!(index.get("Plain"), Some(&vec![&plain]));
         assert!(

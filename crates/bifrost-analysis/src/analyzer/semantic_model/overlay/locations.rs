@@ -54,13 +54,29 @@ impl SourceRecordIdentity {
 
 /// Workspace-derived kind-1 facts, like generated symbols. Only Source
 /// locators are translated eagerly; artifact packs contribute no entries.
-/// M4 bounds these authored anchors together with the generated facts.
-#[derive(Debug, Default)]
+/// The overlay publication budget bounds these anchors with the generated facts.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SourceAnchors {
     anchors: HashMap<SourceRecordIdentity, SemanticModelAuthoredAnchor>,
 }
 
 impl SourceAnchors {
+    pub(super) fn retained_bytes_lower_bound(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.anchors.capacity().saturating_mul(std::mem::size_of::<(
+                SourceRecordIdentity,
+                SemanticModelAuthoredAnchor,
+            )>()))
+            .saturating_add(self.anchors.iter().fold(0usize, |bytes, (key, anchor)| {
+                bytes
+                    .saturating_add(key.pack_digest.capacity())
+                    .saturating_add(key.record_kind.capacity())
+                    .saturating_add(key.record_id.capacity())
+                    .saturating_add(anchor.path.capacity())
+                    .saturating_add(anchor.symbol.capacity())
+            }))
+    }
+
     pub(crate) fn digest(&self) -> String {
         let mut entries = self.anchors.iter().collect::<Vec<_>>();
         entries.sort_unstable_by(|(a, _), (b, _)| {

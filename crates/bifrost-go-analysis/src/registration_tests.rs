@@ -162,90 +162,8 @@ func use(e Embedded, k Kata) { e.Run(); _ = k.Check(1) }
         }
 
         #[cfg(test)]
-        #[test]
-        #[hardwon(
-            "5ffec62f64b0: zero-result method closure could erase the independent unsupported variadic signature gap"
-        )]
-        fn go_variadic_method_zero_result_keeps_unsupported_signature_open() {
-            let source = r#"package p
-
-type Widget struct{}
-func (Widget) Variadic(values ...int) {}
-func use(widget Widget, value int) { widget.Variadic(value) }
-"#;
-            let mut fixture = parsed_go_service_fixture(source, b"go-variadic-method-zero-result");
-            let widget_site = positioned_site_at(
-                &fixture.facts,
-                source.find("Widget struct").expect("Widget declaration"),
-                ResolutionIdentifierRole::Declaration,
-                ResolutionNamespace::Type,
-            );
-            let widget = lowered_semantic_at(
-                &fixture.lexical,
-                widget_site,
-                LoweredSemanticRole::Definition,
-            );
-            let target = go_callable_definition_at(
-                &fixture,
-                source
-                    .find("func (Widget) Variadic")
-                    .expect("method declaration")
-                    + "func (Widget) ".len(),
-            )
-            .1;
-            fixture.service.set_go_member_declarations([
-                super::super::fact_source::GoMemberDeclaration {
-                    definition: widget,
-                    kind: super::super::fact_source::GoMemberDeclarationKind::Struct {
-                        fields: Vec::new(),
-                    },
-                },
-                super::super::fact_source::GoMemberDeclaration {
-                    definition: target,
-                    kind: super::super::fact_source::GoMemberDeclarationKind::Method {
-                        pointer_receiver: Some(false),
-                    },
-                },
-            ]);
-
-            let (answer, _) = resolve_go_call_expression_at(
-                &fixture,
-                source
-                    .find("widget.Variadic(value)")
-                    .expect("variadic method call"),
-            );
-            assert_eq!(answer.binding().targets(), &[target], "{answer:#?}");
-            assert_eq!(
-                answer.binding().completion(),
-                &ResolutionCompletion::Complete,
-                "the uniquely selected method identity is complete: {answer:#?}"
-            );
-            assert!(
-                matches!(answer.completion(), ResolutionCompletion::Incomplete(_)),
-                "unsupported variadic applicability remains open: {answer:#?}"
-            );
-            let result_projection = answer
-                .projections()
-                .iter()
-                .find(|projection| projection.kind().is_callable_result())
-                .expect("variadic method result projection");
-            let result_frontier = answer
-                .projected_frontiers()
-                .iter()
-                .find(|frontier| frontier.slot() == result_projection.output_slot())
-                .expect("variadic method result frontier");
-            assert!(
-                matches!(
-                    result_frontier.completion(),
-                    ResolutionCompletion::Incomplete(_)
-                ),
-                "the empty result tuple does not erase unsupported signature structure: {answer:#?}"
-            );
-        }
-
-        #[cfg(test)]
         #[brokk_bifrost_test_macros::hardwon(
-            "a05d3a95e9d5: Go call signatures must retain unnamed slots and keep omitted variadic inventory incomplete"
+            "a05d3a95e9d5: Go call signatures dropped the slot of an unnamed parameter"
         )]
         #[test]
         fn go_unnamed_and_variadic_parameters_preserve_inventory_and_partial_applicability() {
@@ -295,9 +213,10 @@ func use(x int) {
                         signature_reason.is_none(),
                         "variadic value-shape uncertainty does not poison callable binding"
                     );
-                    assert!(
-                        matches!(signature.completion(), ResolutionCompletion::Incomplete(_)),
-                        "the unsupported variadic parameter value shape keeps the typed signature partial"
+                    assert_eq!(
+                        signature.completion(),
+                        &ResolutionCompletion::Complete,
+                        "the variadic slice parameter has a complete typed signature"
                     );
                 }
 
@@ -320,9 +239,10 @@ func use(x int) {
                         "a uniquely bound, fully typed call is complete: {answer:#?}"
                     );
                 } else {
-                    assert!(
-                        matches!(answer.completion(), ResolutionCompletion::Incomplete(_)),
-                        "{call_text} retains unsupported variadic applicability: {answer:#?}"
+                    assert_eq!(
+                        answer.completion(),
+                        &ResolutionCompletion::Complete,
+                        "{call_text} has fully typed variadic applicability: {answer:#?}"
                     );
                 }
                 assert!(

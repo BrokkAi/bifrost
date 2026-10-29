@@ -16,9 +16,9 @@ use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionTypeRef;
 
 use crate::analyzer::semantic::{
-    BarrierObservation, ContentIdentity, OverlaySnapshotId, SemanticProviderError, SemanticRequest,
-    SemanticWork, SourceMappingKind, SourceRevision, StableDigest, ValueHandle,
-    ValueTypeBarrierContext, ValueTypeBarrierDecision, ValueTypeBarrierReason, ValueTypePredicate,
+    BarrierObservation, SemanticProviderError, SemanticRequest, SemanticWork, SourceMappingKind,
+    ValueHandle, ValueTypeBarrierContext, ValueTypeBarrierDecision, ValueTypeBarrierReason,
+    ValueTypePredicate, prepare_value_type_barrier_source, value_type_barrier_source_matches,
 };
 use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
 
@@ -42,20 +42,16 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustT
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 
-use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
-
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
-
-use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
 use brokk_bifrost_core::hash::HashMap;
 
-use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSourceOrigin, PreparedSyntaxTree};
-use brokk_bifrost_core::analyzer::resolution_facts::{BindingProjectionKind, IntrinsicTypeKind};
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_rust::selected_context::RustSelectedActivation;
@@ -260,30 +256,16 @@ impl RustBarrierContext<'_> {
         {
             return Ok(Undecided(UnavailableObservation));
         }
-        let prepared = match prepare_source(self.rust, &mut state.syntax, &file, request) {
+        let prepared = match prepare_value_type_barrier_source(
+            &self.rust.inner,
+            &mut state.syntax,
+            &file,
+            request,
+        ) {
             Ok(prepared) => prepared,
             Err(reason) => return Ok(Undecided(reason)),
         };
-        let content =
-            ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
-        let revision_matches = match (procedure.artifact().key().revision(), prepared.origin()) {
-            (SourceRevision::Disk { content: expected }, PreparedSourceOrigin::Disk) => {
-                content == expected
-            }
-            (
-                SourceRevision::Overlay {
-                    content: expected,
-                    snapshot,
-                },
-                PreparedSourceOrigin::Overlay,
-            ) => {
-                content == expected
-                    && prepared.overlay_revision().is_some_and(|revision| {
-                        OverlaySnapshotId::hash_bytes(revision.get().to_le_bytes()) == snapshot
-                    })
-            }
-            _ => false,
-        };
+        let revision_matches = value_type_barrier_source_matches(observation, &prepared);
         if !revision_matches
             || !self
                 .rust
@@ -411,67 +393,32 @@ impl RustBarrierContext<'_> {
         predicate: ValueTypePredicate,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ValueTypeBarrierDecision, SemanticProviderError> {
+        let mut selection =
+            brokk_bifrost_analysis::analyzer::native_points::BarrierValueTypeSelection::default();
         let mut selected = None;
-        let mut complete = true;
         for answer in answers {
             if answer.resolution.binding().targets().len() > 1 {
                 return Ok(Undecided(AmbiguousType));
             }
-            complete &= matches!(
-                answer.resolution.completion(),
-                ResolutionCompletion::Complete
-            );
             if !answer.macro_expansion_gaps.is_empty() || !answer.generated_surface_gaps.is_empty()
             {
                 return Ok(Undecided(IncompleteEnumSurface));
             }
-            let observed = answer.resolution.observed_type_identity();
-            let (_, projection_kind, _) =
-                brokk_bifrost_analysis::analyzer::usages::get_type::projection_target_kind(
-                    answer.resolution.projections(),
-                );
-            let slots = answer
-                .resolution
-                .projections()
-                .iter()
-                .filter(|projection| {
-                    Some(projection.kind()) == projection_kind
-                        && projection.kind() != BindingProjectionKind::TargetMemberOwnerType
-                })
-                .map(|projection| projection.output_slot())
-                .chain(observed);
-            for slot in slots {
-                let Some(frontier) = answer
-                    .resolution
-                    .projected_frontiers()
-                    .iter()
-                    .find(|frontier| frontier.slot() == slot)
-                else {
-                    return Ok(Undecided(IncompleteType));
-                };
-                complete &= matches!(frontier.completion(), ResolutionCompletion::Complete);
-                for value in frontier.possible_values() {
-                    let ty = value.ty();
-                    match selected {
-                        Some((previous, _)) if previous != ty => {
-                            return Ok(Undecided(AmbiguousType));
-                        }
-                        None => selected = Some((ty, &answer.projection)),
-                        _ => {}
-                    }
-                }
+            let ty = match selection.observe(&answer.resolution, None) {
+                Ok(Some(ty)) => ty,
+                Ok(None) => continue,
+                Err(reason) => return Ok(Undecided(reason)),
+            };
+            if selected.is_none() {
+                selected = Some((ty, &answer.projection));
             }
         }
-        let Some((ty, projection)) = selected else {
-            return Ok(Undecided(if complete {
-                UnknownType
-            } else {
-                IncompleteType
-            }));
-        };
-        if !complete {
-            return Ok(Undecided(IncompleteType));
+        if let Err(reason) = selection.finish() {
+            return Ok(Undecided(reason));
         }
+        let Some((ty, projection)) = selected else {
+            return Ok(Undecided(UnknownType));
+        };
         if ty.indirection() != 0 {
             return Ok(ProvenNonMatch);
         }
@@ -483,9 +430,29 @@ impl RustBarrierContext<'_> {
             .iter()
             .find(|descriptor| descriptor.identity() == ty.identity())
         {
-            if predicate == ValueTypePredicate::IntrinsicBool
-                && intrinsic.kind() == IntrinsicTypeKind::Primitive
-                && intrinsic.spelling() == "bool"
+            if intrinsic.kind() == IntrinsicTypeKind::Primitive
+                && match predicate {
+                    ValueTypePredicate::IntrinsicBool => intrinsic.spelling() == "bool",
+                    ValueTypePredicate::IntrinsicNumeric => matches!(
+                        intrinsic.spelling(),
+                        "i8" | "i16"
+                            | "i32"
+                            | "i64"
+                            | "i128"
+                            | "isize"
+                            | "u8"
+                            | "u16"
+                            | "u32"
+                            | "u64"
+                            | "u128"
+                            | "usize"
+                            | "f16"
+                            | "f32"
+                            | "f64"
+                            | "f128"
+                    ),
+                    ValueTypePredicate::FieldlessEnum => false,
+                }
             {
                 ProvenMatch
             } else {
@@ -498,7 +465,12 @@ impl RustBarrierContext<'_> {
         {
             match definition {
                 SelectedRustSourceDefinition::Unit(unit) => {
-                    let prepared = match prepare_source(self.rust, syntax, unit.source(), request) {
+                    let prepared = match prepare_value_type_barrier_source(
+                        &self.rust.inner,
+                        syntax,
+                        unit.source(),
+                        request,
+                    ) {
                         Ok(prepared) => prepared,
                         Err(reason) => return Ok(Undecided(reason)),
                     };
@@ -538,7 +510,7 @@ impl RustBarrierContext<'_> {
                     if !enum_attributes_are_source_preserving(node, prepared.source()) {
                         return Ok(Undecided(IncompleteEnumSurface));
                     }
-                    if node.kind() != "enum_item" || predicate == ValueTypePredicate::IntrinsicBool
+                    if node.kind() != "enum_item" || predicate != ValueTypePredicate::FieldlessEnum
                     {
                         ProvenNonMatch
                     } else {
@@ -562,49 +534,6 @@ impl RustBarrierContext<'_> {
         }
         Ok(decision)
     }
-}
-
-// Retain only the source files this request demanded, under its byte budget.
-fn prepare_source(
-    rust: &RustAnalyzer,
-    syntax: &mut HashMap<ProjectFile, Arc<PreparedSyntaxTree>>,
-    file: &ProjectFile,
-    request: &mut SemanticRequest<'_>,
-) -> Result<Arc<PreparedSyntaxTree>, ValueTypeBarrierReason> {
-    if let Some(prepared) = syntax.get(file) {
-        return Ok(Arc::clone(prepared));
-    }
-    let scope = AnalyzerQueryScope::new(rust);
-    let prepared = match rust.inner.prepared_syntax_limited_cancellable(
-        scope.token(),
-        file,
-        request.budget.remaining().source_bytes,
-        Some(request.cancellation),
-    ) {
-        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Available(
-            _,
-            prepared,
-        ) => prepared,
-        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Cancelled => {
-            return Err(Cancelled);
-        }
-        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Exceeded(_) => {
-            return Err(BudgetExceeded);
-        }
-        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Unavailable
-        | brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome::Refused(_) => {
-            return Err(UnavailableObservation);
-        }
-    };
-    if request
-        .budget
-        .admit_source(&prepared, prepared.source().len())
-        .is_err()
-    {
-        return Err(BudgetExceeded);
-    }
-    syntax.insert(file.clone(), Arc::clone(&prepared));
-    Ok(prepared)
 }
 
 fn enum_surface(

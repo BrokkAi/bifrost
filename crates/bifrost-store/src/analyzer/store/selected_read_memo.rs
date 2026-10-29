@@ -32,3 +32,35 @@ impl<K: Eq + Hash, V> ExactReadMemo<K, V> {
         self.entries.insert(key, value)
     }
 }
+
+/// The one insert-stop bound for disposable request caches, including
+/// placement_access's memos. Past it, reads continue uncached.
+pub(crate) const REQUEST_READ_CACHE_ENTRY_CAP: usize = 65_536;
+
+/// Disposable rows for one selected request. Refusing admission never refuses
+/// a read: callers return the computed value and reread SQL on the next miss.
+/// Authoritative preparations must continue to use ExactReadMemo instead.
+pub(crate) struct RequestReadCache<K: Eq + Hash, V> {
+    entries: HashMap<K, V>,
+}
+
+impl<K: Eq + Hash, V> Default for RequestReadCache<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+        }
+    }
+}
+
+impl<K: Eq + Hash, V> RequestReadCache<K, V> {
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key)
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if self.entries.len() >= REQUEST_READ_CACHE_ENTRY_CAP {
+            return None;
+        }
+        self.entries.insert(key, value)
+    }
+}

@@ -3702,7 +3702,10 @@ pub mod rust_departing_root_tests {
             // and RELEASE (-4 search statements): 372 -> 368, preserving every
             // decoded answer row.
             // #6594 empty-stage occupancy skips 31 measured reads; decoded rows stay fixed.
-            (273, 241, 337, 210),
+            // The request-owned identity-recipe cache answers three recipe reads
+            // that repeat an earlier read in the search: -3 statements and -3
+            // decoded rows. Opening is unchanged.
+            (273, 241, 334, 207),
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3751,7 +3754,8 @@ pub mod rust_departing_root_tests {
             // #6291: the same two constant emptiness proof rows as cold.
             // #6594 removes the same four request-buffer writes per search.
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
-            (5, 4, 337, 210),
+            // The same three cached recipe reads as the cold search: -3/-3.
+            (5, 4, 334, 207),
             "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3772,7 +3776,8 @@ pub mod rust_departing_root_tests {
             // #6291: the same two constant emptiness proof rows as cold.
             // #6594 removes the same four request-buffer writes per search.
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
-            (5, 4, 337, 210),
+            // The same three cached recipe reads as the cold search: -3/-3.
+            (5, 4, 334, 207),
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
         assert_eq!(cold.2, first_warm.2);
@@ -6224,7 +6229,10 @@ pub mod rust_departing_root_tests {
                 // #5780 binding-inventory and intermediate-step evidence reads
                 // add SQL work without changing these scope charges.
                 // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
-                scope_nodes: 277,
+                // #6844 adds 30 charged steps for selected-language capability
+                // reads and positional callable-result slots. Nongeneric callees
+                // skip five empty generic-formal reader charges (312 -> 307).
+                scope_nodes: 307,
                 resolution_rounds: 10,
             },
             "engine admission charges the point request; tier-1 candidate and declaration work must remain exact"

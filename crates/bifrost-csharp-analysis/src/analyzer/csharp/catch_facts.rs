@@ -25,8 +25,10 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_csharp::graph::resolver::{reference_type_text, resolve_type_fq_name};
-use brokk_bifrost_csharp::graph_support::CSharpSource;
+use brokk_bifrost_csharp::graph::resolver::{
+    reference_type_text, resolve_type_fq_name, resolve_type_fq_name_of_node,
+};
+use brokk_bifrost_csharp::graph_support::{CSharpLookupContext, CSharpSource};
 use std::collections::HashSet;
 use tree_sitter::Node;
 
@@ -74,8 +76,9 @@ pub fn csharp_catch_facts(
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
     catch: Range,
+    regions: &brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions,
 ) -> CSharpCatchFacts {
-    let CSharpCatchBodyFacts { shape, rethrow } = csharp_catch_body_facts(syntax, catch);
+    let CSharpCatchBodyFacts { shape, rethrow } = csharp_catch_body_facts(syntax, catch, regions);
     let Some(node) = exact_catch_node(syntax, catch) else {
         return CSharpCatchFacts {
             body: shape,
@@ -111,8 +114,15 @@ pub fn csharp_catch_facts(
     let reference = reference_type_text(type_node, syntax.source());
     let packs = csharp.semantic_model_overlay();
     let external = csharp.external_declarations(packs);
-    let (caught_type, caught_type_relation, type_reason) =
-        resolve_caught_type(csharp, token, file, &reference, &external);
+    let (caught_type, caught_type_relation, type_reason) = resolve_caught_type(
+        csharp,
+        token,
+        file,
+        syntax.source(),
+        type_node,
+        &reference,
+        &external,
+    );
     CSharpCatchFacts {
         body: shape,
         caught_type,
@@ -123,10 +133,15 @@ pub fn csharp_catch_facts(
     }
 }
 
+/// The caught type is resolved where the catch is written: a file can hold a
+/// global-namespace class and namespace bodies, and only the namespaces that
+/// enclose the catch are searched for its simple name (#7569).
 fn resolve_caught_type(
     csharp: &CSharpAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
     reference: &str,
     external: &CSharpExternalDeclarations<'_>,
 ) -> (
@@ -134,7 +149,7 @@ fn resolve_caught_type(
     CSharpCatchTypeRelation,
     Option<&'static str>,
 ) {
-    if let Some(fqn) = resolve_type_fq_name(csharp, token, file, reference) {
+    if let Some(fqn) = resolve_type_fq_name_of_node(csharp, file, source, type_node) {
         let definitions = csharp
             .get_definitions(&fqn)
             .into_iter()
@@ -154,9 +169,11 @@ fn resolve_caught_type(
         return (Some(fqn), relation, reason);
     }
 
+    let context = CSharpLookupContext::at(source, type_node, || true)
+        .expect("an unbounded lookup context completes");
     let lookup = external.resolve_type_in_file(
         reference,
-        &csharp.namespace_of_file(file),
+        context.namespace(),
         &csharp.using_namespaces_of(token, file),
         &csharp.using_aliases_of(token, file),
     );

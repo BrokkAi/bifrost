@@ -297,36 +297,74 @@ fn same_field_selector(left: &ScopedSemanticLocator, right: &ScopedSemanticLocat
     }
 }
 
-fn same_root(left: &AccessPathRoot, right: &AccessPathRoot) -> bool {
-    match (left, right) {
-        (AccessPathRoot::Value(left), AccessPathRoot::Value(right)) => same_value(left, right),
-        (AccessPathRoot::CallResult(left), AccessPathRoot::CallResult(right)) => {
-            same_call(left.call(), right.call())
-                && same_value(left.result(), right.result())
-                && same_procedure(left.callee(), right.callee())
-                && same_call_context(left.caller_context(), right.caller_context())
-                && same_call_context(left.callee_context(), right.callee_context())
-        }
-        (AccessPathRoot::ProcedurePort(left), AccessPathRoot::ProcedurePort(right))
-        | (AccessPathRoot::CaptureSlot(left), AccessPathRoot::CaptureSlot(right)) => {
-            same_port(left, right)
-        }
-        (AccessPathRoot::Allocation(left), AccessPathRoot::Allocation(right)) => {
-            left.id() == right.id() && same_procedure(left.procedure(), right.procedure())
-        }
-        (AccessPathRoot::LexicalCell(left), AccessPathRoot::LexicalCell(right)) => {
-            left.id() == right.id() && same_procedure(left.procedure(), right.procedure())
-        }
-        (AccessPathRoot::Static(left), AccessPathRoot::Static(right))
-        | (AccessPathRoot::TypeSummary(left), AccessPathRoot::TypeSummary(right))
-        | (AccessPathRoot::ModuleObject(left), AccessPathRoot::ModuleObject(right))
-        | (AccessPathRoot::External(left), AccessPathRoot::External(right)) => {
-            same_scoped_locator(left, right)
-        }
-        (AccessPathRoot::RuntimeObject(left), AccessPathRoot::RuntimeObject(right)) => {
-            left == right
-        }
-        _ => false,
+fn same_root(mut left: &AccessPathRoot, mut right: &AccessPathRoot) -> bool {
+    loop {
+        return match (left, right) {
+            (AccessPathRoot::Value(left), AccessPathRoot::Value(right)) => same_value(left, right),
+            (AccessPathRoot::CallResult(left), AccessPathRoot::CallResult(right)) => {
+                same_call(left.call(), right.call())
+                    && same_value(left.result(), right.result())
+                    && same_procedure(left.callee(), right.callee())
+                    && same_call_context(left.caller_context(), right.caller_context())
+                    && same_call_context(left.callee_context(), right.callee_context())
+            }
+            (AccessPathRoot::ProcedurePort(left), AccessPathRoot::ProcedurePort(right))
+            | (AccessPathRoot::CaptureSlot(left), AccessPathRoot::CaptureSlot(right)) => {
+                same_port(left, right)
+            }
+            (AccessPathRoot::Allocation(left), AccessPathRoot::Allocation(right)) => {
+                left.id() == right.id() && same_procedure(left.procedure(), right.procedure())
+            }
+            (AccessPathRoot::LexicalCell(left), AccessPathRoot::LexicalCell(right)) => {
+                left.id() == right.id() && same_procedure(left.procedure(), right.procedure())
+            }
+            (AccessPathRoot::Static(left), AccessPathRoot::Static(right))
+            | (AccessPathRoot::TypeSummary(left), AccessPathRoot::TypeSummary(right))
+            | (AccessPathRoot::ModuleObject(left), AccessPathRoot::ModuleObject(right))
+            | (AccessPathRoot::External(left), AccessPathRoot::External(right)) => {
+                same_scoped_locator(left, right)
+            }
+            (AccessPathRoot::RuntimeObject(left), AccessPathRoot::RuntimeObject(right)) => {
+                left == right
+            }
+            (
+                AccessPathRoot::FieldPath {
+                    base: left_base,
+                    member: left_member,
+                },
+                AccessPathRoot::FieldPath {
+                    base: right_base,
+                    member: right_member,
+                },
+            ) => {
+                if left_member != right_member {
+                    return false;
+                }
+                left = left_base;
+                right = right_base;
+                continue;
+            }
+            (
+                AccessPathRoot::CallSubstitution {
+                    procedure: left_procedure,
+                    context: left_context,
+                    base: left_base,
+                    base_cardinality: left_cardinality,
+                },
+                AccessPathRoot::CallSubstitution {
+                    procedure: right_procedure,
+                    context: right_context,
+                    base: right_base,
+                    base_cardinality: right_cardinality,
+                },
+            ) => {
+                same_procedure(left_procedure, right_procedure)
+                    && same_call_context(left_context, right_context)
+                    && left_base == right_base
+                    && left_cardinality == right_cardinality
+            }
+            _ => false,
+        };
     }
 }
 

@@ -308,11 +308,7 @@ const UNRESOLVED_IMPL_HALF_SQL: &str = "SELECT '{side}', source.{name}, source.b
            member.rel_path,
            source.impl_declaration_id,
            CASE
-             WHEN EXISTS(SELECT 1 FROM cr_impl_declarations AS declaration
-                         WHERE declaration.blob_id=source.blob_id
-                           AND declaration.relation_key=source.relation_key
-                           AND declaration.module_path=source.module_path
-                           AND declaration.side='{side}')
+             WHEN declared.declaration_blob_id IS NOT NULL
                THEN 'resolved'
              WHEN EXISTS(SELECT 1 FROM cr_impl_bindings AS binding
                          WHERE binding.blob_id=source.blob_id
@@ -331,10 +327,15 @@ const UNRESOLVED_IMPL_HALF_SQL: &str = "SELECT '{side}', source.{name}, source.b
              (SELECT route.target_module_path FROM {routes} AS route
               WHERE route.blob_id=source.blob_id
                 AND route.relation_key=source.relation_key
-                AND route.module_path=source.module_path))
+                AND route.module_path=source.module_path)),
+           declared.declaration_blob_id, declared.declaration_site, declared.rel_path,
+           source.module_path
     FROM cr_impl_sources AS source
     CROSS JOIN cr_members AS member
       ON member.module_path=source.module_path AND member.blob_id=source.blob_id
+    LEFT JOIN cr_impl_declarations AS declared
+      ON declared.blob_id=source.blob_id AND declared.relation_key=source.relation_key
+     AND declared.module_path=source.module_path AND declared.side='{side}'
     WHERE source.trait_name IS NOT NULL
       AND (NOT EXISTS(SELECT 1 FROM cr_impl_declarations AS declaration
                      WHERE declaration.blob_id=source.blob_id
@@ -351,7 +352,7 @@ const UNRESOLVED_IMPL_HALF_SQL: &str = "SELECT '{side}', source.{name}, source.b
 pub(super) static UNRESOLVED_IMPL_SELECT_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
-            "SELECT DISTINCT * FROM ({} UNION ALL {}) ORDER BY 1, 2, 3, 4, 5, 6, 7, 8",
+            "SELECT DISTINCT * FROM ({} UNION ALL {}) ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12",
             impl_half(
                 UNRESOLVED_IMPL_HALF_SQL,
                 "subject",
@@ -360,8 +361,7 @@ pub(super) static UNRESOLVED_IMPL_SELECT_SQL: std::sync::LazyLock<String> =
             impl_half(UNRESOLVED_IMPL_HALF_SQL, "trait", "cr_impl_trait_routes"),
         )
     });
-pub(super) const UNRESOLVED_IMPL_INSERT_SQL: &str =
-    "INSERT OR IGNORE INTO rust_crate_unresolved_trait_impls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+pub(super) const UNRESOLVED_IMPL_INSERT_SQL: &str = "INSERT OR IGNORE INTO rust_crate_unresolved_trait_impls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
 
 fn impl_half(template: &str, side: &str, routes: &str) -> String {
     template
@@ -2700,7 +2700,7 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         (
             "rust_crate_unresolved_trait_impls_insert",
             UNRESOLVED_IMPL_INSERT_SQL,
-            9,
+            13,
         ),
     ];
     statements.extend([

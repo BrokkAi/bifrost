@@ -32,8 +32,13 @@ pub fn uniform_php_declaration_kind(
 pub fn php_is_constructor(method: &CodeUnit, class_unit: &CodeUnit, _package_name: &str) -> bool {
     method.is_function()
         && class_unit.is_class()
-        && method.identifier() == "__construct"
-        && method.fq_name() == format!("{}.__construct", class_unit.fq_name())
+        && php_is_constructor_name(method.identifier())
+        && method.fq_name() == format!("{}.{}", class_unit.fq_name(), method.identifier())
+}
+
+/// Return whether a PHP callable name denotes the magic constructor.
+pub fn php_is_constructor_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("__construct")
 }
 
 pub fn php_namespace_of_file(php: &dyn PhpSource, file: &ProjectFile) -> String {
@@ -63,17 +68,6 @@ pub fn php_use_aliases_by_kind_of(php: &dyn PhpSource, file: &ProjectFile) -> Ph
         map.insert(local.to_owned(), target);
     }
     aliases
-}
-
-pub fn php_file_context_from_source(
-    php: &dyn PhpSource,
-    file: &ProjectFile,
-    _source: &str,
-) -> PhpFileContext {
-    PhpFileContext {
-        namespace: php_namespace_of_file(php, file),
-        aliases: php_use_aliases_by_kind_of(php, file),
-    }
 }
 
 fn php_declaration_context(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<PhpFileContext> {
@@ -206,4 +200,115 @@ fn php_relevant_candidate_types(
         );
     }
     types
+}
+
+#[cfg(test)]
+mod graph_publication_tests {
+    use super::*;
+    use crate::source_facts::PhpFileSourceFacts;
+    use brokk_bifrost_core::analyzer::project::Project;
+    use brokk_bifrost_core::analyzer::{Language, Range};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    struct Source(Arc<PhpFileSourceFacts>);
+    impl PhpSourceFactProvider for Source {
+        fn php_source_facts_while(
+            &self,
+            _: &ProjectFile,
+            _: &dyn Fn() -> bool,
+        ) -> Option<Arc<PhpFileSourceFacts>> {
+            Some(self.0.clone())
+        }
+    }
+    impl TypeHierarchyProvider for Source {
+        fn get_direct_ancestors(&self, _: &CodeUnit) -> Vec<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_direct_descendants(&self, _: &CodeUnit) -> HashSet<CodeUnit> {
+            unimplemented!()
+        }
+    }
+    impl CodeUnitIndex for Source {
+        fn project(&self) -> &dyn Project {
+            unimplemented!()
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([Language::Php])
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            unimplemented!()
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn alias_and_conditional_kind_publication() {
+        let source = r#"<?php
+use Vendor\T as X;
+use function Vendor\f as X;
+use const Vendor\C as X;
+use function Vendor\Pkg\{run, stop};
+use const Vendor\Pkg\{FLAG, LIMIT};
+if ($choose) { interface I {} trait T {} } else { interface I {} trait T {} }
+"#;
+        let tree = crate::aliases::parse_php_tree(source).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "qs9-conditional.php");
+        let parsed = crate::declarations::parse_php_file(&file, source, &tree);
+        let primary = parsed.source_facts.unwrap();
+        let mut units: HashMap<_, Vec<_>> = HashMap::default();
+        for (id, unit) in parsed.source_declaration_units {
+            units.entry(id).or_default().push(unit);
+        }
+        let mounted = Source(Arc::new(PhpFileSourceFacts {
+            source: primary.occurrences,
+            imports: primary.imports,
+            facts: primary.php.unwrap(),
+            declaration_units: units,
+        }));
+        let aliases = php_use_aliases_by_kind_of(&mounted, &file);
+        assert_eq!(aliases.type_aliases["X"], "Vendor.T");
+        assert_eq!(aliases.function_aliases["X"], "Vendor.f");
+        assert_eq!(aliases.const_aliases["X"], "Vendor.C");
+        assert_eq!(aliases.function_aliases["run"], "Vendor.Pkg.run");
+        assert_eq!(aliases.const_aliases["FLAG"], "Vendor.Pkg.FLAG");
+        for (name, kind) in [
+            ("I", PhpDeclarationKind::Interface),
+            ("T", PhpDeclarationKind::Trait),
+        ] {
+            let unit = parsed
+                .ranges
+                .keys()
+                .find(|unit| unit.identifier() == name)
+                .unwrap();
+            let declarations: Vec<_> = mounted.0.declarations_for(unit).map(|d| d.kind).collect();
+            assert_eq!(declarations, vec![kind, kind]);
+            assert_eq!(
+                uniform_php_declaration_kind(declarations.into_iter()),
+                Some(kind)
+            );
+        }
+    }
 }

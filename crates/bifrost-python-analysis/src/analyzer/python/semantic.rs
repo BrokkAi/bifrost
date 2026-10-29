@@ -112,7 +112,11 @@ use std::sync::Arc;
 // Quicksilver round 6: the regex and structural facts the lowerer reads, the
 // alias-scan budget (exhaustion is Budget, not "no mutation") and runtime key
 // shapes (radix indices, tuple keys) change for unchanged bytes.
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v49";
+// #5658: shared lexical inventories recognize recovered file roots structurally;
+// invalidate artifacts that reached the former module-scope rule.
+// #7182: native member-operation names change on the uncached import-read path.
+// #5658: native lexical presentation changes reparsing reachable from lowering.
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v52";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -7499,6 +7503,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     point: invoke,
                     callee,
                     receiver: Some(receiver),
+                    member_selection: None,
                     arguments: Box::new([]),
                     normal_results: Box::new([]),
                     result: None,
@@ -7879,6 +7884,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     point: invoke,
                     callee,
                     receiver,
+                    member_selection: None,
                     arguments: argument_values.into_boxed_slice(),
                     normal_results: Box::new([]),
                     result: Some(result),
@@ -7899,6 +7905,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     point: invoke,
                     callee,
                     receiver,
+                    member_selection: None,
                     arguments: argument_values.into_boxed_slice(),
                     result: Some(result),
                     thrown: Some(thrown),

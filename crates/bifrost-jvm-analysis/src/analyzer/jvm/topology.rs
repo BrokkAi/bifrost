@@ -106,7 +106,9 @@ struct MavenDependency {
 
 fn maven_topology(project: &dyn Project) -> WorkspaceTopology {
     let Ok(files) = project.all_files() else {
-        return WorkspaceTopology::incomplete(JVM_TOPOLOGY_SUPPORT.clone());
+        let mut topology = WorkspaceTopology::incomplete(JVM_TOPOLOGY_SUPPORT.clone());
+        topology.mark_provider_failed();
+        return topology;
     };
     let configurations: Vec<_> = files
         .iter()
@@ -143,11 +145,13 @@ pub(crate) fn maven_topology_from_inputs<'a>(
     configurations: impl IntoIterator<Item = (&'a Path, Option<&'a [u8]>)>,
 ) -> WorkspaceTopology {
     let mut complete = TopologyCompleteness::Complete;
+    let mut provider_failed = false;
     let mut projects = Vec::new();
     for (path, source) in configurations {
         if path.file_name().is_none_or(|name| name != "pom.xml") {
             continue;
         }
+        provider_failed |= source.is_none_or(|source| source.len() > MAX_BUILD_METADATA_BYTES);
         let parsed = source
             .filter(|source| source.len() <= MAX_BUILD_METADATA_BYTES)
             .and_then(|source| std::str::from_utf8(source).ok())
@@ -158,7 +162,11 @@ pub(crate) fn maven_topology_from_inputs<'a>(
         }
     }
     if projects.is_empty() {
-        return WorkspaceTopology::incomplete(JVM_TOPOLOGY_SUPPORT.clone());
+        let mut topology = WorkspaceTopology::incomplete(JVM_TOPOLOGY_SUPPORT.clone());
+        if provider_failed {
+            topology.mark_provider_failed();
+        }
+        return topology;
     }
 
     let listed_modules: Vec<&PathBuf> = projects
@@ -311,13 +319,17 @@ pub(crate) fn maven_topology_from_inputs<'a>(
     edges.dedup();
     ownership.sort_by(|left, right| left.file.cmp(&right.file));
 
-    WorkspaceTopology::new(
+    let mut topology = WorkspaceTopology::new(
         entities,
         edges,
         ownership,
         JVM_TOPOLOGY_SUPPORT.clone(),
         complete,
-    )
+    );
+    if provider_failed {
+        topology.mark_provider_failed();
+    }
+    topology
 }
 
 fn source_set_name(artifact_id: &str, role: &str) -> String {

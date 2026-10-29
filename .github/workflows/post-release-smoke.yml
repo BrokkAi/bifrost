@@ -318,6 +318,67 @@ jobs:
           test "$expected" = "$actual"
           echo "DSH launcher metadata matches the published macOS archive"
 
+  configuration-coordinates:
+    name: published CLI configuration-fact coordinates
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Download and verify the published Linux binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="bifrost-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          release_dir="$RUNNER_TEMP/published-cli"
+          mkdir -p "$release_dir"
+          for name in "$archive" "$archive.sha256"; do
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              "https://github.com/BrokkAi/bifrost/releases/download/${RELEASE_TAG}/${name}" \
+              -o "$release_dir/$name"
+          done
+          (cd "$release_dir" && sha256sum -c "$archive.sha256")
+          tar -C "$release_dir" -xzf "$release_dir/$archive"
+          binary="$(find "$release_dir" -type f -name bifrost -perm -u+x -print -quit)"
+          test -n "$binary"
+          echo "BIFROST_BIN=$binary" >> "$GITHUB_ENV"
+
+      # A merged fix is delivered only when the published binary carries it:
+      # v0.14.2 was cut before the configuration-range fix for #7067 landed and
+      # shipped `1:1..1:1` for every configuration fact (#7538). Check the
+      # authored range of a property that follows a comment line.
+      - name: Check configuration facts report authored line and column ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/configuration-coordinates"
+          mkdir -p "$fixture"
+          printf '# PostgreSQL connection for the app\ndb.url=jdbc:postgresql://db/app\ndb.user=app\n' \
+            > "$fixture/app.properties"
+          printf '(result-detail full\n  (configuration-facts :format properties :node-kind member))\n' \
+            > "$fixture/query.rql"
+          output="$RUNNER_TEMP/configuration-coordinates.json"
+          (cd "$fixture" && "$BIFROST_BIN" --query-file query.rql) > "$output"
+          jq -e '
+            .isError == false
+            and .structuredContent.truncated == false
+            and ([.structuredContent.results[] | select(.key == "db.url")] as $rows
+              | ($rows | length) == 1
+              and $rows[0].path == "app.properties"
+              and $rows[0].start_byte == 36
+              and $rows[0].end_byte == 67
+              and $rows[0].range == {"start_line": 2, "start_column": 1, "end_line": 2, "end_column": 32})
+          ' "$output" >/dev/null || {
+            echo "Published ${RELEASE_TAG} binary reported wrong configuration-fact coordinates:" >&2
+            jq . "$output" >&2
+            exit 1
+          }
+          echo "Published ${RELEASE_TAG} binary reports authored configuration-fact ranges"
+
   install-smoke:
     name: install and select published npm binary (${{ matrix.os }})
     needs: resolve

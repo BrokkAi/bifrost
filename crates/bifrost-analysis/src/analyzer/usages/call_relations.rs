@@ -269,6 +269,12 @@ pub struct CallDispatchLookup {
     pub go_interface_receiver: bool,
     #[doc(hidden)]
     pub go_selector_member: Option<String>,
+    /// Exact selector occurrence proven to load a field rather than a method.
+    #[doc(hidden)]
+    pub member_field_anchor: Option<crate::analyzer::semantic::SourceAnchor>,
+    /// Exact method receiver preparation retained from the target resolver.
+    #[doc(hidden)]
+    pub member_receiver_preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
     #[doc(hidden)]
     pub truncated: bool,
     #[doc(hidden)]
@@ -277,6 +283,11 @@ pub struct CallDispatchLookup {
     pub budget_exhausted: bool,
     #[doc(hidden)]
     pub diagnostics: Vec<String>,
+    /// Kinds of the definition-lookup diagnostics behind `status`, sorted and
+    /// deduplicated. An unresolved dispatch boundary names them, so a call that
+    /// stays unresolved says which lookup outcome left it so (#4823).
+    #[doc(hidden)]
+    pub diagnostic_kinds: Vec<Box<str>>,
     #[doc(hidden)]
     pub work: CallRelationWork,
 }
@@ -295,6 +306,8 @@ pub struct ResolverOwnedExternalCallDispatch {
     pub parameter_count: u32,
     #[doc(hidden)]
     pub has_receiver: bool,
+    #[doc(hidden)]
+    pub selected_external_descriptor: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
 }
 
 impl ResolverOwnedExternalCallDispatch {
@@ -336,6 +349,7 @@ impl CallDispatchLookup {
             identity: identity.clone(),
             parameter_count: proof.parameter_count(),
             has_receiver: proof.has_receiver(),
+            selected_external_descriptor: proof.external_member_identity().cloned(),
         })
     }
 }
@@ -606,7 +620,7 @@ fn record_call_relation_read(
     subject: &CodeUnit,
     result: &CallRelationResult,
 ) {
-    if !analyzer.read_ledger_attached() {
+    if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
     }
     analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
@@ -1274,6 +1288,94 @@ pub fn project_incoming_call_hit(
         syntax,
         proof,
     ))
+}
+
+/// Legacy usage graphs can establish a member family without selecting one
+/// overload. Prove incoming callees with the same resolver as outgoing calls;
+/// keep the original source argument, including any cast, intact for that proof.
+fn refine_incoming_call_targets(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    sites: Vec<CallSite>,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CallRelationDiagnostic>,
+) -> (Vec<CallSite>, bool) {
+    let mut cache = CallBindingCache::default();
+    // Resolve the selected sites once per file, without scanning other calls.
+    // Stable group order keeps bounded resolver admission deterministic.
+    {
+        let mut requests = sites
+            .iter()
+            .map(|site| (&site.file, site.callee_range))
+            .collect::<Vec<_>>();
+        requests.sort_unstable();
+        requests.dedup();
+        for group in requests.chunk_by(|left, right| left.0 == right.0) {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            cache.prefetch_call_targets_uncached(
+                analyzer,
+                group[0].0,
+                group.iter().map(|(_, range)| *range).collect(),
+                cancellation,
+            );
+        }
+    }
+    let mut retained = Vec::with_capacity(sites.len());
+    let mut unproven_sites = Vec::new();
+    let mut truncated = false;
+    for mut site in sites {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        let matches_target =
+            match cache.resolved_call_target(analyzer, &site.file, site.callee_range, cancellation)
+            {
+                Some(outcome) if outcome.exact_external_call.is_some() => Some(false),
+                Some(outcome) => {
+                    truncated |= outcome.truncated;
+                    let certain = !outcome.structure_unavailable
+                        && !outcome.unproven_link_unit
+                        && !outcome.truncated;
+                    let resolution = resolve_outgoing_call_candidate(
+                        analyzer,
+                        outcome.outcome.status,
+                        outcome.outcome.definitions,
+                    );
+                    (certain
+                        && resolution.proof == Some(UsageProof::Proven)
+                        && resolution.omitted == 0)
+                        .then(|| resolution.callees.contains(target))
+                }
+                None => None,
+            };
+        match matches_target {
+            Some(false) => continue,
+            Some(true) => {}
+            None => {
+                site.proof = UsageProof::Unproven;
+                unproven_sites.push((
+                    crate::path_utils::rel_path_string(&site.file),
+                    site.callee_range,
+                ));
+            }
+        }
+        retained.push(site);
+    }
+    if !unproven_sites.is_empty() {
+        diagnostics.push(CallRelationDiagnostic::analysis_failed(
+            format!(
+                "incoming call target identity was unproven for {} {:?} in {} at {unproven_sites:?}",
+                target.fq_name(),
+                target.signature(),
+                crate::path_utils::rel_path_string(target.source())
+            ),
+            target.fq_name().to_string(),
+            "incoming_call_target_unproven".to_string(),
+        ));
+    }
+    (retained, truncated)
 }
 
 #[doc(hidden)]
@@ -2239,6 +2341,24 @@ impl CallRelationService {
             truncated = true;
             append_incoming_projection_omission(&mut diagnostics, target, omitted);
         }
+        if language_support_for_hook(
+            language_for_file(target.source()),
+            "incoming_call_target_proof",
+        )
+        .is_some_and(|support| support.refine_legacy_incoming_overload_families())
+        {
+            let (refined, target_lookup_truncated) = refine_incoming_call_targets(
+                analyzer,
+                target,
+                sites,
+                cancellation,
+                &mut diagnostics,
+            );
+            sites = refined;
+            truncated |= target_lookup_truncated;
+            cancelled |= cancellation.is_some_and(CancellationToken::is_cancelled);
+            truncated |= cancelled;
+        }
 
         // Usage graphs intentionally suppress references enclosed by the target
         // itself. Recover those exact recursive edges from the target's own
@@ -3081,6 +3201,13 @@ fn apply_dispatch_outcome_with_flags(
         );
     }
     lookup.status = Some(status);
+    lookup.diagnostic_kinds.extend(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind.as_str().into()),
+    );
+    lookup.diagnostic_kinds.sort();
+    lookup.diagnostic_kinds.dedup();
     lookup.diagnostics.extend(
         diagnostics
             .into_iter()

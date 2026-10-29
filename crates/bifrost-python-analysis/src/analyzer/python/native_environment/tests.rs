@@ -579,3 +579,203 @@ fn python_trial_cold_index_publishes_scoped_blobs() {
         }
     );
 }
+
+#[test]
+fn python_configuration_input_names_agree_with_staging() {
+    use brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport;
+    use brokk_bifrost_python::declarations::PYTHON_CONFIGURATION_INPUT_NAMES;
+    for name in PYTHON_CONFIGURATION_INPUT_NAMES {
+        for path in [PathBuf::from(name), Path::new("nested").join(name)] {
+            assert!(
+                super::super::PythonSupport.is_configuration_input_path(&path),
+                "{path:?}"
+            );
+        }
+    }
+    for name in [
+        "setup.cfg",
+        "not-pyproject.toml",
+        "pyproject.toml.bak",
+        "model.py",
+    ] {
+        assert!(
+            !super::super::PythonSupport.is_configuration_input_path(Path::new(name)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn python_workspace_native_environment_lifecycle() {
+    const CHILD: &str = "BIFROST_PYTHON_ENVIRONMENT_LIFECYCLE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for trial in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "analyzer::python::native_environment::tests::python_workspace_native_environment_lifecycle",
+                "--nocapture",
+            ]).env(CHILD, "1").env("XDG_CACHE_HOME", cache.path()).env_remove("BIFROST_TRIAL_NATIVE_PYTHON");
+            if trial {
+                command.env("BIFROST_TRIAL_NATIVE_PYTHON", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "trial={trial}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "child must run: {output:?}"
+            );
+        }
+        return;
+    }
+    use super::super::PythonAnalyzer;
+    use super::super::native_request::{PythonNativeOpen, open_python_native_request};
+    use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
+
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pyproject.toml",
+            "[tool.setuptools.packages.find]\nwhere = ['src']\n",
+        )
+        .file("src/pkg/__init__.py", "")
+        .file("src/pkg/model.py", "class Widget: pass\n")
+        .build();
+    let directory = tempfile::tempdir().unwrap();
+    let store = AnalyzerStore::open_persistent(&directory.path().join("workspace.db")).unwrap();
+    let context = store_context_from_store(fixture.project_dyn().as_ref(), store, false);
+    let store = context.store.clone();
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        fixture.project_dyn(),
+        Default::default(),
+        context,
+    )
+    .unwrap();
+    let token = CancellationToken::new();
+    let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+    if !super::super::trial_native_python_selected() {
+        match open_python_native_request(python, &token).unwrap() {
+            PythonNativeOpen::Unavailable { kind, message } => {
+                assert_eq!(kind, "python_environment_unreconciled");
+                assert!(message.contains("Workspace"), "{message}");
+            }
+            _ => panic!("trial off must report unavailable"),
+        }
+        return;
+    }
+    fn selected(workspace: &WorkspaceAnalyzer, token: &CancellationToken) -> i64 {
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+        match open_python_native_request(python, token).unwrap() {
+            PythonNativeOpen::Ready(request) => {
+                assert_eq!(request.environment.python_version, None);
+                request.environment.summary
+            }
+            PythonNativeOpen::Unavailable { kind, message } => panic!("{kind}: {message}"),
+            PythonNativeOpen::Cancelled => panic!("unexpected cancellation"),
+        }
+    }
+    let first = selected(&workspace, &token);
+    std::fs::write(
+        fixture.root().join("src/pkg/model.py"),
+        "class Widget:\n    def render(self): pass\n",
+    )
+    .unwrap();
+    let workspace = workspace.update(&BTreeSet::from([ProjectFile::new(
+        fixture.root(),
+        "src/pkg/model.py",
+    )]));
+    let second = selected(&workspace, &token);
+    assert_ne!(second, first);
+    std::fs::write(
+        fixture.root().join("pyproject.toml"),
+        "[tool.setuptools.packages.find]\nwhere = ['.']\n",
+    )
+    .unwrap();
+    let workspace = workspace.update(&BTreeSet::from([ProjectFile::new(
+        fixture.root(),
+        "pyproject.toml",
+    )]));
+    let third = selected(&workspace, &token);
+    assert_ne!(third, second);
+    // A standalone delegate update publishes new inputs but does not run the
+    // workspace's environment lifecycle hook. Its fresh instance must not use
+    // the previous summary's still-open validity interval.
+    use brokk_bifrost_analysis::IAnalyzer;
+    let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+    std::fs::write(
+        fixture.root().join("src/pkg/model.py"),
+        "class Latest: pass\n",
+    )
+    .unwrap();
+    let standalone = python.update(&BTreeSet::from([ProjectFile::new(
+        fixture.root(),
+        "src/pkg/model.py",
+    )]));
+    match open_python_native_request(&standalone, &token).unwrap() {
+        PythonNativeOpen::Unavailable { kind, .. } => {
+            assert_eq!(kind, "python_environment_unreconciled")
+        }
+        _ => panic!("standalone update must require reconciliation"),
+    }
+    let conn = store.read_conn().unwrap();
+    let roots = |summary| {
+        conn.prepare("SELECT root_path FROM python_unit_summary_roots WHERE summary_id=?1 ORDER BY root_path").unwrap()
+            .query_map([summary], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    assert_eq!(roots(first), vec!["src"]);
+    assert_eq!(roots(third), vec![""]);
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+    assert!(matches!(
+        open_python_native_request(python, &cancelled).unwrap(),
+        PythonNativeOpen::Cancelled
+    ));
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#5658: review found that a module-qualified external call lost python_provider_open"
+)]
+fn external_callee_import_forms_retain_provider_obligations() {
+    let source = "from missing_m2_provider import direct\nimport missing_m2_provider\n\ndef probe():\n    direct()\n    missing_m2_provider.qualified()\n";
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file("src/probe.py", source)
+        .build();
+    let directory = tempfile::tempdir().unwrap();
+    let environment = PythonNativeEnvironment::open(
+        &directory.path().join("native.db"),
+        fixture.root(),
+        profile(),
+    )
+    .unwrap();
+    let revision = environment.publish_project(fixture.project_dyn()).unwrap();
+    let receipt = environment
+        .reconcile(revision, &CancellationToken::default())
+        .unwrap();
+    assert!(receipt.failed.is_empty(), "{receipt:?}");
+    let output = environment
+        .route_probe(fixture.project_dyn().as_ref(), revision)
+        .unwrap();
+    for name in ["direct", "qualified"] {
+        let start = source.rfind(name).unwrap();
+        let locator = format!("src/probe.py:{start}..{} ", start + name.len());
+        let answer = output
+            .lines()
+            .find(|line| line.starts_with(&locator))
+            .unwrap();
+        assert!(
+            answer.contains("targets=0 complete=false"),
+            "{answer}\n{output}"
+        );
+        assert!(
+            answer.contains("(\"python_provider_open\", \"python_provider_open:src/probe.py:site=")
+                && answer.contains(":provider_open\")"),
+            "{answer}\n{output}"
+        );
+    }
+}

@@ -208,8 +208,10 @@ pub mod pinned_plans {
         FACTS_SQL, REACHED_SQL, READS_SQL,
     };
 
+    use super::super::resolution_operation::RUST_RECEIVER_KIND_SQL;
     use super::super::resolution_operation::jvm_context::SELECTED_JVM_ALIAS_DECLARATION_GAPS;
     use super::super::resolution_operation::selected_rust_declaration_authority_sql;
+    use super::super::resolution_typed::RUST_RECEIVER_IMPL_TARGETS_SQL;
     use super::super::{
         AnalyzerStore, EXACT_PATH_SYMBOL_FQN_SQL, NORMALIZED_PATH_SYMBOL_FQN_SQL,
         REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL, REVERSE_IMPORT_CANDIDATE_BLOBS_SQL,
@@ -426,6 +428,8 @@ pub mod pinned_plans {
     /// does not even prepare, so the dump would report a preparation error
     /// instead of a plan.
     pub fn prepare_pin_context(conn: &Connection) {
+        conn.execute_batch(super::super::python_unit_summaries::STAGING)
+            .expect("Python environment staging tables");
         super::super::ensure_revisioned_workspace_views(conn)
             .expect("revisioned workspace query views");
         conn.execute_batch(super::super::resolution_operation::REVERSE_CANDIDATE_KEYS_DDL)
@@ -918,6 +922,16 @@ pub mod pinned_plans {
                 text("module3/src/main0"),
             ],
         )];
+        queries.push(pin(
+            "rust_receiver_impl_targets",
+            RUST_RECEIVER_IMPL_TARGETS_SQL,
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_receiver_kind",
+            RUST_RECEIVER_KIND_SQL,
+            vec![integer(1), integer(1)],
+        ));
         // Real codec parameters exercise closed, open and proper-prefix arms.
         let root_requests = {
             use crate::analyzer::resolution::{
@@ -1208,6 +1222,11 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
+            "go_import_discovery_failures_ordered_spelling",
+            super::super::resolution_operation::go_context::GO_IMPORT_DISCOVERY_FAILURES_SQL,
+            vec![integer(1), text("[\"main.go\"]")],
+        ));
+        queries.push(pin(
             "go_domain_discovery_failure",
             super::super::resolution_operation::go_context::DOMAIN_DISCOVERY_FAILURE_SQL,
             vec![integer(1)],
@@ -1223,6 +1242,16 @@ pub mod pinned_plans {
                 integer(1),
                 text("main.go"),
             ],
+        ));
+        queries.push(pin(
+            "go_domain_caller_context_publishes_file",
+            super::super::resolution_operation::go_context::CALLER_CONTEXT_PUBLISHES_FILE,
+            vec![text("pkg/1/main.go"), integer(1)],
+        ));
+        queries.push(pin(
+            "go_domain_package_member_sources",
+            super::super::resolution_typed::go_members::PACKAGE_MEMBER_SOURCES,
+            vec![integer(1), integer(0), integer(1), integer(1), text("go")],
         ));
         queries.push(pin(
             "go_domain_deferred_member_participation",
@@ -1242,12 +1271,129 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
+            "go_dead_code_outside_build_files",
+            super::super::go_package_context::OUTSIDE_SELECTED_BUILD_FILES_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+                digest(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "source_reference_names_in_files",
+            super::super::source_facts::REFERENCE_NAMES_IN_FILES_SQL,
+            vec![text(r#"[["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","go",1,1,"main.go"]]"#), text(r#"["helper"]"#)],
+        ));
+        queries.push(pin(
             "go_domain_missing_members",
             super::super::go_package_context::MISSING_MEMBER_PATHS_SQL,
             vec![integer(1), integer(1)],
         ));
         queries.extend([
-            pin("python_environment_snapshot_inputs", super::super::python_unit_summaries::SNAPSHOT_INPUTS_SQL, vec![text(&"e".repeat(64)),integer(0),integer(1)]),
+            pin(
+                "python_env_select_files",
+                super::super::python_unit_summaries::SELECT_FILES,
+                vec![text(&"e".repeat(64)), integer(0), integer(1)],
+            ),
+            pin(
+                "python_env_stage_files",
+                super::super::python_unit_summaries::STAGE_FILES,
+                vec![text(&"e".repeat(64)), integer(0), integer(1)],
+            ),
+            pin(
+                "python_env_stage_roots",
+                format!(
+                    "{} {}",
+                    super::super::python_unit_summaries::stage_roots_prefix(),
+                    super::super::python_unit_summaries::STAGE_ROOT_ROW
+                ),
+                vec![integer(0), text("")],
+            ),
+            pin(
+                "python_env_stage_candidates",
+                format!(
+                    "{} {}",
+                    super::super::python_unit_summaries::stage_candidates_prefix(),
+                    super::super::python_unit_summaries::STAGE_CANDIDATE_ROW
+                ),
+                vec![
+                    text("provider"),
+                    text("file1"),
+                    text(""),
+                    integer(1),
+                    integer(0),
+                    text("module"),
+                    text("file1.py"),
+                    integer(1),
+                    integer(0),
+                    digest(0),
+                ],
+            ),
+            pin(
+                "python_env_stage_imports",
+                super::super::python_unit_summaries::STAGE_IMPORTS,
+                vec![],
+            ),
+            pin(
+                "python_env_stage_segments",
+                super::super::python_unit_summaries::STAGE_SEGMENTS,
+                vec![],
+            ),
+            pin(
+                "python_env_stage_surfaces",
+                super::super::python_unit_summaries::STAGE_SURFACES,
+                vec![],
+            ),
+            pin(
+                "python_env_stage_module_names",
+                super::super::python_unit_summaries::STAGE_MODULE_NAMES,
+                vec![],
+            ),
+            pin(
+                "python_env_stage_curated_names",
+                super::super::python_unit_summaries::STAGE_CURATED_NAMES,
+                vec![],
+            ),
+            pin(
+                "python_env_stage_wildcard_names",
+                super::super::python_unit_summaries::STAGE_WILDCARD_NAMES,
+                vec![],
+            ),
+            pin(
+                "python_env_select_route_inputs",
+                super::super::python_unit_summaries::SELECT_ROUTE_INPUTS,
+                vec![],
+            ),
+            pin(
+                "python_env_stage_route_inputs",
+                format!(
+                    "{} {}",
+                    super::super::python_unit_summaries::stage_route_inputs_prefix(),
+                    super::super::python_unit_summaries::STAGE_ROUTE_INPUT_ROW
+                ),
+                vec![
+                    text("file1.py"),
+                    integer(0),
+                    text("provider"),
+                    text("module"),
+                    integer(1),
+                ],
+            ),
+            pin(
+                "python_env_stage_routes",
+                super::super::python_unit_summaries::STAGE_ROUTES,
+                vec![],
+            ),
+            pin(
+                "python_env_stage_unplaced_routes",
+                super::super::python_unit_summaries::STAGE_UNPLACED_ROUTES,
+                vec![],
+            ),
+        ]);
+        queries.extend([
+            pin("python_environment_snapshot_inputs", super::super::python_unit_summaries::SNAPSHOT_INPUTS_SQL, vec![text(&"e".repeat(64)),integer(0),integer(1),text(&serde_json::to_string(&brokk_bifrost_python::declarations::PYTHON_CONFIGURATION_INPUT_NAMES).unwrap())]),
             pin("python_environment_source_rows", super::super::python_binding_rows::ENVIRONMENT_SOURCE_SQL, vec![text(&"e".repeat(64)),integer(0),integer(1),integer(super::super::python_binding_rows::NATIVE_SOURCE_FORMAT)]),
             pin("python_owner_member_operations", super::super::python_member_rows::OWNER_OPERATIONS_SQL, vec![integer(super::super::python_binding_rows::NATIVE_SOURCE_FORMAT),text("missing"),integer(1)]),
             pin("python_direct_member_writes", super::super::python_member_rows::DIRECT_MEMBER_WRITES_SQL, vec![integer(super::super::python_binding_rows::NATIVE_SOURCE_FORMAT),text("missing"),integer(1),integer(super::super::resolution_prepare::resolution_rows::code(brokk_bifrost_core::analyzer::resolution_facts::ALL_BINDING_PROJECTION_KINDS,brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind::TargetCallableResultType))]),
@@ -1554,8 +1700,8 @@ pub mod pinned_plans {
             vec![integer(1), text("[1,2,3]")],
         ));
         queries.push(pin(
-            "jvm_import_token_metadata",
-            jvm_context::JVM_IMPORT_TOKEN_METADATA,
+            "import_token_metadata",
+            super::super::resolution_operation::imports::IMPORT_TOKEN_METADATA,
             vec![
                 integer(1),
                 integer(1001),
@@ -1566,7 +1712,7 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "jvm_native_import_selector",
-            super::super::resolution_operation::jvm_context::SELECTED_IMPORT_SELECTOR,
+            super::super::resolution_operation::imports::SELECTED_IMPORT_SELECTOR,
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
@@ -2604,6 +2750,11 @@ pub mod pinned_plans {
                 text("gradle.properties"),
                 integer(1),
             ],
+        ));
+        queries.push(pin(
+            "csharp_compilation_metadata",
+            super::super::csharp_compilation::COMPILATION_METADATA_SQL,
+            vec![integer(1), text("Proj2/Proj2.csproj")],
         ));
         queries.push(pin(
             "csharp_selected_set",
@@ -3790,12 +3941,13 @@ pub mod tests {
                             .collect::<rusqlite::Result<Vec<_>>>()
                             .unwrap()
                             .len();
-                        // Each blob has 86 prefix and 85 Any observations.
+                        // Each blob has 86 prefix observations. Any-name observations
+                        // do not nominate targets.
                         // An exact name additionally matches when its written
                         // fixture key is divisible by three.
                         let operation_count = if pin_name == "python_reverse_candidates" && lexical
                         {
-                            width * 171
+                            width * 86
                                 + (0..width)
                                     .filter(|ordinal| (ordinal / 16 + 1) % 3 == 0)
                                     .count()
@@ -4463,6 +4615,42 @@ pub mod tests {
             };
             println!("{record}");
         }
+        // Optional operator-supplied statements use concrete values from this
+        // store. They cover readers outside the pinned registry in a schema
+        // comparison without adding one-off production query registrations.
+        if let Some(path) = std::env::var_os("BIFROST_3016_EXTRA_QUERIES") {
+            let queries: Vec<(String, String, Vec<serde_json::Value>)> = serde_json::from_reader(
+                std::fs::File::open(&path).unwrap_or_else(|error| {
+                    panic!("open extra operator queries {path:?}: {error}")
+                }),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "extra queries in {path:?} are JSON [name, SQL, parameters] triples: {error}"
+                )
+            });
+            for (name, sql, parameters) in queries {
+                let parameters = parameters
+                    .into_iter()
+                    .map(|value| match value {
+                        serde_json::Value::Null => rusqlite::types::Value::Null,
+                        serde_json::Value::String(value) => rusqlite::types::Value::Text(value),
+                        serde_json::Value::Number(number) => {
+                            rusqlite::types::Value::Integer(number.as_i64().unwrap_or_else(|| {
+                                panic!("operator query {name}: parameter {number} is not an i64")
+                            }))
+                        }
+                        value => panic!("operator query {name}: unsupported parameter {value:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                let record = match super::pinned_plans::plan_rows_for_sql(&conn, &sql, &parameters)
+                {
+                    Ok(plan) => serde_json::json!({"pin": name, "plan": plan}),
+                    Err(error) => serde_json::json!({"pin": name, "error": error}),
+                };
+                println!("{record}");
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4541,6 +4729,69 @@ pub mod tests {
                     "AUTOMATIC",
                     "TEMP B-TREE",
                 ],
+            );
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn rust_receiver_impl_targets_seek_subject_and_trait_in_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("rust_receiver_impl_targets"));
+            eprintln!("Rust receiver impl Targets {state}: {plan:?}");
+            for required in [
+                "SEARCH owner_mount USING PRIMARY KEY (mount_ordinal=?)",
+                "resolution_unit_summary_members_blob (blob_id=?)",
+                "rust_resolution_unit_summary_exports_declaration (summary_id=? AND declaration_member_ordinal=? AND declaration_site=? AND namespace=?)",
+                "rust_resolution_unit_summary_trait_endpoints_target (target_unit_key=? AND target_module_path=? AND target_identity_id=?)",
+                "SEARCH trait USING PRIMARY KEY (summary_id=? AND member_ordinal=? AND owner_module_path=? AND source_relation_key=? AND endpoint_role=?)",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(required)),
+                    "{state} Rust receiver impl lookup must {required}: {plan:?}"
+                );
+            }
+            assert!(
+                plan.iter()
+                    .all(|row| !row.starts_with("SCAN ") && !row.contains("AUTOMATIC")),
+                "{state} Rust receiver impl lookup must not scan tables or build automatic indexes: {plan:?}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn rust_receiver_kind_seeks_each_declaration_key_in_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            let plan = explain_pin(&conn, &pinned("rust_receiver_kind"));
+            for required in [
+                "SEARCH mount USING PRIMARY KEY (mount_ordinal=?)",
+                "SEARCH semantic USING INDEX sqlite_autoindex_resolution_semantic_sites_2 (blob_id=? AND semantic_role=? AND semantic_key=?)",
+                "SEARCH native USING PRIMARY KEY (blob_id=? AND source_site=?)",
+                "SEARCH property USING PRIMARY KEY (blob_id=? AND declaration_id=?)",
+            ] {
+                assert!(
+                    plan.iter().any(|row| row.contains(required)),
+                    "{state} Rust receiver-kind lookup must {required}: {plan:?}"
+                );
+            }
+            assert!(
+                plan.iter().all(|row| !row.starts_with("SCAN ")),
+                "{state} Rust receiver-kind lookup must not scan tables: {plan:?}"
             );
         }
     }
@@ -5085,7 +5336,7 @@ pub mod tests {
             }
             for name in [
                 "jvm_preparation_supertype_membership",
-                "jvm_import_token_metadata",
+                "import_token_metadata",
             ] {
                 let plan = explain_pin(&conn, &pinned(name));
                 let required = if name == "jvm_preparation_supertype_membership" {
@@ -6226,9 +6477,14 @@ pub mod tests {
                 for ordinal in 1..=16 {
                     let oid = format!("{ordinal:040x}");
                     conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,'python',0,?2,?3,?4,1)", rusqlite::params![workspace,format!("pkg{ordinal}/model.py"),oid,"0".repeat(64)]).unwrap();
-                    conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,input_kind,valid_from) VALUES(?1,'python',0,?2,?3,'configuration',1)", rusqlite::params![workspace,format!("pkg{ordinal}/pyproject.toml"),oid]).unwrap();
+                    for name in brokk_bifrost_python::declarations::PYTHON_CONFIGURATION_INPUT_NAMES.into_iter().chain(["x_init__.py"]) {
+                        conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,input_kind,valid_from) VALUES(?1,'python',0,?2,?3,'configuration',1)", rusqlite::params![workspace,format!("pkg{ordinal}/{name}"),oid]).unwrap();
+                    }
                     conn.execute("INSERT OR IGNORE INTO workspace_input_sources VALUES(?1,?2)", rusqlite::params![oid,b"[tool.setuptools.packages.find]\nwhere = ['.']\n".as_slice()]).unwrap();
                 }
+                let runtime_oid = "f".repeat(40);
+                conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,input_kind,valid_from) VALUES(?1,'python',0,'.bifrost/python-runtime-selection.json',?2,'configuration',1)", rusqlite::params![workspace,runtime_oid]).unwrap();
+                conn.execute("INSERT OR IGNORE INTO workspace_input_sources VALUES(?1,?2)", rusqlite::params![runtime_oid,br#"{"version":1}"#.as_slice()]).unwrap();
             }
             let query = pinned("python_environment_snapshot_inputs");
             let mut plans = Vec::new();
@@ -6238,8 +6494,9 @@ pub mod tests {
                 eprintln!("{state} {}: {plan:#?}", query.name);
                 let mut statement = conn.prepare(&query.sql).unwrap();
                 let rows = statement.query_map(rusqlite::params_from_iter(&query.params), |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<Vec<u8>>>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-                assert_eq!(rows.len(),32,"{state}: source and configuration partitions must both run: {rows:?}");
-                assert_eq!(rows.iter().filter(|(_,kind,bytes)|kind == "configuration" && bytes.is_some()).count(),16,"{state}: selected configuration bytes must be read: {rows:?}");
+                assert_eq!(rows.len(),64,"{state}: source and configuration partitions must both run: {rows:?}");
+                assert_eq!(rows.iter().filter(|(_,kind,bytes)|kind == "configuration" && bytes.is_some()).count(),48,"{state}: selected configuration bytes must be read: {rows:?}");
+                assert!(rows.iter().filter(|(_,kind,_)| kind == "configuration").all(|(path,_,_)| brokk_bifrost_python::declarations::PYTHON_CONFIGURATION_INPUT_NAMES.contains(&std::path::Path::new(path).file_name().unwrap().to_str().unwrap())), "{state}: only the shared configuration names may be selected: {rows:?}");
                 plans.push((state,plan));
             }
             // Record both plans before checking properties, so a failure shows
@@ -6290,6 +6547,73 @@ pub mod tests {
                 let rows = statement.query_map(rusqlite::params_from_iter(query.params.iter()), |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
                 assert_eq!(rows.len(), 96, "{state}: every child arm must run for all 16 selected files");
                 environment_plans.push((state, plan));
+                conn.execute_batch("UPDATE python_binding_source SET export_curated=1,export_wildcard=1; DELETE FROM temp.py_env_route_inputs; DELETE FROM temp.py_env_routes; DELETE FROM temp.py_env_names; DELETE FROM temp.py_env_surfaces; DELETE FROM temp.py_env_segments; DELETE FROM temp.py_env_imports; DELETE FROM temp.py_env_candidates; DELETE FROM temp.py_env_roots; DELETE FROM temp.py_env_files;").unwrap();
+                for name in ["python_env_select_files","python_env_stage_files","python_env_stage_roots","python_env_stage_candidates","python_env_stage_imports","python_env_stage_segments","python_env_stage_surfaces","python_env_stage_module_names","python_env_stage_curated_names","python_env_stage_wildcard_names","python_env_select_route_inputs","python_env_stage_route_inputs","python_env_stage_routes","python_env_stage_unplaced_routes"] {
+                    let query = pinned(name);
+                    let plan = explain_pin(conn, &query);
+                    eprintln!("{state} {name}: {plan:#?}");
+                    assert!(plan.iter().all(|step| !step.contains("AUTOMATIC") && !["f", "b", "s", "i", "slots", "e", "op", "reset", "providers", "roots", "segments", "target", "provider", "imports", "names"].iter().any(|alias| {
+                        // f/slots are selected TEMP inputs in fact staging. Only
+                        // persistent tables must always be sought by their keys.
+                        let base_alias = match *alias {
+                            "f" => matches!(name, "python_env_select_files" | "python_env_stage_files" | "python_env_stage_curated_names"),
+                            "imports" => name == "python_env_stage_routes",
+                            _ => true,
+                        };
+                        base_alias && (step == &format!("SCAN {alias}") || step.starts_with(&format!("SCAN {alias} ")))
+                    })), "{state} {name}: populated persistent facts must be sought: {plan:#?}");
+                    let mut statement = conn.prepare(&query.sql).unwrap();
+                    statement.reset_status(rusqlite::StatementStatus::RePrepare);
+                    let mut rows = statement.query(rusqlite::params_from_iter(&query.params)).unwrap();
+                    while rows.next().unwrap().is_some() {}
+                    drop(rows);
+                    // These run once on the writer, outside the retained-reader
+                    // QPSG scope. STAT4 may reprepare once at the initial snapshot
+                    // bind; no statement is rebound for individual source rows.
+                    let reprepares = statement.get_status(rusqlite::StatementStatus::RePrepare);
+                    eprintln!("{state} {name}: reprepares={reprepares}");
+                    let maximum = i32::from(matches!(name, "python_env_select_files" | "python_env_stage_files"));
+                    assert!(reprepares <= maximum, "{state} {name}: per-set initial binding, never per-row reprepare: {reprepares}");
+                }
+                // The one-row pins above also seed the following relational
+                // pins. Exercise both larger row_batch shapes without changing
+                // that fixture, including typed BLOB provider digests.
+                for (name, prefix, row_sql) in [
+                    ("python_env_stage_roots", super::super::python_unit_summaries::stage_roots_prefix(), super::super::python_unit_summaries::STAGE_ROOT_ROW),
+                    ("python_env_stage_candidates", super::super::python_unit_summaries::stage_candidates_prefix(), super::super::python_unit_summaries::STAGE_CANDIDATE_ROW),
+                    ("python_env_stage_route_inputs", super::super::python_unit_summaries::stage_route_inputs_prefix(), super::super::python_unit_summaries::STAGE_ROUTE_INPUT_ROW),
+                ] {
+                    let query = pinned(name);
+                    for width in [8, 64] {
+                        conn.execute_batch("SAVEPOINT python_environment_batch_pin").unwrap();
+                        let sql = format!("{prefix} {}", vec![row_sql; width].join(", "));
+                        let values = (0..width).flat_map(|index| {
+                            let mut values = query.params.clone();
+                            if name == "python_env_stage_route_inputs" {
+                                // The fixture's single context occupies site 0.
+                                values[1] = rusqlite::types::Value::Integer(index as i64 + 1);
+                            }
+                            values
+                        }).collect::<Vec<_>>();
+                        let mut statement = conn.prepare(&sql).unwrap();
+                        statement.reset_status(rusqlite::StatementStatus::RePrepare);
+                        statement.execute(rusqlite::params_from_iter(&values)).unwrap();
+                        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) > 0);
+                        let reprepares = statement.get_status(rusqlite::StatementStatus::RePrepare);
+                        assert_eq!(reprepares, 0, "{state} {name} rows={width}");
+                        eprintln!("{state} {name}: rows={width} reprepares={reprepares}");
+                        drop(statement);
+                        conn.execute_batch("ROLLBACK TO python_environment_batch_pin; RELEASE python_environment_batch_pin").unwrap();
+                    }
+                }
+                assert_eq!(conn.query_row("SELECT count(*) FROM temp.py_env_files", [], |r| r.get::<_,i64>(0)).unwrap(), 16);
+                assert_eq!(conn.query_row("SELECT count(*) FROM temp.py_env_imports", [], |r| r.get::<_,i64>(0)).unwrap(), 16);
+                assert_eq!(conn.query_row("SELECT count(*) FROM temp.py_env_routes", [], |r| r.get::<_,i64>(0)).unwrap(), 16);
+                assert_eq!(conn.query_row("SELECT count(*) FROM temp.py_env_names WHERE surface='curated'", [], |r| r.get::<_,i64>(0)).unwrap(), 16);
+
+                // Restore the shared source fixture before the member-operation
+                // pins and the next statistics state read its original policies.
+                conn.execute_batch("UPDATE python_binding_source SET export_curated=0,export_wildcard=0").unwrap();
 
                 for (name,index) in [("python_member_operations_inventory","python_member_operations_inventory"),("python_member_operation_names_lookup","python_member_operation_names_spelling")] {
                     let plan=explain_pin(conn,&pinned(name));
@@ -6494,6 +6818,109 @@ pub mod tests {
                     "{state} {name}: fixture probe must execute"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn go_package_member_sources_seek_selected_variants() {
+        let store = AnalyzerStore::open_ephemeral().expect("Go member planner store");
+        let conn = store.conn.lock().expect("store mutex");
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .unwrap();
+        prepare_pin_context(&conn);
+        // A path-keyed source probe must stay selective among other packages.
+        // The same production file also belongs to an internal test variant.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        for id in 1..=256_i64 {
+            let path = format!("pkg/{id}/main.go");
+            conn.execute("INSERT INTO workspace_file_versions(file_version_id,workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,?2,'go',1,?3,?4,?5,1)", rusqlite::params![id, "a".repeat(64), path, "b".repeat(40), "c".repeat(64)]).unwrap();
+            conn.execute("INSERT INTO go_package_instances(package_id,context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key) VALUES(?1,1,?2,'main','',?2,?3,1,jsonb('[]'),?3)", rusqlite::params![id,path,[1_u8;32]]).unwrap();
+            conn.execute(
+                "INSERT INTO go_package_files VALUES(?1,'go',?2)",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO go_context_publications VALUES(1,1,?1,'go',1,1,NULL,?2,?2,1,jsonb('[]'))",
+            rusqlite::params!["a".repeat(64), [1_u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO temp.selected_workspace_revisions VALUES(?1,'go',1,1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO temp.selected_resolution_mounts(mount_ordinal,file_version_id,semantic_language) VALUES(0,1,'go')", []).unwrap();
+        conn.execute("INSERT INTO go_package_instances(package_id,context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key) VALUES(257,1,'pkg/1 [pkg/1.test]','main','pkg/1','pkg/1',?1,1,jsonb('[]'),?1)", [[1_u8;32]]).unwrap();
+        conn.execute("INSERT INTO go_package_files VALUES(257,'go','pkg/1/main.go'),(257,'test','pkg/1/other_test.go')", []).unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let query = pinned("go_domain_package_member_sources");
+            let plan = explain_pin(&conn, &query);
+            eprintln!("{state} selected variant: {plan:?}");
+            let membership = pinned("go_domain_caller_context_publishes_file");
+            let membership_plan = explain_pin(&conn, &membership);
+            eprintln!("{state} caller context membership: {membership_plan:?}");
+            assert!(
+                membership_plan.iter().any(|line| line
+                    .contains("SEARCH source USING COVERING INDEX idx_go_package_files_file_role")
+                    && line.contains("rel_path=?")),
+                "{state}: {membership_plan:?}"
+            );
+            assert!(
+                membership_plan.iter().any(|line| {
+                    line.starts_with("SEARCH package USING")
+                        && !line.contains("AUTOMATIC")
+                        && (line.contains("INTEGER PRIMARY KEY")
+                            || line.contains("context_id=? AND package_id=?"))
+                }),
+                "{state}: {membership_plan:?}"
+            );
+
+            let rows = conn
+                .prepare(&query.sql)
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(query.params.iter()), |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![Some(0)],
+                "{state}: only the active production variant"
+            );
+
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("SEARCH package USING INTEGER PRIMARY KEY")),
+                "{state}: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("SEARCH member USING")
+                        && line.contains("package_id=?")),
+                "{state}: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("SEARCH active USING")
+                        && line.contains("package_id=?")),
+                "{state}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| (line.contains("AUTOMATIC")
+                    && (line.contains(" member ")
+                        || line.contains(" package ")
+                        || line.contains(" active ")))
+                    || line.starts_with("SCAN member")
+                    || line.starts_with("SCAN package")
+                    || line.starts_with("SCAN active")),
+                "{state}: {plan:?}"
+            );
         }
     }
 

@@ -621,6 +621,14 @@ pub struct CodeQueryMemberFamily {
     /// Why the outcome is not `proven`. A proven family states none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// The unread supertype names responsible for the ancestor gap.
+    pub unread_ancestors: Vec<String>,
+    pub ancestor_coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ancestor_reason: Option<&'static str>,
+    pub descendant_coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub descendant_reason: Option<&'static str>,
     /// The measured strength of the analyzer's member-identity evidence for
     /// this member's language.
     pub capability: &'static str,
@@ -641,7 +649,7 @@ pub struct CodeQueryMemberFamily {
     pub overridden_by_count: usize,
     pub implemented_by_count: usize,
     pub edge_count: usize,
-    /// How many exact roots the family id digested.
+    /// How many roots the walk established; an incomplete family has no id.
     pub root_count: usize,
 }
 
@@ -686,13 +694,11 @@ pub struct CodeQueryMemberFamilyEdge {
     /// when only the recorded parameter-type spellings separated an overload
     /// set: a spelling is not a resolved or erased type.
     pub proof: &'static str,
-    /// `complete`. An edge row is only ever emitted from a fully enumerated
-    /// family, because a truncated walk reports `incomplete` and no edges. The
-    /// axis is published anyway so a policy reads one proof/completeness
-    /// vocabulary across the dispatch and family row families.
+    /// `complete`: this edge is established even when the family's coverage
+    /// is open. Completeness of the edge does not close the family's edge set.
     pub completeness: &'static str,
-    /// The owning member's family coverage, repeated on the edge so an edge
-    /// row alone is enough to reject an exact-set claim.
+    /// Coverage of this edge's direction: ancestors for overrides/implements,
+    /// descendants for overridden_by/implemented_by.
     pub coverage: &'static str,
 }
 
@@ -1980,6 +1986,18 @@ pub struct CodeQueryDecoratedParameter {
     pub annotation_type: Option<Box<CodeQueryDeclaration>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation_status: Option<crate::analyzer::JavaAnnotationTypeStatus>,
+    /// Qualified name of the resolved Java annotation type. It is present for
+    /// a source declaration and for a type an import or qualified name spells
+    /// without an indexed declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_fq_name: Option<String>,
+    /// The type-name tier that decided `annotation_fq_name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_route: Option<crate::analyzer::JavaAnnotationTypeRoute>,
+    /// The external declaration of a route-resolved annotation, when a jar or
+    /// semantic pack indexes it. Its kind was checked to be an annotation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_artifact: Option<crate::analyzer::JavaAnnotationArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -37,7 +37,7 @@ use super::typed_fact_lowering::{
     LoweredDeclaredTypeArgument, LoweredDefinitionPropertyGap, LoweredGenericFormal,
     LoweredGenericFormalDefault, LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed,
     LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
-    LoweredSupertypeProperty, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeTransfer,
+    LoweredSourceSupertypeProperty, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeTransfer,
     LoweredTypedFragment, LoweredTypedFrontier, LoweredUnderlyingType,
 };
 
@@ -470,7 +470,7 @@ pub(super) fn remount_site_metadata(
         metadata
             .reference_owner()
             .map(|owner| owner.map(|semantic| translation.semantic(semantic))),
-        metadata.callable_receiver_origin(),
+        metadata.receiver_origin(),
     )
     .with_go_spelling_namespace(metadata.go_spelling_namespace())
     .with_go_package_qualifier(metadata.go_package_qualifier())
@@ -1268,10 +1268,10 @@ pub(super) fn remount_construction_requirement(
 }
 
 pub(super) fn remount_supertype(
-    property: &LoweredSupertypeProperty,
+    property: &LoweredSourceSupertypeProperty,
     translation: &impl ResolutionIdentityTranslation,
-) -> LoweredSupertypeProperty {
-    LoweredSupertypeProperty::new(
+) -> LoweredSourceSupertypeProperty {
+    LoweredSourceSupertypeProperty::new(
         translation.semantic(property.definition()),
         translation.semantic(property.reference()),
         translation.semantic(property.frontier()),

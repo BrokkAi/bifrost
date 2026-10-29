@@ -90,8 +90,6 @@ use brokk_bifrost_csharp::graph::resolver::member_declared_type_fq_name_in_sessi
 
 use brokk_bifrost_csharp::graph::resolver::method_return_type_fq_name_for_arity_in_session as csharp_method_return_type_fq_name_for_arity_in_session;
 
-use brokk_bifrost_csharp::graph::resolver::resolve_type_fq_name as csharp_resolve_type_fq_name;
-
 use crate::analyzer::usages::csharp_graph::csharp_visible_extension_method_candidates_in_session;
 
 use brokk_bifrost_csharp::graph::resolver::seed_bindings_before_in_session as seed_csharp_bindings_before_in_session;
@@ -153,7 +151,7 @@ pub(crate) struct CSharpDefinitionProvider<'a> {
     /// holding the reference being resolved. Every declaration this provider
     /// returns, and every lookup of the shared usage resolver it calls, is
     /// held to that one rule.
-    scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource,
+    scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource<'a>,
 }
 
 impl<'a> CSharpDefinitionProvider<'a> {
@@ -165,8 +163,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
             parent_answers: RefCell::default(),
             unproven_types: RefCell::default(),
             scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
-                graph_support::CSharpSource::shared_source(csharp),
-                reference,
+                csharp, reference,
             ),
         }
     }
@@ -183,8 +180,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
             parent_answers: RefCell::default(),
             unproven_types: RefCell::default(),
             scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
-                graph_support::CSharpSource::shared_source(csharp),
-                reference,
+                csharp, reference,
             ),
         }
     }
@@ -1407,8 +1403,9 @@ fn resolve_csharp_reference(
                 csharp,
                 definitions,
                 file,
+                source,
+                type_node,
                 &reference,
-                type_node.start_byte(),
             )
         }
         Some(CSharpReferenceNode::Constructor(creation)) => {
@@ -1758,8 +1755,9 @@ fn resolve_csharp_reference(
                     csharp,
                     definitions,
                     file,
+                    source,
+                    identifier,
                     &reference,
-                    identifier.start_byte(),
                 );
             }
             if !bindings.is_shadowed(text) {
@@ -1809,8 +1807,9 @@ fn resolve_csharp_reference(
                     csharp,
                     definitions,
                     file,
+                    source,
+                    identifier,
                     text,
-                    identifier.start_byte(),
                 );
                 if outcome.status != DefinitionLookupStatus::NoDefinition {
                     return outcome;
@@ -1911,12 +1910,15 @@ fn csharp_structured_receiver_type_names(
                     // workspace generation, so it is taken as the answer rather
                     // than re-fed to the visible-name lookup ladder (#1842).
                     CSharpDeclaredType::Resolved { fqn } => names.push(fqn.clone()),
+                    // The binding was declared earlier in this body, inside
+                    // the receiver's namespace scopes.
                     CSharpDeclaredType::Spelling(spelling) => {
                         names.extend(csharp_structured_receiver_reference_type_names(
-                            csharp,
                             token,
                             definitions,
                             file,
+                            source,
+                            receiver,
                             spelling,
                         ));
                     }
@@ -1936,35 +1938,37 @@ fn csharp_structured_receiver_type_names(
         return Vec::new();
     };
     csharp_structured_receiver_reference_type_names(
-        csharp,
         token,
         definitions,
         file,
+        source,
+        type_node,
         &csharp_reference_type_text(type_node, source),
     )
 }
 
+/// The type identities `reference`, written at `site`, can name: the one
+/// visible declaration when the site's lookup proves it, otherwise the
+/// spellings an external surface may answer.
 fn csharp_structured_receiver_reference_type_names(
-    csharp: &CSharpAnalyzer,
     token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
     reference: &str,
 ) -> Vec<String> {
     let reference = csharp_arity_preserving_full_name(reference);
     if reference.is_empty() {
         return Vec::new();
     }
-    if definitions.session().is_some() {
-        let mut candidates =
-            csharp_logical_visible_type_candidates(csharp, token, definitions, file, &reference);
-        if candidates.len() == 1 {
-            return vec![candidates.remove(0).fq_name()];
-        }
-    } else if let Some(resolved) =
-        csharp_resolve_type_fq_name(definitions.source(), token, file, &reference)
-    {
-        return vec![resolved];
+    if let Some(canonical) = csharp_canonical_builtin_type_identity(&reference) {
+        return vec![canonical.to_string()];
+    }
+    let mut candidates =
+        csharp_logical_visible_type_candidates(definitions, file, source, site, &reference);
+    if candidates.len() == 1 {
+        return vec![candidates.remove(0).fq_name()];
     }
 
     let aliases = definitions.using_aliases(token, file);
@@ -2034,7 +2038,7 @@ fn csharp_type_lookup_node_resolution(
         let reference = csharp_type_node_identity(node, source);
         return csharp_type_candidates_resolution_with_kind(
             &reference,
-            csharp_visible_type_output_candidates(csharp, token, definitions, file, &reference),
+            csharp_visible_type_output_candidates(definitions, file, source, node, &reference),
             TypeLookupTargetKind::TypeReference,
             false,
         );
@@ -2074,7 +2078,7 @@ fn csharp_type_lookup_node_resolution(
             });
         }
         let candidates =
-            csharp_visible_type_output_candidates(csharp, token, definitions, file, &reference);
+            csharp_visible_type_output_candidates(definitions, file, source, node, &reference);
         return csharp_type_candidates_resolution_with_kind(
             &reference,
             candidates,
@@ -2084,10 +2088,11 @@ fn csharp_type_lookup_node_resolution(
         .or_else(|| {
             csharp_external_type_resolution(
                 csharp_structured_receiver_reference_type_names(
-                    csharp,
                     token,
                     definitions,
                     file,
+                    source,
+                    node,
                     &reference,
                 ),
                 TypeLookupTargetKind::TypeReference,
@@ -2236,7 +2241,7 @@ fn csharp_receiver_type_lookup_units(
             return (member_candidates, TypeLookupTargetKind::ValueExpression);
         }
         return (
-            csharp_logical_visible_type_candidates(csharp, token, definitions, file, name),
+            csharp_logical_visible_type_candidates(definitions, file, source, receiver, name),
             TypeLookupTargetKind::TypeReference,
         );
     }
@@ -2278,13 +2283,7 @@ fn csharp_declaration_name_type_resolution(
     match parent.kind() {
         "parameter" if parent.child_by_field_name("name") == Some(name) => {
             parent.child_by_field_name("type").and_then(|type_node| {
-                csharp_type_node_resolution(
-                    csharp,
-                    token,
-                    definitions,
-                    file,
-                    &csharp_reference_type_text(type_node, source),
-                )
+                csharp_type_node_resolution(definitions, file, source, type_node)
             })
         }
         "variable_declarator" if parent.child_by_field_name("name") == Some(name) => {
@@ -2293,13 +2292,7 @@ fn csharp_declaration_name_type_resolution(
                     .then(|| declaration.child_by_field_name("type"))
                     .flatten()
                     .and_then(|type_node| {
-                        csharp_type_node_resolution(
-                            csharp,
-                            token,
-                            definitions,
-                            file,
-                            &csharp_reference_type_text(type_node, source),
-                        )
+                        csharp_type_node_resolution(definitions, file, source, type_node)
                     })
             })
         }
@@ -2357,21 +2350,20 @@ fn csharp_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool
 }
 
 fn csharp_type_node_resolution(
-    csharp: &CSharpAnalyzer,
-    token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
-    reference: &str,
+    source: &str,
+    type_node: Node<'_>,
 ) -> Option<CSharpTypeLookupResolution> {
-    if csharp_is_dynamic_type_reference(reference) {
+    let reference = csharp_reference_type_text(type_node, source);
+    if csharp_is_dynamic_type_reference(&reference) {
         return Some(CSharpTypeLookupResolution::Dynamic {
             target_kind: TypeLookupTargetKind::ValueExpression,
         });
     }
-    csharp_type_candidates_resolution(
-        reference,
-        csharp_visible_type_output_candidates(csharp, token, definitions, file, reference),
-    )
+    let candidates =
+        csharp_visible_type_output_candidates(definitions, file, source, type_node, &reference);
+    csharp_type_candidates_resolution(&reference, candidates)
 }
 
 fn csharp_type_candidates_resolution(
@@ -3402,12 +3394,12 @@ fn csharp_external_constructor_target(
     let reference = csharp_reference_type_text(type_node, source);
     let candidate_owners = csharp_external_constructor_owner_names(
         analyzer,
-        csharp,
         token,
         definitions,
         file,
+        source,
+        type_node,
         &reference,
-        type_node.start_byte(),
     );
     if candidate_owners.is_empty() {
         return None;
@@ -3431,13 +3423,14 @@ fn csharp_external_constructor_target(
 #[allow(clippy::too_many_arguments)]
 fn csharp_external_constructor_owner_names(
     analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
     token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
     reference: &str,
-    byte: usize,
 ) -> Vec<String> {
+    let byte = site.start_byte();
     let reference = csharp_normalize_full_name(reference);
     if reference.is_empty() {
         return Vec::new();
@@ -3464,7 +3457,7 @@ fn csharp_external_constructor_owner_names(
         {
             return Vec::new();
         }
-    } else if !csharp_logical_visible_type_candidates(csharp, token, definitions, file, &reference)
+    } else if !csharp_logical_visible_type_candidates(definitions, file, source, site, &reference)
         .is_empty()
     {
         return Vec::new();
@@ -3641,8 +3634,9 @@ fn resolve_csharp_constructor(
             csharp,
             definitions,
             file,
+            source,
+            type_node,
             &reference,
-            type_node.start_byte(),
         );
     }
     if let Some((owner, member, _parameter_count)) = csharp_external_constructor_target(
@@ -3657,7 +3651,7 @@ fn resolve_csharp_constructor(
         return csharp_external_constructor_outcome(file, creation, owner, member);
     }
     let owners =
-        csharp_logical_visible_type_candidates(csharp, token, definitions, file, &reference);
+        csharp_logical_visible_type_candidates(definitions, file, source, type_node, &reference);
     let call_arity = csharp_argument_count(creation, source);
     let mut constructors = Vec::new();
     let mut applicable = Vec::new();
@@ -3731,8 +3725,9 @@ fn resolve_csharp_constructor(
         csharp,
         definitions,
         file,
+        source,
+        type_node,
         &reference,
-        type_node.start_byte(),
     )
 }
 
@@ -3765,17 +3760,20 @@ fn csharp_indexed_non_type_outcome(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn csharp_type_outcome(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
     reference: &str,
-    byte: usize,
 ) -> DefinitionLookupOutcome {
+    let byte = site.start_byte();
     let mut candidates =
-        csharp_visible_type_output_candidates(csharp, token, definitions, file, reference);
+        csharp_visible_type_output_candidates(definitions, file, source, site, reference);
     if candidates.is_empty() {
         candidates = definitions.fqn(reference);
     }
@@ -3798,6 +3796,14 @@ fn csharp_type_outcome(
         byte,
     ) {
         return candidates_outcome(vec![unit]);
+    }
+    if let Some(reason) =
+        csharp.type_forward_boundary(analyzer.semantic_model_overlay(), token, file, reference)
+    {
+        return boundary_unchecked(
+            reason,
+            UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Type),
+        );
     }
     // `csharp_import_boundary_for_type` fuses the unresolved-using signal with
     // the workspace type/namespace check; its negation is the workspace gate.
@@ -4671,11 +4677,11 @@ impl CSharpInitializerOwnerLookups for CSharpForwardInitializerOwnerLookups<'_, 
         csharp_constructed_type_candidates(
             self.analyzer,
             self.token,
-            self.csharp,
             self.definitions,
             self.file,
+            self.source,
+            type_node,
             reference,
-            type_node.start_byte(),
         )
     }
 
@@ -4927,11 +4933,11 @@ fn csharp_collection_element_owner_types(
         let mut owners = csharp_constructed_type_candidates(
             analyzer,
             token,
-            csharp,
             definitions,
             file,
+            source,
+            type_node,
             &type_name,
-            type_node.start_byte(),
         );
         sort_units(&mut owners);
         owners.dedup();
@@ -4977,16 +4983,17 @@ fn csharp_collection_element_owner_types(
 /// and the `Type` reference branch above it): a type nested in an enclosing
 /// class first, because C# looks there before the namespace and `using`
 /// scopes, then the lexically enclosing scopes, then the scope-blind visible
-/// walk, and finally the reference read as a fully qualified name.
+/// walk at the site, and finally the reference read as a fully qualified name.
 fn csharp_constructed_type_candidates(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
     reference: &str,
-    byte: usize,
 ) -> Vec<CodeUnit> {
+    let byte = site.start_byte();
     if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
         analyzer,
         token,
@@ -5008,7 +5015,7 @@ fn csharp_constructed_type_candidates(
         return vec![unit];
     }
     let candidates =
-        csharp_logical_visible_type_candidates(csharp, token, definitions, file, reference);
+        csharp_logical_visible_type_candidates(definitions, file, source, site, reference);
     if !candidates.is_empty() {
         return candidates;
     }
@@ -5519,10 +5526,10 @@ fn csharp_receiver_types(
         }
         let expression_type = csharp_reference_type_text(receiver, source);
         let direct_types = csharp_logical_visible_type_candidates(
-            csharp,
-            token,
             definitions,
             file,
+            source,
+            receiver,
             &expression_type,
         );
         if !direct_types.is_empty() {
@@ -5538,10 +5545,10 @@ fn csharp_receiver_types(
             };
             let type_name = csharp_reference_type_text(*expression, source);
             let candidates = csharp_logical_visible_type_candidates(
-                csharp,
-                token,
                 definitions,
                 file,
+                source,
+                *expression,
                 &type_name,
             );
             if !candidates.is_empty() {
@@ -5599,7 +5606,6 @@ fn csharp_apply_receiver_transitions(
                 csharp_invocation_return_types(
                     analyzer,
                     token,
-                    csharp,
                     definitions,
                     file,
                     source,
@@ -5676,10 +5682,10 @@ fn csharp_receiver_base_types(
                 if receiver_types.units.is_empty() && receiver_types.fq_names.is_empty() {
                     receiver_types =
                         CSharpReceiverTypes::from_units(csharp_logical_visible_type_candidates(
-                            csharp,
-                            token,
                             definitions,
                             file,
+                            source,
+                            receiver,
                             name,
                         ));
                 }
@@ -5706,10 +5712,10 @@ fn csharp_receiver_base_types(
         ),
         "qualified_name" | "alias_qualified_name" | "generic_name" => {
             CSharpReceiverTypes::from_units(csharp_logical_visible_type_candidates(
-                csharp,
-                token,
                 definitions,
                 file,
+                source,
+                receiver,
                 &csharp_reference_type_text(receiver, source),
             ))
         }
@@ -5735,10 +5741,10 @@ fn csharp_receiver_base_types(
                 .child_by_field_name("type")
                 .map(|type_node| {
                     csharp_logical_visible_type_candidates(
-                        csharp,
-                        token,
                         definitions,
                         file,
+                        source,
+                        type_node,
                         &csharp_reference_type_text(type_node, source),
                     )
                 })
@@ -5753,10 +5759,10 @@ fn csharp_receiver_base_types(
                 })
                 .map(|type_node| {
                     csharp_logical_visible_type_candidates(
-                        csharp,
-                        token,
                         definitions,
                         file,
+                        source,
+                        type_node,
                         &csharp_reference_type_text(type_node, source),
                     )
                 })
@@ -5844,7 +5850,14 @@ fn csharp_unindexed_type_qualifier_names(
             return Vec::new();
         }
     }
-    csharp_structured_receiver_reference_type_names(csharp, token, definitions, file, name)
+    csharp_structured_receiver_reference_type_names(
+        token,
+        definitions,
+        file,
+        source,
+        receiver,
+        name,
+    )
 }
 
 fn canonical_csharp_predefined_type(reference: &str) -> Option<&'static str> {
@@ -5935,7 +5948,6 @@ fn csharp_nearest_member_types(
 fn csharp_invocation_return_types(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5953,14 +5965,8 @@ fn csharp_invocation_return_types(
     if receiver_types.fq_names.is_empty() || method.is_empty() {
         return CSharpReceiverTypes::default();
     }
-    let explicit_type_arguments = csharp_resolved_type_arguments(
-        csharp,
-        token,
-        definitions,
-        file,
-        source,
-        name.type_arguments,
-    );
+    let explicit_type_arguments =
+        csharp_resolved_type_arguments(definitions, file, source, name.type_arguments);
     let extension_site =
         (!csharp_is_unqualified_invocation_target(name_node)).then_some(name.identifier);
 
@@ -6043,8 +6049,6 @@ fn csharp_invocation_return_types(
 }
 
 fn csharp_resolved_type_arguments(
-    csharp: &CSharpAnalyzer,
-    token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
@@ -6056,7 +6060,7 @@ fn csharp_resolved_type_arguments(
         }
         let reference = csharp_reference_type_text(argument, source);
         let mut candidates =
-            csharp_logical_visible_type_candidates(csharp, token, definitions, file, &reference);
+            csharp_logical_visible_type_candidates(definitions, file, source, argument, &reference);
         (candidates.len() == 1).then(|| candidates.remove(0).fq_name())
     })
 }
@@ -6158,39 +6162,32 @@ fn csharp_collect_member_types(
     }
 }
 
+// Both lookups take the reference's site. A file can hold several namespace
+// bodies, and a file-wide namespace hint made a global-namespace reference see
+// a sibling namespace's members unqualified (#7569).
 fn csharp_visible_type_output_candidates(
-    csharp: &CSharpAnalyzer,
-    token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let mut candidates = csharp_visible_type_candidates(csharp, token, definitions, file, name);
+    let mut candidates = definitions.visible_type_candidates_at(file, name, source, site);
     graph_support::sort_type_candidates(&mut candidates);
     candidates.dedup();
     candidates
 }
 
 fn csharp_logical_visible_type_candidates(
-    csharp: &CSharpAnalyzer,
-    token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let mut candidates = csharp_visible_type_candidates(csharp, token, definitions, file, name);
+    let mut candidates = definitions.visible_type_candidates_at(file, name, source, site);
     graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
-}
-
-fn csharp_visible_type_candidates(
-    _csharp: &CSharpAnalyzer,
-    token: QueryToken<'_>,
-    definitions: &CSharpDefinitionProvider<'_>,
-    file: &ProjectFile,
-    name: &str,
-) -> Vec<CodeUnit> {
-    definitions.visible_type_candidates(token, file, name)
 }
 
 fn csharp_enclosing_class(
@@ -8176,8 +8173,7 @@ class Runner {
             let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
             let reference = ProjectFile::new(fixture.project_root(), "App/Use.cs");
             let view = brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
-                graph_support::CSharpSource::shared_source(csharp),
-                &reference,
+                csharp, &reference,
             );
             let base = analyzer
                 .get_definitions("Base")
@@ -8532,8 +8528,7 @@ class Runner {
             csharp.get_ancestors(&child); // A populated inner memo must not affect the view.
             let reference = ProjectFile::new(fixture.project_root(), "App/Use.cs");
             let view = brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
-                graph_support::CSharpSource::shared_source(csharp),
-                &reference,
+                csharp, &reference,
             );
             let cancellation = CancellationToken::new();
             let scope = DescendantIndexScope::whole_workspace(&cancellation);

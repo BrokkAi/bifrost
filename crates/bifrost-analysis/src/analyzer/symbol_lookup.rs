@@ -389,11 +389,14 @@ pub fn resolve_codeunit_fuzzy_bounded_with(
     // candidates the ambiguity decision needs.
     let mut indexed = FuzzyMatches::default();
     match suffix_stage_from_index(analyzer, trimmed, include, budget)? {
+        // A miss concludes only this spelling, not the stripped alternate.
+        SuffixStageOutcome::Decided(CodeUnitResolution::NotFound) => {}
         SuffixStageOutcome::Decided(resolved) => return Ok(resolved),
         SuffixStageOutcome::Undecided(matches) => indexed.merge(matches),
     }
     if stripped != trimmed {
         match suffix_stage_from_index(analyzer, &stripped, include, budget)? {
+            SuffixStageOutcome::Decided(CodeUnitResolution::NotFound) => {}
             SuffixStageOutcome::Decided(resolved) => return Ok(resolved),
             SuffixStageOutcome::Undecided(matches) => indexed.merge(matches),
         }
@@ -782,18 +785,8 @@ fn suffix_stage_from_index(
         }
     }
 
-    prefer_recorded_spelling_matches(&mut full_matches, &query_paths_by_language);
-    let decided = if full_matches.is_empty() {
-        unique_resolution_from_matches(analyzer, &suffix_matches, include, budget)?
-    } else {
-        unique_resolution_from_matches(analyzer, &full_matches, include, budget)?
-    };
-    if let Some(resolution) = decided {
-        return Ok(SuffixStageOutcome::Decided(resolution));
-    }
-
-    // Both stages matched against the same query paths with the same
-    // `collect_fuzzy_matches`, so their maps union by match kind.
+    // Both candidate sources participate in one precedence decision. A lone
+    // pattern suffix cannot override full aliases already found by the index.
     let mut matched = FuzzyMatches {
         full: exact_matches,
         suffix: exact_suffix_matches,
@@ -802,6 +795,16 @@ fn suffix_stage_from_index(
         full: full_matches,
         suffix: suffix_matches,
     });
+    prefer_recorded_spelling_matches(&mut matched.full, &query_paths_by_language);
+    let decided = if matched.full.is_empty() {
+        unique_resolution_from_matches(analyzer, &matched.suffix, include, budget)?
+    } else {
+        unique_resolution_from_matches(analyzer, &matched.full, include, budget)?
+    };
+    if let Some(resolution) = decided {
+        return Ok(SuffixStageOutcome::Decided(resolution));
+    }
+
     Ok(SuffixStageOutcome::Undecided(matched))
 }
 
@@ -825,10 +828,6 @@ fn suffix_search_pattern(language: Language, query_path: &[String]) -> String {
     let Some((last, prefix)) = query_path.split_last() else {
         return String::new();
     };
-    if prefix.is_empty() {
-        return String::new();
-    }
-
     let delimiter = r"(?:\.|::|/|\\|\+|\$)";
     let mut pattern = String::from("(?:^|");
     pattern.push_str(delimiter);
@@ -1403,37 +1402,6 @@ mod tests {
 
     #[cfg(test)]
     #[test]
-    fn terminal_segment_prefilter_matches_only_boundary_delimited_occurrences() {
-        // The full-scan prefilter must never falsely reject: a query terminal
-        // that any alias variant could match has to occur boundary-delimited
-        // in one of the raw name strings (fq split, `$`-trim, `$`-split, and
-        // receiver-selector variants only remove non-identifier characters).
-        assert!(contains_boundary_delimited("overlay.rs", "rs"));
-        assert!(contains_boundary_delimited("overlay.rs", "overlay"));
-        assert!(contains_boundary_delimited("Foo$", "Foo"));
-        assert!(contains_boundary_delimited("A$B", "B"));
-        assert!(contains_boundary_delimited(
-            "crate::inner::Config",
-            "Config"
-        ));
-        assert!(contains_boundary_delimited("(*T).M", "T"));
-        assert!(contains_boundary_delimited("x::operator+", "operator+"));
-        assert!(contains_boundary_delimited("rs", "rs"));
-
-        // Identifier-character neighbors are not segment boundaries.
-        assert!(!contains_boundary_delimited("parse", "rs"));
-        assert!(!contains_boundary_delimited("overlays", "overlay"));
-        assert!(!contains_boundary_delimited("wrapper", "rap"));
-
-        // A later boundary-delimited occurrence is still found after an
-        // earlier embedded one, and multibyte neighbors do not panic.
-        assert!(contains_boundary_delimited("parse.rs", "rs"));
-        assert!(!contains_boundary_delimited("héllo", "llo"));
-        assert!(contains_boundary_delimited("héllo.llo", "llo"));
-    }
-
-    #[cfg(test)]
-    #[test]
     fn parse_symbol_path_fq_renders_to_dot_joined_parse_symbol_path() {
         // The structured input parser must reduce to exactly the legacy
         // `parse_symbol_path(..).join(".")` normalization for every language and
@@ -1509,5 +1477,699 @@ mod tests {
             }),
             "nested Java class alias must remain available: {variants:?}"
         );
+    }
+
+    use crate::analyzer::{
+        CodeUnitIndex, CodeUnitType, DeclarationInfo, Project, ProjectFile, Range,
+    };
+    use brokk_bifrost_core::analyzer::project::TestProject;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A declaration-index boundary fake: keys are exact, identifier seeks may
+    // repeat declarations across keys, and no parser/resolver is involved.
+    struct SelectorIndex {
+        project: TestProject,
+        units: Vec<CodeUnit>,
+        definition_reads: AtomicUsize,
+        complete: bool,
+        ledger: std::sync::Arc<crate::analyzer::read_ledger::ReadLedger>,
+    }
+
+    impl SelectorIndex {
+        fn new(root: &std::path::Path, units: Vec<CodeUnit>) -> Self {
+            Self {
+                project: TestProject::with_languages(
+                    root,
+                    units
+                        .iter()
+                        .map(code_unit_language)
+                        .chain([Language::Python])
+                        .collect(),
+                ),
+                units,
+                definition_reads: AtomicUsize::new(0),
+                complete: true,
+                ledger: std::sync::Arc::default(),
+            }
+        }
+    }
+
+    impl CodeUnitIndex for SelectorIndex {
+        fn project(&self) -> &dyn Project {
+            &self.project
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            self.units.iter().map(code_unit_language).collect()
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(self.units.iter().cloned())
+        }
+        fn definitions(&self, name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            self.definition_reads.fetch_add(1, Ordering::Relaxed);
+            let units: Vec<_> = self
+                .units
+                .iter()
+                .filter(|u| u.fq_name() == name)
+                .cloned()
+                .collect();
+            Box::new(units.into_iter())
+        }
+        fn lookup_candidates_by_identifier(&self, name: &str) -> BTreeSet<CodeUnit> {
+            self.definition_reads.fetch_add(1, Ordering::Relaxed);
+            self.units
+                .iter()
+                .filter(|u| identifier_addresses_target(u, name))
+                .cloned()
+                .collect()
+        }
+        fn lookup_candidates_by_short_name(&self, name: &str) -> BTreeSet<CodeUnit> {
+            self.units
+                .iter()
+                .filter(|u| u.short_name() == name)
+                .cloned()
+                .collect()
+        }
+        fn has_complete_symbol_lookup_index(&self) -> bool {
+            self.complete
+        }
+        fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+            assert!(!auto_quote);
+            let pattern = regex::Regex::new(pattern).unwrap();
+            self.units
+                .iter()
+                .filter(|u| pattern.is_match(&u.fq_name()))
+                .cloned()
+                .collect()
+        }
+        fn search_definitions_by_suffix_pattern(
+            &self,
+            pattern: &str,
+            terminal_identifiers: &[String],
+            language: Language,
+        ) -> BTreeSet<CodeUnit> {
+            self.definition_reads.fetch_add(1, Ordering::Relaxed);
+            let pattern = regex::Regex::new(pattern).unwrap();
+            self.units
+                .iter()
+                .filter(|unit| {
+                    code_unit_language(unit) == language
+                        && terminal_identifiers
+                            .iter()
+                            .any(|name| name == unit.identifier())
+                        && pattern.is_match(&unit.fq_name())
+                })
+                .cloned()
+                .collect()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+            None
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            None
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            None
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            None
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            BTreeSet::new()
+        }
+    }
+
+    impl IAnalyzer for SelectorIndex {
+        fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
+            self.ledger.record(key);
+        }
+        fn read_ledger_attached(&self) -> bool {
+            true
+        }
+        fn relational_definition_batch(
+            &self,
+            requests: &[crate::analyzer::RelationalDefinitionRequest],
+            _: &crate::cancellation::CancellationToken,
+        ) -> crate::analyzer::RelationalBatchOutcome {
+            use crate::analyzer::{
+                DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionResult,
+                RelationalDefinitionValue,
+            };
+            RelationalBatchOutcome::Complete(
+                requests
+                    .iter()
+                    .map(|request| {
+                        let DefinitionLanguageScope::Language(language) = request.language_scope
+                        else {
+                            unreachable!()
+                        };
+                        let name = request
+                            .name
+                            .tail()
+                            .display(crate::analyzer::fq_name::segment_interner());
+                        RelationalDefinitionResult {
+                            ordinal: request.ordinal,
+                            value: RelationalDefinitionValue::Definitions(
+                                self.units
+                                    .iter()
+                                    .filter(|unit| {
+                                        code_unit_language(unit) == language
+                                            && unit.fq_name() == name
+                                    })
+                                    .cloned()
+                                    .collect(),
+                            ),
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        fn update(&self, _: &BTreeSet<ProjectFile>) -> Self {
+            unimplemented!()
+        }
+        fn update_all(&self) -> Self {
+            unimplemented!()
+        }
+        fn is_access_expression(&self, _: &ProjectFile, _: usize, _: usize) -> bool {
+            false
+        }
+        fn find_nearest_declaration(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+            _: &str,
+        ) -> Option<DeclarationInfo> {
+            None
+        }
+    }
+
+    impl crate::analyzer::semantic::ProgramSemanticsProvider for SelectorIndex {
+        fn current_artifact_source(
+            &self,
+            _: &crate::ProjectFile,
+            _: usize,
+        ) -> Result<
+            Option<crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+            crate::analyzer::semantic::SemanticProviderError,
+        > {
+            unimplemented!()
+        }
+        fn materialize(
+            &self,
+            _: &crate::ProjectFile,
+            _: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        ) -> Result<
+            crate::analyzer::semantic::SemanticOutcome<
+                std::sync::Arc<crate::analyzer::semantic::SemanticArtifact>,
+            >,
+            crate::analyzer::semantic::SemanticProviderError,
+        > {
+            unimplemented!()
+        }
+    }
+    impl crate::analyzer::multi_analyzer::LanguageAnalyzer for SelectorIndex {
+        fn analyzer(&self) -> &dyn crate::analyzer::IAnalyzer {
+            self
+        }
+        fn program_semantics_provider(
+            &self,
+        ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
+            self
+        }
+        fn clone_with_project(
+            &self,
+            _: std::sync::Arc<dyn crate::Project>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn clone_for_index_warm(
+            &self,
+            _: std::sync::Arc<dyn crate::Project>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn import_analysis_provider(&self) -> Option<&dyn crate::analyzer::ImportAnalysisProvider> {
+            None
+        }
+        fn type_hierarchy_provider(&self) -> Option<&dyn crate::analyzer::TypeHierarchyProvider> {
+            None
+        }
+        fn type_alias_provider(&self) -> Option<&dyn crate::analyzer::TypeAliasProvider> {
+            None
+        }
+        fn test_detection_provider(&self) -> Option<&dyn crate::analyzer::TestDetectionProvider> {
+            None
+        }
+        fn update(
+            &self,
+            _: &BTreeSet<crate::ProjectFile>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn update_all_with_progress(
+            &self,
+            _: Option<crate::analyzer::BuildProgress>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_box(&self) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+    }
+    fn declaration(root: &std::path::Path, file: &str, segments: &[&str]) -> CodeUnit {
+        use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+        let mut fq = FqName::new();
+        for segment in segments {
+            fq.push(segment_interner().intern(segment, SegmentKind::Type));
+        }
+        CodeUnit::from_fq(
+            ProjectFile::new(root, file),
+            CodeUnitType::Class,
+            fq,
+            0,
+            None,
+            false,
+        )
+    }
+
+    fn resolved_set(result: CodeUnitResolution) -> BTreeSet<CodeUnit> {
+        match result {
+            CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => {
+                units.into_iter().collect()
+            }
+            CodeUnitResolution::NotFound => BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: trailing dollar identifiers acquired dollar-free aliases"
+    )]
+    #[ignore = "finds real bug: #7631, a literal trailing dollar gets a dollar-free alias; the fix also changes native JVM import-model routing"]
+    fn literal_dollar_suffix_is_distinct_from_nested_class_separator() {
+        assert_eq!(
+            symbol_selector_leaf(Language::Java, "Foo$"),
+            Some("Foo$".into())
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let units = [
+            declaration(temp.path(), "Foo.java", &["pkg", "Foo$"]),
+            declaration(temp.path(), "Nested.java", &["pkg", "Outer$Inner"]),
+        ];
+        let mut index = SelectorIndex::new(temp.path(), units.to_vec());
+        index.complete = false;
+        assert_eq!(
+            resolved_set(resolve_codeunit_fuzzy(&index, "pkg.Foo$")),
+            BTreeSet::from([units[0].clone()])
+        );
+        for spelling in ["pkg.Foo", "pkg.FFoo"] {
+            assert!(
+                resolved_set(resolve_codeunit_fuzzy(&index, spelling)).is_empty(),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            resolved_set(resolve_codeunit_fuzzy(&index, "pkg.Outer.Inner")),
+            BTreeSet::from([units[1].clone()])
+        );
+        assert!(
+            symbol_path_variants(Language::Scala, "pkg.Foo$")
+                .contains(&vec!["pkg".into(), "Foo".into()])
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: complete-index miss hid stripped alternate separators"
+    )]
+    fn call_suffix_selectors_try_alternate_separators_after_index_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        for (file, segments, spellings) in [
+            (
+                "Type.java",
+                vec!["pkg", "Type", "run"],
+                vec![
+                    "pkg.Type.run",
+                    "pkg.Type.run()",
+                    "pkg::Type::run",
+                    "pkg::Type::run()",
+                ],
+            ),
+            (
+                "type.go",
+                vec!["pkg", "T", "M"],
+                vec!["pkg.T.M", "pkg.T.M()", "pkg.(t *T).M", "pkg.(t *T).M()"],
+            ),
+        ] {
+            let unit = declaration(temp.path(), file, &segments);
+            let index = SelectorIndex::new(temp.path(), vec![unit.clone()]);
+            for spelling in spellings {
+                assert_eq!(
+                    resolved_set(resolve_codeunit_fuzzy(&index, spelling)),
+                    BTreeSet::from([unit.clone()]),
+                    "{spelling}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: one-segment enclosing owners were skipped"
+    )]
+    fn enclosing_selector_unions_equal_depth_owners_across_languages() {
+        let temp = tempfile::tempdir().unwrap();
+        let units = vec![
+            declaration(temp.path(), "A.java", &["a", "X"]),
+            declaration(temp.path(), "B.cs", &["b", "X"]),
+            declaration(temp.path(), "Shallow.java", &["unrelated"]),
+        ];
+        let expected = BTreeSet::from([units[0].clone(), units[1].clone()]);
+        for units in [units.clone(), units.into_iter().rev().collect()] {
+            let index = SelectorIndex::new(temp.path(), units);
+            assert_eq!(
+                resolve_enclosing_codeunits(&index, "X.newMember")
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn bare_selector_requires_agreement_across_languages() {
+        let temp = tempfile::tempdir().unwrap();
+        for (files, expected) in [
+            (vec!["A.rs"], true),
+            (vec!["A.rs", "B.py"], false),
+            (vec!["B.py", "A.rs"], false),
+        ] {
+            let units = files
+                .into_iter()
+                .map(|file| declaration(temp.path(), file, &["run"]))
+                .collect();
+            let index = SelectorIndex::new(temp.path(), units);
+            assert_eq!(is_bare_symbol_query(&index, "r#::run"), expected);
+            assert!(is_bare_symbol_query(&index, "run"));
+            assert!(!is_bare_symbol_query(&index, "owner.run"));
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: pattern suffix displaced ambiguous indexed full aliases"
+    )]
+    fn full_selector_matches_preserve_ambiguity_without_suffix_competitor() {
+        let temp = tempfile::tempdir().unwrap();
+        let units = vec![
+            declaration(temp.path(), "A.cs", &["Outer`1", "Inner", "Method"]),
+            declaration(temp.path(), "B.cs", &["Outer`2", "Inner", "Method"]),
+            declaration(temp.path(), "C.cs", &["Extra", "Outer", "Inner", "Method"]),
+        ];
+        let expected = BTreeSet::from([units[0].clone(), units[1].clone()]);
+        for units in [units.clone(), units.into_iter().rev().collect()] {
+            let index = SelectorIndex::new(temp.path(), units);
+            assert!(matches!(
+                resolve_codeunit_fuzzy(&index, "Outer.Inner.Method"),
+                CodeUnitResolution::Ambiguous(_)
+            ));
+            assert_eq!(
+                resolved_set(resolve_codeunit_fuzzy(&index, "Outer.Inner.Method")),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_nested_selectors_preserve_binary_identifiers() {
+        let temp = tempfile::tempdir().unwrap();
+        let units = vec![
+            declaration(temp.path(), "Plus.cs", &["pkg", "Outer+Inner"]),
+            declaration(temp.path(), "Dollar.java", &["pkg", "Outer$Inner"]),
+            declaration(temp.path(), "Leading.java", &["pkg", "$Outer$Inner"]),
+            declaration(temp.path(), "receiver.go", &["T", "M", "N"]),
+        ];
+        for ordered in [units.clone(), units.iter().cloned().rev().collect()] {
+            let mut index = SelectorIndex::new(temp.path(), ordered);
+            index.complete = false;
+            for (selector, expected) in [
+                (
+                    "Outer.Inner",
+                    BTreeSet::from([units[0].clone(), units[1].clone()]),
+                ),
+                ("pkg.$Outer.Inner", BTreeSet::from([units[2].clone()])),
+                ("pkg.Outer.$Inner", BTreeSet::new()),
+                ("T.M.N", BTreeSet::from([units[3].clone()])),
+                ("(*T)M .N", BTreeSet::new()),
+            ] {
+                assert_eq!(
+                    resolved_set(resolve_codeunit_fuzzy(&index, selector)),
+                    expected,
+                    "{selector}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn language_scoped_name_reads_replay_only_the_selected_language() {
+        use crate::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+        use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ReadKey};
+        use crate::analyzer::{
+            AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
+            LookupReplayLimits, NoSummaryAnswers, WorkspaceAnalyzer, replay_lookup,
+        };
+        let _rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+            Language::JavaScript,
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let python = declaration(root.path(), "a.py", &["shared"]);
+        let js = declaration(root.path(), "a.js", &["shared"]);
+        let base = SelectorIndex::new(root.path(), vec![python.clone(), js.clone()]);
+        {
+            let _scope = AnalyzerQueryScope::with_read_ledger(&base, base.ledger.clone());
+            let lookup = AnalyzerDefinitionLookup::new(&base, Language::None);
+            assert_eq!(
+                lookup.fqn_in_language("shared", Language::Python),
+                vec![python.clone()]
+            );
+            assert!(
+                lookup
+                    .fqn_in_language("absent", Language::Python)
+                    .is_empty()
+            );
+            assert!(lookup.can_publish());
+        }
+        let keys: Vec<_> = base
+            .ledger
+            .keys()
+            .into_iter()
+            .filter(|key| {
+                matches!(
+                    key,
+                    ReadKey::Lookup {
+                        kind: LookupKind::ResolvedName,
+                        question: LookupQuestion::Name {
+                            language: Some(Language::Python),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "must have recorded positive and negative reads: {keys:?}"
+        );
+        for (python_units, js_units, positive_fresh, negative_fresh) in [
+            (vec![python.clone()], vec![js.clone()], true, true),
+            (
+                vec![python.clone()],
+                vec![js.clone(), declaration(root.path(), "b.js", &["absent"])],
+                true,
+                true,
+            ),
+            (vec![], vec![js.clone()], false, true),
+            (
+                vec![
+                    python.clone(),
+                    declaration(root.path(), "b.py", &["absent"]),
+                ],
+                vec![js.clone()],
+                true,
+                false,
+            ),
+        ] {
+            let head = WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(
+                std::collections::BTreeMap::from([
+                    (
+                        Language::Python,
+                        AnalyzerDelegate::new(SelectorIndex::new(root.path(), python_units)),
+                    ),
+                    (
+                        Language::JavaScript,
+                        AnalyzerDelegate::new(SelectorIndex::new(root.path(), js_units)),
+                    ),
+                ]),
+            )));
+            for key in &keys {
+                let ReadKey::Lookup {
+                    kind,
+                    question,
+                    digest,
+                } = key
+                else {
+                    unreachable!()
+                };
+                let LookupQuestion::Name { name, .. } = question else {
+                    unreachable!()
+                };
+                let fresh = if name.as_ref() == "shared" {
+                    positive_fresh
+                } else {
+                    negative_fresh
+                };
+                assert_eq!(
+                    replay_lookup(
+                        &head,
+                        *kind,
+                        question,
+                        LookupReplayLimits::default(),
+                        &NoSummaryAnswers
+                    ) == Some(*digest),
+                    fresh,
+                    "{question:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selector_budget_counts_physical_declarations_before_expansion() {
+        let temp = tempfile::tempdir().unwrap();
+        let units: Vec<_> = (0..6)
+            .map(|i| declaration(temp.path(), &format!("{i}.java"), &["Shared"]))
+            .collect();
+        let index = SelectorIndex::new(temp.path(), units.clone());
+        let cancelled = || false;
+        assert!(matches!(
+            resolve_codeunit_fuzzy_bounded(
+                &index,
+                "Shared",
+                FuzzyResolveBudget::new(&cancelled, 5)
+            ),
+            Err(FuzzyResolveStop::Cancelled)
+        ));
+        assert_eq!(index.definition_reads.load(Ordering::Relaxed), 0);
+        let keep_going = || true;
+        assert!(matches!(
+            resolve_codeunit_fuzzy_bounded(
+                &index,
+                "Shared",
+                FuzzyResolveBudget::new(&keep_going, 5)
+            ),
+            Err(FuzzyResolveStop::TooManyCandidates { total: 6, limit: 5 })
+        ));
+        assert_eq!(
+            index.definition_reads.load(Ordering::Relaxed),
+            2,
+            "only the initial exact and identifier seeks may run before admission"
+        );
+        assert_eq!(
+            resolved_set(
+                resolve_codeunit_fuzzy_bounded(
+                    &index,
+                    "Shared",
+                    FuzzyResolveBudget::new(&keep_going, 6)
+                )
+                .unwrap()
+            ),
+            units.into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn symbolic_terminal_selectors_preserve_recorded_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let units: Vec<_> = ["+", "/", "::", "ordinary"]
+            .into_iter()
+            .map(|name| declaration(temp.path(), "Ops.scala", &["Ops", name]))
+            .collect();
+        let index = SelectorIndex::new(temp.path(), units.clone());
+        for unit in units {
+            assert_eq!(
+                resolved_set(resolve_codeunit_fuzzy(&index, unit.identifier())),
+                BTreeSet::from([unit.clone()])
+            );
+        }
+        assert!(resolved_set(resolve_codeunit_fuzzy(&index, "**")).is_empty());
+    }
+
+    #[test]
+    fn terminal_prefilter_preserves_unfiltered_alias_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        for file in [
+            "A.java", "A.scala", "A.js", "A.ts", "A.go", "A.cs", "A.cpp", "A.rs", "A.py",
+        ] {
+            for name in [
+                "Foo$",
+                "$Foo",
+                "$$",
+                "Outer$Inner",
+                "Outer$$Inner$",
+                "Top`1",
+                "(*T).M",
+                "(t *T).M",
+                "operator+",
+                "operator()",
+                "r#type",
+                "get$static",
+                "data/web-interface.csv",
+                "parse.rs",
+                "h\u{e9}llo",
+                "h\u{e9}llo.llo",
+                "\u{e9}llo",
+                "a::b",
+                "a+b",
+                "a\\b",
+                "a/b",
+                "+",
+                "::",
+            ] {
+                let unit = declaration(temp.path(), file, &["pkg", name]);
+                let aliases = codeunit_lookup_aliases(&unit);
+                let terminals: BTreeSet<_> = aliases
+                    .iter()
+                    .filter_map(|path| path.last().cloned())
+                    .chain(["absent".into(), "llo".into(), "rs".into()])
+                    .collect();
+                assert!(!candidate_has_terminal_segment(&unit, &BTreeSet::new()));
+                for terminal in terminals {
+                    let query = vec![terminal.clone()];
+                    let unfiltered = aliases
+                        .iter()
+                        .any(|path| path == &query || path_ends_with(path, &query));
+                    let filtered =
+                        candidate_has_terminal_segment(&unit, &BTreeSet::from([terminal.clone()]))
+                            && unfiltered;
+                    assert_eq!(
+                        filtered, unfiltered,
+                        "{file}: {name:?}, terminal {terminal:?}, aliases {aliases:?}"
+                    );
+                }
+            }
+        }
     }
 }

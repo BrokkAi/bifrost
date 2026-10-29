@@ -174,11 +174,19 @@ pub fn unavailable(reason: &'static str) -> StatementAssessments {
     }
 }
 
+/// Stable labels shared with the analyzer's literal classifier inventory.
+pub mod reason {
+    pub const CANCELLED: &str = "cancelled";
+    pub const CONTROL_BUDGET_EXHAUSTED: &str = "control_budget_exhausted";
+    pub const CONTROL_EVIDENCE_INCOMPLETE: &str = "control_evidence_incomplete";
+    pub const CONTROL_FRONTIER_INCOMPLETE: &str = "control_frontier_incomplete";
+}
+
 #[doc(hidden)]
 pub fn algorithm_open_reason(error: CfgAlgorithmError<ProgramPointId>) -> &'static str {
     match error {
-        CfgAlgorithmError::Cancelled { .. } => "cancelled",
-        CfgAlgorithmError::ExceededBudget(_) => "control_budget_exhausted",
+        CfgAlgorithmError::Cancelled { .. } => reason::CANCELLED,
+        CfgAlgorithmError::ExceededBudget(_) => reason::CONTROL_BUDGET_EXHAUSTED,
         CfgAlgorithmError::InvalidNode(point) => {
             panic!("validated procedure has an invalid CFG point {point:?}")
         }
@@ -223,7 +231,7 @@ pub fn scan_control_evidence(
         ) && (gap.subject == SemanticGapSubject::Procedure
             || reachable.contains(semantics, gap.point))
         {
-            return Ok(Some("control_evidence_incomplete"));
+            return Ok(Some(reason::CONTROL_EVIDENCE_INCOMPLETE));
         }
     }
     for point in semantics.points() {
@@ -232,19 +240,19 @@ pub fn scan_control_evidence(
             continue;
         }
         if !complete_evidence(point.evidence) {
-            return Ok(Some("control_evidence_incomplete"));
+            return Ok(Some(reason::CONTROL_EVIDENCE_INCOMPLETE));
         }
         if point.id != semantics.normal_exit_point()
             && point.id != semantics.exceptional_exit_point()
             && semantics.successor_edges(point.id).len() == 0
         {
-            return Ok(Some("control_frontier_incomplete"));
+            return Ok(Some(reason::CONTROL_FRONTIER_INCOMPLETE));
         }
     }
     for edge in semantics.control_edges() {
         request.visit_edge::<ProgramPointId>()?;
         if reachable.contains(semantics, edge.source_point) && !complete_evidence(edge.evidence) {
-            return Ok(Some("control_evidence_incomplete"));
+            return Ok(Some(reason::CONTROL_EVIDENCE_INCOMPLETE));
         }
     }
     Ok(None)

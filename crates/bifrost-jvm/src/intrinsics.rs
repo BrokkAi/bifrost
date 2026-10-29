@@ -152,12 +152,7 @@ pub fn language_root_member_inventory(
 /// contains only public instance methods. Parameter lists retain overload
 /// identity; selected providers still supply declaration and applicability
 /// evidence. The interface rule supplies its own declared modifiers.
-#[derive(Debug, Clone, Copy)]
-pub struct JvmImplicitInterfaceMethod {
-    pub name: &'static str,
-    pub parameters: &'static [&'static str],
-    pub returns: &'static str,
-}
+pub use brokk_bifrost_core::analyzer::capabilities::PlatformInventoryMethod as JvmImplicitInterfaceMethod;
 
 /// Language knowledge for an interface's lookup-only member root. Other JVM
 /// languages opt in independently; this is not a nominal inheritance edge.
@@ -259,6 +254,64 @@ const JAVA_OBJECT_METHODS: [JvmImplicitInterfaceMethod; 11] = [
         returns: "void",
     },
 ];
+
+// JLS 4.3.2 and 8.4.8: Object's final methods cannot be overridden.
+// JLS 8.9.3 and 8.10.3 fix Enum's and Record's own overridable sets.
+// These sets are fixed across platform releases, independent of the selected JDK.
+const JAVA_OBJECT_OVERRIDABLE_METHODS: [JvmImplicitInterfaceMethod; 5] = [
+    JAVA_OBJECT_METHODS[1],
+    JAVA_OBJECT_METHODS[2],
+    JAVA_OBJECT_METHODS[3],
+    JAVA_OBJECT_METHODS[9],
+    JAVA_OBJECT_METHODS[10],
+];
+const JAVA_ENUM_OVERRIDABLE_METHODS: [JvmImplicitInterfaceMethod; 1] = [JAVA_OBJECT_METHODS[3]];
+const JAVA_RECORD_OVERRIDABLE_METHODS: [JvmImplicitInterfaceMethod; 5] =
+    JAVA_OBJECT_OVERRIDABLE_METHODS;
+
+// Keep the index-selected inventories tied to their specified method names.
+const _: () = {
+    const fn same_name(actual: &str, expected: &str) -> bool {
+        let actual = actual.as_bytes();
+        let expected = expected.as_bytes();
+        if actual.len() != expected.len() {
+            return false;
+        }
+        let mut index = 0;
+        while index < actual.len() {
+            if actual[index] != expected[index] {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+    let expected = ["hashCode", "equals", "toString", "clone", "finalize"];
+    let mut index = 0;
+    while index < expected.len() {
+        assert!(same_name(
+            JAVA_OBJECT_OVERRIDABLE_METHODS[index].name,
+            expected[index]
+        ));
+        assert!(same_name(
+            JAVA_RECORD_OVERRIDABLE_METHODS[index].name,
+            expected[index]
+        ));
+        index += 1;
+    }
+    assert!(same_name(JAVA_ENUM_OVERRIDABLE_METHODS[0].name, "toString"));
+};
+
+/// Overridable platform member inventories for a source member-family walk.
+/// Interfaces use `implicit_interface_members` (JLS 9.2) instead.
+pub fn overridable_method_inventory(owner: &str) -> Option<&'static [JvmImplicitInterfaceMethod]> {
+    match owner {
+        "java.lang.Object" => Some(&JAVA_OBJECT_OVERRIDABLE_METHODS),
+        "java.lang.Enum" => Some(&JAVA_ENUM_OVERRIDABLE_METHODS),
+        "java.lang.Record" => Some(&JAVA_RECORD_OVERRIDABLE_METHODS),
+        _ => None,
+    }
+}
 
 /// A method inventory fixed by the platform language specification. It proves
 /// enumeration only; actual selected declarations still supply signatures.

@@ -53,6 +53,7 @@ mod js_rule_coverage;
 mod python_call_callee;
 mod python_comparison;
 mod python_imports;
+mod python_iterator_properties;
 mod python_method_receiver;
 mod python_pythagorean;
 mod python_raises;

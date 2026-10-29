@@ -436,6 +436,7 @@ impl KotlinAnalyzer {
     /// Kotlin's view of the shared JVM dependency realm.
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
         crate::analyzer::jvm::external::get_or_build_external_declaration_index(
+            self,
             &self.external_index,
             &self.jvm_config,
             self.inner.project(),
@@ -678,6 +679,11 @@ impl KotlinSource for KotlinAnalyzer {
         if let Some(cached) = cache.get(owner) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "kotlin.realm_direct_ancestors",
+            );
         let ancestors = brokk_bifrost_jvm::kotlin::hierarchy::kotlin_resolve_ancestors_from_facts(
             self,
             token,
@@ -687,7 +693,10 @@ impl KotlinSource for KotlinAnalyzer {
             realm,
             type_by_fqn,
         );
-        cache.insert(owner.clone(), Arc::new(ancestors.clone()));
+        let cache_key = owner.clone();
+        let cache_value = Arc::new(ancestors.clone());
+        persistent_fill_guard.installed("kotlin.realm_direct_ancestors");
+        cache.insert(cache_key, cache_value);
         ancestors
     }
 
@@ -695,8 +704,13 @@ impl KotlinSource for KotlinAnalyzer {
     /// whole package, and repeating that scan per file would be quadratic in
     /// workspace size.
     fn top_level_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
-        self.top_level_declarations_by_package
-            .get_or_init(|| build_kotlin_top_level_declarations_by_package(self))
+        self.top_level_declarations_by_package.get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "kotlin.top_level_declarations_by_package",
+                || build_kotlin_top_level_declarations_by_package(self),
+            )
+        })
     }
 
     fn external_index_is_empty(&self) -> bool {
@@ -1027,6 +1041,14 @@ impl IAnalyzer for KotlinAnalyzer {
             changed_files,
             is_jvm_dependency_input,
         );
+        if Arc::ptr_eq(&self.external_index, &updated.external_index)
+            && self.degraded_persistent_fills() > 0
+        {
+            updated.record_degraded_persistent_fill(
+                "retained_external_index",
+                "inherited_degraded_owner",
+            );
+        }
         updated
     }
 
@@ -1378,6 +1400,10 @@ impl KotlinSupport {
 }
 
 impl LanguageSupport for KotlinSupport {
+    fn supports_selected_resolution_overlays(&self) -> bool {
+        true
+    }
+
     fn call_reference_candidate_override(&self, node: tree_sitter::Node<'_>) -> Option<bool> {
         Some(crate::analyzer::usages::get_definition::kotlin::kotlin_call_reference_candidate(node))
     }

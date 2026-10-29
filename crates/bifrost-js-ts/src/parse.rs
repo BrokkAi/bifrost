@@ -138,6 +138,32 @@ pub(crate) fn parse_with_language(
     Ok(parser.parse(source, None))
 }
 
+/// Node kinds whose bytes are payload in the JavaScript, TypeScript and TSX
+/// grammars: string and template text, comments and JSX text. The Brokk
+/// TypeScript grammar (TS, TSX and `.jsx`) parses a raw NUL in these and keeps
+/// one in an identifier, operator or template substitution a parse error,
+/// which is what lets source admission prove a NUL-bearing file is text. The
+/// JavaScript grammar for plain `.js` still errors on every raw NUL, so such
+/// a file finds no payload node and stays refused until that grammar accepts
+/// one.
+pub const JS_TS_NUL_PAYLOAD_KINDS: &[&str] =
+    &["string_fragment", "comment", "html_comment", "jsx_text"];
+
+/// String literals, including JSX attribute strings, and template literals
+/// without substitutions are data that may occupy a long physical line, such
+/// as an inlined SVG path. A substitution remains executable structure.
+pub fn is_string_line_data(
+    node: Node<'_>,
+    should_stop: &mut dyn FnMut() -> bool,
+) -> std::ops::ControlFlow<(), bool> {
+    brokk_bifrost_core::analyzer::tree_walk::is_uninterpolated_literal(
+        node,
+        &["string", "template_string"],
+        &["template_substitution"],
+        should_stop,
+    )
+}
+
 #[cfg(test)]
 mod grammar_upgrade_tests {
     use super::*;

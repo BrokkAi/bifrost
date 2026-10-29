@@ -66,7 +66,7 @@ use brokk_bifrost_analysis::analyzer::structural::{
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_core::profiling;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Weak};
 use tree_sitter::Node;
 
@@ -1475,6 +1475,13 @@ impl FlowStateDerivation {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // #7340: location alone does not prove locality. Only audited kinds
+        // can leave the procedure-wide veto; unknown and future kinds fail closed.
+        let (located, reasons): (Vec<_>, Vec<_>) = reasons.into_iter().partition(|reason| {
+            matches!(reason, FlowStateIncompleteReason::LoweringGap { gaps, .. }
+                if !gaps.is_empty() && gaps.iter().all(|id| semantics.gap(*id)
+                    .is_some_and(overwrite_gap_is_point_local)))
+        });
         if !reasons.is_empty() {
             return OverwrittenUnreadAnswer::Open { reasons };
         }
@@ -1484,11 +1491,14 @@ impl FlowStateDerivation {
         let result = with_control_graph!(semantics, &self.control_edge_mask, |graph| {
             overwritten_unread_over_graph(
                 graph,
-                semantics,
-                &self.events,
-                &self.event_keys,
-                establishment_event,
-                binding,
+                OverwrittenUnreadWalkInputs {
+                    semantics,
+                    events: &self.events,
+                    event_keys: &self.event_keys,
+                    establishment_event,
+                    binding,
+                    located_reasons: &located,
+                },
                 &mut cfg_request,
             )
         });
@@ -4419,6 +4429,10 @@ pub struct FlowStateRequest<'request> {
 }
 
 impl<'request> FlowStateRequest<'request> {
+    pub fn refusal_count(&self) -> usize {
+        self.cfg_budget.refusal_count()
+    }
+
     pub fn new(cancellation: &'request CancellationToken) -> Self {
         Self {
             cancellation,
@@ -5824,6 +5838,14 @@ pub fn flow_state_for_file(
     let mut budget = match SemanticBudget::new(SemanticWork::default_limits()) {
         Ok(budget) => budget,
         Err(error) => {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:budget_configuration",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
             return FileFlowState::incomplete(
                 vec![FlowStateIncompleteReason::SemanticProviderFailed {
                     detail: error.to_string(),
@@ -5840,6 +5862,14 @@ pub fn flow_state_for_file(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:semantic detail={error:?}",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
             return FileFlowState::incomplete(
                 vec![FlowStateIncompleteReason::SemanticProviderFailed {
                     detail: error.to_string(),
@@ -5967,11 +5997,27 @@ pub fn flow_state_for_selected_property(
         .and_then(|snapshot| snapshot.as_ref())
         .map(|snapshot| snapshot.active_models().active_model_set_hash());
     if state.active_model_set_hash() != selected_model_hash {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=snapshot:models",
+                file!(),
+                line!()
+            )
+        });
+        analyzer.mark_execution_dependent();
         reasons.push(FlowStateIncompleteReason::PropertyProviderFailed {
             detail: "selected property activation differs from the event projection".into(),
         });
     }
     if analyzer.project().analysis_generation() != state.generation {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=snapshot",
+                file!(),
+                line!()
+            )
+        });
+        analyzer.mark_execution_dependent();
         reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
     }
     // These are acquisition/control failures, independent of a property
@@ -6132,6 +6178,14 @@ fn flow_state_for_materialized_selection(
     let mut budget = match SemanticBudget::new(SemanticWork::default_limits()) {
         Ok(budget) => budget,
         Err(error) => {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:budget_configuration",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
             return FileFlowState::incomplete(
                 vec![FlowStateIncompleteReason::SemanticProviderFailed {
                     detail: error.to_string(),
@@ -6172,6 +6226,43 @@ fn flow_state_for_materialized_outcome(
         .as_ref()
         .map(|snapshot| snapshot.active_models().as_ref());
 
+    if matches!(
+        outcome,
+        SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
+    ) {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause={}",
+                file!(),
+                line!(),
+                if matches!(&outcome, SemanticOutcome::Cancelled { .. }) {
+                    "cancelled"
+                } else {
+                    "budget:semantic"
+                }
+            )
+        });
+        analyzer.mark_execution_dependent();
+    }
+    if let Some(artifact) = outcome.available_value()
+        && artifact.procedures().iter().any(|procedure| {
+            procedure.gaps().iter().any(|gap| {
+                matches!(
+                    gap.kind,
+                    crate::analyzer::semantic::SemanticGapKind::ExceededBudget
+                )
+            })
+        })
+    {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=budget:semantic_artifact",
+                file!(),
+                line!()
+            )
+        });
+        analyzer.mark_execution_dependent();
+    }
     let mut file_reasons = Vec::new();
     match &outcome {
         SemanticOutcome::Complete { .. } => {}
@@ -6201,10 +6292,26 @@ fn flow_state_for_materialized_outcome(
     };
 
     let Some(facts) = structural_facts(analyzer, file) else {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=provider:structural_facts",
+                file!(),
+                line!()
+            )
+        });
+        analyzer.mark_execution_dependent();
         file_reasons.push(FlowStateIncompleteReason::NoStructuralFacts);
         return FileFlowState::incomplete(file_reasons, generation, active_model_set_hash);
     };
     if facts.source_identity() != artifact.key().revision().content() {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=snapshot",
+                file!(),
+                line!()
+            )
+        });
+        analyzer.mark_execution_dependent();
         file_reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
         return FileFlowState::incomplete(file_reasons, generation, active_model_set_hash);
     }
@@ -6338,6 +6445,18 @@ fn flow_state_for_materialized_outcome(
         .collect();
     drop(derive_selected_procedures_scope);
 
+    if request.cfg_budget.refusal_count() > 0 || budget.refusal_count() > 0 {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=budget:flow_derivation cfg={} semantic={}",
+                file!(),
+                line!(),
+                request.cfg_budget.refusal_count() > 0,
+                budget.refusal_count() > 0
+            )
+        });
+        analyzer.mark_execution_dependent();
+    }
     FileFlowState {
         procedures,
         completeness: FlowStateCompleteness::from_reasons(file_reasons),
@@ -7071,9 +7190,31 @@ fn materialize_property_reaching(
             &OracleCallContext::empty(),
             &mut SemanticRequest::new(semantic_budget, request.cancellation),
         )
-        .map_err(|error| FlowStateIncompleteReason::PropertyProviderFailed {
-            detail: error.to_string(),
+        .map_err(|error| {
+            brokk_bifrost_core::profiling::note_with(|| format!("policy.units unbounded origin={}:{} cause=provider:property_relation detail={error:?}", file!(), line!()));
+            workspace.analyzer().mark_execution_dependent();
+            FlowStateIncompleteReason::PropertyProviderFailed {
+                detail: error.to_string(),
+            }
         })?;
+    if matches!(
+        outcome,
+        SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
+    ) {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause={}",
+                file!(),
+                line!(),
+                if matches!(&outcome, SemanticOutcome::Cancelled { .. }) {
+                    "cancelled"
+                } else {
+                    "budget:semantic"
+                }
+            )
+        });
+        workspace.analyzer().mark_execution_dependent();
+    }
     let Some(snapshot) = outcome.available_value() else {
         return Err(FlowStateIncompleteReason::PropertyAnalysisPartial {
             detail: format!(
@@ -7085,7 +7226,17 @@ fn materialize_property_reaching(
     let provider = workspace
         .analyzer()
         .property_reaching_provider()
-        .ok_or(FlowStateIncompleteReason::PropertyProviderUnavailable)?;
+        .ok_or_else(|| {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:property_relation",
+                    file!(),
+                    line!()
+                )
+            });
+            workspace.analyzer().mark_execution_dependent();
+            FlowStateIncompleteReason::PropertyProviderUnavailable
+        })?;
     let limits = PropertyReachingLimits {
         cfg_work: request.cfg_budget.limits(),
         ..PropertyReachingLimits::default()
@@ -7102,6 +7253,39 @@ fn materialize_property_reaching(
             request.cancellation,
         )
     };
+    if result.incomplete_reasons().iter().any(|reason| {
+        matches!(
+            reason,
+            PropertyReachingIncompleteReason::InputRelationBudgetExceeded { .. }
+                | PropertyReachingIncompleteReason::ReachingPairBudgetExceeded { .. }
+                | PropertyReachingIncompleteReason::CandidateCoverage(
+                    crate::analyzer::semantic::CandidateCoverage::Truncated
+                )
+                | PropertyReachingIncompleteReason::ReachingDefinitions(
+                    CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::Cancelled { .. }
+                )
+                | PropertyReachingIncompleteReason::Reachability(
+                    CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::Cancelled { .. }
+                )
+                | PropertyReachingIncompleteReason::Dominators(
+                    CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::Cancelled { .. }
+                )
+                | PropertyReachingIncompleteReason::ReachingPairs(
+                    CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::Cancelled { .. }
+                )
+                | PropertyReachingIncompleteReason::Cancelled
+        )
+    }) {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=property_relation detail={:?}",
+                file!(),
+                line!(),
+                result.incomplete_reasons()
+            )
+        });
+        workspace.analyzer().mark_execution_dependent();
+    }
     Ok(result)
 }
 
@@ -7141,6 +7325,7 @@ impl EventBuilder<'_> {
     ) -> Vec<String> {
         let bases = BindingBases::build(procedure);
         let binding_origins = BindingOriginIndex::from_semantics(procedure);
+        let receiver_preparations = procedure.implicit_receiver_preparation_memory_events();
         let property_stores = property_result.map_or_else(HashMap::default, |result| {
             result
                 .stores()
@@ -7157,6 +7342,9 @@ impl EventBuilder<'_> {
         });
         for point in procedure.points() {
             for (event_index, event) in point.events.iter().enumerate() {
+                if receiver_preparations.contains(&(point.id, event_index)) {
+                    continue;
+                }
                 let (class, subject, value) = match &event.effect {
                     SemanticEffect::Assignment { target, value } => {
                         let Some(target_value) = procedure.value(*target) else {
@@ -8191,22 +8379,100 @@ fn push_algorithm_reason(
     }
 }
 
-fn overwritten_unread_over_graph<G>(
-    graph: &G,
-    semantics: &ProcedureSemantics,
-    events: &[StateEventRow],
-    event_keys: &[SemanticEventKey],
+// #7340 lowerer audit: this allow-list intentionally excludes assignment/storage,
+// capture, deferred execution, resource lifetime and region/order obligations
+// (D1-D10). A point on those gaps need not be their complete execution scope.
+fn overwrite_gap_is_point_local(gap: &SemanticGap) -> bool {
+    matches!(
+        (gap.capability, gap.kind, gap.subject, gap.discharge),
+        // #7340 audit: PHP/Go/Python Point return gaps describe transfer at
+        // the return boundary; named-result/defer Value gaps remain global.
+        (
+            SemanticCapability::ReturnFlow,
+            SemanticGapKind::Unsupported,
+            SemanticGapSubject::Point,
+            SemanticGapDischarge::None
+        )
+        // #7340 audit: JS/TS control.rs member_expression emits this only at
+        // the access operation, after evaluating its object and index.
+        | (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            SemanticGapSubject::Point,
+            SemanticGapDischarge::RuntimeReadBehavior
+        )
+        // #7340 audit: Go/Rust checks and JS/Python yield gaps mark the actual
+        // abort/resume point. Deferred Unknown and early drop-summary markers
+        // (ExitOnly/AfterInertDrops, D6/D9) do not match this tuple.
+        | (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            SemanticGapSubject::Point,
+            SemanticGapDischarge::NonRejoiningExceptionalExit
+        )
+    )
+}
+
+struct OverwrittenUnreadWalkInputs<'a> {
+    semantics: &'a ProcedureSemantics,
+    events: &'a [StateEventRow],
+    event_keys: &'a [SemanticEventKey],
     establishment_event: usize,
     binding: ValueId,
+    located_reasons: &'a [FlowStateIncompleteReason],
+}
+
+fn overwritten_unread_over_graph<G>(
+    graph: &G,
+    inputs: OverwrittenUnreadWalkInputs<'_>,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<OverwrittenUnreadAnswer, CfgAlgorithmError<ProgramPointId>>
 where
     G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
 {
+    let OverwrittenUnreadWalkInputs {
+        semantics,
+        events,
+        event_keys,
+        establishment_event,
+        binding,
+        located_reasons,
+    } = inputs;
+    // Index once per query, charging each gap once. Ordered points and the
+    // retained gap order within each point keep reported reasons deterministic.
+    let mut gaps_by_point = BTreeMap::<_, Vec<_>>::new();
+    for reason in located_reasons {
+        let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
+            unreachable!("only attributed lowering gaps are scoped");
+        };
+        for id in gaps {
+            request.visit_pair()?;
+            let gap = semantics.gap(*id).expect("attributed gap exists");
+            gaps_by_point.entry(gap.point).or_default().push(*id);
+        }
+    }
     let origin = &events[establishment_event];
     let reachable = forward_reachability(graph, semantics.entry_point(), request)?;
     if !reachable.contains(graph, origin.point) {
-        return Ok(OverwrittenUnreadAnswer::Unreachable);
+        // #7340: missing prefix edges cannot prove source unreachability. Any
+        // reachable gap leaves this entry proof open, independently of the
+        // capability axes table and the establishment-to-kill walk.
+        let mut reasons = Vec::new();
+        for (&point, gaps) in &gaps_by_point {
+            if reachable.contains(graph, point) {
+                for id in gaps {
+                    push_gap_reason(
+                        &mut reasons,
+                        semantics.gap(*id).expect("attributed gap exists"),
+                    );
+                }
+            }
+        }
+        return Ok(if reasons.is_empty() {
+            OverwrittenUnreadAnswer::Unreachable
+        } else {
+            OverwrittenUnreadAnswer::Open { reasons }
+        });
     }
 
     // A local represented by an address or closure cell is not closed under
@@ -8301,6 +8567,19 @@ where
             graph.node_at(state).expect("visited graph node exists")
         };
         let point = semantics.point(point_id).expect("graph point exists");
+        // Reuse the live-value walk, including exceptional continuations. A
+        // point-level gap cannot be ordered against events in that point, so
+        // keep gaps at the origin and replacement points conservative.
+        if let Some(gaps) = gaps_by_point.get(&point_id) {
+            let mut reasons = Vec::new();
+            for id in gaps {
+                push_gap_reason(
+                    &mut reasons,
+                    semantics.gap(*id).expect("attributed gap exists"),
+                );
+            }
+            return Ok(OverwrittenUnreadAnswer::Open { reasons });
+        }
         let start = if state == initial {
             event_keys[establishment_event].event_index as usize + 1
         } else {
@@ -11566,11 +11845,14 @@ class Sample {
         assert_eq!(facts.uninitialized_before_event.get(&2), Some(&false));
         let answer = overwritten_unread_over_graph(
             procedure,
-            procedure,
-            &events,
-            &keys,
-            1,
-            write.subject.value(),
+            OverwrittenUnreadWalkInputs {
+                semantics: procedure,
+                events: &events,
+                event_keys: &keys,
+                establishment_event: 1,
+                binding: write.subject.value(),
+                located_reasons: &[],
+            },
             &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
         )
         .expect("same-point overwrite walk completes");
@@ -16553,6 +16835,241 @@ func second(input int) int {
             std::iter::once(stored_source_read).collect::<HashSet<_>>(),
             "only the unresolved store remains open"
         );
+    }
+
+    #[test]
+    fn overwritten_unread_keeps_unlocated_observation_gaps_blocking() {
+        const SOURCE: &str = "class Sample { int clean() { int x; x = 1; x = 2; return x; } }";
+        let fixture = Fixture::new(Language::Java, &[("src/Sample.java", SOURCE)]);
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish && spelling(SOURCE, event) == "x = 1"
+        });
+        let event = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(SOURCE, event) == "x = 1"
+            })
+            .expect("the first write projects an establishment")
+            .event;
+        let procedure = fixture.procedure(0, original.procedure);
+        let cancellation = CancellationToken::default();
+        assert!(matches!(
+            original.overwritten_unread_local(
+                &procedure,
+                event,
+                &mut FlowStateRequest::new(&cancellation)
+            ),
+            OverwrittenUnreadAnswer::Proven { .. }
+        ));
+        let reason = FlowStateIncompleteReason::LoweringGap {
+            gaps: Vec::new(),
+            capability: SemanticCapability::Assignments,
+            kind: SemanticGapKind::Unknown,
+            detail: "test-only observation gap without a point".into(),
+        };
+        let mut derivation = original.clone();
+        derivation.completeness = FlowStateCompleteness::from_reasons(vec![reason.clone()]);
+        assert_eq!(
+            derivation.overwritten_unread_local(
+                &procedure,
+                event,
+                &mut FlowStateRequest::new(&cancellation)
+            ),
+            OverwrittenUnreadAnswer::Open {
+                reasons: vec![reason]
+            }
+        );
+    }
+
+    #[test]
+    fn overwritten_unread_keeps_live_and_entry_gaps_open() {
+        use crate::analyzer::semantic::{ProcedureSemanticsParts, SemanticGapImpacts};
+
+        const SOURCE: &str =
+            "class Sample { int check() { int x; x = 1; new Object(); x = 2; return x; } }";
+        let fixture = Fixture::new(Language::Java, &[("src/Sample.java", SOURCE)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish && spelling(SOURCE, event) == "x = 1"
+        });
+        let first = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(SOURCE, event) == "x = 1"
+            })
+            .expect("the first write projects an establishment");
+        let original = fixture.procedure(0, derivation.procedure);
+        let semantics = original.semantics();
+        let exit = semantics
+            .points()
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| event.effect == SemanticEffect::ExceptionalExit)
+            })
+            .expect("the call has an exceptional exit");
+        assert!(
+            semantics.control_edges().iter().any(|edge| {
+                edge.kind == ControlEdgeKind::Exceptional && edge.target_point == exit.id
+            }),
+            "the exceptional destination must have a real incoming exceptional edge"
+        );
+        assert!(semantics.guard_facts().is_empty());
+        assert!(semantics.switch_facts().is_empty());
+        let mut parts = ProcedureSemanticsParts::new(
+            ProcedureId::new(0),
+            semantics.locator().clone(),
+            semantics.kind(),
+            semantics.source(),
+            semantics.evidence(),
+        );
+        parts.properties = semantics.properties();
+        parts.values = semantics.values().to_vec();
+        parts.allocations = semantics.allocations().to_vec();
+        parts.memory_locations = semantics.memory_locations().to_vec();
+        parts.captures = semantics.captures().to_vec();
+        parts.call_sites = semantics.call_sites().to_vec();
+        parts.source_mappings = semantics.source_mappings().to_vec();
+        parts.evidence_rows = semantics.evidence_rows().to_vec();
+        parts.gaps = semantics.gaps().to_vec();
+        parts.blocks = semantics.blocks().to_vec();
+        parts.points = semantics.points().to_vec();
+        parts.control_edges = semantics.control_edges().to_vec();
+        let id = SemanticGapId::new(parts.gaps.len() as u32);
+        parts.gaps.push(SemanticGap {
+            id,
+            point: exit.id,
+            subject: SemanticGapSubject::Point,
+            capability: SemanticCapability::Assignments,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Assignments,
+                SemanticGapSubject::Point,
+            ),
+            kind: SemanticGapKind::Unknown,
+            budget: None,
+            discharge: SemanticGapDischarge::None,
+            detail: "test-only observation gap at the exceptional destination".into(),
+            source: exit.source,
+            evidence: exit.evidence,
+        });
+        let point = &mut parts.points[exit.id.index()];
+        let mut events = point.events.to_vec();
+        events.insert(
+            0,
+            crate::analyzer::semantic::SemanticEvent::new(
+                SemanticEffect::Gap { gap: id },
+                exit.source,
+                exit.evidence,
+            ),
+        );
+        point.events = events.into_boxed_slice();
+        let mut prefix_parts = parts.clone();
+        let artifact = SemanticArtifact::try_new(
+            original.artifact().key().clone(),
+            original.artifact().capabilities().clone(),
+            vec![parts],
+        )
+        .expect("the exceptional-destination gap preserves valid semantics");
+        let semantics = &artifact.procedures()[0];
+        let mut reasons = Vec::new();
+        push_gap_reason(
+            &mut reasons,
+            semantics.gap(id).expect("the injected gap exists"),
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::default();
+        let mut run = |located_reasons: &[FlowStateIncompleteReason]| {
+            overwritten_unread_over_graph(
+                semantics,
+                OverwrittenUnreadWalkInputs {
+                    semantics,
+                    events: &derivation.events,
+                    event_keys: &derivation.event_keys,
+                    establishment_event: first.event,
+                    binding: first.subject.value(),
+                    located_reasons,
+                },
+                &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+            )
+            .expect("the live-value walk completes")
+        };
+        // Without an observation gap, the old value can escape exceptionally
+        // before its normal-path replacement. This proves the path is visited.
+        assert_eq!(run(&[]), OverwrittenUnreadAnswer::PathWithoutOverwrite);
+        assert_eq!(run(&reasons), OverwrittenUnreadAnswer::Open { reasons });
+
+        // Independently test the entry proof: disconnect the origin while
+        // keeping a reachable return-flow gap at entry. Without the gap,
+        // the retained graph alone would incorrectly claim source unreachability.
+        let entry = semantics.entry_point();
+        prefix_parts
+            .control_edges
+            .retain(|edge| edge.source_point != entry);
+        let gap = &mut prefix_parts.gaps[id.index()];
+        gap.point = entry;
+        gap.capability = SemanticCapability::ReturnFlow;
+        gap.kind = SemanticGapKind::Unsupported;
+        gap.impacts = SemanticGapImpacts::for_gap(gap.capability, gap.subject);
+        for point in &mut prefix_parts.points {
+            point.events = point
+                .events
+                .iter()
+                .filter(|event| event.effect != (SemanticEffect::Gap { gap: id }))
+                .cloned()
+                .collect();
+        }
+        let point = &mut prefix_parts.points[entry.index()];
+        let mut events = point.events.to_vec();
+        events.push(crate::analyzer::semantic::SemanticEvent::new(
+            SemanticEffect::Gap { gap: id },
+            point.source,
+            point.evidence,
+        ));
+        point.events = events.into_boxed_slice();
+        let capabilities = original
+            .artifact()
+            .capabilities()
+            .iter()
+            .fold(
+                SemanticCapabilities::builder(),
+                |builder, (capability, support)| builder.support(capability, support),
+            )
+            .partial(SemanticCapability::ReturnFlow)
+            .build();
+        let prefix_artifact = SemanticArtifact::try_new(
+            original.artifact().key().clone(),
+            capabilities,
+            vec![prefix_parts],
+        )
+        .expect("a located gap may retain a disconnected source region");
+        let semantics = &prefix_artifact.procedures()[0];
+        let mut reasons = Vec::new();
+        push_gap_reason(&mut reasons, semantics.gap(id).unwrap());
+        let mut budget = CfgAlgorithmBudget::default();
+        let mut run = |located_reasons: &[FlowStateIncompleteReason]| {
+            overwritten_unread_over_graph(
+                semantics,
+                OverwrittenUnreadWalkInputs {
+                    semantics,
+                    events: &derivation.events,
+                    event_keys: &derivation.event_keys,
+                    establishment_event: first.event,
+                    binding: first.subject.value(),
+                    located_reasons,
+                },
+                &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+            )
+            .expect("the independent entry walk completes")
+        };
+        assert_eq!(run(&[]), OverwrittenUnreadAnswer::Unreachable);
+        assert_eq!(run(&reasons), OverwrittenUnreadAnswer::Open { reasons });
     }
 
     #[test]

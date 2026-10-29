@@ -4,6 +4,11 @@ use std::sync::Arc;
 
 use crate::analyzer::resolution::ExternalOwnerIdentity;
 use crate::analyzer::resolution::registry_vocabulary::ModeledExternalPackageIdentity;
+use crate::analyzer::semantic_model::TypeRef;
+use crate::analyzer::semantic_model::overlay::{
+    ModelOwnerAnswer, ModelProviderSelection, ModelSymbolRef, ModelTypeOwnerAnswer,
+    SemanticModelOverlayBuildError, SemanticModelSymbol,
+};
 use crate::analyzer::store::active_models::ResolvedActiveSemanticModels;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 
@@ -15,6 +20,43 @@ pub trait SelectedAnalyzerServices: Send + Sync {
 }
 
 pub trait SelectedModelAuthority {
+    /// Selected composed alias groups for an owner name or declaration ID.
+    fn model_selected_groups(
+        &self,
+        language: &str,
+        reference: &TypeRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<Vec<SemanticModelSymbol>>, SemanticModelOverlayBuildError>;
+
+    /// The owner a nominal type reference names in the selected composition.
+    fn model_type_owner(
+        &self,
+        language: &str,
+        nominal: &TypeRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<ModelTypeOwnerAnswer<SemanticModelSymbol>, SemanticModelOverlayBuildError>;
+
+    /// SemanticModelOverlay is the single implementation of model member declarations.
+    fn model_member_declarations(
+        &self,
+        owner: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Option<ModelOwnerAnswer>, SemanticModelOverlayBuildError>;
+    /// SemanticModelOverlay is the single implementation of declared callable results.
+    /// None is also returned for a selected callable without a structured
+    /// signature, and for `returns: None` from a producer that does not
+    /// conform to the returns contract (#7570); it does not mean the symbol
+    /// is not a model callable.
+    fn model_callable_results(
+        &self,
+        callable: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Option<Vec<Option<TypeRef>>>, SemanticModelOverlayBuildError>;
+
     fn modeled_external_package_identity(
         &self,
         language: Language,
@@ -28,6 +70,7 @@ pub trait SelectedModelAuthority {
 /// Selected declaration authority, before any intrinsic fallback. `None` is
 /// absence; `Some(None)` is ambiguous authority and must stay open.
 pub(in crate::analyzer::store) fn selected_jvm_declaration_owner(
+    relations: &super::nominal_rules::ExternalOwnerRelations,
     connection: &rusqlite::Connection,
     authority: Option<&(dyn SelectedModelAuthority + Send + Sync)>,
     providers: &[String],
@@ -48,9 +91,13 @@ pub(in crate::analyzer::store) fn selected_jvm_declaration_owner(
     }
     let providers = serde_json::to_string(providers).expect("string provider identities serialize");
     // No aggregate row means absence; a NULL provider means ambiguity.
-    let provider: Option<Option<String>> = connection.query_row(
-        "SELECT CASE WHEN count(*)=1 THEN min(provider_id) END FROM main.jvm_external_owners WHERE owner_fqn=?1 AND provider_id IN (SELECT value FROM json_each(?2)) HAVING count(*)>0",
-        rusqlite::params![fqn, providers], |row| row.get(0)).optional()?;
+    let provider: Option<Option<String>> = connection
+        .query_row(
+            relations.declaration_owner,
+            rusqlite::params![fqn, providers],
+            |row| row.get(0),
+        )
+        .optional()?;
     Ok(provider.map(|provider| {
         provider.map(|provider| ExternalOwnerIdentity {
             provider_id: Arc::from(provider),

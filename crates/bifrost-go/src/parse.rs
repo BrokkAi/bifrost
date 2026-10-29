@@ -197,6 +197,48 @@ mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[test]
+    fn interleaved_new_repairs_preserve_all_callee_ranges() {
+        let source = "package p\nfunc f(x int) int { return x }\nfunc h(x int){ _=new(new(f(x))); _=new(f(x)); _=new(new(new(f(x)))); _=f(x) }\n";
+        let before = crate::declarations::parse_go_tree(source);
+        let first = demotable_new_tokens(&before, source, &[]);
+        let round = parse_source_ranges_with_cancellation(
+            &tree_sitter_go::LANGUAGE.into(),
+            source,
+            &demotion_spans(source, &first),
+            None,
+        )
+        .unwrap();
+        let second = demotable_new_tokens(&round, source, &first);
+        assert!(
+            second.iter().any(|token| *token < *first.last().unwrap()),
+            "{first:?} {second:?}"
+        );
+        let tree = parse_go(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        for (offset, _) in source
+            .match_indices("new(")
+            .chain(source.match_indices("f(x)"))
+        {
+            let node = node_at(&tree, offset);
+            let expected = if source[offset..].starts_with("new") {
+                "new"
+            } else {
+                "f"
+            };
+            assert_eq!(node_source_text(node, source), expected);
+            assert_eq!(node.byte_range(), offset..offset + expected.len());
+            assert_eq!(
+                node.parent().unwrap().child_by_field_name("function"),
+                Some(node)
+            );
+        }
+    }
+
     /// The named node that starts exactly at `offset`, innermost first.
     fn node_at<'tree>(tree: &'tree Tree, offset: usize) -> Node<'tree> {
         tree.root_node()

@@ -1141,6 +1141,16 @@ pub trait HalfRules {
     ) -> Option<ResolutionCompletion> {
         None
     }
+    /// Read the selected targets of a source import from the same named
+    /// context builder used by provider preparation. These are row targets,
+    /// not a prepared publication; the closer still owns export proofs,
+    /// source-half closure, and registration.
+    fn source_import_targets(
+        &self,
+        _: &Self::Placement,
+    ) -> Result<Read<Option<Vec<Self::Target>>>> {
+        Ok(Read::ready(None))
+    }
     fn initial_completion(&self) -> ResolutionCompletion {
         ResolutionCompletion::Complete
     }
@@ -1823,6 +1833,20 @@ pub trait DemandRules {
     ) -> Result<Read<Option<SelectedResolutionContextSet>>> {
         Ok(Read::ready(None))
     }
+    /// Resolve selected modules' import bindings after qualifier answers settle.
+    /// The shared scheduler owns every yielded Reference and its exact reply.
+    // External test adapters inherit the default; continuation types stay private.
+    #[allow(private_interfaces)]
+    fn prepare_module_imports(
+        &mut self,
+        _frame: &RootFrame,
+        _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        _provenance: crate::analyzer::resolution::HierarchyProvenanceView<'_>,
+        _resume: crate::analyzer::resolution::CloseResume<'_>,
+    ) -> Result<crate::analyzer::resolution::CloseProgress<()>> {
+        Ok(crate::analyzer::resolution::CloseProgress::Ready(()))
+    }
+
     fn resolve_prefix_operands(
         &mut self,
         _frame: &mut RootFrame,
@@ -2075,7 +2099,57 @@ impl SelectedResolutionOperation<'_, '_> {
         artifacts: Option<&mut crate::analyzer::resolution::ForwardCandidateArtifactCache>,
         run: impl FnOnce(&mut crate::analyzer::resolution::FactResolutionOperation<'_>) -> Result<T>,
     ) -> Result<T> {
-        let provider = super::demand::DemandProvider::new(SharedDemand {
+        self.with_shared_forward_provider(
+            rules,
+            arena,
+            paths,
+            lexical,
+            projection_memo,
+            cancellation,
+            session,
+            |provider| {
+                if let Some(artifacts) = artifacts {
+                    blueprint.with_demand_operation_using_artifacts(
+                        source,
+                        paths,
+                        lexical,
+                        typed,
+                        provider,
+                        cancellation,
+                        session,
+                        artifacts,
+                        run,
+                    )
+                } else {
+                    blueprint.with_demand_operation(
+                        source,
+                        paths,
+                        lexical,
+                        typed,
+                        provider,
+                        cancellation,
+                        session,
+                        run,
+                    )
+                }
+            },
+        )
+    }
+    /// Construct the same demand provider for explicit point consumers and
+    /// operations which attach it for shared reference-seed batching.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn with_shared_forward_provider<R: DemandRules, T>(
+        &self,
+        rules: R,
+        arena: &RefCell<ClosedRelations>,
+        paths: &dyn SelectedContextPathSource,
+        lexical: &dyn BatchResolutionFragmentSource,
+        projection_memo: Option<&super::file_context::ContextBlueprintMemo>,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+        run: impl FnOnce(super::demand::DemandProvider<SharedDemand<'_, '_, '_, R>>) -> Result<T>,
+    ) -> Result<T> {
+        run(super::demand::DemandProvider::new(SharedDemand {
             source_closures: HashMap::default(),
             rules,
             arena,
@@ -2086,31 +2160,7 @@ impl SelectedResolutionOperation<'_, '_> {
             session,
             cancellation,
             completion: &ResolutionCompletion::Complete,
-        });
-        if let Some(artifacts) = artifacts {
-            blueprint.with_demand_operation_using_artifacts(
-                source,
-                paths,
-                lexical,
-                typed,
-                provider,
-                cancellation,
-                session,
-                artifacts,
-                run,
-            )
-        } else {
-            blueprint.with_demand_operation(
-                source,
-                paths,
-                lexical,
-                typed,
-                provider,
-                cancellation,
-                session,
-                run,
-            )
-        }
+        }))
     }
 }
 
@@ -2145,6 +2195,35 @@ where
                 endpoint, frame, context, inputs, selection,
             )?));
         }
+        // Module import preparation can itself request a reference, after the
+        // positioned qualifier answers but before any namespace route is read.
+        let resume = if !self.source_closures.contains_key(endpoint) {
+            match self
+                .rules
+                .prepare_module_imports(frame, inputs, provenance, resume)?
+            {
+                CloseProgress::Ready(()) => CloseResume::Start,
+                CloseProgress::Reference {
+                    continuation,
+                    key,
+                    completion,
+                } => {
+                    return Ok(CloseProgress::Reference {
+                        continuation,
+                        key,
+                        completion,
+                    });
+                }
+                CloseProgress::Cancelled(completion) => {
+                    return Ok(CloseProgress::Cancelled(completion));
+                }
+                CloseProgress::Members { .. } => {
+                    unreachable!("module imports request reference answers")
+                }
+            }
+        } else {
+            resume
+        };
         let mut slot = self.source_closures.remove(endpoint);
         if slot.is_none() {
             assert!(
@@ -5165,6 +5244,31 @@ fn poll_source_rows<R: DemandRules>(
                 }
                 match active.phase {
                     PlacementPhase::Root => {
+                        let targets = match rules.source_import_targets(&active.owner)? {
+                            Read::Ready { value, completion } => {
+                                state.accum.hook_completion =
+                                    state.accum.hook_completion.combine(&completion);
+                                active.facts.completion =
+                                    active.facts.completion.combine(&completion);
+                                value
+                            }
+                            Read::Cancelled(completion) => {
+                                return Ok(Read::Cancelled(
+                                    state.accum.hook_completion.combine(&completion),
+                                ));
+                            }
+                            Read::Unavailable { reason, completion } => {
+                                return Ok(Read::Unavailable {
+                                    reason,
+                                    completion: state.accum.hook_completion.combine(&completion),
+                                });
+                            }
+                        };
+                        if let Some(targets) = targets {
+                            active.facts.targets.extend(targets);
+                            active.phase = PlacementPhase::Finish;
+                            continue;
+                        }
                         active.starts = shared
                             .rules
                             .root_starts(&mut rules, &active.owner, &mut active.facts)?

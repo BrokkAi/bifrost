@@ -1,0 +1,2 @@
+# Declaration snapshots compare exact LF-joined rows on every platform.
+*.txt text eol=lf

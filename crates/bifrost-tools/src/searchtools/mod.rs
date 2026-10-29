@@ -384,6 +384,9 @@ pub use crate::searchtools::scan_usages::scan_usages_by_location_with_cancellati
 
 pub use crate::searchtools::scan_usages::scan_usages_by_reference_with_cancellation;
 
+#[cfg(feature = "test-support")]
+pub use crate::searchtools::scan_usages::legacy_usage_graph_withheld_references_for_test;
+
 pub use crate::searchtools::scan_usages::usage_graph;
 
 pub use crate::searchtools::scan_usages::usage_graph_with_cancellation;
@@ -681,6 +684,25 @@ pub struct RefreshResult {
     pub declarations: usize,
 }
 
+/// Runtime state of the semantic-model declaration overlay, separate from warm-up completion.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SemanticModelOverlayStatus {
+    Ready,
+    NoModels,
+    Pending,
+    Partial {
+        reasons: Vec<String>,
+    },
+    Unavailable {
+        reason: String,
+        #[serde(flatten, skip_serializing_if = "Option::is_none")]
+        budget: Option<
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayBudgetExceeded,
+        >,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ActiveWorkspaceResult {
     pub workspace_path: String,
@@ -705,7 +727,9 @@ pub struct ActiveWorkspaceResult {
     /// verify a release bundle, and decode whole packs before it settles
     /// (issue #3372). Policy evaluation and a pack-scope refresh wait for it;
     /// everything else proceeds.
+    /// This reports warm-up completion; `semantic_model_overlay` says whether models are active.
     pub semantic_packs_ready: bool,
+    pub semantic_model_overlay: SemanticModelOverlayStatus,
 }
 
 /// The subset of the workspace this session covers, or `None` when it covers
@@ -1113,7 +1137,11 @@ where
     if items.len() <= 1 {
         return items.into_iter().map(map).collect();
     }
-    items.into_par_iter().map(map).collect()
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
+    items
+        .into_par_iter()
+        .map(|item| attribution.run(|| map(item)))
+        .collect()
 }
 
 fn line_count(content: &str) -> usize {

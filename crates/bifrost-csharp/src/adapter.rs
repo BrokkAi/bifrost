@@ -9,6 +9,7 @@
 //! [`csharp_nested_owner_short_name_candidates`] for the `$`-encoded nested
 //! spellings that are C#-specific.
 
+use crate::syntax::csharp_is_irrefutable_pattern;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
 use std::sync::LazyLock;
 use tree_sitter::Node;
@@ -87,20 +88,6 @@ fn csharp_case_increment(node: Node<'_>, _source: &str) -> u32 {
     count
 }
 
-fn csharp_is_irrefutable_pattern(mut pattern: Node<'_>) -> bool {
-    while pattern.kind() == "parenthesized_pattern" {
-        let Some(inner) = pattern.named_child(0) else {
-            return false;
-        };
-        pattern = inner;
-    }
-    matches!(pattern.kind(), "discard" | "var_pattern")
-        || (pattern.kind() == "declaration_pattern"
-            && pattern
-                .child_by_field_name("type")
-                .is_some_and(|ty| ty.kind() == "implicit_type"))
-}
-
 pub fn csharp_extract_call_receiver(reference: &str) -> Option<String> {
     brokk_bifrost_core::analyzer::common::extract_call_reference_parts(reference, &["."])
         .map(|(receiver, _)| receiver.to_string())
@@ -124,8 +111,7 @@ pub fn csharp_extract_call_receiver(reference: &str) -> Option<String> {
 /// cost its own SQL query, which made a single visible-type search over a file
 /// with a deep namespace cost thousands of them (#1806).
 ///
-/// Paths longer than nine parts keep the single collapsed spelling the mask
-/// walk used, so this returns a subset of what it returned at every length.
+/// This linear list includes every legal nesting run at arbitrary depth.
 pub fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String> {
     let parts: Vec<_> = normalized
         .split('.')
@@ -136,12 +122,6 @@ pub fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String
     }
 
     let separator_count = parts.len() - 1;
-    if separator_count > 8 {
-        let mut encoded = parts[..separator_count].join("$");
-        encoded.push('.');
-        encoded.push_str(parts[separator_count]);
-        return vec![encoded];
-    }
 
     (1..=separator_count)
         .map(|nested_run| {
@@ -157,7 +137,34 @@ pub fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String
 
 #[cfg(test)]
 mod tests {
-    use super::csharp_nested_owner_short_name_candidates;
+    use super::{
+        csharp_case_increment, csharp_extract_call_receiver, csharp_is_irrefutable_pattern,
+        csharp_nested_owner_short_name_candidates,
+    };
+    use tree_sitter::{Parser, Tree};
+
+    fn parsed(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar loads");
+        parser.parse(source, None).expect("C# source parses")
+    }
+
+    fn node<'tree>(tree: &'tree Tree, kind: &str) -> tree_sitter::Node<'tree> {
+        let mut pending = vec![tree.root_node()];
+        while let Some(current) = pending.pop() {
+            if current.kind() == kind {
+                return current;
+            }
+            pending.extend(
+                (0..current.child_count())
+                    .rev()
+                    .filter_map(|index| current.child(index)),
+            );
+        }
+        panic!("expected {kind} syntax node")
+    }
 
     /// Every spelling is a leading `$` run followed by `.` for the rest, and
     /// there is exactly one per run length.
@@ -174,7 +181,7 @@ mod tests {
             vec!["Outer$Inner.Member", "Outer$Inner$Member"]
         );
 
-        for parts in 2..=9 {
+        for parts in 2..=24 {
             let path = (0..parts)
                 .map(|part| format!("P{part}"))
                 .collect::<Vec<_>>()
@@ -199,17 +206,112 @@ mod tests {
         }
     }
 
-    /// A path too deep to enumerate keeps the single collapsed spelling, so the
-    /// candidate set is a subset of the mask walk's at every length.
     #[test]
-    fn a_path_deeper_than_nine_parts_keeps_one_collapsed_spelling() {
-        let path = (0..12)
-            .map(|part| format!("P{part}"))
-            .collect::<Vec<_>>()
-            .join(".");
+    #[brokk_bifrost_test_macros::hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: deep nested declarations lost their lookup spelling"
+    )]
+    fn nested_declaration_spellings_remain_addressable_at_every_depth() {
+        use crate::declarations::parse_csharp_file;
+        use brokk_bifrost_core::analyzer::ProjectFile;
+
+        for depth in [9, 10, 11, 24] {
+            let mut source = String::new();
+            for part in 0..depth {
+                source.push_str(&format!("class P{part} {{ "));
+            }
+            source.push_str("void Method() {} ");
+            source.push_str(&"}".repeat(depth));
+            let tree = parsed(&source);
+            assert!(!tree.root_node().has_error());
+            let file = ProjectFile::new(std::env::temp_dir(), "Nested.cs");
+            let declarations = parse_csharp_file(&file, &source, &tree);
+            assert!(
+                declarations.declarations().len() >= depth,
+                "nested declaration inventory must be populated"
+            );
+            for declaration in declarations.declarations() {
+                let stored = declaration.short_name();
+                if !stored.contains('$') {
+                    continue;
+                }
+                let displayed = stored.replace('$', ".");
+                let candidates = csharp_nested_owner_short_name_candidates(&displayed);
+                assert!(
+                    candidates.iter().any(|candidate| candidate == stored),
+                    "declaration {stored} at depth {depth} is absent from {candidates:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn switch_pattern_grammar_distinguishes_irrefutable_and_guarded_cases() {
+        let source = r#"
+class C {
+    int M(object value) {
+        switch (value) {
+            case _: break;
+            case var any: break;
+            case object typed: break;
+            case 1: break;
+            case var guarded when true: break;
+        }
+        return value switch { _ => 0, var any when true => 1, 1 => 2 };
+    }
+}
+        "#;
+        let tree = parsed(source);
+        let mut pending = vec![tree.root_node()];
+        let mut sections = Vec::new();
+        while let Some(current) = pending.pop() {
+            if current.kind() == "switch_section" {
+                sections.push(current);
+            }
+            pending.extend(
+                (0..current.child_count())
+                    .rev()
+                    .filter_map(|index| current.child(index)),
+            );
+        }
+        assert_eq!(sections.len(), 5, "grammar exposes all switch sections");
+        let case_tokens = sections
+            .iter()
+            .map(|section| {
+                (0..section.child_count())
+                    .filter_map(|index| section.child(index))
+                    .filter(|child| child.kind() == "case")
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(case_tokens, 5, "grammar exposes each switch case token");
         assert_eq!(
-            csharp_nested_owner_short_name_candidates(&path),
-            vec!["P0$P1$P2$P3$P4$P5$P6$P7$P8$P9$P10.P11"]
+            sections
+                .iter()
+                .map(|section| csharp_case_increment(*section, source))
+                .sum::<u32>(),
+            3
         );
+
+        let expression = node(&tree, "switch_expression_arm");
+        let pattern = expression.named_child(0).expect("switch arm pattern");
+        assert!(
+            csharp_is_irrefutable_pattern(pattern),
+            "grammar pattern kind is {}, children: {:?}",
+            pattern.kind(),
+            (0..pattern.child_count())
+                .filter_map(|index| pattern.child(index))
+                .map(|child| (child.kind(), &source[child.byte_range()]))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(csharp_case_increment(expression, source), 0);
+    }
+
+    #[test]
+    fn call_receiver_extraction_handles_member_and_bare_invocations() {
+        assert_eq!(
+            csharp_extract_call_receiver("value.Member()"),
+            Some("value".into())
+        );
+        assert_eq!(csharp_extract_call_receiver("Member()"), None);
     }
 }

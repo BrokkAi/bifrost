@@ -1150,6 +1150,7 @@ fn guard_transfers(
                         kind: edge.kind,
                         carrier: carrier.clone(),
                         sources: tables.source_lists.intern(dropped),
+                        labels: None,
                     });
                 }
             }
@@ -1170,6 +1171,7 @@ fn guard_transfers(
                     kind: edge.kind,
                     carrier: carrier.clone(),
                     sources: tables.source_lists.intern(unknown_sources.clone()),
+                    labels: None,
                 });
             }
             if guard.true_edge.is_some() && !true_arm_sources.is_empty() {
@@ -1297,6 +1299,7 @@ fn guard_transfers(
                                 kind: edge.kind,
                                 carrier: carrier.clone(),
                                 sources: tables.source_lists.intern(vec![id]),
+                                labels: None,
                             });
                         }
                     }
@@ -1388,6 +1391,7 @@ fn guard_transfers(
                         kind: edge.kind,
                         carrier: carrier.clone(),
                         sources: dropped,
+                        labels: None,
                     });
                 }
             }
@@ -1501,6 +1505,7 @@ fn kill_at_predecessors(
             kind: edge.kind,
             carrier: carrier.clone(),
             sources,
+            labels: None,
         });
     }
 }
@@ -3096,6 +3101,7 @@ impl TypeFlowPlan {
                     kind,
                     carrier,
                     sources: list,
+                    labels: None,
                 });
             }
         }

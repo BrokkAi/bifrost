@@ -5,6 +5,147 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## Unreleased
+
+## [0.14.3] - 2026-10-28
+
+### Changed
+
+- TypeScript, TSX and JSX files that contain a raw NUL byte inside a string,
+  comment, template text or JSX text are now analyzed with their exact bytes,
+  because the parser proves each NUL is payload. A NUL anywhere else, or in a
+  plain `.js` file, still refuses the file as binary. String and template literals without
+  substitutions, such as an inlined SVG path, are now excluded from the
+  16000-byte line limit, as Python strings already were.
+  `BIFROST_ADMIT_NUL_BYTES` is removed (#4479).
+- Go rooted and whole-workspace usage graphs now use the native engine by
+  default; `BIFROST_TRIAL_NATIVE_GO_GRAPH` is removed. Ambiguous Go and Rust
+  graph sites are reported as withheld references instead of speculative
+  edges. Large OTel whole graphs can still exceed the interactive time budget
+  (#6643).
+- Go dead-code analysis now uses the native engine, including interface and
+  promoted-member usage checks. References outside the selected build keep a
+  candidate inconclusive rather than classifying it as dead (#6567).
+- Taint reports expose certainty for each source origin in CLI, SARIF and MCP
+  output. A grouped finding can be definite when one origin has a proven,
+  complete path; uncertainty in other origins and run completeness remain
+  separately reported (#7480).
+- Incremental policy checks reuse sliced units that report diagnostics about
+  the code itself, such as an unsupported construct. Only a diagnostic that can
+  depend on the state of the run, such as cancellation, an exhausted budget or
+  a provider failure, still makes a policy evaluate whole. Policy units stored
+  by earlier versions are not reused. RQL results report identical diagnostics
+  once, and receiver-analysis diagnostics no longer state a row count (#7278).
+- Ruby member calls into workspace classes and modules can now conclude. A
+  call on a constant path, a `Const.new(...)` receiver, or a local that only
+  holds one class's construction closes its dispatch gap. The class and its
+  ancestry must be declared once, resolve fully, and define no
+  `method_missing` or other dispatch hook. The caller's and declaring files
+  must not rewrite methods at run time. Constant-path calls previously
+  concluded without those checks; a class that rewrites the called method now
+  keeps the run open. Calls on `self`, parameters and instance variables stay
+  open (#3494).
+
+### Added
+
+- Taint policies support branch-conditioned sanitizers for direct Go guard
+  conditions, with operand requirements and label-specific sanitization.
+  Unsupported guards retain findings with an explicit decline reason; Java
+  support remains separate (#7624).
+- Go native type queries expose structured slice, map and array shapes instead
+  of requiring consumers to interpret type spellings. Unsupported type shapes
+  retain explicit uncertainty (#7626).
+- Rule packs can ship taint catalogs and select registered catalogs by category,
+  with matched catalog identities and provenance retained in policy results
+  (#7223).
+- Incremental policy reports include `widen_detail` and `base_widen_detail`,
+  naming the query-plan construct that requires whole-workspace evaluation
+  without changing the slicing decision (#7161).
+- Rust rustdoc pack generation preserves associated-type projections in member
+  signatures instead of replacing them with wildcards. Dispatcher support for
+  those projections remains separate (#7257).
+- Release tooling generates JDK 21 procedure-summary packs and taint source,
+  sink and barrier catalogs from CodeQL's Java models-as-data
+  (`codeql-jdk-summaries`, `codeql-jvm-catalogs`), with reports of the rows
+  translated, collapsed and skipped (#7199, #7385).
+- The CodeQL catalog generator also reads library JARs alongside the JDK, keeps
+  `path-injection[read]` sinks as their own category, and reports the exact
+  CodeQL rows each catalog translated, so recall comparisons can scope to them
+  (#7529).
+- Taint selectors that pick a library argument by index bind when the callee
+  has no recorded parameter names, as in JDK class files compiled without
+  `-parameters`. A name-based selector on such a formal reports an incomplete
+  diagnostic that suggests `:formal-index` (#7195, #7473).
+- Java parameter annotations resolve to qualified names through single-type
+  imports and written qualified names, with or without the annotation's jar,
+  and record the route and any declaring artifact. RQL
+  `decorator-bindings :annotation-type` selects them by resolved type (#3734).
+
+### Fixed
+
+- Taint findings retain their source origins when the witness collection budget
+  is exhausted, truncating evidence instead of silently losing findings. Any
+  candidates still dropped because attribution cannot complete are counted in
+  diagnostics and make discovery incomplete (#7685).
+- Go function literals retain callable signatures, allowing native analysis to
+  resolve member calls through locals initialized with closures (#7709).
+- Java value-flow analysis handles compound assignments with correct unboxing
+  and evaluation order, and unifies bare and qualified writes to source static
+  fields. Java and C# navigation respects pattern-variable bindings instead
+  of selecting same-named fields (#7565).
+- C# structural policies preserve uncertainty for unresolved conditional
+  compilation in block emptiness, catch handlers and useless-if checks, rather
+  than reporting complete answers from an assumed branch (#7540).
+- An external call's result takes the receiver's object identity only from a
+  summary transfer classified as an identity conversion. Taint-only transfers
+  such as `toString` or `substring` no longer alias the result to the receiver
+  (#7202).
+- Java member families no longer report `proven` for methods that override
+  unread library or JDK supertypes, including the implicit `java.lang.Object`,
+  `Enum` and `Record` roots. Completeness is reported separately for ancestors
+  and descendants (#7179).
+- Java JARs with more than 1,024 classes, such as `javax:javaee-api`, produce
+  declarations instead of being refused as incompletely classified Kotlin
+  (#7473).
+- Policy runs no longer abort intermittently with a semantic-budget assertion
+  (`work <= used`) when a cached semantic result is revived while the budget
+  refunds expired artifacts (#7425).
+- Configuration facts, and the configuration side of `correlate` results and
+  policy findings, report the authored line and column range instead of
+  `1:1..1:1`. Byte offsets were already exact. The fix was merged before the
+  v0.14.2 release but was not in its release candidate (#7067, #7538).
+- Go native usage graphs account for unsaved source edits that change imports
+  or package membership, including new unsaved files. Unsaved module/workspace
+  configuration edits and deletions still require a save (#7236).
+- Go analysis retains generic interface embeddings and decoded import paths,
+  corrects literal types and discarded call results, and respects initializer
+  and closure scopes when checking names (#7317).
+- Rust wrapper analysis proves standard-library identity instead of treating
+  every `Box`, `Option` or `Result` spelling as a standard wrapper. Local
+  aliases, generic parameters and disabled preludes no longer supply false
+  standard-type evidence (#7020, #7201).
+- Rust member-family queries retain trait and impl members under inert builtin
+  attributes such as `must_use` and `inline`; conditional, unknown and malformed
+  attribute wrappers keep their uncertainty (#7251).
+- JavaScript and TypeScript imports refresh when an inherited tsconfig changes
+  or a previously missing inherited config appears, without invalidating warm
+  caches for unrelated JSON edits (#7145).
+- JavaScript and TypeScript analysis preserves lexical receiver ownership,
+  decoded imports and generic inheritance, and keeps conditional receiver
+  writes and ambiguous imports uncertain. Deep binding-pattern and hierarchy
+  walks no longer rely on recursive traversal (#7218).
+- C# usage graphs include calls imported by file-level and global `using
+  static`, while respecting enclosing-type precedence and excluding extension
+  methods from bare-call imports (#7157).
+- PHP analysis respects case-insensitive aliases and method names, retains
+  ambiguous PHPDoc union arms, and corrects receiver reassignment and field
+  ownership. Static include expressions preserve path separators and numeric
+  base semantics (#7228).
+- Ruby navigation and usage graphs respect lexical constants, class reopenings
+  and local-scope boundaries, avoid nested factory-cache panics, and preserve
+  uncertainty for dynamic sends and unsupported factory chains. Require-order
+  and persisted lexical-context gaps remain separate (#7290).
+
 ## [0.14.2] - 2026-10-26
 
 ### Changed

@@ -8,13 +8,13 @@
 use git2::Oid;
 
 use super::{Result, StoreError};
-use crate::analyzer::Language;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
 use crate::analyzer::read_ledger::{
     CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ProcedureCallSiteLocator, ReadKey,
 };
 use crate::analyzer::semantic::ids::StableDigest;
+use crate::analyzer::{CodeUnitType, Language};
 
 /// The normalized column values for one [`ReadKey`].
 ///
@@ -36,6 +36,8 @@ pub(super) struct ReadKeyColumns {
     pub(super) end_byte: Option<i64>,
     pub(super) digest: Option<Vec<u8>>,
     pub(super) site_ordinal: Option<i64>,
+    pub(super) decl_kind: Option<&'static str>,
+    pub(super) decl_signature: Option<String>,
 }
 
 impl ReadKeyColumns {
@@ -55,6 +57,8 @@ impl ReadKeyColumns {
             end_byte: None,
             digest: None,
             site_ordinal: None,
+            decl_kind: None,
+            decl_signature: None,
         };
         match key {
             ReadKey::File {
@@ -91,9 +95,16 @@ impl ReadKeyColumns {
                             language.map(|language| language.config_label().to_string());
                         columns.name = Some(name.to_string());
                     }
-                    LookupQuestion::Declaration { rel_path, fq_name } => {
+                    LookupQuestion::Declaration {
+                        rel_path,
+                        fq_name,
+                        kind,
+                        signature,
+                    } => {
                         columns.rel_path = Some(rel_path.to_string());
                         columns.name = Some(fq_name.to_string());
+                        columns.decl_kind = Some(kind.identity_label());
+                        columns.decl_signature = signature.clone();
                     }
                     LookupQuestion::File { rel_path } => {
                         columns.rel_path = Some(rel_path.to_string());
@@ -155,8 +166,9 @@ impl ReadKeyColumns {
 ///
 /// `row` must select `key_digest`, `kind`, `family`, `languages`, `rel_path`,
 /// `name`, `index_key`, `blob_oid`, `subject`, `start_byte`, `end_byte`,
-/// `digest`, and `site_ordinal`, in that order. Comparing the rebuilt key's canonical digest with
-/// `key_digest` turns column fidelity into a checked store invariant.
+/// `digest`, `site_ordinal`, `decl_kind`, and `decl_signature`, in that order.
+/// Comparing the rebuilt key's canonical digest with `key_digest` turns column
+/// fidelity into a checked store invariant.
 pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     let key_digest = row.get::<_, Vec<u8>>(0)?;
     let kind = row.get::<_, String>(1)?;
@@ -171,6 +183,8 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     let end_byte = row.get::<_, Option<i64>>(10)?;
     let digest = row.get::<_, Option<Vec<u8>>>(11)?;
     let site_ordinal = row.get::<_, Option<i64>>(12)?;
+    let decl_kind = row.get::<_, Option<String>>(13)?;
+    let decl_signature = row.get::<_, Option<String>>(14)?;
 
     let missing = |column: &str| StoreError::new(format!("read key `{kind}` has no {column}"));
     let key = match kind.as_str() {
@@ -197,6 +211,13 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                 (Some(rel_path), Some(fq_name), None, None, None) => LookupQuestion::Declaration {
                     rel_path: Box::from(rel_path.as_str()),
                     fq_name: Box::from(fq_name.as_str()),
+                    kind: CodeUnitType::ALL
+                        .into_iter()
+                        .find(|kind| Some(kind.identity_label()) == decl_kind.as_deref())
+                        .ok_or_else(|| {
+                            StoreError::new(format!("unknown declaration kind {decl_kind:?}"))
+                        })?,
+                    signature: decl_signature,
                 },
                 (Some(rel_path), None, None, None, None) => LookupQuestion::File {
                     rel_path: Box::from(rel_path.as_str()),
@@ -450,7 +471,7 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         connection
             .query_row(
-                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13",
+                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15",
                 params![
                     columns.key_digest.as_slice(),
                     columns.kind,
@@ -465,6 +486,8 @@ mod tests {
                     columns.end_byte,
                     columns.digest,
                     columns.site_ordinal,
+                    columns.decl_kind,
+                    columns.decl_signature,
                 ],
                 |row| {
                     decode_read_key(row).map_err(|error| {

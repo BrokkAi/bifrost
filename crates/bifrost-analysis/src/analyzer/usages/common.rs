@@ -46,7 +46,8 @@ pub(crate) fn is_constructor_metadata(metadata: &[SignatureMetadata]) -> bool {
 
 /// Apply [`classify_recursive_hit`] to a proven hit set: a recursive call into
 /// a callable target is kept and classified `SelfReceiver` (#1638), and every
-/// other enclosing-equals-target hit stays dropped.
+/// other enclosing-equals-target hit stays dropped unless it reads a field
+/// initializer value.
 ///
 /// The target's own declared name is refused first. A scan records a
 /// declaration's name token like any other occurrence -- Rust's `fn is_unpin<T>
@@ -67,7 +68,15 @@ pub fn classify_recursive_hits(
     if !hits.iter().any(|hit| &hit.enclosing == target) {
         return hits;
     }
-    let name_ranges = target_declaration_name_ranges(analyzer, target);
+    let context = analyzer
+        .indexed_source(target.source())
+        .map(|content| DeclarationNameRangeContext::new(target.source(), content));
+    let name_ranges = context
+        .as_ref()
+        .map(|context| context.name_ranges(analyzer, target))
+        .unwrap_or_default();
+    let knowledge = crate::analyzer::languages::language_knowledge(language_for_target(target))
+        .expect("a usage target has a supported language");
     hits.into_iter()
         .filter(|hit| {
             &hit.enclosing != target
@@ -76,22 +85,15 @@ pub fn classify_recursive_hits(
                     hit.start_offset >= range.start_byte && hit.end_offset <= range.end_byte
                 })
         })
-        .filter_map(|hit| classify_recursive_hit(hit, target))
+        .filter_map(|hit| {
+            let site = context
+                .as_ref()
+                .filter(|_| target.is_field() && hit.enclosing == *target)
+                .and_then(|context| context.root_node())
+                .and_then(|root| root.descendant_for_byte_range(hit.start_offset, hit.end_offset));
+            classify_recursive_hit(hit, target, site, knowledge)
+        })
         .collect()
-}
-
-fn target_declaration_name_ranges(
-    analyzer: &dyn IAnalyzer,
-    target: &CodeUnit,
-) -> Vec<crate::analyzer::Range> {
-    // The hits' offsets come from scanning the analyzed snapshot, so the name
-    // ranges must be computed against that same snapshot, not the file on
-    // disk. A file the analyzer has not indexed produced no hits, so an empty
-    // answer is exact there.
-    let Some(content) = analyzer.indexed_source(target.source()) else {
-        return Vec::new();
-    };
-    DeclarationNameRangeContext::new(target.source(), content).name_ranges(analyzer, target)
 }
 
 pub(super) use crate::analyzer::common::language_for_file;

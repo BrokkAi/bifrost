@@ -6,6 +6,11 @@
 //! independently of which analyzers have been constructed.
 //!
 use crate::analyzer::common::language_for_target;
+use crate::analyzer::structural::reference_edges::EdgeIncompleteReason;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    DeclarationKinds, declaration_kind_index,
+};
+use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
 
 use crate::analyzer::loop_facts::LoopSyntax;
 
@@ -365,6 +370,25 @@ pub struct DeclarationNavigationOccurrence {
 pub type PatternBindingNameProvider =
     for<'tree> fn(tree_sitter::Node<'tree>) -> Option<tree_sitter::Node<'tree>>;
 
+/// Pattern syntax admitted by query-local lexical lookup. This is separate
+/// from pattern inventory: a language may inventory patterns while leaving
+/// their lexical resolution incomplete.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct LexicalPatternBindings {
+    /// Given a binder token, return its declaring pattern node.
+    pub declaration_for_name:
+        for<'tree> fn(tree_sitter::Node<'tree>) -> Option<tree_sitter::Node<'tree>>,
+    pub is_scope: fn(&str) -> bool,
+    /// Prove visibility at this reference. `None` withholds identity,
+    /// including fallback to an outer binding.
+    pub visible_at:
+        for<'tree> fn(tree_sitter::Node<'tree>, tree_sitter::Node<'tree>) -> Option<bool>,
+    /// Whether bindings may be visible beyond this pattern scope. The
+    /// reference-sensitive visibility proof still decides each candidate.
+    pub bindings_may_escape_scope: fn(&str) -> bool,
+}
+
 /// Syntax roles one language supplies for procedure-local source proofs:
 /// statement-entry assessment and loop repetition. Both enumerate syntax
 /// independently of the producer, so a statement or loop classified here
@@ -410,6 +434,17 @@ pub type AssignmentValueTypeSpelling = fn(
 
 #[doc(hidden)]
 pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send + Sync {
+    /// Whether shared lexical discovery may answer a local definition before
+    /// the language's authoritative definition operation runs.
+    fn lexical_definitions_are_authoritative(&self) -> bool {
+        true
+    }
+
+    /// Whether this frontend can publish selected native content overlays.
+    fn supports_selected_resolution_overlays(&self) -> bool {
+        false
+    }
+
     /// Workspace-aware imports; None keeps the delegate's own answer.
     fn workspace_imported_code_units(
         &self,
@@ -550,6 +585,34 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
     }
 
     fn knowledge(&self) -> &'static dyn LanguageKnowledge;
+
+    /// Select one grammar reference in a branch body. Shared code owns bounded
+    /// traversal, lexical filtering, definition lookup and distinct-only proof.
+    fn branch_body_reference_site(
+        &self,
+        _node: tree_sitter::Node<'_>,
+        _source: &str,
+    ) -> Option<structural::branch_relations::BranchReferenceSite> {
+        None
+    }
+
+    /// Select one reference that can distinguish conditions. This never grants
+    /// condition stability or equality from equal presentation targets.
+    fn branch_condition_reference_site(
+        &self,
+        _node: tree_sitter::Node<'_>,
+        _source: &str,
+    ) -> Option<structural::branch_relations::BranchReferenceSite> {
+        None
+    }
+
+    /// Current-object field grammar. Shared branch comparison admits equality
+    /// only with an exact physical storage declaration for each reference.
+    fn branch_current_object_fields(
+        &self,
+    ) -> Option<structural::branch_relations::BranchCurrentObjectFields> {
+        None
+    }
 
     /// Whether a resolved target at this reference site denotes a conversion
     /// rather than a callable edge.
@@ -814,6 +877,11 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
     /// Shared analysis uses this for pattern bindings the generic lexical environment
     /// does not model.
     fn pattern_binding_name_provider(&self) -> Option<PatternBindingNameProvider> {
+        None
+    }
+
+    /// Opt into pattern binding lookup, including expression-only scopes.
+    fn lexical_pattern_bindings(&self) -> Option<LexicalPatternBindings> {
         None
     }
 
@@ -1343,6 +1411,22 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    /// Refine legacy incoming hits whose graph does placement by owner, name
+    /// and call shape without argument types, so a hit can sit under the
+    /// wrong overload. C# matches
+    /// ordinary/generic arity before bucketing hits under the requested target.
+    /// Java's legacy graph also matches owner and arity; Kotlin uses FQN and
+    /// accepted arities; Scala adds call-list, named-argument and literal checks
+    /// but does not fully type non-literal arguments. Their opt-ins remain
+    /// separate changes requiring language-specific proof, cache and CPU checks.
+    /// A false default preserves existing authority, not a claim of exactness.
+    /// External static-owner normalization (`csharp_normalized_static_owner`)
+    /// is separate from source overload selection. Native call-relation
+    /// providers bypass this legacy projection.
+    fn refine_legacy_incoming_overload_families(&self) -> bool {
+        false
+    }
+
     /// Refine proof for resolved source-call targets using language-owned
     /// receiver evidence. The default keeps the resolver's proof unchanged.
     fn refine_resolved_call_targets(
@@ -1383,6 +1467,18 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         &self,
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider>;
+
+    /// Whether written call arguments enumerate the values that will bind.
+    /// Languages with implicit argument expansion withhold completeness until
+    /// the query has proved that no unrepresented values are being passed.
+    fn call_argument_partition_is_complete(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _shape: &crate::analyzer::usages::call_shape::CallShapeReport,
+        _cancellation: Option<&crate::analyzer::semantic::CancellationToken>,
+    ) -> bool {
+        true
+    }
 
     /// Language-owned producer for resolver-proven actual-to-formal call
     /// conversion facts. The shared call-conversion relation supplies the
@@ -1477,6 +1573,13 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _file: &ProjectFile,
         _spelling: &str,
     ) -> bool {
+        false
+    }
+
+    /// Whether an exact closed nominal receiver proof and a unique complete
+    /// summary can close an external method body. Languages opt in only when
+    /// the proven method set cannot acquire overrides.
+    fn closed_receiver_summary_closes_external_body(&self) -> bool {
         false
     }
 
@@ -1604,6 +1707,48 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
     /// How dead-code analysis proves this language's candidates.
     fn dead_code(&self) -> DeadCodeSupport {
         DeadCodeSupport::default()
+    }
+
+    /// Report-local coverage, including language-owned exclusions from authoritative absence.
+    /// The returned collections must not survive this report.
+    fn dead_code_coverage(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _candidates: &[CodeUnit],
+    ) -> crate::analyzer::store::Result<DeadCodeCoverage> {
+        Ok(DeadCodeCoverage::default())
+    }
+
+    /// Whether this reason describes the report's stated certainty boundary rather
+    /// than a missing reference. Reference-attributable losses must return false.
+    fn dead_code_reason_is_scope(&self, _reason: &EdgeIncompleteReason) -> bool {
+        false
+    }
+
+    /// Whether a semantic gap is already fully attributed by the graph's
+    /// unresolved-name set. The consumer still vetoes every matching candidate.
+    fn dead_code_reason_is_attributed(&self, _reason: &EdgeIncompleteReason) -> bool {
+        false
+    }
+
+    /// Explicit caller inventory for precise dead-code proof when generic import
+    /// discovery is not this language's native authority. A missing file budget
+    /// still makes the proof inconclusive; this is never a fallback resolver.
+    fn dead_code_reference_scope(&self, _analyzer: &dyn IAnalyzer) -> Option<HashSet<ProjectFile>> {
+        None
+    }
+
+    /// Interpret precise-query coverage for this consumer without changing usages.
+    fn dead_code_usage_result(&self, result: FuzzyResult) -> FuzzyResult {
+        result
+    }
+
+    /// Source files in no selected build context; their references still veto dead code.
+    fn dead_code_outside_build_files(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+    ) -> crate::analyzer::store::Result<HashSet<ProjectFile>> {
+        Ok(HashSet::default())
     }
 
     /// Whether a candidate requires the language's precise dead-code strategy.
@@ -1738,6 +1883,19 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _request: &mut SemanticRequest<'_>,
     ) -> Result<ValueTypeBarrierDecision, SemanticProviderError> {
         Ok(ValueTypeBarrierDecision::Undecided(
+            ValueTypeBarrierReason::UnsupportedLanguage,
+        ))
+    }
+
+    /// Resolve a declared carrier shape using the request-owned native context.
+    /// Canonical names exclude generic arguments and come from structured identities.
+    fn observed_value_type(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _observation: &BarrierObservation,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<crate::analyzer::semantic::ObservedValueType, SemanticProviderError> {
+        Ok(crate::analyzer::semantic::ObservedValueType::Undecided(
             ValueTypeBarrierReason::UnsupportedLanguage,
         ))
     }
@@ -2179,6 +2337,8 @@ pub enum LanguageEdgeWeights {
 #[doc(hidden)]
 pub struct EdgeSiteScanCtx<'a> {
     #[doc(hidden)]
+    pub cancellation: &'a CancellationToken,
+    #[doc(hidden)]
     pub analyzer: &'a dyn IAnalyzer,
     #[doc(hidden)]
     pub fqns: &'a HashSet<String>,
@@ -2192,6 +2352,8 @@ pub struct EdgeSiteScanCtx<'a> {
 /// which identity a pass keys by; a pass reads exactly one of them.
 #[doc(hidden)]
 pub struct EdgeWeightScanCtx<'a> {
+    /// Kinds retained from the graph's indexed declaration inventory.
+    pub declaration_kinds: &'a DeclarationKinds,
     #[doc(hidden)]
     pub analyzer: &'a dyn IAnalyzer,
     #[doc(hidden)]
@@ -2349,6 +2511,13 @@ pub struct DeadCodeSupport {
     pub bulk: Option<&'static dyn DeadCodeBulkProof>,
 }
 
+/// Coverage retained for one dead-code report only.
+#[derive(Default)]
+pub struct DeadCodeCoverage {
+    pub note: Option<String>,
+    pub vetoes: HashMap<brokk_bifrost_core::analyzer::model::DeclarationId, String>,
+}
+
 /// One language family's whole-workspace dead-code proof.
 ///
 /// Deliberately not [`LanguageEdgePass`]. The dead-code builds diverge from the general
@@ -2450,15 +2619,25 @@ pub fn fqn_bulk_nodes(
     is_caller: impl Fn(&CodeUnit) -> bool,
     candidates: &[CodeUnit],
 ) -> HashSet<String> {
-    let mut nodes: HashSet<String> = analyzer
+    fqn_bulk_declarations(analyzer, language, is_caller, candidates)
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect()
+}
+
+fn fqn_bulk_declarations(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    is_caller: impl Fn(&CodeUnit) -> bool,
+    candidates: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    analyzer
         .all_declarations()
         .filter(|unit| {
             language_for_target(unit) == language && !unit.is_synthetic() && is_caller(unit)
         })
-        .map(|unit| unit.fq_name())
-        .collect();
-    nodes.extend(candidates.iter().map(CodeUnit::fq_name));
-    nodes
+        .chain(candidates.iter().cloned())
+        .collect()
 }
 
 #[doc(hidden)]
@@ -2466,15 +2645,17 @@ pub fn build_fqn_bulk_edges(
     analyzer: &dyn IAnalyzer,
     language: Language,
     candidates: &[CodeUnit],
-    build_edges: impl FnOnce(&dyn IAnalyzer, &HashSet<String>) -> Option<UsageEdges>,
+    build_edges: impl FnOnce(&dyn IAnalyzer, &HashSet<String>, &DeclarationKinds) -> Option<UsageEdges>,
 ) -> Option<DeadCodeBulkEdges> {
-    let nodes = fqn_bulk_nodes(
+    let declarations = fqn_bulk_declarations(
         analyzer,
         language,
         |unit| unit.is_function() || unit.is_class(),
         candidates,
     );
-    build_edges(analyzer, &nodes).map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    let nodes = declarations.iter().map(CodeUnit::fq_name).collect();
+    let kinds = declaration_kind_index(&declarations);
+    build_edges(analyzer, &nodes, &kinds).map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
 }
 
 #[doc(hidden)]
@@ -2562,8 +2743,8 @@ pub trait ReceiverRequest {
 /// leave the receiver query with half an implementation part-way through a report.
 #[doc(hidden)]
 pub trait StructuralReceiverResolver: Send + Sync {
-    /// Whether this resolver consumes a caller-owned Go selected-operation
-    /// memo. Other resolvers keep their existing per-query entry points.
+    /// Whether this resolver consumes caller-owned selected-operation state
+    /// shared by the bounded queries in one receiver request.
     fn reuses_request_scoped_native_points(&self) -> bool {
         false
     }

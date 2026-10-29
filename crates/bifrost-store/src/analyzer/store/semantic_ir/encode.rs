@@ -659,6 +659,35 @@ impl<'a> Encoder<'a> {
                         .map(|value| i64::from(value.get())),
                 )
             };
+            let [
+                member,
+                place_kind,
+                place_locator,
+                place_location,
+                pointer_depth,
+            ] = match &call.member_selection {
+                Some(selection) => {
+                    let [kind, locator, location] = selection
+                        .receiver_place
+                        .as_ref()
+                        .map(|place| self.place(place))
+                        .unwrap_or([Value::Null, Value::Null, Value::Null]);
+                    [
+                        some(self.text(&selection.member)),
+                        kind,
+                        locator,
+                        location,
+                        optional(selection.receiver_pointer_depth),
+                    ]
+                }
+                None => [
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
+            };
             let [resolution, targets] = self.resolution(id, &call.declared_targets);
             let [normal, normal_target] = continuation(call.normal_continuation);
             let [exceptional, exceptional_target] = continuation(call.exceptional_continuation);
@@ -684,6 +713,11 @@ impl<'a> Encoder<'a> {
                     exceptional_target,
                     integer(call.source),
                     integer(call.evidence),
+                    member,
+                    place_kind,
+                    place_locator,
+                    place_location,
+                    pointer_depth,
                 ],
             );
             for (ordinal, argument) in call.arguments.iter().enumerate() {

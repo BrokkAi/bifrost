@@ -559,9 +559,11 @@ pub enum SemanticValueKind {
     },
     /// A compile-time constant whose payload is not represented structurally.
     Constant,
-    /// A compile-time string constant with its exact payload. Two values of
-    /// this kind denote the same constant exactly when their payloads are
-    /// equal, so consumers may compare the payloads as keys or labels.
+    /// A language-defined constant key. Equal payloads denote the same
+    /// constant; unequal payloads do not prove different values. A payload may
+    /// be a literal's spelling or a synthetic label. Obtain its string value
+    /// through LanguageKnowledge::semantic_string_constant_value rather than
+    /// treating the key as decoded text.
     ConstantString(Box<str>),
     Exception,
     Callable,
@@ -1131,6 +1133,27 @@ impl ControlContinuation {
     }
 }
 
+/// A member invocation whose field-versus-method interpretation requires
+/// declaration lookup. The owning call row supplies the exact call occurrence
+/// and evaluated receiver value; the member name is not an occurrence key.
+///
+/// A method binds either an address or a value copy according to its declared
+/// receiver and the operand's static pointer depth. A function-valued field is
+/// loaded before invocation. An unresolved selection remains open and may
+/// write through the receiver; consumers must invalidate the affected place
+/// rather than retain its pre-call value. Selecting an interface method never
+/// passes the interface variable itself by address.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeferredMemberSelection {
+    pub member: Box<str>,
+    /// Storage of the written receiver, when structurally addressable. This
+    /// does not itself assert that the call passes that storage by address.
+    pub receiver_place: Option<SemanticPlace>,
+    /// Pointer indirections in the receiver's static type; None retains an
+    /// unknown type rather than guessing a non-pointer receiver.
+    pub receiver_pointer_depth: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticCallSite {
     pub id: CallSiteId,
@@ -1146,6 +1169,8 @@ pub struct SemanticCallSite {
     /// The evaluated call receiver, or a module namespace qualifier when the
     /// callable reference is `ModuleQualified`.
     pub receiver: Option<ValueId>,
+    /// Deferred field/method selection on this call's evaluated receiver.
+    pub member_selection: Option<Box<DeferredMemberSelection>>,
     pub arguments: Box<[SemanticCallArgument]>,
     /// Ordered normal results for a language call that returns more than one
     /// independent value. This is mutually exclusive with `result` and must

@@ -6,6 +6,7 @@
 //! asks tree-sitter for the AST node at that already-selected source span so
 //! the row can name the cleanup and the explicit abrupt statement inside it.
 
+use super::IAnalyzer;
 use super::results::{
     CodeQueryPendingCleanupFlow, CodeQueryProgramPointRef, CodeQueryRange, CodeQueryResultRef,
     DetailedCodeQueryKey,
@@ -18,6 +19,7 @@ use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_analysis::analyzer::semantic::{ControlEdgeKind, ProgramPointId, SemanticEffect};
 use tree_sitter::Node;
 
@@ -202,7 +204,9 @@ fn has_gap(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cleanup_outcome(
+    analyzer: &dyn IAnalyzer,
     procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureSemantics,
     entry: ProgramPointId,
     cleanup_span: (usize, usize),
@@ -226,6 +230,14 @@ fn cleanup_outcome(
         steps = steps.saturating_add(1);
         if steps > MAX_CLEANUP_WALK_POINTS || !seen.insert(point) {
             if steps > MAX_CLEANUP_WALK_POINTS {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=budget:cleanup_walk",
+                        file!(),
+                        line!()
+                    )
+                });
+                analyzer.mark_execution_dependent();
                 return CleanupAnalysis {
                     outcome: CleanupOutcome::Unknown,
                     transitions,
@@ -358,24 +370,33 @@ fn public_ref(
 }
 
 fn diagnostic(
+    analyzer: &dyn IAnalyzer,
     procedure: &SemanticProcedureValue,
     reason: &str,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    diagnostics.push(CodeQueryDiagnostic {
-        related: Vec::new(),
-        source: None,
-        code: CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: language_for_file(procedure.file()).config_label(),
-        message: format!(
-            "{} pending cleanup flow is incomplete: {reason}",
-            procedure.wire_id()
-        ),
-        exhausted_roots: Vec::new(),
-        withheld_rows_path: None,
-    });
+    diagnostics.push(super::QueryExecutionState::diagnostic(
+        analyzer,
+        CodeQueryDiagnostic {
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: language_for_file(procedure.file()).config_label(),
+            message: format!(
+                "{} pending cleanup flow is incomplete: {reason}",
+                procedure.wire_id()
+            ),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        },
+        CodeQueryDiagnosticCode::from_execution_reason(
+            CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete,
+            reason,
+        )
+        .1,
+    ));
 }
 
 fn row(
@@ -407,7 +428,11 @@ fn row(
             };
             (verdict, "exact", "exhaustive")
         }
-        _ => ("unknown", "unknown", "incomplete"),
+        _ => (
+            derivation_reason::UNKNOWN,
+            derivation_reason::UNKNOWN,
+            "incomplete",
+        ),
     };
     Some(pipeline_expansion(PipelineValue::PendingCleanupFlow(
         Box::new(PendingCleanupFlowValue {
@@ -458,6 +483,7 @@ pub(super) fn result_ref(value: &PendingCleanupFlowValue) -> CodeQueryResultRef 
 }
 
 pub(super) fn pending_cleanup_flow_expansions(
+    analyzer: &dyn IAnalyzer,
     procedure: &SemanticProcedureValue,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -494,17 +520,40 @@ pub(super) fn pending_cleanup_flow_expansions(
     {
         direct_cleanup_edges = direct_cleanup_edges.saturating_add(1);
         let Some((cleanup_start, cleanup_end)) = source_range(semantics, edge.target_point) else {
-            diagnostic(procedure, "cleanup_source_mapping_missing", diagnostics);
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::CLEANUP_SOURCE_MAPPING_MISSING,
+                diagnostics,
+            );
             continue;
         };
         let Some(root) = root else {
-            diagnostic(procedure, "syntax_unavailable", diagnostics);
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:syntax",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::SYNTAX_UNAVAILABLE,
+                diagnostics,
+            );
             continue;
         };
         let Some(cleanup_kind) =
             cleanup_kind(source_node(root, cleanup_start, cleanup_end).unwrap_or(root))
         else {
-            diagnostic(procedure, "cleanup_kind_unrecognized", diagnostics);
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::CLEANUP_KIND_UNRECOGNIZED,
+                diagnostics,
+            );
             continue;
         };
         semantic_cleanup_spans.push((cleanup_kind, cleanup_start, cleanup_end));
@@ -534,7 +583,12 @@ pub(super) fn pending_cleanup_flow_expansions(
         if let Some(syntax_cleanup_spans) = syntax_cleanup_spans
             && !syntax_cleanup_spans.is_empty()
         {
-            diagnostic(procedure, "cleanup_semantics_unpublished", diagnostics);
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::CLEANUP_SEMANTICS_UNPUBLISHED,
+                diagnostics,
+            );
         }
         return rows;
     }
@@ -542,34 +596,72 @@ pub(super) fn pending_cleanup_flow_expansions(
     let mut processed_edges = 0_usize;
     while let Some(pending_edge) = pending_edges.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            diagnostic(procedure, "cancelled", diagnostics);
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::CANCELLED,
+                diagnostics,
+            );
             break;
         }
         processed_edges = processed_edges.saturating_add(1);
         if processed_edges > MAX_CLEANUP_WALK_POINTS {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=budget:cleanup_walk",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
             diagnostic(
+                analyzer,
                 procedure,
-                "pending_cleanup_state_budget_exhausted",
+                derivation_reason::PENDING_CLEANUP_STATE_BUDGET_EXHAUSTED,
                 diagnostics,
             );
             break;
         }
         let Some(root) = root else {
-            diagnostic(procedure, "syntax_unavailable", diagnostics);
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:syntax",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::SYNTAX_UNAVAILABLE,
+                diagnostics,
+            );
             break;
         };
         let Some((cleanup_start, cleanup_end)) = source_range(semantics, pending_edge.target)
         else {
-            diagnostic(procedure, "cleanup_source_mapping_missing", diagnostics);
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::CLEANUP_SOURCE_MAPPING_MISSING,
+                diagnostics,
+            );
             continue;
         };
         let Some(cleanup_kind) =
             cleanup_kind(source_node(root, cleanup_start, cleanup_end).unwrap_or(root))
         else {
-            diagnostic(procedure, "cleanup_kind_unrecognized", diagnostics);
+            diagnostic(
+                analyzer,
+                procedure,
+                derivation_reason::CLEANUP_KIND_UNRECOGNIZED,
+                diagnostics,
+            );
             continue;
         };
         let analysis = cleanup_outcome(
+            analyzer,
             semantics,
             pending_edge.target,
             (cleanup_start, cleanup_end),
@@ -582,11 +674,12 @@ pub(super) fn pending_cleanup_flow_expansions(
         let exact_selection_incomplete = procedure.exact_selection_incomplete_reason().is_some();
         let mut outcome = analysis.outcome;
         if exact_selection_incomplete {
-            reason = Some("procedure_semantic_quality_incomplete".to_owned());
+            reason = Some(derivation_reason::PROCEDURE_SEMANTIC_QUALITY_INCOMPLETE.to_owned());
             outcome = CleanupOutcome::Unknown;
         }
         if matches!(outcome, CleanupOutcome::Unknown) {
-            reason = reason.or_else(|| Some("cleanup_outcome_unproven".to_owned()));
+            reason =
+                reason.or_else(|| Some(derivation_reason::CLEANUP_OUTCOME_UNPROVEN.to_owned()));
         }
         if let Some(expansion) = row(
             procedure,
@@ -616,7 +709,12 @@ pub(super) fn pending_cleanup_flow_expansions(
                 },
             );
             if !has_semantic_edge {
-                diagnostic(procedure, "cleanup_semantics_unpublished", diagnostics);
+                diagnostic(
+                    analyzer,
+                    procedure,
+                    derivation_reason::CLEANUP_SEMANTICS_UNPUBLISHED,
+                    diagnostics,
+                );
             }
         }
     }

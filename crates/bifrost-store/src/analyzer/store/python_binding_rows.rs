@@ -21,10 +21,10 @@ pub fn namespace_definition_provider()
 // Format 6 also requires member role/base inputs and compiler proxy contexts.
 // Format 7 fixes authored parameter/field type owners and positional receiver roles.
 // Format 7 also publishes direct assignment Value properties for typed reads.
-// This format is frozen because production has no Python resolution publication path:
-// selected_resolution_overlay_inputs_excluding does not admit Python, and
-// PythonEnvironmentPublication is test-support only. The admission point ends
-// this freeze; #6108 sets the production format once.
+// Production builds do not admit Python to selected overlays. Test-support builds
+// admit it for the native trial; their test-support stores are rejected by the
+// flip's format bump. The production flip ends this freeze and sets the format
+// once with its rejection test (#6108).
 pub(crate) const NATIVE_SOURCE_FORMAT: i64 = 7;
 // Dormant inputs also retain dynamic operations and exact/prefix/Any names.
 
@@ -33,6 +33,7 @@ pub(crate) const NATIVE_SOURCE_FORMAT: i64 = 7;
 pub(crate) struct BindingScope {
     pub(crate) scope: u32,
     pub(crate) parent: Option<u32>,
+    pub(crate) class_body: bool,
 }
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
@@ -75,6 +76,7 @@ pub(crate) struct PythonBindingRows {
     pub(crate) predicates: Vec<PythonNativePredicateFact>,
     pub(crate) imports: Vec<PythonNativeImportFact>,
     pub(crate) import_positions: Vec<(u32, u32, usize)>,
+    pub(crate) loop_regions: Vec<(u32, std::ops::Range<usize>)>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -92,6 +94,7 @@ impl super::cache_budget::RetainedBytes for PythonBindingRows {
         heap.vec(&self.predicates);
         heap.vec(&self.imports);
         heap.vec(&self.import_positions);
+        heap.vec(&self.loop_regions);
         for slot in &self.slots {
             heap.add(slot.name.capacity());
         }
@@ -691,11 +694,18 @@ impl PythonBindingRows {
             }};
         }
         read!(
-            "SELECT scope,parent_scope FROM resolution_binding_scopes WHERE blob_id=?1 ORDER BY scope",
+            "SELECT scopes.scope,scopes.parent_scope,EXISTS(
+                SELECT 1 FROM resolution_member_scope_properties properties
+                JOIN resolution_node_catalog nodes ON nodes.blob_id=properties.blob_id
+                    AND nodes.local_key=properties.scope_head_node_key
+                WHERE properties.blob_id=?1 AND properties.scope_kind='type_body'
+                    AND nodes.source_scope=scopes.scope)
+             FROM resolution_binding_scopes scopes WHERE scopes.blob_id=?1 ORDER BY scopes.scope",
             scopes,
             |r| Ok(BindingScope {
                 scope: r.get(0)?,
-                parent: r.get(1)?
+                parent: r.get(1)?,
+                class_body: r.get(2)?
             })
         );
         read!(
@@ -800,6 +810,50 @@ impl PythonBindingRows {
             import_positions,
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         );
+        // The structured loop node spans include targets, iterable/condition
+        // headers and bodies. Guard chains alone cover only the body/else arms.
+        {
+            use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+            let mut statement = conn.prepare_cached(
+                "WITH owners AS MATERIALIZED (
+                    SELECT nodes.source_scope,declaration.start_byte,declaration.end_byte
+                    FROM resolution_member_scope_properties properties
+                    JOIN resolution_node_catalog nodes ON nodes.blob_id=properties.blob_id
+                        AND nodes.local_key=properties.scope_head_node_key
+                    JOIN resolution_semantic_sites semantic ON semantic.blob_id=properties.blob_id
+                        AND semantic.semantic_key=properties.definition_semantic_key
+                        AND semantic.semantic_role='definition'
+                    JOIN source_native_declaration_bridges bridge ON bridge.blob_id=semantic.blob_id
+                        AND bridge.source_site=semantic.source_site
+                    JOIN source_declarations declaration ON declaration.blob_id=bridge.blob_id
+                        AND declaration.declaration_id=bridge.declaration_id
+                    WHERE properties.blob_id=?1
+                 )
+                 SELECT coalesce((SELECT source_scope FROM owners
+                     WHERE start_byte<=node.value->>3 AND end_byte>=node.value->>4
+                     ORDER BY end_byte-start_byte LIMIT 1),root.scope),
+                     node.value->>3,node.value->>4
+                 FROM source_structural_facts facts
+                 JOIN resolution_binding_scopes root ON root.blob_id=facts.blob_id
+                     AND root.parent_scope IS NULL
+                 CROSS JOIN json_each(facts.nodes) node
+                 WHERE facts.blob_id=?1 AND node.value->>0 IN (?2,?3)",
+            )?;
+            let loops = statement.query_map(
+                params![
+                    blob,
+                    NormalizedKind::ForLoop as u8,
+                    NormalizedKind::WhileLoop as u8
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?..row.get(2)?)),
+            )?;
+            for region in loops {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                result.loop_regions.push(region?);
+            }
+        }
         if cancellation.is_cancelled() {
             return Ok(None);
         }

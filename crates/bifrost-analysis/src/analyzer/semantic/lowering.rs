@@ -838,6 +838,7 @@ pub(crate) mod tests {
                     point: invoke,
                     callee,
                     receiver: None,
+                    member_selection: None,
                     arguments: Box::new([]),
                     normal_results: Box::new([]),
                     result: None,

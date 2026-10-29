@@ -107,27 +107,6 @@ pub trait RubyGemSurface {
     fn require_boundary(&self, require_path: &str) -> RubyGemBoundary;
 }
 
-/// A surface that has acquired nothing. Every boundary is unknown, which is the
-/// honest answer for an analyzer no host has activated gem packs on.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnacquiredRubyGems;
-
-impl RubyGemSurface for UnacquiredRubyGems {
-    fn constant_boundary(&self, _owner_path: &[String], _terminal: &str) -> RubyGemBoundary {
-        RubyGemBoundary::Unpublished(unknown_dependency_reason())
-    }
-
-    fn require_boundary(&self, _require_path: &str) -> RubyGemBoundary {
-        RubyGemBoundary::Unpublished(unknown_dependency_reason())
-    }
-}
-
-fn unknown_dependency_reason() -> SemanticDiagnosticIncompleteReason {
-    SemanticDiagnosticIncompleteReason::missing_dependency_discovery(
-        BoundaryStatus::ExternalUnknown,
-    )
-}
-
 /// Collect Ruby semantic diagnostics and the proof or suppression behind each.
 pub fn collect_ruby_semantic_diagnostics(
     graph: RubyGraphSource<'_>,
@@ -324,7 +303,7 @@ impl RubyDiagnosticCollector<'_> {
                     stack.push(ScanFrame::Node(right));
                 }
             }
-            "string" | "comment" => {}
+            "comment" => {}
             _ => brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
                 node,
                 stack,

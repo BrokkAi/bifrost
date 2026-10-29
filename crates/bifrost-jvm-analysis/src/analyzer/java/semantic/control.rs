@@ -25,6 +25,102 @@ use brokk_bifrost_analysis::analyzer::java_integral_parameter::decimal_integer_v
 /// flow solver tracks, so the elements past the cap are left to a write gap.
 const JAVA_ARRAY_INITIALIZER_ELEMENT_CAP: usize = 1024;
 
+#[derive(Clone, Copy)]
+enum JavaCompoundType {
+    Primitive(JavaScalarType),
+    Boxed(JavaScalarType),
+    String,
+    Null,
+    Unknown,
+}
+
+impl JavaCompoundType {
+    fn is_floating(self) -> bool {
+        matches!(
+            self,
+            Self::Primitive(JavaScalarType::Float | JavaScalarType::Double)
+                | Self::Boxed(JavaScalarType::Float | JavaScalarType::Double)
+        )
+    }
+
+    fn may_unbox(self) -> bool {
+        !matches!(self, Self::Primitive(_))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JavaCompoundContext {
+    left: JavaCompoundType,
+    right: JavaCompoundType,
+    divisor_nonzero: bool,
+    concatenation_call_free: bool,
+}
+
+fn java_numeric_compound_can_throw(context: JavaCompoundContext) -> bool {
+    // The left operand was already unboxed before evaluation of the RHS.
+    context.right.may_unbox()
+}
+
+fn java_add_compound_can_throw(context: JavaCompoundContext) -> bool {
+    if matches!(context.left, JavaCompoundType::String) {
+        !context.concatenation_call_free
+    } else {
+        java_numeric_compound_can_throw(context)
+    }
+}
+
+fn java_divide_compound_can_throw(context: JavaCompoundContext) -> bool {
+    java_numeric_compound_can_throw(context)
+        || (!context.left.is_floating() && !context.right.is_floating() && !context.divisor_nonzero)
+}
+
+const JAVA_COMPOUND_OPERATORS: &[CompoundAssignmentOperator<JavaCompoundContext>] = &[
+    CompoundAssignmentOperator {
+        compound: "+=",
+        can_throw: java_add_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "-=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "*=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "/=",
+        can_throw: java_divide_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "%=",
+        can_throw: java_divide_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "<<=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: ">>=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: ">>>=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "&=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "|=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+    CompoundAssignmentOperator {
+        compound: "^=",
+        can_throw: java_numeric_compound_can_throw,
+    },
+];
+
 pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
@@ -58,6 +154,7 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         expression_values: HashMap::default(),
         constant_index_values: HashMap::default(),
         field_declaration_anchors: declaration_inventory.field_anchors,
+        source_type_nodes: declaration_inventory.type_nodes,
         type_name_roots: declaration_inventory.type_roots,
         local_types: HashMap::default(),
         local_type_nodes: HashMap::default(),
@@ -65,7 +162,7 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         non_null_values: HashSet::default(),
         catch_binders: HashMap::default(),
         yield_results: HashMap::default(),
-        pattern_variable_names: HashSet::default(),
+        pattern_variable_names: declaration_inventory.pattern_names,
         parameters: HashMap::default(),
         locals: HashMap::default(),
         implicit_field_values: HashMap::default(),
@@ -190,27 +287,6 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
     )
 }
 
-/// One normalized condition. `holds_on_false_arm` marks a negated condition
-/// whose predicate has no negated form, such as `!(x < 1.0)` under NaN: the
-/// guard keeps the un-negated predicate and its true arm is the condition's
-/// false successor.
-struct NormalizedGuard {
-    predicate: GuardPredicate,
-    subject: Option<ValueId>,
-    holds_on_false_arm: bool,
-}
-
-impl NormalizedGuard {
-    /// A predicate that already states the condition's own polarity.
-    const fn folded(predicate: GuardPredicate, subject: Option<ValueId>) -> Self {
-        Self {
-            predicate,
-            subject,
-            holds_on_false_arm: false,
-        }
-    }
-}
-
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn local_declaration(
         &mut self,
@@ -295,86 +371,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
-        let left = required_field(node, "left")?;
-        let right = required_field(node, "right")?;
-        let plain_assignment = required_field(node, "operator")?.kind() == "=";
-        let lexical_target = (left.kind() == "identifier")
-            .then(|| self.lexical_reference_binding(left))
-            .flatten();
-        let terminal = self.point(builder, node, Vec::new())?;
-        // `x += c` or `x -= c` on a primitive integral binding cannot unbox,
-        // divide or convert to a string, so it can neither throw nor call.
-        let compound_offset = self.compound_integer_offset(node, left, right);
-        if !plain_assignment
-            && compound_offset.is_none()
-            && !self.string_compound_assignment_is_call_free(left, right)
-        {
-            self.add_gap(
-                builder,
-                terminal,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
-                "compound assignment can throw during unboxing or arithmetic before storing the computed value",
-            )?;
-            // Only a `String` target converts its operand with `toString`. A
-            // primitive numeric local cannot be one.
-            let primitive_target = lexical_target.is_some_and(|(target, _)| {
-                self.is_primitive_integral_binding(target)
-                    || self.primitive_floating_type(target).is_some()
-            });
-            if !primitive_target {
-                self.session.add_gap_with_impacts(
-                    builder,
-                    terminal,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::Calls,
-                    SemanticGapImpacts::CALL_EVALUATION,
-                    SemanticGapKind::Unknown,
-                    "string compound assignment can invoke user-defined toString during conversion",
-                )?;
-            }
+        if required_field(node, "operator")?.kind() != "=" {
+            return self.compound_assignment_expression(builder, node, entry, next, scope, stack);
         }
-        let right_kind = if plain_assignment {
-            lexical_target
-                .map(|(target, _)| self.assignment_literal_kind(target, right))
-                .unwrap_or_else(|| expression_value_kind(right))
+        let left = brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression(
+            required_field(node, "left")?,
+        );
+        let right = required_field(node, "right")?;
+        let lexical_target = self.lexical_reference_binding(left);
+        let terminal = self.point(builder, node, Vec::new())?;
+        // putstatic initializes after the RHS and writes only on success.
+        let evaluation_terminal = if self.static_field_may_initialize(left) {
+            let initialize = self.point(builder, left, Vec::new())?;
+            self.edge(builder, initialize, EdgeTarget::normal(terminal))?;
+            self.implicit_abort_edge(builder, left, initialize, scope, None, stack)?;
+            initialize
         } else {
-            expression_value_kind(right)
+            terminal
         };
-        let right_value = self.expression_value(builder, right, right_kind)?;
+        let kind = lexical_target
+            .map(|(target, _)| self.assignment_literal_kind(target, right))
+            .unwrap_or_else(|| expression_value_kind(right));
+        let value = self.expression_value(builder, right, kind)?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
-        // A compound assignment reads the old target and computes a new value.
-        // An integral literal offset is exact up to the implicit narrowing,
-        // which the consumer's domain overflow check covers. Other
-        // arithmetic, narrowing, overflow, and string conversion are not
-        // represented by a scalar transfer here. A language-defined flow
-        // retains the operand dependencies while giving scalar consumers an
-        // unknown result instead of incorrectly copying the right operand.
-        let value = if plain_assignment {
-            right_value
-        } else {
-            let old = self.expression_value(builder, left, expression_value_kind(left))?;
-            let computed = self.value(builder, terminal, SemanticValueKind::Temporary)?;
-            match compound_offset {
-                Some(offset) => self.append_effect(
-                    builder,
-                    terminal,
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::IntegerOffset { offset },
-                        source: old,
-                        target: computed,
-                    },
-                )?,
-                None => self.session.append_language_defined_value_flows(
-                    builder,
-                    terminal,
-                    [old, right_value],
-                    computed,
-                )?,
-            }
-            computed
-        };
         self.append_effect(
             builder,
             terminal,
@@ -383,121 +402,377 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 value,
             },
         )?;
-
-        let evaluations = if left.kind() == "identifier" {
-            if let Some((target, kind)) = lexical_target {
-                if plain_assignment
-                    && matches!(kind, ValueFlowKind::Local)
-                    && self.expression_is_non_null(right)
-                {
-                    self.non_null_values.insert(target);
-                }
-                self.append_effect(
-                    builder,
-                    terminal,
-                    SemanticEffect::Assignment { target, value },
-                )?;
-                self.append_effect(
-                    builder,
-                    terminal,
-                    SemanticEffect::ValueFlow {
-                        kind,
-                        source: value,
-                        target,
-                    },
-                )?;
-            } else {
-                // #2573: not a local or a parameter -- may still be an
-                // implicit `this.field` write (`LDAPManager`'s own
-                // constructor, `ctx = getDirContext();`). Symmetric with the
-                // read side (`emit_implicit_field_load`); a no-op when
-                // `left` does not unambiguously name a non-`static` instance
-                // field on the enclosing type.
-                let stored = self.emit_implicit_field_store(builder, left, terminal, value)?;
-                if !stored && !plain_assignment {
-                    self.add_gap(
+        if let Some((target, flow)) = lexical_target
+            && matches!(flow, ValueFlowKind::Local)
+            && self.expression_is_non_null(right)
+        {
+            self.non_null_values.insert(target);
+        }
+        if let Some((target, carrier)) = self.assignment_target(builder, terminal, left)? {
+            match target {
+                CompoundAssignmentTarget::Binding {
+                    value: target,
+                    flow,
+                } => {
+                    self.append_effect(
                         builder,
                         terminal,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::Assignments,
-                        SemanticGapKind::Unknown,
-                        "compound assignment target has no resolved lexical or field binding",
+                        SemanticEffect::Assignment { target, value },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: flow,
+                            source: value,
+                            target,
+                        },
+                    )?;
+                }
+                CompoundAssignmentTarget::Memory { location, kind } => {
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::MemoryStore {
+                            kind,
+                            location,
+                            value,
+                        },
                     )?;
                 }
             }
-            if plain_assignment {
-                vec![right]
-            } else {
-                vec![left, right]
+            if let Some(carrier) = carrier {
+                self.assign_implicit_field_carrier(builder, terminal, carrier, value)?;
             }
-        } else if left.kind() == "field_access" && !self.field_access_is_type_qualifier(left) {
-            let object = required_field(left, "object")?;
-            let field = required_field(left, "field")?;
-            let base = self.expression_value(builder, object, expression_value_kind(object))?;
-            let (member, resolved) = self.memory_member_locator(field, object)?;
-            let location = self.session.add_memory_location(
-                builder,
-                terminal,
-                MemoryLocationKind::Field { base, member },
-            )?;
-            if !resolved {
-                self.add_field_identity_gap(builder, terminal, location)?;
-            }
-            self.append_effect(
-                builder,
-                terminal,
-                SemanticEffect::MemoryStore {
-                    kind: MemoryAccessKind::Field,
-                    location,
-                    value,
-                },
-            )?;
-            if plain_assignment {
-                vec![object, right]
-            } else {
-                vec![left, right]
-            }
-        } else if left.kind() == "array_access" {
-            let array = required_field(left, "array")?;
-            let index = required_field(left, "index")?;
-            let base = self.expression_value(builder, array, expression_value_kind(array))?;
-            let index_value = self.index_value(builder, index)?;
-            let location = self.session.add_memory_location(
-                builder,
-                terminal,
-                MemoryLocationKind::Index {
-                    base,
-                    index: Some(index_value),
-                    constant_index: None,
-                    identity: brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element,
-                },
-            )?;
-            self.append_effect(
-                builder,
-                terminal,
-                SemanticEffect::MemoryStore {
-                    kind: MemoryAccessKind::Index,
-                    location,
-                    value,
-                },
-            )?;
-            if plain_assignment {
-                vec![array, index, right]
-            } else {
-                vec![left, right]
-            }
-        } else {
-            runtime_expression_children(node)
+        }
+        let evaluations = match left.kind() {
+            "identifier" => vec![right],
+            "field_access" => vec![required_field(left, "object")?, right],
+            "array_access" => vec![
+                required_field(left, "array")?,
+                required_field(left, "index")?,
+                right,
+            ],
+            _ => runtime_expression_children(node),
         };
         self.edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
             entry,
             &evaluations,
-            EdgeTarget::normal(terminal),
+            EdgeTarget::normal(evaluation_terminal),
             scope,
             stack,
         )
+    }
+
+    /// Java selects the storage address once. Shared lowering owns the
+    /// compound write; an implicit instance field additionally updates its
+    /// existing procedure-local carrier on that same normal continuation.
+    fn assignment_target(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        left: Node<'tree>,
+    ) -> Result<Option<(CompoundAssignmentTarget, Option<ValueId>)>, JavaLoweringError> {
+        let target = match left.kind() {
+            "identifier" => {
+                if let Some((value, flow)) = self.lexical_reference_binding(left) {
+                    Some((CompoundAssignmentTarget::Binding { value, flow }, None))
+                } else if let Some((member, _)) = self.static_field_locator(left) {
+                    let location = self.session.add_memory_location(
+                        builder,
+                        point,
+                        MemoryLocationKind::Static { member },
+                    )?;
+                    Some((
+                        CompoundAssignmentTarget::Memory {
+                            location,
+                            kind: MemoryAccessKind::Static,
+                        },
+                        None,
+                    ))
+                } else if let Some((location, carrier)) =
+                    self.implicit_instance_field_storage(builder, left, point)?
+                {
+                    Some((
+                        CompoundAssignmentTarget::Memory {
+                            location,
+                            kind: MemoryAccessKind::Field,
+                        },
+                        Some(carrier),
+                    ))
+                } else {
+                    None
+                }
+            }
+            "field_access" if !self.field_access_is_type_qualifier(left) => {
+                let object = required_field(left, "object")?;
+                let base = self.expression_value(builder, object, expression_value_kind(object))?;
+                let (location, kind) = self.field_memory_location(builder, point, left, base)?;
+                Some((CompoundAssignmentTarget::Memory { location, kind }, None))
+            }
+            "array_access" => {
+                let array = required_field(left, "array")?;
+                let base = self.expression_value(builder, array, expression_value_kind(array))?;
+                let index = self.index_value(builder, required_field(left, "index")?)?;
+                let location = self.session.add_memory_location(builder, point, MemoryLocationKind::Index {
+                    base, index: Some(index), constant_index: None,
+                    identity: brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element,
+                })?;
+                Some((
+                    CompoundAssignmentTarget::Memory {
+                        location,
+                        kind: MemoryAccessKind::Index,
+                    },
+                    None,
+                ))
+            }
+            _ => None,
+        };
+        if target.is_none() {
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unknown,
+                "assignment target has no resolved lexical or field binding",
+            )?;
+        }
+        Ok(target)
+    }
+
+    fn compound_assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let left = brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression(
+            required_field(node, "left")?,
+        );
+        let right = required_field(node, "right")?;
+        let operator = required_field(node, "operator")?.kind();
+        let operation = self.point(builder, node, Vec::new())?;
+        let write = self.point(builder, node, Vec::new())?;
+        let old = self.expression_value(builder, left, expression_value_kind(left))?;
+        let operand = self.expression_value(builder, right, expression_value_kind(right))?;
+        let computed = self.value(builder, operation, SemanticValueKind::Temporary)?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let left_type = self.compound_value_type(left);
+        let concatenation_call_free = self.string_compound_assignment_is_call_free(left, right);
+        if operator == "+="
+            && matches!(
+                left_type,
+                JavaCompoundType::String | JavaCompoundType::Unknown
+            )
+            && !concatenation_call_free
+        {
+            self.session.add_gap_with_impacts(
+                builder,
+                operation,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapImpacts::CALL_EVALUATION,
+                SemanticGapKind::Unknown,
+                "string compound assignment can invoke user-defined toString during conversion",
+            )?;
+        }
+        if let Some((target, carrier)) = self.assignment_target(builder, write, left)? {
+            let offset = self.compound_integer_offset(node, left, right);
+            let can_throw = self.session.append_compound_assignment(
+                builder,
+                JAVA_COMPOUND_OPERATORS,
+                operator,
+                JavaCompoundContext {
+                    left: left_type,
+                    right: self.compound_value_type(right),
+                    divisor_nonzero: java_numeric_literal(self.prepared.source(), right)
+                        .and_then(JavaNumericLiteral::integer)
+                        .is_some_and(|value| value != 0),
+                    concatenation_call_free,
+                },
+                CompoundAssignment {
+                    operation,
+                    write,
+                    old,
+                    right: operand,
+                    result: computed,
+                    target,
+                },
+                |session, builder, point, old, right, result| {
+                    if let Some(offset) = offset {
+                        session.append_effect(
+                            builder,
+                            point,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::IntegerOffset { offset },
+                                source: old,
+                                target: result,
+                            },
+                        )
+                    } else {
+                        compute_language_defined_compound_assignment(
+                            session, builder, point, old, right, result,
+                        )
+                    }
+                },
+            )?;
+            if let Some(carrier) = carrier {
+                self.assign_implicit_field_carrier(builder, write, carrier, computed)?;
+            }
+            if can_throw {
+                self.implicit_abort_edge(builder, node, operation, scope, None, stack)?;
+            }
+        } else {
+            compute_language_defined_compound_assignment(
+                &self.session,
+                builder,
+                operation,
+                old,
+                operand,
+                computed,
+            )?;
+            self.edge(builder, operation, EdgeTarget::normal(write))?;
+        }
+        self.append_effect(
+            builder,
+            write,
+            SemanticEffect::Assignment {
+                target: result,
+                value: computed,
+            },
+        )?;
+        self.edge(builder, write, next)?;
+        // The old value (including numeric unboxing) is saved before the RHS.
+        // Reuse its receiver/index values for the write even if the RHS mutates
+        // a binding used by that address.
+        let right_entry = self.point(builder, right, Vec::new())?;
+        let after_left = if left_type.may_unbox() && !matches!(left_type, JavaCompoundType::String)
+        {
+            let unbox = self.point(builder, left, Vec::new())?;
+            self.edge(builder, unbox, EdgeTarget::normal(right_entry))?;
+            self.implicit_abort_edge(builder, left, unbox, scope, None, stack)?;
+            unbox
+        } else {
+            right_entry
+        };
+        self.schedule_expressions(
+            builder,
+            right_entry,
+            &[right],
+            EdgeTarget::normal(operation),
+            scope,
+            stack,
+        )?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[left],
+            EdgeTarget::normal(after_left),
+            scope,
+            stack,
+        )
+    }
+
+    fn compound_declared_type(&self, mut node: Node<'tree>) -> Option<Node<'tree>> {
+        let mut indexes = 0;
+        while node.kind() == "array_access" {
+            indexes += 1;
+            node = node.child_by_field_name("array")?;
+        }
+        let (ty, array) = if let Some((value, _)) = self.lexical_reference_binding(node) {
+            (
+                *self.local_type_nodes.get(&value)?,
+                self.array_values.contains(&value),
+            )
+        } else {
+            let (_, field) = self.source_field_declaration(node)?;
+            (java_binding_type(field.declaration)?, field.is_array)
+        };
+        if indexes == 0 && array {
+            return None;
+        }
+        if indexes == 0 {
+            return Some(ty);
+        }
+        let dimensions = ty.child_by_field_name("dimensions")?;
+        let rank = (0..dimensions.child_count())
+            .filter(|index| {
+                dimensions
+                    .child(*index)
+                    .is_some_and(|node| node.kind() == "[")
+            })
+            .count();
+        (rank == indexes)
+            .then(|| ty.child_by_field_name("element"))
+            .flatten()
+    }
+
+    fn compound_value_type(&self, mut node: Node<'tree>) -> JavaCompoundType {
+        loop {
+            match node.kind() {
+                "parenthesized_expression" => {
+                    node = first_named_child(node).expect("parenthesized value");
+                }
+                "assignment_expression" => {
+                    node = node.child_by_field_name("left").expect("assignment left");
+                }
+                "update_expression" => {
+                    node = first_runtime_named_child(node).expect("update operand");
+                }
+                _ => break,
+            }
+        }
+        if let Some(literal) = java_numeric_literal(self.prepared.source(), node) {
+            return JavaCompoundType::Primitive(match literal {
+                JavaNumericLiteral::Int(_) => {
+                    JavaScalarType::Integral(JavaIntegralDomain::Signed(32))
+                }
+                JavaNumericLiteral::Long(_) => {
+                    JavaScalarType::Integral(JavaIntegralDomain::Signed(64))
+                }
+                JavaNumericLiteral::Float(_) => JavaScalarType::Float,
+                JavaNumericLiteral::Double(_) => JavaScalarType::Double,
+            });
+        }
+        match node.kind() {
+            "string_literal" => return JavaCompoundType::String,
+            "null_literal" => return JavaCompoundType::Null,
+            "true" | "false" => return JavaCompoundType::Primitive(JavaScalarType::Boolean),
+            "character_literal" => {
+                return JavaCompoundType::Primitive(JavaScalarType::Integral(
+                    JavaIntegralDomain::Unsigned(16),
+                ));
+            }
+            _ => {}
+        }
+        let ty = if node.kind() == "cast_expression" {
+            node.child_by_field_name("type")
+        } else {
+            self.compound_declared_type(node)
+        };
+        let Some(ty) = ty else {
+            return JavaCompoundType::Unknown;
+        };
+        if let Some(scalar) = JavaScalarType::from_type(ty) {
+            return JavaCompoundType::Primitive(scalar);
+        }
+        if matches!(ty.kind(), "type_identifier" | "scoped_type_identifier")
+            && matches!(
+                node_text(self.prepared.source(), ty),
+                Some("String" | "java.lang.String")
+            )
+        {
+            return JavaCompoundType::String;
+        }
+        JavaScalarType::from_wrapper_type(ty, self.prepared.source())
+            .map(JavaCompoundType::Boxed)
+            .unwrap_or(JavaCompoundType::Unknown)
     }
 
     fn string_compound_assignment_is_call_free(
@@ -505,25 +780,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         left: Node<'tree>,
         right: Node<'tree>,
     ) -> bool {
-        let is_string = |node: Node<'tree>| {
-            self.lexical_reference_binding(node)
-                .and_then(|(binding, _)| self.local_type_nodes.get(&binding).copied())
-                .is_some_and(|ty| {
-                    matches!(ty.kind(), "type_identifier" | "scoped_type_identifier")
-                        && matches!(
-                            node_text(self.prepared.source(), ty),
-                            Some("String" | "java.lang.String")
-                        )
-                })
-        };
+        let is_string = |node| matches!(self.compound_value_type(node), JavaCompoundType::String);
         if !is_string(left) {
             return false;
         }
         let mut pending = vec![right];
         while let Some(node) = pending.pop() {
             match node.kind() {
-                "string_literal" => {}
-                "identifier" if is_string(node) => {}
+                _ if matches!(
+                    self.compound_value_type(node),
+                    JavaCompoundType::Primitive(_) | JavaCompoundType::Null
+                ) => {}
+                _ if is_string(node) => {}
                 "binary_expression"
                     if node
                         .child_by_field_name("operator")
@@ -628,22 +896,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else if operand.kind() == "field_access" && !self.field_access_is_type_qualifier(operand)
         {
             let object = required_field(operand, "object")?;
-            let field = required_field(operand, "field")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
-            let (member, resolved) = self.memory_member_locator(field, object)?;
-            let location = self.session.add_memory_location(
-                builder,
-                terminal,
-                MemoryLocationKind::Field { base, member },
-            )?;
-            if !resolved {
-                self.add_field_identity_gap(builder, terminal, location)?;
-            }
+            let (location, kind) = self.field_memory_location(builder, terminal, operand, base)?;
             self.append_effect(
                 builder,
                 terminal,
                 SemanticEffect::MemoryStore {
-                    kind: MemoryAccessKind::Field,
+                    kind,
                     location,
                     value: computed,
                 },
@@ -684,7 +943,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         self.edge(builder, operation, EdgeTarget::normal(terminal))?;
-        self.implicit_abort_edge(builder, node, operation, scope, None, stack)?;
+        if !self
+            .static_field_locator(operand)
+            .is_some_and(|(_, primitive)| primitive.is_some())
+        {
+            self.implicit_abort_edge(builder, node, operation, scope, None, stack)?;
+        }
         self.edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
@@ -785,6 +1049,43 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 );
                 Ok(())
             }
+            ("unary_expression", _)
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "!")
+                    && condition_requires_branch_lowering(node) =>
+            {
+                let operand = required_field(node, "operand")?;
+                stack.push(Work::Condition {
+                    node: operand,
+                    entry,
+                    when_true: when_false,
+                    when_false: when_true,
+                    scope,
+                });
+                Ok(())
+            }
+            ("instanceof_expression", _) if java_pattern_has_value(node) => {
+                let operand = required_field(node, "left")?;
+                let value =
+                    self.expression_value(builder, operand, expression_value_kind(operand))?;
+                let bound = self.establish_pattern_binding(builder, node, value, when_true)?;
+                let matched = EdgeTarget {
+                    point: bound,
+                    kind: when_true.kind,
+                };
+                let decision = self.point(builder, node, Vec::new())?;
+                self.edge(builder, decision, matched)?;
+                self.edge(builder, decision, when_false)?;
+                self.record_guard(builder, decision, node, Some(matched), Some(when_false))?;
+                stack.push(Work::Expression {
+                    node,
+                    entry,
+                    next: EdgeTarget::normal(decision),
+                    scope,
+                });
+                Ok(())
+            }
             ("ternary_expression", _) => {
                 let condition = required_field(node, "condition")?;
                 let consequence = required_field(node, "consequence")?;
@@ -835,6 +1136,50 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    /// Pattern bindings receive the saved tested value only on the selected
+    /// successful edge. The non-null fact belongs to that establishment, not
+    /// to a procedure-global assumption that could outlive reassignment.
+    fn establish_pattern_binding(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        pattern: Node<'tree>,
+        value: ValueId,
+        next: EdgeTarget,
+    ) -> Result<ProgramPointId, JavaLoweringError> {
+        let name = brokk_bifrost_jvm::java::structural::java_pattern_binding_name(pattern)
+            .expect("simple pattern binder");
+        let text = node_text(self.prepared.source(), name).expect("source-backed pattern name");
+        let target = self
+            .local_declaration_value(text, name.start_byte())
+            .expect("pattern local was inventoried");
+        let point = self.point(builder, pattern, Vec::new())?;
+        self.append_effect(builder, point, SemanticEffect::Assignment { target, value })?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source: value,
+                target,
+            },
+        )?;
+        self.edge(builder, point, next)?;
+        self.session.add_guard_fact(
+            builder,
+            point,
+            GuardPredicate::NullComparison {
+                null_on_true: false,
+            },
+            Some(target),
+            Some(GuardArm {
+                target_point: next.point,
+                kind: next.kind,
+            }),
+            None,
+        )?;
+        Ok(point)
+    }
+
     /// Publish one normalized guard fact for a decision the lowerer just made.
     ///
     /// A predicate is published only when Java's own structured syntax
@@ -858,7 +1203,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let guard = match self.normalize_condition(builder, condition)? {
             Some(normalized) => normalized,
-            None => NormalizedGuard::folded(
+            None => NormalizedConditionGuard::folded(
                 GuardPredicate::Opaque {
                     digest: GuardConditionDigest::from_syntax_kind(condition.kind()),
                 },
@@ -872,11 +1217,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             ),
         };
         // A guard's true arm is the edge taken when its predicate holds.
-        let (holds, fails) = if guard.holds_on_false_arm {
-            (when_false, when_true)
-        } else {
-            (when_true, when_false)
-        };
+        let (holds, fails) = guard.arms(when_true, when_false);
         self.session.add_guard_fact(
             builder,
             point,
@@ -905,41 +1246,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         condition: Node<'tree>,
-    ) -> Result<Option<NormalizedGuard>, JavaLoweringError> {
-        let mut cursor = condition;
-        let mut negated = false;
-        loop {
-            match cursor.kind() {
-                "parenthesized_expression" => {
-                    let Some(inner) = first_named_child(cursor) else {
-                        return Ok(None);
-                    };
-                    cursor = inner;
-                }
-                "unary_expression"
-                    if cursor
-                        .child_by_field_name("operator")
-                        .is_some_and(|operator| operator.kind() == "!") =>
-                {
-                    let Some(operand) = cursor.child_by_field_name("operand") else {
-                        return Ok(None);
-                    };
-                    negated = !negated;
-                    cursor = operand;
-                }
-                _ => break,
-            }
+    ) -> Result<Option<NormalizedConditionGuard>, JavaLoweringError> {
+        use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
+        let syntax = brokk_bifrost_jvm::JavaKnowledge
+            .guard_condition_syntax()
+            .expect("Java supplies guard grammar shapes");
+        let Ok((cursor, negated)) = peel_guard_condition(condition, syntax) else {
+            return Ok(None);
+        };
+        // This rule is disjoint from local, literal and comparison rules by
+        // the peeled terminal's node kind. A null boxed Boolean exits through
+        // the existing exceptional path before either decision arm is taken.
+        if let Some(guard) = normalize_direct_call_guard(condition, syntax, |call| {
+            self.expression_value(builder, call, expression_value_kind(call))
+        })? {
+            return Ok(Some(guard));
         }
 
         match cursor.kind() {
             "true" => {
-                return Ok(Some(NormalizedGuard::folded(
+                return Ok(Some(NormalizedConditionGuard::folded(
                     GuardPredicate::ConstantBoolean { value: !negated },
                     None,
                 )));
             }
             "false" => {
-                return Ok(Some(NormalizedGuard::folded(
+                return Ok(Some(NormalizedConditionGuard::folded(
                     GuardPredicate::ConstantBoolean { value: negated },
                     None,
                 )));
@@ -955,7 +1287,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 let subject =
                     self.expression_value(builder, cursor, expression_value_kind(cursor))?;
-                return Ok(Some(NormalizedGuard {
+                return Ok(Some(NormalizedConditionGuard {
                     predicate: GuardPredicate::Truthy { value: subject },
                     subject: Some(subject),
                     holds_on_false_arm: negated,
@@ -992,7 +1324,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 _ => None,
             };
             if let Some(value) = value {
-                return Ok(Some(NormalizedGuard::folded(
+                return Ok(Some(NormalizedConditionGuard::folded(
                     GuardPredicate::ConstantBoolean {
                         value: value != negated,
                     },
@@ -1007,7 +1339,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             };
             if let Some(nan_on_true) = nan_on_true {
                 let subject = self.expression_value(builder, left, expression_value_kind(left))?;
-                return Ok(Some(NormalizedGuard::folded(
+                return Ok(Some(NormalizedConditionGuard::folded(
                     GuardPredicate::NanComparison {
                         nan_on_true: nan_on_true != negated,
                     },
@@ -1054,13 +1386,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if floating {
                 // A NaN subject fails both `x < c` and the negated relation
                 // `x >= c`, so `!(x < c)` keeps `x < c` on swapped arms.
-                return Ok(Some(NormalizedGuard {
+                return Ok(Some(NormalizedConditionGuard {
                     predicate: GuardPredicate::OrderedFloatComparison { relation, constant },
                     subject: Some(subject),
                     holds_on_false_arm: negated,
                 }));
             }
-            return Ok(Some(NormalizedGuard::folded(
+            return Ok(Some(NormalizedConditionGuard::folded(
                 GuardPredicate::OrderedIntegerComparison {
                     relation: if negated { relation.negate() } else { relation },
                     constant,
@@ -1078,7 +1410,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // Two reads of the same reference, including a boxed value, compare
         // by identity without unboxing.
         if same_binding.is_some_and(|binding| self.has_reflexive_equality_binding(binding)) {
-            return Ok(Some(NormalizedGuard::folded(
+            return Ok(Some(NormalizedConditionGuard::folded(
                 GuardPredicate::ConstantBoolean {
                     value: equal_on_true,
                 },
@@ -1098,7 +1430,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some(subject) = null_subject {
             let subject =
                 self.expression_value(builder, subject, expression_value_kind(subject))?;
-            return Ok(Some(NormalizedGuard::folded(
+            return Ok(Some(NormalizedConditionGuard::folded(
                 GuardPredicate::NullComparison {
                     null_on_true: equal_on_true,
                 },
@@ -1134,7 +1466,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .unwrap_or(SemanticValueKind::Constant);
         let constant = self.expression_value(builder, constant, constant_kind)?;
         let subject = self.expression_value(builder, subject, expression_value_kind(subject))?;
-        Ok(Some(NormalizedGuard::folded(
+        Ok(Some(NormalizedConditionGuard::folded(
             GuardPredicate::ConstantEquality {
                 negated: !equal_on_true,
                 constant,
@@ -1917,12 +2249,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // (the only case `emit_lexical_input_flow` above leaves as a
             // no-op) may still name an implicit `this.field` access.
             self.emit_implicit_field_load(builder, node, entry, result)?;
-            // A name that an `instanceof` or record pattern binds has no
-            // lowered binding, so a reference to it that resolves to no local
-            // or parameter holds a value with no source.
+            if self.static_field_may_initialize(node) {
+                self.implicit_abort_edge(builder, node, entry, scope, None, stack)?;
+            }
+            // A lexical pattern identity does not manufacture a value when
+            // record extraction or a capture relay was not established.
             if self.lexical_reference_binding(node).is_none()
-                && node_text(self.prepared.source(), node)
-                    .is_some_and(|name| self.pattern_variable_names.contains(name))
+                && (self.pattern_definition_at(node).is_some()
+                    || self.pattern_visibility_unproven(node)
+                    || (node_text(self.prepared.source(), node)
+                        .is_some_and(|name| self.pattern_variable_names.contains(name))
+                        && self.source_field_declaration(node).is_none()))
             {
                 self.add_gap(
                     builder,
@@ -1930,7 +2267,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapSubject::Value(result),
                     SemanticCapability::Values,
                     SemanticGapKind::Unsupported,
-                    "a pattern variable has no lowered binding, so its value has no source",
+                    "pattern value establishment or record component extraction is not represented",
                 )?;
             }
         }
@@ -2137,31 +2474,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "field_access" => {
                 let object = required_field(node, "object")?;
-                let field = required_field(node, "field")?;
                 let access = self.point(builder, node, Vec::new())?;
                 let base = self.expression_value(builder, object, expression_value_kind(object))?;
-                let (member, resolved) = self.memory_member_locator(field, object)?;
-                let location = self.session.add_memory_location(
-                    builder,
-                    access,
-                    MemoryLocationKind::Field { base, member },
-                )?;
-                if !resolved {
-                    self.add_field_identity_gap(builder, access, location)?;
-                }
+                let (location, kind) = self.field_memory_location(builder, access, node, base)?;
                 self.append_effect(
                     builder,
                     access,
                     SemanticEffect::MemoryLoad {
-                        kind: MemoryAccessKind::Field,
+                        kind,
                         location,
                         result,
                     },
                 )?;
                 self.edge(builder, access, next)?;
-                if !self.expression_is_non_null(object) {
-                    // NullPointerException. Its message names the expression,
-                    // not the receiver's value, so the exception carries none.
+                if (kind == MemoryAccessKind::Static && self.static_field_may_initialize(node))
+                    || (kind != MemoryAccessKind::Static && !self.expression_is_non_null(object))
+                {
+                    // Static access can initialize another declaring class.
+                    // Only an instance access dereferences the qualifier.
                     self.implicit_abort_edge(builder, node, access, scope, None, stack)?;
                 }
                 self.schedule_expressions(
@@ -3030,11 +3360,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "pattern compatibility requires type refinement",
                     )?;
                 }
+                let mut pattern_stack = vec![*switch_label];
+                let mut simple_patterns = Vec::new();
+                while let Some(pattern) = pattern_stack.pop() {
+                    if java_pattern_has_value(pattern) {
+                        simple_patterns.push(pattern);
+                    }
+                    pattern_stack.extend(named_children(pattern));
+                }
+                let selected = if simple_patterns.is_empty() {
+                    comparison
+                } else {
+                    self.point(builder, *switch_label, Vec::new())?
+                };
                 let case_edge_source = if let Some(guard) = switch_label_guard(*switch_label) {
                     let guard_entry = self.point(builder, guard, Vec::new())?;
                     self.edge(
                         builder,
-                        comparison,
+                        selected,
                         EdgeTarget {
                             point: guard_entry,
                             kind: ControlEdgeKind::ConditionalTrue,
@@ -3060,7 +3403,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     self.edge(
                         builder,
-                        comparison,
+                        selected,
                         EdgeTarget {
                             point: arm_entries[arm_index],
                             kind: ControlEdgeKind::SwitchCase,
@@ -3069,8 +3412,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     if default_point == Some(no_match.point) {
                         default_edge_source = Some(comparison);
                     }
-                    comparison
+                    selected
                 };
+                if selected != comparison {
+                    let mut next = EdgeTarget::normal(selected);
+                    for pattern in simple_patterns.into_iter().rev() {
+                        next = EdgeTarget::normal(
+                            self.establish_pattern_binding(builder, pattern, selector, next)?,
+                        );
+                    }
+                    self.edge(
+                        builder,
+                        comparison,
+                        EdgeTarget {
+                            point: next.point,
+                            kind: ControlEdgeKind::ConditionalTrue,
+                        },
+                    )?;
+                }
                 for case_value in named_children(*switch_label)
                     .into_iter()
                     .filter(|child| child.kind() != "guard")
@@ -3543,6 +3902,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: argument_values.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -4201,6 +4561,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     point: invoke,
                     callee,
                     receiver: Some(receiver),
+                    member_selection: None,
                     arguments: Box::new([]),
                     normal_results: Box::new([]),
                     result: None,

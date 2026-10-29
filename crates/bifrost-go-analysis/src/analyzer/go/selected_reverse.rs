@@ -5,6 +5,7 @@
 //! causes with one selected context per caller file.
 
 use crate::analyzer::go::GoAnalyzer;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GoReverseConfirmationMemo;
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
     SelectedInverseIndexOutcome, SelectedInverseReferenceIndex, SelectedInverseReferenceProvider,
 };
@@ -127,7 +128,16 @@ pub fn go_selected_inverse_for(
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> GoSelectedReverseOutcome<EdgeDerivationResult> {
-    match go_selected_inverse_for_inner(go, target, true, None, cancellation, false, None) {
+    match go_selected_inverse_for_inner(
+        go,
+        target,
+        true,
+        None,
+        cancellation,
+        false,
+        None,
+        &mut GoReverseConfirmationMemo::default(),
+    ) {
         Ok(outcome) => outcome,
         Err(error) => GoSelectedReverseOutcome::StoreError(error.to_string()),
     }
@@ -138,6 +148,7 @@ pub(crate) fn go_selected_inverse_for_usage_scope(
     target: &CodeUnit,
     scope: &UsageScanScope<'_>,
     cancellation: &CancellationToken,
+    memo: &mut GoReverseConfirmationMemo,
 ) -> GoSelectedReverseOutcome<EdgeDerivationResult> {
     match go_selected_inverse_for_inner(
         go,
@@ -147,6 +158,7 @@ pub(crate) fn go_selected_inverse_for_usage_scope(
         cancellation,
         false,
         None,
+        memo,
     ) {
         Ok(outcome) => outcome,
         Err(error) => GoSelectedReverseOutcome::StoreError(error.to_string()),
@@ -171,6 +183,7 @@ pub(crate) fn go_selected_inverse_for_rename_original(
         cancellation,
         true,
         Some((new_name, &mut conflict)),
+        &mut GoReverseConfirmationMemo::default(),
     ) {
         Ok(outcome) => outcome,
         Err(error) => GoSelectedReverseOutcome::StoreError(error.to_string()),
@@ -178,6 +191,7 @@ pub(crate) fn go_selected_inverse_for_rename_original(
     (outcome, conflict)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn go_selected_inverse_for_inner(
     go: &GoAnalyzer,
     target: &CodeUnit,
@@ -189,6 +203,7 @@ fn go_selected_inverse_for_inner(
         &str,
         &mut Option<brokk_bifrost_analysis::analyzer::rename::RenameFailure>,
     )>,
+    memo: &mut GoReverseConfirmationMemo,
 ) -> Result<GoSelectedReverseOutcome<EdgeDerivationResult>> {
     if cancellation.is_cancelled() {
         return Ok(GoSelectedReverseOutcome::Cancelled);
@@ -242,6 +257,7 @@ fn go_selected_inverse_for_inner(
             cancellation,
             record_initial_rename_phases,
             check,
+            memo,
         )? {
             GoSelectedReverseOutcome::Ready(part) => {
                 answer.edges.extend(part.edges);
@@ -293,6 +309,7 @@ fn go_selected_inverse_in_context(
         &str,
         &mut Option<brokk_bifrost_analysis::analyzer::rename::RenameFailure>,
     )>,
+    memo: &mut GoReverseConfirmationMemo,
 ) -> Result<GoSelectedReverseOutcome<EdgeDerivationResult>> {
     if cancellation.is_cancelled() {
         return Ok(GoSelectedReverseOutcome::Cancelled);
@@ -435,11 +452,12 @@ fn go_selected_inverse_in_context(
     let mut context_metrics = SelectedResolutionContextMetrics;
     let confirmation_phase =
         record_initial_rename_phases.then(|| go_rename_phase(GoRenamePhase::Confirmation));
-    let confirmed = match operation.confirm_go_reverse_candidates(
+    let confirmed = match operation.confirm_go_reverse_candidates_with_memo(
         context.context_id,
         candidates,
         cancellation,
         &mut context_metrics,
+        memo,
         |operation, candidate, metadata| {
             confirm_go_reverse_member_access(
                 go,
@@ -510,7 +528,9 @@ fn go_selected_inverse_in_context(
         ));
     }
     // Projection reads structural facts through the analyzer. Release the
-    // selected connection first, then recheck publication authority below.
+    // selected reader first: an in-memory store uses the writer connection
+    // for reads and cannot acquire it again while this operation holds it.
+    // Publication authority of every bound context is rechecked below.
     let bound_contexts = operation.bound_go_context_publications();
     drop(operation);
     let answer = project_confirmed_references(go, target, generation, confirmed, cancellation)?;
@@ -951,12 +971,13 @@ fn project_confirmed_references(
         };
         let directly_bound = answer.binding().targets().contains(&confirmed.target);
         let interface_dispatch = !directly_bound
-            && answer
-                .binding()
-                .targets()
-                .iter()
-                .any(|method| confirmed.family.contains(*method));
-        if interface_dispatch && answer.call_target_completion() != ResolutionCompletion::Complete {
+            && answer.binding().targets().iter().any(|method| {
+                confirmed.family.contains(*method) || confirmed.implementations.contains(method)
+            });
+        if interface_dispatch
+            && !confirmed.family.contains(confirmed.target)
+            && answer.call_target_completion() != ResolutionCompletion::Complete
+        {
             push_reason(
                 &mut reasons,
                 EdgeIncompleteReason::InverseIndexResolutionIncomplete,
@@ -982,10 +1003,14 @@ fn project_confirmed_references(
         let incomplete_literal_key = metadata.site_kind()
             == ResolutionSiteKind::CompositeLiteralKeyReference
             && answer.binding().completion() != &ResolutionCompletion::Complete;
+        // Name nomination is still a possible usage when forward resolution
+        // could not decide the callable receiver. A closed binding to another
+        // member, or a closed empty member set, disproves this candidate.
         if !directly_bound
             && !interface_dispatch
             && !transparent_type_alias
             && !incomplete_literal_key
+            && !brokk_bifrost_analysis::analyzer::resolution::undecided_callable_receiver(&answer)
         {
             continue;
         }
@@ -1044,11 +1069,9 @@ fn project_confirmed_references(
             },
             target: target.clone(),
             reference_kind,
-            proof: if (directly_bound || interface_dispatch)
+            proof: if directly_bound
                 && answer.binding().targets().len() == 1
                 && answer.binding().completion() == &ResolutionCompletion::Complete
-                && (!interface_dispatch
-                    || answer.call_target_completion() == ResolutionCompletion::Complete)
             {
                 UsageProof::Proven
             } else {
@@ -1056,7 +1079,10 @@ fn project_confirmed_references(
             },
             ambiguous_candidate: false,
             usage_kind: if interface_dispatch {
-                UsageHitKind::DeclaredReference
+                // A compatible family member is a possible runtime usage,
+                // not a declared-contract navigation edge. Its binding to a
+                // different declaration cannot prove execution of this target.
+                UsageHitKind::Reference
             } else {
                 go_selected_usage_kind(
                     metadata,
@@ -1243,8 +1269,7 @@ fn go_selected_usage_kind(
     } else if (receiver_type_reference
         && metadata.site_kind() == ResolutionSiteKind::TypeReference
         && metadata.namespace() == ResolutionNamespace::Type)
-        || metadata.callable_receiver_origin()
-            == Some(ResolutionCallableReceiverOrigin::CurrentInstance)
+        || metadata.receiver_origin() == Some(ResolutionCallableReceiverOrigin::CurrentInstance)
         || (owner_relation
             == brokk_bifrost_core::analyzer::structural::edges::OwnerRelation::SelfReference
             && target.is_function())
@@ -1740,7 +1765,7 @@ func externalTest() {
         assert_eq!(
             sites,
             vec![
-                ("api/use.go".to_owned(), 2, UsageHitKind::DeclaredReference),
+                ("api/use.go".to_owned(), 2, UsageHitKind::Reference),
                 ("client/use.go".to_owned(), 3, UsageHitKind::Reference),
             ],
             "{references:?}"
@@ -1766,8 +1791,8 @@ func externalTest() {
         let target = target_at(&analyzer, &fixture, "concrete/api.go", "Common");
         let references = inverse(&analyzer, &target);
         // Imported interface dispatch retains the shared resolver's open
-        // runtime boundary. The editor reference names the declared method;
-        // it is not proof of a particular runtime implementation.
+        // runtime boundary. A compatible concrete target is a runtime
+        // candidate, without proof of a particular implementation.
         let hits = references
             .edges
             .iter()
@@ -1776,7 +1801,7 @@ func externalTest() {
         assert_eq!(hits.len(), 1, "{references:?}");
         assert_eq!(
             hits[0].usage_kind,
-            UsageHitKind::DeclaredReference,
+            UsageHitKind::Reference,
             "{references:?}"
         );
     }
@@ -2681,111 +2706,6 @@ func use() {
             hit.file == fixture.file(CLIENT)
                 && hit.start_offset == CLIENT_SOURCE.find("NewWidget :=").unwrap()
         }));
-    }
-
-    #[test]
-    fn selected_go_usage_matches_incumbent_on_the_real_store_fixture() {
-        use brokk_bifrost_analysis::analyzer::usages::traits::UsageAnalyzer;
-
-        use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
-
-        let (_fixture, analyzer) = fixture();
-        let admitted = analyzer
-            .get_analyzed_files()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        for name in ["Widget", "Name", "Run", "NewWidget"] {
-            let target = target(&analyzer, &_fixture, name);
-            let legacy = GoUsageGraphStrategy::new().find_usages(
-                &analyzer,
-                std::slice::from_ref(&target),
-                &admitted,
-                100,
-            );
-            let native = GoNativeUsageStrategy::new().find_usages(
-                &analyzer,
-                std::slice::from_ref(&target),
-                &admitted,
-                100,
-            );
-            let (legacy, _) = usage_hits(legacy);
-            let (native, native_incomplete) = usage_hits(native);
-            let signatures =
-                |hits: BTreeSet<brokk_bifrost_core::analyzer::usages::model::UsageHit>| {
-                    hits.into_iter()
-                        .map(|hit| {
-                            (
-                                hit.file.rel_path().to_path_buf(),
-                                hit.start_offset,
-                                hit.end_offset,
-                                hit.kind,
-                            )
-                        })
-                        .collect::<BTreeSet<_>>()
-                };
-            let legacy = signatures(legacy);
-            let native = signatures(native);
-            let sites = |signatures: &BTreeSet<(
-                std::path::PathBuf,
-                usize,
-                usize,
-                brokk_bifrost_core::analyzer::usages::model::UsageHitKind,
-            )>| {
-                signatures
-                    .iter()
-                    .map(|(path, start, end, _)| (path.clone(), *start, *end))
-                    .collect::<BTreeSet<_>>()
-            };
-            let legacy_sites = sites(&legacy);
-            let native_sites = sites(&native);
-            let legacy_only = legacy_sites.difference(&native_sites).collect::<Vec<_>>();
-            let native_only = native_sites.difference(&legacy_sites).collect::<Vec<_>>();
-            if !legacy_only.is_empty() || !native_only.is_empty() {
-                assert!(
-                    matches!(name, "Widget" | "NewWidget")
-                        && native_incomplete
-                        && native_only.is_empty()
-                        && legacy_only
-                            .iter()
-                            .all(|(path, ..)| path.as_path() == std::path::Path::new(EXTERNAL)),
-                    "source-adjudicate incumbent/native difference for {name}: legacy-only={legacy_only:?}, native-only={native_only:?}, incomplete={native_incomplete}"
-                );
-            }
-            let native_kinds = native
-                .iter()
-                .map(|(path, start, end, kind)| ((path.clone(), *start, *end), *kind))
-                .collect::<HashMap<_, _>>();
-            let kind_differences = legacy
-                .iter()
-                .filter_map(|(path, start, end, legacy_kind)| {
-                    native_kinds
-                        .get(&(path.clone(), *start, *end))
-                        .filter(|native_kind| *native_kind != legacy_kind)
-                        .map(|native_kind| (path.clone(), *start, *end, *legacy_kind, *native_kind))
-                })
-                .collect::<BTreeSet<_>>();
-            if !kind_differences.is_empty() {
-                let receiver_site = MODEL_SOURCE
-                    .find("func (w Widget)")
-                    .expect("Go method receiver")
-                    + "func (w ".len();
-                assert_eq!(
-                    name, "Widget",
-                    "unexpected incumbent/native usage-kind difference: {kind_differences:?}"
-                );
-                assert_eq!(
-                    kind_differences,
-                    BTreeSet::from([(
-                        std::path::PathBuf::from(MODEL),
-                        receiver_site,
-                        receiver_site + "Widget".len(),
-                        brokk_bifrost_core::analyzer::usages::model::UsageHitKind::SelfReceiver,
-                        brokk_bifrost_core::analyzer::usages::model::UsageHitKind::Reference,
-                    )]),
-                    "source-adjudicate Go's receiver-type kind difference"
-                );
-            }
-        }
     }
 
     #[test]

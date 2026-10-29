@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, error::Error, fmt, hash::Hash, mem::size_of_val, sync::Arc};
 
+use crate::taint::TaintClassSet;
+
 use crate::ordering::{compare_call_sites as compare_calls, compare_points, compare_procedures};
 
 use crate::analyzer::semantic::{
@@ -88,6 +90,8 @@ pub struct ValueFlowEdgeKillSpec {
     pub kind: ControlEdgeKind,
     pub carrier: ValueFlowCarrier,
     pub sources: ValueFlowSourceListId,
+    /// Optional taint-label narrowing; None removes all labels of the selected sources.
+    pub labels: Option<TaintClassSet>,
 }
 
 /// One policy-authored point-local carrier relation.
@@ -126,6 +130,7 @@ impl ValueFlowLocalRuleSpec {
 pub(crate) struct BoundValueFlowEdgeKill {
     pub carrier: ValueFlowCarrierId,
     pub sources: ValueFlowSourceListId,
+    pub labels: Option<TaintClassSet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -350,7 +355,7 @@ pub(crate) struct ValueFlowFallbackSummaryRule {
 pub(crate) struct ValueFlowLocationBindingSummaryRule {
     call: CallSiteId,
     port: SummaryPort,
-    carrier: ValueFlowCarrierKey,
+    carrier: Option<ValueFlowCarrierKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -360,6 +365,7 @@ pub(crate) struct ValueFlowEdgeKillSummaryRule {
     kind: ControlEdgeKind,
     carrier: ValueFlowCarrierKey,
     sources: Box<[ValueFlowEventKey]>,
+    labels: Option<TaintClassSet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -439,6 +445,7 @@ impl ValueFlowSourceBehaviorIdentity {
             digest.push(kill.kind.label().as_bytes());
             push_summary_carrier(&mut digest, &kill.carrier, Some(procedure));
             push_summary_bool(&mut digest, kill.sources.binary_search(source).is_ok());
+            push_edge_kill_labels(&mut digest, kill.labels.as_ref());
         }
         digest.finish()
     }
@@ -601,7 +608,7 @@ impl ValueFlowCarrierSummaryIdentity {
             digest.push(b"location_binding");
             digest.push(&binding.call.get().to_le_bytes());
             push_summary_port(&mut digest, &binding.port);
-            push_summary_carrier(&mut digest, &binding.carrier, procedure);
+            push_optional_carrier(&mut digest, binding.carrier.as_ref(), procedure);
         }
 
         push_summary_len(&mut digest, self.conditional_sources.len());
@@ -641,6 +648,7 @@ impl ValueFlowCarrierSummaryIdentity {
             ProgramPointId,
             ControlEdgeKind,
             &ValueFlowCarrierKey,
+            Option<&TaintClassSet>,
             Vec<&ValueFlowEventKey>,
         )>::new();
         for kill in &self.edge_kills {
@@ -651,26 +659,36 @@ impl ValueFlowCarrierSummaryIdentity {
                     internal_source_owners.is_none_or(|owners| owners.contains_key(source))
                 })
                 .collect::<Vec<_>>();
-            if let Some((point, target, kind, carrier, retained)) = normalized_kills.last_mut()
+            if let Some((point, target, kind, carrier, labels, retained)) =
+                normalized_kills.last_mut()
                 && *point == kill.point
                 && *target == kill.target
                 && *kind == kill.kind
                 && *carrier == &kill.carrier
+                && *labels == kill.labels.as_ref()
             {
                 retained.extend(sources);
                 retained.sort_unstable();
                 retained.dedup();
             } else {
-                normalized_kills.push((kill.point, kill.target, kill.kind, &kill.carrier, sources));
+                normalized_kills.push((
+                    kill.point,
+                    kill.target,
+                    kill.kind,
+                    &kill.carrier,
+                    kill.labels.as_ref(),
+                    sources,
+                ));
             }
         }
         push_summary_len(&mut digest, normalized_kills.len());
-        for (point, target, kind, carrier, sources) in normalized_kills {
+        for (point, target, kind, carrier, labels, sources) in normalized_kills {
             digest.push(b"edge_kill");
             digest.push(&point.get().to_le_bytes());
             digest.push(&target.get().to_le_bytes());
             digest.push(kind.label().as_bytes());
             push_summary_carrier(&mut digest, carrier, procedure);
+            push_edge_kill_labels(&mut digest, labels);
             // An external source arrives as the reusable entry placeholder;
             // its exact membership is keyed by that entry's behavior
             // partition. Internal sources remain fixed procedure semantics
@@ -736,7 +754,12 @@ impl ValueFlowCarrierSummaryIdentity {
         let location_bindings = size_of_val(self.location_bindings.as_ref()).saturating_add(
             self.location_bindings
                 .iter()
-                .map(|binding| binding.carrier.retained_bytes())
+                .map(|binding| {
+                    binding
+                        .carrier
+                        .as_ref()
+                        .map_or(0, ValueFlowCarrierKey::retained_bytes)
+                })
                 .fold(0usize, usize::saturating_add),
         );
         let edge_kills = size_of_val(self.edge_kills.as_ref()).saturating_add(
@@ -746,6 +769,11 @@ impl ValueFlowCarrierSummaryIdentity {
                     kill.carrier
                         .retained_bytes()
                         .saturating_add(size_of_val(kill.sources.as_ref()))
+                        .saturating_add(
+                            kill.labels
+                                .as_ref()
+                                .map_or(0, TaintClassSet::retained_heap_bytes),
+                        )
                         .saturating_add(
                             kill.sources
                                 .iter()
@@ -990,6 +1018,16 @@ fn classify_snapshot_openness<'snapshot>(
     resolved_external_calls: &HashSet<CallSiteHandle>,
 ) -> SnapshotOpenness {
     let procedure = snapshot.procedure();
+    let infeasible = procedure_infeasible_points(procedure.semantics());
+    if snapshot.member_receivers().iter().any(|receiver| {
+        !receiver.selection_is_complete()
+            && procedure
+                .semantics()
+                .call_site(receiver.call().id())
+                .is_some_and(|call| infeasible.binary_search(&call.point).is_err())
+    }) {
+        return SnapshotOpenness::Blocked(None);
+    }
     // A typed gap may outrank an unproven retained relation in the oracle's
     // top-level outcome, but refining that gap does not prove the relation.
     // Preserve the relation's independent quality floor before considering
@@ -1575,7 +1613,8 @@ impl ValueFlowReturnedCallable {
 struct BoundSummaryLocationBinding {
     call: CallSiteHandle,
     port: SummaryPort,
-    carrier: ValueFlowCarrierId,
+    // None explicitly keeps an unproven receiver storage port unbound.
+    carrier: Option<ValueFlowCarrierId>,
 }
 
 impl ValueFlowCuratedCallModel {
@@ -1784,6 +1823,7 @@ fn same_propagation_configuration(left: &ValueFlowPlan, right: &ValueFlowPlan) -
                 && a.target == b.target
                 && a.kind == b.kind
                 && a.carrier == b.carrier
+                && a.labels == b.labels
                 && left.source_list_keys(a.sources) == right.source_list_keys(b.sources)
         })
         && left.snapshot_procedures == right.snapshot_procedures
@@ -2009,6 +2049,10 @@ impl Hash for ValueFlowPlan {
             kill.kind.hash(state);
             kill.carrier.hash(state);
             self.source_list_keys(kill.sources).hash(state);
+            if let Some(labels) = &kill.labels {
+                b"edge_kill_labels".hash(state);
+                labels.hash(state);
+            }
         }
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
@@ -2116,7 +2160,7 @@ impl ValueFlowPlan {
         relevant.extend(
             self.summary_location_bindings
                 .iter()
-                .map(|binding| binding.carrier),
+                .filter_map(|binding| binding.carrier),
         );
         // The root's procedure ports and all abstract locations are public
         // summary and heap boundaries. They may be demanded by a caller,
@@ -2489,6 +2533,28 @@ impl ValueFlowPlan {
         let mut first_incomplete_cause: Option<ValueFlowIncompleteCause> = None;
         let mut carrier_candidates = Vec::new();
         let mut relation_count = 0usize;
+        let mut unavailable_receivers = Vec::new();
+        for input in &snapshots {
+            for receiver in input.value().member_receivers() {
+                if receiver.preparation()
+                    != Some(crate::analyzer::semantic::MemberReceiverPreparation::CopyValue)
+                    && receiver.storage().is_empty()
+                {
+                    unavailable_receivers.push(BoundSummaryLocationBinding {
+                        call: receiver.call().clone(),
+                        port: SummaryPort::Receiver,
+                        carrier: None,
+                    });
+                }
+            }
+        }
+        unavailable_receivers.sort_by(|left, right| {
+            compare_calls(&left.call, &right.call).then_with(|| left.port.cmp(&right.port))
+        });
+        unavailable_receivers.dedup();
+        if unavailable_receivers.len() > MAX_SUMMARY_BOUNDARY_BINDINGS {
+            return Err(ValueFlowPlanError::LimitExceeded);
+        }
         let mut resolved_external_calls = resolved_external_calls;
         resolved_external_calls.sort_by(compare_calls);
         resolved_external_calls
@@ -2732,14 +2798,30 @@ impl ValueFlowPlan {
         // conservative value rules and never acquire an optimistic location
         // transfer here.
         for input in &bindings {
-            append_call_location_rules(
+            if !append_call_location_rules(
                 input.value(),
                 &snapshots,
                 limits.max_carriers,
                 limits.max_access_path,
                 &mut caller_origins,
                 &mut pending_call_location_rules,
-            )?;
+            )? {
+                discovery_complete = false;
+                non_snapshot_discovery_complete = false;
+                discovery_status = discovery_status.merge(SemanticInputStatus::Unknown);
+                if !incomplete_binding_calls
+                    .iter()
+                    .any(|call| compare_calls(call, input.value().call()) == Ordering::Equal)
+                {
+                    incomplete_binding_calls.push(input.value().call().clone());
+                }
+                first_incomplete_cause.get_or_insert_with(|| {
+                    ValueFlowIncompleteCause::CallBindingCoverage {
+                        call: input.value().call().clone(),
+                        callee: input.value().callee().clone(),
+                    }
+                });
+            }
         }
         drop(caller_origins);
         relation_count = relation_count.saturating_add(pending_call_location_rules.len());
@@ -2848,6 +2930,7 @@ impl ValueFlowPlan {
             }
         }
         local_rules.sort_by(compare_local_rules);
+        local_rules.dedup();
 
         let mut call_rules = Vec::new();
         for input in &bindings {
@@ -2942,7 +3025,7 @@ impl ValueFlowPlan {
             call_rule_reverse_index,
             fallback_profiles: fallback_profiles.into_boxed_slice(),
             fallback_locations,
-            summary_location_bindings: Box::default(),
+            summary_location_bindings: unavailable_receivers.into_boxed_slice(),
             source_key_order: source_key_order(&bound_sources),
             sources: bound_sources.into_boxed_slice(),
             source_index,
@@ -3234,19 +3317,37 @@ impl ValueFlowPlan {
         {
             return Err(ValueFlowPlanError::DuplicateSummaryLocationBinding);
         }
-        self.summary_location_bindings = bindings
-            .into_iter()
-            .map(|binding| {
-                Ok(BoundSummaryLocationBinding {
-                    call: binding.call,
-                    port: binding.port,
-                    carrier: self
-                        .carrier_id(&binding.carrier)
+        // Preserve internal unavailable-receiver markers while replacing the
+        // caller-supplied heap/capture bindings, as this setter always did.
+        let mut bound = self
+            .summary_location_bindings
+            .iter()
+            .filter(|binding| binding.port == SummaryPort::Receiver)
+            .cloned()
+            .collect::<Vec<_>>();
+        for binding in bindings {
+            bound.push(BoundSummaryLocationBinding {
+                call: binding.call,
+                port: binding.port,
+                carrier: Some(
+                    self.carrier_id(&binding.carrier)
                         .ok_or(ValueFlowPlanError::MissingCarrier)?,
-                })
-            })
-            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?
-            .into_boxed_slice();
+                ),
+            });
+        }
+        if bound.len() > MAX_SUMMARY_BOUNDARY_BINDINGS {
+            return Err(ValueFlowPlanError::LimitExceeded);
+        }
+        bound.sort_by(|left, right| {
+            compare_calls(&left.call, &right.call).then_with(|| left.port.cmp(&right.port))
+        });
+        if bound
+            .windows(2)
+            .any(|pair| pair[0].call == pair[1].call && pair[0].port == pair[1].port)
+        {
+            return Err(ValueFlowPlanError::DuplicateSummaryLocationBinding);
+        }
+        self.summary_location_bindings = bound.into_boxed_slice();
         Ok(self)
     }
 
@@ -3524,7 +3625,10 @@ impl ValueFlowPlan {
         for binding in &self.summary_location_bindings {
             binding.call.hash(state);
             binding.port.hash(state);
-            self.carrier_keys[binding.carrier.index()].hash(state);
+            binding
+                .carrier
+                .map(|carrier| &self.carrier_keys[carrier.index()])
+                .hash(state);
         }
         for kill in &self.edge_kills {
             kill.point.hash(state);
@@ -3669,7 +3773,7 @@ impl ValueFlowPlan {
         }
         let mut summary_location_bindings = self.summary_location_bindings.to_vec();
         for binding in &mut summary_location_bindings {
-            binding.carrier = remap(binding.carrier)?;
+            binding.carrier = binding.carrier.map(remap).transpose()?;
         }
 
         let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids)?;
@@ -3797,7 +3901,7 @@ impl ValueFlowPlan {
         }
         let mut summary_location_bindings = first.summary_location_bindings.to_vec();
         for binding in &mut summary_location_bindings {
-            binding.carrier = remap(binding.carrier)?;
+            binding.carrier = binding.carrier.map(remap).transpose()?;
         }
 
         let mut source_origins = plans
@@ -5035,7 +5139,9 @@ impl ValueFlowPlan {
                 .push(ValueFlowLocationBindingSummaryRule {
                     call: binding.call.id(),
                     port: binding.port.clone(),
-                    carrier: self.carrier_keys[binding.carrier.index()].clone(),
+                    carrier: binding
+                        .carrier
+                        .map(|carrier| self.carrier_keys[carrier.index()].clone()),
                 });
         }
         for source in &self.sources {
@@ -5075,6 +5181,7 @@ impl ValueFlowPlan {
                     target: kill.target,
                     kind: kill.kind,
                     carrier: self.carrier_keys[carrier.index()].clone(),
+                    labels: kill.labels.clone(),
                     sources: self
                         .source_list_keys(kill.sources)
                         .into_iter()
@@ -5294,14 +5401,23 @@ impl ValueFlowPlan {
         port: &SummaryPort,
         actual_to_formal: SummaryCallBinding<'_>,
     ) -> Option<ValueFlowCarrierId> {
-        if matches!(port, SummaryPort::Capture(_) | SummaryPort::Heap(_)) {
-            return self
+        if matches!(
+            port,
+            SummaryPort::Receiver | SummaryPort::Capture(_) | SummaryPort::Heap(_)
+        ) {
+            let binding = self
                 .summary_location_bindings
                 .binary_search_by(|binding| {
                     compare_calls(&binding.call, call).then_with(|| binding.port.cmp(port))
                 })
                 .ok()
-                .map(|index| self.summary_location_bindings[index].carrier);
+                .map(|index| &self.summary_location_bindings[index]);
+            if let Some(binding) = binding {
+                return binding.carrier;
+            }
+            if !matches!(port, SummaryPort::Receiver) {
+                return None;
+            }
         }
         let value = self.summary_port_value(call, port, actual_to_formal)?;
         self.carrier_id(&ValueFlowCarrier::for_value(value))
@@ -5316,12 +5432,28 @@ impl ValueFlowPlan {
         port: &SummaryPort,
         actual_to_formal: SummaryCallBinding<'_>,
     ) -> Option<crate::analyzer::semantic::ValueHandle> {
+        if matches!(port, SummaryPort::Receiver) && !self.receiver_storage_is_available(call) {
+            return None;
+        }
         call_port_value(
             call,
             port,
             actual_to_formal,
             self.is_resolved_external_constructor(call),
         )
+    }
+
+    /// Whether receiver-consuming models have a proven storage binding.
+    /// A fresh-result model that never uses the receiver port needs no binding.
+    pub fn receiver_storage_is_available(&self, call: &CallSiteHandle) -> bool {
+        !self
+            .summary_location_bindings
+            .binary_search_by(|binding| {
+                compare_calls(&binding.call, call)
+                    .then_with(|| binding.port.cmp(&SummaryPort::Receiver))
+            })
+            .ok()
+            .is_some_and(|index| self.summary_location_bindings[index].carrier.is_none())
     }
 
     fn is_resolved_external_call(&self, call: &CallSiteHandle) -> bool {
@@ -5833,6 +5965,12 @@ impl ValueFlowPlan {
                 kind,
             })
             .map_or(&[], Box::as_ref)
+    }
+
+    pub(crate) fn edge_kill_label_sets(&self) -> impl Iterator<Item = &TaintClassSet> {
+        self.edge_kills
+            .iter()
+            .filter_map(|kill| kill.labels.as_ref())
     }
 
     /// Whether the forward-only client is required because propagation
@@ -7558,6 +7696,7 @@ struct CallerOriginIndex<'snapshot> {
         Vec<&'snapshot crate::analyzer::semantic::ValueFlowRelation>,
     >,
     member_owners: HashSet<&'snapshot crate::analyzer::semantic::ValueHandle>,
+    addressed_places: HashMap<crate::analyzer::semantic::ValueId, Vec<Option<AccessPathRoot>>>,
 }
 
 impl<'snapshot> CallerOriginIndexes<'snapshot> {
@@ -7586,10 +7725,23 @@ impl<'snapshot> CallerOriginIndexes<'snapshot> {
                     member_owners.insert(owner);
                 }
             }
+            let mut addressed_places = HashMap::<_, Vec<_>>::default();
+            for alias in snapshot.procedure().semantics().pointer_aliases() {
+                if snapshot
+                    .procedure()
+                    .semantics()
+                    .value(alias.pointer)
+                    .is_some_and(|value| value.kind == SemanticValueKind::Address)
+                {
+                    addressed_places.entry(alias.pointer).or_default().push(
+                        crate::analyzer::semantic::workspace_oracle::heap::exact_addressed_pointer_root(snapshot.procedure(), alias));
+                }
+            }
             self.entries.push(CallerOriginIndex {
                 snapshot,
                 incoming,
                 member_owners,
+                addressed_places,
             });
             self.entries.len() - 1
         };
@@ -7665,6 +7817,33 @@ fn caller_origin_paths<'snapshot>(
         }
         if current.value.procedure() != snapshot.procedure() {
             search.incomplete = true;
+            continue;
+        }
+        // Taking an address does not load the value of the place. A pointer
+        // receiver shares that place's storage, including fields written by
+        // its body; rooting it at the Address temporary loses those writes.
+        if let Some(places) = index.addressed_places.get(&current.value.id()) {
+            for root in places {
+                let Some(root) = root else {
+                    search.incomplete = true;
+                    continue;
+                };
+                let location = AbstractObject::new(root.clone(), ObjectCardinality::Unknown)
+                    .and_then(|object| {
+                        AccessPath::exact(root.clone(), Vec::new(), path_limits)
+                            .and_then(|path| AbstractLocation::new(object, path))
+                    });
+                match location {
+                    Ok(location) => append_origin(
+                        &mut search,
+                        location,
+                        current.proof.clone(),
+                        current.completeness.clone(),
+                        max_origins,
+                    ),
+                    Err(_) => search.incomplete = true,
+                }
+            }
             continue;
         }
         // Explicit destination members are the caller's current snapshot.
@@ -7765,7 +7944,7 @@ fn append_projected_location_rules<'snapshot>(
     inputs: ProjectedLocationRuleInputs<'_, 'snapshot>,
     caller_origins: &mut CallerOriginIndexes<'snapshot>,
     output: &mut Vec<PendingCallFlowRule>,
-) {
+) -> bool {
     let ProjectedLocationRuleInputs {
         bindings,
         actual,
@@ -7779,7 +7958,7 @@ fn append_projected_location_rules<'snapshot>(
     } = inputs;
     // Scalar-only formals have no location projection to consume an origin.
     if callee_locations.is_empty() {
-        return;
+        return true;
     }
     let origins = match kind {
         // Reading the formal's member at entry observes the caller's member,
@@ -7803,8 +7982,9 @@ fn append_projected_location_rules<'snapshot>(
         }
     };
     if origins.origins.is_empty() {
-        return;
+        return !origins.incomplete;
     }
+    let mut complete = !origins.incomplete;
     let multiple_origins = origins.incomplete || origins.origins.len() > 1;
     for origin in origins.origins {
         for formal_location in callee_locations {
@@ -7815,7 +7995,10 @@ fn append_projected_location_rules<'snapshot>(
                 path_limits,
             ) {
                 Ok(location) => location,
-                Err(_) => continue,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
             let mut proof = bindings.candidate().proof().clone();
             proof = merge_call_rule_proof(&proof, mapping_proof.clone());
@@ -7866,6 +8049,7 @@ fn append_projected_location_rules<'snapshot>(
             });
         }
     }
+    complete
 }
 
 fn append_call_location_rules<'snapshot>(
@@ -7875,20 +8059,34 @@ fn append_call_location_rules<'snapshot>(
     max_access_path: usize,
     caller_origins: &mut CallerOriginIndexes<'snapshot>,
     output: &mut Vec<PendingCallFlowRule>,
-) -> Result<(), ValueFlowPlanError> {
+) -> Result<bool, ValueFlowPlanError> {
     let caller_snapshot = snapshot_for_procedure(snapshots, bindings.call().procedure());
     let callee_snapshot = snapshot_for_procedure(snapshots, bindings.callee());
     let Some(callee_snapshot) = callee_snapshot else {
-        return Ok(());
+        return Ok(true);
     };
     let path_limits = call_location_oracle_limits(max_access_path);
     let (coverage_proof, coverage_completeness) = binding_coverage_quality(bindings);
+    let mut complete = true;
     for binding in bindings.bindings() {
         match binding {
             CallBinding::Receiver { actual, formal, .. } => {
                 let actual = CallArgumentEndpoint::Value(actual.clone());
                 let formal_locations = formal_location_carriers(callee_snapshot, formal);
-                append_projected_location_rules(
+                if matches!(
+                    bindings.candidate().member_receiver_preparation(),
+                    Some(
+                        crate::analyzer::semantic::MemberReceiverPreparation::CopyValue
+                            | crate::analyzer::semantic::MemberReceiverPreparation::CopyPointee
+                    )
+                ) {
+                    // Per-file unknown selection cannot snapshot these fields.
+                    // Preserve the copy barrier and open coverage until the
+                    // selected receiver's copied contents are represented.
+                    complete &= formal_locations.is_empty();
+                    continue;
+                }
+                complete &= append_projected_location_rules(
                     ProjectedLocationRuleInputs {
                         bindings,
                         actual: &actual,
@@ -7903,7 +8101,7 @@ fn append_call_location_rules<'snapshot>(
                     caller_origins,
                     output,
                 );
-                append_projected_location_rules(
+                complete &= append_projected_location_rules(
                     ProjectedLocationRuleInputs {
                         bindings,
                         actual: &actual,
@@ -7934,7 +8132,7 @@ fn append_call_location_rules<'snapshot>(
                     );
                     let mapping_proof =
                         merge_call_rule_proof(&coverage_proof, mapping.proof().clone());
-                    append_projected_location_rules(
+                    complete &= append_projected_location_rules(
                         ProjectedLocationRuleInputs {
                             bindings,
                             actual,
@@ -7949,7 +8147,7 @@ fn append_call_location_rules<'snapshot>(
                         caller_origins,
                         output,
                     );
-                    append_projected_location_rules(
+                    complete &= append_projected_location_rules(
                         ProjectedLocationRuleInputs {
                             bindings,
                             actual,
@@ -7969,7 +8167,7 @@ fn append_call_location_rules<'snapshot>(
             CallBinding::NormalReturn { formal, result, .. } => {
                 let actual = CallArgumentEndpoint::Value(result.clone());
                 let formal_locations = formal_location_carriers(callee_snapshot, formal);
-                append_projected_location_rules(
+                complete &= append_projected_location_rules(
                     ProjectedLocationRuleInputs {
                         bindings,
                         actual: &actual,
@@ -7988,7 +8186,7 @@ fn append_call_location_rules<'snapshot>(
             CallBinding::ImplicitArgument { .. } | CallBinding::ExceptionalReturn { .. } => {}
         }
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// Spell one callee member selector the way the caller spells the same member.
@@ -8276,16 +8474,9 @@ fn argument_carrier(
     match endpoint {
         CallArgumentEndpoint::Value(value) => Ok(ValueFlowCarrier::for_value(value.clone())),
         CallArgumentEndpoint::Location { location, .. } => {
-            let cardinality = if matches!(location.path().root(), AccessPathRoot::TypeSummary(_)) {
-                ObjectCardinality::Summary
-            } else {
-                ObjectCardinality::Unknown
-            };
-            let object = AbstractObject::new(location.path().root().clone(), cardinality)
+            let endpoint = ValueFlowEndpoint::for_path(location.path().clone())
                 .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
-            let location = AbstractLocation::new(object, location.path().clone())
-                .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
-            Ok(ValueFlowCarrier::Location(Box::new(location)))
+            Ok(ValueFlowCarrier::from(endpoint))
         }
     }
 }
@@ -8629,8 +8820,12 @@ fn same_summary_location_bindings(left: &ValueFlowPlan, right: &ValueFlowPlan) -
             .all(|(left_binding, right_binding)| {
                 left_binding.call == right_binding.call
                     && left_binding.port == right_binding.port
-                    && left.carrier_keys[left_binding.carrier.index()]
-                        == right.carrier_keys[right_binding.carrier.index()]
+                    && left_binding
+                        .carrier
+                        .map(|carrier| &left.carrier_keys[carrier.index()])
+                        == right_binding
+                            .carrier
+                            .map(|carrier| &right.carrier_keys[carrier.index()])
             })
 }
 
@@ -8775,6 +8970,18 @@ fn call_rule_rank(kind: CallFlowRuleKind) -> u8 {
     }
 }
 
+// None deliberately emits no bytes: automatic comparison kills retain their identity.
+fn push_edge_kill_labels(digest: &mut LengthDelimitedDigest, labels: Option<&TaintClassSet>) {
+    if let Some(labels) = labels {
+        digest.push(b"edge_kill_labels");
+        digest.push(&labels.universe().bytes());
+        digest.push(&(labels.class_count() as u64).to_le_bytes());
+        for class in labels.iter_dense() {
+            digest.push(&class.get().to_le_bytes());
+        }
+    }
+}
+
 fn compare_edge_kills(
     left: &ValueFlowEdgeKillSpec,
     right: &ValueFlowEdgeKillSpec,
@@ -8790,6 +8997,7 @@ fn compare_edge_kills(
                 .ok()
                 .cmp(&right.carrier.stable_key().ok())
         })
+        .then_with(|| left.labels.cmp(&right.labels))
         .then_with(|| {
             let keys = |list| {
                 let mut keys = lists
@@ -8814,6 +9022,7 @@ fn normalize_summary_edge_kills(
             && previous.target == row.target
             && previous.kind == row.kind
             && previous.carrier == row.carrier
+            && previous.labels == row.labels
         {
             let mut sources = std::mem::take(&mut previous.sources).into_vec();
             sources.extend(row.sources);
@@ -8894,6 +9103,7 @@ fn build_edge_kill_index(
             .push(BoundValueFlowEdgeKill {
                 carrier,
                 sources: spec.sources,
+                labels: spec.labels.clone(),
             });
     }
     Ok(EdgeKillIndex {
@@ -9021,7 +9231,7 @@ mod activation_properties {
             sources.specs[count as usize] = source(count).when_sources_reach(list);
             let kill = ValueFlowEdgeKillSpec {
                 point: entry.clone(), target: entry.id(), kind: ControlEdgeKind::Normal,
-                carrier: carrier.clone(), sources: invalid,
+                carrier: carrier.clone(), sources: invalid, labels: None,
             };
             prop_assert!(matches!(validate_source_lists(&sources.specs, &[kill], &sources.lists), Err(ValueFlowPlanError::InvalidEdgeKill)));
 

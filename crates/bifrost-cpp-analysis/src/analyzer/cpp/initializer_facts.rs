@@ -4,6 +4,7 @@
 //! remain the flow layer's responsibility; the RQL relation joins these rows
 //! to exact establish/read events from that layer.
 
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_analysis::analyzer::common::exact_span;
@@ -50,7 +51,7 @@ pub fn cpp_initializer_candidates(
         return complete();
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
 
     let file = ProjectFile::new(
@@ -66,11 +67,13 @@ pub fn cpp_initializer_candidates(
     let syntax = match syntax {
         Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax,
         Some(StructuralSyntaxLimitedOutcome::Exceeded { .. }) => {
-            return unavailable("source_budget_exhausted");
+            return unavailable(derivation_reason::SOURCE_BUDGET_EXHAUSTED);
         }
-        Some(StructuralSyntaxLimitedOutcome::Cancelled) => return unavailable("cancelled"),
+        Some(StructuralSyntaxLimitedOutcome::Cancelled) => {
+            return unavailable(derivation_reason::CANCELLED);
+        }
         Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
-            return unavailable("prepared_syntax_unavailable");
+            return unavailable(derivation_reason::PREPARED_SYNTAX_UNAVAILABLE);
         }
     };
     let Ok(syntax) = validate_prepared_syntax_source_for_procedure(
@@ -79,14 +82,14 @@ pub fn cpp_initializer_candidates(
         &file,
         syntax.into_inner(),
     ) else {
-        return unavailable("source_identity_mismatch");
+        return unavailable(derivation_reason::SOURCE_IDENTITY_MISMATCH);
     };
     let semantics = procedure.semantics();
     let Some(mapping) = semantics.source_mapping(semantics.source()) else {
-        return unavailable("procedure_mapping_missing");
+        return unavailable(derivation_reason::PROCEDURE_MAPPING_MISSING);
     };
     if mapping.kind != SourceMappingKind::Exact {
-        return unavailable("procedure_mapping_inexact");
+        return unavailable(derivation_reason::PROCEDURE_MAPPING_INEXACT);
     }
     let span = mapping.locator.anchor().span();
     let Some(procedure_node) = syntax
@@ -94,16 +97,16 @@ pub fn cpp_initializer_candidates(
         .root_node()
         .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
     else {
-        return unavailable("procedure_syntax_missing");
+        return unavailable(derivation_reason::PROCEDURE_SYNTAX_MISSING);
     };
     if !exact_span(span, procedure_node) || procedure_node.has_error() {
-        return unavailable("procedure_syntax_inexact");
+        return unavailable(derivation_reason::PROCEDURE_SYNTAX_INEXACT);
     }
 
     let Some(cpp) = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
         crate::analyzer::cpp::CppAnalyzer,
     >(workspace.analyzer()) else {
-        return unavailable("cpp_analyzer_unavailable");
+        return unavailable(derivation_reason::CPP_ANALYZER_UNAVAILABLE);
     };
     let is_c_source = file
         .rel_path()
@@ -122,7 +125,7 @@ pub fn cpp_initializer_candidates(
     let mut stack = vec![procedure_node];
     while let Some(node) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
+            return unavailable(derivation_reason::CANCELLED);
         }
         if node.id() != procedure_node.id()
             && matches!(node.kind(), "function_definition" | "lambda_expression")
@@ -205,9 +208,9 @@ pub fn cpp_initializer_candidates(
         rows,
         complete: !(has_preprocessing || has_macro_hazard),
         reason: if has_preprocessing {
-            Some("preprocessing_present")
+            Some(derivation_reason::PREPROCESSING_PRESENT)
         } else {
-            has_macro_hazard.then_some("macro_possible")
+            has_macro_hazard.then_some(derivation_reason::MACRO_POSSIBLE)
         },
     }
 }

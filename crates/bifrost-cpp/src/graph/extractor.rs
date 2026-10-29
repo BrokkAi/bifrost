@@ -818,6 +818,13 @@ fn seed_binding_from_type_or_value(
                     cpp_type_text_pointer_depth(text),
                 );
             }
+            if let Some(unit) = function_local_type_for_node(node, ctx) {
+                return CppScanBinding::from_type_name(
+                    name,
+                    unit,
+                    cpp_type_text_pointer_depth(text),
+                );
+            }
             // Bare type names need lexical ownership before the coarse visible-name
             // fallback (two namespaces can each declare `CopyResult`). Template
             // references keep the specialization-aware resolver first because a
@@ -1435,6 +1442,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }) {
         return;
     }
+    if !local_class_target_reachable(node, ctx) {
+        return;
+    }
     if !recovered_type
         && !recovered_qualified_friend
         && !recovered_exported_class_base
@@ -1769,6 +1779,44 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.recovered_sentinel_scope(hit_node).as_deref(),
         )
     };
+    // When the qualifier's template arguments decide the owner, the resolution
+    // above already looked the member up in that owner. The target-guided
+    // fallbacks below read the qualifier without its arguments and would
+    // prove the primary template's member instead, so they do not run; an
+    // owner the arguments cannot decide leaves the reference unproven
+    // (#6902).
+    match select_qualifier_owner(
+        node,
+        is_globally_qualified_cpp_name(node),
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
+        QualifierOwnerSelection::Unchanged => {}
+        QualifierOwnerSelection::Selected(_) => {
+            if !matches!(
+                &type_resolution,
+                LexicalTypeResolution::Resolved { unit, candidates, .. }
+                    if type_resolution_matches_target(node, unit, candidates, ctx)
+            ) {
+                return;
+            }
+        }
+        QualifierOwnerSelection::Ambiguous => {
+            // Only the member the terminal names depends on the undecided
+            // owner; a qualifier or alias target keeps its ordinary handling.
+            if let Some(terminal) = cpp_name_component_nodes(node)
+                .and_then(|components| components.last().copied())
+                .filter(|terminal| node_text(*terminal, ctx.source) == ctx.spec.target.identifier())
+            {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(terminal, ctx);
+                return;
+            }
+        }
+    }
     match type_resolution {
         LexicalTypeResolution::Resolved {
             unit, candidates, ..
@@ -1824,6 +1872,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             {
                 *ctx.raw_match_count += 1;
                 push_type_hit(leaf, ctx);
+            } else if guarded_alias_alternatives_include_target(hit_node, ctx) {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(type_reference_hit_node(hit_node), ctx);
             }
             return;
         }
@@ -2066,6 +2117,23 @@ fn target_guided_nested_type_terminal_hit<'tree>(
         && namespace_import_can_name_nested_target(complete, ctx)
     {
         return Some(node);
+    }
+    // The owner-spelling paths below compare the qualifier's names without
+    // its template arguments, which only names the right owner when those
+    // arguments select the primary template (#6902).
+    if !matches!(
+        select_qualifier_owner(
+            complete,
+            owner.global,
+            &ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+        ),
+        QualifierOwnerSelection::Unchanged
+    ) {
+        return None;
     }
 
     let target_owner = ctx
@@ -2497,9 +2565,13 @@ fn member_pointer_owner_components<'tree>(
         return None;
     }
     let declarator = node.child_by_field_name("name")?;
+    // brokk-tree-sitter-cpp 0.24.7 names a member pointer with the pointer
+    // declarator of its context: `pointer_declarator` in declarations,
+    // parameters and fields, `pointer_type_declarator` in typedefs, and
+    // `abstract_pointer_declarator` in `R (Owner::*)(...)`.
     if !matches!(
         declarator.kind(),
-        "pointer_type_declarator" | "abstract_pointer_declarator"
+        "pointer_declarator" | "pointer_type_declarator" | "abstract_pointer_declarator"
     ) {
         return None;
     }
@@ -2937,6 +3009,57 @@ fn qualified_type_scope_contains_template(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+/// Whether an undecided reference to a conditional alias family keeps the
+/// target as one of its alternatives. Guards that select no arm leave every
+/// compatible arm, and the type it names, a candidate rather than proof
+/// (#6902).
+fn guarded_alias_alternatives_include_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some((components, global)) = type_reference_components(node, ctx.source) else {
+        return false;
+    };
+    // The arms are candidates whose guards need not hold here, so look them up
+    // without the in-context visibility filter that would drop them.
+    let lexical_scope = if global {
+        Vec::new()
+    } else {
+        match cached_enclosing_lexical_scope_components_with_unresolved_owner(
+            node,
+            &ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            true,
+            false,
+            Some(&ctx.lexical_scope_cache),
+        ) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => return false,
+        }
+    };
+    let LexicalTypeResolution::Resolved { candidates, .. } = ctx
+        .visibility
+        .resolve_type_components_lexically_for_forward(
+            &ctx.analyzer,
+            ctx.file,
+            &components,
+            global,
+            &lexical_scope,
+        )
+    else {
+        return false;
+    };
+    let Some(GuardedAliasSelection::Alternatives(alternatives)) = ctx
+        .visibility
+        .guarded_alias_selection_at_reference(&ctx.analyzer, ctx.file, node, &candidates)
+    else {
+        return false;
+    };
+    alternatives
+        .iter()
+        .chain(&candidates)
+        .any(|unit| same_visible_symbol(unit, &ctx.spec.target))
 }
 
 fn physically_visible_type_target<'a>(ctx: &'a ScanCtx<'_>) -> Option<&'a CodeUnit> {
@@ -4483,6 +4606,21 @@ fn qualified_reference_selects_type_candidate(
         return false;
     }
     let candidate_components = canonical_cpp_scope_components(candidate);
+    match select_qualifier_owner(
+        reference,
+        global,
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
+        QualifierOwnerSelection::Unchanged => {}
+        QualifierOwnerSelection::Selected(selected) => {
+            return selected == candidate_components;
+        }
+        QualifierOwnerSelection::Ambiguous => return false,
+    }
     let lexical_scope = ctx.recovered_sentinel_scope(reference).unwrap_or_else(|| {
         match enclosing_lexical_scope_components(
             reference,
@@ -5110,6 +5248,23 @@ fn target_guided_missing_dependent_nested_type_leaf<'tree>(
     if node_text(name, ctx.source) != ctx.spec.target.identifier() {
         return None;
     }
+    // Template arguments that select a specialization, or that cannot be
+    // bound, decide the owner; the owner-spelling fallback below reads the
+    // qualifier without them and would name the primary template (#6902).
+    if !matches!(
+        select_qualifier_owner(
+            node,
+            is_globally_qualified_cpp_name(node),
+            &ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+        ),
+        QualifierOwnerSelection::Unchanged
+    ) {
+        return None;
+    }
     let owner_target = ctx.analyzer.parent_of(&ctx.spec.target)?;
     if !owner_target.is_class() {
         return None;
@@ -5618,6 +5773,33 @@ fn nearer_type_name_shadows_structured_reference(node: Node<'_>, ctx: &ScanCtx<'
     false
 }
 
+/// Whether a type spelling can name a function-local class target at all.
+///
+/// Only block-scope lookup of an unqualified head reaches a local class, so
+/// the spelling must not be `::`-rooted and its head must resolve to the
+/// target or to a local class that encloses it. Anything else names some
+/// other type, and neither a proven nor an unproven hit may claim it. Every
+/// other target is unaffected.
+fn local_class_target_reachable(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if !ctx.spec.target.is_class() || !is_function_local_unit(&ctx.spec.target) {
+        return true;
+    }
+    type_reference_components(node, ctx.source).is_some_and(|(components, global)| {
+        !global
+            && matches!(
+                function_local_type_resolution(
+                    &ctx.analyzer,
+                    ctx.file,
+                    node,
+                    &components[..1],
+                    ctx.source,
+                ),
+                Some(LexicalTypeResolution::Resolved { unit, .. })
+                    if ctx.spec.target.fq().starts_with(unit.fq())
+            )
+    })
+}
+
 fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if cpp_active_template_type_parameter(
         node,
@@ -5626,6 +5808,48 @@ fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         &ctx.ancestry,
     ) {
         return true;
+    }
+    // A function-local class target is itself one of the local declarations
+    // the walk below treats as shadows. A spelling reaches a local class only
+    // through block-scope lookup of its head: a `::`-rooted name never does,
+    // and an unqualified name or a qualifier head is shadowed exactly when
+    // that lookup names another declaration. A later component of a qualified
+    // name is decided by ordinary resolution, which applies the same lookup
+    // to its head.
+    if ctx.spec.target.is_class() && is_function_local_unit(&ctx.spec.target) {
+        let qualifier = ctx.ancestry.parent(node).filter(|parent| {
+            matches!(
+                parent.kind(),
+                "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+            )
+        });
+        if let Some(qualifier) = qualifier {
+            let scope = qualifier.child_by_field_name("scope");
+            if scope.is_none() {
+                return true;
+            }
+            let is_head = scope == Some(node)
+                && ctx.ancestry.parent(qualifier).is_none_or(|outer| {
+                    !matches!(
+                        outer.kind(),
+                        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                    ) || outer.child_by_field_name("scope") == Some(qualifier)
+                });
+            if !is_head {
+                return false;
+            }
+        }
+        return !matches!(
+            function_local_type_resolution(
+                &ctx.analyzer,
+                ctx.file,
+                node,
+                &[ctx.spec.target.identifier().to_string()],
+                ctx.source,
+            ),
+            Some(LexicalTypeResolution::Resolved { unit, .. })
+                if same_visible_symbol(&unit, &ctx.spec.target)
+        );
     }
     let Some(callable) = nearest_callable_scope(node) else {
         return false;
@@ -6159,6 +6383,40 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .callable_arity_at(node.start_byte())
                 .is_none_or(|expected| expected.accepts(declaration_constructor_arity(node, ctx)))
         {
+            // The spelling names the owner in some configuration. The type
+            // node's structured resolution applies this declaration's guards
+            // to conditional alias arms, so an arm naming another class is not
+            // this constructor's site (#6902).
+            let structured = node.child_by_field_name("type").map(|type_node| {
+                resolve_type_node_lexically_for_target(
+                    type_node,
+                    &ctx.analyzer,
+                    ctx.visibility,
+                    &ctx.ordinary_type_imports,
+                    ctx.file,
+                    ctx.source,
+                    owner,
+                    Some(&ctx.lexical_scope_cache),
+                    ctx.recovered_sentinel_scope(type_node).as_deref(),
+                )
+            });
+            match structured {
+                Some(LexicalTypeResolution::Resolved {
+                    unit, candidates, ..
+                }) if !same_visible_symbol(&unit, owner)
+                    && !candidates
+                        .iter()
+                        .any(|candidate| same_visible_symbol(candidate, owner)) =>
+                {
+                    return;
+                }
+                Some(LexicalTypeResolution::Ambiguous) => {
+                    push_unproven_hit(node, ctx);
+                    return;
+                }
+                Some(LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing)
+                | None => {}
+            }
             match constructor_overload_selection(node, ctx) {
                 ConstructorOverloadSelection::Target => push_hit(node, ctx),
                 ConstructorOverloadSelection::Ambiguous => push_unproven_hit(node, ctx),
@@ -9009,6 +9267,9 @@ fn resolve_receiver_type_node(
     ctx: &ScanCtx<'_>,
 ) -> std::result::Result<Option<CodeUnit>, CppTemplateResolutionError> {
     let type_node = receiver_type_node_base(type_node);
+    if let Some(local) = function_local_type_for_node(type_node, ctx) {
+        return Ok(local);
+    }
     if let Some(unit) = ctx
         .visibility
         .resolve_type_node_result(ctx.file, type_node, ctx.source)?
@@ -9896,6 +10157,20 @@ fn type_reference_components(node: Node<'_>, source: &str) -> Option<(Vec<String
     (!components.is_empty()).then_some((components, is_globally_qualified_cpp_name(node)))
 }
 
+/// The block-scope answer for a type node, when a local class declaration
+/// decides it: `Some(None)` when a block declares the name but it denotes no
+/// minted class, so callers must not fall back to an outer type.
+fn function_local_type_for_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Option<CodeUnit>> {
+    let (components, global) = type_reference_components(node, ctx.source)?;
+    if global {
+        return None;
+    }
+    match function_local_type_resolution(&ctx.analyzer, ctx.file, node, &components, ctx.source)? {
+        LexicalTypeResolution::Resolved { unit, .. } => Some(Some(unit)),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => Some(None),
+    }
+}
+
 pub fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Vec<String> {
     let mut namespaces = Vec::new();
     for parent in enclosing_cpp_namespace_nodes(node) {
@@ -10433,6 +10708,189 @@ fn cached_indexed_enclosing_class_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Op
     .find(|unit| is_indexed_class_owner(&ctx.analyzer, unit))
 }
 
+/// How a qualified type's qualifier selects the owner of the member it names.
+pub enum QualifierOwnerSelection {
+    /// No qualifier applies template arguments or names an alias, or the
+    /// arguments select the primary template, which the ordinary component
+    /// lookup already names.
+    Unchanged,
+    /// The qualifier selects an owner the plain spelling does not reach: a
+    /// specialization its arguments name, or the class an alias qualifier
+    /// denotes. Look the rest of the path up through the owner's own scope
+    /// components.
+    Selected(Vec<String>),
+    /// The arguments cannot be bound, more than one specialization applies,
+    /// or the alias arms the reference admits disagree. The reference stays
+    /// unproven rather than falling back to the primary template's member.
+    Ambiguous,
+}
+
+/// Select the owner a qualifier such as `Owner<int>` in `Owner<int>::Alias`
+/// names before its member is looked up (#6902 item 9).
+///
+/// Component lookup reads a qualified name as plain spellings, so it drops
+/// the qualifier's template arguments and always reaches the primary
+/// template's member. The qualifier prefix is resolved lexically to its
+/// primary template, and the shared argument binding and specialization
+/// selection ([`VisibilityIndex::resolve_template_arguments`]) pick the class
+/// those arguments name, the same choice an unqualified `Owner<int>` makes.
+/// Only the last qualifier that applies arguments is selected; a deeper one,
+/// as in `A<int>::B<char>::C`, keeps the ordinary lookup. A qualifier without
+/// arguments may still be an alias of a specialization
+/// ([`select_alias_qualifier_owner`]).
+#[allow(clippy::too_many_arguments)]
+pub fn select_qualifier_owner(
+    node: Node<'_>,
+    global: bool,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+) -> QualifierOwnerSelection {
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+    ) {
+        return QualifierOwnerSelection::Unchanged;
+    }
+    let Some(components) = cpp_name_component_nodes(node) else {
+        return QualifierOwnerSelection::Unchanged;
+    };
+    fn templated(component: Node<'_>) -> Option<Node<'_>> {
+        component.parent().filter(|parent| {
+            parent.kind() == "template_type"
+                && parent.child_by_field_name("name") == Some(component)
+        })
+    }
+    let qualifiers = &components[..components.len().saturating_sub(1)];
+    let Some((index, template)) = qualifiers
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, component)| templated(*component).map(|template| (index, template)))
+    else {
+        return select_alias_qualifier_owner(
+            node,
+            &components,
+            global,
+            analyzer,
+            visibility,
+            file,
+            source,
+        );
+    };
+    if qualifiers[..index]
+        .iter()
+        .any(|component| templated(*component).is_some())
+    {
+        return QualifierOwnerSelection::Unchanged;
+    }
+    let Some(arguments) = cpp_template_reference_arguments(template, source) else {
+        return QualifierOwnerSelection::Unchanged;
+    };
+    let names = components
+        .iter()
+        .map(|component| node_text(*component, source).to_owned())
+        .collect::<Vec<_>>();
+    let primary = match resolve_type_components_lexically_at(
+        node,
+        &names[..=index],
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } => unit,
+        LexicalTypeResolution::Ambiguous => return QualifierOwnerSelection::Ambiguous,
+        LexicalTypeResolution::Missing => return QualifierOwnerSelection::Unchanged,
+    };
+    match visibility.resolve_template_arguments(file, primary.clone(), &arguments) {
+        Ok(owner) if same_visible_symbol(&owner, &primary) => QualifierOwnerSelection::Unchanged,
+        Ok(owner) => {
+            let mut redirected = canonical_cpp_scope_components(&owner);
+            redirected.extend_from_slice(&names[index + 1..]);
+            QualifierOwnerSelection::Selected(redirected)
+        }
+        Err(_) => QualifierOwnerSelection::Ambiguous,
+    }
+}
+
+/// The owner an alias qualifier such as `Selected` in `Selected::Alias`
+/// denotes.
+///
+/// `using Selected = Owner<int>;` keeps the arguments in the alias's own
+/// declaration, so the qualifier resolves through the alias to the selected
+/// specialization, never to the primary template that the spelling `Owner`
+/// would reach. The alias declarations the reference's own guards admit are
+/// read directly: conditional arms that select different owners leave the
+/// member undecided, and only arms that all agree decide it.
+fn select_alias_qualifier_owner(
+    node: Node<'_>,
+    components: &[Node<'_>],
+    global: bool,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    source: &str,
+) -> QualifierOwnerSelection {
+    let Some((terminal, qualifiers)) = components.split_last() else {
+        return QualifierOwnerSelection::Unchanged;
+    };
+    let Some(last_qualifier) = qualifiers.last() else {
+        return QualifierOwnerSelection::Unchanged;
+    };
+    let names = qualifiers
+        .iter()
+        .map(|component| node_text(*component, source).to_owned())
+        .collect::<Vec<_>>();
+    let declared = visibility
+        .visible_identifier_candidates(file, node_text(*last_qualifier, source))
+        .filter(|candidate| declared_type_alias(analyzer, candidate))
+        .filter(|candidate| {
+            let scope = canonical_cpp_scope_components(candidate);
+            if global {
+                scope == names
+            } else {
+                scope.ends_with(&names)
+            }
+        })
+        .collect::<Vec<_>>();
+    let aliases = declared
+        .iter()
+        .filter(|candidate| {
+            visibility.external_type_candidate_visible_in_context(analyzer, file, candidate, node)
+        })
+        .map(|alias| visibility.canonical_type_unit_in_context(analyzer, file, node, alias))
+        .collect::<Vec<_>>();
+    let Some((first, rest)) = aliases.split_first() else {
+        return QualifierOwnerSelection::Unchanged;
+    };
+    let Some(owner) = first else {
+        return QualifierOwnerSelection::Unchanged;
+    };
+    if !rest.iter().all(|target| {
+        target
+            .as_ref()
+            .is_some_and(|target| same_visible_symbol(target, owner))
+    }) {
+        return QualifierOwnerSelection::Ambiguous;
+    }
+    // Ordinary lookup already follows an unconditional alias to a class it
+    // can name by spelling. It cannot name a specialization, and conditional
+    // arms leave it undecided even when the arms the reference admits agree,
+    // so the decided owner is used in those two cases only.
+    let conditional = aliases.len() < declared.len();
+    if !owner.is_class() || (!conditional && !visibility.is_template_specialization(owner)) {
+        return QualifierOwnerSelection::Unchanged;
+    }
+    let mut redirected = canonical_cpp_scope_components(owner);
+    redirected.push(node_text(*terminal, source).to_owned());
+    QualifierOwnerSelection::Selected(redirected)
+}
+
 pub fn resolve_type_node_lexically(
     node: Node<'_>,
     analyzer: &CppGraphSource<'_>,
@@ -10444,6 +10902,30 @@ pub fn resolve_type_node_lexically(
     let Some((components, global)) = type_reference_components(node, source) else {
         return LexicalTypeResolution::Missing;
     };
+    match select_qualifier_owner(
+        node,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+    ) {
+        QualifierOwnerSelection::Unchanged => {}
+        QualifierOwnerSelection::Selected(components) => {
+            return resolve_type_components_lexically_at(
+                node,
+                &components,
+                true,
+                analyzer,
+                visibility,
+                ordinary_type_imports,
+                file,
+                source,
+            );
+        }
+        QualifierOwnerSelection::Ambiguous => return LexicalTypeResolution::Ambiguous,
+    }
     let resolution = resolve_type_components_lexically_at(
         node,
         &components,
@@ -10670,6 +11152,33 @@ pub fn resolve_type_node_lexically_for_target(
             }
             LexicalTypeResolution::Ambiguous => LexicalTypeResolution::Ambiguous,
         };
+    }
+    match select_qualifier_owner(
+        node,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+    ) {
+        QualifierOwnerSelection::Unchanged => {}
+        QualifierOwnerSelection::Selected(components) => {
+            return resolve_type_components_lexically_at_for_target_with_scope_cache(
+                node,
+                &components,
+                true,
+                analyzer,
+                visibility,
+                ordinary_type_imports,
+                file,
+                source,
+                target,
+                true,
+                scope_cache,
+            );
+        }
+        QualifierOwnerSelection::Ambiguous => return LexicalTypeResolution::Ambiguous,
     }
     let resolution = if let Some(recovered_scope) = recovered_scope {
         resolve_type_components_lexically_at_for_target_with_recovered_scope(
@@ -12652,6 +13161,14 @@ pub(super) fn resolve_type_components_in_authoritative_scope(
     allow_compatible_foreign_import: bool,
     lexical_scope: Vec<String>,
 ) -> LexicalTypeResolution {
+    // Block scope is the innermost scope of unqualified lookup, so a local
+    // class answers before every namespace, member and import tier below.
+    if !global
+        && let Some(resolution) =
+            function_local_type_resolution(analyzer, file, node, components, source)
+    {
+        return resolution;
+    }
     let resolve = |components: &[String], global: bool, lexical_scope: Vec<String>| {
         resolve_unaliased_type_components_in_authoritative_scope(
             node,
@@ -12696,6 +13213,66 @@ pub(super) fn resolve_type_components_in_authoritative_scope(
         } => resolve(&components, global, lexical_scope),
         NamespaceQualifierBinding::Unresolved { .. } => LexicalTypeResolution::Ambiguous,
         NamespaceQualifierBinding::Unaliased => unreachable!("an unaliased binding has no depth"),
+    }
+}
+
+/// Select conditional alias arms with the reference's guards before
+/// canonicalizing them (#6902).
+///
+/// A resolved answer carries the arms as its candidates. An ambiguity carries
+/// none, so the alias-preserving lookup at the same scope recovers them. A
+/// proven selection resolves to its one type; undecided arms stay ambiguous
+/// rather than naming either class.
+#[allow(clippy::too_many_arguments)]
+fn guarded_alias_type_resolution(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    lexical_scope: &[String],
+    resolution: LexicalTypeResolution,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+) -> LexicalTypeResolution {
+    let preserved;
+    let arms = match &resolution {
+        LexicalTypeResolution::Resolved { .. } => &resolution,
+        LexicalTypeResolution::Ambiguous => {
+            preserved = visibility.resolve_type_components_lexically_for_forward(
+                analyzer,
+                file,
+                components,
+                global,
+                lexical_scope,
+            );
+            &preserved
+        }
+        LexicalTypeResolution::Missing => return resolution,
+    };
+    let LexicalTypeResolution::Resolved {
+        components: resolved_components,
+        candidates,
+        ..
+    } = arms
+    else {
+        return resolution;
+    };
+    if !candidates
+        .iter()
+        .any(|candidate| declared_type_alias(analyzer, candidate))
+    {
+        return resolution;
+    }
+    match visibility.guarded_alias_selection_at_reference(analyzer, file, node, candidates) {
+        None => resolution,
+        Some(GuardedAliasSelection::Proven { unit, candidates }) => {
+            LexicalTypeResolution::Resolved {
+                unit,
+                components: resolved_components.clone(),
+                candidates,
+            }
+        }
+        Some(GuardedAliasSelection::Alternatives(_)) => LexicalTypeResolution::Ambiguous,
     }
 }
 
@@ -12803,6 +13380,23 @@ fn resolve_unaliased_type_components_in_authoritative_scope(
             lexical_normal_started.elapsed().as_millis(),
         );
     }
+    // Conditional alias arms face this reference's guards before their targets
+    // are canonicalized together (#6902). The preserving forward mode keeps the
+    // alias itself, so it has nothing to select.
+    let normal = if preserve_alias || cpp_template_reference_arguments(node, source).is_some() {
+        normal
+    } else {
+        guarded_alias_type_resolution(
+            node,
+            components,
+            global,
+            &lexical_scope,
+            normal,
+            analyzer,
+            visibility,
+            file,
+        )
+    };
     let normal = match normal {
         LexicalTypeResolution::Resolved { ref unit, .. }
             if !visibility

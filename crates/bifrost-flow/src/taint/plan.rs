@@ -606,6 +606,11 @@ impl TaintAnalysisPlan {
         {
             return Err(TaintPlanError::DuplicateBinding);
         }
+        if value_flow.edge_kill_label_sets().any(|labels| {
+            labels.universe() != universe.hash() || labels.class_count() != universe.classes().len()
+        }) {
+            return Err(TaintPlanError::InvalidCarrierBinding);
+        }
         for source in &sources {
             if value_flow.source(source.source).is_none()
                 || source.classes.universe() != universe.hash()

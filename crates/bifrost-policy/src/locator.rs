@@ -189,6 +189,15 @@ pub(super) fn resolve_policy_definition_locators(
             resolve_taint_set(&mut spec.sources, locators)?;
             resolve_taint_set(&mut spec.sinks, locators)?;
             resolve_taint_set(&mut spec.sanitizers, locators)?;
+            for entry in &mut spec.sanitizers.entries {
+                if let TaintSanitizerKind::Conditional { requires, .. } = &mut entry.kind {
+                    for item in requires {
+                        if let TaintSanitizerCondition::ResultOf(selector) = &mut item.condition {
+                            resolve_selector_locators(selector, locators)?;
+                        }
+                    }
+                }
+            }
             resolve_taint_set(&mut spec.entry_points, locators)?;
             resolve_taint_set(&mut spec.transforms, locators)?;
             resolve_taint_set(&mut spec.external_models, locators)?;
@@ -340,6 +349,11 @@ pub(super) fn resolved_locator_metadata(
             collect_taint_set_locators(&spec.sources, &mut locators);
             collect_taint_set_locators(&spec.sinks, &mut locators);
             collect_taint_set_locators(&spec.sanitizers, &mut locators);
+            for entry in &spec.sanitizers.entries {
+                for (_, selector) in entry.kind.requirement_selectors() {
+                    collect_selector_locators(selector, &mut locators);
+                }
+            }
             collect_taint_set_locators(&spec.entry_points, &mut locators);
             collect_taint_set_locators(&spec.transforms, &mut locators);
             collect_taint_set_locators(&spec.external_models, &mut locators);

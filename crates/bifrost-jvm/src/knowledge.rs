@@ -4,6 +4,8 @@ use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::fq_name::FqName;
 use brokk_bifrost_core::analyzer::fq_name::SegmentKind;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
+use brokk_bifrost_core::analyzer::language_knowledge::BuiltinSupertypes;
+use brokk_bifrost_core::analyzer::language_knowledge::GuardConditionSyntax;
 use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
 use brokk_bifrost_core::analyzer::language_knowledge::ParserFlavor;
 use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
@@ -13,6 +15,61 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct JavaKnowledge;
 
 impl LanguageKnowledge for JavaKnowledge {
+    fn semantic_string_constant_value(&self, payload: &str) -> Option<String> {
+        Some(payload.to_owned())
+    }
+
+    fn declared_type_is_referent_immutable(&self, canonical_type: &str) -> bool {
+        matches!(
+            canonical_type,
+            "java.lang.String"
+                | "java.lang.Boolean"
+                | "java.lang.Byte"
+                | "java.lang.Short"
+                | "java.lang.Character"
+                | "java.lang.Integer"
+                | "java.lang.Long"
+                | "java.lang.Float"
+                | "java.lang.Double"
+                | "java.io.File"
+                | "java.nio.file.Path"
+                | "java.net.URI"
+                | "boolean"
+                | "byte"
+                | "short"
+                | "char"
+                | "int"
+                | "long"
+                | "float"
+                | "double"
+        )
+    }
+
+    fn guard_condition_syntax(&self) -> Option<&'static GuardConditionSyntax> {
+        Some(&GuardConditionSyntax {
+            call_kinds: &["method_invocation"],
+            parenthesis_kinds: &["parenthesized_expression"],
+            parenthesis_field: None,
+            negation_kinds: &["unary_expression"],
+            operator_field: "operator",
+            negation_operator: "!",
+            operand_field: "operand",
+        })
+    }
+
+    fn field_initializer<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        if node.kind() != "variable_declarator" {
+            return None;
+        }
+        Some((
+            node.child_by_field_name("name")?,
+            node.child_by_field_name("value")?,
+        ))
+    }
+
     fn factory_name_node<'t>(&self, call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
         if call.kind() != "method_invocation" {
             return None;
@@ -91,6 +148,30 @@ impl LanguageKnowledge for JavaKnowledge {
 pub struct KotlinKnowledge;
 
 impl LanguageKnowledge for KotlinKnowledge {
+    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+        false
+    }
+
+    fn field_initializer<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        if node.kind() != "property_declaration" {
+            return None;
+        }
+        let mut cursor = node.walk();
+        let binding = node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "variable_declaration" | "multi_variable_declaration"
+            )
+        })?;
+        Some((
+            binding,
+            crate::kotlin::structural::property_value_node(node)?,
+        ))
+    }
+
     fn language(&self) -> Language {
         Language::Kotlin
     }
@@ -123,6 +204,85 @@ impl LanguageKnowledge for KotlinKnowledge {
             _ => return None,
         };
         Some((IntrinsicTypeKind::LanguageBuiltin, name))
+    }
+
+    // The kotlin.* builtin class headers, plus java.io.Serializable, which the
+    // JVM builtins add to primitives and String. A mapped Java spelling names
+    // the same type, and scala.Any and scala.AnyRef name java.lang.Object.
+    // Platform boxes and Comparable's type argument stay open. Nothing and
+    // FunctionN follow other rules and have no answer.
+    //
+    // A Scala or Java formal names a Kotlin builtin in its own vocabulary:
+    // Scala `Int` is scala.Int and Java `int` is the primitive, both the JVM
+    // int that Kotlin calls kotlin.Int. Kotlin has no implicit widening, so
+    // only the same type is an alias. A Scala `Unit` parameter erases to
+    // scala.runtime.BoxedUnit rather than kotlin.Unit, so it stays open.
+    fn builtin_supertypes(&self, spelling: &str) -> Option<BuiltinSupertypes> {
+        const ANY: &[&str] = &[
+            "kotlin.Any",
+            "java.lang.Object",
+            "scala.Any",
+            "scala.AnyRef",
+        ];
+        const SCALAR: &[&str] = &[
+            "java.io.Serializable",
+            "kotlin.Any",
+            "java.lang.Object",
+            "scala.Any",
+            "scala.AnyRef",
+        ];
+        const NUMBER: &[&str] = &[
+            "kotlin.Number",
+            "java.lang.Number",
+            "java.io.Serializable",
+            "kotlin.Any",
+            "java.lang.Object",
+            "scala.Any",
+            "scala.AnyRef",
+        ];
+        const STRING: &[&str] = &[
+            "kotlin.String",
+            "java.lang.String",
+            "kotlin.CharSequence",
+            "java.lang.CharSequence",
+            "java.io.Serializable",
+            "kotlin.Any",
+            "java.lang.Object",
+            "scala.Any",
+            "scala.AnyRef",
+        ];
+        const COMPARABLE: &[&str] = &["kotlin.Comparable", "java.lang.Comparable"];
+        const BOXED: &[&str] = &[
+            "kotlin.Comparable",
+            "java.lang.Comparable",
+            "java.lang.Boolean",
+            "java.lang.Byte",
+            "java.lang.Character",
+            "java.lang.Double",
+            "java.lang.Float",
+            "java.lang.Integer",
+            "java.lang.Long",
+            "java.lang.Short",
+        ];
+        let (aliases, nominal, open): (&[&str], _, _) = match spelling {
+            "kotlin.Any" | "java.lang.Object" => (&[], ANY, &[][..]),
+            "kotlin.Unit" => (&[], ANY, &["scala.Unit"][..]),
+            "kotlin.Byte" => (&["scala.Byte", "byte"], NUMBER, BOXED),
+            "kotlin.Short" => (&["scala.Short", "short"], NUMBER, BOXED),
+            "kotlin.Int" => (&["scala.Int", "int"], NUMBER, BOXED),
+            "kotlin.Long" => (&["scala.Long", "long"], NUMBER, BOXED),
+            "kotlin.Float" => (&["scala.Float", "float"], NUMBER, BOXED),
+            "kotlin.Double" => (&["scala.Double", "double"], NUMBER, BOXED),
+            "kotlin.Char" => (&["scala.Char", "char"], SCALAR, BOXED),
+            "kotlin.Boolean" => (&["scala.Boolean", "boolean"], SCALAR, BOXED),
+            "kotlin.String" | "java.lang.String" => (&["scala.Predef.String"], STRING, COMPARABLE),
+            _ => return None,
+        };
+        Some(BuiltinSupertypes {
+            aliases,
+            nominal,
+            open,
+        })
     }
 
     fn call_may_apply_value(&self) -> bool {
@@ -208,6 +368,23 @@ impl LanguageKnowledge for KotlinKnowledge {
 pub struct ScalaKnowledge;
 
 impl LanguageKnowledge for ScalaKnowledge {
+    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+        false
+    }
+
+    fn field_initializer<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        if !matches!(node.kind(), "val_definition" | "var_definition") {
+            return None;
+        }
+        Some((
+            node.child_by_field_name("pattern")?,
+            node.child_by_field_name("value")?,
+        ))
+    }
+
     fn language(&self) -> Language {
         Language::Scala
     }

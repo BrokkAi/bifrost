@@ -83,7 +83,7 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
-use brokk_bifrost_go::graph::reference::go_name_shadowed_at_with_scope;
+use brokk_bifrost_go::references::go_name_shadowed_at_with_scope;
 use std::sync::Arc;
 
 /// The modeled `net/http` handler func type whose conversion is a pure

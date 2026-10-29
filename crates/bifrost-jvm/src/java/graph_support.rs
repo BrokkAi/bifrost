@@ -657,6 +657,12 @@ pub enum JavaSourceTypeCandidates {
     Resolved(CodeUnit),
     Ambiguous(Vec<CodeUnit>),
     Incomplete(Vec<CodeUnit>),
+    /// The deciding tier is a written route -- one single-type import, or a
+    /// qualified name whose head no workspace type tier binds -- that no
+    /// workspace declaration reads and no workspace type owns a prefix of.
+    /// The route's segments therefore spell the type's qualified name; whether
+    /// a declaration exists for it is external evidence the caller weighs.
+    Route(Vec<String>),
     Unresolved,
 }
 
@@ -695,6 +701,15 @@ pub fn resolve_java_usage_type_component_candidates_in(
         }
     };
 
+    // A route spells a qualified name only when no workspace type owns one of
+    // its strict prefixes: an owner could supply the tail as an inherited
+    // member type, whose qualified name is its declaring type's, not the
+    // route's. Absence is proof only from an exhaustive inventory.
+    let unowned_route = |route: &[String]| {
+        source.has_complete_symbol_lookup_index()
+            && (1..route.len()).all(|length| candidate(&route[..length]).is_empty())
+    };
+
     let imports = source.import_info_of(token, file);
     let mut explicit_routes = Vec::new();
     for import in &imports {
@@ -724,7 +739,11 @@ pub fn resolve_java_usage_type_component_candidates_in(
         if explicit_routes.len() > 1 {
             return JavaSourceTypeCandidates::Ambiguous(targets);
         }
-        return proven_route(&explicit_routes[0]);
+        let route = explicit_routes.remove(0);
+        if targets.is_empty() && unowned_route(&route) {
+            return JavaSourceTypeCandidates::Route(route);
+        }
+        return proven_route(&route);
     }
 
     if components.len() > 1 {
@@ -785,6 +804,27 @@ pub fn resolve_java_usage_type_component_candidates_in(
             return JavaSourceTypeCandidates::Incomplete(wildcard_candidates);
         }
         return java_source_type_candidates(wildcard_candidates);
+    }
+
+    // A qualified name whose head no same-package or on-demand workspace type
+    // binds reads its head as a package. The lexical, single-type import and
+    // static-import tiers are the caller's and this function's earlier tiers.
+    if components.len() > 1 {
+        let mut head_package_type =
+            same_package_segments[..same_package_segments.len() - components.len()].to_vec();
+        head_package_type.push(components[0].clone());
+        let head_is_workspace_type = !candidate(&head_package_type).is_empty()
+            || imports.iter().any(|import| {
+                import.is_wildcard
+                    && non_static_import_path(import).is_some_and(|path| {
+                        let mut head = path.segments.clone();
+                        head.push(components[0].clone());
+                        !candidate(&head).is_empty()
+                    })
+            });
+        if !head_is_workspace_type && unowned_route(components) {
+            return JavaSourceTypeCandidates::Route(components.to_vec());
+        }
     }
 
     if missing_route {

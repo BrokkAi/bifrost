@@ -577,6 +577,7 @@ fn sliced_assertion_run(
     let limits = budget.query_limits();
     let workspace_files = context.analyzer.analyzed_files();
     let execution = UnitQueryExecution {
+        flow_state: context.flow_resources(),
         analyzer: context.analyzer,
         // The whole subject execution is analyzer-only, so its units are too.
         workspace: None,
@@ -649,7 +650,6 @@ fn sliced_assertion_run(
                     // that answered a different question.
                     return Err(WidenReason::ProductLoadFailed);
                 };
-                check_exhaustive_assert_file(&product)?;
                 product
             }
             None => {
@@ -663,19 +663,21 @@ fn sliced_assertion_run(
                     context,
                     active_semantic_model_snapshot.clone(),
                 );
-                let (product, reads) = recompute_unit(context.analyzer, || {
-                    evaluate_assert_file(
-                        path,
-                        file_subjects,
-                        &run.plan,
-                        &presentation,
-                        &run.subject_diagnostics,
-                        &run.files_by_rel,
-                        &mut caches,
-                        context,
-                        budget,
-                    )
-                });
+                let (product, reads, elapsed) =
+                    recompute_unit(context.analyzer, context.cancellation, || {
+                        evaluate_assert_file(
+                            path,
+                            file_subjects,
+                            &run.plan,
+                            &presentation,
+                            &run.subject_diagnostics,
+                            &run.files_by_rel,
+                            &mut caches,
+                            context,
+                            budget,
+                        )
+                    });
+                reuse.record_recompute(elapsed);
                 let product = match product {
                     Ok(product) => product,
                     // A file that cannot be evaluated fails the whole run,
@@ -702,6 +704,7 @@ fn sliced_assertion_run(
                 product
             }
         };
+        check_exhaustive_assert_file(&product)?;
         totals.merge(path, product);
     }
 
@@ -717,18 +720,15 @@ fn sliced_assertion_run(
     ))
 }
 
-/// A published assert unit is a partition of a whole run only when its own
-/// iteration concluded cleanly.
-///
-/// A file whose row queries raised a diagnostic is one whose capability gaps
-/// the run reports, and diagnostics are not additive across partitions; a file
-/// the run could not conclude is a legitimate product and merges, because the
-/// whole run records exactly the same unconcluded entry for it.
 fn check_exhaustive_assert_file(product: &AssertFileProduct) -> Result<(), WidenReason> {
-    if product.diagnostics.is_empty() {
-        return Ok(());
+    if product
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code.is_execution_state())
+    {
+        return Err(WidenReason::UnitDiagnostics);
     }
-    Err(WidenReason::UnitDiagnostics)
+    Ok(())
 }
 
 /// The digest of one file's subject rows, as the assert unit's key carries it.
@@ -783,6 +783,7 @@ fn whole_assertion_run(
             None => Arc::new(ExecutedQueryRows::of_detailed(match context.workspace {
                 Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
                     workspace,
+                    context.flow_resources(),
                     subject_query,
                     budget.query_limits(),
                     context.cancellation,
@@ -790,6 +791,7 @@ fn whole_assertion_run(
                 ),
                 None => execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
+                    context.flow_resources(),
                     subject_query,
                     budget.query_limits(),
                     context.cancellation,
@@ -1267,21 +1269,26 @@ fn finish_assertion_run(
     run_incomplete.dedup();
 
     let completion = if run_incomplete.is_empty() {
-        let mut completion = PolicyRunCompletion::Complete;
-        if let CodeQueryCompletion::ProvenSubset { codes } = &subject_completion {
-            completion = PolicyRunCompletion::proven_subset(codes.clone())
-                .expect("the detailed subject query declared at least one non-exhaustive omission");
+        // Every declared omission participates, including row queries when
+        // the subject itself is a subset. A sorted union is independent of
+        // file order and of the order in which unit products are replayed.
+        let mut codes = std::iter::once(subject_completion)
+            .chain(totals.row_completions.iter())
+            .filter_map(|completion| match completion {
+                CodeQueryCompletion::ProvenSubset { codes } => Some(codes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        if codes.is_empty() {
+            PolicyRunCompletion::Complete
         } else {
-            for row_completion in &totals.row_completions {
-                if let CodeQueryCompletion::ProvenSubset { codes } = row_completion {
-                    completion = PolicyRunCompletion::proven_subset(codes.clone()).expect(
-                        "a detailed row query declared at least one non-exhaustive omission",
-                    );
-                    break;
-                }
-            }
+            PolicyRunCompletion::proven_subset(codes)
+                .expect("the subject or row queries declared non-exhaustive omissions")
         }
-        completion
     } else {
         PolicyRunCompletion::inconclusive_in(run_incomplete, scope)
             .expect("typed per-file incomplete reasons are canonical")
@@ -1351,6 +1358,7 @@ fn evaluate_assert_file(
             let query = query.map_err(|message| Box::new(AssertFileFailure::QueryPlan(message)))?;
             let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
                 context.analyzer,
+                context.flow_resources(),
                 &query,
                 budget.query_limits(),
                 context.cancellation,
@@ -1487,6 +1495,7 @@ fn evaluate_assert_file(
     for query in &queries {
         let outcome = execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
             context.analyzer,
+            context.flow_resources(),
             query,
             budget.query_limits(),
             context.cancellation,
@@ -1513,6 +1522,7 @@ fn evaluate_assert_file(
         };
         let mut outcome = execute_code_query_detailed_eager_index(
             context.analyzer,
+            context.flow_resources(),
             &query,
             budget.query_limits(),
             context.cancellation,
@@ -2318,6 +2328,7 @@ fn whole_relational_bindings(
             ExecutedQueryRows::of_detailed(match context.workspace {
                 Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
                     workspace,
+                    context.flow_resources(),
                     query,
                     budget.query_limits(),
                     context.cancellation,
@@ -2327,6 +2338,7 @@ fn whole_relational_bindings(
                 ),
                 None => execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
+                    context.flow_resources(),
                     query,
                     budget.query_limits(),
                     context.cancellation,
@@ -2364,12 +2376,14 @@ fn sliced_relational_bindings(
 ) -> Result<Vec<ExecutedQueryRows>, WidenReason> {
     // Check every binding before executing any units: a later workspace
     // prepass would otherwise discard earlier sliced work and run it again.
-    if let Some(reason) = queries.iter().find_map(query_slicing_widen_reason) {
-        return Err(reason);
+    if let Some(widen) = queries.iter().find_map(query_slicing_widen_reason) {
+        attempt.set_widen_detail(Some(widen.detail));
+        return Err(widen.reason);
     }
     let limits = budget.query_limits();
     let workspace_files = context.analyzer.analyzed_files();
     let execution = UnitQueryExecution {
+        flow_state: context.flow_resources(),
         analyzer: context.analyzer,
         workspace: context.workspace,
         cancellation: context.cancellation,

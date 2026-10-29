@@ -255,13 +255,18 @@ fn derive_scalar_states(
     language: Language,
     procedure: &ProcedureHandle,
     prepared: &PreparedSyntaxTree,
+    reference_receiver_calls: &[crate::analyzer::semantic::CallSiteId],
 ) -> ScalarStateDerivation {
+    let effects = ScalarCallEffects {
+        reference_receiver_calls,
+        ..ScalarCallEffects::default()
+    };
     match language {
         Language::Java => {
             let seeds = java_scalar_seeds(procedure, prepared);
             ScalarStateDerivation::derive_typed(
                 procedure,
-                ScalarCallEffects::default(),
+                effects,
                 &seeds.entry_facts,
                 &seeds.typing,
             )
@@ -286,7 +291,7 @@ fn derive_scalar_states(
             let seeds = declared_scalar_seeds(procedure, declared);
             ScalarStateDerivation::derive_typed(
                 procedure,
-                ScalarCallEffects::default(),
+                effects,
                 &seeds.entry_facts,
                 &seeds.typing,
             )
@@ -296,7 +301,7 @@ fn derive_scalar_states(
             let seeds = declared_scalar_seeds(procedure, declared);
             ScalarStateDerivation::derive_typed(
                 procedure,
-                ScalarCallEffects::default(),
+                effects,
                 &seeds.entry_facts,
                 &seeds.typing,
             )
@@ -306,18 +311,18 @@ fn derive_scalar_states(
             let seeds = declared_scalar_seeds(procedure, declared);
             ScalarStateDerivation::derive_typed(
                 procedure,
-                ScalarCallEffects::default(),
+                effects,
                 &seeds.entry_facts,
                 &seeds.typing,
             )
         }
         Language::JavaScript | Language::TypeScript => ScalarStateDerivation::derive_typed(
             procedure,
-            ScalarCallEffects::default(),
+            effects,
             &[],
             &ScalarTyping::dynamic_binary64(),
         ),
-        _ => ScalarStateDerivation::derive(procedure),
+        _ => ScalarStateDerivation::derive_with_call_effects(procedure, effects),
     }
 }
 
@@ -719,6 +724,50 @@ pub(super) fn scalar_condition_outcomes(
     procedure: &ProcedureHandle,
     prepared: Arc<PreparedSyntaxTree>,
     cancellation: &CancellationToken,
+    reference_receiver_calls: &[crate::analyzer::semantic::CallSiteId],
+) -> Result<ScalarConditionDerivation, ScalarConditionGap> {
+    let result = derive_scalar_condition_outcomes(
+        workspace,
+        file,
+        procedure,
+        prepared,
+        cancellation,
+        reference_receiver_calls,
+    );
+    let transient = |gap| {
+        matches!(
+            gap,
+            ScalarConditionGap::WorkLimit
+                | ScalarConditionGap::StaleSource
+                | ScalarConditionGap::Cancelled
+        )
+    };
+    if match &result {
+        Err(gap) => transient(*gap),
+        Ok(derived) => derived.outcomes.iter().any(|outcome| matches!(outcome.verdict, ScalarConditionVerdict::Open(gap) if transient(gap))),
+    } {
+        brokk_bifrost_core::profiling::note_with(|| {
+            let gaps = match &result {
+                Err(gap) => vec![*gap],
+                Ok(derived) => derived.outcomes.iter().filter_map(|outcome| match outcome.verdict {
+                    ScalarConditionVerdict::Open(gap) if transient(gap) => Some(gap),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+            };
+            format!("policy.units unbounded origin={}:{} cause=scalar_condition gaps={gaps:?}", file!(), line!())
+        });
+        workspace.analyzer().mark_execution_dependent();
+    }
+    result
+}
+
+fn derive_scalar_condition_outcomes(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    procedure: &ProcedureHandle,
+    prepared: Arc<PreparedSyntaxTree>,
+    cancellation: &CancellationToken,
+    reference_receiver_calls: &[crate::analyzer::semantic::CallSiteId],
 ) -> Result<ScalarConditionDerivation, ScalarConditionGap> {
     if cancellation.is_cancelled() {
         return Err(ScalarConditionGap::Cancelled);
@@ -745,6 +794,16 @@ pub(super) fn scalar_condition_outcomes(
         &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
     )
     .ok();
+    if cfg_budget.refusal_count() > 0 {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=budget:cfg",
+                file!(),
+                line!()
+            )
+        });
+        workspace.analyzer().mark_execution_dependent();
+    }
     let before_exceptions = points_before_exit_only_exceptions(semantics);
     let vetoing_gaps = semantics
         .gaps()
@@ -803,8 +862,16 @@ pub(super) fn scalar_condition_outcomes(
                 .chain(std::iter::once(*source))
         })
         .collect::<HashSet<_>>();
-    let scalar = (!partial_procedure && !partial_producer)
-        .then(|| derive_scalar_states(workspace, file, language, procedure, &prepared));
+    let scalar = (!partial_procedure && !partial_producer).then(|| {
+        derive_scalar_states(
+            workspace,
+            file,
+            language,
+            procedure,
+            &prepared,
+            reference_receiver_calls,
+        )
+    });
     if cancellation.is_cancelled() {
         return Err(ScalarConditionGap::Cancelled);
     }
@@ -2017,7 +2084,7 @@ mod gap_relevance_tests {
                 None,
             ));
             let derived =
-                scalar_condition_outcomes(&workspace, &file, &handle, prepared, &cancellation)
+                scalar_condition_outcomes(&workspace, &file, &handle, prepared, &cancellation, &[])
                     .expect("scalar conditions");
             assert_eq!(derived.outcomes.len(), 1, "{declaration}: {derived:?}");
             assert!(

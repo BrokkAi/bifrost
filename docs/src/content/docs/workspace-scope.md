@@ -60,8 +60,12 @@ Bifrost builds the workspace file inventory this way:
 Some files stay in the inventory but are never parsed, so they get no code
 intelligence even when no ignore rule matches them:
 
-- Binary files: a file that contains a NUL byte, unless
-  `BIFROST_ADMIT_NUL_BYTES=1` is set.
+- Binary files: a file that contains a NUL byte, unless the language's parser
+  proves that every NUL byte is inside a string, a comment, template text or
+  JSX text. TypeScript, TSX and JSX files support this proof; plain `.js`
+  files do not yet, because their grammar does not parse a raw NUL. A NUL
+  byte in an identifier, an operator, a template substitution or a file
+  that is not UTF-8 still marks the file as binary.
 - Files with overlong structural lines, such as minified JavaScript bundles.
   The default limit is 16000 bytes. Set `BIFROST_MAX_LINE_LENGTH` to apply a
   strict physical-line limit, or to `0` to turn the line limit off. See
@@ -72,6 +76,8 @@ The parser must prove that the excluded spans contain only numeric initializer
 lists, including nested lists and signed numbers. Python also admits string
 and bytes literals, including implicit concatenation, when they contain no
 interpolation fields (for example, generated protobuf descriptors).
+JavaScript and TypeScript admit string literals, JSX attribute strings and
+template literals without substitutions (for example, an inlined SVG path).
 The remaining bytes on each
 physical line must fit the default limit. The complete original source is still
 analyzed, and any separate syntax recovery remains incomplete evidence.
@@ -81,7 +87,8 @@ depth 128, 8 MiB of cumulative node spans, and 8192 nodes across all excluded
 data subtrees. Parsing and admission share a 10-second deadline. An explicit positive
 `BIFROST_MAX_LINE_LENGTH`, including `16000`, applies the strict physical-line
 limit instead. Choose this setting before starting Bifrost; changing it between
-runs invalidates C/C++ and Python facts admitted under the previous setting.
+runs invalidates C/C++, Python, JavaScript and TypeScript facts admitted under
+the previous setting. The 1 MiB source limit also applies to the NUL proof.
 
 File-level tools can still read files that analysis refuses.
 

@@ -1708,7 +1708,7 @@ fn java_type_constructor_shape(node: Node<'_>) -> Option<JavaTypeConstructorShap
     }
 }
 
-pub(super) fn spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
+pub fn spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = parameter.walk();
     parameter.named_children(&mut cursor).find(|child| {
         !matches!(

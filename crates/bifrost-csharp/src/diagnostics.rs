@@ -40,14 +40,16 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Tree};
 
-use crate::graph::resolver::CSharpDeclaredType;
+use crate::graph::resolver::{
+    CSharpDeclaredType, member_declared_type_fq_name, type_parameter_shadows_reference,
+};
 use crate::graph_support::{
     CSharpSource, first_logical_type_fqn, logical_type_count, visible_type_candidates,
 };
 use crate::imports::csharp_using_alias_from_node;
 use crate::syntax::{
     csharp_type_node_identity, csharp_using_directive_is_static, csharp_using_directive_namespace,
-    csharp_using_directive_target_node_matching, normalize_csharp_type_fragment,
+    csharp_using_directive_target_node, normalize_csharp_type_fragment,
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
@@ -74,6 +76,19 @@ pub enum CSharpExternalTypes {
     One { fqn: String },
     /// More than one, so the reference is ambiguous rather than resolved.
     Many { count: usize },
+    /// The retained facts cannot close the lookup, for this explicit reason.
+    Unknown(SemanticDiagnosticIncompleteReason),
+}
+
+/// The retained evidence for one external namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CSharpExternalNamespace {
+    /// A retained TypeDef declares this namespace.
+    Declared,
+    /// Complete provider evidence has neither a declaration nor a forward here.
+    Absent,
+    /// A forward or unreadable provider prevents proving the namespace absent.
+    Unknown(SemanticDiagnosticIncompleteReason),
 }
 
 /// What the retained index proves about one member on an external owner.
@@ -94,6 +109,10 @@ pub enum CSharpMemberSurface {
 /// assembly, `project.assets.json`, or a NuGet cache, and none may trigger an
 /// index build: an answer a request cannot see is an incompleteness, never a
 /// reason to go and produce it.
+/// A miss proves absence only when every possible provider was read and none
+/// declares or forwards a candidate name. Missing readers, unreadable forward
+/// tables and unbuilt indexes are Unknown. Native answers map onto the same
+/// declared/resolved, absent, and unknown states.
 pub trait CSharpExternalEvidence {
     /// Why the retained index cannot prove any name absent, or `None` when it
     /// is built and read every one of its inputs whole.
@@ -113,7 +132,7 @@ pub trait CSharpExternalEvidence {
     fn surface_is_known(&self) -> bool;
 
     /// Whether the index publishes an externally visible type in `namespace`.
-    fn declares_namespace(&self, namespace: &str) -> bool;
+    fn declares_namespace(&self, namespace: &str) -> CSharpExternalNamespace;
 
     /// The externally visible types the index resolves `identity` to, as
     /// `file`'s own namespace, `using` namespaces and aliases spell it.
@@ -210,8 +229,8 @@ pub fn collect_csharp_semantic_diagnostics(
 /// Every namespace a file opens: its own `using` directives plus the workspace's
 /// `global using` ones, which C# applies to every file in the compilation.
 fn file_using_namespaces(csharp: &dyn CSharpSource, file: &ProjectFile) -> Vec<String> {
-    let mut usings: BTreeSet<String> = csharp.using_namespaces_of(file).into_iter().collect();
-    usings.extend(csharp.global_using_namespaces().iter().cloned());
+    // The source contract already includes global using namespaces.
+    let usings: BTreeSet<String> = csharp.using_namespaces_of(file).into_iter().collect();
     usings.into_iter().collect()
 }
 
@@ -265,6 +284,8 @@ enum WorkspaceTypes {
 
 /// The owner a member access reads through, once this pass has proven it.
 enum MemberOwner {
+    /// A namespace qualifier has no value member surface to check.
+    Namespace,
     /// A workspace declaration, at this fully qualified name.
     Workspace { fqn: String },
     /// An indexed assembly type, at this metadata identity.
@@ -310,6 +331,9 @@ impl CSharpDiagnosticCollector<'_> {
         }
         directives.sort_by_key(Node::start_byte);
         for directive in directives {
+            if self.diagnostic_count >= MAX_CSHARP_SEMANTIC_DIAGNOSTICS {
+                break;
+            }
             self.check_using_directive(token, directive);
         }
     }
@@ -326,10 +350,10 @@ impl CSharpDiagnosticCollector<'_> {
         if csharp_using_directive_is_static(node) {
             // `using static X;` names a type whose static members the file
             // opens, so it is a type reference like any other.
-            let Some(target) = csharp_using_directive_target_identity(node, self.source) else {
+            let Some(target) = csharp_using_directive_target_node(node) else {
                 return;
             };
-            self.check_type_identity(token, range, &target);
+            self.check_type_identity(token, range, target);
             return;
         }
         let Some((_, target)) = csharp_using_alias_from_node(node, self.source) else {
@@ -337,12 +361,21 @@ impl CSharpDiagnosticCollector<'_> {
         };
         // An alias target is either a namespace or a type, and C# accepts both
         // spellings. A namespace hit settles it; otherwise the type ladder does.
-        if self.namespace_is_visible(&target) {
+        let namespace_visible = match self.namespace_is_visible(&target) {
+            Ok(visible) => visible,
+            Err(reason) => {
+                self.report.push_incomplete(Some(range), vec![reason]);
+                return;
+            }
+        };
+        if namespace_visible {
             self.report
                 .push_resolved(range, self.namespace_boundary(&target));
             return;
         }
-        self.check_type_identity(token, range, &target);
+        if let Some(target) = csharp_using_directive_target_node(node) {
+            self.check_type_identity(token, range, target);
+        }
     }
 
     fn check_using_namespace(&mut self, range: Range, namespace: &str) {
@@ -359,10 +392,18 @@ impl CSharpDiagnosticCollector<'_> {
             self.report.push_incomplete(Some(range), vec![reason]);
             return;
         }
-        if self.external.declares_namespace(namespace) {
-            self.report
-                .push_resolved(range, BoundaryStatus::ExternalIndexed);
-            return;
+        match self.external.declares_namespace(namespace) {
+            CSharpExternalNamespace::Declared => {
+                self.report
+                    .push_resolved(range, BoundaryStatus::ExternalIndexed);
+                return;
+            }
+            CSharpExternalNamespace::Unknown(reason) => {
+                self.scope_is_visible = false;
+                self.report.push_incomplete(Some(range), vec![reason]);
+                return;
+            }
+            CSharpExternalNamespace::Absent => {}
         }
         if !self.external.surface_is_known() {
             // The index read every input it was given, but it was given none.
@@ -394,9 +435,24 @@ impl CSharpDiagnosticCollector<'_> {
         );
     }
 
-    fn namespace_is_visible(&self, namespace: &str) -> bool {
-        self.csharp.workspace_namespace_exists(namespace)
-            || (self.unreadable_external.is_none() && self.external.declares_namespace(namespace))
+    fn namespace_is_visible(
+        &self,
+        namespace: &str,
+    ) -> Result<bool, SemanticDiagnosticIncompleteReason> {
+        if self.csharp.workspace_namespace_exists(namespace) {
+            return Ok(true);
+        }
+        if self.unreadable_external.is_some() {
+            // This is a namespace probe on a type-or-namespace spelling.
+            // Leave the workspace type ladder available; it can still prove
+            // an alias/static owner without any external evidence.
+            return Ok(false);
+        }
+        match self.external.declares_namespace(namespace) {
+            CSharpExternalNamespace::Declared => Ok(true),
+            CSharpExternalNamespace::Absent => Ok(false),
+            CSharpExternalNamespace::Unknown(reason) => Err(reason),
+        }
     }
 
     fn namespace_boundary(&self, namespace: &str) -> BoundaryStatus {
@@ -489,11 +545,7 @@ impl CSharpDiagnosticCollector<'_> {
     // -- type references ----------------------------------------------------
 
     fn check_type_reference(&mut self, token: QueryToken<'_>, node: Node<'_>) {
-        let identity = csharp_type_node_identity(node, self.source);
-        if self.is_uncheckable_type_identity(&identity) {
-            return;
-        }
-        self.check_type_identity(token, self.range_of(node), &identity);
+        self.check_type_identity(token, self.range_of(node), node);
     }
 
     /// Names that are not lookups: a predefined keyword type, the inferred
@@ -511,8 +563,12 @@ impl CSharpDiagnosticCollector<'_> {
             .any(|frame| frame.contains(head.as_str()))
     }
 
-    fn check_type_identity(&mut self, token: QueryToken<'_>, range: Range, identity: &str) {
-        match self.workspace_types(token, identity) {
+    fn check_type_identity(&mut self, token: QueryToken<'_>, range: Range, node: Node<'_>) {
+        let identity = csharp_type_node_identity(node, self.source);
+        if self.is_uncheckable_type_identity(&identity) {
+            return;
+        }
+        match self.workspace_types(token, &identity) {
             WorkspaceTypes::One => {
                 self.report
                     .push_resolved(range, BoundaryStatus::WorkspaceLocal);
@@ -521,7 +577,7 @@ impl CSharpDiagnosticCollector<'_> {
                 self.report
                     .push_ambiguous(range, vec![BoundaryStatus::WorkspaceLocal; count]);
             }
-            WorkspaceTypes::None => self.check_external_type(range, identity),
+            WorkspaceTypes::None => self.check_external_type(range, &identity, node),
         }
     }
 
@@ -550,27 +606,31 @@ impl CSharpDiagnosticCollector<'_> {
         }
     }
 
-    fn check_external_type(&mut self, range: Range, identity: &str) {
-        if self.workspace_bounded() {
-            // Nothing this file can name lives outside the workspace, so the
-            // workspace was the whole surface and the miss is already proven.
-            // No external state is read at all on this path.
-            self.publish_absence(
-                range,
-                SemanticDiagnosticDomain::Type {
-                    name: identity.to_string(),
-                },
-                BoundaryStatus::WorkspaceLocal,
-                CSHARP_UNRECOGNIZED_SYMBOL,
-                format!("unrecognized type `{identity}`"),
-            );
-            return;
+    fn check_external_type(&mut self, range: Range, identity: &str, mut node: Node<'_>) {
+        // Qualification belongs to this reference, not to the file's imports.
+        // Wrapper nodes keep their referent's lookup scope.
+        while matches!(
+            node.kind(),
+            "array_type"
+                | "nullable_type"
+                | "pointer_type"
+                | "simple_base_type"
+                | "primary_constructor_base_type"
+        ) {
+            node = node
+                .child_by_field_name("type")
+                .or_else(|| node.named_child(0))
+                .expect("type wrapper referent");
         }
+        let unqualified = matches!(node.kind(), "identifier" | "generic_name");
         if let Some(reason) = self.unreadable_external.clone() {
             self.report.push_incomplete(Some(range), vec![reason]);
             return;
         }
         match self.external.resolve_type(self.file, identity) {
+            CSharpExternalTypes::Unknown(reason) => {
+                self.report.push_incomplete(Some(range), vec![reason]);
+            }
             CSharpExternalTypes::One { .. } => {
                 self.report
                     .push_resolved(range, BoundaryStatus::ExternalIndexed);
@@ -580,6 +640,31 @@ impl CSharpDiagnosticCollector<'_> {
                     .push_ambiguous(range, vec![BoundaryStatus::ExternalIndexed; count]);
             }
             CSharpExternalTypes::None => {
+                let workspace_bounded = if unqualified {
+                    match self.workspace_bounded() {
+                        Ok(bounded) => bounded,
+                        Err(reason) => {
+                            self.report.push_incomplete(Some(range), vec![reason]);
+                            return;
+                        }
+                    }
+                } else {
+                    false
+                };
+                if workspace_bounded {
+                    // This identity also misses against retained external evidence.
+                    // A fully local unqualified lookup scope can prove its absence.
+                    self.publish_absence(
+                        range,
+                        SemanticDiagnosticDomain::Type {
+                            name: identity.to_string(),
+                        },
+                        BoundaryStatus::WorkspaceLocal,
+                        CSHARP_UNRECOGNIZED_SYMBOL,
+                        format!("unrecognized type `{identity}`"),
+                    );
+                    return;
+                }
                 if !self.external_miss_is_proof() {
                     self.report.push_incomplete(
                         Some(range),
@@ -616,14 +701,18 @@ impl CSharpDiagnosticCollector<'_> {
     /// missing local type, and it is the same rule C# scoping uses -- a name,
     /// and an extension method, is reachable only through a namespace the file
     /// actually opens.
-    fn workspace_bounded(&self) -> bool {
-        self.scope_is_visible
-            && self.unreadable_external.is_none()
-            && !self.external.declares_namespace("")
-            && self
+    fn workspace_bounded(&self) -> Result<bool, SemanticDiagnosticIncompleteReason> {
+        if !self.scope_is_visible || self.unreadable_external.is_some() {
+            return Ok(false);
+        }
+        match self.external.declares_namespace("") {
+            CSharpExternalNamespace::Declared => Ok(false),
+            CSharpExternalNamespace::Absent => Ok(self
                 .usings
                 .iter()
-                .all(|namespace| self.csharp.workspace_namespace_exists(namespace))
+                .all(|namespace| self.csharp.workspace_namespace_exists(namespace))),
+            CSharpExternalNamespace::Unknown(reason) => Err(reason),
+        }
     }
 
     /// Whether a miss against the indexed external surface is a proof.
@@ -651,10 +740,8 @@ impl CSharpDiagnosticCollector<'_> {
         // `System.Console` is a `member_access_expression` in expression
         // position. Those are settled by the type ladder, not the member one.
         let receiver_identity = csharp_type_node_identity(receiver, self.source);
-        if !receiver_identity.is_empty() && self.namespace_is_visible(&receiver_identity) {
-            return;
-        }
         match self.member_owner(token, receiver, &receiver_identity) {
+            Ok(MemberOwner::Namespace) => {}
             Ok(MemberOwner::Workspace { fqn }) => {
                 self.check_workspace_member(token, range, &fqn, &member)
             }
@@ -679,7 +766,7 @@ impl CSharpDiagnosticCollector<'_> {
                     detail: "`this` appears outside a type declaration".to_string(),
                 });
             };
-            return self.type_owner(token, &enclosing).ok_or_else(|| {
+            return self.type_owner(token, &enclosing)?.ok_or_else(|| {
                 SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                     detail: format!("enclosing type `{enclosing}` does not resolve uniquely"),
                 }
@@ -691,15 +778,15 @@ impl CSharpDiagnosticCollector<'_> {
         // named `widget` whenever a local shadows one, and report a member the
         // value does have as absent.
         if receiver.kind() == "identifier" {
-            let symbol = node_text(receiver, self.source).trim();
-            match self.declared_type_of_binding(token, receiver, symbol) {
+            let symbol = receiver_identity;
+            match self.declared_type_of_binding(token, receiver, symbol)? {
                 // The seeder proved this identity against the workspace, so it
                 // is looked up as an identity rather than re-read as a written
                 // name.
-                Ok(CSharpDeclaredType::Resolved { fqn }) => {
+                Some(CSharpDeclaredType::Resolved { fqn }) => {
                     return self.resolved_type_owner(token, &fqn, symbol);
                 }
-                Ok(CSharpDeclaredType::Spelling(spelling)) => {
+                Some(CSharpDeclaredType::Spelling(spelling)) => {
                     // Only a written spelling can say `dynamic`; a resolved
                     // workspace fq name never does.
                     if is_csharp_dynamic(&spelling) {
@@ -707,7 +794,12 @@ impl CSharpDiagnosticCollector<'_> {
                             detail: format!("`{symbol}` is declared `dynamic`"),
                         });
                     }
-                    return self.type_owner(token, &spelling).ok_or_else(|| {
+                    if type_parameter_shadows_reference(receiver, self.source, &spelling) {
+                        return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                            detail: format!("receiver `{symbol}` has type parameter `{spelling}`"),
+                        });
+                    }
+                    return self.type_owner(token, &spelling)?.ok_or_else(|| {
                         SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                             detail: format!("receiver `{symbol}` has no uniquely resolved type"),
                         }
@@ -715,16 +807,27 @@ impl CSharpDiagnosticCollector<'_> {
                 }
                 // Nothing binds the name as a value, so it may name a type and
                 // this is a static access.
-                Err(unbound) => {
+                None => {
+                    if self.namespace_is_visible(symbol)? {
+                        return Ok(MemberOwner::Namespace);
+                    }
                     return self
-                        .type_owner(token, symbol)
+                        .type_owner(token, symbol)?
                         .filter(|_| !self.is_uncheckable_type_identity(symbol))
-                        .ok_or(unbound);
+                        .ok_or_else(
+                            || SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                                detail: format!(
+                                    "receiver `{symbol}` has no uniquely inferred declared type"
+                                ),
+                            },
+                        );
                 }
             }
         }
-        // A qualified receiver can only be a type or namespace path; the
-        // namespace case was settled before this call.
+        // A qualified receiver can name either a type or a namespace.
+        if !receiver_identity.is_empty() && self.namespace_is_visible(receiver_identity)? {
+            return Ok(MemberOwner::Namespace);
+        }
         if receiver_identity.is_empty() || self.is_uncheckable_type_identity(receiver_identity) {
             return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!(
@@ -733,7 +836,7 @@ impl CSharpDiagnosticCollector<'_> {
                 ),
             });
         }
-        self.type_owner(token, receiver_identity).ok_or_else(|| {
+        self.type_owner(token, receiver_identity)?.ok_or_else(|| {
             SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!("receiver `{receiver_identity}` has no uniquely resolved type"),
             }
@@ -743,16 +846,15 @@ impl CSharpDiagnosticCollector<'_> {
     /// The declared type name of a local, parameter or field the receiver
     /// identifier binds.
     ///
-    /// Seeded from the file root with the receiver's own start byte as the
-    /// cutoff, which is what `get_definition`'s
-    /// `csharp_structured_receiver_type_names` does. Seeding from the enclosing
-    /// body instead would miss a field declared after the method that reads it.
+    /// The seeder supplies only visible locals and parameters. If none binds
+    /// the name, resolve a member through its indexed enclosing owner, which
+    /// also sees fields declared after the method that reads them.
     fn declared_type_of_binding(
         &self,
         token: QueryToken<'_>,
         receiver: Node<'_>,
         symbol: &str,
-    ) -> Result<CSharpDeclaredType, SemanticDiagnosticIncompleteReason> {
+    ) -> Result<Option<CSharpDeclaredType>, SemanticDiagnosticIncompleteReason> {
         let mut bindings = LocalInferenceEngine::<CSharpDeclaredType>::default();
         crate::graph::resolver::seed_bindings_before(
             file_root(receiver),
@@ -763,6 +865,15 @@ impl CSharpDiagnosticCollector<'_> {
             self.source,
             &mut bindings,
         );
+        if !bindings.is_shadowed(symbol) {
+            let classes = self.csharp.class_range_index(self.file);
+            return Ok(classes
+                .enclosing_unit(receiver.start_byte())
+                .and_then(|owner| {
+                    member_declared_type_fq_name(self.csharp, token, self.file, owner, symbol)
+                        .map(CSharpDeclaredType::resolved)
+                }));
+        }
         let resolution = bindings.resolve_symbol(symbol);
         let Some(targets) = resolution.as_precise() else {
             return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
@@ -771,7 +882,7 @@ impl CSharpDiagnosticCollector<'_> {
         };
         let mut declared = targets.iter();
         match (declared.next(), declared.next()) {
-            (Some(only), None) => Ok(only.clone()),
+            (Some(only), None) => Ok(Some(only.clone())),
             _ => Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!("receiver `{symbol}` binds more than one declared type"),
             }),
@@ -812,17 +923,25 @@ impl CSharpDiagnosticCollector<'_> {
     }
 
     /// The unique declaration a type name identifies, workspace first.
-    fn type_owner(&self, token: QueryToken<'_>, identity: &str) -> Option<MemberOwner> {
+    fn type_owner(
+        &self,
+        token: QueryToken<'_>,
+        identity: &str,
+    ) -> Result<Option<MemberOwner>, SemanticDiagnosticIncompleteReason> {
         let candidates = self.visible_types(token, identity);
         if let Some(owner) = unique_workspace_member_owner(&candidates) {
-            return Some(owner);
+            return Ok(Some(owner));
         }
-        if !candidates.is_empty() || self.unreadable_external.is_some() {
-            return None;
+        if !candidates.is_empty() {
+            return Ok(None);
+        }
+        if let Some(reason) = &self.unreadable_external {
+            return Err(reason.clone());
         }
         match self.external.resolve_type(self.file, identity) {
-            CSharpExternalTypes::One { fqn } => Some(MemberOwner::External { fqn }),
-            CSharpExternalTypes::None | CSharpExternalTypes::Many { .. } => None,
+            CSharpExternalTypes::One { fqn } => Ok(Some(MemberOwner::External { fqn })),
+            CSharpExternalTypes::None | CSharpExternalTypes::Many { .. } => Ok(None),
+            CSharpExternalTypes::Unknown(reason) => Err(reason),
         }
     }
 
@@ -915,7 +1034,14 @@ impl CSharpDiagnosticCollector<'_> {
             );
             return;
         }
-        if self.extension_method_could_apply(member) {
+        let extension_possible = match self.extension_method_could_apply(member) {
+            Ok(possible) => possible,
+            Err(reason) => {
+                self.report.push_incomplete(Some(range), vec![reason]);
+                return;
+            }
+        };
+        if extension_possible {
             self.report.push_incomplete(
                 Some(range),
                 vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
@@ -956,18 +1082,22 @@ impl CSharpDiagnosticCollector<'_> {
     /// declares it, so a file whose lookups cannot leave the workspace can only
     /// reach a workspace one -- and then no external state is read at all.
     /// Otherwise an index this pass cannot read has to be assumed to hold one.
-    fn extension_method_could_apply(&self, member: &str) -> bool {
-        if !self.workspace_bounded()
+    fn extension_method_could_apply(
+        &self,
+        member: &str,
+    ) -> Result<bool, SemanticDiagnosticIncompleteReason> {
+        if !self.workspace_bounded()?
             && (self.unreadable_external.is_some()
                 || self
                     .external
                     .could_supply_extension_method(&self.usings, member))
         {
-            return true;
+            return Ok(true);
         }
         let mut namespaces: Vec<&str> = self.usings.iter().map(String::as_str).collect();
         namespaces.push(self.file_namespace.as_str());
-        self.csharp
+        Ok(self
+            .csharp
             .declaration_candidates_by_identifier(member)
             .iter()
             .any(|candidate| {
@@ -975,7 +1105,7 @@ impl CSharpDiagnosticCollector<'_> {
                     && namespaces
                         .iter()
                         .any(|namespace| candidate.package_name() == *namespace)
-            })
+            }))
     }
 
     /// Walk the owner's ancestors for `member`.
@@ -1133,18 +1263,6 @@ enum InheritedTypeName {
     Spelled(String),
 }
 
-/// The identity a `using static X;` directive names.
-fn csharp_using_directive_target_identity(node: Node<'_>, source: &str) -> Option<String> {
-    let target = csharp_using_directive_target_node_matching(node, |child| {
-        matches!(
-            child.kind(),
-            "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name"
-        )
-    })?;
-    let identity = csharp_type_node_identity(target, source);
-    (!identity.is_empty()).then_some(identity)
-}
-
 fn describe_reason(reason: &SemanticDiagnosticIncompleteReason) -> String {
     match reason {
         SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery { boundary } => {
@@ -1192,7 +1310,8 @@ fn declared_type_parameters(node: Node<'_>, source: &str) -> Option<HashSet<Stri
 ///
 /// A wrapper's inner type answers `false` because the wrapper itself already
 /// covers it -- [`csharp_type_node_identity`] unwraps arrays, nullables and
-/// pointers to the type they decorate.
+/// pointers to the type they decorate. A `ref_type` has no dotted identity;
+/// its `type` child supplies the one reference site instead.
 fn is_type_reference_position(node: Node<'_>) -> bool {
     if !matches!(
         node.kind(),
@@ -1212,8 +1331,8 @@ fn is_type_reference_position(node: Node<'_>) -> bool {
         return false;
     };
     match parent.kind() {
-        "array_type" | "nullable_type" | "pointer_type" | "ref_type" => false,
-        "type_argument_list" | "base_list" => true,
+        "array_type" | "nullable_type" | "pointer_type" => false,
+        "ref_type" | "type_argument_list" | "base_list" => true,
         _ => ["type", "returns"].iter().any(|field| {
             parent
                 .child_by_field_name(field)
@@ -1287,4 +1406,46 @@ fn is_csharp_keyword_type(name: &str) -> bool {
             | "nint"
             | "nuint"
     )
+}
+
+#[cfg(test)]
+mod type_position_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "ae2a8d00737b: quicksilver round 8 on brokk-bifrost-csharp: ref return referents had no diagnostic type position"
+    )]
+    fn grammar_type_positions_cover_wrappers_arguments_and_bases_once() {
+        let source = "class C : MissingBase { Missing[] a; Missing? b; Missing* c; ref Missing M() { throw null; } Box<Missing> d; }";
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut positions = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if is_type_reference_position(node) {
+                positions.push((node.kind(), node_text(node, source)));
+            }
+            for i in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(i).unwrap());
+            }
+        }
+        assert_eq!(
+            positions,
+            [
+                ("identifier", "MissingBase"),
+                ("array_type", "Missing[]"),
+                ("nullable_type", "Missing?"),
+                ("pointer_type", "Missing*"),
+                ("identifier", "Missing"),
+                ("generic_name", "Box<Missing>"),
+                ("identifier", "Missing")
+            ]
+        );
+    }
 }

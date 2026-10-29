@@ -12,6 +12,17 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct JavascriptKnowledge;
 
 impl LanguageKnowledge for JavascriptKnowledge {
+    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+        false
+    }
+
+    fn field_initializer<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        js_ts_field_initializer(node)
+    }
+
     fn language(&self) -> Language {
         Language::JavaScript
     }
@@ -66,6 +77,17 @@ impl LanguageKnowledge for JavascriptKnowledge {
 pub struct TypescriptKnowledge;
 
 impl LanguageKnowledge for TypescriptKnowledge {
+    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+        false
+    }
+
+    fn field_initializer<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, tree_sitter::Node<'t>)> {
+        js_ts_field_initializer(node)
+    }
+
     fn language(&self) -> Language {
         Language::TypeScript
     }
@@ -120,5 +142,54 @@ impl LanguageKnowledge for TypescriptKnowledge {
 
     fn highlight_query(&self) -> Option<&'static str> {
         Some(tree_sitter_typescript::HIGHLIGHTS_QUERY)
+    }
+}
+
+fn js_ts_field_initializer(
+    node: tree_sitter::Node<'_>,
+) -> Option<(tree_sitter::Node<'_>, tree_sitter::Node<'_>)> {
+    let (target, value) = match node.kind() {
+        "field_definition" => ("property", "value"),
+        "public_field_definition" => ("name", "value"),
+        "assignment_expression" => ("left", "right"),
+        _ => return None,
+    };
+    Some((
+        node.child_by_field_name(target)?,
+        node.child_by_field_name(value)?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+
+    #[test]
+    fn typescript_structural_grammar_inventory() {
+        let source = "interface Shape { field:string; } type Alias=Shape; enum Choice { A } declare function ambient():void; function concrete() {}";
+        let tree = crate::test_support::parse_typescript(source);
+        assert!(!tree.root_node().has_error());
+        let spec = TypescriptKnowledge.structural_spec();
+        assert_eq!(spec.language(), Language::TypeScript);
+        let expected = [
+            ("interface_declaration", NormalizedKind::Class),
+            ("type_alias_declaration", NormalizedKind::Class),
+            ("enum_declaration", NormalizedKind::Class),
+            ("function_signature", NormalizedKind::Function),
+            ("function_declaration", NormalizedKind::Function),
+        ];
+        let mut found = Vec::new();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if let Some((kind, normalized)) = expected.iter().find(|(kind, _)| *kind == node.kind())
+            {
+                assert!(spec.kind_table().contains(&(*kind, *normalized)), "{kind}");
+                assert!(node.child_by_field_name("name").is_some());
+                found.push(*kind);
+            }
+            WalkControl::Continue
+        });
+        assert_eq!(found, expected.map(|(kind, _)| kind));
     }
 }

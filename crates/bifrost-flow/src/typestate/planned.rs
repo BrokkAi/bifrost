@@ -4,9 +4,9 @@ use std::fmt;
 
 use crate::analyzer::semantic::{IcfgProvider, ProcedureHandle, SemanticBudget, SemanticWork};
 use crate::dataflow::{
-    DataflowDirection, DataflowDirectionPlan, DataflowDirectionPlanningError, DataflowRequest,
-    IcfgSolveInput, NormalizedWitnessAvailability, NormalizedWitnessUnavailableReason,
-    PlannedDataflowCompletion, PlannedDataflowResult, SnapshotReplayProvider,
+    DataflowDirection, DataflowDirectionPlan, DataflowRequest, IcfgSolveInput,
+    NormalizedWitnessAvailability, NormalizedWitnessUnavailableReason, PlannedDataflowCompletion,
+    PlannedDataflowResult, SnapshotReplayProvider,
 };
 
 use super::client::{
@@ -61,7 +61,6 @@ pub type TypestatePlannedResult =
 /// Errors from typestate planned dispatch.
 #[derive(Debug)]
 pub enum TypestatePlannedSolveError {
-    Planning(DataflowDirectionPlanningError),
     Forward(TypestateSolveError),
     Backward(TypestateBackwardSolveError),
 }
@@ -69,7 +68,6 @@ pub enum TypestatePlannedSolveError {
 impl fmt::Display for TypestatePlannedSolveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Planning(error) => error.fmt(formatter),
             Self::Forward(error) => error.fmt(formatter),
             Self::Backward(error) => error.fmt(formatter),
         }
@@ -79,16 +77,9 @@ impl fmt::Display for TypestatePlannedSolveError {
 impl std::error::Error for TypestatePlannedSolveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Planning(error) => Some(error),
             Self::Forward(error) => Some(error),
             Self::Backward(error) => Some(error),
         }
-    }
-}
-
-impl From<DataflowDirectionPlanningError> for TypestatePlannedSolveError {
-    fn from(error: DataflowDirectionPlanningError) -> Self {
-        Self::Planning(error)
     }
 }
 

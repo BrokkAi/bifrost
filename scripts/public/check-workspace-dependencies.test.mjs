@@ -64,10 +64,26 @@ const names = [
   "brokk-bifrost-mcp",
   "brokk-bifrost-semantic-packs",
   "brokk-bifrost-test-macros",
+  "workspace-hack",
 ];
 
-function dependency(name, kind = undefined, req = "=0.8.12") {
-  return { name, req, kind, source: null };
+function dependency(name, kind = undefined, req = "=0.8.12", features = []) {
+  return { name, req, kind, source: null, rename: null, optional: false, features, uses_default_features: true };
+}
+
+const sealWritingDependencies = ["brokk-bifrost-store", "brokk-bifrost-analysis", "brokk-bifrost-semantic"];
+const features = {
+  "brokk-bifrost-store": { "test-support": ["brokk-bifrost-core/test-support"] },
+  "brokk-bifrost-semantic": { "test-support": ["brokk-bifrost-core/test-support"] },
+  "brokk-bifrost-analysis": { "test-support": ["brokk-bifrost-store/test-support"] },
+};
+
+// Crates that can write store seals reach core's test-support through their
+// first seal-writing dependency, unless a test removes that chain.
+function withTestSupport(dependencies) {
+  const index = dependencies.findIndex(({ name }) => sealWritingDependencies.includes(name));
+  return index < 0 ? dependencies : dependencies.map((dependency, position) =>
+    position === index ? { ...dependency, features: ["test-support"] } : dependency);
 }
 
 function metadata(overrides = {}) {
@@ -99,7 +115,7 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-ruby"),
       dependency("brokk-bifrost-rust"),
     ],
-    "brokk-bifrost-store": [],
+    "brokk-bifrost-store": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-analysis": [
       dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-semantic"),
@@ -164,9 +180,13 @@ function metadata(overrides = {}) {
   const packages = packageNames.map((name) => ({
     id: `path+file:///workspace/${name}#${name}@${versions[name] ?? "0.8.12"}`,
     name,
+    publish: name === "workspace-hack" ? [] : null,
     version: versions[name] ?? "0.8.12",
-    dependencies: [
-      ...(dependencies[name] ?? []),
+    features: features[name] ?? {},
+    dependencies: name === "workspace-hack" ? (dependencies[name] ?? []) : [
+      ...(overrides.withoutTestSupport?.includes(name)
+        ? dependencies[name] ?? []
+        : withTestSupport(dependencies[name] ?? [])),
       dependency("brokk-bifrost-test-macros", "dev", "*"),
     ],
   }));
@@ -178,6 +198,22 @@ function metadata(overrides = {}) {
 
 test("accepts the intended one-way workspace graph", () => {
   assert.deepEqual(validateWorkspaceGraph(metadata()), []);
+});
+
+test("the unpublished feature union cannot reverse engine layers or import host stacks", () => {
+  const graph = metadata();
+  graph.packages.find(pkg => pkg.name === "brokk-bifrost-core").dependencies.push(dependency("workspace-hack", null, "*"));
+  assert.deepEqual(validateWorkspaceGraph(graph), []);
+  const hack = graph.packages.find(pkg => pkg.name === "workspace-hack");
+  hack.publish = null;
+  hack.dependencies.push(dependency("brokk-bifrost-analysis"), {
+    ...dependency("pyo3"), source: "registry+https://github.com/rust-lang/crates.io-index",
+  });
+  assert.deepEqual(validateWorkspaceGraph(graph), [
+    "workspace-hack must remain unpublished",
+    "workspace-hack must not depend on brokk-bifrost-analysis",
+    "workspace-hack must not depend on pyo3",
+  ]);
 });
 
 test("test macros are permitted only as path-only development dependencies", () => {
@@ -443,6 +479,21 @@ test("rejects a non-exact implementation dependency version", () => {
   );
 });
 
+test("crates that can write store seals test with every seal validated", () => {
+  assert.deepEqual(validateWorkspaceGraph(metadata({ withoutTestSupport: ["brokk-bifrost-flow"] })), [
+    "brokk-bifrost-flow depends on brokk-bifrost-analysis but no dependency enables brokk-bifrost-core/test-support; its tests would validate only sampled store seals",
+  ]);
+  // Analysis reaches core through semantic. A weak entry on an optional
+  // dependency enables nothing unless something else turns that dependency on.
+  const graph = metadata();
+  const semantic = graph.packages.find(({ name }) => name === "brokk-bifrost-semantic");
+  semantic.features = { "test-support": ["brokk-bifrost-core?/test-support"] };
+  semantic.dependencies.find(({ name }) => name === "brokk-bifrost-core").optional = true;
+  assert.deepEqual(validateWorkspaceGraph(graph), [
+    "brokk-bifrost-analysis depends on brokk-bifrost-semantic, brokk-bifrost-store but no dependency enables brokk-bifrost-core/test-support; its tests would validate only sampled store seals",
+  ]);
+});
+
 test("rejects unexpected workspace members", () => {
   assert.deepEqual(
     validateWorkspaceGraph(metadata({ names: [...names, "surprise-package"] })),
@@ -457,7 +508,8 @@ const knowledgeCrates = metadata().packages.find(
 );
 
 function withExtraDependency(graph, from, to) {
-  graph.packages.find(({ name }) => name === from).dependencies.push(dependency(to));
+  const pkg = graph.packages.find(({ name }) => name === from);
+  pkg.dependencies = withTestSupport([...pkg.dependencies, dependency(to)]);
   return graph;
 }
 

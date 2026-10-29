@@ -20,6 +20,35 @@ maturin develop
 
 This repository has a maturin-backed `pyproject.toml` so `uv run python ...` can execute the `bifrost_searchtools` client through the PyO3 native Rust extension.
 
+Third-party dependency features are unified by the unpublished `workspace-hack`
+crate, so narrow package builds can reuse each other's compiled dependencies.
+After changing dependencies or `Cargo.lock`, update it with:
+
+```sh
+cargo install --locked cargo-hakari --version 0.9.39
+node scripts/public/workspace-hack.mjs
+```
+
+`node scripts/public/workspace-hack.mjs --check` checks both Hakari's generated
+manifest and member dependencies and the generated cargo-machete metadata.
+The union includes third-party features requested by optional workspace
+features, but workspace features such as `test-support` still produce separate
+builds. Host and target unions stay separate, so build-only JSON insertion
+ordering does not spread into target libraries. Python extension linkage stays
+outside the union.
+The first build pays for the new union; later builds reuse it through the
+normal Cargo cache. Release binaries use this union, while release packaging
+removes the build aid in a disposable source copy so registry consumers depend
+only on the features each published crate declares.
+
+Use `--check` for the CI drift check. `cargo hakari verify` is diagnostic:
+version 0.9.39 also reports synthetic "post-compute fixup" builds and host-side
+variants for serde, serde_json, proc-macro2 and libc. A workspace proc-macro's
+normal dependency on the hack can add target-requested features on the host.
+Host-only behavior switches stay off the target. Compiler-artifact replay of
+successive narrow test builds establishes whether those builds reuse their
+shared libraries.
+
 ## Test
 
 Run the core Rust checks before submitting a change:
@@ -502,9 +531,9 @@ the dependency graph: `brokk-bifrost-core`, then the language crates
 run in parallel), then `brokk-bifrost-semantic`, then `brokk-bifrost-store`,
 then `brokk-bifrost-analysis`,
 then `brokk-bifrost-jvm-analysis`, `brokk-bifrost-go-analysis`, `brokk-bifrost-cpp-analysis`, `brokk-bifrost-csharp-analysis`, `brokk-bifrost-php-analysis`, `brokk-bifrost-python-analysis`, `brokk-bifrost-ruby-analysis`, `brokk-bifrost-rust-analysis`, `brokk-bifrost-js-ts-analysis` and `brokk-bifrost-flow` in parallel, then
-`brokk-bifrost-tools` and `brokk-bifrost-semantic-packs` in parallel, then
-`brokk-bifrost-rql`, then `brokk-bifrost-policy`, then
-`brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
+`brokk-bifrost-tools`, then `brokk-bifrost-rql`, then `brokk-bifrost-policy`,
+then `brokk-bifrost-runtime` and `brokk-bifrost-semantic-packs` in parallel,
+then MCP and LSP (which may run in parallel), and the
 stable `brokk-bifrost` facade last. Each publication waits for crates.io to
 expose the exact version and archive checksum before its dependents proceed.
 
@@ -539,7 +568,7 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-tools` | `crates/bifrost-tools/Cargo.toml` | 7 |
 | `brokk-bifrost-flow` | `crates/bifrost-flow/Cargo.toml` | 6 |
 | `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 8 |
-| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 8 |
+| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 10 |
 | `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 9 |
 | `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 10 |
 | `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 11 |
@@ -661,6 +690,16 @@ Use one explicit handoff from source projection to release publication:
    source. Skipping this step is what left `v0.10.3` and `v0.10.4` publishing
    plugins whose committed checksums described the previous release, so a
    fresh marketplace install failed closed with `checksum_mismatch`.
+   Leave `qualification_tooling_sha` empty. Before it pushes anything, the
+   sync runs `scripts/release-qualification.mjs --tooling-check` on the
+   private source commit and dispatches the projection with the newest
+   master commit whose qualification tooling contract the RC carries, the
+   commit the RC's `Release gate` summary names. Left to its own default the
+   projection would compare the RC with master head, and in v0.14.2 it failed
+   with "RC qualification tooling differs from trusted workflow revision"
+   because master had changed CI files since the RC was cut. Set the input
+   only to override that search: it must be an ancestor of the commit the
+   sync was dispatched from, and the RC must still carry its contract.
 5. Re-qualify the corrected commit. Dispatch `Release readiness` again against
    the new public head with `requalify_from_run` set to the run from step 2,
    without waiting for the public CI run the re-projection started: the
@@ -677,7 +716,14 @@ Use one explicit handoff from source projection to release publication:
    `vX.Y.Z` tag on the **corrected** public commit, whose committed checksums
    now describe its own artifacts. Projection does not create a tag, dispatch
    `Release`, or publish an artifact.
-7. After promotion, invoke the post-release smoke workflow with that exact tag
+7. Carry the checksum correction to master. The sync commits it only to the
+   release branch, so without this master keeps the previous release's
+   `archiveSha256` values.
+   After the tag, cherry-pick the correction commit (`git cherry-pick -x`)
+   onto a branch from current `origin/master` and land it through the queue
+   (v0.14.2: #7489). This is the one direction a commit moves from an RC to
+   master; it changes only the launcher checksum projections.
+8. After promotion, invoke the post-release smoke workflow with that exact tag
    (through its reusable call or manual dispatch), then monitor registry and
    marketplace visibility and rerun only the failed smoke jobs when a target
    is still propagating.

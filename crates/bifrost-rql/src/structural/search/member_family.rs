@@ -12,7 +12,8 @@
 //! edge rows can never be read as a proven-empty family. `family_edges` emits
 //! the forward edges (`overrides`, `implements`) and the bounded inversion of
 //! the same relation (`overridden_by`, `implemented_by`) for the same member,
-//! and only ever from a proven answer.
+//! retaining established edges even when the family remains open. When no edge
+//! row can carry that open coverage, a query diagnostic states the gap.
 
 use super::*;
 
@@ -109,6 +110,7 @@ pub(super) fn member_family_expansions_for_declaration(
     declaration: &DeclarationValue,
     cancellation: Option<&CancellationToken>,
     edges: bool,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     let member_id = render::canonical_member_digest(analyzer, &declaration.unit);
     let Some(provider) = analyzer.member_family_provider() else {
@@ -119,12 +121,10 @@ pub(super) fn member_family_expansions_for_declaration(
             MemberFamilyAnswer::unsupported_answer(),
             Vec::new(),
             edges,
+            diagnostics,
         );
     };
     let answer = provider.member_family(&declaration.unit, cancellation);
-    if !answer.is_proven() {
-        return finish(analyzer, declaration, member_id, answer, Vec::new(), edges);
-    }
     let row_edges = answer
         .edges
         .iter()
@@ -140,7 +140,15 @@ pub(super) fn member_family_expansions_for_declaration(
             },
         })
         .collect();
-    finish(analyzer, declaration, member_id, answer, row_edges, edges)
+    finish(
+        analyzer,
+        declaration,
+        member_id,
+        answer,
+        row_edges,
+        edges,
+        diagnostics,
+    )
 }
 
 fn finish(
@@ -150,7 +158,40 @@ fn finish(
     answer: MemberFamilyAnswer,
     row_edges: Vec<MemberFamilyRowEdge>,
     edges: bool,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
+    let gap_code = match answer.outcome {
+        MemberFamilyOutcome::Incomplete => Some(CodeQueryDiagnosticCode::SemanticAnalysisPartial),
+        MemberFamilyOutcome::Unsupported => {
+            Some(CodeQueryDiagnosticCode::SemanticCapabilityUnsupported)
+        }
+        MemberFamilyOutcome::Proven | MemberFamilyOutcome::NoFamily => None,
+    };
+    if edges
+        && row_edges.is_empty()
+        && let Some(code) = gap_code
+    {
+        diagnostics.push(incomplete_diagnostic(
+            code,
+            crate::analyzer::common::language_for_file(declaration.unit.source()).config_label(),
+            format!(
+                "member-family {} for {} in {} has no established edges: {}{}",
+                answer.outcome.label(),
+                declaration.unit.identifier(),
+                rel_path_string(declaration.unit.source()),
+                answer
+                    .reason
+                    .expect("a non-proven family states its reason")
+                    .label(),
+                if answer.unread_ancestors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; unread ancestors: {:?}", answer.unread_ancestors)
+                },
+            ),
+            Vec::new(),
+        ));
+    }
     let family_id = member_family_id(analyzer, &answer);
     let value = MemberFamilyValue {
         member: declaration.clone(),

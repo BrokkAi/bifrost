@@ -56,6 +56,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResol
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::ClaimSubjectRole;
+use brokk_bifrost_analysis::analyzer::usages::get_definition::{CallApplicationKind, CallEvidence};
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupDiagnostic;
 
@@ -95,6 +96,9 @@ use std::sync::{Arc, OnceLock};
 #[path = "native_points/tests.rs"]
 mod tests;
 
+/// Query-only native result and the call proof derived during its selection.
+pub(crate) type RustDefinitionLookup = (BoundedResolution<DefinitionLookupOutcome>, CallEvidence);
+
 /// Inputs for selected Rust point operations in one source-definition batch.
 /// The factory retains overlay masks and content mounts across that batch's
 /// selected operations.
@@ -108,6 +112,11 @@ pub(crate) struct RustDefinitionOperationFactory<'analyzer> {
 struct RustDefinitionOverlayInputs {
     masks: Vec<SelectedResolutionOverlayMask>,
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
+}
+
+fn diagnostic_json(mut value: serde_json::Value) -> String {
+    value.sort_all_objects();
+    value.to_string()
 }
 
 pub(crate) enum RustDefinitionOperationOpenFailure {
@@ -213,13 +222,35 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
         resolve_rust_definition_in_operation(query, operation)
     }
 
+    pub(crate) fn resolve_with_evidence(
+        &self,
+        operation: &mut SelectedResolutionOperation<'_, '_>,
+        query: BoundedReceiverQuery<'_>,
+    ) -> RustDefinitionLookup {
+        let mut evidence = CallEvidence::default();
+        let outcome =
+            resolve_rust_definition_in_operation_with_evidence(query, operation, &mut evidence);
+        (outcome, evidence)
+    }
+
     pub(crate) fn resolve_many(
         &self,
         operation: &mut SelectedResolutionOperation<'_, '_>,
         queries: &[BoundedReceiverQuery<'_>],
         cancellation: &CancellationToken,
-    ) -> Vec<Option<BoundedResolution<DefinitionLookupOutcome>>> {
-        resolve_rust_definitions_in_operation(self.rust, operation, queries, cancellation)
+    ) -> Vec<Option<RustDefinitionLookup>> {
+        let mut evidence = vec![CallEvidence::default(); queries.len()];
+        resolve_rust_definitions_in_operation(
+            self.rust,
+            operation,
+            queries,
+            cancellation,
+            &mut evidence,
+        )
+        .into_iter()
+        .zip(evidence)
+        .map(|(outcome, evidence)| outcome.map(|outcome| (outcome, evidence)))
+        .collect()
     }
 
     pub(crate) fn resolve_bounded(
@@ -307,6 +338,18 @@ pub(crate) fn resolve_rust_definition_in_operation(
     query: BoundedReceiverQuery<'_>,
     operation: &mut SelectedResolutionOperation<'_, '_>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
+    resolve_rust_definition_in_operation_with_evidence(
+        query,
+        operation,
+        &mut CallEvidence::default(),
+    )
+}
+
+fn resolve_rust_definition_in_operation_with_evidence(
+    query: BoundedReceiverQuery<'_>,
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+    evidence: &mut CallEvidence,
+) -> BoundedResolution<DefinitionLookupOutcome> {
     let cancellation = query.cancellation.cloned().unwrap_or_default();
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(query.analyzer) else {
         return complete_definition(
@@ -317,7 +360,7 @@ pub(crate) fn resolve_rust_definition_in_operation(
         )
         .into_complete_resolution();
     };
-    resolve_rust_definition_with_operation(query, rust, operation, &cancellation)
+    resolve_rust_definition_with_operation(query, rust, operation, &cancellation, evidence)
 }
 
 #[cfg(test)]
@@ -370,6 +413,27 @@ pub fn resolve_rust_definition_bounded(
 pub(crate) fn resolve_rust_definition_bounded_with_after_open(
     query: BoundedReceiverQuery<'_>,
     after_open: impl FnOnce(),
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    resolve_rust_definition_bounded_with_after_open_and_evidence(
+        query,
+        after_open,
+        &mut CallEvidence::default(),
+    )
+}
+
+pub(crate) fn resolve_rust_definition_bounded_with_evidence(
+    query: BoundedReceiverQuery<'_>,
+) -> RustDefinitionLookup {
+    let mut evidence = CallEvidence::default();
+    let outcome =
+        resolve_rust_definition_bounded_with_after_open_and_evidence(query, || {}, &mut evidence);
+    (outcome, evidence)
+}
+
+fn resolve_rust_definition_bounded_with_after_open_and_evidence(
+    query: BoundedReceiverQuery<'_>,
+    after_open: impl FnOnce(),
+    evidence: &mut CallEvidence,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
     let cancellation = query.cancellation.cloned().unwrap_or_default();
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(query.analyzer) else {
@@ -487,7 +551,28 @@ pub(crate) fn resolve_rust_definition_bounded_with_after_open(
     };
     after_open();
 
-    resolve_rust_definition_with_operation(query, rust, &mut operation, &cancellation)
+    resolve_rust_definition_with_operation(query, rust, &mut operation, &cancellation, evidence)
+}
+
+/// Rust's projection for the shared declaration-at-range lookup.
+fn project_rust_declarations(
+    ready: &brokk_bifrost_analysis::analyzer::store::resolution_operation::ReadySelectedResolution<
+        '_,
+        '_,
+    >,
+    definitions: &[brokk_bifrost_analysis::analyzer::resolution::model::SemanticId],
+    cancellation: &CancellationToken,
+    session: &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+) -> brokk_bifrost_analysis::analyzer::store::Result<SelectedRustSourceDefinitionProjection> {
+    brokk_bifrost_analysis::analyzer::store::resolution_operation::project_rust_source_definitions(
+        ready,
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMountTable::new(
+            &ready.inventory,
+        ),
+        definitions,
+        cancellation,
+        session,
+    )
 }
 
 fn resolve_rust_definition_with_operation(
@@ -495,6 +580,7 @@ fn resolve_rust_definition_with_operation(
     rust: &RustAnalyzer,
     operation: &mut SelectedResolutionOperation<'_, '_>,
     cancellation: &CancellationToken,
+    evidence: &mut CallEvidence,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
     let source_matches = rust
         .inner
@@ -814,7 +900,7 @@ fn resolve_rust_definition_with_operation(
     // Declaration identifiers denote themselves, even when there is no
     // reference row at the focused range. The selected lookup serves both
     // persisted source bridges and transient native declaration facts.
-    let declaration = operation.rust_declaration_at_range_bounded(
+    let declaration = operation.declaration_at_range_bounded(
         &SelectedSemanticLocator::for_declaration_range(
             "rust",
             rel_path_string(query.file),
@@ -823,6 +909,8 @@ fn resolve_rust_definition_with_operation(
         ),
         query.budget,
         cancellation,
+        project_rust_declarations,
+        SelectedRustSourceDefinitionProjection::Cancelled,
     );
     match declaration {
         Ok(None) => {}
@@ -915,7 +1003,7 @@ fn resolve_rust_definition_with_operation(
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Complete { value, work } => {
-            let mut outcome = adapt_definition_value(&query, value);
+            let mut outcome = adapt_definition_value(&query, value, evidence, cancellation);
             if matcher_namespace_undecided
                 && outcome
                     .diagnostics
@@ -961,6 +1049,7 @@ fn resolve_rust_definitions_in_operation(
     operation: &mut SelectedResolutionOperation<'_, '_>,
     queries: &[BoundedReceiverQuery<'_>],
     cancellation: &CancellationToken,
+    evidence: &mut [CallEvidence],
 ) -> Vec<Option<BoundedResolution<DefinitionLookupOutcome>>> {
     let mut results = std::iter::repeat_with(|| None)
         .take(queries.len())
@@ -1072,10 +1161,12 @@ fn resolve_rust_definitions_in_operation(
             query.site.focus_start_byte,
             query.site.focus_end_byte,
         );
-        match operation.rust_declaration_at_range_bounded(
+        match operation.declaration_at_range_bounded(
             &declaration_locator,
             query.budget,
             cancellation,
+            project_rust_declarations,
+            SelectedRustSourceDefinitionProjection::Cancelled,
         ) {
             Ok(None) => {}
             Ok(Some(_)) | Err(_) => continue,
@@ -1132,7 +1223,8 @@ fn resolve_rust_definitions_in_operation(
             }
             BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
             BoundedResolution::Complete { value, work } => {
-                let mut outcome = adapt_definition_value(query, value);
+                let mut outcome =
+                    adapt_definition_value(query, value, &mut evidence[index], cancellation);
                 if let Some(condition) = &conditional_cfg {
                     outcome
                         .diagnostics
@@ -1731,9 +1823,67 @@ pub(crate) fn resolve_rust_type_bounded(
     }
 }
 
+/// Read the category of the receiver selected by native member lookup.
+/// This consumes selection evidence; it never re-infers a receiver expression.
+fn selected_member_call_evidence(
+    query: &BoundedReceiverQuery<'_>,
+    answers: &[SelectedRustReferenceAnswer],
+) -> CallEvidence {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+    use brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind;
+
+    let Some(_) = query
+        .tree
+        .and_then(|tree| {
+            crate::analyzer::rust::external_calls::call_path_for_site(tree, query.site)
+        })
+        .and_then(brokk_bifrost_rust::structural::rust_method_call_parts)
+    else {
+        return CallEvidence::default();
+    };
+    if answers.is_empty() {
+        return CallEvidence::default();
+    }
+    let mut extensibility = None;
+    for answer in answers {
+        let [target] = answer.resolution.binding().targets() else {
+            return CallEvidence::default();
+        };
+        let Some(selected) = answer
+            .member_attributions
+            .iter()
+            .find(|member| member.target == *target)
+        else {
+            return CallEvidence::default();
+        };
+        let kind = if selected.receiver_is_intrinsic {
+            SemanticModelSymbolKind::Class
+        } else {
+            match selected.receiver_kind {
+                Some(RustDeclarationKind::Struct) => SemanticModelSymbolKind::Struct,
+                Some(RustDeclarationKind::Enum) => SemanticModelSymbolKind::Enum,
+                Some(RustDeclarationKind::Union) => SemanticModelSymbolKind::Union,
+                Some(RustDeclarationKind::Trait) => SemanticModelSymbolKind::Trait,
+                _ => return CallEvidence::default(),
+            }
+        };
+        extensibility = super::modeled_members::receiver_dispatch_extensibility(kind, None);
+        if extensibility.is_none() {
+            return CallEvidence::default();
+        }
+    }
+    CallEvidence {
+        call_application: CallApplicationKind::BoundReceiver,
+        dispatch_extensibility: extensibility,
+        ..CallEvidence::default()
+    }
+}
+
 fn adapt_definition_value(
     query: &BoundedReceiverQuery<'_>,
     value: SelectedRustCallerReferenceOutcome,
+    evidence: &mut CallEvidence,
+    cancellation: &CancellationToken,
 ) -> DefinitionLookupOutcome {
     let site = query.site;
     match value {
@@ -1757,9 +1907,28 @@ fn adapt_definition_value(
             SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
                 answer,
             )) => {
+                *evidence = selected_member_call_evidence(query, &answer);
+                let Some(completion) = ResolutionCompletion::combine_all_with_poll(
+                    answer
+                        .iter()
+                        .map(|answer| answer.resolution.binding().completion()),
+                    &mut || cancellation.is_cancelled(),
+                ) else {
+                    return complete_definition(
+                        site,
+                        DefinitionLookupStatus::Cancelled,
+                        "cancelled",
+                        "selected Rust point operation was cancelled",
+                    )
+                    .into_complete_value();
+                };
                 let modeled = modeled_macro_definitions(query, &answer);
-                let mut outcome =
-                    adapt_definition_answer(site, answer, focused_qualified_type_route(query));
+                let mut outcome = adapt_definition_answer(
+                    site,
+                    answer,
+                    completion,
+                    focused_qualified_type_route(query),
+                );
                 match modeled {
                     Ok(definitions) if !definitions.is_empty() => {
                         outcome.status =
@@ -2267,6 +2436,7 @@ fn rust_external_macro_frontiers(
 fn adapt_definition_answer(
     site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
     answers: Vec<SelectedRustReferenceAnswer>,
+    completion: ResolutionCompletion,
     qualified_route_head: bool,
 ) -> DefinitionLookupOutcome {
     let canonical_targets = answers
@@ -2276,11 +2446,7 @@ fn adapt_definition_answer(
     let authored_member_candidate = answers
         .iter()
         .any(|answer| !answer.member_attributions.is_empty());
-    let completion = answers
-        .iter()
-        .fold(ResolutionCompletion::Complete, |completion, answer| {
-            completion.combine(answer.resolution.binding().completion())
-        });
+
     let diagnostic_identities = answers
         .iter()
         .flat_map(|answer| answer.diagnostic_identities.iter().cloned())
@@ -2463,7 +2629,7 @@ fn adapt_definition_answer(
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
             kind: "UnsupportedMacroGeneratedSurface".to_owned(),
-            message: serde_json::json!({
+            message: diagnostic_json(serde_json::json!({
                 "evidence": [{
                     "reason": "UnexpandedMacroBoundary",
                     "macro": gap.macro_name,
@@ -2471,8 +2637,7 @@ fn adapt_definition_answer(
                     "start_byte": gap.start_byte,
                     "end_byte": gap.end_byte,
                 }]
-            })
-            .to_string(),
+            })),
         });
     }
     let mut public_generated_surface_gaps = generated_surface_gaps
@@ -2484,13 +2649,12 @@ fn adapt_definition_answer(
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
             kind: "GeneratedItemSurface".to_owned(),
-            message: serde_json::json!({
+            message: diagnostic_json(serde_json::json!({
                 "evidence": [{
                     "reason": "GeneratedItemSurface",
                     "semantic": semantic,
                 }]
-            })
-            .to_string(),
+            })),
         });
     }
     if lexical.len() > 1 {
@@ -2740,21 +2904,15 @@ fn adapt_definition_answer(
             diagnostics.push(DefinitionLookupDiagnostic {
                 claim: None,
                 kind: "GeneratedItemSurface".to_owned(),
-                // Emit keys in sorted order. `serde_json`'s `preserve_order`
-                // feature is unified into a `--workspace` build (for example by
-                // the policy crate's dev-dependency), which would otherwise
-                // serialize this literal in insertion order and flip the key
-                // order inside the diagnostic message between a narrow and a
-                // whole-workspace run.
-                message: serde_json::json!({
+                // #6112: diagnostic JSON keys stay stable across feature unification.
+                message: diagnostic_json(serde_json::json!({
                     "evidence": [{
                         "gap_kind": frontier.kind.evidence_name(),
                         "native_macro_invocation": false,
                         "reason": "GeneratedItemSurface",
                         "semantic": project_identity(&frontier.semantic),
                     }]
-                })
-                .to_string(),
+                })),
             });
         }
     }
@@ -2780,15 +2938,13 @@ fn adapt_definition_answer(
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
             kind: kind.to_owned(),
-            // Sorted keys for the same feature-unification reason as above.
-            message: serde_json::json!({
+            message: diagnostic_json(serde_json::json!({
                 "evidence": frontiers.iter().map(|frontier| serde_json::json!({
                     "gap_kind": frontier.kind.evidence_name(),
                     "semantic": project_identity(&frontier.semantic),
                 })).collect::<Vec<_>>(),
                 "reason": reason,
-            })
-            .to_string(),
+            })),
         });
     }
     if generated_surface_evidence && status == DefinitionLookupStatus::Incomplete {

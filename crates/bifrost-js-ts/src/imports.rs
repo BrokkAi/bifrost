@@ -1,12 +1,11 @@
 use crate::access_chain::{ImportMemberChainOwner, JsTsImportedMemberChain};
 use crate::providers::JsTsSource;
-use crate::syntax::{JsTsImportBinder, js_ts_statement_module_source, unquote};
+use crate::syntax::{JsTsImportBinder, js_ts_statement_module_source, js_ts_string_literal_value};
 use crate::tsconfig::AliasResolver;
 use crate::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
 use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPath};
-use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind as first_child_of_kind;
 use brokk_bifrost_core::analyzer::usages::model::ImportBinding;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
@@ -40,7 +39,6 @@ pub fn js_ts_direct_import_export_name<'a>(
 pub struct JsTsImportSyntax<'tree> {
     pub import: ImportInfo,
     pub declaration: Node<'tree>,
-    pub target: Option<Node<'tree>>,
     pub name: Option<Node<'tree>>,
     pub alias: Option<Node<'tree>>,
     pub kind: Option<ImportKind>,
@@ -56,7 +54,7 @@ pub fn parse_es_import_syntaxes_from_node<'tree>(
         return Vec::new();
     }
     let raw = node_text(node, source).trim().to_string();
-    let Some((source_node, module_specifier)) = js_ts_statement_module_source(node, source) else {
+    let Some((_, module_specifier)) = js_ts_statement_module_source(node, source) else {
         return Vec::new();
     };
     let path = structured_module_path(&module_specifier, node.start_byte());
@@ -73,7 +71,6 @@ pub fn parse_es_import_syntaxes_from_node<'tree>(
                 binder_span: None,
             },
             declaration: node,
-            target: Some(source_node),
             name: None,
             alias: None,
             kind: None,
@@ -101,7 +98,6 @@ pub fn parse_es_import_syntaxes_from_node<'tree>(
                             )),
                         },
                         declaration: node,
-                        target: Some(source_node),
                         name: Some(child),
                         alias: None,
                         kind: Some(ImportKind::Default),
@@ -127,7 +123,6 @@ pub fn parse_es_import_syntaxes_from_node<'tree>(
                                 )),
                             },
                             declaration: node,
-                            target: Some(source_node),
                             name: None,
                             alias: Some(alias_node),
                             kind: Some(ImportKind::Namespace),
@@ -136,14 +131,9 @@ pub fn parse_es_import_syntaxes_from_node<'tree>(
                     }
                 }
             }
-            "named_imports" => collect_named_es_import_syntaxes(
-                child,
-                source,
-                &raw,
-                source_node,
-                node,
-                &mut imports,
-            ),
+            "named_imports" => {
+                collect_named_es_import_syntaxes(child, source, &raw, node, &mut imports)
+            }
             _ => {}
         }
     }
@@ -191,7 +181,6 @@ pub fn parse_commonjs_require_import_syntaxes_from_node<'tree>(
                 binder_span: None,
             },
             declaration: node,
-            target: direct_require_call(node, source).and_then(require_call_target_node),
             name: None,
             alias: None,
             // A side-effect require has no local binder. Keep its import leaf
@@ -244,13 +233,9 @@ fn commonjs_require_import_syntaxes_from_declaration<'tree>(
         let Some(name) = child.child_by_field_name("name") else {
             continue;
         };
-        let target = child
-            .child_by_field_name("value")
-            .and_then(require_call_target_node);
         imports.extend(commonjs_require_import_syntaxes_from_name(
             name,
             node,
-            target,
             &raw,
             &module_specifier,
             source,
@@ -262,7 +247,6 @@ fn commonjs_require_import_syntaxes_from_declaration<'tree>(
 fn commonjs_require_import_syntaxes_from_name<'tree>(
     node: Node<'tree>,
     declaration: Node<'tree>,
-    target: Option<Node<'tree>>,
     raw: &str,
     module_specifier: &str,
     source: &str,
@@ -294,7 +278,6 @@ fn commonjs_require_import_syntaxes_from_name<'tree>(
                         Some(brokk_bifrost_core::analyzer::common::node_span(node)),
                     ),
                     declaration,
-                    target,
                     name: Some(node),
                     alias: None,
                     kind: Some(ImportKind::CommonJsRequire),
@@ -302,66 +285,30 @@ fn commonjs_require_import_syntaxes_from_name<'tree>(
                 }]
             }
         }
-        "object_pattern" => {
-            let mut imports = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                match child.kind() {
-                    "shorthand_property_identifier_pattern" => {
-                        let identifier = node_text(child, source).trim();
-                        if !identifier.is_empty() {
-                            imports.push(JsTsImportSyntax {
-                                import: import_info(
-                                    identifier.to_string(),
-                                    None,
-                                    Some(brokk_bifrost_core::analyzer::common::node_span(child)),
-                                ),
-                                declaration,
-                                target,
-                                name: Some(child),
-                                alias: None,
-                                kind: Some(ImportKind::Named),
-                                is_static: false,
-                            });
-                        }
-                    }
-                    "pair_pattern" => {
-                        let name = child
-                            .child_by_field_name("key")
-                            .or_else(|| first_child_of_kind(child, "property_identifier"));
-                        let Some(name) = name else {
-                            continue;
-                        };
-                        let identifier = node_text(name, source).trim();
-                        if identifier.is_empty() {
-                            continue;
-                        }
-                        let alias = child
-                            .child_by_field_name("value")
-                            .and_then(|value| commonjs_pattern_local_name_node(value, source));
-                        let alias_text =
-                            alias.map(|node| node_text(node, source).trim().to_string());
-                        imports.push(JsTsImportSyntax {
-                            import: import_info(
-                                identifier.to_string(),
-                                alias_text,
-                                Some(brokk_bifrost_core::analyzer::common::node_span(
-                                    alias.unwrap_or(name),
-                                )),
-                            ),
-                            declaration,
-                            target,
-                            name: Some(name),
-                            alias,
-                            kind: Some(ImportKind::Named),
-                            is_static: false,
-                        });
-                    }
-                    _ => {}
+        "object_pattern" => crate::syntax::object_pattern_entries(node)
+            .into_iter()
+            .filter_map(|entry| {
+                let binder = entry.binder?;
+                let identifier = node_text(entry.key, source).trim();
+                let local = node_text(binder, source).trim();
+                if identifier.is_empty() || local.is_empty() {
+                    return None;
                 }
-            }
-            imports
-        }
+                let alias = (binder.id() != entry.key.id()).then_some(binder);
+                Some(JsTsImportSyntax {
+                    import: import_info(
+                        identifier.to_string(),
+                        alias.map(|_| local.to_string()),
+                        Some(brokk_bifrost_core::analyzer::common::node_span(binder)),
+                    ),
+                    declaration,
+                    name: Some(entry.key),
+                    alias,
+                    kind: Some(ImportKind::Named),
+                    is_static: false,
+                })
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -421,19 +368,7 @@ pub fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<Str
     if !matches!(first_argument.kind(), "string" | "string_fragment") {
         return None;
     }
-    Some(unquote(node_text(first_argument, source)))
-}
-
-fn commonjs_pattern_local_name_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-    match node.kind() {
-        "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
-            (!node_text(node, source).trim().is_empty()).then_some(node)
-        }
-        "assignment_pattern" => node
-            .child_by_field_name("left")
-            .and_then(|left| commonjs_pattern_local_name_node(left, source)),
-        _ => None,
-    }
+    js_ts_string_literal_value(first_argument, source)
 }
 
 fn direct_require_expression(node: Node<'_>, source: &str) -> bool {
@@ -452,16 +387,6 @@ fn is_require_call(node: Node<'_>, source: &str) -> bool {
 
 fn direct_require_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
     direct_require_call(node, source).and_then(|call| require_call_module_specifier(call, source))
-}
-
-fn require_call_target_node(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() != "call_expression" {
-        return None;
-    }
-    let arguments = node.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let argument = arguments.named_children(&mut cursor).next()?;
-    matches!(argument.kind(), "string" | "string_fragment").then_some(argument)
 }
 
 fn structured_module_path(
@@ -484,7 +409,6 @@ fn collect_named_es_import_syntaxes<'tree>(
     node: Node<'tree>,
     source: &str,
     raw: &str,
-    target: Node<'tree>,
     declaration: Node<'tree>,
     imports: &mut Vec<JsTsImportSyntax<'tree>>,
 ) {
@@ -517,7 +441,6 @@ fn collect_named_es_import_syntaxes<'tree>(
                 binder_span,
             },
             declaration,
-            target: Some(target),
             name: name_node,
             alias: alias_node,
             kind: Some(ImportKind::Named),
@@ -1214,6 +1137,73 @@ mod tests {
     use super::parse_commonjs_require_import_infos_from_node;
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
+
+    #[test]
+    fn module_identity_boundaries() {
+        for (specifier, expected) in [
+            ("q", Some(("q", None))),
+            ("@scope/q", Some(("@scope/q", None))),
+            ("node:fs/promises", Some(("fs", Some("promises")))),
+            ("./q", None),
+            ("../q", None),
+            ("/absolute/q", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                super::js_ts_module_identity(specifier).map(|i| (i.package, i.subpath)),
+                expected,
+                "{specifier}"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_runtime_extension_precedence() {
+        use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+        let root = tempfile::tempdir().unwrap();
+        for name in ["m.ts", "m.js", "m.js.ts", "fallback.js.ts"] {
+            std::fs::write(root.path().join(name), "export const value=1;").unwrap();
+        }
+        let file = ProjectFile::new(root.path(), "caller.ts");
+        for (specifier, expected) in [("./m.js", "m.ts"), ("./fallback.js", "fallback.js.ts")] {
+            assert_eq!(
+                super::resolve_js_ts_module_specifier(&file, specifier, Language::TypeScript, None),
+                vec![ProjectFile::new(root.path(), expected)]
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: shorthand CommonJS defaults lost binders"
+    )]
+    fn commonjs_default_patterns_use_the_bound_name() {
+        let source =
+            "const {readFile=fallback, writeFile:save=other, stat:inspect=()=>0}=require('fs');";
+        for language in [
+            tree_sitter_javascript::LANGUAGE.into(),
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ] {
+            let mut parser = Parser::new();
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let declaration = tree.root_node().named_child(0).unwrap();
+            let bindings = super::parse_commonjs_require_bindings_from_node(declaration, source);
+            let names: Vec<_> = bindings
+                .iter()
+                .map(|b| (b.imported_name.as_str(), b.local_name.as_str()))
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    ("readFile", "readFile"),
+                    ("writeFile", "save"),
+                    ("stat", "inspect")
+                ]
+            );
+        }
+    }
 
     #[test]
     #[hardwon("#2587: CommonJS import paths had to come from the AST literal")]

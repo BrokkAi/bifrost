@@ -121,27 +121,6 @@ impl SemanticWork {
             .unwrap_or_else(|| Self::uniform(usize::MAX))
     }
 
-    pub const fn saturating_add(self, other: Self) -> Self {
-        Self {
-            source_bytes: self.source_bytes.saturating_add(other.source_bytes),
-            procedures: self.procedures.saturating_add(other.procedures),
-            blocks: self.blocks.saturating_add(other.blocks),
-            program_points: self.program_points.saturating_add(other.program_points),
-            values: self.values.saturating_add(other.values),
-            allocations: self.allocations.saturating_add(other.allocations),
-            call_sites: self.call_sites.saturating_add(other.call_sites),
-            memory_locations: self.memory_locations.saturating_add(other.memory_locations),
-            captures: self.captures.saturating_add(other.captures),
-            source_mappings: self.source_mappings.saturating_add(other.source_mappings),
-            evidence: self.evidence.saturating_add(other.evidence),
-            gaps: self.gaps.saturating_add(other.gaps),
-            events: self.events.saturating_add(other.events),
-            control_edges: self.control_edges.saturating_add(other.control_edges),
-            nested_entries: self.nested_entries.saturating_add(other.nested_entries),
-            owned_text_bytes: self.owned_text_bytes.saturating_add(other.owned_text_bytes),
-        }
-    }
-
     pub const fn component_max(self, other: Self) -> Self {
         Self {
             source_bytes: if self.source_bytes > other.source_bytes {
@@ -492,7 +471,7 @@ impl SemanticBudget {
     /// Release a closed file/root window without refunding performed work.
     pub fn release_resident(&mut self) {
         let used = SemanticWork::default();
-        self.ledger = BudgetLedger::new(self.limits(), used);
+        self.ledger = self.ledger.with_used(used);
         self.resident_artifacts = Arc::default();
         self.resident_owners = Arc::default();
         self.inherited_artifacts = Arc::default();
@@ -512,7 +491,7 @@ impl SemanticBudget {
             .resident_owners
             .values()
             .fold(retained, |sum, (_, work)| sum.conservative_add(*work));
-        self.ledger = BudgetLedger::new(self.limits(), retained);
+        self.ledger = self.ledger.with_used(retained);
     }
 
     /// A closed query window refunds only allocations it did not promote
@@ -538,7 +517,7 @@ impl SemanticBudget {
         // Prepared sessions and cached results have their own holders. A
         // pooled source has no active session token after return, so its
         // admission is refunded independently of pool occupancy.
-        self.ledger = BudgetLedger::new(self.limits(), used);
+        self.ledger = self.ledger.with_used(used);
     }
 
     /// Associate admitted census with its allocation without pinning it.
@@ -563,7 +542,7 @@ impl SemanticBudget {
                 .all(|dimension| work.get(*dimension) <= used.get(*dimension))
         );
         used = used.saturating_sub(work);
-        self.ledger = BudgetLedger::new(self.limits(), used);
+        self.ledger = self.ledger.with_used(used);
     }
 
     /// Run a derivation whose unowned admissions are scratch. Keep performed
@@ -662,11 +641,21 @@ impl SemanticBudget {
     }
 
     fn reconcile_residency(&mut self) {
-        let resident = self.resident();
-        Arc::make_mut(&mut self.resident_owners).retain(|_, (owner, _)| owner.strong_count() > 0);
-        Arc::make_mut(&mut self.resident_artifacts)
-            .retain(|_, (artifact, _)| artifact.has_consumer());
-        self.ledger = BudgetLedger::new(self.limits(), resident);
+        // Consumer state can change when another policy takes a cached artifact.
+        // Decide retention and refund together: a second observation could keep
+        // an artifact whose census the first observation already refunded.
+        let mut resident = self.ledger.used();
+        refund_expired_residents(
+            Arc::make_mut(&mut self.resident_owners),
+            &mut resident,
+            |owner| owner.strong_count() > 0,
+        );
+        refund_expired_residents(
+            Arc::make_mut(&mut self.resident_artifacts),
+            &mut resident,
+            ResidentArtifact::has_consumer,
+        );
+        self.ledger = self.ledger.with_used(resident);
     }
 
     pub fn remaining(&self) -> SemanticWork {
@@ -674,8 +663,13 @@ impl SemanticBudget {
     }
 
     /// Check one atomic charge without mutating this budget.
+    pub fn refusal_count(&self) -> usize {
+        self.ledger.refusal_count()
+    }
+
     pub fn check_admission(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
-        BudgetLedger::new(self.limits(), self.resident())
+        self.ledger
+            .with_used(self.resident())
             .check(work)
             .map_err(SemanticBudgetExceeded::from)?;
         let Some(limit) = self.shared_summary_expansion_limit else {
@@ -694,6 +688,7 @@ impl SemanticBudget {
             assert!(work.captures > 0, "summary expansion charge is non-empty");
             SemanticBudgetDimension::Captures
         };
+        self.ledger.record_refusal();
         Err(SemanticBudgetExceeded {
             dimension,
             limit,
@@ -808,16 +803,14 @@ impl SemanticBudget {
     }
 
     fn raw_resident(&self) -> SemanticWork {
-        let mut raw = self.resident();
-        for (owner, census) in self.resident_artifacts.values() {
-            if owner.has_consumer() {
-                raw = raw.saturating_sub(*census);
-            }
+        // The raw balance and registry describe the same admissions. Remove
+        // every registered census once, without polling mutable consumer state.
+        let mut raw = self.ledger.used();
+        for (_, census) in self.resident_artifacts.values() {
+            raw = raw.saturating_sub(*census);
         }
-        for (owner, census) in self.resident_owners.values() {
-            if owner.strong_count() > 0 {
-                raw = raw.saturating_sub(*census);
-            }
+        for (_, census) in self.resident_owners.values() {
+            raw = raw.saturating_sub(*census);
         }
         raw
     }
@@ -1074,7 +1067,7 @@ impl SemanticBudget {
         let mut child = Self::new_child(parent.limits(), &parent.scope_snapshot());
         // Copy the raw balance with its raw weak registry, then refund once.
         // An effective balance with expired entries would refund them twice.
-        child.ledger = BudgetLedger::new(parent.limits(), parent.ledger.used());
+        child.ledger = parent.ledger.with_used(parent.ledger.used());
         child.shared_summary_expansion_limit = parent.shared_summary_expansion_limit;
         child.resident_artifacts = Arc::clone(&parent.resident_artifacts);
         child.resident_owners = Arc::clone(&parent.resident_owners);
@@ -2231,6 +2224,35 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#7421: a revived cached consumer kept an artifact after its census was refunded")]
+    fn reconciliation_uses_one_observation_for_refund_and_retention() {
+        let census = SemanticWork {
+            program_points: 7,
+            ..SemanticWork::default()
+        };
+        let mut entries = HashMap::from([(0, ((), census))]);
+        let mut used = census;
+        let mut observations = 0;
+        refund_expired_residents(&mut entries, &mut used, |_| {
+            observations += 1;
+            // The first observation sees only cache pins. A concurrent policy
+            // takes the artifact before a second observation would run.
+            observations > 1
+        });
+        assert_eq!(observations, 1);
+        assert!(entries.is_empty());
+        assert_eq!(used, SemanticWork::default());
+        // A later consumer has no retained admission and must pay again.
+        entries.insert(0, ((), census));
+        used = used.conservative_add(census);
+        refund_expired_residents(&mut entries, &mut used, |_| true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(used, census);
+        refund_expired_residents(&mut entries, &mut used, |_| false);
+        assert_eq!(used, SemanticWork::default());
+    }
+
+    #[test]
     #[hardwon("#5113: failed refinement derivations left scratch admitted after return")]
     fn temporary_derivation_admissions_close_on_success_and_error() {
         let mut budget = SemanticBudget::uniform(100).expect("positive grant");
@@ -3169,6 +3191,22 @@ impl ResidentArtifact {
             None
         }
     }
+}
+
+/// Refund and remove using one liveness observation per admission.
+fn refund_expired_residents<Key: Eq + std::hash::Hash, Owner>(
+    entries: &mut HashMap<Key, (Owner, SemanticWork)>,
+    used: &mut SemanticWork,
+    mut is_live: impl FnMut(&Owner) -> bool,
+) {
+    entries.retain(|_, (owner, work)| {
+        if is_live(owner) {
+            true
+        } else {
+            *used = used.saturating_sub(*work);
+            false
+        }
+    });
 }
 
 type ResidentArtifacts = HashMap<(StableDigest, usize), (ResidentArtifact, SemanticWork)>;

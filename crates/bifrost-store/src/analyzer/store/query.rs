@@ -160,14 +160,14 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
         rows: &[SearchCandidateNameRow],
         mut keep: impl FnMut(&str, &str) -> bool,
         cancellation: Option<&CancellationToken>,
-    ) -> LimitedQueryRows<SearchCandidateKey> {
+    ) -> Result<LimitedQueryRows<SearchCandidateKey>> {
         let mut paths: HashMap<(Oid, usize), Vec<ProjectFile>> = HashMap::default();
         let mut packages: HashMap<(Oid, usize, &str), Vec<String>> = HashMap::default();
         let mut out = Vec::new();
         let mut inspected = 0usize;
         for row in rows {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return LimitedQueryRows::incomplete(out, inspected);
+                return Ok(LimitedQueryRows::incomplete(out, inspected));
             }
             inspected = inspected.saturating_add(1);
             let Some(lang) = langs.get(row.lang_index) else {
@@ -190,17 +190,22 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
             if files.is_empty() {
                 continue;
             }
-            let package_names = packages
-                .entry((row.blob_oid, row.lang_index, row.content_qualifier.as_str()))
-                .or_insert_with(|| {
+            let package_names = match packages.entry((
+                row.blob_oid,
+                row.lang_index,
+                row.content_qualifier.as_str(),
+            )) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
                     files
                         .iter()
                         .map(|file| {
                             self.adapter
                                 .hydrate_content_qualifier(&row.content_qualifier, file)
                         })
-                        .collect()
-                });
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            };
             if package_names
                 .iter()
                 .any(|package_name| keep(package_name, &row.short_name))
@@ -212,7 +217,7 @@ impl<'a, A: StoreLanguageAdapter> QueryResolver<'a, A> {
                 });
             }
         }
-        LimitedQueryRows::complete(out, inspected)
+        Ok(LimitedQueryRows::complete(out, inspected))
     }
 
     fn paths_for_oid(&self, oid: Oid) -> Vec<ProjectFile> {

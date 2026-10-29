@@ -29,7 +29,7 @@ use super::definition::{
     TaintSourceEvidence, TaintSystemEntry, TaintTag, TaintThreatModel, TaintTrustBoundary,
     TypestateEventId, TypestateExitScope, TypestateExpectationId, TypestateStateId,
 };
-use super::finding::PolicySourceLocation;
+use super::finding::{FindingCertainty, PolicySourceLocation};
 use super::finding_identity::{
     AnalysisEventRef, AnalysisFindingId, AnalysisSubjectRef, EvidenceRef, OpaqueFindingKey,
     SourceScenarioId, StableIdentityDerivation, StableSemanticIdentity, TypestateScenarioId,
@@ -646,6 +646,10 @@ pub struct TaintOriginEvidence {
     primary: PolicySourceLocation,
     scenario_id: SourceScenarioId,
     evidence_refs: Vec<EvidenceRef>,
+    /// Whether this origin alone has a certain path at the solver fixed point.
+    /// A grouped finding is definite when any one origin is (#5597), so a
+    /// definite finding can list possible origins.
+    certainty: FindingCertainty,
 }
 
 impl TaintOriginEvidence {
@@ -666,9 +670,11 @@ impl TaintOriginEvidence {
             primary,
             scenario_id,
             evidence_refs,
+            FindingCertainty::Definite,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new_with_threat_model(
         source_endpoint: ResolvedEndpointIdentity,
         source_label: TaintLabel,
@@ -677,6 +683,7 @@ impl TaintOriginEvidence {
         primary: PolicySourceLocation,
         scenario_id: SourceScenarioId,
         mut evidence_refs: Vec<EvidenceRef>,
+        certainty: FindingCertainty,
     ) -> Result<Self, FutureEvidenceError> {
         normalize_semantic_set(
             &mut evidence_refs,
@@ -692,6 +699,7 @@ impl TaintOriginEvidence {
             primary,
             scenario_id,
             evidence_refs,
+            certainty,
         })
     }
 
@@ -722,6 +730,10 @@ impl TaintOriginEvidence {
     pub fn evidence_refs(&self) -> &[EvidenceRef] {
         &self.evidence_refs
     }
+
+    pub const fn certainty(&self) -> &FindingCertainty {
+        &self.certainty
+    }
 }
 
 impl RetainedSize for TaintOriginEvidence {
@@ -735,6 +747,7 @@ impl RetainedSize for TaintOriginEvidence {
                 retained_extra(&self.primary),
                 retained_extra(&self.scenario_id),
                 retained_extra(&self.evidence_refs),
+                retained_extra(&self.certainty),
             ],
         )
     }

@@ -79,10 +79,11 @@ pub fn build_jsts_usage_index_with_cancellation(
         }
         Some((file.clone(), exports, binder))
     };
+    let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     let per_file: Vec<(ProjectFile, ExportIndex, JsTsImportBinder)> = if parallel {
         files
             .par_iter()
-            .map(compute_file)
+            .map(|file| context.run(|| compute_file(file)))
             .collect::<Option<Vec<_>>>()?
     } else {
         files.iter().map(compute_file).collect::<Option<Vec<_>>>()?
@@ -776,4 +777,78 @@ pub fn unbound_browser_global_property<'a>(
 
 pub fn is_static_member(target: &CodeUnit) -> bool {
     target.short_name().ends_with("$static")
+}
+
+#[cfg(test)]
+mod external_star_boundary_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::usages::model::ReexportStar;
+    use brokk_bifrost_test_macros::hardwon;
+
+    // This crosses the export-index/graph boundary. The resolver's oracle maps
+    // the workspace specifier and leaves package specifiers external.
+    fn star_index(specifiers: &[&str]) -> (JsTsUsageIndex, ProjectFile) {
+        let root = std::env::current_dir().expect("absolute root");
+        let barrel = ProjectFile::new(root.clone(), "barrel.ts");
+        let local = ProjectFile::new(root, "local.ts");
+        let mut exports = ExportIndex::empty();
+        exports.reexport_stars = specifiers
+            .iter()
+            .map(|specifier| ReexportStar {
+                module_specifier: (*specifier).to_string(),
+            })
+            .collect();
+        let exports_by_file = HashMap::from_iter([
+            (barrel.clone(), exports),
+            (local.clone(), ExportIndex::empty()),
+        ]);
+        let edges = build_reexport_edges(
+            &exports_by_file,
+            &HashMap::default(),
+            &|_, specifier| {
+                if specifier == "./local" {
+                    vec![local.clone()]
+                } else {
+                    Vec::new()
+                }
+            },
+            None,
+        )
+        .expect("re-export graph");
+        (
+            JsTsUsageIndex {
+                exports_by_file,
+                direct_reexport_edges: edges.direct_reexport_edges,
+                direct_star_reexports: edges.direct_star_reexports,
+                ..Default::default()
+            },
+            barrel,
+        )
+    }
+
+    #[test]
+    fn external_star_reports_module_boundary() {
+        let (index, barrel) = star_index(&["external-package"]);
+        assert_eq!(
+            index.unresolved_reexport_boundary(std::slice::from_ref(&barrel), "missing"),
+            Some((barrel.clone(), "external-package".into()))
+        );
+        assert_eq!(
+            index.unresolved_reexport_boundary(&[barrel], "default"),
+            None
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: local star frontier hid an external star boundary"
+    )]
+    #[ignore = "finds real bug: local star frontier hides external stars; needs module-resolution identity at the query caller"]
+    fn mixed_star_reports_external_boundary() {
+        let (index, barrel) = star_index(&["./local", "external-package"]);
+        assert_eq!(
+            index.unresolved_reexport_boundary(std::slice::from_ref(&barrel), "missing"),
+            Some((barrel, "external-package".into()))
+        );
+    }
 }

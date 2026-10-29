@@ -4050,8 +4050,10 @@ fn completion_contains_cancelled_with_poll(
     Some(false)
 }
 
-/// The first shared semantic choice point whose rank differs decides the
-/// winner. Unrelated choice points do not order otherwise ambiguous paths.
+/// Compare the composed key: the last `CandidateOriginRank` step, when both
+/// paths carry one, then shared semantic choice points in path order. The
+/// first shared choice with different (tier, ordinal) decides. Equal or
+/// unordered paths to distinct targets survive together as an ambiguous answer.
 fn path_shadows_with_poll(
     left: &PartialPath,
     right: &PartialPath,

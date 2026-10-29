@@ -62,7 +62,7 @@ pub(crate) fn resolve_definition_dispatch<'a: 'selection, 'factory, 'selection, 
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
 > {
-    let mut evidence = CallEvidence::default();
+    let mut evidence;
     let outcome = {
         let query = brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
             analyzer,
@@ -77,10 +77,15 @@ pub(crate) fn resolve_definition_dispatch<'a: 'selection, 'factory, 'selection, 
             budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
             cancellation,
         };
-        let rust_resolution = match rust_definition_batch.as_mut() {
+        let (rust_resolution, native_evidence) = match rust_definition_batch.as_mut() {
             Some(batch) => batch.resolve(query),
-            None => crate::analyzer::rust::native_points::resolve_rust_definition_bounded(query),
+            None => {
+                crate::analyzer::rust::native_points::resolve_rust_definition_bounded_with_evidence(
+                    query,
+                )
+            }
         };
+        evidence = native_evidence;
         let rust_outcome = match rust_resolution {
             BoundedResolution::Complete { value, .. } => hold_rust_answer_to_its_proof(value),
             BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
@@ -291,7 +296,7 @@ pub(crate) struct RustDefinitionBatchOperation<'analyzer, 'factory, 'selection, 
     file_window: bool,
     retained_reader: Option<brokk_bifrost_analysis::analyzer::store::writer::RetainedExclusiveReader>,
     reuse_disabled: bool,
-    precomputed: Vec<Option<BoundedResolution<DefinitionLookupOutcome>>>,
+    precomputed: Vec<Option<crate::analyzer::rust::native_points::RustDefinitionLookup>>,
     precomputed_index: usize,
 }
 
@@ -369,12 +374,13 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                         }
                     };
                     for (request_index, query) in request_indices.iter().copied().zip(queries) {
-                        self.precomputed[request_index] = Some(
+                        self.precomputed[request_index] = Some((
                             crate::analyzer::rust::native_points::resolve_rust_definition_open_failure_for_batch(
                                 query,
                                 &failure,
                             ),
-                        );
+                            CallEvidence::default(),
+                        ));
                     }
                     return;
                 }
@@ -392,7 +398,7 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
         for (request_index, result) in request_indices.iter().copied().zip(results) {
             self.precomputed[request_index] = result;
         }
-        if self.precomputed.iter().flatten().any(|result| {
+        if self.precomputed.iter().flatten().any(|(result, _)| {
             matches!(
                 result,
                 BoundedResolution::Complete { value, .. }
@@ -410,7 +416,7 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
     fn resolve(
         &mut self,
         query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
-    ) -> BoundedResolution<DefinitionLookupOutcome> {
+    ) -> crate::analyzer::rust::native_points::RustDefinitionLookup {
         if self.precomputed_index < self.precomputed.len() {
             let precomputed = self.precomputed[self.precomputed_index].take();
             self.precomputed_index += 1;
@@ -424,9 +430,9 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
     fn resolve_unprepared(
         &mut self,
         query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
-    ) -> BoundedResolution<DefinitionLookupOutcome> {
+    ) -> crate::analyzer::rust::native_points::RustDefinitionLookup {
         if self.reuse_disabled {
-            return crate::analyzer::rust::native_points::resolve_rust_definition_bounded(query);
+            return crate::analyzer::rust::native_points::resolve_rust_definition_bounded_with_evidence(query);
         }
         if self.operation.is_none() && self.borrowed_operation.is_none() {
             let cancellation = query.cancellation.cloned().unwrap_or_default();
@@ -448,9 +454,9 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                 },
                 outcome => {
                     self.reuse_disabled = true;
-                    return crate::analyzer::rust::native_points::resolve_rust_definition_open_failure(
+                    return (crate::analyzer::rust::native_points::resolve_rust_definition_open_failure(
                         query, outcome,
-                    );
+                    ), CallEvidence::default());
                 }
             }
         }
@@ -463,13 +469,13 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
             operation.ready.inventory.connection().is_autocommit(),
             "scalar entry must not retain a read transaction"
         );
-        let result = self.factory.resolve(operation, query);
+        let result = self.factory.resolve_with_evidence(operation, query);
         assert!(
             operation.ready.inventory.connection().is_autocommit(),
             "scalar exit must close its stage read transaction"
         );
         if matches!(
-            &result,
+            &result.0,
             BoundedResolution::Complete { value, .. }
                 if value.diagnostics.iter().any(|diagnostic| {
                     matches!(diagnostic.kind.as_str(), "native_stale" | "native_store_error")

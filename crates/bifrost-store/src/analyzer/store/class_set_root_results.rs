@@ -1599,6 +1599,52 @@ mod tests {
     }
 
     #[test]
+    fn finding_free_root_representation_v4_misses_and_recomputes_under_v5() {
+        let store = store_with_blob();
+        let previous = result(1);
+        let mut previous_key = previous.key;
+        previous_key.generation.representation_version = 4;
+        let old = FindingFreeClassSetRootResult::try_new(
+            previous_key,
+            previous.attachment,
+            previous.rows,
+        )
+        .unwrap();
+        assert!(
+            store
+                .publish_finding_free_class_set_root_result(old.clone(), &CancellationToken::new())
+                .unwrap()
+        );
+        let mut current_key = old.key.clone();
+        current_key.generation.representation_version = 5;
+        assert_eq!(
+            load(&store, &current_key).unwrap(),
+            ClassSetRootResultLookup::Miss
+        );
+        // Recompute the fixture product after the miss and publish at the new key.
+        let current = result(1);
+        let recomputed =
+            FindingFreeClassSetRootResult::try_new(current_key, current.attachment, current.rows)
+                .unwrap();
+        assert!(
+            store
+                .publish_finding_free_class_set_root_result(
+                    recomputed.clone(),
+                    &CancellationToken::new()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            load(&store, &recomputed.key).unwrap(),
+            ClassSetRootResultLookup::Hit(Box::new(recomputed))
+        );
+        assert_eq!(
+            load(&store, &old.key).unwrap(),
+            ClassSetRootResultLookup::Hit(Box::new(old))
+        );
+    }
+
+    #[test]
     fn finding_free_root_results_round_trip_canonically_and_publish_idempotently() {
         let store = store_with_blob();
         let expected = result(1);

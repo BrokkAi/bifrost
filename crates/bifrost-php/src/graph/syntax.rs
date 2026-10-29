@@ -5,6 +5,7 @@ use crate::aliases::{
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_direct_declared_class_parent;
+use crate::graph_support::php_is_constructor_name;
 use crate::phpdoc::parameter_element_type as phpdoc_parameter_element_type;
 use brokk_bifrost_core::analyzer::php_facts::{
     PhpDeclarationSourceFact, PhpDeclaredSourceType, PhpFieldWriteKind,
@@ -350,8 +351,10 @@ pub fn static_scope_type_fq_name(
     enclosing_owner: Option<&str>,
 ) -> Option<String> {
     match raw {
-        "self" | "static" => enclosing_owner.map(str::to_string),
-        "parent" => {
+        raw if raw.eq_ignore_ascii_case("self") || raw.eq_ignore_ascii_case("static") => {
+            enclosing_owner.map(str::to_string)
+        }
+        raw if raw.eq_ignore_ascii_case("parent") => {
             let enclosing_owner = enclosing_owner?;
             let mut definitions = analyzer
                 .index
@@ -791,30 +794,36 @@ where
         .flatten()
 }
 
-fn statement_prevents_following_sibling<F>(node: Node<'_>, step: &mut F) -> bool
+fn statement_prevents_following_sibling<F>(mut node: Node<'_>, step: &mut F) -> bool
 where
     F: FnMut() -> bool,
 {
-    if !step() {
-        return false;
+    loop {
+        if !step() {
+            return false;
+        }
+        if matches!(node.kind(), "return_statement" | "continue_statement") {
+            return true;
+        }
+        if node.kind() == "expression_statement"
+            && node
+                .named_child(0)
+                .is_some_and(|child| child.kind() == "throw_expression")
+        {
+            return true;
+        }
+        if node.kind() != "compound_statement" {
+            return false;
+        }
+        let Some(last) = node
+            .named_child_count()
+            .checked_sub(1)
+            .and_then(|i| node.named_child(i))
+        else {
+            return false;
+        };
+        node = last;
     }
-    if matches!(node.kind(), "return_statement" | "continue_statement") {
-        return true;
-    }
-    if node.kind() == "expression_statement"
-        && node
-            .named_child(0)
-            .is_some_and(|child| child.kind() == "throw_expression")
-    {
-        return true;
-    }
-    if node.kind() != "compound_statement" {
-        return false;
-    }
-    node.named_child_count()
-        .checked_sub(1)
-        .and_then(|index| node.named_child(index))
-        .is_some_and(|last| statement_prevents_following_sibling(last, step))
 }
 
 fn subtree_assigns_variable<F>(root: Node<'_>, variable: &str, source: &str, step: &mut F) -> bool
@@ -1010,6 +1019,22 @@ fn inferred_constructor_field_type_fq_name(
 }
 
 pub fn canonical_inferred_field_type(php: &dyn PhpSource, field: &CodeUnit) -> Option<String> {
+    let metadata = php.signature_metadata(field);
+    if let Some(first) = metadata.first() {
+        let is_static = first.field_is_static();
+        if metadata
+            .iter()
+            .any(|row| row.field_is_static() != is_static)
+        {
+            return None;
+        }
+        let kind = if is_static {
+            PhpFieldWriteKind::Static
+        } else {
+            PhpFieldWriteKind::Instance
+        };
+        return canonical_field_write_type(php, field, kind);
+    }
     canonical_field_write_type(php, field, PhpFieldWriteKind::Instance)
         .or_else(|| canonical_field_write_type(php, field, PhpFieldWriteKind::Static))
 }
@@ -1111,9 +1136,7 @@ where
         }
         if node.kind() == "method_declaration" {
             let name = node.child_by_field_name("name")?;
-            return node_text(name, source)
-                .eq_ignore_ascii_case("__construct")
-                .then_some(parameter);
+            return php_is_constructor_name(node_text(name, source)).then_some(parameter);
         }
         if is_local_scope(node) {
             return None;
@@ -1243,6 +1266,7 @@ pub fn infer_indexed_local_element_type(
     }
     let scope = scope?;
     let mut inferred = None;
+    let mut invalidated = false;
     let mut stack = vec![scope];
     while let Some(node) = stack.pop() {
         if node.start_byte() >= before_byte {
@@ -1258,20 +1282,33 @@ pub fn infer_indexed_local_element_type(
                 && variable_identifier(left, source) == collection_name
             {
                 let right = unwrap_parenthesized(right);
-                if right.kind() != "array_creation_expression" || right.named_child_count() != 0 {
-                    return None;
+                // A replacement can discard earlier uncertainty only when it
+                // executes unconditionally in this local scope. A reset in a
+                // branch or loop does not prove the post-branch contents.
+                let mut ancestor = node.parent();
+                while ancestor.is_some_and(|parent| {
+                    matches!(parent.kind(), "expression_statement" | "compound_statement")
+                }) {
+                    ancestor = ancestor.expect("checked assignment parent").parent();
                 }
+                invalidated = ancestor != Some(scope)
+                    || right.kind() != "array_creation_expression"
+                    || right.named_child_count() != 0;
+                inferred = None;
             } else if left.kind() == "subscript_expression"
                 && left.named_child(0).is_some_and(|base| {
                     base.kind() == "variable_name"
                         && variable_identifier(base, source) == collection_name
                 })
             {
-                let value = resolve_value(right)?;
-                if inferred.as_ref().is_some_and(|known| known != &value) {
-                    return None;
+                if let Some(value) = resolve_value(right) {
+                    if inferred.as_ref().is_some_and(|known| known != &value) {
+                        invalidated = true;
+                    }
+                    inferred = Some(value);
+                } else {
+                    invalidated = true;
                 }
-                inferred = Some(value);
             }
         }
         for index in (0..node.named_child_count()).rev() {
@@ -1280,7 +1317,7 @@ pub fn infer_indexed_local_element_type(
             }
         }
     }
-    inferred
+    (!invalidated).then_some(inferred).flatten()
 }
 
 pub(crate) fn this_field_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -1325,7 +1362,7 @@ where
         if node.kind() == "method_declaration" {
             return node
                 .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source).eq_ignore_ascii_case("__construct"));
+                .is_some_and(|name| php_is_constructor_name(node_text(name, source)));
         }
         if is_local_scope(node) {
             return false;
@@ -1478,6 +1515,7 @@ fn collection_element_type_fq_name_inner(
             )
         }
         CollectionElementTypeAccess::MemberCall(collection) => {
+            let remaining_collection_depth = remaining_collection_depth.checked_sub(1)?;
             let object = collection.child_by_field_name("object")?;
             let owner = instance_receiver_type_fq_name_inner(
                 php,
@@ -1623,30 +1661,25 @@ fn instance_receiver_type_fq_name_inner(
                         } else if let Some(collection) =
                             enclosing_foreach_collection(node, source, || true)
                         {
-                            collection_element_type_fq_name_inner(
-                                php,
-                                analyzer,
-                                collection,
-                                source,
-                                ctx,
-                                bindings,
-                                enclosing_owner,
-                                remaining_collection_depth,
-                            )
-                            .or_else(|| {
-                                foreach_value_reassigned_before(node, source)
-                                    .then(|| match bindings.resolve_symbol(name) {
-                                        SymbolResolution::Precise(targets)
-                                            if targets.len() == 1 =>
-                                        {
-                                            targets.into_iter().next()
-                                        }
-                                        SymbolResolution::Unknown
-                                        | SymbolResolution::Ambiguous
-                                        | SymbolResolution::Precise(_) => None,
-                                    })
-                                    .flatten()
-                            })
+                            if foreach_value_reassigned_before(node, source) {
+                                match bindings.resolve_symbol(name) {
+                                    SymbolResolution::Precise(targets) if targets.len() == 1 => {
+                                        targets.into_iter().next()
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                collection_element_type_fq_name_inner(
+                                    php,
+                                    analyzer,
+                                    collection,
+                                    source,
+                                    ctx,
+                                    bindings,
+                                    enclosing_owner,
+                                    remaining_collection_depth,
+                                )
+                            }
                         } else if let SymbolResolution::Precise(targets) =
                             bindings.resolve_symbol(name)
                             && targets.len() == 1
@@ -1905,8 +1938,17 @@ fn declared_member_family(
 ) -> Option<Vec<CodeUnit>> {
     let direct: Vec<_> = analyzer
         .index
-        .definitions(&format!("{owner_fq_name}.{member}"))
+        .definitions(owner_fq_name)
+        .filter(CodeUnit::is_class)
+        .flat_map(|owner| analyzer.index.direct_children(&owner))
         .filter(wanted)
+        .filter(|candidate| {
+            if candidate.is_function() {
+                candidate.identifier().eq_ignore_ascii_case(member)
+            } else {
+                candidate.identifier() == member
+            }
+        })
         .collect();
     if !direct.is_empty() {
         return Some(direct);
@@ -1935,8 +1977,17 @@ fn declared_member_family(
             let ancestor_fq_name = ancestor.fq_name();
             let definitions = analyzer
                 .index
-                .definitions(&format!("{ancestor_fq_name}.{member}"))
-                .filter(wanted);
+                .definitions(&ancestor_fq_name)
+                .filter(CodeUnit::is_class)
+                .flat_map(|owner| analyzer.index.direct_children(&owner))
+                .filter(wanted)
+                .filter(|candidate| {
+                    if candidate.is_function() {
+                        candidate.identifier().eq_ignore_ascii_case(member)
+                    } else {
+                        candidate.identifier() == member
+                    }
+                });
             for definition in definitions {
                 families
                     .entry(definition.fq_name())
@@ -1985,26 +2036,7 @@ fn indexed_declared_type_fq_name(analyzer: PhpGraphSource<'_>, unit: &CodeUnit) 
     analyzer.facts.declaration_return_type_fqn(unit)
 }
 
-/// Every class the declared type of one field or callable names.
-///
-/// This is the arms-aware form of [`declared_field_type_fq_name`] and
-/// [`declared_callable_return_type_fq_name`], for the one surface that can
-/// carry bounded ambiguity (forward definition lookup). A union declaration
-/// yields one entry per arm; every other declaration yields at most one.
-pub fn declared_type_arm_fq_names(
-    php: &dyn PhpSource,
-    analyzer: PhpGraphSource<'_>,
-    unit: &CodeUnit,
-) -> Vec<String> {
-    declared_type_of(php, analyzer, unit).arms()
-}
-
-/// What the declared type of one field or callable proves, including the case
-/// where it proves the value is dynamic (`object`/`mixed`) rather than nothing.
-///
-/// [`declared_type_arm_fq_names`] is this computation read for its classes
-/// only; forward definition lookup reads the whole answer so it can tell a
-/// proven-dynamic declaration from one it does not follow (#2030).
+/// What the declared type of one field or callable proves, including dynamic types.
 pub fn declared_type_of(
     php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
@@ -2019,11 +2051,6 @@ pub fn declared_type_of(
     let signature = canonical_declared_type(php, unit);
     if signature != PhpDeclaredType::Unknown {
         return signature;
-    }
-    if unit.is_field() {
-        return PhpDeclaredType::nominal(
-            canonical_doc_nominal_type(php, unit).into_iter().collect(),
-        );
     }
     PhpDeclaredType::nominal(canonical_doc_nominal_type(php, unit).into_iter().collect())
 }
@@ -2172,9 +2199,6 @@ mod declaration_name_range_tests {
     /// A method name is a bare `name` with no `variable_name` parent. Widening
     /// must not reach it, and must not reach a sigil-free `->last` access.
     #[test]
-    #[hardwon(
-        "#2416: PHP property declaration ranges omitted the variable sigil or widened to unrelated names"
-    )]
     fn a_name_without_a_variable_parent_is_left_alone() {
         assert_eq!(
             range_text("<?php\nclass F {\n    public function bar() {}\n}\n", "bar"),
@@ -2230,5 +2254,655 @@ mod clone_object_operand_tests {
                 .map(|node| &source[node.start_byte()..node.end_byte()]);
             assert_eq!(actual, expected, "source: {source}");
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod graph_boundary_tests {
+    use super::*;
+    use crate::graph::PhpCallableFacts;
+    use crate::source_facts::{PhpFileSourceFacts, PhpSourceFactProvider};
+    use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+    use brokk_bifrost_core::analyzer::model::{Language, Range};
+    use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+    use brokk_bifrost_core::analyzer::project::{Project, ProjectSourceSnapshot};
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+        FileDeclarations, FileEdgeScanInput,
+    };
+    use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    // A single-file index at the parser/graph boundary. All declaration and
+    // type facts come from the production parser, not a hand-authored model.
+    pub(crate) struct Fixture {
+        pub source: String,
+        pub tree: tree_sitter::Tree,
+        pub file: ProjectFile,
+        pub parsed: ParsedFile,
+        facts: Arc<PhpFileSourceFacts>,
+    }
+    impl Fixture {
+        pub fn new(source: &str) -> Self {
+            let tree = crate::aliases::parse_php_tree(source).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let file = ProjectFile::new(std::env::temp_dir(), PathBuf::from("qs9-boundary.php"));
+            let mut parsed = crate::declarations::parse_php_file(&file, source, &tree);
+            let rows = parsed.source_facts.as_mut().unwrap();
+            let mut units: HashMap<_, Vec<_>> = HashMap::default();
+            for (id, unit) in &parsed.source_declaration_units {
+                units.entry(*id).or_default().push(unit.clone());
+            }
+            let facts = Arc::new(PhpFileSourceFacts {
+                source: rows.occurrences.clone(),
+                imports: rows.imports.clone(),
+                facts: rows.php.clone().unwrap(),
+                declaration_units: units,
+            });
+            Self {
+                source: source.into(),
+                tree,
+                file,
+                parsed,
+                facts,
+            }
+        }
+        pub fn add_definition_file(&mut self, name: &str, source: &str) {
+            let tree = crate::aliases::parse_php_tree(source).unwrap();
+            let file = ProjectFile::new(std::env::temp_dir(), PathBuf::from(name));
+            let parsed = crate::declarations::parse_php_file(&file, source, &tree);
+            for (unit, ranges) in &parsed.ranges {
+                let parent = parsed
+                    .children
+                    .iter()
+                    .find(|(_, children)| children.contains(unit))
+                    .map(|(owner, _)| owner.clone());
+                for range in ranges {
+                    self.parsed.add_code_unit_with_range(
+                        unit.clone(),
+                        *range,
+                        parent.clone(),
+                        None,
+                    );
+                }
+            }
+        }
+        pub fn graph(&self) -> PhpGraphSource<'_> {
+            PhpGraphSource {
+                index: self,
+                facts: self,
+            }
+        }
+        pub fn unit(&self, name: &str) -> CodeUnit {
+            self.definitions(name)
+                .next()
+                .unwrap_or_else(|| panic!("missing {name}: {:?}", self.parsed.declarations()))
+        }
+        pub fn reference_targets(&self) -> Vec<(String, String)> {
+            let nodes: HashSet<_> = self.all_declarations().map(|unit| unit.fq_name()).collect();
+            let declarations = FileDeclarations {
+                enclosing_units: HashMap::default(),
+                enclosers: self
+                    .parsed
+                    .ranges
+                    .iter()
+                    .filter(|(unit, _)| unit.source() == &self.file)
+                    .flat_map(|(unit, ranges)| {
+                        ranges
+                            .iter()
+                            .map(|r| (r.start_byte, r.end_byte, unit.fq_name()))
+                    })
+                    .collect(),
+                definitions: self
+                    .parsed
+                    .ranges
+                    .iter()
+                    .filter(|(unit, _)| unit.source() == &self.file)
+                    .map(|(unit, ranges)| {
+                        (
+                            unit.fq_name(),
+                            ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect(),
+                        )
+                    })
+                    .collect(),
+            };
+            let lines = brokk_bifrost_core::text_utils::compute_line_starts(&self.source);
+            let terminal_catalog =
+                brokk_bifrost_core::analyzer::usages::inverted_edges::terminal_index(
+                    &crate::PhpKnowledge,
+                    &nodes,
+                    |key| self.definitions(key).map(|unit| unit.kind()).collect(),
+                );
+            let input = FileEdgeScanInput::new(
+                brokk_bifrost_core::analyzer::usages::inverted_edges::FileEdgeSyntax {
+                    tree: &self.tree,
+                    source: &self.source,
+                    line_starts: &lines,
+                },
+                &crate::PhpKnowledge,
+                Some(&nodes),
+                Some(&nodes),
+                &declarations,
+                &terminal_catalog,
+            );
+            crate::graph::inverted::scan_php_file(self.graph(), self, &self.file, &input)
+                .edge_lines
+                .into_keys()
+                .collect()
+        }
+    }
+    impl Project for Fixture {
+        fn root(&self) -> &Path {
+            self.file.root()
+        }
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([Language::Php])
+        }
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            Ok(BTreeSet::from([self.file.clone()]))
+        }
+        fn analyzable_files(&self, _: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.all_files()
+        }
+        fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+            (path == self.file.rel_path()).then(|| self.file.clone())
+        }
+        fn read_source(&self, _: &ProjectFile) -> std::io::Result<String> {
+            Ok(self.source.clone())
+        }
+        fn read_source_snapshot(&self, _: &ProjectFile) -> std::io::Result<ProjectSourceSnapshot> {
+            Ok(ProjectSourceSnapshot::disk(self.source.as_str()))
+        }
+    }
+    impl CodeUnitIndex for Fixture {
+        fn project(&self) -> &dyn Project {
+            self
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            self.analyzer_languages()
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(self.parsed.declarations().iter().cloned())
+        }
+        fn definitions(&self, name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            let name = name.to_string();
+            Box::new(
+                self.parsed
+                    .declarations()
+                    .iter()
+                    .filter(move |unit| unit.fq_name() == name)
+                    .cloned(),
+            )
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+            self.parsed
+                .ranges
+                .iter()
+                .flat_map(|(unit, ranges)| ranges.iter().map(move |r| (unit, r)))
+                .filter(|(_, r)| r.start_byte <= range.start_byte && range.end_byte <= r.end_byte)
+                .min_by_key(|(_, r)| r.end_byte - r.start_byte)
+                .map(|(u, _)| u.clone())
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+        fn direct_children(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+            self.parsed.children.get(unit).cloned().unwrap_or_default()
+        }
+        fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+            self.parsed.ranges.get(unit).cloned().unwrap_or_default()
+        }
+        fn signature_metadata(
+            &self,
+            unit: &CodeUnit,
+        ) -> Vec<brokk_bifrost_core::analyzer::model::SignatureMetadata> {
+            self.parsed
+                .signature_metadata
+                .get(unit)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+            self.all_declarations()
+                .filter(|unit| unit.source() == file)
+                .collect()
+        }
+    }
+    impl TypeHierarchyProvider for Fixture {
+        fn get_direct_ancestors(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+            self.facts
+                .declarations_for(unit)
+                .flat_map(|d| &d.supertypes)
+                .flat_map(|name| self.definitions(name))
+                .collect()
+        }
+        fn get_direct_descendants(&self, _: &CodeUnit) -> HashSet<CodeUnit> {
+            unimplemented!()
+        }
+    }
+    impl PhpSourceFactProvider for Fixture {
+        fn php_source_facts_while(
+            &self,
+            file: &ProjectFile,
+            _: &dyn Fn() -> bool,
+        ) -> Option<Arc<PhpFileSourceFacts>> {
+            (file == &self.file).then(|| self.facts.clone())
+        }
+    }
+    impl PhpCallableFacts for Fixture {
+        fn declaration_return_type_fqn(&self, unit: &CodeUnit) -> Option<String> {
+            canonical_declared_type_fq_name(self, unit)
+                .or_else(|| canonical_doc_nominal_type(self, unit))
+        }
+        fn callable_return_type_fqn(&self, name: &str) -> Option<String> {
+            self.definitions(name)
+                .find(CodeUnit::is_function)
+                .and_then(|unit| self.declaration_return_type_fqn(&unit))
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: static field inference used dynamic instance writes"
+    )]
+    fn static_field_inference_respects_declaration_storage() {
+        let fixture = Fixture::new(
+            "<?php class A {} class B {} class C { public static $value; function __construct() { $this->value=new A(); } static function init() { self::$value=new B(); } }",
+        );
+        assert_eq!(
+            canonical_inferred_field_type(&fixture, &fixture.unit("C.value")),
+            Some("B".into())
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: empty array assignment retained historical element types"
+    )]
+    fn indexed_collection_reset_replaces_historical_values() {
+        for (program, expected) in [
+            ("$items=[]; $items[]=new A(); $items=[];", None),
+            (
+                "$items=[]; $items[]=new A(); $items=[]; $items[]=new B();",
+                Some("B"),
+            ),
+            (
+                "$items=[]; $items[]=new A(); $items[]=new B(); $items=[]; $items[]=new B();",
+                Some("B"),
+            ),
+            ("$items=unknown(); $items=[]; $items[]=new B();", Some("B")),
+            (
+                "$items=[]; $items[]=new A(); if ($choice) { $items=[]; $items[]=new B(); }",
+                None,
+            ),
+        ] {
+            let source = format!("<?php function f() {{ {program} consume($items); }}");
+            let tree = crate::aliases::parse_php_tree(&source).unwrap();
+            let mut stack = vec![tree.root_node()];
+            let mut refs = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "variable_name" && node_text(node, &source) == "$items" {
+                    refs.push(node);
+                }
+                for i in 0..node.named_child_count() {
+                    stack.push(node.named_child(i).unwrap());
+                }
+            }
+            let collection = refs.into_iter().max_by_key(Node::start_byte).unwrap();
+            let inferred = infer_indexed_local_element_type(
+                collection,
+                &source,
+                collection.start_byte(),
+                &mut |right| object_creation_type(right).map(|ty| node_text(ty, &source).into()),
+            );
+            assert_eq!(inferred.as_deref(), expected, "{source}");
+        }
+    }
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: typed foreach collection hid a receiver reassignment"
+    )]
+    fn typed_foreach_reassignment_uses_the_current_value() {
+        let fixture = Fixture::new(
+            r"<?php
+class A { function touch() {} }
+class B { function touch() {} }
+class Owner {
+/** @var A[] */ public $items;
+function caller() {
+    foreach ($this->items as $item) {
+        $item = new B();
+        $item->touch();
+    }
+}
+}",
+        );
+        let targets = fixture.reference_targets();
+        assert!(
+            targets.contains(&("Owner.caller".into(), "B.touch".into())),
+            "{targets:?}"
+        );
+        assert!(
+            !targets.contains(&("Owner.caller".into(), "A.touch".into())),
+            "{targets:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: qualified instanceof operands were omitted from inverse edges"
+    )]
+    fn qualified_instanceof_publishes_the_type_edge() {
+        let fixture = Fixture::new(
+            r"<?php namespace App; class Target {} function check($value) { return $value instanceof \App\Target; }",
+        );
+        assert!(
+            fixture
+                .reference_targets()
+                .contains(&("App.check".into(), "App.Target".into()))
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: mixed-case method names lost targeted references"
+    )]
+    fn mixed_case_method_calls_reach_targeted_and_inverse_scans() {
+        let fixture = Fixture::new(
+            "<?php class Service { public $Value; const FLAG=1; function run() {} } function caller(Service $s) { $s->RUN(); $s->Value; $s->value; Service::FLAG; Service::flag; }",
+        );
+        let spec =
+            crate::graph::resolver::TargetSpec::from_target(&fixture, &fixture.unit("Service.run"))
+                .unwrap();
+        let hierarchy =
+            crate::graph::resolver::PhpHierarchyIndex::for_target_owner(&fixture, &spec);
+        let mut hits = BTreeSet::new();
+        crate::graph::extractor::scan_file(
+            &fixture,
+            fixture.graph(),
+            &fixture.file,
+            &spec,
+            &hierarchy,
+            &mut hits,
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            fixture
+                .reference_targets()
+                .contains(&("caller".into(), "Service.run".into()))
+        );
+        for target in ["Service.Value", "Service.FLAG"] {
+            let spec =
+                crate::graph::resolver::TargetSpec::from_target(&fixture, &fixture.unit(target))
+                    .unwrap();
+            let hierarchy =
+                crate::graph::resolver::PhpHierarchyIndex::for_target_owner(&fixture, &spec);
+            let mut hits = BTreeSet::new();
+            crate::graph::extractor::scan_file(
+                &fixture,
+                fixture.graph(),
+                &fixture.file,
+                &spec,
+                &hierarchy,
+                &mut hits,
+            );
+            assert_eq!(hits.len(), 1, "case-sensitive {target}: {hits:?}");
+            let hit = hits.first().unwrap();
+            assert_eq!(
+                &fixture.source[hit.start_offset..hit.end_offset],
+                spec.member_name
+            );
+        }
+    }
+    #[test]
+    fn php_receiver_flow_golden() {
+        let fixture = Fixture::new(include_str!(
+            "../../tests/fixtures/golden/receiver-flow/input.php"
+        ));
+        let mut rendered: Vec<_> = fixture
+            .reference_targets()
+            .into_iter()
+            .filter(|(_, callee)| {
+                ["A.touch", "A.run", "B.touch", "Both.run", "Base.run"].contains(&callee.as_str())
+            })
+            .map(|(caller, callee)| format!("{caller} -> {callee}\n"))
+            .collect();
+        let mut targeted = Vec::new();
+        for callee in ["A.touch", "A.run", "B.touch", "Both.run", "Base.run"] {
+            let spec =
+                crate::graph::resolver::TargetSpec::from_target(&fixture, &fixture.unit(callee))
+                    .unwrap();
+            let hierarchy =
+                crate::graph::resolver::PhpHierarchyIndex::for_target_owner(&fixture, &spec);
+            let mut hits = BTreeSet::new();
+            crate::graph::extractor::scan_file(
+                &fixture,
+                fixture.graph(),
+                &fixture.file,
+                &spec,
+                &hierarchy,
+                &mut hits,
+            );
+            for hit in hits {
+                targeted.push(format!("{} -> {callee}\n", hit.enclosing.fq_name()));
+            }
+        }
+        targeted.sort();
+        assert_eq!(
+            targeted.concat(),
+            include_str!("../../tests/fixtures/golden/receiver-flow/expected.txt")
+        );
+        rendered.sort();
+        assert_eq!(
+            rendered.concat(),
+            include_str!("../../tests/fixtures/golden/receiver-flow/expected.txt")
+        );
+    }
+    #[test]
+    fn php_conditional_declarations_golden() {
+        let mut fixture = Fixture::new(include_str!(
+            "../../tests/fixtures/golden/conditional-declarations/input.php"
+        ));
+        fixture.add_definition_file(
+            "qs9-duplicate.php",
+            "<?php class Ambiguous { function touch() {} }",
+        );
+        let rendered = fixture
+            .reference_targets()
+            .into_iter()
+            .filter(|(_, callee)| callee.ends_with(".touch"))
+            .map(|(caller, callee)| format!("{caller} -> {callee}\n"))
+            .collect::<String>();
+        assert_eq!(
+            rendered,
+            include_str!("../../tests/fixtures/golden/conditional-declarations/expected.txt")
+        );
+    }
+
+    #[test]
+    fn php_function_fallback_golden() {
+        let fixture = Fixture::new(include_str!(
+            "../../tests/fixtures/golden/function-fallback/input.php"
+        ));
+        let rendered = fixture
+            .reference_targets()
+            .into_iter()
+            .filter(|(_, callee)| callee.ends_with(".touch"))
+            .map(|(caller, callee)| format!("{caller} -> {callee}\n"))
+            .collect::<String>();
+        assert_eq!(
+            rendered,
+            include_str!("../../tests/fixtures/golden/function-fallback/expected.txt")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#7228: review: member-call collection inference recursed without consuming its depth budget"
+    )]
+    fn deep_member_collection_chain_is_bounded() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let fixture =
+                    Fixture::new("<?php class A { /** @return A[] */ function items() {} }");
+                let source = format!("<?php $a{};", "->items()[0]".repeat(2048));
+                let tree = crate::aliases::parse_php_tree(&source).unwrap();
+                assert!(!tree.root_node().has_error());
+                let expression = tree
+                    .root_node()
+                    .named_child(1)
+                    .unwrap()
+                    .named_child(0)
+                    .unwrap();
+                assert_eq!(expression.kind(), "subscript_expression");
+                let bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                let actual = instance_receiver_type_fq_name(
+                    &fixture,
+                    fixture.graph(),
+                    expression,
+                    &source,
+                    &PhpFileContext {
+                        namespace: String::new(),
+                        aliases: Default::default(),
+                    },
+                    &bindings,
+                    |_, _| Some("A".into()),
+                );
+                assert_eq!(actual, None);
+            })
+            .unwrap()
+            .join()
+            .expect("bounded member collection inference");
+    }
+
+    #[test]
+    fn supported_nested_collection_depths_preserve_the_receiver() {
+        let mut source = String::from("<?php class A { function touch() {} }\n");
+        for depth in 0..8 {
+            source.push_str(&format!(
+                "function depth{depth}() {{ $a0=[]; $a0[]=new A();\n"
+            ));
+            for hop in 1..=depth {
+                source.push_str(&format!("$a{hop}=[]; $a{hop}[]=$a{}[0];\n", hop - 1));
+            }
+            source.push_str(&format!("$a{depth}[0]->touch(); }}\n"));
+        }
+        let fixture = Fixture::new(&source);
+        let actual: Vec<_> = fixture
+            .reference_targets()
+            .into_iter()
+            .filter(|(_, callee)| callee == "A.touch")
+            .map(|(caller, _)| caller)
+            .collect();
+        assert_eq!(
+            actual,
+            (0..8)
+                .map(|depth| format!("depth{depth}"))
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: canonical field writes mixed static and instance storage"
+    )]
+    fn field_write_inference_respects_published_storage_metadata() {
+        let source = "<?php class A {} class B {} class C { public static $value; function __construct() { $this->value=new A(); } static function init() { self::$value=new B(); } }";
+        let mut fixture = Fixture::new(source);
+        let field = fixture.unit("C.value");
+        for (is_static, expected) in [(true, "B"), (false, "A")] {
+            for metadata in fixture.parsed.signature_metadata.get_mut(&field).unwrap() {
+                *metadata = metadata.clone().with_field_modifiers(is_static, false);
+            }
+            assert_eq!(
+                canonical_inferred_field_type(&fixture, &field).as_deref(),
+                Some(expected)
+            );
+        }
+        fixture.parsed.signature_metadata.remove(&field).unwrap();
+        assert_eq!(
+            canonical_inferred_field_type(&fixture, &field).as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: uppercase relative scopes lost or misclassified static calls"
+    )]
+    fn relative_static_scopes_and_method_names_ignore_ascii_case() {
+        let fixture = Fixture::new(
+            "<?php class Base { static function run() {} } class Child extends Base { function caller() { PARENT::RUN(); SELF::RUN(); STATIC::RUN(); } }",
+        );
+        let methods: Vec<_> = fixture
+            .reference_targets()
+            .into_iter()
+            .filter(|(_, callee)| callee.ends_with(".run") || callee.ends_with(".RUN"))
+            .collect();
+        assert_eq!(methods, vec![("Child.caller".into(), "Base.run".into())]);
+        let spec =
+            crate::graph::resolver::TargetSpec::from_target(&fixture, &fixture.unit("Base.run"))
+                .unwrap();
+        let hierarchy =
+            crate::graph::resolver::PhpHierarchyIndex::for_target_owner(&fixture, &spec);
+        let mut hits = BTreeSet::new();
+        crate::graph::extractor::scan_file(
+            &fixture,
+            fixture.graph(),
+            &fixture.file,
+            &spec,
+            &hierarchy,
+            &mut hits,
+        );
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(
+            hits.iter()
+                .filter(|hit| hit.kind
+                    == brokk_bifrost_core::analyzer::usages::model::UsageHitKind::SelfReceiver)
+                .count(),
+            2
+        );
+    }
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: PHP graph and exit-guard walks recursively consumed the Rust stack"
+    )]
+    fn deep_syntax_uses_bounded_rust_stack_through_both_usage_scans() {
+        std::thread::Builder::new().stack_size(256 * 1024).spawn(|| {
+            let depth = 2048;
+            let source = format!("<?php class A {{ function touch() {{}} }} function caller($value) {{ if (!($value instanceof A)) {}return;{} $value->touch(); new A(); }}", "{".repeat(depth), "}".repeat(depth));
+            let fixture = Fixture::new(&source);
+            assert!(fixture.reference_targets().contains(&("caller".into(), "A.touch".into())));
+            for (target, expected) in [("A", 2), ("A.touch", 1)] {
+                let spec = crate::graph::resolver::TargetSpec::from_target(&fixture, &fixture.unit(target)).unwrap();
+                let hierarchy = crate::graph::resolver::PhpHierarchyIndex::for_target_owner(&fixture, &spec);
+                let mut hits = BTreeSet::new();
+                crate::graph::extractor::scan_file(&fixture, fixture.graph(), &fixture.file, &spec, &hierarchy, &mut hits);
+                assert_eq!(hits.len(), expected, "{target}: {hits:?}");
+            }
+        }).unwrap().join().expect("bounded-stack graph scans");
     }
 }

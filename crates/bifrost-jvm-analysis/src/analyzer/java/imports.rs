@@ -69,11 +69,22 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         &self,
         files: &[ProjectFile],
     ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/java/imports.rs",
+            );
+
         let mut imports_by_file = HashMap::default();
         for (file, facts) in self.inner.bulk_import_facts(files.iter().cloned()) {
-            self.memo_caches
-                .package_names
-                .insert(file.clone(), Arc::from(facts.package_name));
+            {
+                let cache_key = file.clone();
+                let cache_value = Arc::from(facts.package_name);
+                persistent_fill_guard.installed("package_names");
+                self.memo_caches
+                    .package_names
+                    .insert(cache_key, cache_value);
+            };
             imports_by_file.insert(file, facts.imports);
         }
         Some(imports_by_file)
@@ -83,12 +94,29 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         if let Some(cached) = self.memo_caches.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/java/imports.rs",
+            );
 
         let reverse_index =
             brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
                 &self.memo_caches.reverse_import_index,
-                || self.inner.all_files(),
-                |candidate| self.imported_code_units_of(candidate),
+                || {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "java.reverse_file_index",
+                        || self.inner.all_files(),
+                    )
+                },
+                |candidate| {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "java.reverse_file_index",
+                        || self.imported_code_units_of(candidate),
+                    )
+                },
             );
         let mut result = reverse_index
             .get(file)
@@ -98,9 +126,14 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             result.extend(files.iter().cloned());
         }
 
-        self.memo_caches
-            .referencing_files
-            .insert(file.clone(), Arc::new(result.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(result.clone());
+            persistent_fill_guard.installed("referencing_files");
+            self.memo_caches
+                .referencing_files
+                .insert(cache_key, cache_value);
+        };
         result
     }
 
@@ -109,6 +142,12 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         targets: &HashSet<ProjectFile>,
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> HashSet<ProjectFile> {
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/java/imports.rs",
+            );
+
         let _scope =
             brokk_bifrost_core::profiling::scope("JavaAnalyzer::referencing_files_of_targets");
         if targets.is_empty() || cancellation.is_cancelled() {
@@ -237,55 +276,60 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         };
         let target_set = &uncached_targets;
 
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let matches = {
             let _scope =
                 brokk_bifrost_core::profiling::scope("JavaAnalyzer::reverse.exact_verification");
             plausible
                 .par_iter()
                 .filter_map(|candidate| {
-                    if cancellation.is_cancelled() {
-                        return None;
-                    }
-                    let imports = imports_by_file.get(candidate)?;
-                    let package = java_package_name_of(self, candidate).unwrap_or_default();
-                    let mut matched = HashSet::default();
+                    context.run(|| {
+                        if cancellation.is_cancelled() {
+                            return None;
+                        }
+                        let imports = imports_by_file.get(candidate)?;
+                        let package = java_package_name_of(self, candidate).unwrap_or_default();
+                        let mut matched = HashSet::default();
 
-                    if let Some(identifiers) = identifiers_by_file.get(candidate) {
-                        let targets_by_identifier = same_package_targets
-                            .get(&package)
-                            .expect("bulk type identifiers were restricted to seed packages");
-                        for identifier in identifiers {
-                            if let Some(matching_targets) = targets_by_identifier.get(identifier) {
-                                matched.extend(matching_targets.iter().cloned());
+                        if let Some(identifiers) = identifiers_by_file.get(candidate) {
+                            let targets_by_identifier = same_package_targets
+                                .get(&package)
+                                .expect("bulk type identifiers were restricted to seed packages");
+                            for identifier in identifiers {
+                                if let Some(matching_targets) =
+                                    targets_by_identifier.get(identifier)
+                                {
+                                    matched.extend(matching_targets.iter().cloned());
+                                }
                             }
                         }
-                    }
 
-                    let could_resolve_to_target = imports.iter().any(|import| {
-                        let Some(path) = non_static_import_path(import) else {
-                            return false;
-                        };
-                        let path = path.render_segments(".");
-                        if import.is_wildcard {
-                            wildcard_targets.contains(&path)
-                        } else {
-                            exact_targets.contains(&path)
+                        let could_resolve_to_target = imports.iter().any(|import| {
+                            let Some(path) = non_static_import_path(import) else {
+                                return false;
+                            };
+                            let path = path.render_segments(".");
+                            if import.is_wildcard {
+                                wildcard_targets.contains(&path)
+                            } else {
+                                exact_targets.contains(&path)
+                            }
+                        });
+                        if could_resolve_to_target {
+                            let resolved = self
+                                .imported_code_units_from_infos(candidate, imports)
+                                .expect("Java resolves already-loaded import facts");
+                            matched.extend(
+                                resolved
+                                    .iter()
+                                    .map(CodeUnit::source)
+                                    .filter(|source| target_set.contains(*source))
+                                    .cloned(),
+                            );
                         }
-                    });
-                    if could_resolve_to_target {
-                        let resolved = self
-                            .imported_code_units_from_infos(candidate, imports)
-                            .expect("Java resolves already-loaded import facts");
-                        matched.extend(
-                            resolved
-                                .iter()
-                                .map(CodeUnit::source)
-                                .filter(|source| target_set.contains(*source))
-                                .cloned(),
-                        );
-                    }
 
-                    (!matched.is_empty()).then_some((candidate.clone(), matched))
+                        (!matched.is_empty()).then_some((candidate.clone(), matched))
+                    })
                 })
                 .collect::<Vec<_>>()
         };
@@ -308,9 +352,14 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         }
         for (target, referencing) in computed {
             result.extend(referencing.iter().cloned());
-            self.memo_caches
-                .referencing_files
-                .insert(target, Arc::new(referencing));
+            {
+                let cache_key = target;
+                let cache_value = Arc::new(referencing);
+                persistent_fill_guard.installed("referencing_files");
+                self.memo_caches
+                    .referencing_files
+                    .insert(cache_key, cache_value);
+            };
         }
         result
     }
@@ -476,11 +525,21 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         if let Some(cached) = self.memo_caches.relevant_imports.get(code_unit) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/java/imports.rs",
+            );
 
         let matched_imports = compute_java_relevant_imports(self, token, code_unit);
-        self.memo_caches
-            .relevant_imports
-            .insert(code_unit.clone(), Arc::new(matched_imports.clone()));
+        {
+            let cache_key = code_unit.clone();
+            let cache_value = Arc::new(matched_imports.clone());
+            persistent_fill_guard.installed("relevant_imports");
+            self.memo_caches
+                .relevant_imports
+                .insert(cache_key, cache_value);
+        };
         matched_imports
     }
 
@@ -514,8 +573,20 @@ impl JavaAnalyzer {
         &self,
     ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.memo_caches.same_package_reference_index.get_or_build(
-            || compute_java_same_package_reference_index(self, true),
-            || compute_java_same_package_reference_index(self, false),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "java.same_package_reference_index",
+                    || compute_java_same_package_reference_index(self, true),
+                )
+            },
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "java.same_package_reference_index",
+                    || compute_java_same_package_reference_index(self, false),
+                )
+            },
         )
     }
 
@@ -535,11 +606,21 @@ impl JavaAnalyzer {
         if let Some(cached) = self.memo_caches.resolved_imports.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-jvm-analysis/src/analyzer/java/imports.rs",
+            );
 
         let resolved = Arc::new(self.resolve_imports_uncached(token, file));
-        self.memo_caches
-            .resolved_imports
-            .insert(file.clone(), Arc::clone(&resolved));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&resolved);
+            persistent_fill_guard.installed("resolved_imports");
+            self.memo_caches
+                .resolved_imports
+                .insert(cache_key, cache_value);
+        };
         resolved
     }
 

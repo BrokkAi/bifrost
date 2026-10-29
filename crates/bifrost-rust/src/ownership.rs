@@ -16,12 +16,13 @@ use crate::graph_support::{
     rust_path_segments_bounded,
 };
 use crate::imports::RustImportBindingName;
-use crate::lexical_scope::{RustTypeHead, rust_type_head_at_bounded};
+use crate::lexical_scope::{RustTypeHead, RustTypeHeadMemo, rust_type_head_at_bounded};
 use crate::prelude::rust_std_type_fact;
 use crate::syntax::{attribute_payload, unwrap_attributes};
 use brokk_bifrost_core::analyzer::tree_walk::{
     has_child_of_kind as has_anonymous_child, named_children_vec as named_children,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -182,6 +183,18 @@ struct PendingImpl<'tree> {
     generic: bool,
 }
 
+/// What one path's standard-path proof established, before it is compared
+/// with an expected item.
+#[derive(Debug)]
+enum StandardPathProof {
+    NotProven,
+    /// The path names exactly this canonical path.
+    Exact(Vec<String>),
+    /// An unbound head that is not a standard root: only a language prelude
+    /// name, checked against the expected item, can prove these names.
+    Prelude(Vec<String>),
+}
+
 /// The bounded ownership/type/trait producer for one Rust syntax tree.
 #[derive(Debug)]
 pub struct RustOwnershipIndex<'tree, 'source> {
@@ -192,16 +205,30 @@ pub struct RustOwnershipIndex<'tree, 'source> {
     imports: Vec<ImportBinding>,
     shadowed_names: HashSet<ShadowedBinding>,
     states: HashMap<usize, NominalState>,
+    /// Per-proof cap supplied by the semantic lowerer's existing work budget.
+    standard_path_work_limit: usize,
+    /// Standard-path proofs by path node id. The lowerer asks about one
+    /// callee path for dozens of standard items, and each proof walks the
+    /// lexical scope chain, so the walk runs once per path (#7585).
+    standard_path_proofs: RefCell<HashMap<usize, StandardPathProof>>,
     module_context_by_node: HashMap<usize, Option<usize>>,
     lexical_modules: Vec<LexicalModuleContext>,
+    type_heads: RustTypeHeadMemo,
     #[cfg(test)]
     lexical_module_context_steps: AtomicUsize,
+    #[cfg(test)]
+    standard_path_proof_walks: AtomicUsize,
 }
 
 impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
     /// Scan declarations, exact local trait evidence, and lexical imports,
     /// then solve nominal payload dependencies to a fixed point.
-    pub fn build<F, E>(root: Node<'tree>, source: &'source str, mut charge: F) -> Result<Self, E>
+    pub fn build<F, E>(
+        root: Node<'tree>,
+        source: &'source str,
+        standard_path_work_limit: usize,
+        mut charge: F,
+    ) -> Result<Self, E>
     where
         F: FnMut(usize) -> Result<(), E>,
     {
@@ -352,8 +379,13 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             states: HashMap::new(),
             module_context_by_node,
             lexical_modules,
+            standard_path_work_limit,
+            type_heads: RustTypeHeadMemo::default(),
+            standard_path_proofs: RefCell::new(HashMap::new()),
             #[cfg(test)]
             lexical_module_context_steps: AtomicUsize::new(0),
+            #[cfg(test)]
+            standard_path_proof_walks: AtomicUsize::new(0),
         };
         for declaration_index in 0..index.declarations.len() {
             index
@@ -622,7 +654,14 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             return Ok(None);
         };
         let absolute = rust_path_is_leading_absolute_bounded(name, &mut *charge)?;
-        let actual_head = rust_type_head_at_bounded(self.root, self.source, name, first, charge)?;
+        let actual_head = rust_type_head_at_bounded(
+            self.root,
+            self.source,
+            name,
+            first,
+            &self.type_heads,
+            charge,
+        )?;
         let head = if absolute {
             // Keep activation/opaque-scope refusal at the actual site even
             // though an absolute name selects its head at the crate root.
@@ -631,7 +670,14 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                     RustOwnershipIncomplete::UnresolvedPath,
                 ))));
             }
-            rust_type_head_at_bounded(self.root, self.source, self.root, first, charge)?
+            rust_type_head_at_bounded(
+                self.root,
+                self.source,
+                self.root,
+                first,
+                &self.type_heads,
+                charge,
+            )?
         } else {
             actual_head
         };
@@ -715,6 +761,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                                 self.source,
                                 declaration,
                                 first,
+                                &self.type_heads,
                                 charge
                             )?,
                             RustTypeHead::Unbound
@@ -824,67 +871,113 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
     /// standard prelude is consulted only for language-defined names and only
     /// when no local or imported binding shadows that name.
     pub fn resolves_standard_path(&self, path_node: Node<'tree>, expected: &[&str]) -> bool {
-        let Some(segments) = rust_path_segments(path_node) else {
-            return false;
+        let mut proofs = self.standard_path_proofs.borrow_mut();
+        let proof = proofs.entry(path_node.id()).or_insert_with(|| {
+            let mut remaining = self.standard_path_work_limit;
+            let mut charge = |work: usize| {
+                remaining = remaining.checked_sub(work).ok_or(())?;
+                Ok::<_, ()>(())
+            };
+            self.standard_path_proof_bounded(path_node, &mut charge)
+                .unwrap_or(StandardPathProof::NotProven)
+        });
+        match proof {
+            StandardPathProof::NotProven => false,
+            StandardPathProof::Exact(path) => {
+                path.iter().map(String::as_str).eq(expected.iter().copied())
+            }
+            StandardPathProof::Prelude(names) => is_standard_prelude_path(expected, names),
+        }
+    }
+
+    /// The part of a standard-path proof that does not depend on the expected
+    /// item. Exhausting the work cap means not proven.
+    fn standard_path_proof_bounded<F, E>(
+        &self,
+        path_node: Node<'tree>,
+        charge: &mut F,
+    ) -> Result<StandardPathProof, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        #[cfg(test)]
+        self.standard_path_proof_walks
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(segments) = rust_path_segments_bounded(path_node, &mut *charge)? else {
+            return Ok(StandardPathProof::NotProven);
         };
-        let names = segments
-            .iter()
-            .map(|segment| rust_node_text(*segment, self.source).to_string())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            return false;
+        let mut names = Vec::new();
+        for segment in segments {
+            let name = rust_node_text(segment, self.source);
+            charge(name.len())?;
+            names.push(name.to_string());
         }
-        let module_path = self.lexical_module_path(path_node);
-        let absolute = rust_path_is_leading_absolute(path_node);
-        let mut resolved = Vec::<Vec<String>>::new();
-
-        if absolute {
-            resolved.push(names.clone());
+        let Some(first) = names.first() else {
+            return Ok(StandardPathProof::NotProven);
+        };
+        let absolute = rust_path_is_leading_absolute_bounded(path_node, &mut *charge)?;
+        let actual_head = rust_type_head_at_bounded(
+            self.root,
+            self.source,
+            path_node,
+            first,
+            &self.type_heads,
+            charge,
+        )?;
+        let head = if absolute {
+            // As in conditional Copy, a leading root does not erase an
+            // opaque or conditionally active use site.
+            if matches!(actual_head, RustTypeHead::Unknown) {
+                return Ok(StandardPathProof::NotProven);
+            }
+            rust_type_head_at_bounded(
+                self.root,
+                self.source,
+                self.root,
+                first,
+                &self.type_heads,
+                charge,
+            )?
         } else {
-            let first = names.first().expect("nonempty path has a first segment");
-            let named_imports = self
-                .imports
-                .iter()
-                .filter(|import| is_lexically_visible(&module_path, &import.module_path))
-                .filter(|import| !import.wildcard && import.local_name == *first)
-                .collect::<Vec<_>>();
-
-            for import in &named_imports {
-                let mut target =
-                    resolve_standard_import_path(&import.module_path, &import.target_path);
-                target.extend(names.iter().skip(1).cloned());
-                resolved.push(target);
-            }
-
-            if named_imports.is_empty() && is_standard_root(first) {
-                if !self.name_is_shadowed(&module_path, first) {
-                    resolved.push(names.clone());
-                }
-            } else if named_imports.is_empty() {
-                for import in self.imports.iter().filter(|import| {
-                    import.wildcard && is_lexically_visible(&module_path, &import.module_path)
-                }) {
-                    let mut target =
-                        resolve_standard_import_path(&import.module_path, &import.target_path);
-                    target.extend(names.iter().cloned());
-                    resolved.push(target);
-                }
-                if resolved.is_empty()
-                    && is_standard_prelude_path(expected, &names)
-                    && !self.name_is_shadowed(&module_path, first)
+            actual_head
+        };
+        Ok(match head {
+            RustTypeHead::Unbound if is_standard_root(first) => StandardPathProof::Exact(names),
+            RustTypeHead::Unbound if !absolute => StandardPathProof::Prelude(names),
+            RustTypeHead::Import { path, declaration } if !absolute => {
+                // Import roots resolve where the import was written, not at
+                // the use site. Local modules named std/core/alloc are not
+                // evidence of a standard-library identity. Relative imports
+                // stay local even if normalization leaves that spelling.
+                let Some(root) = path.first() else {
+                    return Ok(StandardPathProof::NotProven);
+                };
+                if !is_standard_root(root)
+                    || !matches!(
+                        rust_type_head_at_bounded(
+                            self.root,
+                            self.source,
+                            declaration,
+                            root,
+                            &self.type_heads,
+                            charge
+                        )?,
+                        RustTypeHead::Unbound
+                    )
                 {
-                    resolved.push(expected.iter().map(|part| (*part).to_string()).collect());
+                    return Ok(StandardPathProof::NotProven);
                 }
+                let module_path = self.lexical_module_path(declaration);
+                charge(module_path.len())?;
+                let mut target = resolve_standard_import_path(&module_path, &path);
+                for name in names.into_iter().skip(1) {
+                    charge(name.len())?;
+                    target.push(name);
+                }
+                StandardPathProof::Exact(target)
             }
-        }
-
-        resolved.sort_unstable();
-        resolved.dedup();
-        resolved.len() == 1
-            && resolved[0]
-                .iter()
-                .map(String::as_str)
-                .eq(expected.iter().copied())
+            _ => StandardPathProof::NotProven,
+        })
     }
 
     fn lexical_module_path(&self, node: Node<'tree>) -> Vec<String> {
@@ -2327,7 +2420,8 @@ mod tests {
         let source = "#[derive(core::marker::Copy, core::clone::Clone)] struct NotCopy(&'static mut u8); fn f(value: NotCopy) {}\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         assert_ne!(
             index.classify_type(type_named(tree.root_node(), source, "NotCopy")),
             RustOwnershipClass::AggregateCopy
@@ -2339,7 +2433,8 @@ mod tests {
         let source = "#[derive(core::marker::Copy, core::clone::Clone)] struct Good(u8);\nstruct Plain(u8);\nstruct Dropped(u8);\nimpl core::ops::Drop for Dropped {}\nstruct Negative(u8);\nimpl !core::marker::Copy for Negative {}\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         assert_eq!(
             index.classify_type(type_named(tree.root_node(), source, "Good")),
             RustOwnershipClass::AggregateCopy
@@ -2363,7 +2458,8 @@ mod tests {
         let source = "struct A<T>(T);\nstruct S(u8);\nstruct S(u8);\nimpl foo::Copy for S {}\nfn f(a: A<u8>, p: *const u8) {}\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         assert!(matches!(
             index.classify_type(type_named(tree.root_node(), source, "A<u8>")),
             RustOwnershipClass::Incomplete(RustOwnershipIncomplete::GenericObligation)
@@ -2386,7 +2482,8 @@ mod tests {
         let source = "#[derive(core::marker::Copy, core::clone::Clone)] struct Pair(u32); unsafe fn f(value: Pair, unknown: Missing) {} opaque!(Pair);";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let ty = all_type_nodes(tree.root_node())
             .into_iter()
             .find(|node| rust_node_text(*node, source) == "Pair" && has_unsafe_ancestor(*node))
@@ -2422,7 +2519,8 @@ mod tests {
         let source = "unsafe fn f(value: u32) -> u32 { value } fn g(value: u32) { unsafe { let copied = value; } }\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let unsafe_type = all_type_nodes(tree.root_node())
             .into_iter()
             .find(|node| {
@@ -2456,7 +2554,8 @@ mod tests {
         let source = "mod Copy {}\n#[derive(core::marker::Copy, core::clone::Clone)]\nstruct Qualified(u8);\n#[derive(Copy, Clone)]\nstruct Shadowed(u8);\nstruct Good(u8);\nimpl core::marker::Copy for Good {}\nimpl core::clone::Clone for Good {}\nstruct Bad(u8);\nimpl Copy for Bad {}\nimpl Clone for Bad {}\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         assert_eq!(
             index.classify_type(type_named(tree.root_node(), source, "Qualified")),
             RustOwnershipClass::AggregateCopy
@@ -2477,7 +2576,8 @@ mod tests {
         let source = "struct Spelled(u8);\nimpl Copy for Spelled {}\nimpl Clone for Spelled {}\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         assert_eq!(
             index.classify_type(type_named(tree.root_node(), source, "Spelled")),
             RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
@@ -2489,7 +2589,8 @@ mod tests {
         let source = "use core::ptr as raw; use std::boxed::Box as HeapBox; struct LocalBox(u8); fn f(pointer: *mut u8) { let _ = raw::read(pointer); let _ = HeapBox::from_raw(pointer); let _ = Box::into_raw(pointer); } mod ptr { fn read() {} } fn shadowed() { ptr::read(); }";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let mut stack = vec![tree.root_node()];
         let mut read_path = None;
         let mut box_path = None;
@@ -2529,7 +2630,8 @@ mod tests {
         let source = "struct Box(u8); fn f() { let _value: Box = Box(0); }";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let mut stack = vec![tree.root_node()];
         let mut box_type = None;
         while let Some(node) = stack.pop() {
@@ -2559,7 +2661,8 @@ mod tests {
 
         let tree = parse(&source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), &source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), &source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let mut paths = Vec::new();
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
@@ -2577,7 +2680,56 @@ mod tests {
         }
         assert_eq!(
             index.lexical_module_context_steps.load(Ordering::Relaxed),
-            call_count * module_depth
+            0,
+            "unbound standard roots need no import-module path reconstruction"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7585: each standard item asked about one call path repeated its lexical scope walk"
+    )]
+    fn standard_path_questions_about_one_path_share_one_proof() {
+        let source =
+            "use std::mem::forget as leak; fn f() { leak(()); drop(()); core::ptr::read(p); }";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
+        let mut paths = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression"
+                && let Some(function) = node.child_by_field_name("function")
+            {
+                paths.push(function);
+            }
+            stack.extend(named_children(node));
+        }
+        assert_eq!(paths.len(), 3);
+        let items: [&[&str]; 4] = [
+            &["core", "ptr", "read"],
+            &["std", "mem", "drop"],
+            &["std", "mem", "forget"],
+            &["std", "boxed", "Box", "new"],
+        ];
+        for path in &paths {
+            let proven = items
+                .iter()
+                .filter(|item| index.resolves_standard_path(*path, item))
+                .copied()
+                .collect::<Vec<_>>();
+            let expected: &[&str] = match rust_node_text(*path, source) {
+                "leak" => &["std", "mem", "forget"],
+                "drop" => &["std", "mem", "drop"],
+                "core::ptr::read" => &["core", "ptr", "read"],
+                other => panic!("unexpected call path {other}"),
+            };
+            assert_eq!(proven, [expected], "{}", rust_node_text(*path, source));
+        }
+        assert_eq!(
+            index.standard_path_proof_walks.load(Ordering::Relaxed),
+            paths.len()
         );
     }
 
@@ -2592,7 +2744,8 @@ mod tests {
         }"#;
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let mut macros = Vec::new();
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
@@ -2622,7 +2775,8 @@ mod tests {
         let source = "struct Owned; impl core::ops::Drop for Owned { fn drop(&mut self) {} } fn f(value: Owned) {}";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let ty = type_named(tree.root_node(), source, "Owned");
         let method = index
             .drop_impl_method_for_type(ty)
@@ -2640,7 +2794,8 @@ mod tests {
             "struct Owned; mod custom { pub trait Drop {} } impl custom::Drop for Owned {}";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         assert_eq!(
             index.drop_impl_method_for_type(type_named(tree.root_node(), source, "Owned")),
             Ok(None)
@@ -2649,7 +2804,8 @@ mod tests {
         let source = "struct Field; struct Owner { first: Field, second: u8 }";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let fields = index
             .drop_fields_for_type(type_named(tree.root_node(), source, "Owner"))
             .expect("nongeneric local struct fields");
@@ -2672,7 +2828,8 @@ mod tests {
         let source = "fn f(a: &[u8; 2], b: &mut [u8; 2], c: &[u8], d: &mut [u8]) {}";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         for (from, to, allowed) in [
             ("&[u8; 2]", "&mut [u8]", false),
             ("&[u8; 2]", "&[u8]", true),
@@ -2700,7 +2857,8 @@ mod tests {
         let source = "fn f(a: &[u8; 2], b: &[u8], c: &mut u8, d: &u8) {}\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let array_reference = type_named(tree.root_node(), source, "&[u8; 2]");
         let slice_reference = type_named(tree.root_node(), source, "&[u8]");
         let mutable_reference = type_named(tree.root_node(), source, "&mut u8");
@@ -2758,11 +2916,102 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6844: standard-path proof inferred Option despite a disabled implicit prelude"
+    )]
+    fn standard_path_proof_respects_disabled_prelude() {
+        let source = "#![no_implicit_prelude]\nfn f(value: Option<usize>) {}";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
+        let option = type_named(tree.root_node(), source, "Option");
+        assert!(!index.resolves_standard_path(option, &["core", "option", "Option"]));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6844: standard-path proof ignored a local Option type alias"
+    )]
+    fn standard_path_proof_rejects_local_option_alias() {
+        let source =
+            "struct NotCopy<T>(T); type Option<T> = NotCopy<T>; fn f(value: Option<usize>) {}";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
+        let option = type_named(tree.root_node(), source, "Option<usize>");
+        assert!(matches!(
+            index.classify_type(option),
+            RustOwnershipClass::Incomplete(_)
+        ));
+        assert!(!index.resolves_standard_path(
+            option.child_by_field_name("type").unwrap(),
+            &["core", "option", "Option"]
+        ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6844: a generic parameter named Box acquired standard-library identity"
+    )]
+    fn standard_path_proof_rejects_generic_wrapper_parameter() {
+        let source = "fn f<Box>(value: Box) {}";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
+        assert!(!index.resolves_standard_path(
+            type_named(tree.root_node(), source, "Box"),
+            &["std", "boxed", "Box"]
+        ));
+    }
+
+    #[test]
+    fn standard_path_proof_exhaustion_withholds_identity() {
+        let source = "fn f(value: std::boxed::Box<u8>) {}";
+        let tree = parse(source);
+        let path = type_named(tree.root_node(), source, "std::boxed::Box");
+        for (limit, proven) in [(0, false), (100_000, true)] {
+            let index =
+                RustOwnershipIndex::build(tree.root_node(), source, limit, |_| Ok::<_, ()>(()))
+                    .unwrap();
+            assert_eq!(
+                index.resolves_standard_path(path, &["std", "boxed", "Box"]),
+                proven,
+                "work limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6844: relative imports of a local std module acquired external standard identity"
+    )]
+    fn standard_path_proof_rejects_relative_standard_spelling() {
+        let source = "mod std { pub mod boxed { pub struct Box<T>(pub T); } } use crate::std::boxed::Box as FromCrate; use self::std::boxed::Box as FromSelf; fn f(a: FromCrate<u8>, b: FromSelf<u8>) {}";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
+        for name in ["FromCrate", "FromSelf"] {
+            assert!(
+                !index.resolves_standard_path(
+                    type_named(tree.root_node(), source, name),
+                    &["std", "boxed", "Box"]
+                ),
+                "{name} names a local type"
+            );
+        }
+    }
+
+    #[test]
     fn nested_trait_shadow_does_not_poison_outer_qualified_derives() {
         let source = "#[derive(core::marker::Copy, core::clone::Clone)] struct Outer(u8); mod nested { trait Copy {} struct Inner(u8); impl Copy for Inner {} } fn f(value: Outer) {}\n";
         let tree = parse(source);
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         assert_eq!(
             index.classify_type(type_named(tree.root_node(), source, "Outer")),
             RustOwnershipClass::AggregateCopy
@@ -2863,7 +3112,7 @@ fn grouped_imports() {
 "#;
         let tree = parse(source);
         let root = tree.root_node();
-        let index = RustOwnershipIndex::build(root, source, |_| Ok::<_, ()>(())).unwrap();
+        let index = RustOwnershipIndex::build(root, source, 100_000, |_| Ok::<_, ()>(())).unwrap();
         let declared_type = |name: &str| {
             let mut stack = vec![root];
             while let Some(node) = stack.pop() {
@@ -3138,7 +3387,7 @@ fn grouped_imports() {
         let disabled_source = "#![no_implicit_prelude]\nfn f(value: Option<usize>) {}";
         let disabled_tree = parse(disabled_source);
         let disabled_index =
-            RustOwnershipIndex::build(disabled_tree.root_node(), disabled_source, |_| {
+            RustOwnershipIndex::build(disabled_tree.root_node(), disabled_source, 100_000, |_| {
                 Ok::<_, ()>(())
             })
             .unwrap();
@@ -3339,10 +3588,11 @@ impl Owner {
     fn charge_callback_bounds_scan_and_fixed_point() {
         let tree = parse("struct A(u8);");
         let mut charges = 0usize;
-        let result = RustOwnershipIndex::build(tree.root_node(), "struct A(u8);", |work| {
-            charges += work;
-            if charges > 2 { Err(()) } else { Ok(()) }
-        });
+        let result =
+            RustOwnershipIndex::build(tree.root_node(), "struct A(u8);", 100_000, |work| {
+                charges += work;
+                if charges > 2 { Err(()) } else { Ok(()) }
+            });
         assert!(result.is_err());
         assert!(charges > 0);
     }
@@ -3507,7 +3757,8 @@ mod ownership_evidence_boundaries {
             pending.extend(named_children(node));
         }
         let index =
-            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
         let parameters = nodes
             .iter()
             .copied()

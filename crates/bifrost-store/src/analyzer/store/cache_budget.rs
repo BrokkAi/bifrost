@@ -404,26 +404,39 @@ fn entry_weight(key: &StoreCacheKey, value: &StoreCacheValue) -> u32 {
 
 /// Temporary census for a single value. Aliases of shared immutable backing
 /// allocations are charged once, not once per Arc handle. This set dies at the
-/// end of weighing and is never retained by the store.
+/// end of weighing and is never retained by the store. Collection elements and
+/// distinct Arc allocations contribute entries; other visits use `add_entries`.
 #[derive(Default)]
-pub(crate) struct RetainedHeap {
+pub struct RetainedHeap {
     bytes: usize,
+    entries: usize,
     shared: crate::hash::HashSet<usize>,
 }
 impl RetainedHeap {
-    pub(crate) fn add(&mut self, bytes: usize) {
+    pub fn add(&mut self, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes);
     }
-    pub(crate) fn total(self) -> usize {
+    /// Add visited entries independently of their retained byte charge.
+    pub fn add_entries(&mut self, entries: usize) {
+        self.entries = self.entries.saturating_add(entries);
+    }
+    /// Return retained bytes and visited entries from this census.
+    pub fn totals(self) -> (usize, usize) {
+        (self.bytes, self.entries)
+    }
+    pub fn total(self) -> usize {
         self.bytes
     }
-    pub(crate) fn slice<T>(&mut self, slice: &[T]) {
+    pub fn slice<T>(&mut self, slice: &[T]) {
         self.add(std::mem::size_of_val(slice));
+        self.add_entries(slice.len());
     }
-    pub(crate) fn vec<T>(&mut self, values: &Vec<T>) {
+    pub fn vec<T>(&mut self, values: &Vec<T>) {
         self.add(values.capacity().saturating_mul(std::mem::size_of::<T>()));
+        self.add_entries(values.len());
     }
-    pub(crate) fn map<K, V, S>(&mut self, values: &std::collections::HashMap<K, V, S>) {
+    pub fn map<K, V, S>(&mut self, values: &std::collections::HashMap<K, V, S>) {
+        self.add_entries(values.len());
         // Hashbrown's load factor reserves 1/8 of the buckets; each bucket
         // owns one control byte. Capacity excludes those reserved buckets.
         if values.capacity() != 0 {
@@ -439,7 +452,8 @@ impl RetainedHeap {
             );
         }
     }
-    pub(crate) fn hash_set<T, S>(&mut self, values: &std::collections::HashSet<T, S>) {
+    pub fn hash_set<T, S>(&mut self, values: &std::collections::HashSet<T, S>) {
+        self.add_entries(values.len());
         if values.capacity() != 0 {
             let buckets = values
                 .capacity()
@@ -453,13 +467,15 @@ impl RetainedHeap {
             );
         }
     }
-    pub(crate) fn arc<T: ?Sized>(&mut self, value: &Arc<T>, charge: impl FnOnce(&T, &mut Self)) {
+    pub fn arc<T: ?Sized>(&mut self, value: &Arc<T>, charge: impl FnOnce(&T, &mut Self)) {
         if self.shared.insert(Arc::as_ptr(value).cast::<()>() as usize) {
             self.add(std::mem::size_of_val(&**value) + 2 * std::mem::size_of::<usize>());
+            self.add_entries(1);
             charge(value, self);
         }
     }
-    pub(crate) fn btree_set<T>(&mut self, values: &std::collections::BTreeSet<T>) {
+    pub fn btree_set<T>(&mut self, values: &std::collections::BTreeSet<T>) {
+        self.add_entries(values.len());
         // A non-root B-tree node holds at least five keys; allow one node
         // per five keys (including the root), with eleven key slots,
         // twelve child pointers and its header, even for a leaf.
@@ -489,4 +505,31 @@ pub struct CompositionCacheStats {
     pub search_misses: u64,
     pub search_retained_bytes: u64,
     pub retained_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetainedHeap;
+    use std::sync::Arc;
+
+    #[test]
+    fn retained_heap_counts_aliased_allocations_and_entries_once() {
+        let values = Arc::new(vec![1u64, 2]);
+        let alias = Arc::clone(&values);
+        let mut heap = RetainedHeap::default();
+        let mut visits = 0;
+        for value in [&values, &alias] {
+            heap.arc(value, |values, heap| {
+                visits += 1;
+                heap.vec(values);
+                heap.add_entries(3);
+            });
+        }
+        let (bytes, entries) = heap.totals();
+        let mut single = RetainedHeap::default();
+        single.arc(&values, |values, heap| heap.vec(values));
+        assert_eq!(bytes, single.total());
+        assert_eq!(entries, 6); // One Arc, two elements, three explicit visits.
+        assert_eq!(visits, 1);
+    }
 }

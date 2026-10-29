@@ -4,6 +4,17 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
+/// A decoded module/member route, with Python identifier-valued segments.
+/// This classifies an API string value rather than parsing source syntax.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn is_python_member_path(value: &str) -> bool {
+    static IDENTIFIER: std::sync::LazyLock<::regex::Regex> = std::sync::LazyLock::new(|| {
+        ::regex::Regex::new(r"\A[_\p{XID_Start}]\p{XID_Continue}*\z")
+            .expect("Python identifier value regex")
+    });
+    value.contains('.') && value.split('.').all(|part| IDENTIFIER.is_match(part))
+}
+
 /// The operands of a Python conditional expression (`value if test else
 /// alternative`).
 ///

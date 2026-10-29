@@ -9,6 +9,12 @@ mod go_overlay_test {
 
     use brokk_bifrost_analysis::analyzer::usages::workspace_graph::build_workspace_usage_graph_with_cancellation;
 
+    use brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystem;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+    use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
+
     use brokk_bifrost_go_analysis::analyzer::go::GoAnalyzer;
 
     use crate::inline_project::InlineTestProject;
@@ -28,35 +34,64 @@ mod go_overlay_test {
             .file("go.mod", "module example.com/app\n")
             .file("app.go", source)
             .build();
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
         let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
         let file = fixture.file("app.go");
         assert!(overlay.set(file.abs_path(), source.to_owned()));
-        let analyzer = GoAnalyzer::new(overlay.clone() as Arc<dyn Project>);
+        let mut config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
+        config.go.dependency_discovery.mode =
+            brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryMode::FullProduction;
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            overlay.clone() as Arc<dyn Project>,
+            config.clone(),
+        )
+        .unwrap();
+        let discovery = workspace.resolve_dependency_discovery(
+            DependencyPackEcosystem::Go,
+            &config,
+            &DependencyPackLimits::default(),
+            &CancellationToken::default(),
+        );
+        assert!(
+            discovery.complete,
+            "Go build selection failed: {discovery:#?}"
+        );
+        let analyzer = workspace.analyzer();
+        let go_analyzer = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            GoAnalyzer,
+        >(analyzer)
+        .expect("workspace has a Go analyzer");
         let build = |catalog: WorkspaceUsageCatalog| {
             assert!(
                 !catalog.nodes.is_empty(),
                 "the Go pass must have graph roots"
             );
             build_workspace_usage_graph_with_cancellation(
-                &analyzer,
+                analyzer,
                 catalog,
                 &BTreeSet::from([UsageEcosystem::Go]),
                 &CancellationToken::default(),
             )
         };
-        assert!(analyzer.graph_inventory_complete());
+        assert!(go_analyzer.graph_inventory_complete());
         assert!(matches!(
-            build(WorkspaceUsageCatalog::build(&analyzer)),
+            build(WorkspaceUsageCatalog::build(analyzer)),
             WorkspaceUsageGraphBuildOutcome::Complete(_)
         ));
 
         // Preserve the selected roots while invalidating the authority for
         // their package-qualified identities. A source-only edit can be
         // hydrated on demand; a module rename requires workspace reprojection.
-        let catalog = WorkspaceUsageCatalog::build(&analyzer);
+        let catalog = WorkspaceUsageCatalog::build(analyzer);
         let module = fixture.file("go.mod");
         assert!(overlay.set(module.abs_path(), "module example.com/renamed\n".to_owned()));
-        assert!(!analyzer.graph_inventory_complete());
+        assert!(!go_analyzer.graph_inventory_complete());
         assert!(
             matches!(
                 build(catalog),
@@ -66,9 +101,9 @@ mod go_overlay_test {
         );
 
         assert!(overlay.clear(&module.abs_path()));
-        assert!(analyzer.graph_inventory_complete());
+        assert!(go_analyzer.graph_inventory_complete());
         assert!(matches!(
-            build(WorkspaceUsageCatalog::build(&analyzer)),
+            build(WorkspaceUsageCatalog::build(analyzer)),
             WorkspaceUsageGraphBuildOutcome::Complete(_)
         ));
     }

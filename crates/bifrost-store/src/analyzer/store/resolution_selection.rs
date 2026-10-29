@@ -24,6 +24,8 @@ use crate::analyzer::resolution::{
 
 use crate::hash::{HashMap, HashSet};
 
+type PythonReceiverRows = super::selected_read_memo::RequestReadCache<(i64, u32), Vec<(u32, u32)>>;
+
 pub(crate) use super::resolution::ResolutionManifestCounts;
 use super::resolution::{
     RESOLUTION_MANIFEST_COUNT_COLUMNS, resolution_bundle_epoch, with_resolution_progress_handler,
@@ -1446,6 +1448,18 @@ pub struct SelectedResolutionMountInventory<'store> {
     pub authority_request_memo: RefCell<super::resolution_authority::AuthorityRequestMemo>,
     /// Published site rows touched by this one operation.
     site_row_memo: RefCell<super::resolution_lexical::SiteRowMemo>,
+    // Durable recipes owned by this selected request, never pooled. Only found
+    // recipes are kept; see read_stored_lookup_recipes.
+    pub(super) identity_recipe_memo: RefCell<
+        super::selected_read_memo::RequestReadCache<
+            i64,
+            crate::analyzer::resolution::ResolutionLookupSemanticRecipe,
+        >,
+    >,
+    pub(super) python_receiver_rows: RefCell<PythonReceiverRows>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) python_unit_metadata:
+        RefCell<super::selected_read_memo::RequestReadCache<i64, (Vec<u8>, String)>>,
     /// Complete header-read answers demanded by this query, never retained
     /// with the pooled selection. Mount rows do not change while this owner
     /// lives; scope writers invalidate this memo before changing its scope.
@@ -3122,6 +3136,10 @@ impl AnalyzerStore {
                             authority_validations: RefCell::default(),
                             authority_request_memo: RefCell::default(),
                             site_row_memo: RefCell::default(),
+                            identity_recipe_memo: RefCell::default(),
+                            python_receiver_rows: RefCell::default(),
+                            #[cfg(any(test, feature = "test-support"))]
+                            python_unit_metadata: RefCell::default(),
                             path_endpoint_header_memo: RefCell::default(),
                             inventory_revalidation_memo: Cell::new(None),
                             operation_change_stamp: None,
@@ -3293,6 +3311,10 @@ impl AnalyzerStore {
                         authority_validations: RefCell::default(),
                         authority_request_memo: RefCell::default(),
                         site_row_memo: RefCell::default(),
+                        identity_recipe_memo: RefCell::default(),
+                        python_receiver_rows: RefCell::default(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        python_unit_metadata: RefCell::default(),
                         path_endpoint_header_memo: RefCell::default(),
                         inventory_revalidation_memo: Cell::new(None),
                         operation_change_stamp: None,

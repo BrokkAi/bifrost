@@ -62,8 +62,8 @@ mod row_fixture {
         CallSiteId, CallableReferenceKind, CallableTarget, CallableTargetResolution, CallableValue,
         CaptureBinding, CaptureId, CaptureMode, CaptureSource, ConstructionReturn, ContentIdentity,
         ControlContinuation, ControlEdge, ControlEdgeKind, DeclarationLocator, DeclarationSegment,
-        DeclarationSegmentKind, DispatchExtensibility, DropBehavior, DropFact, Evidence,
-        EvidenceCompleteness, EvidenceId, ExecutionTiming, FormalMultiplicity,
+        DeclarationSegmentKind, DeferredMemberSelection, DispatchExtensibility, DropBehavior,
+        DropFact, Evidence, EvidenceCompleteness, EvidenceId, ExecutionTiming, FormalMultiplicity,
         FormalParameterPassingMode, GoPredeclaredBuiltin, GuardArm, GuardConditionDigest,
         GuardFactParts, GuardId, GuardPredicate, IndexedLocationIdentity, IntegerComparison,
         LifecycleIncompleteReason, LoopSite, MemoryAccessKind, MemoryLocation, MemoryLocationId,
@@ -189,6 +189,7 @@ mod row_fixture {
             execution_timing: timing,
             callee: v(16),
             receiver: None,
+            member_selection: None,
             arguments: arguments.into(),
             normal_results: normal_results.into(),
             result: None,
@@ -685,6 +686,23 @@ mod row_fixture {
                 Vec::new(),
             ),
         ];
+        for (index, place, depth) in [
+            (
+                0,
+                Some(SemanticPlace::LocalBinding(binding.clone())),
+                Some(0),
+            ),
+            (1, Some(SemanticPlace::MemoryLocation(mem(0))), Some(1)),
+            (2, None, Some(0)),
+            (3, None, None),
+        ] {
+            p0.call_sites[index].receiver = Some(v(4));
+            p0.call_sites[index].member_selection = Some(Box::new(DeferredMemberSelection {
+                member: "selected_member".into(),
+                receiver_place: place,
+                receiver_pointer_depth: depth,
+            }));
+        }
         p0.source_mappings = vec![
             SourceMapping {
                 id: sm(0),
@@ -1714,6 +1732,7 @@ mod row_fixture {
             execution_timing: ExecutionTiming::SameInvocation,
             callee: v(1),
             receiver: None,
+            member_selection: None,
             arguments: vec![argument(
                 0,
                 CallArgumentExpansion::Direct(ArgumentDomain::Positional),
@@ -2054,6 +2073,22 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
             )
             .unwrap();
         assert_eq!(usize::try_from(logical_rows).unwrap(), 1 + child_rows);
+        for statement in [
+            "UPDATE semantic_ir_call_sites SET receiver_place_locator = 999 WHERE blob_id = ?1 AND procedure = 0 AND call_site = 0",
+            "UPDATE semantic_ir_call_sites SET receiver_place_location = 999 WHERE blob_id = ?1 AND procedure = 0 AND call_site = 1",
+        ] {
+            assert!(
+                conn.execute(statement, [blob_id]).is_err(),
+                "receiver places must name stored parents: {statement}"
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
     }
 
     let decoded = store.read_semantic_ir(blob_id, &fixture.scope).unwrap();
@@ -2210,6 +2245,14 @@ fn semantic_ir_decoder_rejects_corrupted_rows_by_naming_the_row() {
             "UPDATE semantic_ir_values SET text = 999 WHERE blob_id = {blob} AND procedure = 0 AND value = 18",
             &[
                 "semantic_ir_values row of blob {blob} with key [0, 18] does not decode: names missing text 999",
+            ],
+        ),
+        (
+            "a member selection whose name text is missing",
+            CorruptedRead::Ir,
+            "UPDATE semantic_ir_call_sites SET member = 999 WHERE blob_id = {blob} AND procedure = 0 AND call_site = 0",
+            &[
+                "semantic_ir_call_sites row of blob {blob} with key [0, 0] does not decode: names missing text 999",
             ],
         ),
         (

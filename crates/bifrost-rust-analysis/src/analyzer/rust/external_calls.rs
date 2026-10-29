@@ -291,6 +291,12 @@ fn canonical_rust_external_owner_components(
     let BoundedResolution::Complete { value, .. } = resolution else {
         return components;
     };
+    if let Some(path) = crate::analyzer::rust::std_types::standard_wrapper_owner(&value) {
+        return path
+            .into_iter()
+            .chain(components.iter().skip(1).cloned())
+            .collect();
+    }
     if let Some(prelude) = crate::analyzer::rust::std_types::prelude_item_of(&value, "type")
         && let Some(fact) = rust_std_type_fact(&prelude)
     {

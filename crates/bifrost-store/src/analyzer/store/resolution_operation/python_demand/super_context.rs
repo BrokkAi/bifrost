@@ -1,6 +1,8 @@
 //! Structured proxy-call context. Names and candidate roles never prove identity.
 use super::*;
 
+pub(super) type SuperContextRow = (u32, u32, Option<u32>, Option<u32>, bool, bool);
+
 #[derive(Clone)]
 pub(super) struct SuperContext {
     callee: Option<SemanticId>,
@@ -30,8 +32,12 @@ impl SuperContext {
         if rules.cancellation.is_cancelled() || !rules.session.scope_step() {
             return Ok(None);
         }
-        type SuperContextRow = (u32, u32, Option<u32>, Option<u32>, bool, bool);
-        let context: Option<SuperContextRow> = conn.query_row(
+        let key = (mount.blob_id(), reference.local_key());
+        let cached = rules.super_context_rows.borrow().get(&key).copied();
+        let context = if let Some(context) = cached {
+            context
+        } else {
+            let context: Option<SuperContextRow> = conn.query_row(
             "SELECT context.call,context.callee,context.callable,context.class_cell,
                 context.first_parameter IS NOT NULL,
                 EXISTS(SELECT 1 FROM python_member_member_roles role WHERE role.blob_id=context.blob_id AND role.member=context.callable AND role.receiver_parameter=context.first_parameter)
@@ -40,6 +46,15 @@ impl SuperContext {
              JOIN python_member_super_contexts context ON context.blob_id=member.blob_id AND context.call=member.call
              WHERE semantic.blob_id=?1 AND semantic.semantic_key=?2 AND semantic.semantic_role='reference'",
             rusqlite::params![mount.blob_id(),reference.local_key()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
+            assert!(
+                rules
+                    .super_context_rows
+                    .borrow_mut()
+                    .insert(key, context)
+                    .is_none()
+            );
+            context
+        };
         let Some((call, callee, callable, class_cell, first_parameter, method)) = context else {
             return Ok(None);
         };

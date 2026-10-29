@@ -16,6 +16,7 @@
 use super::super::rewrite_paths::{
     FileRewritePaths, RewritePathCompleteness, RewritePathIncompleteReason,
 };
+use super::DerivationExecutionCause;
 use super::rel_path_string;
 use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryRange,
@@ -66,6 +67,7 @@ impl RewritePathTraversalCache {
     /// Turn one derivation's completeness into typed diagnostics.
     pub(super) fn report_completeness(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         subject: &str,
         language: Language,
         completeness: &RewritePathCompleteness,
@@ -73,26 +75,30 @@ impl RewritePathTraversalCache {
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
         for reason in completeness.reasons() {
-            let (code, detail) = classify_reason(reason);
+            let (code, detail, cause) = classify_reason(reason);
             if !self.reported.insert((subject.to_string(), detail)) {
                 continue;
             }
             let uncovered = uncovered_domains(completeness);
-            diagnostics.push(CodeQueryDiagnostic {
-                related: Vec::new(),
-                source: None,
-                code,
-                impact: CodeQueryDiagnosticImpact::Incomplete,
-                branch: Vec::new(),
-                language: language.config_label(),
-                message: format!(
-                    "{subject} has an incomplete rewrite-path derivation in generation \
+            diagnostics.push(super::QueryExecutionState::diagnostic(
+                analyzer,
+                CodeQueryDiagnostic {
+                    related: Vec::new(),
+                    source: None,
+                    code,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: language.config_label(),
+                    message: format!(
+                        "{subject} has an incomplete rewrite-path derivation in generation \
                      {generation} ({detail}); uncovered domains: [{}]",
-                    uncovered.join(", ")
-                ),
-                exhausted_roots: Vec::new(),
-                withheld_rows_path: None,
-            });
+                        uncovered.join(", ")
+                    ),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                },
+                cause,
+            ));
         }
     }
 }
@@ -103,23 +109,31 @@ impl RewritePathTraversalCache {
 /// here deliberately rather than defaulting into a generic message.
 fn classify_reason(
     reason: &RewritePathIncompleteReason,
-) -> (CodeQueryDiagnosticCode, &'static str) {
+) -> (
+    CodeQueryDiagnosticCode,
+    &'static str,
+    Option<DerivationExecutionCause>,
+) {
     match reason {
         RewritePathIncompleteReason::CanonicalFactsUnavailable => (
             CodeQueryDiagnosticCode::RewritePathDerivationIncomplete,
             "canonical source facts required by the derivation are unavailable",
+            Some(DerivationExecutionCause::Provider),
         ),
         RewritePathIncompleteReason::NoDomainAnalyzer(_) => (
             CodeQueryDiagnosticCode::RewriteDomainUnsupported,
             "the workspace has no analyzer for the domain's language",
+            None,
         ),
         RewritePathIncompleteReason::Cancelled => (
             CodeQueryDiagnosticCode::RewritePathDerivationIncomplete,
             "the derivation was cancelled",
+            Some(DerivationExecutionCause::Cancelled),
         ),
         RewritePathIncompleteReason::NoIndexedSource => (
             CodeQueryDiagnosticCode::RewritePathDerivationIncomplete,
             "the analyzer no longer holds the analyzed source the origins anchor in",
+            Some(DerivationExecutionCause::Provider),
         ),
     }
 }
@@ -254,6 +268,13 @@ fn uncovered_domains(completeness: &RewritePathCompleteness) -> Vec<&'static str
 
 #[test]
 fn an_incomplete_derivation_reports_every_reason_once_per_subject() {
+    let directory = tempfile::tempdir().unwrap();
+    let analyzer =
+        crate::analyzer::JavascriptAnalyzer::from_project(crate::analyzer::TestProject::new(
+            directory.path().to_path_buf(),
+            crate::analyzer::Language::JavaScript,
+        ));
+
     let mut cache = RewritePathTraversalCache::default();
     let completeness = RewritePathCompleteness::Incomplete {
         reasons: vec![
@@ -264,6 +285,7 @@ fn an_incomplete_derivation_reports_every_reason_once_per_subject() {
     };
     let mut diagnostics = Vec::new();
     cache.report_completeness(
+        &analyzer,
         "src/lib.rs",
         Language::Rust,
         &completeness,
@@ -272,6 +294,7 @@ fn an_incomplete_derivation_reports_every_reason_once_per_subject() {
     );
     crate::structural::search::test_support::assert_incomplete_diagnostics(&diagnostics, 3);
     cache.report_completeness(
+        &analyzer,
         "src/lib.rs",
         Language::Rust,
         &completeness,

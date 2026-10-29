@@ -352,7 +352,10 @@ impl JsTsImportBinder {
     }
 
     pub fn binding(&self, local_name: &str) -> Option<&ImportBinding> {
-        Some(&self.bindings.get(local_name)?.last()?.binding)
+        let [binding] = self.bindings.get(local_name)?.as_slice() else {
+            return None;
+        };
+        (!self.was_truncated(local_name)).then_some(&binding.binding)
     }
 
     fn projected_bindings_for(&self, local_name: &str) -> impl Iterator<Item = &JsTsImportBinding> {
@@ -430,20 +433,6 @@ impl JsTsImportBinder {
                     .iter()
                     .map(move |binding| (local_name.as_str(), binding))
             })
-    }
-
-    /// Binding events for one local name in source order. Static imports,
-    /// CommonJS requires, and typed module values share this ordering so
-    /// callers need not reconstruct their relative positions from text.
-    pub fn binding_records_for(&self, local_name: &str) -> Vec<&JsTsImportBinding> {
-        let mut bindings = self
-            .provenance_bindings
-            .get(local_name)
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        bindings.sort_by_key(|binding| binding.provenance.order);
-        bindings
     }
 
     pub fn has_binding_records(&self, local_name: &str) -> bool {
@@ -813,8 +802,8 @@ pub struct JsTsRuntimeReadFacts {
     /// Unknown effects and deferred execution are represented independently
     /// in the evidence rows and do not make this bit false.
     pub traversal_complete: bool,
-    /// False only when the bounded traversal could not visit the full syntax
-    /// tree. Per-read dynamic keys, writes, unknown effects, and deferred
+    /// False when traversal or emitted-fact capacity omits evidence.
+    /// Per-read dynamic keys, writes, unknown effects, and deferred
     /// execution contexts remain represented in their rows.
     pub complete: bool,
 }
@@ -827,6 +816,7 @@ struct JsTsRuntimeTraversalBudget {
     remaining: usize,
     exhausted: bool,
     visited_nodes: usize,
+    facts_truncated: bool,
 }
 
 impl JsTsRuntimeTraversalBudget {
@@ -838,6 +828,7 @@ impl JsTsRuntimeTraversalBudget {
                 .min(1_000_000),
             exhausted: false,
             visited_nodes: 0,
+            facts_truncated: false,
         }
     }
 
@@ -872,6 +863,7 @@ impl JsTsLexicalBindingIndex {
             remaining: usize::MAX,
             exhausted: false,
             visited_nodes: 0,
+            facts_truncated: false,
         };
         Self::build_bounded(root, source, &mut budget).0
     }
@@ -1543,16 +1535,26 @@ pub(crate) fn for_each_parameter<'tree>(
 }
 
 /// The nonempty name of the indexed parameter selected by a dialect's binder rule.
+/// An unparenthesized arrow (`x => x`) has a single `parameter` field instead of
+/// a `parameters` list.
 pub fn parameter_name_at_index<'tree>(
     function: Node<'tree>,
     source: &str,
     parameter_index: usize,
     mut name_node: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
 ) -> Option<String> {
-    let parameters = function.child_by_field_name("parameters")?;
-    let mut cursor = parameters.walk();
+    let parameters = match function.child_by_field_name("parameters") {
+        Some(parameters) => {
+            let mut cursor = parameters.walk();
+            parameters.named_children(&mut cursor).collect::<Vec<_>>()
+        }
+        None => function
+            .child_by_field_name("parameter")
+            .into_iter()
+            .collect(),
+    };
     parameters
-        .named_children(&mut cursor)
+        .into_iter()
         .filter_map(&mut name_node)
         .nth(parameter_index)
         .map(|name| slice(name, source).trim().to_string())
@@ -1631,6 +1633,11 @@ pub fn object_literal_property_key_node(property: Node<'_>) -> Option<Node<'_>> 
         "method_definition" => property.child_by_field_name("name"),
         _ => None,
     }
+}
+
+/// Decode a selected literal only when its value is representable in UTF-8.
+pub(crate) fn js_ts_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
+    String::from_utf16(&js_ts_string_literal_code_units(node, source)?).ok()
 }
 
 /// Exact UTF-16 value of a structurally selected JS/TS string literal.
@@ -2362,9 +2369,6 @@ fn append_runtime_write_facts(
     let destructuring_target = matches!(target.kind(), "object_pattern" | "array_pattern");
     let targets = runtime_write_targets(target, budget);
     for target in targets {
-        if writes.len() >= max_facts {
-            return;
-        }
         let Some((root, segments)) = runtime_path(target, source) else {
             continue;
         };
@@ -2433,6 +2437,10 @@ fn append_runtime_write_facts(
                 JsTsRuntimeWriteTarget::Unknown,
             ),
         };
+        if writes.len() >= max_facts {
+            budget.facts_truncated = true;
+            continue;
+        }
         writes.push(JsTsRuntimeWrite {
             binding_name: slice(root, source).to_string(),
             root_name,
@@ -2658,7 +2666,8 @@ fn module_member_writes(
             if let [name, specifier] = children.as_slice()
                 && name.kind() == "identifier"
                 && specifier.kind() == "string"
-                && module_matches(&unquote(slice(*specifier, source)))
+                && js_ts_string_literal_value(*specifier, source)
+                    .is_some_and(|value| module_matches(&value))
             {
                 required
                     .entry(slice(*name, source).to_string())
@@ -2761,6 +2770,7 @@ fn module_member_writes(
         remaining: usize::MAX,
         exhausted: false,
         visited_nodes: 0,
+        facts_truncated: false,
     };
     let mut writes = JsTsModuleMemberWrites::default();
     // The earliest refusal in the file is the one reported, so a caller naming
@@ -2883,76 +2893,79 @@ pub fn extract_js_ts_runtime_reads(
             && let Some((root_name, lexical_resolution, segments)) =
                 normalized_runtime_path(&bindings, path_root, segments, source)
             && segments.len() == 2
-            && reads.len() + writes.len() < max_facts
         {
-            let container = &segments[0];
-            let key = &segments[1];
-            let scope = enclosing_runtime_function(node);
-            let scope_key = scope.map(|scope| scope.id());
-            let hazards = scope_hazards.entry(scope_key).or_insert_with(|| {
-                let scope_root = scope.unwrap_or(root);
-                let (hazards, hazards_complete) = runtime_scope_hazards(
-                    &bindings,
-                    &local_functions,
-                    scope_root,
-                    source,
-                    &mut budget,
-                );
-                scopes_complete &= hazards_complete;
-                hazards
-            });
-            let read_range = node_source_range(node);
-            let has_unknown_effects = hazards
-                .iter()
-                .any(|hazard| (hazard.effect || hazard.accessor) && hazard.can_precede(read_range));
-            let accessor = if hazards
-                .iter()
-                .any(|hazard| hazard.accessor && hazard.can_precede(read_range))
-            {
-                JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+            if reads.len() + writes.len() >= max_facts {
+                budget.facts_truncated = true;
             } else {
-                JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects
-            };
-            let mutation = if has_unknown_effects {
-                if writes.iter().any(|write| {
+                let container = &segments[0];
+                let key = &segments[1];
+                let scope = enclosing_runtime_function(node);
+                let scope_key = scope.map(|scope| scope.id());
+                let hazards = scope_hazards.entry(scope_key).or_insert_with(|| {
+                    let scope_root = scope.unwrap_or(root);
+                    let (hazards, hazards_complete) = runtime_scope_hazards(
+                        &bindings,
+                        &local_functions,
+                        scope_root,
+                        source,
+                        &mut budget,
+                    );
+                    scopes_complete &= hazards_complete;
+                    hazards
+                });
+                let read_range = node_source_range(node);
+                let has_unknown_effects = hazards.iter().any(|hazard| {
+                    (hazard.effect || hazard.accessor) && hazard.can_precede(read_range)
+                });
+                let accessor = if hazards
+                    .iter()
+                    .any(|hazard| hazard.accessor && hazard.can_precede(read_range))
+                {
+                    JsTsRuntimeAccessorCoverage::UnknownAccessorEffects
+                } else {
+                    JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects
+                };
+                let mutation = if has_unknown_effects {
+                    if writes.iter().any(|write| {
+                        write.root_name == root_name
+                            && write.lexical_resolution != JsTsRuntimeRootResolution::LexicallyBound
+                    }) {
+                        JsTsRuntimeMutationEvidence::KnownWriteAndUnknownEffects
+                    } else {
+                        JsTsRuntimeMutationEvidence::UnknownEffects
+                    }
+                } else if writes.iter().any(|write| {
                     write.root_name == root_name
                         && write.lexical_resolution != JsTsRuntimeRootResolution::LexicallyBound
                 }) {
-                    JsTsRuntimeMutationEvidence::KnownWriteAndUnknownEffects
+                    JsTsRuntimeMutationEvidence::KnownWrite
                 } else {
-                    JsTsRuntimeMutationEvidence::UnknownEffects
-                }
-            } else if writes.iter().any(|write| {
-                write.root_name == root_name
-                    && write.lexical_resolution != JsTsRuntimeRootResolution::LexicallyBound
-            }) {
-                JsTsRuntimeMutationEvidence::KnownWrite
-            } else {
-                JsTsRuntimeMutationEvidence::NoKnownWrite
-            };
-            let execution = match scope {
-                Some(function) => {
-                    JsTsRuntimeExecutionContext::DeferredFunction(node_source_range(function))
-                }
-                None => JsTsRuntimeExecutionContext::Program,
-            };
-            let candidate_anchor = runtime_keyed_access_seed(node, &bindings, source)
-                .expect("a normalized runtime read names its structural seed");
-            reads.push(JsTsRuntimeRead {
-                binding_name: slice(path_root, source).to_string(),
-                root_name,
-                container: runtime_container_name(container, source),
-                access: key.access.clone(),
-                range: read_range,
-                root_range: node_source_range(path_root),
-                container_range: node_source_range(container.node),
-                candidate_anchor: node_source_range(candidate_anchor),
-                key_range: key.key_range,
-                lexical_resolution,
-                mutation,
-                execution,
-                accessor,
-            });
+                    JsTsRuntimeMutationEvidence::NoKnownWrite
+                };
+                let execution = match scope {
+                    Some(function) => {
+                        JsTsRuntimeExecutionContext::DeferredFunction(node_source_range(function))
+                    }
+                    None => JsTsRuntimeExecutionContext::Program,
+                };
+                let candidate_anchor = runtime_keyed_access_seed(node, &bindings, source)
+                    .expect("a normalized runtime read names its structural seed");
+                reads.push(JsTsRuntimeRead {
+                    binding_name: slice(path_root, source).to_string(),
+                    root_name,
+                    container: runtime_container_name(container, source),
+                    access: key.access.clone(),
+                    range: read_range,
+                    root_range: node_source_range(path_root),
+                    container_range: node_source_range(container.node),
+                    candidate_anchor: node_source_range(candidate_anchor),
+                    key_range: key.key_range,
+                    lexical_resolution,
+                    mutation,
+                    execution,
+                    accessor,
+                });
+            }
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -2976,7 +2989,8 @@ pub fn extract_js_ts_runtime_reads(
             && effects_complete
             && accessors_complete
             && scopes_complete
-            && !budget.exhausted,
+            && !budget.exhausted
+            && !budget.facts_truncated,
     }
 }
 
@@ -3008,6 +3022,7 @@ fn runtime_effect_coverage_with_bindings(
             remaining: usize::MAX,
             exhausted: false,
             visited_nodes: 0,
+            facts_truncated: false,
         },
     )
     .0
@@ -3016,14 +3031,7 @@ fn runtime_effect_coverage_with_bindings(
 /// Function shapes that own a runtime execution context. Both scope
 /// assignment and scope walking share this predicate so they cannot drift.
 fn is_runtime_function_boundary(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_declaration"
-            | "function_expression"
-            | "generator_function"
-            | "arrow_function"
-            | "method_definition"
-    )
+    is_function_like(kind)
 }
 
 /// The innermost enclosing function of a syntax node, or `None` for a
@@ -3752,7 +3760,7 @@ pub fn js_ts_statement_module_source<'tree>(
     source: &str,
 ) -> Option<(Node<'tree>, String)> {
     let source_node = statement.child_by_field_name("source")?;
-    let specifier = unquote(slice(source_node, source));
+    let specifier = js_ts_string_literal_value(source_node, source)?;
     (!specifier.is_empty()).then_some((source_node, specifier))
 }
 
@@ -4404,7 +4412,6 @@ pub fn type_argument_module_value_import_syntaxes<'tree>(
         if raw.is_empty() {
             continue;
         }
-        let target = type_argument_call_target_node(value);
         let path = Some(StructuredImportPath {
             segments: vec![module_specifier.clone()],
             kind: None,
@@ -4429,7 +4436,6 @@ pub fn type_argument_module_value_import_syntaxes<'tree>(
                         binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(name)),
                     },
                     declaration,
-                    target,
                     name: None,
                     alias: Some(name),
                     kind: Some(ImportKind::Namespace),
@@ -4460,7 +4466,6 @@ pub fn type_argument_module_value_import_syntaxes<'tree>(
                             )),
                         },
                         declaration,
-                        target,
                         name: Some(entry.key),
                         alias,
                         kind: Some(ImportKind::Named),
@@ -4472,21 +4477,6 @@ pub fn type_argument_module_value_import_syntaxes<'tree>(
         }
     }
     syntaxes
-}
-
-fn type_argument_call_target_node(value: Node<'_>) -> Option<Node<'_>> {
-    let mut call = value;
-    while matches!(call.kind(), "await_expression" | "parenthesized_expression") {
-        call = call.named_child(0)?;
-    }
-    if call.kind() != "call_expression" {
-        return None;
-    }
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .find(|argument| matches!(argument.kind(), "string" | "string_fragment"))
 }
 
 pub fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
@@ -4801,19 +4791,6 @@ fn visit_import_statement(
     }
 }
 
-pub(crate) fn unquote(text: &str) -> String {
-    let trimmed = text.trim();
-    let stripped = trimmed
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-        });
-    stripped.unwrap_or(trimmed).to_string()
-}
-
 pub fn parse_js_ts_tree(file: &ProjectFile, source: &str, language: Language) -> Option<Tree> {
     let tree_sitter_language = crate::parse::js_ts_tree_sitter_language_for_file(file, language)?;
     crate::parse::parse_with_language(source, &tree_sitter_language).ok()?
@@ -4833,6 +4810,394 @@ mod tests {
         WalkControl, first_named_descendant_of_kind_inclusive, walk_named_tree_preorder,
     };
     use brokk_bifrost_test_macros::hardwon;
+
+    // The pinned grammars select every owner/token in these tables. Expected
+    // intervals and fields come from tree-sitter, not the lexical index.
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: duplicate imports selected arbitrary owners"
+    )]
+    fn duplicate_imports_have_no_single_compatibility_binding() {
+        for source in [
+            "import * as M from './a'; import * as M from './b'; M.value;",
+            "import * as M from './b'; import * as M from './a'; M.value;",
+        ] {
+            let tree = parse_typescript(source);
+            let imports = compute_import_binder(source, &tree);
+            assert!(imports.has_competing_static_imports("M"));
+            assert!(imports.binding("M").is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_alias_redeclarations_and_shadow_writes() {
+        for (source, alias, reassigned) in [
+            ("var p=process; var p={}; p.env.X;", None, false),
+            ("var p={}; var p=process; p.env.X;", Some("process"), false),
+            (
+                "var p=process; function f(p){p={};} p={}; p.env.X;",
+                None,
+                true,
+            ),
+            (
+                "var p=process; function f(p){p={};} p.env.X;",
+                Some("process"),
+                false,
+            ),
+        ] {
+            for tree in [parse_javascript(source), parse_typescript(source)] {
+                let root = tree.root_node();
+                let index = JsTsLexicalBindingIndex::build(root, source);
+                let access =
+                    first_named_descendant_of_kind_inclusive(root, "member_expression").unwrap();
+                assert_eq!(
+                    index.runtime_global_alias_at("p", access.start_byte()),
+                    alias,
+                    "{source}"
+                );
+                assert_eq!(
+                    index.is_program_binding_reassigned("p", root),
+                    reassigned,
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_owner_intervals_and_eof() {
+        for source in [
+            "var x=1;x",
+            "var x=1;x;",
+            "function f(x=0){ { let y=1; y; } return x; }",
+            "class C { static { var local=1; local; } }",
+            "const {x}=obj;x",
+        ] {
+            for tree in [parse_javascript(source), parse_typescript(source)] {
+                assert!(!tree.root_node().has_error());
+                let root = tree.root_node();
+                let index = JsTsLexicalBindingIndex::build(root, source);
+                let mut owners = 0;
+                walk_named_tree_preorder(root, true, |node| {
+                    if matches!(
+                        node.kind(),
+                        "program"
+                            | "statement_block"
+                            | "function_declaration"
+                            | "class_static_block"
+                    ) {
+                        owners += 1;
+                        let scope = node_scope(node);
+                        assert!(scope.contains(node.start_byte()));
+                        if node.start_byte() > 0 {
+                            assert!(!scope.contains(node.start_byte() - 1));
+                        }
+                        assert!(scope.contains(node.end_byte() - 1));
+                        assert!(!scope.contains(node.end_byte()));
+                    }
+                    if node.kind() == "identifier"
+                        && slice(node, source) == "x"
+                        && node
+                            .parent()
+                            .is_some_and(|p| p.kind() == "expression_statement")
+                    {
+                        assert_eq!(
+                            index.binding_scope_at("x", node.start_byte()),
+                            Some(node_scope(root))
+                        );
+                    }
+                    if node.kind() == "class_static_block" {
+                        assert!(js_ts_is_var_scope_kind(node.kind()));
+                    }
+                    if node.kind() == "class_declaration" {
+                        assert!(!js_ts_is_var_scope_kind(node.kind()));
+                    }
+                    WalkControl::Continue
+                });
+                assert!(owners > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_access_grammar_vocabulary() {
+        for (expression, expected) in [
+            ("process.env[key]", JsTsRuntimeAccessKey::Dynamic),
+            ("process.env[obj.key]", JsTsRuntimeAccessKey::Dynamic),
+            ("process.env[keys[0]]", JsTsRuntimeAccessKey::Dynamic),
+            ("process.env[next()]", JsTsRuntimeAccessKey::Dynamic),
+            ("process?.env.X", JsTsRuntimeAccessKey::Unsupported),
+            ("process.env?.X", JsTsRuntimeAccessKey::Unsupported),
+            (
+                "globalThis?.process.env.X",
+                JsTsRuntimeAccessKey::Unsupported,
+            ),
+            ("process.env.X", JsTsRuntimeAccessKey::Property("X".into())),
+        ] {
+            let source = format!("{expression};");
+            for tree in [parse_javascript(&source), parse_typescript(&source)] {
+                let facts = extract_js_ts_runtime_reads(tree.root_node(), &source, 64);
+                assert!(facts.complete, "{facts:#?}");
+                let read = facts
+                    .reads
+                    .iter()
+                    .find(|r| {
+                        slice(
+                            smallest_named_node_covering(
+                                tree.root_node(),
+                                r.range.start_byte,
+                                r.range.end_byte,
+                            )
+                            .unwrap(),
+                            &source,
+                        ) == expression
+                    })
+                    .expect("the selected expression publishes a read");
+                assert_eq!(read.access, expected, "{expression}: {facts:#?}");
+            }
+        }
+        // ECMA-262 array indices end at 2^32-2. Different radix spellings
+        // select the same mathematical integer, including the excluded bound.
+        for (literal, expected) in [
+            ("4294967294", Some(u32::MAX - 1)),
+            ("0xfffffffe", Some(u32::MAX - 1)),
+            ("0o37777777776", Some(u32::MAX - 1)),
+            ("4294967295", None),
+            ("0xffffffff", None),
+            ("0o37777777777", None),
+        ] {
+            let source = format!("process.argv[{literal}];");
+            for tree in [parse_javascript(&source), parse_typescript(&source)] {
+                let token =
+                    first_named_descendant_of_kind_inclusive(tree.root_node(), "number").unwrap();
+                assert_eq!(static_runtime_index(token, &source), expected, "{literal}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_execution_context_table() {
+        for (source, expected) in [
+            (
+                "async function f(){await 0;return process.env.X;}",
+                JsTsRuntimeMutationEvidence::UnknownEffects,
+            ),
+            (
+                "for(;;){process.env.X;external();}",
+                JsTsRuntimeMutationEvidence::UnknownEffects,
+            ),
+            (
+                "function f(){return process.env.X;}",
+                JsTsRuntimeMutationEvidence::NoKnownWrite,
+            ),
+        ] {
+            for tree in [parse_javascript(source), parse_typescript(source)] {
+                let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+                assert!(facts.complete);
+                assert_eq!(facts.reads.len(), 1, "{facts:#?}");
+                assert_eq!(facts.reads[0].mutation, expected, "{source}: {facts:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn typescript_wrapper_grammar_fields() {
+        for (expression, expected_type) in [
+            ("<Shape>value", "Shape"),
+            ("value as Shape", "Shape"),
+            ("value satisfies Shape", "Shape"),
+        ] {
+            let source = format!("const result={expression};");
+            let tree = parse_typescript(&source);
+            assert!(!tree.root_node().has_error());
+            let declarator =
+                first_named_descendant_of_kind_inclusive(tree.root_node(), "variable_declarator")
+                    .unwrap();
+            let wrapper = declarator.child_by_field_name("value").unwrap();
+            assert_eq!(
+                slice(ts_type_wrapper_operand(wrapper).unwrap(), &source),
+                "value"
+            );
+            assert_eq!(
+                slice(ts_type_wrapper_type(wrapper).unwrap(), &source),
+                expected_type
+            );
+        }
+        let source = "const result=<Shape>{key:1};";
+        let tree = parse_typescript(source);
+        let object = first_named_descendant_of_kind_inclusive(tree.root_node(), "object").unwrap();
+        let wrapper = object.parent().unwrap();
+        assert_eq!(wrapper.kind(), "type_assertion");
+        assert_eq!(js_ts_object_literal_value(wrapper), Some(object));
+    }
+
+    #[test]
+    fn pattern_and_member_grammar_fields() {
+        let source = "const {plain, rename:local=defaultValue, nested:{inner}}=obj; obj.member;";
+        for tree in [parse_javascript(source), parse_typescript(source)] {
+            let pattern =
+                first_named_descendant_of_kind_inclusive(tree.root_node(), "object_pattern")
+                    .unwrap();
+            let entries = object_pattern_entries(pattern);
+            let names: Vec<_> = entries
+                .iter()
+                .map(|e| (slice(e.key, source), e.binder.map(|b| slice(b, source))))
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    ("plain", Some("plain")),
+                    ("rename", Some("local")),
+                    ("nested", None)
+                ]
+            );
+            let member =
+                first_named_descendant_of_kind_inclusive(tree.root_node(), "member_expression")
+                    .unwrap();
+            assert!(is_property_key_in_member(
+                member.child_by_field_name("property").unwrap()
+            ));
+            assert!(is_object_in_member_expression(
+                member.child_by_field_name("object").unwrap()
+            ));
+            assert!(!is_property_key_in_member(
+                member.child_by_field_name("object").unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn module_member_census_budget() {
+        let source = format!(
+            "const cp=require('child_process'); {} cp.execSync('echo ok');",
+            (0..6000)
+                .map(|index| format!("const unrelated_{index}=0;"))
+                .collect::<String>()
+        );
+        for tree in [parse_javascript(&source), parse_typescript(&source)] {
+            let mut visited = 0;
+            walk_named_tree_preorder(tree.root_node(), true, |_| {
+                visited += 1;
+                WalkControl::Continue
+            });
+            assert!(visited > 20_000 && visited < 200_000, "{visited}");
+            assert!(module_member_is_mutation_free(
+                tree.root_node(),
+                &source,
+                "child_process",
+                "execSync"
+            ));
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: fact caps reported complete censuses"
+    )]
+    fn runtime_fact_capacity_reports_omissions() {
+        for (source, cap) in [
+            ("", 0),
+            ("let local=0; local=1;", 0),
+            ("process={}; let local=0; local=1;", 1),
+        ] {
+            for tree in [parse_javascript(source), parse_typescript(source)] {
+                let facts = extract_js_ts_runtime_reads(tree.root_node(), source, cap);
+                assert!(
+                    facts.complete,
+                    "unrelated syntax must not consume fact capacity: {facts:#?}"
+                );
+            }
+        }
+        for source in [
+            "process.env.A; process.env.B;",
+            "process.env.A=1; process.env.B=2; process.env.C=3;",
+            "globalThis.x.A=1; process.env.B;",
+            "process={}; globalThis={}; global={};",
+        ] {
+            for tree in [parse_javascript(source), parse_typescript(source)] {
+                let full = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+                assert!(full.complete, "{full:#?}");
+                let total = full.reads.len() + full.writes.len();
+                assert!(total >= 2);
+                for cap in 0..=total + 1 {
+                    let facts = extract_js_ts_runtime_reads(tree.root_node(), source, cap);
+                    assert!(facts.reads.len() + facts.writes.len() <= cap, "{facts:#?}");
+                    assert_eq!(
+                        facts.complete,
+                        cap >= total,
+                        "cap={cap} source={source} {facts:#?}"
+                    );
+                    assert!(facts.traversal_complete, "{facts:#?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: generator declarations leaked deferred hazards"
+    )]
+    fn runtime_generator_context_is_deferred() {
+        let source = "function* unused(){ external(); yield process.env.X; } process.env.Y;";
+        for tree in [parse_javascript(source), parse_typescript(source)] {
+            let facts = extract_js_ts_runtime_reads(tree.root_node(), source, 64);
+            assert!(facts.complete, "{facts:#?}");
+            let deferred = facts
+                .reads
+                .iter()
+                .find(|r| r.access == JsTsRuntimeAccessKey::Property("X".into()))
+                .unwrap();
+            assert!(
+                matches!(
+                    deferred.execution,
+                    JsTsRuntimeExecutionContext::DeferredFunction(_)
+                ),
+                "{facts:#?}"
+            );
+            let program = facts
+                .reads
+                .iter()
+                .find(|r| r.access == JsTsRuntimeAccessKey::Property("Y".into()))
+                .unwrap();
+            assert_eq!(
+                program.mutation,
+                JsTsRuntimeMutationEvidence::NoKnownWrite,
+                "{facts:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: module specifiers kept escaped spelling"
+    )]
+    fn module_specifier_string_values_agree_across_import_forms() {
+        for (literal, expected) in [
+            (r#""./m""#, "./m"),
+            (r#""./\u006d""#, "./m"),
+            (r#""./\x6d""#, "./m"),
+            (r#"'./\u{6d}'"#, "./m"),
+            (r#""./quo\"te""#, "./quo\"te"),
+            (r#"'./quo\'te'"#, "./quo'te"),
+            (r#""./back\\slash""#, "./back\\slash"),
+        ] {
+            let source = format!("import {{f}} from {literal}; const m=require({literal});");
+            for tree in [parse_javascript(&source), parse_typescript(&source)] {
+                let root = tree.root_node();
+                let import = root.named_child(0).unwrap();
+                assert_eq!(
+                    js_ts_statement_module_specifier(import, &source).as_deref(),
+                    Some(expected)
+                );
+                let require =
+                    first_named_descendant_of_kind_inclusive(root, "call_expression").unwrap();
+                assert_eq!(
+                    require_call_module_specifier(require, &source).as_deref(),
+                    Some(expected)
+                );
+            }
+        }
+    }
 
     #[test]
     #[hardwon("#5295: property identity used raw escaped strings instead of exact UTF-16 values")]
@@ -5322,7 +5687,7 @@ mapping;
         };
         assert_eq!(first.binding.module_specifier, "./first");
         assert_eq!(second.binding.module_specifier, "./second");
-        assert_eq!(imports.binding_records_for("mapping").len(), 2);
+        assert_eq!(imports.provenance_bindings["mapping"].len(), 2);
         assert!(first.provenance.order < second.provenance.order);
     }
 
@@ -5743,6 +6108,7 @@ relay();
             remaining: usize::MAX,
             exhausted: false,
             visited_nodes: 0,
+            facts_truncated: false,
         };
         let (bindings, complete) =
             JsTsLexicalBindingIndex::build_bounded(tree.root_node(), recovered, &mut budget);
@@ -5755,6 +6121,7 @@ relay();
             remaining: 1,
             exhausted: false,
             visited_nodes: 0,
+            facts_truncated: false,
         };
         let tree = parse_javascript("function f(X = 1) {}");
         let function = tree.root_node().named_child(0).unwrap();
@@ -6362,7 +6729,7 @@ relay();
         let use_byte = source.rfind("relay();").expect("relay use");
 
         assert_eq!(imports.bindings_for("relay").count(), 1);
-        assert_eq!(imports.binding_records_for("relay").len(), 2);
+        assert_eq!(imports.provenance_bindings["relay"].len(), 2);
         assert!(!imports.has_competing_static_imports("relay"));
         assert!(!imports.was_truncated("relay"));
         assert_eq!(
@@ -6387,7 +6754,7 @@ relay();
             MAX_STATIC_IMPORT_BINDINGS_PER_NAME
         );
         assert_eq!(
-            imports.binding_records_for("relay").len(),
+            imports.provenance_bindings["relay"].len(),
             MAX_IMPORT_BINDING_RECORDS_PER_NAME
         );
         assert!(!imports.was_truncated("relay"));
@@ -6412,7 +6779,7 @@ relay();
             MAX_STATIC_IMPORT_BINDINGS_PER_NAME
         );
         assert_eq!(
-            overflow_imports.binding_records_for("relay").len(),
+            overflow_imports.provenance_bindings["relay"].len(),
             MAX_IMPORT_BINDING_RECORDS_PER_NAME
         );
         assert!(overflow_imports.was_truncated("relay"));
@@ -6436,7 +6803,7 @@ relay();
 
         assert_eq!(imports.bindings_for("relay").count(), 1);
         assert_eq!(
-            imports.binding_records_for("relay").len(),
+            imports.provenance_bindings["relay"].len(),
             MAX_IMPORT_BINDING_RECORDS_PER_NAME
         );
         assert!(imports.was_truncated("relay"));

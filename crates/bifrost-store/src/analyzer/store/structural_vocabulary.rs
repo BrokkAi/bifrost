@@ -105,8 +105,11 @@ use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
 /// diverged as version 46 on the two branches.
 /// Version 49 stores Rust callee provenance, supplier, type shape and bounds
 /// and Rust call unsafe context as trailing structural node-array positions (#6217).
+/// Version 50 stores declaration modifier words and declaration type kinds as
+/// trailing structural node-array positions 24 and 25, and adds general
+/// expression/statement facts (#4365).
 #[doc(hidden)]
-pub const STRUCTURAL_FACTS_VERSION: i64 = 49;
+pub const STRUCTURAL_FACTS_VERSION: i64 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
@@ -130,6 +133,8 @@ pub struct PersistedStructuralNode {
     pub is_async: Option<bool>,
     /// Rust call-site unsafe context; absent on other kinds and languages.
     pub unsafe_context: Option<bool>,
+    pub declaration_attributes:
+        Option<brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes>,
     pub string_value: Option<String>,
     pub construct: Option<String>,
     pub span: PersistedSpan,

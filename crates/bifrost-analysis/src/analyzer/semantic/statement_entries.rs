@@ -6,6 +6,7 @@
 
 use crate::analyzer::languages::ProcedureSyntaxRoles;
 use crate::analyzer::languages::language_support_for_hook;
+use crate::analyzer::read_ledger::reason as derivation_reason;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, forward_reachability,
 };
@@ -46,9 +47,9 @@ impl ProcedureSyntax {
         let language = procedure.artifact().key().language().language();
         let roles = language_support_for_hook(language, "procedure_syntax_roles")
             .and_then(|support| support.procedure_syntax_roles())
-            .ok_or("unsupported_language")?;
+            .ok_or(derivation_reason::UNSUPPORTED_LANGUAGE)?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err("cancelled");
+            return Err(derivation_reason::CANCELLED);
         }
         let file = ProjectFile::new(
             workspace.analyzer().project().root().to_path_buf(),
@@ -65,11 +66,29 @@ impl ProcedureSyntax {
         let syntax = match syntax {
             Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax,
             Some(StructuralSyntaxLimitedOutcome::Exceeded { .. }) => {
-                return Err("source_budget_exhausted");
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=budget:source",
+                        file!(),
+                        line!()
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
+                return Err(derivation_reason::SOURCE_BUDGET_EXHAUSTED);
             }
-            Some(StructuralSyntaxLimitedOutcome::Cancelled) => return Err("cancelled"),
+            Some(StructuralSyntaxLimitedOutcome::Cancelled) => {
+                return Err(derivation_reason::CANCELLED);
+            }
             Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
-                return Err("prepared_syntax_unavailable");
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=provider:prepared_syntax",
+                        file!(),
+                        line!()
+                    )
+                });
+                workspace.analyzer().mark_execution_dependent();
+                return Err(derivation_reason::PREPARED_SYNTAX_UNAVAILABLE);
             }
         };
         let syntax = validate_prepared_syntax_source_for_procedure(
@@ -78,7 +97,7 @@ impl ProcedureSyntax {
             &file,
             syntax.into_inner(),
         )
-        .map_err(|_| "source_identity_mismatch")?;
+        .map_err(|_| derivation_reason::SOURCE_IDENTITY_MISMATCH)?;
         Ok(Self {
             file,
             syntax,
@@ -110,7 +129,7 @@ impl ProcedureSyntax {
                 .expect("validated procedure source exists")
         });
         if mapping.kind != SourceMappingKind::Exact {
-            return Err("procedure_mapping_inexact");
+            return Err(derivation_reason::PROCEDURE_MAPPING_INEXACT);
         }
         let span = mapping.locator.anchor().span();
         let mut node = self
@@ -118,7 +137,7 @@ impl ProcedureSyntax {
             .tree()
             .root_node()
             .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-            .ok_or("procedure_syntax_missing")?;
+            .ok_or(derivation_reason::PROCEDURE_SYNTAX_MISSING)?;
         let mut matching_roles = 0;
         let mut selected = None;
         loop {
@@ -136,9 +155,9 @@ impl ProcedureSyntax {
         }
         let node = selected
             .filter(|_| matching_roles == 1)
-            .ok_or("procedure_syntax_ambiguous")?;
+            .ok_or(derivation_reason::PROCEDURE_SYNTAX_AMBIGUOUS)?;
         if node.has_error() {
-            return Err("procedure_syntax_recovery");
+            return Err(derivation_reason::PROCEDURE_SYNTAX_RECOVERY);
         }
         Ok(node)
     }
@@ -175,7 +194,15 @@ pub(crate) fn build_statement_assessments(
         roles: grammar,
     } = &prepared;
     let Ok(index) = StatementEntryIndex::new(procedure, file, syntax) else {
-        return unavailable("source_identity_mismatch");
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=snapshot",
+                file!(),
+                line!()
+            )
+        });
+        workspace.analyzer().mark_execution_dependent();
+        return unavailable(derivation_reason::SOURCE_IDENTITY_MISMATCH);
     };
     let semantics = procedure.semantics();
     let procedure_node = match prepared.procedure_node(procedure) {
@@ -193,7 +220,7 @@ pub(crate) fn build_statement_assessments(
     let mut span_counts = HashMap::<SourceSpan, usize>::default();
     while let Some(node) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return unavailable("cancelled");
+            return unavailable(derivation_reason::CANCELLED);
         }
         if node.id() != procedure_node.id() && (grammar.nested_procedure)(node) {
             continue;
@@ -219,7 +246,7 @@ pub(crate) fn build_statement_assessments(
                         end_column,
                     },
                     kind,
-                    verdict: StatementVerdict::Open("syntax_recovery"),
+                    verdict: StatementVerdict::Open(derivation_reason::SYNTAX_RECOVERY),
                 },
             ));
         }
@@ -231,29 +258,29 @@ pub(crate) fn build_statement_assessments(
     let mut request = CfgAlgorithmRequest::new(&mut budget, cancellation.unwrap_or(&uncancelled));
     let reachable = forward_reachability(semantics, semantics.entry_point(), &mut request);
     let control_open = match &reachable {
-        Err(error) => Some(algorithm_open_reason(*error)),
+        Err(error) => Some(execution_open_reason(workspace.analyzer(), *error)),
         Ok(reachable) => match scan_control_evidence(semantics, reachable, &mut request) {
             Ok(reason) => reason,
-            Err(error) => Some(algorithm_open_reason(error)),
+            Err(error) => Some(execution_open_reason(workspace.analyzer(), error)),
         },
     };
     let mut rows = Vec::with_capacity(candidates.len());
     for (span, malformed, mut row) in candidates {
         if let Err(error) = request.visit_node::<ProgramPointId>() {
-            return unavailable(algorithm_open_reason(error));
+            return unavailable(execution_open_reason(workspace.analyzer(), error));
         }
         if !malformed {
             row.verdict = if span_counts[&span] != 1 {
-                StatementVerdict::Open("ambiguous_statement_span")
+                StatementVerdict::Open(derivation_reason::AMBIGUOUS_STATEMENT_SPAN)
             } else if let Some(reason) = control_open {
                 StatementVerdict::Open(reason)
             } else {
                 match index.at_span(span) {
                     Err(StatementEntryOpen::MissingProducerSite) => {
-                        StatementVerdict::Open("missing_statement_entry")
+                        StatementVerdict::Open(derivation_reason::MISSING_STATEMENT_ENTRY)
                     }
                     Err(StatementEntryOpen::SourceSnapshotMismatch) => {
-                        StatementVerdict::Open("source_identity_mismatch")
+                        StatementVerdict::Open(derivation_reason::SOURCE_IDENTITY_MISMATCH)
                     }
                     Ok(entries) => {
                         let reachable = reachable.as_ref().expect("complete control proof");
@@ -277,6 +304,23 @@ pub(crate) fn build_statement_assessments(
         complete: true,
         reason: None,
     }
+}
+
+/// Classify the typed refusal before its public row erases it to a label.
+fn execution_open_reason(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    error: crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError<ProgramPointId>,
+) -> &'static str {
+    let cause = crate::analyzer::read_ledger::DerivationExecutionCause::from_cfg_error(&error);
+    brokk_bifrost_core::profiling::note_with(|| {
+        format!(
+            "policy.units unbounded origin={}:{} cause=cfg:{cause:?} detail={error:?}",
+            file!(),
+            line!()
+        )
+    });
+    analyzer.mark_execution_dependent();
+    algorithm_open_reason(error)
 }
 
 #[cfg(test)]

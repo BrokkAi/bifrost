@@ -7,9 +7,6 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_terminal_callee, field_name_in_parent, first_named_child, terminal_callee_leaf,
     unquoted_string_content_span,
 };
-use brokk_bifrost_core::analyzer::structural::body_relations::{
-    BodyOwner, BodyState, body_relation_for_block,
-};
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallShapeCoverage, CallSiteContext, CallSiteFacts,
 };
@@ -38,7 +35,7 @@ use brokk_bifrost_core::analyzer::structural::routes::{
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, named_children_iter, node_range};
 use brokk_bifrost_core::analyzer::{Language, Range};
-use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -393,62 +390,6 @@ fn cpp_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn direct_code_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    named_children_iter(node).filter(|child| {
-        !child.is_extra() && !child.kind().starts_with("preproc_") && child.kind() != "comment"
-    })
-}
-
-fn direct_code_child_count(node: Node<'_>) -> usize {
-    direct_code_children(node).count()
-}
-
-fn loop_body_is_complex(loop_node: Node<'_>) -> bool {
-    loop_node
-        .child_by_field_name("body")
-        .is_some_and(|body| direct_code_child_count(body) > 6)
-}
-
-fn complex_statement_count(block: Node<'_>) -> usize {
-    direct_code_children(block)
-        .filter(|child| {
-            matches!(
-                child.kind(),
-                "for_statement"
-                    | "for_range_loop"
-                    | "while_statement"
-                    | "do_statement"
-                    | "switch_statement"
-            )
-        })
-        .filter(|child| child.kind() == "switch_statement" || loop_body_is_complex(*child))
-        .count()
-}
-
-fn operator_kind(node: Node<'_>) -> Option<&'static str> {
-    let operator = node.child_by_field_name("operator")?;
-    match operator.kind() {
-        "&&" => Some("&&"),
-        "||" => Some("||"),
-        _ => None,
-    }
-}
-
-fn logical_operator_count(expression: Node<'_>) -> usize {
-    let mut count = 0usize;
-    let mut stack = vec![expression];
-    while let Some(node) = stack.pop() {
-        if let Some(operator) = operator_kind(node) {
-            let parent_operator = node.parent().and_then(operator_kind);
-            if parent_operator != Some(operator) {
-                count = count.saturating_add(1);
-            }
-        }
-        stack.extend(named_children_iter(node).filter(|child| !child.is_extra()));
-    }
-    count
-}
-
 fn condition_expression(node: Node<'_>) -> Option<Node<'_>> {
     let condition = node.child_by_field_name("condition")?;
     if condition.kind() == "condition_clause" {
@@ -458,41 +399,6 @@ fn condition_expression(node: Node<'_>) -> Option<Node<'_>> {
     } else {
         Some(condition)
     }
-}
-
-fn switch_cases(body: Node<'_>) -> Vec<Node<'_>> {
-    let mut cases = Vec::new();
-    let mut stack = vec![body];
-    while let Some(node) = stack.pop() {
-        if node != body
-            && matches!(
-                node.kind(),
-                "switch_statement" | "function_definition" | "lambda_expression"
-            )
-        {
-            continue;
-        }
-        if node != body && node.kind() == "case_statement" {
-            cases.push(node);
-        }
-        stack.extend(named_children_iter(node).filter(|child| !child.is_extra()));
-    }
-    cases.sort_unstable_by_key(Node::start_byte);
-    cases
-}
-
-fn switch_case_is_long(switch: Node<'_>) -> bool {
-    let Some(body) = switch.child_by_field_name("body") else {
-        return false;
-    };
-    let cases = switch_cases(body);
-    cases.iter().enumerate().any(|(index, case)| {
-        let end_line = cases.get(index + 1).map_or_else(
-            || switch.end_position().row + 1,
-            |next| next.start_position().row + 1,
-        );
-        end_line.saturating_sub(case.start_position().row + 1) > 30
-    })
 }
 
 /// Declaration evidence retained only while classifying one switch.
@@ -907,54 +813,6 @@ fn cpp_switch_enum_type<'tree>(switch: Node<'tree>, source: &str) -> Option<Node
     (enum_type.kind() == "enum_specifier").then_some(enum_type)
 }
 
-fn switch_case_names(switch: Node<'_>, source: &str) -> HashSet<String> {
-    let Some(body) = switch.child_by_field_name("body") else {
-        return HashSet::default();
-    };
-    switch_cases(body)
-        .into_iter()
-        .filter_map(|case| case.child_by_field_name("value"))
-        .filter_map(|value| {
-            expression_name_node(value)
-                .and_then(|name| node_text(name, source))
-                .map(str::to_owned)
-        })
-        .collect()
-}
-
-fn switch_has_default(switch: Node<'_>) -> bool {
-    switch
-        .child_by_field_name("body")
-        .map(switch_cases)
-        .is_some_and(|cases| {
-            cases
-                .iter()
-                .any(|case| case.child_by_field_name("value").is_none())
-        })
-}
-
-fn enum_switch_is_missing_case(switch: Node<'_>, source: &str) -> bool {
-    if switch_has_default(switch) {
-        return false;
-    }
-    let Some(enum_type) = cpp_switch_enum_type(switch, source) else {
-        // Unknown operand types carry no enum-completeness evidence.
-        return false;
-    };
-    let Some(body) = enum_type.child_by_field_name("body") else {
-        return false;
-    };
-    let declared: HashSet<_> = named_children_iter(body)
-        .filter(|node| node.kind() == "enumerator")
-        .filter_map(|node| node.child_by_field_name("name"))
-        .filter_map(|name| node_text(name, source))
-        .collect();
-    let cases = switch_case_names(switch, source);
-    !cases.is_empty()
-        && cases.iter().all(|name| declared.contains(name.as_str()))
-        && declared.iter().any(|name| !cases.contains(*name))
-}
-
 fn declarator_identifier<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = node;
     loop {
@@ -995,309 +853,85 @@ fn loop_variable<'tree>(loop_node: Node<'tree>, source: &'tree str) -> Option<&'
     node_text(name, source)
 }
 
-fn numeric_literal_value(node: Node<'_>, source: &str) -> Option<i64> {
-    if node.kind() != "number_literal" {
-        return None;
-    }
-    node_text(node, source)?.parse().ok()
-}
-
-fn for_loop_has_small_literal_bound(loop_node: Node<'_>, source: &str) -> bool {
-    use brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression;
-
-    let Some(variable) = loop_variable(loop_node, source) else {
-        return false;
-    };
-    let Some(condition) = loop_node.child_by_field_name("condition") else {
-        return false;
-    };
-    let mut stack = vec![condition];
-    while let Some(node) = stack.pop() {
-        let node = unwrap_parenthesized_expression(node);
-        if node.kind() != "binary_expression" {
-            continue;
-        }
-        let Some(operator) = node.child_by_field_name("operator") else {
-            continue;
-        };
-        // A conjunct must hold on every iteration. A comparison nested in an
-        // OR, negation or another expression does not bound the loop.
-        if operator.kind() == "&&" {
-            stack.extend([
-                node.child_by_field_name("left").expect("binary left"),
-                node.child_by_field_name("right").expect("binary right"),
-            ]);
-            continue;
-        }
-        let operands = match operator.kind() {
-            "<" | "<=" => Some(("left", "right")),
-            ">" | ">=" => Some(("right", "left")),
+impl brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax
+    for CppStructuralSpec
+{
+    fn roles<'tree>(&self, node: Node<'tree>, role: Role) -> Vec<Node<'tree>> {
+        let target = match role {
+            Role::Test if node.kind() == "case_statement" => node.child_by_field_name("value"),
+            Role::Test => condition_expression(node),
+            Role::Consequence => node.child_by_field_name("consequence"),
+            Role::Alternative => {
+                brokk_bifrost_core::analyzer::structural::body_relations::if_alternative_body(
+                    node,
+                    brokk_bifrost_core::analyzer::structural::body_relations::syntax_for(
+                        Language::Cpp,
+                    )
+                    .expect("C++ body syntax"),
+                )
+            }
+            Role::Body => node.child_by_field_name("body"),
+            Role::Operator => node.child_by_field_name("operator"),
+            Role::Left => node.child_by_field_name("left"),
+            Role::Right => node.child_by_field_name("right"),
+            Role::Label => node.child_by_field_name("label"),
             _ => None,
         };
-        if let Some((value_field, bound_field)) = operands
-            && let Some(value) = node
-                .child_by_field_name(value_field)
-                .map(unwrap_parenthesized_expression)
-            && value.kind() == "identifier"
-            && node_text(value, source) == Some(variable)
-            && let Some(bound) = node
-                .child_by_field_name(bound_field)
-                .map(unwrap_parenthesized_expression)
-                .and_then(|value| numeric_literal_value(value, source))
-            && (0..=1).contains(&bound)
-        {
-            return true;
-        }
+        target.into_iter().collect()
     }
-    false
-}
 
-fn alloca_is_in_unbounded_loop(call: Node<'_>, source: &str) -> bool {
-    let Some(function) = call.child_by_field_name("function") else {
-        return false;
-    };
-    if !matches!(
-        node_text(function, source),
-        Some("alloca" | "__builtin_alloca" | "_alloca" | "_malloca")
-    ) {
-        return false;
+    fn is_code_child(&self, node: Node<'_>) -> bool {
+        !node.is_extra() && !node.kind().starts_with("preproc_") && node.kind() != "comment"
     }
-    let mut current = call.parent();
-    while let Some(parent) = current {
-        if matches!(parent.kind(), "for_statement" | "for_range_loop") {
-            if parent
-                .child_by_field_name("initializer")
-                .is_some_and(|initializer| {
-                    initializer.start_byte() <= call.start_byte()
-                        && call.end_byte() <= initializer.end_byte()
+
+    fn loop_variable(&self, node: Node<'_>, source: &str) -> Option<String> {
+        matches!(node.kind(), "for_statement" | "for_range_loop")
+            .then(|| loop_variable(node, source).map(str::to_owned))
+            .flatten()
+    }
+
+    fn is_counted_loop(&self, node: Node<'_>) -> bool {
+        node.kind() == "for_statement"
+    }
+
+    fn loop_initializers<'tree>(&self, node: Node<'tree>) -> Vec<Node<'tree>> {
+        node.child_by_field_name("initializer")
+            .into_iter()
+            .collect()
+    }
+
+    fn is_alloca(&self, node: Node<'_>, source: &str) -> bool {
+        node.kind() == "call_expression"
+            && node
+                .child_by_field_name("function")
+                .and_then(|function| node_text(function, source))
+                .is_some_and(|name| {
+                    matches!(name, "alloca" | "__builtin_alloca" | "_alloca" | "_malloca")
                 })
-            {
-                return false;
-            }
-            return !for_loop_has_small_literal_bound(parent, source);
-        }
-        if matches!(parent.kind(), "while_statement" | "do_statement") {
-            return true;
-        }
-        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
-            break;
-        }
-        current = parent.parent();
     }
-    false
-}
 
-fn goto_counts(function: Node<'_>, source: &str) -> (usize, usize) {
-    let mut labels = HashMap::<String, usize>::default();
-    let mut gotos = Vec::new();
-    let mut stack = vec![function];
-    while let Some(node) = stack.pop() {
-        if node != function && matches!(node.kind(), "function_definition" | "lambda_expression") {
-            continue;
-        }
-        match node.kind() {
-            "labeled_statement" => {
-                if let Some(label) = node.child_by_field_name("label")
-                    && let Some(text) = node_text(label, source)
-                {
-                    labels.insert(text.to_owned(), node.start_position().row);
-                }
-            }
-            "goto_statement" => {
-                if let Some(label) = node.child_by_field_name("label")
-                    && let Some(text) = node_text(label, source)
-                {
-                    gotos.push((text.to_owned(), node.start_position().row));
-                }
-            }
-            _ => {}
-        }
-        stack.extend(named_children_iter(node).filter(|child| !child.is_extra()));
+    fn switch_enum<'tree>(&self, node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+        cpp_switch_enum_type(node, source)
     }
-    gotos
-        .into_iter()
-        .fold((0, 0), |(forward, backward), (name, line)| {
-            match labels.get(&name).copied() {
-                Some(target) if line < target => (forward + 1, backward),
-                Some(target) if target < line => (forward, backward + 1),
-                _ => (forward, backward),
-            }
-        })
-}
 
-fn conditional_block_is_empty(block: Node<'_>) -> bool {
-    body_relation_for_block(block, Language::Cpp).is_some_and(|relation| {
-        relation.state == BodyState::Empty
-            && matches!(
-                relation.owner_kind,
-                BodyOwner::IfConsequence | BodyOwner::IfAlternative
-            )
-    })
-}
-
-/// Classify one C++ AST node for the statement-level CodeQL parity facts.
-///
-/// Every branch is anchored to a tree-sitter node and reads only structured
-/// fields or values selected from those nodes. The same classifier is used by
-/// structural construct labels and by the C++ statement relation producer.
-pub fn statement_fact_kind(node: Node<'_>, source: &str) -> Option<StatementFactKind> {
-    match node.kind() {
-        "call_expression" if alloca_is_in_unbounded_loop(node, source) => {
-            Some(StatementFactKind::AllocaInLoop)
+    fn enumeration(
+        &self,
+        node: Node<'_>,
+        source: &str,
+    ) -> Option<(
+        brokk_bifrost_core::analyzer::statement_facts::EnumFact,
+        Vec<brokk_bifrost_core::analyzer::statement_facts::EnumeratorFact>,
+    )> {
+        use brokk_bifrost_core::analyzer::statement_facts::{EnumFact, EnumeratorFact};
+        if node.kind() != "enum_specifier" {
+            return None;
         }
-        "compound_statement" => {
-            if complex_statement_count(node) > 3 {
-                Some(StatementFactKind::ComplexBlock)
-            } else if conditional_block_is_empty(node) {
-                Some(StatementFactKind::EmptyBlock)
-            } else {
-                None
-            }
-        }
-        "if_statement"
-            if condition_expression(node)
-                .is_some_and(|condition| logical_operator_count(condition) > 5) =>
-        {
-            Some(StatementFactKind::ComplexCondition)
-        }
-        "switch_statement" => {
-            if switch_case_is_long(node) {
-                Some(StatementFactKind::LongSwitch)
-            } else if enum_switch_is_missing_case(node, source) {
-                Some(StatementFactKind::MissingCaseInSwitch)
-            } else {
-                None
-            }
-        }
-        "function_definition" => {
-            let (forward, backward) = goto_counts(node, source);
-            (forward > 0 && backward > 0 && forward != 1 && backward != 1)
-                .then_some(StatementFactKind::UseOfGoto)
-        }
-        _ => None,
-    }
-}
-
-/// Capture the source-owned statement rows while the parsed tree is available.
-/// The rows retain only bounded, file-local facts; semantic CFG joins remain in
-/// the query layer and are never rebuilt here.
-pub(crate) fn capture_statement_fact_rows(
-    node: Node<'_>,
-    source: &str,
-    rows: &mut brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows,
-) {
-    use brokk_bifrost_core::analyzer::statement_facts::{
-        CppConditionFact, CppEnumFact, CppEnumeratorFact, CppGotoFact, CppLabelFact, CppLoopFact,
-        CppStatementFact, CppSwitchCaseFact, CppSwitchFact,
-    };
-
-    let range = node_range(node);
-    if let Some(kind) = statement_fact_kind(node, source) {
-        rows.statements.push(CppStatementFact { range, kind });
-    }
-    if node.kind() == "switch_statement" {
-        let long_case = switch_case_is_long(node);
-        let missing_case = enum_switch_is_missing_case(node, source);
-        if long_case
-            && !rows
-                .statements
-                .iter()
-                .any(|fact| fact.range == range && fact.kind == StatementFactKind::LongSwitch)
-        {
-            rows.statements.push(CppStatementFact {
-                range,
-                kind: StatementFactKind::LongSwitch,
-            });
-        }
-        if missing_case
-            && !rows.statements.iter().any(|fact| {
-                fact.range == range && fact.kind == StatementFactKind::MissingCaseInSwitch
-            })
-        {
-            rows.statements.push(CppStatementFact {
-                range,
-                kind: StatementFactKind::MissingCaseInSwitch,
-            });
-        }
-        let cases = node
-            .child_by_field_name("body")
-            .map(switch_cases)
-            .unwrap_or_default();
-        for case in &cases {
-            let value = case
-                .child_by_field_name("value")
-                .and_then(expression_name_node)
-                .and_then(|name| node_text(name, source))
-                .map(str::to_owned);
-            rows.switch_cases.push(CppSwitchCaseFact {
-                range: node_range(*case),
-                value,
-            });
-        }
-        rows.switches.push(CppSwitchFact {
-            range,
-            case_count: cases.len(),
-            default_present: switch_has_default(node),
-            long_case,
-            missing_enum_case: missing_case,
-        });
-    }
-    if node.kind() == "if_statement"
-        && let Some(condition) = condition_expression(node)
-    {
-        rows.conditions.push(CppConditionFact {
-            range: node_range(condition),
-            logical_operator_count: logical_operator_count(condition),
-        });
-    }
-    if matches!(
-        node.kind(),
-        "for_statement" | "for_range_loop" | "while_statement" | "do_statement"
-    ) {
-        let body_statement_count = node
-            .child_by_field_name("body")
-            .map(direct_code_child_count)
-            .unwrap_or_default();
-        let variable = if matches!(node.kind(), "for_statement" | "for_range_loop") {
-            loop_variable(node, source).map(str::to_owned)
-        } else {
-            None
-        };
-        rows.loops.push(CppLoopFact {
-            range,
-            variable,
-            body_statement_count,
-            tightly_bounded: node.kind() == "for_statement"
-                && for_loop_has_small_literal_bound(node, source),
-        });
-    }
-    if node.kind() == "labeled_statement"
-        && let Some(label) = node.child_by_field_name("label")
-        && let Some(name) = node_text(label, source)
-    {
-        rows.labels.push(CppLabelFact {
-            range,
-            name: name.to_owned(),
-        });
-    }
-    if node.kind() == "goto_statement"
-        && let Some(label) = node.child_by_field_name("label")
-        && let Some(name) = node_text(label, source)
-    {
-        let forward = goto_target_line(node, name, source)
-            .is_some_and(|target| node.start_position().row < target);
-        rows.gotos.push(CppGotoFact {
-            range,
-            target: name.to_owned(),
-            forward,
-        });
-    }
-    if node.kind() == "enum_specifier" {
+        let range = node_range(node);
         let name = node
             .child_by_field_name("name")
             .and_then(|name| node_text(name, source))
             .map(str::to_owned);
-        rows.enums.push(CppEnumFact { range, name });
+        let mut enumerators = Vec::new();
         let mut stack = vec![node];
         while let Some(current) = stack.pop() {
             if current != node && current.kind() == "enum_specifier" {
@@ -1305,42 +939,59 @@ pub(crate) fn capture_statement_fact_rows(
             }
             if current.kind() == "enumerator"
                 && let Some(name) = current.child_by_field_name("name")
-                && let Some(text) = node_text(name, source)
+                && let Some(name) = node_text(name, source)
             {
-                rows.enumerators.push(CppEnumeratorFact {
+                enumerators.push(EnumeratorFact {
                     range: node_range(current),
                     enum_range: range,
-                    name: text.to_owned(),
+                    name: name.to_owned(),
                 });
             }
             stack.extend(named_children_iter(current).filter(|child| !child.is_extra()));
         }
+        Some((EnumFact { range, name }, enumerators))
+    }
+
+    fn name<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        expression_name_node(node)
     }
 }
 
-fn goto_target_line(goto: Node<'_>, target: &str, source: &str) -> Option<usize> {
-    let mut function = goto;
-    while let Some(parent) = function.parent() {
-        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
-            function = parent;
-            break;
-        }
-        function = parent;
-    }
-    let mut stack = vec![function];
-    while let Some(node) = stack.pop() {
-        if node != function && matches!(node.kind(), "function_definition" | "lambda_expression") {
-            continue;
-        }
-        if node.kind() == "labeled_statement"
-            && let Some(label) = node.child_by_field_name("label")
-            && node_text(label, source) == Some(target)
-        {
-            return Some(node.start_position().row);
-        }
-        stack.extend(named_children_iter(node).filter(|child| !child.is_extra()));
-    }
-    None
+/// The persisted C++ generator label and the query-time rows share one classifier.
+pub fn statement_fact_kind(node: Node<'_>, source: &str) -> Option<StatementFactKind> {
+    brokk_bifrost_core::analyzer::statement_facts::producer::StatementFacts::new(
+        &CPP_STRUCTURAL_SPEC,
+    )
+    .expect("C++ statement syntax")
+    .classify(node, source, &Default::default())
+}
+
+pub(crate) fn capture_statement_fact_rows(
+    node: Node<'_>,
+    source: &str,
+    rows: &mut brokk_bifrost_core::analyzer::statement_facts::StatementFactRows,
+) {
+    brokk_bifrost_core::analyzer::statement_facts::producer::StatementFacts::new(
+        &CPP_STRUCTURAL_SPEC,
+    )
+    .expect("C++ statement syntax")
+    .capture(node, source, &Default::default(), rows);
+}
+
+#[cfg(test)]
+fn alloca_is_in_unbounded_loop(node: Node<'_>, source: &str) -> bool {
+    statement_fact_kind(node, source) == Some(StatementFactKind::AllocaInLoop)
+}
+
+#[cfg(test)]
+fn enum_switch_is_missing_case(node: Node<'_>, source: &str) -> bool {
+    let producer = brokk_bifrost_core::analyzer::statement_facts::producer::StatementFacts::new(
+        &CPP_STRUCTURAL_SPEC,
+    )
+    .unwrap();
+    let mut rows = brokk_bifrost_core::analyzer::statement_facts::StatementFactRows::default();
+    producer.capture(node, source, &Default::default(), &mut rows);
+    rows.switches.iter().any(|fact| fact.missing_enum_case)
 }
 
 /// Whether tree-sitter recovered `.field = value` as a declaration child pair:
@@ -1838,6 +1489,13 @@ impl StructuralSpec for CppStructuralSpec {
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         CPP_KIND_TABLE
+    }
+
+    fn statement_fact_syntax(
+        &self,
+    ) -> Option<&dyn brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax>
+    {
+        Some(self)
     }
 
     fn generator_construct(

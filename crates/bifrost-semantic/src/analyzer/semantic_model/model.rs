@@ -28,8 +28,9 @@ use serde::{Deserialize, Serialize};
 /// carries ordered exhaustive Python runtime direct-base claims. Version eighteen
 /// carries Rust generic defaults, implemented traits and receiver forms. Version
 /// nineteen carries implementation inventories, conditions and extraction authority.
+/// Version twenty carries assembly identities and type-forwarding records.
 pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 19;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 20;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -40,7 +41,7 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 19;
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
 pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 ];
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
@@ -50,6 +51,10 @@ pub const CALLABLE_VALUES_MIN_SCHEMA_VERSION: u32 = 10;
 pub const PROCEDURE_FORMALS_MIN_SCHEMA_VERSION: u32 = 11;
 /// Directional rest-formal kinds first appeared in schema fourteen.
 pub const PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION: u32 = 14;
+/// Assembly definition identity first appeared in schema twenty.
+pub const ASSEMBLY_IDENTITY_MIN_SCHEMA_VERSION: u32 = 20;
+/// Type forwarding records first appeared in schema twenty.
+pub const TYPE_FORWARDS_MIN_SCHEMA_VERSION: u32 = 20;
 /// Typed module values and callable parameter roles first appeared in schema fifteen.
 pub const TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION: u32 = 15;
 /// Explicit exact runtime return-class sets first appeared in schema sixteen.
@@ -1706,10 +1711,49 @@ pub struct AuthoredShard {
     pub callable_values: Option<CallableValuesPayload>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssemblyReference {
+    pub name: String,
+    pub version: String,
+    pub culture: Option<String>,
+    pub public_key_token: Option<String>,
+}
+
+impl AssemblyReference {
+    /// CLI versions have exactly four unsigned 16-bit components. Share this
+    /// value interpretation between admission and query-time unification.
+    pub fn version_components(&self) -> Option<[u16; 4]> {
+        let mut parts = self.version.split('.');
+        let version = [
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        ];
+        parts.next().is_none().then_some(version)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypeForwardFact {
+    pub name: String,
+    /// The root ExportedType's TypeNamespace; empty means global namespace.
+    /// Nested exports inherit this value from their outer chain.
+    pub namespace: String,
+    pub outer: Option<String>,
+    pub target: AssemblyReference,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthoredPayload {
     DeclarationFacts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assembly_identity: Option<AssemblyReference>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_forwards: Vec<TypeForwardFact>,
         #[serde(default)]
         types: Vec<TypeFact>,
         #[serde(default)]
@@ -2278,15 +2322,17 @@ pub struct AuthoredSummaryTransfer {
     pub input: AuthoredSummaryInput,
     pub exit_kind: AuthoredSummaryExitKind,
     pub output: AuthoredSummaryOutput,
-    /// Optional identity-separating value-transfer semantics for this core
-    /// transfer. The endpoints remain the core transfer's ports; this field
-    /// only classifies the value/identity relationship and selected
-    /// operation. Omission means this profile was not reviewed.
+    /// Optional value/identity relationship and selected operation for this
+    /// transfer's ports. Omission is unreviewed and supplies taint dependency
+    /// only, without object identity. On a receiver-to-normal-return transfer,
+    /// Conversion with Identity means the result denotes the receiver object.
+    /// Summary transfers are never lowered to IR Transfer edges; the IR rule
+    /// that separates storage identity does not apply here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_transfer: Option<SummaryValueTransfer>,
 }
 
-/// Typed identity-separating semantics attached to one procedure-summary
+/// Typed value/identity semantics attached to one procedure-summary
 /// transfer. This is intentionally separate from the core transfer endpoints
 /// so a consumer can distinguish value-flow coverage from profile coverage.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -2325,6 +2371,9 @@ pub enum SummaryMoveInvalidation {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SummaryValuePreservation {
+    /// On a receiver-to-normal-return summary transfer, the result denotes
+    /// the receiver object. Summary transfers are never lowered to IR Transfer
+    /// edges, whose storage-separating rule does not apply here.
     Identity,
     Preserving,
     Changing,
@@ -3505,6 +3554,9 @@ pub struct Signature {
     pub type_parameters: Vec<String>,
     #[serde(default)]
     pub parameters: Vec<Parameter>,
+    /// None means the callable declares no results. A producer that cannot
+    /// decode a declared result writes TypeRef::Unknown; it never omits
+    /// `returns`. Several producers do not conform yet (#7570).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<TypeRef>,
 }
@@ -3684,6 +3736,9 @@ impl TypeRef {
     /// Whether any part of this type lacks type knowledge. Representational
     /// equality remains useful for transport; it cannot prove type equality
     /// when this returns true.
+    /// Wildcard(Any, None) means any type, which is known; Unknown means the type
+    /// could not be determined. A nested wildcard argument is a legitimate
+    /// hierarchy target; a bare root wildcard says nothing about the target.
     pub fn contains_unknown(&self) -> bool {
         let mut pending = vec![self];
         while let Some(reference) = pending.pop() {
@@ -4128,7 +4183,9 @@ impl AuthoredPayload {
                 types,
                 members,
                 relations,
-            } => types.len() + members.len() + relations.len(),
+                type_forwards,
+                ..
+            } => types.len() + members.len() + relations.len() + type_forwards.len(),
             Self::GeneratorRules { rules } => rules.len(),
             Self::ProcedureSummaries { summaries } => summaries.len(),
         }

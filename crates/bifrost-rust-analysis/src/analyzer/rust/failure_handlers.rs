@@ -6,7 +6,9 @@ use brokk_bifrost_analysis::analyzer::structural::failure_handlers::HandlerBodyS
 
 use brokk_bifrost_analysis::analyzer::structural::failure_handlers::HandlerBodyState;
 
-use brokk_bifrost_analysis::analyzer::structural::failure_handlers::NativeFailureBranch;
+use brokk_bifrost_analysis::analyzer::structural::failure_handlers::{
+    HandlerIdentityProof, NativeFailureBranch,
+};
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 
@@ -20,7 +22,9 @@ use tree_sitter::Node;
 
 use crate::analyzer::rust::std_types::RustResultVariant;
 
-use crate::analyzer::rust::std_types::rust_standard_result_variant;
+use crate::analyzer::rust::std_types::{
+    RustProofAttempt, completed_proof, rust_standard_result_variant,
+};
 
 /// Find Rust's native failure branches inside one callable.
 ///
@@ -86,9 +90,10 @@ fn match_arm_branch(
     if has_macro_ancestor(arm) {
         return None;
     }
-    let shape = match_arm_shape(workspace, file, syntax, arm)?;
+    let (identity, shape) = match_arm_shape(workspace, file, syntax, arm)?;
     Some(NativeFailureBranch {
         handler: node_range(arm),
+        identity,
         shape,
     })
 }
@@ -105,12 +110,13 @@ fn let_condition_branch(
     condition
         .parent()
         .filter(|parent| parent.kind() == "if_expression")?;
-    let shape = let_condition_shape(workspace, file, syntax, condition)?;
+    let (identity, shape) = let_condition_shape(workspace, file, syntax, condition)?;
     Some(NativeFailureBranch {
         // Keep the selector as the stable handler anchor, matching the
         // source-level node that identifies this native failure branch. The
         // shape carries the selected consequence or alternative body.
         handler: node_range(condition),
+        identity,
         shape,
     })
 }
@@ -120,32 +126,22 @@ fn match_arm_shape(
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
     arm: Node<'_>,
-) -> Option<HandlerBodyShape> {
+) -> Option<(HandlerIdentityProof, HandlerBodyShape)> {
     let pattern = arm.child_by_field_name("pattern")?;
     let constructor = result_constructor(pattern)?;
-    let name = constructor_name(syntax, constructor)?;
-    if name != "Err" {
+    if constructor_name(syntax, constructor)? != "Err" {
         return None;
     }
-    if rust_standard_result_variant(
-        workspace.analyzer(),
-        file,
-        syntax.source(),
-        constructor.byte_range(),
-    ) != Some(RustResultVariant::Err)
-    {
-        return Some(open_shape(
+    let identity = result_identity(workspace, file, syntax, constructor, RustResultVariant::Err);
+    let shape = if has_syntax_recovery(arm) {
+        open_shape(
             HandlerBodyGap::SyntaxRecovery,
             arm.child_by_field_name("value").map(node_range),
-        ));
-    }
-    if has_syntax_recovery(arm) {
-        return Some(open_shape(
-            HandlerBodyGap::SyntaxRecovery,
-            arm.child_by_field_name("value").map(node_range),
-        ));
-    }
-    Some(classify_body(arm.child_by_field_name("value")))
+        )
+    } else {
+        classify_body(arm.child_by_field_name("value"))
+    };
+    Some((identity, shape))
 }
 
 fn let_condition_shape(
@@ -153,53 +149,55 @@ fn let_condition_shape(
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
     condition: Node<'_>,
-) -> Option<HandlerBodyShape> {
+) -> Option<(HandlerIdentityProof, HandlerBodyShape)> {
     let pattern = condition.child_by_field_name("pattern")?;
     let constructor = result_constructor(pattern)?;
-    let name = constructor_name(syntax, constructor)?;
     let owner = condition
         .parent()
         .filter(|parent| parent.kind() == "if_expression")?;
-    let body = match name {
-        "Err" => {
-            if rust_standard_result_variant(
-                workspace.analyzer(),
-                file,
-                syntax.source(),
-                constructor.byte_range(),
-            ) != Some(RustResultVariant::Err)
-            {
-                return Some(open_shape(
-                    HandlerBodyGap::SyntaxRecovery,
-                    owner.child_by_field_name("consequence").map(node_range),
-                ));
-            }
-            owner.child_by_field_name("consequence")?
-        }
-        "Ok" => {
-            if rust_standard_result_variant(
-                workspace.analyzer(),
-                file,
-                syntax.source(),
-                constructor.byte_range(),
-            ) != Some(RustResultVariant::Ok)
-            {
-                return Some(open_shape(
-                    HandlerBodyGap::SyntaxRecovery,
-                    alternative_body(owner).map(node_range),
-                ));
-            }
-            alternative_body(owner)?
-        }
+    let (variant, body) = match constructor_name(syntax, constructor)? {
+        "Err" => (
+            RustResultVariant::Err,
+            owner.child_by_field_name("consequence"),
+        ),
+        "Ok" => (RustResultVariant::Ok, alternative_body(owner)),
         _ => return None,
     };
-    if has_syntax_recovery(condition) {
-        return Some(open_shape(
-            HandlerBodyGap::SyntaxRecovery,
-            Some(node_range(body)),
-        ));
+    let identity = result_identity(workspace, file, syntax, constructor, variant);
+    if identity == HandlerIdentityProof::Exact && body.is_none() {
+        return None;
     }
-    Some(classify_body(Some(body)))
+    let shape = if has_syntax_recovery(condition) {
+        open_shape(HandlerBodyGap::SyntaxRecovery, body.map(node_range))
+    } else {
+        classify_body(body)
+    };
+    Some((identity, shape))
+}
+
+fn result_identity(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    syntax: &PreparedSyntaxTree,
+    constructor: Node<'_>,
+    variant: RustResultVariant,
+) -> HandlerIdentityProof {
+    let proof = completed_proof(None, || {
+        rust_standard_result_variant(
+            workspace.analyzer(),
+            file,
+            syntax.source(),
+            constructor.byte_range(),
+        )
+    });
+    if matches!(&proof, RustProofAttempt::Incomplete { .. }) {
+        workspace.analyzer().mark_execution_dependent();
+    }
+    if proof.into_value() == Some(variant) {
+        HandlerIdentityProof::Exact
+    } else {
+        HandlerIdentityProof::Open
+    }
 }
 
 fn is_nested_callable(node: Node<'_>) -> bool {

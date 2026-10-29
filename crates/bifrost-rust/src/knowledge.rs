@@ -9,6 +9,14 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct RustKnowledge;
 
 impl LanguageKnowledge for RustKnowledge {
+    fn models_compose_from_catalog_rows(&self) -> bool {
+        true
+    }
+
+    fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
+        false
+    }
+
     fn unbound_call_passes_receiver_as_argument(&self) -> bool {
         true
     }

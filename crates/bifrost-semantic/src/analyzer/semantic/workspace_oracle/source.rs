@@ -715,8 +715,12 @@ fn source_value_candidates(
         let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
             continue;
         };
+        let implicit_preparations = procedure.implicit_receiver_preparation_values();
         let mut candidates_by_width = HashMap::<usize, Vec<SourceValueCandidate>>::default();
         for value in procedure.values() {
+            if implicit_preparations.contains(&value.id) {
+                continue;
+            }
             if cancellation.is_cancelled() {
                 return Err(Interruption::Cancelled);
             }

@@ -1,0 +1,8 @@
+<Project>
+  <ItemGroup>
+    <Using Include="Shared.Configuration" />
+    <Using Include="Shared.RemoveByTargets" />
+    <Using Remove="System.Net.Http" />
+    <InternalsVisibleTo Include="RemoveMe" />
+  </ItemGroup>
+</Project>

@@ -493,6 +493,7 @@ where
             .len()
             .div_ceil(MAX_PARALLEL_ITEM_EVALUATIONS)
             .max(1);
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let passes = active_groups
             .par_chunks(chunk_len)
             .flat_map_iter(|groups| {
@@ -511,7 +512,7 @@ where
                             )
                         })
                         .collect();
-                    let values = evaluate(&inputs);
+                    let values = context.run(|| evaluate(&inputs));
                     assert_eq!(
                         values.len(),
                         indices.len(),
@@ -864,6 +865,53 @@ mod tests {
             outcome,
             RelationalItemFrontierOutcome::Failed(error) if error.message() == "injected"
         ));
+    }
+
+    #[test]
+    fn retry_after_failed_batch_matches_a_fresh_frontier() {
+        use crate::analyzer::RelationalBatchError;
+
+        let question = package_question("retry");
+        let frontier = Arc::new(RecordingRelationalFrontier::default());
+        let cancellation = CancellationToken::new();
+        let failed = resolve_relational_frontier_on(
+            &frontier,
+            &cancellation,
+            |_| RelationalBatchOutcome::Failed(RelationalBatchError::new("injected")),
+            |answers| exists(answers.as_ref(), &question),
+        );
+        assert!(
+            matches!(failed, RelationalFrontierOutcome::Failed(error) if error.message() == "injected")
+        );
+        let batches = Cell::new(0);
+        let execute = |requests: &[RelationalDefinitionRequest]| {
+            batches.set(batches.get() + 1);
+            RelationalBatchOutcome::Complete(
+                requests
+                    .iter()
+                    .map(|request| RelationalDefinitionResult {
+                        ordinal: request.ordinal,
+                        value: RelationalDefinitionValue::PackageRelation(
+                            PackageRelationValue::Exists(true),
+                        ),
+                    })
+                    .collect(),
+            )
+        };
+        let retried =
+            resolve_relational_frontier_on(&frontier, &cancellation, execute, |answers| {
+                exists(answers.as_ref(), &question)
+            });
+        assert_eq!(batches.get(), 1, "retry must execute a new batch");
+        let fresh = resolve_relational_frontier_on(
+            &Arc::new(RecordingRelationalFrontier::default()),
+            &cancellation,
+            execute,
+            |answers| exists(answers.as_ref(), &question),
+        );
+        assert_eq!(fresh, RelationalFrontierOutcome::Complete(true));
+        assert_eq!(retried, fresh);
+        assert_eq!(batches.get(), 2);
     }
 
     #[test]

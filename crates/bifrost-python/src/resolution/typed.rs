@@ -81,6 +81,49 @@ impl Typed<'_, '_, '_> {
         }
     }
 
+    // Module imports and local values share Python's Value bindings. The
+    // selected temporal binding decides whether an attribute prefix is a module,
+    // including attributes used as types rather than runtime values.
+    fn attribute_root(
+        &mut self,
+        mut object: Node<'_>,
+        object_slot: ResolutionTypeSlotId,
+        reference: ResolutionSiteId,
+    ) {
+        while object.kind() == "type" && object.named_child_count() == 1 {
+            object = object.named_child(0).unwrap();
+        }
+        if object.kind() == "identifier" {
+            let prefix_reference = self.p.facts.type_slots[object_slot.index()].site;
+            let name = self
+                .p
+                .facts
+                .identifiers
+                .iter()
+                .find(|identifier| identifier.site == prefix_reference)
+                .expect("a spelled operand has a reference identifier")
+                .name;
+            self.p
+                .facts
+                .root_references
+                .push(ResolutionRootReferenceFact {
+                    reference,
+                    root_scope: ResolutionScopeId::new(0),
+                    anchor: ResolutionRootImportAnchor::Lexical,
+                    prefix_reference: Some(prefix_reference),
+                    owner_continued: false,
+                });
+            self.p
+                .facts
+                .root_reference_segments
+                .push(ResolutionRootReferenceSegmentFact {
+                    reference,
+                    position: 0,
+                    name,
+                });
+        }
+    }
+
     /// Expression dependencies are evaluated iteratively, including call chains.
     fn expression(&mut self, root: Node<'_>) -> ResolutionTypeSlotId {
         let mut pending = vec![(root, false)];
@@ -159,38 +202,7 @@ impl Typed<'_, '_, '_> {
                             .find(|id| id.site == site)
                             .unwrap()
                             .qualifier = Some(receiver);
-                        // Module imports and local values share Python's Value
-                        // namespace. The selected temporal binding, not syntax,
-                        // decides whether this prefix can continue as a module.
-                        if object.kind() == "identifier" {
-                            let prefix_reference =
-                                self.p.facts.type_slots[object_slot.index()].site;
-                            let name = self
-                                .p
-                                .facts
-                                .identifiers
-                                .iter()
-                                .find(|identifier| identifier.site == prefix_reference)
-                                .expect("a spelled operand has a reference identifier")
-                                .name;
-                            self.p
-                                .facts
-                                .root_references
-                                .push(ResolutionRootReferenceFact {
-                                    reference: site,
-                                    root_scope: ResolutionScopeId::new(0),
-                                    anchor: ResolutionRootImportAnchor::Lexical,
-                                    prefix_reference: Some(prefix_reference),
-                                    owner_continued: false,
-                                });
-                            self.p.facts.root_reference_segments.push(
-                                ResolutionRootReferenceSegmentFact {
-                                    reference: site,
-                                    position: 0,
-                                    name,
-                                },
-                            );
-                        }
+                        self.attribute_root(object, object_slot, site);
                         let slot = self
                             .p
                             .facts
@@ -397,7 +409,14 @@ impl Typed<'_, '_, '_> {
             if !ready {
                 pending.push((node, true));
                 if node.kind() != "string" {
+                    // The owner of a qualified type is an ordinary Python
+                    // expression. Only its terminal is a type reference.
                     for child in named_children_iter(node)
+                        .filter(|child| match node.kind() {
+                            "attribute" => node.child_by_field_name("attribute") == Some(*child),
+                            "member_type" => child.kind() == "identifier",
+                            _ => true,
+                        })
                         .collect::<Vec<_>>()
                         .into_iter()
                         .rev()
@@ -443,7 +462,7 @@ impl Typed<'_, '_, '_> {
                         ResolutionSiteKind::MemberReference,
                         ResolutionNamespace::Type,
                     );
-                    let qualifier = slots[&object.id()];
+                    let qualifier = self.expression(object);
                     self.p
                         .facts
                         .identifiers
@@ -451,12 +470,13 @@ impl Typed<'_, '_, '_> {
                         .find(|id| id.site == site)
                         .unwrap()
                         .qualifier = Some(qualifier);
+                    self.attribute_root(object, qualifier, site);
                     // The terminal identifier already owns this type projection.
                     slots[&attribute.id()]
                 }
                 "member_type" => {
                     let children = named_children_iter(node).collect::<Vec<_>>();
-                    let object = children
+                    let mut object = children
                         .iter()
                         .find(|child| child.kind() == "type")
                         .copied()
@@ -471,13 +491,18 @@ impl Typed<'_, '_, '_> {
                         ResolutionSiteKind::MemberReference,
                         ResolutionNamespace::Type,
                     );
+                    while object.kind() == "type" && object.named_child_count() == 1 {
+                        object = object.named_child(0).unwrap();
+                    }
+                    let qualifier = self.expression(object);
                     self.p
                         .facts
                         .identifiers
                         .iter_mut()
                         .find(|id| id.site == site)
                         .unwrap()
-                        .qualifier = Some(slots[&object.id()]);
+                        .qualifier = Some(qualifier);
+                    self.attribute_root(object, qualifier, site);
                     slots[&attribute.id()]
                 }
                 "type" if node.named_child_count() == 1 => {
@@ -613,6 +638,12 @@ pub(super) fn produce(
             site
         };
         declarations.insert(node.id(), authored);
+        // Decorators are siblings of the declaration inside this wrapper.
+        // Authored containment assigns their references to the decorated
+        // declaration, independently of their header evaluation scope.
+        if let Some(parent) = node.parent().filter(|p| p.kind() == "decorated_definition") {
+            declarations.insert(parent.id(), authored);
+        }
         let value =
             t.p.facts
                 .allocate_type_slot(authored, ResolutionTypeSlotRole::ExpressionValue);
@@ -1466,23 +1497,180 @@ pub(super) fn produce(
                 first_parameter,
             });
     }
-    // Annotation identifiers now have structured type references. Retire only
-    // scope gaps whose exact source range has such a reference; quoted/PEP695
-    // and implicit class-cell gaps remain intact.
-    let structured =
+    // A receiver identity is stronger than a receiver type. Only a direct,
+    // undecorated method's unchanged first positional parameter proves it.
+    // Count the whole cell inventory before visiting members: even a later write
+    // or a nested nonlocal write withdraws identity from every observation.
+    let mut writers = HashMap::<ResolutionSiteId, Vec<&ResolutionBindingEventFact>>::default();
+    for event in &t.p.facts.binding_events {
+        if event.kind != ResolutionBindingEventKind::Annotation {
+            writers.entry(event.slot).or_default().push(event);
+        }
+    }
+    let mut receivers = HashMap::default();
+    for function in nodes
+        .iter()
+        .copied()
+        .filter(|node| node.kind() == "function_definition")
+    {
+        let Some(class) = function
+            .parent()
+            .filter(|body| body.kind() == "block")
+            .and_then(|body| {
+                body.parent().filter(|class| {
+                    class.kind() == "class_definition"
+                        && class.child_by_field_name("body") == Some(body)
+                })
+            })
+        else {
+            continue;
+        };
+        let method_name = function.child_by_field_name("name").expect("method name");
+        // Python gives these undecorated definitions class/static binding.
+        if matches!(
+            &t.p.source[method_name.byte_range()],
+            "__new__" | "__init_subclass__" | "__class_getitem__"
+        ) {
+            continue;
+        }
+        let callable = declarations[&function.id()];
+        let Some(definition) = t.p.facts.binding_events.iter().find(|event| {
+            event.kind == ResolutionBindingEventKind::Function
+                && event.authored_declaration == Some(callable)
+        }) else {
+            continue;
+        };
+        // A class-body replacement such as helper = staticmethod(helper)
+        // changes how the first argument is supplied, even inside the def.
+        if t.p.facts.sites[definition.slot.index()].scope != scope_nodes[&class.id()]
+            || writers[&definition.slot].len() != 1
+        {
+            continue;
+        }
+        let Some(parameter) = t.p.facts.python_parameters.iter().find(|row| {
+            row.callable == callable
+                && row.ordinal == 0
+                && matches!(
+                    row.kind,
+                    PythonNativeParameterKind::PositionalOnly
+                        | PythonNativeParameterKind::PositionalOrKeyword
+                )
+        }) else {
+            continue;
+        };
+        let Some(event) = t.p.facts.binding_events.iter().find(|event| {
+            event.kind == ResolutionBindingEventKind::Parameter
+                && event.authored_declaration == Some(parameter.parameter)
+        }) else {
+            continue;
+        };
+        if writers[&event.slot].len() != 1
+            || t.p
+                .facts
+                .python_site_guards
+                .iter()
+                .any(|guard| guard.site == event.target)
+        {
+            continue;
+        }
+        let name =
+            t.p.facts
+                .identifiers
+                .iter()
+                .find(|id| id.site == event.target)
+                .expect("a parameter writer has an identifier")
+                .name;
+        receivers.insert(scope_nodes[&function.id()], name);
+    }
+    for member in nodes
+        .iter()
+        .copied()
+        .filter(|node| node.kind() == "attribute")
+    {
+        let object = member
+            .child_by_field_name("object")
+            .expect("attribute object");
+        let attribute = member
+            .child_by_field_name("attribute")
+            .expect("attribute name");
+        if object.kind() != "identifier" {
+            continue;
+        }
+        let Some(&receiver_name) = receivers.get(&scopes[&object.id()]) else {
+            // Nested functions, lambdas and comprehension frames never inherit
+            // their enclosing method's receiver identity.
+            continue;
+        };
+        let Some(&object_site) = t.references.get(&(object.start_byte(), object.end_byte())) else {
+            continue;
+        };
+        if !t
+            .p
+            .facts
+            .identifiers
+            .iter()
+            .any(|id| id.site == object_site && id.name == receiver_name)
+        {
+            continue;
+        }
+        let Some(&reference) = t
+            .references
+            .get(&(attribute.start_byte(), attribute.end_byte()))
+        else {
+            continue;
+        };
+        if t.p.facts.sites[reference.index()].kind != ResolutionSiteKind::MemberReference
+            || !t
+                .p
+                .facts
+                .identifiers
+                .iter()
+                .any(|id| id.site == reference && id.namespace == ResolutionNamespace::Value)
+        {
+            continue;
+        }
+        t.p.facts
+            .callable_receiver_origins
+            .push(ResolutionCallableReceiverOriginFact {
+                reference,
+                origin: ResolutionCallableReceiverOrigin::CurrentInstance,
+            });
+    }
+    // Annotation identifiers have structured type references; their qualified
+    // owners are value expressions. Retire scope gaps only at these exact
+    // reference ranges. Quoted/PEP695 and implicit class-cell gaps remain intact.
+    let type_references =
         t.p.facts
             .identifiers
             .iter()
             .filter(|row| {
                 row.role == ResolutionIdentifierRole::Reference
                     && row.namespace == ResolutionNamespace::Type
-                    && t.p.facts.names[row.name.index()].spelling != "__class__"
             })
-            .map(|row| {
-                let site = t.p.facts.sites[row.site.index()];
-                (site.start_byte, site.end_byte)
-            })
+            .map(|row| row.site)
             .collect::<HashSet<_>>();
+    let type_prefixes =
+        t.p.facts
+            .root_references
+            .iter()
+            .filter(|root| type_references.contains(&root.reference))
+            .filter_map(|root| root.prefix_reference)
+            .collect::<HashSet<_>>();
+    let structured = t
+        .p
+        .facts
+        .identifiers
+        .iter()
+        .filter(|row| {
+            row.role == ResolutionIdentifierRole::Reference
+                && (row.namespace == ResolutionNamespace::Type || type_prefixes.contains(&row.site))
+                && t.p.facts.names[row.name.index()].spelling != "__class__"
+        })
+        .map(|row| {
+            let site = t.p.facts.sites[row.site.index()];
+            (site.start_byte, site.end_byte)
+        })
+        .collect::<HashSet<_>>();
     let argument_containers = nodes
         .iter()
         .filter(|node| node.kind() == "type_parameter" && t.type_nodes.contains(&node.id()))

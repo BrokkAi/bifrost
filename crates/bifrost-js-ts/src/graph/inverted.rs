@@ -17,7 +17,6 @@
 //! need module/default-export and type inference); those references are simply not
 //! emitted, mirroring a recall gap rather than a wrong edge.
 
-use super::extractor::rightmost_jsx_identifier;
 use super::receiver_analysis::JsTsReceiverFactProvider;
 use super::resolver::{
     JsTsUsageIndex, browser_global_property_shape, unbound_browser_global_property,
@@ -32,7 +31,7 @@ use crate::syntax::{
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, JsTsScopedNodeStatus, PerFileEdges, UsageNodeKey,
+    FileEdgeScanInput, JsTsScopedNodeStatus, NodeKey, PerFileEdges, UsageNodeKey,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -118,6 +117,7 @@ pub fn scan_file(
     with_usage_definitions(host, token, |definitions| {
         let mut ctx = TsScan {
             source,
+            import_binder: binder.clone(),
             receiver_provider: JsTsReceiverFactProvider::new(
                 host,
                 definitions,
@@ -145,7 +145,7 @@ pub fn scan_file(
 /// The workspace-wide state a scoped scan resolves through, built once before
 /// the per-file fan-out.
 pub struct ScopedScanPrep {
-    declarations: HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    declarations: ScopedDeclarations,
     imports_by_file: HashMap<ProjectFile, ScopedImportBindings>,
     /// Whether each requested node is resolvable, ambiguous, or unseedable.
     pub node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus>,
@@ -231,6 +231,7 @@ pub fn scan_scoped_file(
     with_usage_definitions(host, token, |definitions| {
         let mut ctx = ScopedTsScan {
             source: input.source,
+            import_binder: receiver_binder.clone(),
             receiver_provider: JsTsReceiverFactProvider::new(
                 host,
                 definitions,
@@ -263,10 +264,11 @@ struct ScopedImportBindings {
 }
 
 struct ScopedTsScan<'a> {
+    import_binder: JsTsImportBinder,
     source: &'a str,
     receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
     index: &'a JsTsUsageIndex,
-    declarations: &'a HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    declarations: &'a ScopedDeclarations,
     imports: ScopedImportBindings,
     same_file: HashMap<String, UsageNodeKey>,
     browser_globals: HashMap<String, UsageNodeKey>,
@@ -284,6 +286,7 @@ impl<'a> ScopedTsScan<'a> {
             &self.imports.named,
             &self.browser_globals,
             self.lexical_bindings.as_ref(),
+            &self.import_binder,
             |name| self.same_file.get(name).cloned(),
         )
     }
@@ -321,6 +324,7 @@ impl<'a> ScopedTsScan<'a> {
         member_declaration_candidate(&owner.fqn, member, |fqn, local_name| {
             let key = UsageNodeKey::new(owner.file.clone(), fqn.to_string());
             self.declarations
+                .by_name
                 .get(&(owner.file.clone(), local_name.to_string()))
                 .is_some_and(|keys| keys.contains(&key))
                 .then_some(key)
@@ -339,6 +343,7 @@ impl<'a> ScopedTsScan<'a> {
 }
 
 struct TsScan<'a> {
+    import_binder: JsTsImportBinder,
     source: &'a str,
     receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
     named_imports: HashMap<String, String>,
@@ -385,10 +390,15 @@ fn bare_callee<T: Clone>(
     imports: &HashMap<String, T>,
     browser_globals: &HashMap<String, T>,
     lexical_bindings: Option<&JsTsLexicalBindingIndex>,
+    import_binder: &JsTsImportBinder,
     same_file: impl FnOnce(&str) -> Option<T>,
 ) -> Option<T> {
     if let Some(key) = imports.get(text) {
-        return Some(key.clone());
+        return matches!(
+            import_binder.binding_at(text, byte),
+            crate::syntax::JsTsImportBindingResolution::Exact(_)
+        )
+        .then(|| key.clone());
     }
     if let Some(key) =
         unshadowed_browser_global(text, text, byte, browser_globals, lexical_bindings)
@@ -437,9 +447,14 @@ fn member_declaration_candidate<T>(
     lookup(&plain_fqn, member).into_iter().collect()
 }
 
-fn scoped_declarations_by_file_and_name(
-    analyzer: &dyn CodeUnitIndex,
-) -> HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>> {
+// Both projections live for one graph query. Module export lookup uses the
+// analyzer's published top-level relation; member lookup retains descendants.
+struct ScopedDeclarations {
+    by_name: HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    module_bindings: HashSet<UsageNodeKey>,
+}
+
+fn scoped_declarations_by_file_and_name(analyzer: &dyn CodeUnitIndex) -> ScopedDeclarations {
     let mut out: HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>> = HashMap::default();
     for declaration in analyzer.all_declarations().filter(|unit| {
         matches!(
@@ -457,7 +472,16 @@ fn scoped_declarations_by_file_and_name(
             declaration.fq_name(),
         ));
     }
-    out
+    let files = out.keys().map(|(file, _)| file).collect::<HashSet<_>>();
+    let module_bindings = files
+        .into_iter()
+        .flat_map(|file| analyzer.top_level_declarations(file))
+        .map(|unit| UsageNodeKey::new(unit.source().clone(), unit.fq_name()))
+        .collect();
+    ScopedDeclarations {
+        by_name: out,
+        module_bindings,
+    }
 }
 
 fn scoped_same_file_declarations(
@@ -576,7 +600,7 @@ fn browser_global_declarations(
 
 fn scoped_import_bindings_by_file(
     index: &JsTsUsageIndex,
-    declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    declarations: &ScopedDeclarations,
 ) -> HashMap<ProjectFile, ScopedImportBindings> {
     let mut grouped_named: HashMap<ProjectFile, HashMap<String, BTreeSet<UsageNodeKey>>> =
         HashMap::default();
@@ -636,7 +660,7 @@ fn scoped_import_bindings_by_file(
 fn scoped_node_status(
     index: &JsTsUsageIndex,
     nodes: &HashSet<UsageNodeKey>,
-    declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    declarations: &ScopedDeclarations,
 ) -> BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> {
     let seed_index = ScopedDeclarationSeedIndex::new(declarations);
     nodes
@@ -677,9 +701,9 @@ struct ScopedDeclarationSeedIndex {
 }
 
 impl ScopedDeclarationSeedIndex {
-    fn new(declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>) -> Self {
+    fn new(declarations: &ScopedDeclarations) -> Self {
         let mut index = Self::default();
-        for ((file, identifier), keys) in declarations {
+        for ((file, identifier), keys) in &declarations.by_name {
             let trie = index.by_file.entry(file.clone()).or_default();
             for key in keys {
                 trie.insert(&key.fqn, identifier);
@@ -750,7 +774,7 @@ impl DeclarationSeedTrie {
 
 fn ambiguous_alias_for_node(
     index: &JsTsUsageIndex,
-    declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    declarations: &ScopedDeclarations,
     node: &UsageNodeKey,
     export_name: &str,
 ) -> bool {
@@ -776,80 +800,100 @@ fn ambiguous_alias_for_node(
 
 fn canonical_export_keys(
     index: &JsTsUsageIndex,
-    declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    declarations: &ScopedDeclarations,
     file: &ProjectFile,
     export_name: &str,
 ) -> BTreeSet<UsageNodeKey> {
-    canonical_export_keys_inner(index, declarations, file, export_name, &mut BTreeSet::new())
-}
-
-fn canonical_export_keys_inner(
-    index: &JsTsUsageIndex,
-    declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
-    file: &ProjectFile,
-    export_name: &str,
-    seen: &mut BTreeSet<(ProjectFile, String)>,
-) -> BTreeSet<UsageNodeKey> {
-    let current = (file.clone(), export_name.to_string());
-    if !seen.insert(current.clone()) {
-        return BTreeSet::new();
+    enum Frame {
+        Visit(ProjectFile, String),
+        Direct(ProjectFile, String, usize),
+        Stars(usize),
     }
-
-    if let Some(exports) = index.exports_by_file.get(file)
-        && let Some(entry) = exports.exports_by_name.get(export_name)
-    {
-        match entry {
-            ExportEntry::Local { local_name } => {
-                if let Some(keys) = declarations.get(&(file.clone(), local_name.clone())) {
-                    return keys.clone();
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![Frame::Visit(file.clone(), export_name.to_string())];
+    let mut results: Vec<BTreeSet<UsageNodeKey>> = Vec::new();
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(file, name) => {
+                let current = (file.clone(), name.clone());
+                if !seen.insert(current.clone()) {
+                    results.push(BTreeSet::new());
+                    continue;
+                }
+                let local = index
+                    .exports_by_file
+                    .get(&file)
+                    .and_then(|exports| exports.exports_by_name.get(&name))
+                    .and_then(|entry| match entry {
+                        ExportEntry::Local { local_name }
+                        | ExportEntry::Default {
+                            local_name: Some(local_name),
+                        } => Some(local_name.as_str()),
+                        ExportEntry::Default { local_name: None } => Some("default"),
+                        ExportEntry::ReexportedNamed { .. }
+                        | ExportEntry::ReexportedModule { .. } => None,
+                    });
+                if let Some(local) = local
+                    && let Some(keys) = declarations.by_name.get(&(file.clone(), local.to_string()))
+                {
+                    results.push(
+                        keys.iter()
+                            .filter(|key| declarations.module_bindings.contains(*key))
+                            .cloned()
+                            .collect(),
+                    );
+                    continue;
+                }
+                // Anonymous defaults have no star fallback, even when their
+                // synthetic declaration is absent from this scoped selection.
+                if local == Some("default") && name == "default" {
+                    results.push(BTreeSet::new());
+                    continue;
+                }
+                let targets = index
+                    .direct_reexport_edges
+                    .get(&current)
+                    .map_or(&[][..], Vec::as_slice);
+                stack.push(Frame::Direct(file, name, targets.len()));
+                stack.extend(
+                    targets
+                        .iter()
+                        .rev()
+                        .map(|(file, name)| Frame::Visit(file.clone(), name.clone())),
+                );
+            }
+            Frame::Direct(file, name, count) => {
+                let mut out = BTreeSet::new();
+                for child in results.drain(results.len() - count..) {
+                    out.extend(child);
+                }
+                let stars = index
+                    .direct_star_reexports
+                    .get(&file)
+                    .map_or(&[][..], Vec::as_slice);
+                if out.is_empty() && !stars.is_empty() {
+                    stack.push(Frame::Stars(stars.len()));
+                    stack.extend(
+                        stars
+                            .iter()
+                            .rev()
+                            .map(|file| Frame::Visit(file.clone(), name.clone())),
+                    );
+                } else {
+                    results.push(out);
                 }
             }
-            ExportEntry::Default {
-                local_name: Some(local_name),
-            } => {
-                if let Some(keys) = declarations.get(&(file.clone(), local_name.clone())) {
-                    return keys.clone();
+            Frame::Stars(count) => {
+                let mut out = BTreeSet::new();
+                for child in results.drain(results.len() - count..) {
+                    out.extend(child);
                 }
+                results.push(out);
             }
-            ExportEntry::Default { local_name: None } => {
-                // Anonymous default exports are represented by the analyzer's
-                // synthetic, file-scoped `default` declaration. Anchor lookup to
-                // the exporting file so unrelated anonymous defaults stay distinct.
-                if let Some(keys) = declarations.get(&(file.clone(), "default".to_string())) {
-                    return keys.clone();
-                }
-                return BTreeSet::new();
-            }
-            ExportEntry::ReexportedNamed { .. } | ExportEntry::ReexportedModule { .. } => {}
         }
     }
-
-    let mut out = BTreeSet::new();
-    if let Some(targets) = index.direct_reexport_edges.get(&current) {
-        for (target_file, target_name) in targets {
-            out.extend(canonical_export_keys_inner(
-                index,
-                declarations,
-                target_file,
-                target_name,
-                seen,
-            ));
-        }
-    }
-    if out.is_empty()
-        && let Some(target_files) = index.direct_star_reexports.get(file)
-    {
-        for target_file in target_files {
-            out.extend(canonical_export_keys_inner(
-                index,
-                declarations,
-                target_file,
-                export_name,
-                seen,
-            ));
-        }
-    }
-    out
+    assert_eq!(results.len(), 1, "each re-export traversal has one result");
+    results.pop().expect("completed re-export traversal")
 }
 
 fn single_key(keys: BTreeSet<UsageNodeKey>) -> Option<UsageNodeKey> {
@@ -878,6 +922,7 @@ impl TsScan<'_> {
             &self.named_imports,
             &self.browser_globals,
             self.lexical_bindings.as_ref(),
+            &self.import_binder,
             |name| self.same_file.contains(name).then(|| name.to_string()),
         )
     }
@@ -919,8 +964,13 @@ fn scan_node_enter(
     ctx: &mut TsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) -> Option<bool> {
-    let introduces_scope =
-        enter_ts_scan_node(node, ctx.source, &mut ctx.type_shadow_scopes, locals)?;
+    let introduces_scope = enter_ts_scan_node(
+        node,
+        ctx.source,
+        &ctx.import_binder,
+        &mut ctx.type_shadow_scopes,
+        locals,
+    )?;
 
     match node.kind() {
         "nested_type_identifier" => handle_nested_type_identifier(node, ctx, locals),
@@ -930,7 +980,7 @@ fn scan_node_enter(
         "property_identifier" | "pair" => handle_contextual_object_key(node, ctx),
         "object" => handle_contextual_object_literal(node, ctx),
         "member_expression" => handle_member(node, ctx, locals),
-        "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx(node, ctx, locals),
+        "jsx_opening_element" | "jsx_self_closing_element" => record_jsx_attributes(node, ctx),
         _ => {}
     }
     Some(introduces_scope)
@@ -952,8 +1002,13 @@ fn scan_scoped_node_enter(
     ctx: &mut ScopedTsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) -> Option<bool> {
-    let introduces_scope =
-        enter_ts_scan_node(node, ctx.source, &mut ctx.type_shadow_scopes, locals)?;
+    let introduces_scope = enter_ts_scan_node(
+        node,
+        ctx.source,
+        &ctx.import_binder,
+        &mut ctx.type_shadow_scopes,
+        locals,
+    )?;
 
     match node.kind() {
         "nested_type_identifier" => handle_scoped_nested_type_identifier(node, ctx, locals),
@@ -963,7 +1018,9 @@ fn scan_scoped_node_enter(
         "property_identifier" | "pair" => handle_scoped_contextual_object_key(node, ctx),
         "object" => handle_scoped_contextual_object_literal(node, ctx),
         "member_expression" => handle_scoped_member(node, ctx, locals),
-        "jsx_opening_element" | "jsx_self_closing_element" => handle_scoped_jsx(node, ctx, locals),
+        "jsx_opening_element" | "jsx_self_closing_element" => {
+            record_scoped_jsx_attributes(node, ctx)
+        }
         _ => {}
     }
     Some(introduces_scope)
@@ -972,17 +1029,26 @@ fn scan_scoped_node_enter(
 fn enter_ts_scan_node(
     node: Node<'_>,
     source: &str,
+    import_binder: &JsTsImportBinder,
     type_shadow_scopes: &mut Vec<HashSet<String>>,
     locals: &mut LocalInferenceEngine<String>,
 ) -> Option<bool> {
     let kind = node.kind();
-    let introduces_scope = introduces_js_ts_scope(kind);
+    register_lexical_type_shadow(node, source, type_shadow_scopes);
+    let introduces_scope = introduces_js_ts_scope(kind)
+        || kind == "for_in_statement"
+        || node.child_by_field_name("type_parameters").is_some();
     if introduces_scope {
         locals.enter_scope();
         type_shadow_scopes.push(HashSet::default());
         declare_scope_parameter_shadows(node, source, locals);
+        super::for_each_type_parameter_name(node, source, |name| {
+            type_shadow_scopes
+                .last_mut()
+                .expect("entered type scope")
+                .insert(name.to_string());
+        });
     }
-    register_lexical_type_shadow(node, source, type_shadow_scopes);
 
     if matches!(
         kind,
@@ -1002,7 +1068,15 @@ fn enter_ts_scan_node(
     if kind == "variable_declarator"
         && let Some(name) = node.child_by_field_name("name")
     {
-        declare_pattern_shadows(name, source, locals);
+        for binder in crate::syntax::pattern_binder_identifiers(name) {
+            let text = slice(binder, source);
+            let is_import = matches!(import_binder.binding_at(text, node.end_byte()), crate::syntax::JsTsImportBindingResolution::Exact(binding)
+                if binding.provenance.declaration_range.start_byte == binder.start_byte()
+                    && binding.provenance.declaration_range.end_byte == binder.end_byte());
+            if !is_import && !text.is_empty() {
+                locals.declare_shadow(text.to_string());
+            }
+        }
     }
     Some(introduces_scope)
 }
@@ -1014,6 +1088,11 @@ fn declare_scope_parameter_shadows(
 ) {
     if let Some(parameters) = node.child_by_field_name("parameters") {
         declare_pattern_shadows(parameters, source, locals);
+    }
+    if node.kind() == "for_in_statement"
+        && let Some(pattern) = node.child_by_field_name("left")
+    {
+        declare_pattern_shadows(pattern, source, locals);
     }
     if node.kind() == "catch_clause"
         && let Some(parameter) = node.child_by_field_name("parameter")
@@ -1029,40 +1108,10 @@ fn declare_pattern_shadows(
     source: &str,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => {
-                let text = slice(node, source);
-                if !text.is_empty() {
-                    locals.declare_shadow(text.to_string());
-                }
-            }
-            "required_parameter" | "optional_parameter" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    stack.push(name);
-                }
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    stack.push(pattern);
-                }
-            }
-            "assignment_pattern" | "object_assignment_pattern" => {
-                if let Some(left) = node.child_by_field_name("left") {
-                    stack.push(left);
-                }
-            }
-            "pair_pattern" => {
-                if let Some(value) = node.child_by_field_name("value") {
-                    stack.push(value);
-                }
-            }
-            _ => {
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
-            }
+    for binder in crate::syntax::pattern_binder_identifiers(node) {
+        let name = slice(binder, source);
+        if !name.is_empty() {
+            locals.declare_shadow(name.to_string());
         }
     }
 }
@@ -1073,6 +1122,14 @@ fn handle_identifier(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferen
     else {
         return;
     };
+    if matches!(
+        ctx.import_binder.binding_at(text, node.start_byte()),
+        crate::syntax::JsTsImportBindingResolution::Ambiguous
+    ) {
+        ctx.edges
+            .record_unproven_name_at_node(ctx.input, text, node);
+        return;
+    }
     if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {
         ctx.record(callee, node);
     }
@@ -1088,6 +1145,14 @@ fn handle_scoped_identifier(
     else {
         return;
     };
+    if matches!(
+        ctx.import_binder.binding_at(text, node.start_byte()),
+        crate::syntax::JsTsImportBindingResolution::Ambiguous
+    ) {
+        ctx.edges
+            .record_unproven_name_at_node(ctx.input, text, node);
+        return;
+    }
     if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {
         ctx.record(callee, node);
     }
@@ -1099,8 +1164,14 @@ fn identifier_reference_candidate<'source>(
     type_shadow_scopes: &[HashSet<String>],
     locals: &LocalInferenceEngine<String>,
 ) -> Option<&'source str> {
+    let qualified_part = super::qualified_type_part(node);
+    if qualified_part == Some(super::QualifiedTypePart::Member) {
+        return None;
+    }
     let text = slice(node, source);
-    let shadowed = if node.kind() == "type_identifier" {
+    let shadowed = if node.kind() == "type_identifier"
+        || qualified_part == Some(super::QualifiedTypePart::Owner)
+    {
         super::is_name_shadowed_in_scopes(type_shadow_scopes, text)
     } else {
         locals.is_shadowed(text)
@@ -1238,13 +1309,23 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEn
 
     // `ns.member` — namespace import access resolves to the exported member.
     if ctx.namespace_locals.contains(object_text) {
-        ctx.record(property_text.to_string(), property);
+        if matches!(
+            ctx.import_binder
+                .binding_at(object_text, object.start_byte()),
+            crate::syntax::JsTsImportBindingResolution::Exact(_)
+        ) {
+            ctx.record(property_text.to_string(), property);
+        }
         return;
     }
     // `Class.member` — static access on an imported / same-file class resolves to
     // the member's `Owner.member` fqn.
     if let Some(class) = ctx.bare_callee(object_text, object.start_byte()) {
-        for member in ctx.member_declaration_keys(&class, property_text) {
+        let members = ctx.member_declaration_keys(&class, property_text);
+        if members.is_empty() {
+            record_receiver_member(node, object, property, property_text, ctx);
+        }
+        for member in members {
             ctx.record(member, property);
         }
     }
@@ -1252,7 +1333,10 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEn
 
 fn handle_contextual_object_key(node: Node<'_>, ctx: &mut TsScan<'_>) {
     for target in contextual_object_literal_key_targets(&ctx.receiver_provider, node) {
-        ctx.record(target.fq_name(), node);
+        ctx.record(
+            target.fq_name(),
+            crate::syntax::object_literal_property_key_node(node).unwrap_or(node),
+        );
     }
 }
 
@@ -1306,7 +1390,11 @@ fn handle_scoped_member(
             return;
         }
         if let Some(class) = ctx.bare_callee(object_text, object.start_byte()) {
-            for member in ctx.scoped_member_declaration_keys(&class, property_text) {
+            let members = ctx.scoped_member_declaration_keys(&class, property_text);
+            if members.is_empty() {
+                record_scoped_receiver_member(node, object, property, property_text, ctx);
+            }
+            for member in members {
                 ctx.record(member, property);
             }
         }
@@ -1328,9 +1416,10 @@ fn handle_scoped_member(
 
 fn handle_scoped_contextual_object_key(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
     for target in contextual_object_literal_key_targets(&ctx.receiver_provider, node) {
+        let key = crate::syntax::object_literal_property_key_node(node).unwrap_or(node);
         ctx.record(
             UsageNodeKey::new(target.source().clone(), target.fq_name()),
-            node,
+            key,
         );
     }
 }
@@ -1368,23 +1457,13 @@ fn record_receiver_member(
         );
         return true;
     }
-    match ctx.receiver_provider.resolve_member_targets(
+    let outcome = ctx.receiver_provider.resolve_member_targets(
         object,
         property_text,
         node.start_byte(),
         ReceiverAnalysisBudget::default(),
-    ) {
-        ReceiverAnalysisOutcome::Precise(targets) => {
-            for target in targets {
-                ctx.record(target.fq_name(), property);
-            }
-            true
-        }
-        ReceiverAnalysisOutcome::Ambiguous(_)
-        | ReceiverAnalysisOutcome::Unsupported { .. }
-        | ReceiverAnalysisOutcome::ExceededBudget { .. } => true,
-        ReceiverAnalysisOutcome::Unknown => false,
-    }
+    );
+    record_receiver_member_outcome(outcome, property, property_text, ctx.input, &mut ctx.edges)
 }
 
 fn record_scoped_receiver_member(
@@ -1407,26 +1486,39 @@ fn record_scoped_receiver_member(
         );
         return true;
     }
-    match ctx.receiver_provider.resolve_member_targets(
+    let outcome = ctx.receiver_provider.resolve_member_targets(
         object,
         property_text,
         node.start_byte(),
         ReceiverAnalysisBudget::default(),
-    ) {
+    );
+    record_receiver_member_outcome(outcome, property, property_text, ctx.input, &mut ctx.edges)
+}
+
+// Both graph projections must preserve an open receiver result. In particular,
+// an ambiguous empty candidate set means unknown owners, not proof of no use.
+fn record_receiver_member_outcome<K: NodeKey>(
+    outcome: ReceiverAnalysisOutcome<CodeUnit>,
+    property: Node<'_>,
+    property_text: &str,
+    input: &FileEdgeScanInput<'_, K>,
+    edges: &mut PerFileEdges<K>,
+) -> bool {
+    match outcome {
         ReceiverAnalysisOutcome::Precise(targets) => {
             for target in targets {
-                ctx.record(
-                    UsageNodeKey::new(target.source().clone(), target.fq_name()),
-                    property,
-                );
+                edges.record_reference(input, K::from_unit(&target), property);
             }
             true
         }
         ReceiverAnalysisOutcome::Ambiguous(targets) => {
+            if targets.is_empty() {
+                edges.record_unproven_name_at_node(input, property_text, property);
+            }
             for target in targets {
-                ctx.edges.record_unproven(
-                    ctx.input,
-                    UsageNodeKey::new(target.source().clone(), target.fq_name()),
+                edges.record_unproven(
+                    input,
+                    K::from_unit(&target),
                     property.start_byte(),
                     property.end_byte(),
                 );
@@ -1435,21 +1527,11 @@ fn record_scoped_receiver_member(
         }
         ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
-            ctx.edges.record_unproven_name(
-                ctx.input,
-                property_text,
-                property.start_byte(),
-                property.end_byte(),
-            );
+            edges.record_unproven_name_at_node(input, property_text, property);
             true
         }
         ReceiverAnalysisOutcome::Unknown => {
-            ctx.edges.record_unproven_name(
-                ctx.input,
-                property_text,
-                property.start_byte(),
-                property.end_byte(),
-            );
+            edges.record_unproven_name_at_node(input, property_text, property);
             false
         }
     }
@@ -1466,7 +1548,13 @@ fn scoped_namespace_member_callee(
         return None;
     }
     let namespace = slice(object, ctx.source);
-    if namespace.is_empty() || locals.is_shadowed(namespace) {
+    if namespace.is_empty()
+        || locals.is_shadowed(namespace)
+        || !matches!(
+            ctx.import_binder.binding_at(namespace, object.start_byte()),
+            crate::syntax::JsTsImportBindingResolution::Exact(_)
+        )
+    {
         return None;
     }
     let class_name = slice(property, ctx.source);
@@ -1476,36 +1564,12 @@ fn scoped_namespace_member_callee(
     ctx.namespace_member_callee(namespace, class_name)
 }
 
-fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEngine<String>) {
-    record_jsx_attributes(node, ctx);
-    let Some((rightmost, leaf_text)) = jsx_component_reference(node, ctx.source, locals) else {
-        return;
-    };
-    if let Some(callee) = ctx.bare_callee(leaf_text, rightmost.start_byte()) {
-        ctx.record(callee, rightmost);
-    }
-}
-
 fn record_jsx_attributes(node: Node<'_>, ctx: &mut TsScan<'_>) {
     let (provider, edges) = (&ctx.receiver_provider, &mut ctx.edges);
     let input = ctx.input;
     for_each_jsx_attribute_target(node, provider, |target, name| {
         edges.record_reference(input, target.fq_name(), name);
     });
-}
-
-fn handle_scoped_jsx(
-    node: Node<'_>,
-    ctx: &mut ScopedTsScan<'_>,
-    locals: &LocalInferenceEngine<String>,
-) {
-    record_scoped_jsx_attributes(node, ctx);
-    let Some((rightmost, leaf_text)) = jsx_component_reference(node, ctx.source, locals) else {
-        return;
-    };
-    if let Some(callee) = ctx.bare_callee(leaf_text, rightmost.start_byte()) {
-        ctx.record(callee, rightmost);
-    }
 }
 
 fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
@@ -1518,16 +1582,6 @@ fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
             name,
         );
     });
-}
-
-fn jsx_component_reference<'tree>(
-    node: Node<'tree>,
-    source: &'tree str,
-    locals: &LocalInferenceEngine<String>,
-) -> Option<(Node<'tree>, &'tree str)> {
-    let name_node = node.child_by_field_name("name")?;
-    let (rightmost, leaf_text) = rightmost_jsx_identifier(name_node, source)?;
-    (!leaf_text.is_empty() && !locals.is_shadowed(leaf_text)).then_some((rightmost, leaf_text))
 }
 
 fn for_each_jsx_attribute_target<'tree>(
@@ -1558,6 +1612,52 @@ fn for_each_jsx_attribute_target<'tree>(
 mod tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: acyclic reexports used unbounded Rust recursion"
+    )]
+    fn reexport_chain_is_stack_safe() {
+        let root = std::env::current_dir().expect("absolute root");
+        let files = (0..10000)
+            .map(|i| ProjectFile::new(root.clone(), format!("module{i}.ts")))
+            .collect::<Vec<_>>();
+        let mut index = JsTsUsageIndex::default();
+        for pair in files.windows(2) {
+            index.direct_reexport_edges.insert(
+                (pair[0].clone(), "Public".into()),
+                vec![(pair[1].clone(), "Public".into())],
+            );
+        }
+        let last = files.last().expect("last module");
+        let mut exports = brokk_bifrost_core::analyzer::usages::model::ExportIndex::empty();
+        exports.exports_by_name.insert(
+            "Public".into(),
+            ExportEntry::Local {
+                local_name: "actual".into(),
+            },
+        );
+        index.exports_by_file.insert(last.clone(), exports);
+        let target = UsageNodeKey::new(last.clone(), "actual".into());
+        let by_name = HashMap::from_iter([(
+            (last.clone(), "actual".into()),
+            BTreeSet::from([target.clone()]),
+        )]);
+        let declarations = ScopedDeclarations {
+            by_name,
+            module_bindings: HashSet::from_iter([target.clone()]),
+        };
+        assert_eq!(
+            canonical_export_keys(&index, &declarations, &files[0], "Public"),
+            BTreeSet::from([target])
+        );
+        // A cycle without any local binding completes with no declaration.
+        index.direct_reexport_edges.insert(
+            (last.clone(), "Missing".into()),
+            vec![(files[0].clone(), "Missing".into())],
+        );
+        assert!(canonical_export_keys(&index, &declarations, last, "Missing").is_empty());
+    }
 
     #[test]
     fn pattern_shadows_only_structured_binding_positions() {

@@ -19,9 +19,9 @@ name = "brokk_bifrost_ruby_analysis"
 workspace = true
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.2" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2" }
-brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.14.2" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3" }
+brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.14.3" }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 git2 = { version = "0.20.2", default-features = false }
 moka = { version = "0.12.11", features = ["sync"] }
@@ -40,6 +40,7 @@ tree-sitter = "0.25.10"
 tree-sitter-rbs = "=0.2.2"
 tree-sitter-ruby = "0.23.1"
 tar = { version = "0.4.44", default-features = false }
+workspace-hack.workspace = true
 
 [features]
 default = []
@@ -47,9 +48,9 @@ test-support = ["brokk-bifrost-analysis/test-support"]
 randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3", features = ["test-support"] }
 rusqlite = { version = "0.40.2", default-features = false, features = [
 "bundled",
 "cache",

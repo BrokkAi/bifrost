@@ -73,6 +73,8 @@ use crate::analyzer::semantic_model::CompiledSummaryEffect;
 use crate::analyzer::semantic_model::CompiledSummaryExitKind;
 use crate::analyzer::semantic_model::CompiledSummaryInput;
 use crate::analyzer::semantic_model::CompiledSummaryOutput;
+use crate::analyzer::semantic_model::CompiledSummaryValuePreservation;
+use crate::analyzer::semantic_model::CompiledSummaryValueTransferKind;
 use crate::analyzer::semantic_model::Completeness;
 use crate::analyzer::semantic_model::SemanticModelMatchDisposition;
 use crate::analyzer::semantic_model::compiled_flow_claims_agree;
@@ -85,7 +87,7 @@ use crate::analyzer::usages::UsageProofAuthority;
 use crate::analyzer::AnalyzerQueryScope;
 use crate::analyzer::QueryScope;
 
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 
 pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::heap::*;
 
@@ -135,7 +137,7 @@ pub(crate) fn complete_external_summary(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn modeled_external_call_gap_discharges_value(
+pub(crate) fn call_gap_discharges_value(
     oracle: &WorkspaceSemanticOracle<'_>,
     procedure: &ProcedureHandle,
     gap: &SemanticGap,
@@ -174,6 +176,15 @@ pub(crate) fn modeled_external_call_gap_discharges_value(
     let Some(dispatch) = dispatch_outcome.available_value() else {
         return Ok(false);
     };
+    // Reference preparation passes the evaluated pointer value, not its
+    // variable's place. Target/body uncertainty can still open pointee
+    // contents, but cannot replace this already-evaluated value's identity.
+    if call_row.receiver == Some(value)
+        && dispatch.member_receiver_preparation()
+            == Some(crate::analyzer::semantic::MemberReceiverPreparation::Reference)
+    {
+        return Ok(true);
+    }
     let summary = complete_external_summary(oracle, dispatch);
     let Some(summary) = summary else {
         return Ok(false);
@@ -181,6 +192,222 @@ pub(crate) fn modeled_external_call_gap_discharges_value(
     let preserves = complete_external_summary_preserves_receiver(&summary, call_row, value);
     let escapes = complete_external_summary_escapes_value(&summary, call_row, value);
     Ok(preserves || escapes)
+}
+
+/// A private lexical cell can use its binding's ordinary point-sensitive
+/// assignment trace only when every store mirrors that assignment and no
+/// address/capture can independently write the cell. Query-proven Reference
+/// member calls pass its pointer payload, not the binding's storage.
+fn mirrored_private_cell_binding(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    procedure: &ProcedureHandle,
+    location: crate::analyzer::semantic::MemoryLocationId,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<Option<crate::analyzer::semantic::ValueId>, InterruptionOrProvider> {
+    use crate::analyzer::semantic::{
+        BindingOriginIndex, SemanticGapImpact, SemanticGapSubject, SemanticValueKind,
+    };
+    // Native dispatch may ask for this procedure's property/heap facts again.
+    // Reuse the shared unfinished-property guard rather than recurse into the
+    // same proof with a fresh native-resolution session.
+    let Some(_active) =
+        crate::analyzer::semantic::property_reaching::ActivePropertyProcedure::enter(procedure)
+    else {
+        return Ok(None);
+    };
+    let semantics = procedure.semantics();
+    let Some(MemoryLocationKind::LexicalCell { binding }) =
+        semantics.memory_location(location).map(|row| &row.kind)
+    else {
+        return Ok(None);
+    };
+    let binding = *binding;
+    // A creator-local slot has no incoming by-reference parameter contract.
+    if !semantics
+        .value(binding)
+        .is_some_and(|value| value.kind == SemanticValueKind::Local)
+    {
+        return Ok(None);
+    }
+    if semantics.captures().iter().any(|capture| {
+        matches!(capture.captured, CaptureSource::Value(value) if value == binding)
+            || matches!(capture.captured, CaptureSource::Location(cell) if cell == location)
+    }) {
+        return Ok(None);
+    }
+    let origins = BindingOriginIndex::from_semantics(semantics);
+    if semantics
+        .values()
+        .iter()
+        .filter(|value| value.kind == SemanticValueKind::Address)
+        .any(|value| {
+            let addressed = origins.addressed_binding_origins(value.id);
+            addressed.bindings().contains(&binding)
+        })
+    {
+        return Ok(None);
+    }
+    if semantics.pointer_origins().iter().any(|origin| {
+        if let crate::analyzer::semantic::PointerOriginKind::StackPlace { place } = &origin.kind {
+            return addressed_place_root(procedure, place).is_some_and(
+                |root| matches!(root, AccessPathRoot::LexicalCell(cell) if cell.id() == location),
+            );
+        }
+        false
+    }) {
+        return Ok(None);
+    }
+    let mut abort_user_code = None;
+    for gap in semantics.gaps() {
+        if matches!(
+            gap.capability,
+            crate::analyzer::semantic::SemanticCapability::NormalControlFlow
+                | crate::analyzer::semantic::SemanticCapability::CleanupControlFlow
+                | crate::analyzer::semantic::SemanticCapability::NonLocalControl
+        ) {
+            return Ok(None);
+        }
+        if gap.capability == crate::analyzer::semantic::SemanticCapability::ExceptionalControlFlow
+            && !matches!(
+                gap.discharge,
+                crate::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExit
+                    | crate::analyzer::semantic::SemanticGapDischarge::ExitOnlyProcedureCompletion
+            )
+        {
+            return Ok(None);
+        }
+        // An exit cannot replace this unaddressed, uncaptured binding on
+        // paths reaching the observation. This proof concerns the private
+        // slot, not heap contents that user cleanup code could modify.
+        if gap.capability == crate::analyzer::semantic::SemanticCapability::ExceptionalControlFlow
+            && matches!(
+                gap.discharge,
+                crate::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExit
+                    | crate::analyzer::semantic::SemanticGapDischarge::ExitOnlyProcedureCompletion
+            )
+        {
+            continue;
+        }
+        if !gap_can_open_heap(procedure, gap, &mut abort_user_code) {
+            continue;
+        }
+        if gap.impacts.contains(SemanticGapImpact::HeapWrite) {
+            match gap.subject {
+                SemanticGapSubject::Value(value) if value == binding => return Ok(None),
+                SemanticGapSubject::MemoryLocation(cell)
+                    if semantics.memory_location(cell).is_some_and(|location| {
+                        semantics.values().iter().any(|value| {
+                            origins.unique_binding_origin(value.id) == Some(binding)
+                                && location.kind.uses_value(value.id)
+                        })
+                    }) =>
+                {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+        staged.charge_work(SemanticWork {
+            gaps: 1,
+            ..SemanticWork::default()
+        });
+        if gap.impacts.contains(SemanticGapImpact::HeapWrite)
+            && matches!(
+                gap.subject,
+                SemanticGapSubject::Procedure | SemanticGapSubject::Point
+            )
+        {
+            return Ok(None);
+        }
+        if gap.impacts.contains(SemanticGapImpact::HeapWrite)
+            && matches!(gap.subject, SemanticGapSubject::MemoryLocation(cell) if cell == location)
+        {
+            return Ok(None);
+        }
+    }
+    for point in semantics.points() {
+        if cancellation.is_cancelled() {
+            return Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled,
+            ));
+        }
+        staged.charge_work(SemanticWork {
+            program_points: 1,
+            events: point.events.len(),
+            ..SemanticWork::default()
+        });
+        for (index, event) in point.events.iter().enumerate() {
+            let (assignment, value) = match event.effect {
+                SemanticEffect::Assignment { target, value } if target == binding => (true, value),
+                SemanticEffect::ValueFlow { target, source, .. } if target == binding => {
+                    (true, source)
+                }
+                SemanticEffect::MemoryStore {
+                    location: cell,
+                    value,
+                    ..
+                } if cell == location => (false, value),
+                _ => continue,
+            };
+            let Some(evidence) = semantics.evidence_row(event.evidence) else {
+                return Ok(None);
+            };
+            if !evidence
+                .proof
+                .establishes_complete_evidence(&evidence.completeness)
+            {
+                return Ok(None);
+            }
+            let paired = if assignment {
+                point.events[index + 1..].iter().take_while(|next|
+                    !matches!(next.effect, SemanticEffect::Assignment { target, .. } if target == binding)
+                        && !matches!(next.effect, SemanticEffect::MemoryLoad { location: cell, .. } if cell == location))
+                    .any(|next| matches!(next.effect, SemanticEffect::MemoryStore { location: cell, value: stored, .. } if cell == location && (stored == value || stored == binding)))
+            } else {
+                point.events[..index].iter().rev().take_while(|previous|
+                    !matches!(previous.effect, SemanticEffect::MemoryLoad { location: cell, .. } if cell == location))
+                    .find_map(|previous| match previous.effect {
+                        SemanticEffect::Assignment { target, value: assigned } if target == binding => Some(value == assigned || value == binding),
+                        _ => None,
+                    }).unwrap_or(false)
+            };
+            if !paired {
+                return Ok(None);
+            }
+        }
+    }
+    for call in semantics.call_sites() {
+        let borrows_cell = call
+            .member_selection
+            .as_ref()
+            .and_then(|selection| selection.receiver_place.as_ref())
+            .and_then(|place| addressed_place_root(procedure, place))
+            .is_some_and(
+                |root| matches!(root, AccessPathRoot::LexicalCell(cell) if cell.id() == location),
+            );
+        if !borrows_cell {
+            continue;
+        }
+        let handle = procedure
+            .call_site_handle(call.id)
+            .expect("a live cell call exists");
+        let dispatch = oracle
+            .resolve_call(&handle, &mut staged.request(cancellation))
+            .map_err(InterruptionOrProvider::Provider)?;
+        staged.work = staged.work.conservative_add(dispatch.work());
+        if let Some(stop) = outcome_interruption(&dispatch) {
+            return Err(InterruptionOrProvider::Interruption(stop));
+        }
+        if dispatch
+            .available_value()
+            .and_then(|value| value.member_receiver_preparation())
+            != Some(crate::analyzer::semantic::MemberReceiverPreparation::Reference)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(binding))
 }
 
 /// Return the object identity an activated complete summary assigns to one
@@ -199,16 +426,14 @@ pub(crate) fn modeled_external_call_result(
     let receiver_identity = summary.transfers.iter().any(|transfer| {
         transfer.exit_kind == CompiledSummaryExitKind::Normal
             && matches!(transfer.input, CompiledSummaryInput::Receiver {})
+            && matches!(transfer.output, CompiledSummaryOutput::NormalReturn {})
             && matches!(
-                transfer.output,
-                CompiledSummaryOutput::NormalReturn {} | CompiledSummaryOutput::Receiver {}
+                transfer.value_transfer.as_ref().map(|value| &value.kind),
+                Some(CompiledSummaryValueTransferKind::Conversion {
+                    preservation: CompiledSummaryValuePreservation::Identity,
+                })
             )
     });
-    if receiver_identity {
-        let receiver = procedure.value_handle(call_row.receiver?)?;
-        return Some(ModeledExternalCallResult::Receiver(receiver));
-    }
-
     let fresh_result = summary.effects.iter().any(|effect| {
         matches!(
             effect,
@@ -218,6 +443,15 @@ pub(crate) fn modeled_external_call_result(
             }
         )
     });
+    // Both readers use this classification. A contradictory summary cannot
+    // establish either receiver identity or fresh-result identity.
+    if receiver_identity {
+        if fresh_result {
+            return None;
+        }
+        let receiver = procedure.value_handle(call_row.receiver?)?;
+        return Some(ModeledExternalCallResult::Receiver(receiver));
+    }
     fresh_result.then_some(ModeledExternalCallResult::Fresh)
 }
 
@@ -741,10 +975,39 @@ pub(crate) fn incoming_call_actual_queries(
                 } if formal == &expected_formal => {
                     candidate_has_actual = true;
                     candidate_has_receiver_relation = true;
+                    let addressed_root = match candidate.member_receiver_preparation() {
+                        Some(
+                            crate::analyzer::semantic::MemberReceiverPreparation::CopyValue
+                            | crate::analyzer::semantic::MemberReceiverPreparation::CopyPointee,
+                        ) => {
+                            result.open = true;
+                            continue;
+                        }
+                        Some(
+                            crate::analyzer::semantic::MemberReceiverPreparation::AddressOfPlace,
+                        ) => {
+                            staged.charge_work(SemanticWork {
+                                values: caller.semantics().values().len(),
+                                ..SemanticWork::default()
+                            });
+                            let root = call_row
+                                .member_selection
+                                .as_ref()
+                                .and_then(|selection| selection.receiver_place.as_ref())
+                                .and_then(|place| addressed_place_root(caller, place));
+                            if root.is_none() {
+                                result.open = true;
+                                continue;
+                            }
+                            root
+                        }
+                        _ => None,
+                    };
                     actuals.push((
                         actual.clone(),
                         candidate.proof().clone(),
                         candidate.completeness().clone(),
+                        addressed_root,
                     ));
                 }
                 CallBinding::ArgumentGroup(group) => {
@@ -772,6 +1035,7 @@ pub(crate) fn incoming_call_actual_queries(
                             mapping.actual().value().clone(),
                             mapping_candidate.proof().clone(),
                             mapping_candidate.completeness().clone(),
+                            None,
                         ));
                     }
                     // An open group can omit a mapping for this port even when
@@ -790,11 +1054,12 @@ pub(crate) fn incoming_call_actual_queries(
                         source.clone(),
                         candidate.proof().clone(),
                         candidate.completeness().clone(),
+                        None,
                     ));
                 }
                 _ => {}
             }
-            for (value, proof, completeness) in actuals {
+            for (value, proof, completeness, addressed_root) in actuals {
                 let observation = ValueAtPoint::new(
                     value,
                     point.clone(),
@@ -808,6 +1073,7 @@ pub(crate) fn incoming_call_actual_queries(
                     ))
                 })?;
                 result.candidates.push(IncomingActualQuery {
+                    addressed_root,
                     observation,
                     proof,
                     completeness,
@@ -1191,6 +1457,7 @@ pub(crate) fn resolve_objects_inner(
     let mut truncated = false;
     let mut ambiguous = false;
     let mut abort_user_code = None;
+    let mut private_cell_bindings = HashMap::default();
     // Loop membership is a property of the procedure, so the derivation runs at
     // most once per query no matter how many allocations the trace reaches.
     let mut cyclic: Option<Option<CyclicRegions>> = None;
@@ -1215,6 +1482,61 @@ pub(crate) fn resolve_objects_inner(
                 "trace reached a stale program point",
             ))
         })?;
+        if procedure
+            .semantics()
+            .value(state.value)
+            .is_some_and(|value| value.kind == SemanticValueKind::Address)
+            && state.event_limit == point.events.len()
+            && (state.point != query.point().id()
+                || query.phase() == ObservationPhase::AfterEffects)
+        {
+            let mut represented = false;
+            let mut uncertain = false;
+            staged.charge_work(SemanticWork {
+                nested_entries: procedure.semantics().pointer_aliases().len(),
+                ..SemanticWork::default()
+            });
+            for alias in procedure
+                .semantics()
+                .pointer_aliases()
+                .iter()
+                .filter(|alias| alias.pointer == state.value && alias.point == state.point)
+            {
+                staged.charge_work(SemanticWork {
+                    values: procedure.semantics().values().len(),
+                    ..SemanticWork::default()
+                });
+                let Some(root) =
+                    crate::analyzer::semantic::workspace_oracle::heap::exact_addressed_pointer_root(
+                        procedure, alias,
+                    )
+                else {
+                    uncertain = true;
+                    continue;
+                };
+                let evidence = inherited_evidence.to_vec_with(
+                    evidence_handle(procedure, alias.evidence)
+                        .map_err(InterruptionOrProvider::Provider)?,
+                );
+                let cardinality = if query.context().was_truncated() {
+                    ObjectCardinality::Unknown
+                } else {
+                    candidate_cardinality_for_root(&root)
+                };
+                let object = AbstractObject::new(root, cardinality).map_err(|error| {
+                    InterruptionOrProvider::Provider(internal_contract(
+                        "invalid stack address",
+                        error,
+                    ))
+                })?;
+                push_trace_object(&mut drafts, object, evidence, &state.alternative_quality);
+                represented = true;
+            }
+            if represented {
+                open |= uncertain;
+                continue;
+            }
+        }
         let mut producer = None;
         let mut producer_alternative_quality = None;
         for (index, event) in point.events[..state.event_limit].iter().enumerate().rev() {
@@ -1236,7 +1558,7 @@ pub(crate) fn resolve_objects_inner(
                     && gap_can_open_heap(procedure, gap, &mut abort_user_code)
                     && traced_gap_affects_value(procedure, gap, state.value, staged, cancellation)?
                     && !call_result_materialization_owns_gap(procedure, gap, state.value)
-                    && !modeled_external_call_gap_discharges_value(
+                    && !call_gap_discharges_value(
                         oracle,
                         procedure,
                         gap,
@@ -1371,6 +1693,34 @@ pub(crate) fn resolve_objects_inner(
                 event.effect,
                 SemanticEffect::MemoryLoad { result, .. } if result == state.value
             ) {
+                if let SemanticEffect::MemoryLoad { location, .. } = event.effect
+                    && procedure
+                        .semantics()
+                        .memory_location(location)
+                        .is_some_and(|row| {
+                            matches!(row.kind, MemoryLocationKind::LexicalCell { .. })
+                        })
+                {
+                    let binding = if let Some(binding) = private_cell_bindings.get(&location) {
+                        *binding
+                    } else {
+                        let binding = mirrored_private_cell_binding(
+                            oracle,
+                            procedure,
+                            location,
+                            staged,
+                            cancellation,
+                        )?;
+                        private_cell_bindings.insert(location, binding);
+                        binding
+                    };
+                    if let Some(binding) = binding {
+                        let evidence = evidence_handle(procedure, event.evidence)
+                            .map_err(InterruptionOrProvider::Provider)?;
+                        producer = Some((binding, index, ProducerEvidence::Extends(evidence)));
+                        break;
+                    }
+                }
                 let endpoint = runtime_reads.and_then(|reads| {
                     reads.endpoints.iter().find(|endpoint| {
                         [&endpoint.observation, &endpoint.container_observation]
@@ -1638,15 +1988,41 @@ pub(crate) fn resolve_objects_inner(
                         open = true;
                     } else {
                         for actual in incoming.candidates {
-                            let actual_points_to = resolve_objects_with_active_query(
-                                oracle,
-                                &actual.observation,
-                                limits,
-                                staged,
-                                cancellation,
-                                expansion_depth + 1,
-                                active_queries,
-                            )?;
+                            let actual_points_to = if let Some(root) = actual.addressed_root {
+                                let cardinality = if actual.identity_context.was_truncated() {
+                                    ObjectCardinality::Unknown
+                                } else {
+                                    candidate_cardinality_for_root(&root)
+                                };
+                                let object =
+                                    AbstractObject::new(root, cardinality).map_err(|error| {
+                                        InterruptionOrProvider::Provider(internal_contract(
+                                            "invalid addressed receiver",
+                                            error,
+                                        ))
+                                    })?;
+                                DraftSet {
+                                    candidates: vec![ObjectDraft {
+                                        object,
+                                        evidence: Vec::new(),
+                                        proof: actual.proof.clone(),
+                                        completeness: actual.completeness.clone(),
+                                        runtime_read: None,
+                                    }],
+                                    coverage: CandidateCoverage::Exhaustive,
+                                    ambiguous: false,
+                                }
+                            } else {
+                                resolve_objects_with_active_query(
+                                    oracle,
+                                    &actual.observation,
+                                    limits,
+                                    staged,
+                                    cancellation,
+                                    expansion_depth + 1,
+                                    active_queries,
+                                )?
+                            };
                             open |= actual_points_to.coverage != CandidateCoverage::Exhaustive;
                             truncated |= actual_points_to.coverage == CandidateCoverage::Truncated;
                             ambiguous |= actual_points_to.ambiguous;
@@ -2106,7 +2482,7 @@ impl EscapeCallSession<'_> {
                         let Some(call) = procedure.semantics().call_site(call_site) else {
                             return Ok(false);
                         };
-                        if !call_names_any(call, &names) {
+                        if !call_names_any(procedure.semantics(), call, &names) {
                             continue;
                         }
                         let Some(call_handle) = procedure.call_site_handle(call_site) else {
@@ -2410,7 +2786,7 @@ pub fn object_escape_status(
                     let Some(call) = semantics.call_site(call_site) else {
                         return Ok(EscapeStatus::MayEscape);
                     };
-                    if !call_names_any(call, &names) {
+                    if !call_names_any(procedure.semantics(), call, &names) {
                         false
                     } else {
                         let Some(call_handle) = procedure.call_site_handle(call_site) else {
@@ -2760,11 +3136,26 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             });
         }
         let mut staged = WorkStager::new(request);
+        let mut private_cells = HashMap::default();
         let drafts = match resolve_fresh_object_publications(
             query,
             *self.limits(),
             &mut staged,
             request.cancellation,
+            |location, staged| {
+                if let Some(binding) = private_cells.get(&location) {
+                    return Ok(*binding);
+                }
+                let binding = mirrored_private_cell_binding(
+                    self,
+                    query.observation().procedure(),
+                    location,
+                    staged,
+                    request.cancellation,
+                )?;
+                private_cells.insert(location, binding);
+                Ok(binding)
+            },
         ) {
             Ok(drafts) => drafts,
             Err(InterruptionOrProvider::Provider(error)) => {

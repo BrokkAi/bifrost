@@ -1,0 +1,21 @@
+SOURCE function outer(){function inner(){return {ghost:1};}return {};}
+Function [("Member", "outer")] lookup=false signatures=["function outer() { ... }"] labels=[([], true, false)] supers=[]
+SOURCE function build(x){const helper={m(){return x;}}; return 0;} export const value=build({ghost:1});
+Field [("Path", "surface.ts"), ("Member", "value")] lookup=false signatures=["export const value"] labels=[] supers=[]
+Function [("Member", "build"), ("Member", "helper"), ("Member", "m")] lookup=true signatures=["m(){return x;}"] labels=[] supers=[]
+Function [("Member", "build")] lookup=false signatures=["function build(x) { ... }"] labels=[(["x"], true, false)] supers=[]
+export Some("value") Local { local_name: "value" }
+materialized Named "value" target=None
+SOURCE class C { constructor(){const helper={m(){this.ghost=1;}};this.own=1;} }
+Class [("Type", "C")] lookup=false signatures=["class C {"] labels=[] supers=[]
+Field [("Type", "C"), ("Member", "own")] lookup=false signatures=["this.own=1"] labels=[] supers=[]
+Function [("Type", "C"), ("Member", "constructor")] lookup=false signatures=["constructor() { ... }"] labels=[([], false, true)] supers=[]
+Function [("Type", "C"), ("Nested", "function_0"), ("Member", "helper"), ("Member", "m")] lookup=true signatures=["m(){this.ghost=1;}"] labels=[] supers=[]
+SOURCE function wrap(config: Object){return config;} export const api=wrap({run(){}});
+Field [("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Field [("Path", "surface.ts"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+Function [("Member", "wrap")] lookup=false signatures=["function wrap(config: Object) { ... }"] labels=[(["config"], true, false)] supers=[]
+Function [("Path", "surface.ts"), ("Member", "api"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None

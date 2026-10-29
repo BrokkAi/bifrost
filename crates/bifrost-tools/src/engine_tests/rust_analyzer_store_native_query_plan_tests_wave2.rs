@@ -95,6 +95,9 @@ mod rust_departing_wave2_root_tests {
             "the component-wave ordering query must be planned"
         );
         brokk_bifrost_analysis::analyzer::store::go_unit_summaries::register_go_summary_sql_functions(conn).unwrap();
+        // The reader does not register the writer-only seal function, but the
+        // source-fact seal UPDATE fires triggers that call it.
+        brokk_bifrost_core::cache_db::register_seal_validation(conn).unwrap();
         for schema in &registry.schemas {
             conn.execute_batch(schema).unwrap();
         }

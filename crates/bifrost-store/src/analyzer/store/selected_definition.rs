@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::hash::HashSet;
+
 use crate::CancellationToken;
 use crate::analyzer::resolution::lexical_definition::LexicalDefinition;
 use crate::analyzer::resolution::{ResolutionLocalKey, SelectedResolutionMountOrdinal};
@@ -47,6 +49,8 @@ pub enum SelectedDeclarationDefinition {
     /// The declaration's own source range. There is no stored identifier and
     /// no lexical kind to report, because the parser published neither.
     WithoutUnit(Range),
+    /// A nameless authored module whose identity comes from its selected mount.
+    Module(Range),
 }
 
 #[doc(hidden)]
@@ -66,13 +70,13 @@ pub enum SelectedLexicalDefinitionReadOutcome {
 // `lexical_kind` and `lexical_identifier` are read, not filtered on: a
 // declaration that carries neither is an item with no `CodeUnit`, which is a
 // projection this reader must answer rather than drop.
-pub(super) const SELECTED_LEXICAL_DEFINITIONS_SQL: &str =
-    "SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]'),
+pub(super) const SELECTED_LEXICAL_DEFINITIONS_SQL: &str = "SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]'),
             declaration.lexical_kind, declaration.lexical_identifier,
             declaration.start_byte, declaration.end_byte,
             declaration.start_line, declaration.end_line,
             declaration.name_start_byte, declaration.name_end_byte,
-            declaration.name_start_line, declaration.name_end_line
+            declaration.name_start_line, declaration.name_end_line,
+            declaration.name_occurrence_id IS NULL
      FROM json_each(?1) AS request
      CROSS JOIN temp.selected_resolution_mounts AS mount
        ON mount.mount_ordinal = json_extract(request.value, '$[0]')
@@ -93,7 +97,8 @@ pub(super) const SELECTED_LEXICAL_DEFINITIONS_SQL: &str =
      CROSS JOIN main.source_declarations AS declaration
        ON declaration.blob_id = bridge.blob_id
       AND declaration.declaration_id = bridge.declaration_id
-      AND declaration.name_occurrence_id IS NOT NULL";
+     WHERE declaration.name_occurrence_id IS NOT NULL
+        OR json_extract(request.value, '$[2]')";
 
 /// The hydrated `code_units` columns every selected unit reader projects, in
 /// the order `candidate_row_from_row` reads them.
@@ -294,18 +299,50 @@ impl SelectedResolutionMountInventory<'_> {
         if cancellation.is_cancelled() {
             return Ok(SelectedLexicalDefinitionReadOutcome::Cancelled);
         }
+        // Definitions do not publish reference-site metadata. The language's
+        // existing namespace classifier certifies nameless module identities;
+        // every other nameless declaration remains excluded by the SQL read.
+        let classifiers = self
+            .namespace_definition_providers()
+            .iter()
+            .map(|(_, _, factory)| factory())
+            .collect::<Vec<_>>();
         let mut all_rows = Vec::new();
         for page in definitions.chunks(SELECTED_MOUNT_PAGE_ROWS) {
             if cancellation.is_cancelled() {
                 return Ok(SelectedLexicalDefinitionReadOutcome::Cancelled);
             }
-            let requests = json_pair_array(
-                page.iter()
-                    .map(|(mount, key)| (i64::from(mount.get()), key.get())),
-            );
+            let semantics = page
+                .iter()
+                .map(|(mount, key)| {
+                    let key = key.try_u32().ok_or_else(|| {
+                        StoreError::corrupt(
+                            "selected definition local key exceeds the semantic identity range",
+                        )
+                    })?;
+                    Ok(crate::analyzer::resolution::SemanticId::local(
+                        mount.get(),
+                        key,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut modules = HashSet::default();
+            for classifier in &classifiers {
+                modules.extend(classifier.definitions(self, &semantics, cancellation)?);
+            }
+            let requests = serde_json::to_string(
+                &page
+                    .iter()
+                    .zip(&semantics)
+                    .map(|((mount, key), semantic)| {
+                        (mount.get(), key.get(), modules.contains(semantic))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("integer and Boolean request tuples serialize");
             let rows =
                 with_resolution_read_progress_handler(self.connection(), cancellation, |conn| {
-                    let mut statement = conn.prepare(SELECTED_LEXICAL_DEFINITIONS_SQL)?;
+                    let mut statement = conn.prepare_cached(SELECTED_LEXICAL_DEFINITIONS_SQL)?;
                     statement
                         .query_map([&requests], |row| {
                             let range = |offset| -> rusqlite::Result<Range> {
@@ -322,7 +359,11 @@ impl SelectedResolutionMountInventory<'_> {
                                 row.get::<_, Option<String>>(2)?,
                                 row.get::<_, Option<String>>(3)?,
                                 range(4)?,
-                                range(8)?,
+                                if row.get::<_, bool>(12)? {
+                                    None
+                                } else {
+                                    Some(range(8)?)
+                                },
                             ))
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()
@@ -350,9 +391,16 @@ impl SelectedResolutionMountInventory<'_> {
                             source_file: None,
                             identifier,
                             kind,
-                            name_range,
+                            name_range: name_range.ok_or_else(|| {
+                                StoreError::corrupt(
+                                    "a selected lexical declaration has no name range",
+                                )
+                            })?,
                             declaration_range,
                         })
+                    }
+                    (None, None) if name_range.is_none() => {
+                        SelectedDeclarationDefinition::Module(declaration_range)
                     }
                     (None, None) => SelectedDeclarationDefinition::WithoutUnit(declaration_range),
                     (kind, identifier) => unreachable!(
@@ -397,7 +445,7 @@ impl SelectedResolutionMountInventory<'_> {
         }
         let result =
             with_resolution_read_progress_handler(self.connection(), cancellation, |conn| {
-                let mut statement = conn.prepare(&DEFINITION_SEMANTICS_SQL)?;
+                let mut statement = conn.prepare_cached(&DEFINITION_SEMANTICS_SQL)?;
                 let rows = statement
                     .query_map([blob], |row| {
                         Ok((
@@ -565,7 +613,12 @@ impl SelectedResolutionMountInventory<'_> {
             );
             let result =
                 with_resolution_read_progress_handler(self.connection(), cancellation, |conn| {
-                    let mut statement = conn.prepare(sql)?;
+                    let mut statement = conn.prepare_cached(sql)?;
+                    // Cached statements retain VM counters across uses; each page
+                    // measures only this execution, as it did when every
+                    // statement was freshly prepared.
+                    #[cfg(any(test, feature = "test-support"))]
+                    statement.reset_status(rusqlite::StatementStatus::VmStep);
                     let rows = statement
                         .query_map([&requests], |row| {
                             Ok((

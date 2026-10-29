@@ -93,7 +93,8 @@ use brokk_bifrost_core::hash::HashSet;
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v13";
+// The lowerer reaches receiverless-loop recognition: a declared loop is not Kernel#loop.
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v14";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -4263,6 +4264,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver: (!constructor).then_some(receiver).flatten(),
+                member_selection: None,
                 arguments: arguments.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -5548,6 +5550,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver: None,
+                member_selection: None,
                 arguments: Box::new([]),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -6162,8 +6165,7 @@ fn expression_value_kind(source: &str, node: Node<'_>) -> SemanticValueKind {
         }
         // A constant read names one compile-time constant object, and a
         // `scope_resolution` path (`Net::HTTP`) is the same read with an
-        // explicit owner. Neither is a runtime temporary, and the dispatch
-        // discharge for a call written on a constant receiver reads this kind.
+        // explicit owner. Neither is a runtime temporary.
         "integer" | "float" | "rational" | "complex" | "true" | "false" | "nil" | "constant"
         | "scope_resolution" | "simple_symbol" | "hash_key_symbol" | "bare_symbol"
         | "character" => SemanticValueKind::Constant,

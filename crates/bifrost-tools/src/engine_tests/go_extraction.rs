@@ -2378,6 +2378,21 @@ func caller() {
                     "Variadic",
                     2,
                 ),
+                // A source signature proves two results too. This closes
+                // callee applicability; actual-value bindings stay open until
+                // the lowering expansion in #7208.
+                (
+                    "model.Variadic(pair())",
+                    "example.com/model.Variadic",
+                    "Variadic",
+                    2,
+                ),
+                (
+                    "model.Variadic((pair()))",
+                    "example.com/model.Variadic",
+                    "Variadic",
+                    2,
+                ),
             ] {
                 let exact = lookup(call);
                 assert!(
@@ -2427,8 +2442,6 @@ func caller() {
                 ("model.Vector(1)", true),
                 ("model.Open(model.Pair())", true),
                 ("model.Zero(model.NoResult())", false),
-                ("model.Variadic(pair())", false),
-                ("model.Variadic((pair()))", false),
                 ("model.Variadic(values...)", false),
                 ("model.Flag()", true),
                 ("model.Conflict()", false),
@@ -2922,6 +2935,56 @@ func caller() { _, _ = os.Open("book.xlsx") }
             activate_go_context(&workspace);
             Some((fixture, workspace))
         }
+        #[test]
+        fn go_package_peer_relation_decodes_ordered_mount_ordinals() {
+            let (_fixture, workspace) = published_go_workspace(&[
+                ("go.mod", "module example.test/packageplan\n\ngo 1.22\n"),
+                (
+                    "pair/a.go",
+                    "package pair\nfunc Run() int { return helper() }\n",
+                ),
+                (
+                    "pair/b.go",
+                    "package pair\nfunc helper() int { return 1 }\n",
+                ),
+            ])
+            .expect("publish the same-package fixture with host Go");
+            let go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()).unwrap();
+            let cancellation = CancellationToken::new();
+            let GoNativePointRequestOpen::Ready(mut request) =
+                GoNativePointRequest::open(go, None, &cancellation).unwrap()
+            else {
+                panic!("open the selected same-package fixture");
+            };
+            let (operation, context_id) = request.oracle_for_test("pair/a.go");
+            let expected = ["pair/a.go", "pair/b.go"].map(|path| {
+                operation
+                    .mount_table()
+                    .mount_for_path("go", path)
+                    .unwrap()
+                    .unwrap()
+                    .ordinal()
+            });
+            let version = operation
+                .ready
+                .inventory
+                .mount_record_by_ordinal(expected[0])
+                .unwrap()
+                .file_version_id()
+                .unwrap();
+            let connection = operation.ready.inventory.connection();
+            let package: i64 = connection.query_row(
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::go_same_package::CALLER_PACKAGE.as_str(),
+                rusqlite::params![context_id, version, "go"],
+                |row| row.get(0),
+            ).unwrap();
+            let peers = operation
+                .go_package_peers_for_test(context_id, package, "go", &cancellation)
+                .expect("read the selected package's peers")
+                .expect("peer read must finish without cancellation");
+            assert_eq!(peers, expected);
+        }
+
         /// One member file of one unit, as the incumbent same-package reader sees it.
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
         struct UnitMemberFact {
@@ -5579,6 +5642,8 @@ func main() { api.Public() }
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoPreparedImportContextOutcome;
 
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::package_context::SelectedPackageRows;
+
         use brokk_bifrost_core::hash::HashMap;
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::LocatedSemantic;
@@ -5934,6 +5999,7 @@ type Item struct{ Decoy bool }
                             None,
                             None,
                             &locator,
+                            None,
                             ReceiverAnalysisBudget::default(),
                             &cancellation,
                             &mut context_metrics,
@@ -6338,9 +6404,11 @@ type Item struct{ Decoy bool }
                 // Includes the #5243 type-production read and migration 0181 schema statements.
                 // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
                 // #5671 root-prefix seeks stop returning the two context rows admission rejected: scope steps (Definition 459 -> 457, Type 462 -> 460) and decoded search rows (Definition cold 156 -> 154/warm 96 -> 94, Type cold 152 -> 150/warm 93 -> 91) fall together; search statement counts are unchanged.
+                // #7684: direct type-shape demand and projection add four
+                // definition steps and five value-type steps in this fixture.
                 let expected_scope_nodes = match kind {
-                    ProductionGoPointKind::Definition => 411,
-                    ProductionGoPointKind::Type => 414,
+                    ProductionGoPointKind::Definition => 415,
+                    ProductionGoPointKind::Type => 420,
                 };
                 // These generic-free fixtures no longer open the optional formal-row
                 // table and its indexes during cold point setup. The cold open is
@@ -6415,11 +6483,18 @@ type Item struct{ Decoy bool }
                 // #6594 skips empty staged families: measured Definition cold/warm
                 // searches lose 20/14 statements, Type loses 22/16; rows and work stay
                 // fixed. Only the ordinary empty type-production read remains.
+                // #6979 selects the active caller source role and exact package
+                // variant before forward resolution: two indexed statements and
+                // two decoded rows per search, without additional engine work.
+                // #7684: direct type-shape demand and projection add three
+                // cold/warm search statements, without additional decoded rows.
+                // #7509: sharing declaration-site selection adds one indexed
+                // statement and row, and one scope step, to Type searches.
                 let (cold_open, cold_search, warm_open, warm_search) = match kind {
                     ProductionGoPointKind::Definition => {
-                        ((273, 241), (155, 154), (5, 4), (120, 94))
+                        ((273, 241), (160, 156), (5, 4), (125, 96))
                     }
-                    ProductionGoPointKind::Type => ((273, 241), (172, 150), (5, 4), (138, 91)),
+                    ProductionGoPointKind::Type => ((273, 241), (178, 153), (5, 4), (144, 94)),
                 };
                 let production_schema = cold
                     .open
@@ -7023,6 +7098,61 @@ type Item struct{ Decoy bool }
             assert!(reverse.references().contains(&reference));
         }
         #[test]
+        fn go_package_context_without_references_reads_no_members() {
+            let fixture = GoRootResolutionOperationFixture::with_consumer("package consumer\n");
+            let context_id =
+                publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let source = operation
+                .mount_table()
+                .mount_for_path("go", GO_ROOT_CONSUMER_PATH)
+                .unwrap()
+                .unwrap();
+            let SelectedPackageRows::Ready(references) = operation
+                .selected_package_references(source.ordinal(), &cancellation)
+                .unwrap()
+            else {
+                panic!("reference read must finish");
+            };
+            assert!(references.is_empty(), "{references:?}");
+            let connection = operation.ready.inventory.connection();
+            begin_production_selected_sql_trace_on_connection(connection);
+            let outcome = operation
+                .go_file_import_context_with_role(
+                    context_id,
+                    GO_ROOT_CONSUMER_PATH,
+                    "go",
+                    &cancellation,
+                )
+                .unwrap();
+            let cost = finish_production_selected_sql_trace_on_connection(connection);
+            assert!(matches!(outcome, GoPreparedImportContextOutcome::Ready(_)));
+            assert!(
+                cost.statements
+                    .iter()
+                    .any(|sql| sql.trim() == go_same_package::CALLER_PACKAGE.trim()),
+                "package selection ran: {cost:?}"
+            );
+            assert!(
+                cost.statements
+                    .iter()
+                    .any(|sql| sql.trim() == go_same_package::PACKAGE_PEER_MOUNTS.trim()),
+                "peer selection ran: {cost:?}"
+            );
+            let member_reads = cost
+                .statements
+                .iter()
+                .filter(|sql| {
+                    go_same_package::PACKAGE_MEMBER_READ_STATEMENTS_FOR_TEST
+                        .iter()
+                        .any(|statement| sql.trim() == statement.trim())
+                })
+                .collect::<Vec<_>>();
+            assert!(member_reads.is_empty(), "{member_reads:?}");
+        }
+
+        #[test]
         fn selected_go_package_rows_compose_dot_import_without_manual_bridges() {
             let fixture = GoRootResolutionOperationFixture::new();
             let context_id =
@@ -7347,8 +7477,11 @@ type Item struct{ Decoy bool }
                 .find_map(|reference| reference.prefix_reference)
                 .expect("structured fmt package qualifier");
             let mut first_targets = None;
-            for restored in [false, true] {
+            for (restored, mint_owner) in [(false, false), (true, false), (false, true)] {
                 let operation = fixture.open_ready(&cancellation);
+                if mint_owner {
+                    operation.mint_go_external_owner_for_test();
+                }
                 let unrelated = restored.then(|| operation.ready.shared_names().intern([7; 32]));
                 let GoPreparedImportContextOutcome::Ready(prepared) = operation
                     .go_file_import_context_with_role(
@@ -7361,10 +7494,14 @@ type Item struct{ Decoy bool }
                 else {
                     panic!("selected fmt import context must be available");
                 };
+                eprintln!(
+                    "prepared_context_measurement restored={restored} minted_go_owner={mint_owner} loaded_files={}",
+                    operation.go_import_inputs.borrow().len()
+                );
                 assert_eq!(
-                    operation.go_import_inputs.borrow().is_empty(),
-                    restored,
-                    "the second request must restore the cached context without loading import inputs"
+                    operation.go_import_inputs.borrow().len(),
+                    usize::from(!restored),
+                    "cold and post-mint contexts load one file; only an empty request restores the snapshot"
                 );
                 if let Some(unrelated) = unrelated {
                     assert_eq!(
@@ -13245,7 +13382,9 @@ func inspect() {
 
         use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::scoped_call_dispatch_gap;
         use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::synthetic_unmaterialized_external;
-        use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::virtual_dispatch_implementor_targets;
+        use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::{
+            ImplementorTargets, virtual_dispatch_implementor_targets,
+        };
         use brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchBoundaryKind;
         use brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchLookup;
 
@@ -13268,15 +13407,17 @@ func inspect() {
                 .into_iter()
                 .find(|declaration| declaration.fq_name() == interface_member)
                 .expect("interface method declaration");
-            virtual_dispatch_implementor_targets(
+            let ImplementorTargets::Proven(implementors) = virtual_dispatch_implementor_targets(
                 analyzer,
                 &declaration,
                 &CancellationToken::default(),
-            )
-            .expect("Go method-family provider")
-            .into_iter()
-            .map(|implementor| implementor.fq_name().to_owned())
-            .collect()
+            ) else {
+                panic!("Go method family must be proven");
+            };
+            implementors
+                .into_iter()
+                .map(|implementor| implementor.fq_name().to_owned())
+                .collect()
         }
         use brokk_bifrost_analysis::analyzer::semantic::DispatchOracle as _;
         #[test]

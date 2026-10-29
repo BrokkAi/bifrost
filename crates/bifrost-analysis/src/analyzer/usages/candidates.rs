@@ -374,60 +374,63 @@ fn find_direct_importers_with_cancellation(
     // new work across the pool instead of still visiting every remaining file -- with `for_each` a
     // cancelled scan degrades from an immediate `break` to an O(files) pass that just skips work per
     // item, so cancel latency would scale with workspace size instead of staying near-instant.
+    let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     let _ = files.par_iter().try_for_each(|candidate| {
-        if cancellation.is_cancelled() {
-            return Err(());
-        }
-        if source_files.contains(candidate) {
-            return Ok(());
-        }
-        let imports = import_infos
-            .as_ref()
-            .and_then(|infos| infos.get(candidate))
-            .cloned()
-            .unwrap_or_else(|| import_provider.import_info_of(token, candidate));
-        // A single `DoesNotReach` only rules out one target, so the walk keeps
-        // asking until a target reaches or one answers `Unknown`. The backstop
-        // below is skipped only when EVERY target was proved unreachable
-        // (#1730): one undecided pair is enough to need it.
-        let mut verdict = ImportReachability::DoesNotReach;
-        for target in source_files {
-            match import_provider.import_reachability(candidate, &imports, target) {
-                ImportReachability::Reaches => {
-                    verdict = ImportReachability::Reaches;
-                    break;
-                }
-                ImportReachability::Unknown => verdict = ImportReachability::Unknown,
-                ImportReachability::DoesNotReach => {}
+        context.run(|| {
+            if cancellation.is_cancelled() {
+                return Err(());
             }
-        }
-        if cancellation.is_cancelled() {
-            return Err(());
-        }
-        match verdict {
-            ImportReachability::Reaches => {
-                if let Ok(mut sink) = importers.lock() {
-                    sink.insert(candidate.clone());
-                }
+            if source_files.contains(candidate) {
                 return Ok(());
             }
-            ImportReachability::DoesNotReach => return Ok(()),
-            ImportReachability::Unknown => {}
-        }
-        let imported = import_provider
-            .imported_code_units_from_infos(candidate, &imports)
-            .unwrap_or_else(|| import_provider.imported_code_units_of(candidate));
-        if cancellation.is_cancelled() {
-            return Err(());
-        }
-        if imported
-            .iter()
-            .any(|unit| source_files.contains(unit.source()))
-            && let Ok(mut sink) = importers.lock()
-        {
-            sink.insert(candidate.clone());
-        }
-        Ok(())
+            let imports = import_infos
+                .as_ref()
+                .and_then(|infos| infos.get(candidate))
+                .cloned()
+                .unwrap_or_else(|| import_provider.import_info_of(token, candidate));
+            // A single `DoesNotReach` only rules out one target, so the walk keeps
+            // asking until a target reaches or one answers `Unknown`. The backstop
+            // below is skipped only when EVERY target was proved unreachable
+            // (#1730): one undecided pair is enough to need it.
+            let mut verdict = ImportReachability::DoesNotReach;
+            for target in source_files {
+                match import_provider.import_reachability(candidate, &imports, target) {
+                    ImportReachability::Reaches => {
+                        verdict = ImportReachability::Reaches;
+                        break;
+                    }
+                    ImportReachability::Unknown => verdict = ImportReachability::Unknown,
+                    ImportReachability::DoesNotReach => {}
+                }
+            }
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
+            match verdict {
+                ImportReachability::Reaches => {
+                    if let Ok(mut sink) = importers.lock() {
+                        sink.insert(candidate.clone());
+                    }
+                    return Ok(());
+                }
+                ImportReachability::DoesNotReach => return Ok(()),
+                ImportReachability::Unknown => {}
+            }
+            let imported = import_provider
+                .imported_code_units_from_infos(candidate, &imports)
+                .unwrap_or_else(|| import_provider.imported_code_units_of(candidate));
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
+            if imported
+                .iter()
+                .any(|unit| source_files.contains(unit.source()))
+                && let Ok(mut sink) = importers.lock()
+            {
+                sink.insert(candidate.clone());
+            }
+            Ok(())
+        })
     });
     importers.into_inner().expect("importers set poisoned")
 }

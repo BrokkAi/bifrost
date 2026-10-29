@@ -36,6 +36,7 @@
 //! files already in the workspace and memoised per request. Nothing enters the
 //! semantic IR, so no adapter version moves.
 
+use super::DerivationExecutionCause;
 use super::results::{
     CodeQueryBuildTarget, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
     CodeQueryResultRef, CodeQuerySourceSet, CodeQueryTopologyEdge, DetailedCodeQueryKey,
@@ -66,6 +67,9 @@ impl TopologyTraversalCache {
     /// Read (or replay) the workspace's declared topology.
     pub(super) fn workspace(&mut self, analyzer: &dyn IAnalyzer) -> Arc<WorkspaceTopology> {
         if let Some(cached) = &self.topology {
+            if cached.provider_failed() {
+                analyzer.mark_execution_dependent();
+            }
             return Arc::clone(cached);
         }
         let derived = Arc::new(workspace_topology(analyzer.project()));
@@ -83,6 +87,7 @@ impl TopologyTraversalCache {
     /// "Bifrost has no reader for this build system".
     fn report_axis(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         topology: &WorkspaceTopology,
         axis: TopologyAxis,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -103,6 +108,7 @@ impl TopologyTraversalCache {
             return;
         }
         if !topology.completeness().is_complete() {
+            let start = diagnostics.len();
             self.report(
                 "workspace",
                 CodeQueryDiagnosticCode::TopologyDerivationIncomplete,
@@ -114,6 +120,15 @@ impl TopologyTraversalCache {
                 ),
                 diagnostics,
             );
+            for diagnostic in &mut diagnostics[start..] {
+                *diagnostic = super::QueryExecutionState::diagnostic(
+                    analyzer,
+                    diagnostic.clone(),
+                    topology
+                        .provider_failed()
+                        .then_some(DerivationExecutionCause::Provider),
+                );
+            }
         }
     }
 
@@ -317,7 +332,7 @@ fn entities_owned_by_file(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<TopologyEntityValue> {
     let topology = cache.workspace(analyzer);
-    cache.report_axis(&topology, axis, diagnostics);
+    cache.report_axis(analyzer, &topology, axis, diagnostics);
     let ownership = topology.ownership_of(file.rel_path());
     let Some(name) = owner_name(cache, file, &ownership, select_owner, diagnostics) else {
         return Vec::new();
@@ -375,11 +390,13 @@ fn entity_rows(
 /// The `topology_edge` rows one target declares: every dependency whose
 /// depending end is this target.
 pub(super) fn topology_edges_of_target(
+    analyzer: &dyn IAnalyzer,
     cache: &mut TopologyTraversalCache,
     target: &TopologyEntityValue,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<TopologyEdgeValue> {
     cache.report_axis(
+        analyzer,
         &target.topology,
         TopologyAxis::TargetDependencies,
         diagnostics,
@@ -685,6 +702,11 @@ mod tests {
     /// are different reasons, and both make the response incomplete.
     #[test]
     fn an_unsupported_axis_and_an_unread_build_are_reported_apart() {
+        let directory = tempfile::tempdir().unwrap();
+        let analyzer = crate::analyzer::JavascriptAnalyzer::from_project(
+            crate::analyzer::TestProject::new(directory.path().to_path_buf(), Language::JavaScript),
+        );
+
         let mut cache = TopologyTraversalCache::default();
         let unsupported = WorkspaceTopology::new(
             Vec::new(),
@@ -694,7 +716,12 @@ mod tests {
             TopologyCompleteness::Complete,
         );
         let mut diagnostics = Vec::new();
-        cache.report_axis(&unsupported, TopologyAxis::Targets, &mut diagnostics);
+        cache.report_axis(
+            &analyzer,
+            &unsupported,
+            TopologyAxis::Targets,
+            &mut diagnostics,
+        );
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(
             diagnostics[0].message.contains("no build model"),
@@ -704,7 +731,7 @@ mod tests {
 
         let unread =
             WorkspaceTopology::incomplete(TopologySupport::NONE.supported(TopologyAxis::Targets));
-        cache.report_axis(&unread, TopologyAxis::Targets, &mut diagnostics);
+        cache.report_axis(&analyzer, &unread, TopologyAxis::Targets, &mut diagnostics);
         assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
         assert!(
             diagnostics
@@ -722,7 +749,12 @@ mod tests {
             TopologySupport::NONE.supported(TopologyAxis::Targets),
             TopologyCompleteness::Complete,
         );
-        cache.report_axis(&complete, TopologyAxis::Targets, &mut diagnostics);
+        cache.report_axis(
+            &analyzer,
+            &complete,
+            TopologyAxis::Targets,
+            &mut diagnostics,
+        );
         assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
     }
 }

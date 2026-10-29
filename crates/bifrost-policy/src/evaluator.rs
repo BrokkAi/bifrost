@@ -151,6 +151,7 @@ pub struct PolicyEvaluationContext<'a> {
     /// into procedure, value, call-site, and heap identities.
     pub workspace: Option<&'a WorkspaceAnalyzer>,
     pub flow_state: &'a brokk_bifrost_flow::FlowWorkspaceState,
+    pub root_memo: Option<&'a brokk_bifrost_rql::TypeFlowRootMemo>,
     pub cancellation: Option<&'a CancellationToken>,
     pub cvss_overlays: &'a [CvssEvaluationOverlay],
     pub organizational_risk: &'a [OrganizationalRiskOverlay],
@@ -161,6 +162,13 @@ pub struct PolicyEvaluationContext<'a> {
     /// store to look a unit up in, so nothing to reuse and nothing to publish.
     /// A `--diff-base` run with `incremental` on supplies one on both sides.
     pub incremental: Option<&'a PolicyIncrementalContext<'a>>,
+}
+
+impl PolicyEvaluationContext<'_> {
+    pub(crate) fn flow_resources(&self) -> brokk_bifrost_rql::SemanticFlowResources {
+        brokk_bifrost_rql::SemanticFlowResources::from_workspace_state(self.flow_state)
+            .with_root_memo(self.root_memo.cloned())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -892,6 +900,7 @@ fn evaluate_match_policy(
         Some(execution_scope) => match match_policy_query(policy) {
             Ok(query) => evaluate_match_query_candidates_in_scope(
                 &policy.definition().metadata.id,
+                context.flow_resources(),
                 context.analyzer,
                 context.workspace,
                 query,
@@ -909,6 +918,7 @@ fn evaluate_match_policy(
                 Some(batch) => shared_match_candidates(policy, batch, context, budget),
                 None => evaluate_match_policy_candidates(
                     policy,
+                    context.flow_resources(),
                     context.analyzer,
                     context.workspace,
                     budget,
@@ -2549,6 +2559,7 @@ fn sliced_match_candidates(
     // unit-wise execution linear in the file count.
     let workspace_files = context.analyzer.analyzed_files();
     let execution = UnitQueryExecution {
+        flow_state: context.flow_resources(),
         analyzer: context.analyzer,
         workspace: context.workspace,
         cancellation: context.cancellation,
@@ -2607,6 +2618,7 @@ fn widened_match_candidates(
     let execute = || {
         execute_code_query_unit(
             context.analyzer,
+            context.flow_resources(),
             context.workspace,
             &executable,
             budget.query_limits(),
@@ -2678,17 +2690,20 @@ fn match_policy_query(
 /// Evaluate the match selector stored in a fully resolved policy.
 pub(crate) fn evaluate_match_policy_candidates(
     policy: &LoadedPolicy,
+    flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
     analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> EvaluatedMatchPolicy {
+    let flow_state = flow_state.into();
     let query = match match_policy_query(policy) {
         Ok(query) => query,
         Err(refusal) => return refusal.into_run(budget),
     };
     evaluate_match_query_candidates(
         &policy.definition().metadata.id,
+        &flow_state,
         analyzer,
         workspace,
         query,
@@ -2901,14 +2916,17 @@ fn executable_match_query(
 /// Execute one match policy's query over the whole workspace and adapt it.
 fn evaluate_match_query_candidates(
     policy_id: &PolicyId,
+    flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
     analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> EvaluatedMatchPolicy {
+    let flow_state = flow_state.into();
     evaluate_match_query_candidates_in_scope(
         policy_id,
+        &flow_state,
         analyzer,
         workspace,
         query,
@@ -2918,8 +2936,10 @@ fn evaluate_match_query_candidates(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_match_query_candidates_in_scope(
     policy_id: &PolicyId,
+    flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
     analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
     query: &brokk_bifrost_rql::structural::CodeQuery,
@@ -2927,6 +2947,7 @@ fn evaluate_match_query_candidates_in_scope(
     cancellation: Option<&CancellationToken>,
     execution_scope: CodeQueryExecutionScope<'_>,
 ) -> EvaluatedMatchPolicy {
+    let flow_state = flow_state.into();
     let executable = match executable_match_query(query, budget) {
         Ok(executable) => executable,
         Err(refusal) => return refusal.into_run(budget),
@@ -2938,6 +2959,7 @@ fn evaluate_match_query_candidates_in_scope(
     let detailed = match workspace {
         Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
             workspace,
+            &flow_state,
             &executable,
             budget.query_limits(),
             cancellation,
@@ -2945,6 +2967,7 @@ fn evaluate_match_query_candidates_in_scope(
         ),
         None => execute_code_query_detailed_eager_index_in_scope(
             analyzer,
+            &flow_state,
             &executable,
             budget.query_limits(),
             cancellation,

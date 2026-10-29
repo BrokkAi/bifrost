@@ -156,3 +156,174 @@ fn normalize_project_relative_path(path: &Path) -> Option<PathBuf> {
 fn normalize_rel_path(path: impl AsRef<Path>) -> PathBuf {
     normalize_project_relative_path(path.as_ref()).unwrap_or_else(|| path.as_ref().to_path_buf())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::model::{CodeUnitType, Language, Range};
+    use brokk_bifrost_core::analyzer::project::{FileSetProject, OverlayProject};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    struct Index {
+        project: OverlayProject,
+        owner: CodeUnit,
+        listed: bool,
+    }
+
+    // A project may expose unsaved source before its tracked-file index updates.
+    impl Project for Index {
+        fn root(&self) -> &Path {
+            self.project.root()
+        }
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.project.analyzer_languages()
+        }
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.project.all_files()
+        }
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.project.analyzable_files(language)
+        }
+        fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+            self.listed
+                .then(|| self.project.file_by_rel_path(path))
+                .flatten()
+        }
+        fn has_overlay(&self, file: &ProjectFile) -> bool {
+            self.project.has_overlay(file)
+        }
+        fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
+            self.project.read_source(file)
+        }
+        fn read_source_snapshot(
+            &self,
+            file: &ProjectFile,
+        ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot> {
+            self.project.read_source_snapshot(file)
+        }
+    }
+
+    impl CodeUnitIndex for Index {
+        fn project(&self) -> &dyn Project {
+            &self.project
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([Language::Php])
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(std::iter::once(self.owner.clone()))
+        }
+        fn parent_of(&self, _: &CodeUnit) -> Option<CodeUnit> {
+            Some(self.owner.clone())
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn composer_manifest_format_boundary() {
+        // Composer's PSR-4 schema maps namespaces to a string or an array;
+        // PSR-4 maps remaining namespace components and the basename to .php.
+        let manifest = serde_json::json!({
+            "autoload": {"psr-4": {
+                "App\\": "src/", "Multi\\": ["modern/", "legacy/"], "": "fallback/"
+            }},
+            "autoload-dev": {"psr-4": {"Tests\\": "tests/"}}
+        })
+        .to_string();
+        let root = std::env::current_dir().unwrap();
+        // Exercise a listed manifest and an overlay-only manifest, with a
+        // conflicting lock file present in both project views.
+        for listed in [true, false] {
+            let files = if listed {
+                vec![
+                    PathBuf::from("composer.json"),
+                    PathBuf::from("composer.lock"),
+                ]
+            } else {
+                vec![PathBuf::from("composer.lock")]
+            };
+            let project = OverlayProject::new(Arc::new(FileSetProject::new(root.clone(), files)));
+            assert!(project.set(root.join("composer.json"), manifest.clone()));
+            assert!(project.set(root.join("composer.lock"), "{}".into()));
+            let mut index = Index {
+                project,
+                listed,
+                owner: CodeUnit::new(
+                    ProjectFile::new(&root, "src/Service.php"),
+                    CodeUnitType::Class,
+                    "App",
+                    "Service",
+                ),
+            };
+            let autoload = PhpComposerAutoload::from_project(&index);
+            let rows = [
+                ("App", "Service", "src/Service.php", true),
+                ("App.Package", "Service", "src/Package/Service.php", true),
+                ("Tests", "Helper", "tests/Helper.php", true),
+                ("Multi", "Modern", "modern/Modern.php", true),
+                ("Multi", "Legacy", "legacy/Legacy.php", true),
+                (
+                    "Vendor.Package",
+                    "Service",
+                    "fallback/Vendor/Package/Service.php",
+                    true,
+                ),
+                ("App", "Service", "Service.php", false),
+                ("App", "Service", "src/Other.php", false),
+                ("App", "Service", "src/Service.phtml", false),
+                ("Vendor", "OffPath", "misc/OffPath.php", false),
+                ("Application", "Service", "src/Service.php", false),
+            ];
+            for (namespace, class, path, expected) in rows {
+                let file = ProjectFile::new(&root, path);
+                let owner = CodeUnit::new(file.clone(), CodeUnitType::Class, namespace, class);
+                let member = CodeUnit::new(
+                    file,
+                    CodeUnitType::Function,
+                    owner.fq_name().as_str(),
+                    "run",
+                );
+                index.owner = owner.clone();
+                assert_eq!(
+                    autoload.class_is_autoloaded(&owner),
+                    expected,
+                    "listed={listed}: {owner:?}"
+                );
+                assert_eq!(
+                    autoload.target_is_autoloaded(&index, &owner),
+                    expected,
+                    "class {owner:?}"
+                );
+                assert_eq!(
+                    autoload.target_is_autoloaded(&index, &member),
+                    expected,
+                    "member {member:?}"
+                );
+                assert!(!autoload.class_is_autoloaded(&member));
+            }
+        }
+    }
+}

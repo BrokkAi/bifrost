@@ -49,7 +49,7 @@ use brokk_bifrost_core::analyzer::structural::native_obligation::{
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::path_utils::rel_path_string;
 use brokk_bifrost_go::declarations::{go_structured_type_identity, is_predeclared_go_type};
-use brokk_bifrost_go::graph::reference::go_name_shadowed_at_with_scope;
+use brokk_bifrost_go::references::go_name_shadowed_at_with_scope;
 use tree_sitter::Node;
 
 /// Exact source larger than this is outside the bounded result-binding proof.
@@ -671,6 +671,212 @@ impl GoTypeIdentityContext<'_, '_, '_, '_> {
             admitted
         })
         .unwrap_or(true)
+    }
+}
+
+use ValueTypeBarrierDecision::{ProvenMatch, ProvenNonMatch, Undecided};
+use ValueTypeBarrierReason::{IncompleteType, UnknownType};
+use brokk_bifrost_analysis::analyzer::semantic::{
+    ValueTypeBarrierDecision, ValueTypeBarrierReason, ValueTypePredicate,
+};
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+    SelectedNativeDefinition, SelectedNativeReferenceTypes, SelectedNativeTypes,
+};
+use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+
+pub(super) enum CarrierType {
+    Decision(ValueTypeBarrierDecision),
+    Named(CodeUnit),
+}
+
+// Interpret only selected identities. A rendered type name is never proof.
+pub(super) fn go_selected_carrier_type(
+    answer: &SelectedNativeReferenceTypes,
+    predicate: ValueTypePredicate,
+) -> CarrierType {
+    let selected =
+        match brokk_bifrost_analysis::analyzer::native_points::selected_value_type_for_barrier(
+            &answer.answer,
+            answer.query_result_slot,
+        ) {
+            Ok(selected) => selected,
+            Err(reason) => return CarrierType::Decision(Undecided(reason)),
+        };
+    let SelectedNativeTypes::Ready {
+        intrinsic, nominal, ..
+    } = &answer.value_types
+    else {
+        return CarrierType::Decision(Undecided(IncompleteType));
+    };
+    let Some(ty) = selected else {
+        return CarrierType::Decision(Undecided(UnknownType));
+    };
+    if ty.indirection() != 0 {
+        return CarrierType::Decision(ProvenNonMatch);
+    }
+    if let Some(descriptor) = intrinsic
+        .iter()
+        .find(|descriptor| descriptor.identity() == ty.identity())
+    {
+        // Untyped constants have LanguageBuiltin descriptors and do not kill.
+        // Interfaces (including any) carry arbitrary dynamic values and abstain.
+        let name = descriptor.spelling();
+        if matches!(name, "any" | "error" | "comparable" | "interface{}")
+            || descriptor.kind() == IntrinsicTypeKind::Structural
+        {
+            return CarrierType::Decision(Undecided(UnknownType));
+        }
+        let matches = descriptor.kind() == IntrinsicTypeKind::Primitive
+            && match predicate {
+                ValueTypePredicate::IntrinsicBool => name == "bool",
+                ValueTypePredicate::IntrinsicNumeric => matches!(
+                    name,
+                    "int"
+                        | "int8"
+                        | "int16"
+                        | "int32"
+                        | "int64"
+                        | "uint"
+                        | "uint8"
+                        | "uint16"
+                        | "uint32"
+                        | "uint64"
+                        | "uintptr"
+                        | "float32"
+                        | "float64"
+                        | "byte"
+                        | "rune"
+                ),
+                ValueTypePredicate::FieldlessEnum => false,
+            };
+        return CarrierType::Decision(if matches { ProvenMatch } else { ProvenNonMatch });
+    }
+    if let Some((_, SelectedNativeDefinition::Unit(unit))) = nominal
+        .iter()
+        .find(|(identity, _)| *identity == ty.identity())
+    {
+        return CarrierType::Named(unit.clone());
+    }
+    CarrierType::Decision(Undecided(UnknownType))
+}
+
+/// A nominal declaration still needs its structured declaration category checked.
+pub(super) enum ObservedCarrierType {
+    Type(brokk_bifrost_analysis::analyzer::semantic::ObservedValueType),
+    Named(CodeUnit),
+}
+
+/// Translate the selected public native answer without consulting native slots.
+pub(super) fn go_observed_value_type(answer: &SelectedNativeReferenceTypes) -> ObservedCarrierType {
+    use ObservedCarrierType::Type;
+    use brokk_bifrost_analysis::analyzer::resolution::FactProjectedTypeNodeForm;
+    use brokk_bifrost_analysis::analyzer::semantic::{ObservedValueType, ValueShape};
+    let selected =
+        match brokk_bifrost_analysis::analyzer::native_points::selected_value_type_for_barrier(
+            &answer.answer,
+            answer.query_result_slot,
+        ) {
+            Ok(Some(ty)) => ty,
+            Ok(None) => return Type(ObservedValueType::Undecided(UnknownType)),
+            Err(reason) => return Type(ObservedValueType::Undecided(reason)),
+        };
+    let SelectedNativeTypes::Ready {
+        intrinsic, nominal, ..
+    } = &answer.value_types
+    else {
+        return Type(ObservedValueType::Undecided(IncompleteType));
+    };
+    if selected.indirection() != 0 {
+        return Type(ObservedValueType::NonNamed(ValueShape::Pointer));
+    }
+    let mut identity = selected.identity();
+    // Aliases are edges between selected slots, never names to parse.
+    for shape in answer.answer.projected_type_shapes() {
+        let Some(root) = shape
+            .nodes()
+            .iter()
+            .find(|node| node.slot() == shape.root_slot())
+        else {
+            continue;
+        };
+        if root.identity() != identity {
+            continue;
+        }
+        let mut node = root;
+        let mut remaining = shape.nodes().len();
+        loop {
+            if remaining == 0 {
+                return Type(ObservedValueType::Undecided(IncompleteType));
+            }
+            remaining -= 1;
+            if node.indirection() != 0 {
+                return Type(ObservedValueType::NonNamed(ValueShape::Pointer));
+            }
+            match node.form() {
+                FactProjectedTypeNodeForm::Slice(_) => {
+                    return Type(ObservedValueType::NonNamed(ValueShape::Slice));
+                }
+                FactProjectedTypeNodeForm::Array(_) => {
+                    return Type(ObservedValueType::NonNamed(ValueShape::Array));
+                }
+                FactProjectedTypeNodeForm::Map { .. } => {
+                    return Type(ObservedValueType::NonNamed(ValueShape::Map));
+                }
+                FactProjectedTypeNodeForm::Unsupported => {
+                    return Type(ObservedValueType::Undecided(UnknownType));
+                }
+                FactProjectedTypeNodeForm::Alias(child) => {
+                    let Some(next) = shape
+                        .nodes()
+                        .iter()
+                        .find(|candidate| candidate.slot() == *child)
+                    else {
+                        return Type(ObservedValueType::Undecided(IncompleteType));
+                    };
+                    node = next;
+                }
+                FactProjectedTypeNodeForm::Leaf | FactProjectedTypeNodeForm::Applied(_) => {
+                    identity = node.identity();
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(descriptor) = intrinsic.iter().find(|item| item.identity() == identity) {
+        // These are selected universe descriptors, not source or display spellings.
+        if matches!(descriptor.spelling(), "any" | "error" | "comparable") {
+            return Type(ObservedValueType::NonNamed(ValueShape::Interface));
+        }
+        match descriptor.kind() {
+            IntrinsicTypeKind::Slice => {
+                return Type(ObservedValueType::NonNamed(ValueShape::Slice));
+            }
+            IntrinsicTypeKind::Array => {
+                return Type(ObservedValueType::NonNamed(ValueShape::Array));
+            }
+            IntrinsicTypeKind::Primitive => {
+                return Type(ObservedValueType::Named {
+                    canonical: descriptor.spelling().to_owned(),
+                });
+            }
+            IntrinsicTypeKind::Structural if descriptor.spelling() == "function-type" => {
+                return Type(ObservedValueType::NonNamed(ValueShape::Function));
+            }
+            _ => return Type(ObservedValueType::Undecided(UnknownType)),
+        }
+    }
+    match nominal
+        .iter()
+        .find(|(candidate, _)| *candidate == identity)
+        .map(|(_, definition)| definition)
+    {
+        Some(SelectedNativeDefinition::Unit(unit)) => ObservedCarrierType::Named(unit.clone()),
+        Some(SelectedNativeDefinition::Intrinsic { canonical_name, .. }) => {
+            Type(ObservedValueType::Named {
+                canonical: canonical_name.clone(),
+            })
+        }
+        _ => Type(ObservedValueType::Undecided(UnknownType)),
     }
 }
 

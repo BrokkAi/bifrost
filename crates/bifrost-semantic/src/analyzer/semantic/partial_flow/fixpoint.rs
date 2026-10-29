@@ -602,6 +602,7 @@ struct RelationStep {
     uncertain: bool,
     /// The relation carries a captured source into a child's capture slot.
     captures: bool,
+    before_call: bool,
 }
 
 /// The boundary facts of one call site.
@@ -1143,6 +1144,13 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
                 _ => None,
             };
             if let Some(call) = call {
+                while cursor < self.steps[index].len()
+                    && self.steps[index][cursor].event_index == event_index
+                    && self.steps[index][cursor].before_call
+                {
+                    self.apply_relation(&mut live, point, self.steps[index][cursor])?;
+                    cursor += 1;
+                }
                 let observed = self.calls[&call].observed.clone();
                 for (port, carrier) in observed {
                     self.observe(
@@ -1451,6 +1459,20 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     let mut carriers = Carriers::default();
     let mut ports = PortTable::default();
 
+    let member_reads = snapshot
+        .member_receivers()
+        .iter()
+        .flat_map(|receiver| receiver.transfers())
+        .filter(|transfer| transfer.before_call)
+        .map(|transfer| {
+            (
+                transfer.point.id(),
+                transfer.event_index,
+                transfer.source,
+                transfer.target,
+            )
+        })
+        .collect::<HashSet<_>>();
     let mut steps = vec![Vec::new(); point_count];
     for relation in snapshot.relations() {
         let source = carriers.intern(&relation.source);
@@ -1468,10 +1490,18 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
             invalidate_source: invalidates_source(relation.transfer),
             uncertain: !relation.is_proven_complete(),
             captures: relation.kind == ValueFlowRelationKind::Capture,
+            before_call: relation.kind == ValueFlowRelationKind::LanguageDefined
+                && !member_reads.is_empty()
+                && member_reads.contains(&(
+                    relation.point.id(),
+                    relation.event_index,
+                    relation.source.clone(),
+                    relation.target.clone(),
+                )),
         });
     }
     for point_steps in &mut steps {
-        point_steps.sort_by_key(|step| step.event_index);
+        point_steps.sort_by_key(|step| (step.event_index, !step.before_call));
     }
 
     // Seeds live before a point's events: `(point, seed, carrier, uncertain)`.

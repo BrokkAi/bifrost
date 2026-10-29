@@ -19,16 +19,16 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionCallableParameterFact, ResolutionCallableReceiverFact,
     ResolutionCallableReceiverForm, ResolutionCallableReceiverOrigin,
     ResolutionCallableReceiverOriginFact, ResolutionCallableResultBindingFact,
-    ResolutionCallableResultTypeParameterFact, ResolutionCallableSignatureFact,
-    ResolutionConditionalBinderFact, ResolutionDeclarationVisibilityFact,
-    ResolutionDeclaredTypeRelationFact, ResolutionDeclaredTypeRelationKind,
-    ResolutionDeferredMemberOwnerFact, ResolutionDefinitionUnitFact,
-    ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind, ResolutionGapFact,
-    ResolutionGapKind, ResolutionGenericFormalDefaultFact, ResolutionGenericFormalFact,
-    ResolutionGenericTypeAliasParameterFact, ResolutionIdentifierRole, ResolutionLocalWriteFact,
-    ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberOwnerFact,
-    ResolutionMemberQualifierCompatibility, ResolutionNameId, ResolutionNamespace,
-    ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact,
+    ResolutionCallableResultTypeFact, ResolutionCallableResultTypeParameterFact,
+    ResolutionCallableSignatureFact, ResolutionConditionalBinderFact,
+    ResolutionDeclarationVisibilityFact, ResolutionDeclaredTypeRelationFact,
+    ResolutionDeclaredTypeRelationKind, ResolutionDeferredMemberOwnerFact,
+    ResolutionDefinitionUnitFact, ResolutionEngineRuleEligibilityFact, ResolutionEngineRuleKind,
+    ResolutionGapFact, ResolutionGapKind, ResolutionGenericFormalDefaultFact,
+    ResolutionGenericFormalFact, ResolutionGenericTypeAliasParameterFact, ResolutionIdentifierRole,
+    ResolutionLocalWriteFact, ResolutionMemberAccess, ResolutionMemberKind,
+    ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility, ResolutionNameId,
+    ResolutionNamespace, ResolutionReferenceEnumerationGapFact, ResolutionReferenceOwnerFact,
     ResolutionRelationMemberFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
     ResolutionRootImportDemandFact, ResolutionRootImportDemandTarget,
     ResolutionRootImportDemandTargetFact, ResolutionRootImportFact, ResolutionRootImportKind,
@@ -369,6 +369,7 @@ pub(crate) struct RustResolutionBuilder<'source> {
     item_scopes: HashMap<ResolutionScopeId, ResolutionScopeId>,
     handled_identifiers: HashSet<usize>,
     type_reference_identities: HashMap<(usize, ResolutionScopeId), ResolutionTypeSlotId>,
+    conditional_type_applications: HashMap<(usize, ResolutionScopeId), ResolutionTypeSlotId>,
     lowered_type_application_arguments: HashSet<(ResolutionTypeSlotId, u32)>,
     consumed_subtrees: HashSet<usize>,
     pending_glob_imports: Vec<ResolutionSiteId>,
@@ -522,6 +523,7 @@ impl<'source> RustResolutionBuilder<'source> {
             item_scopes: HashMap::new(),
             handled_identifiers: HashSet::new(),
             type_reference_identities: HashMap::new(),
+            conditional_type_applications: HashMap::new(),
             lowered_type_application_arguments: HashSet::new(),
             consumed_subtrees: HashSet::new(),
             pending_glob_imports: Vec::new(),
@@ -2447,7 +2449,7 @@ impl<'source> RustResolutionBuilder<'source> {
                     if lowered.indirection == lowered.reference_indirection
                         && lowered.reference_indirection > 0
                         && reference_member_owner.is_some_and(|owner| {
-                            rust_is_supported_inherent_impl_target(owner, self.source)
+                            rust_has_nominal_type_head(owner, self.source)
                         }) =>
                 {
                     // Keep the reference target's own subject frontier and
@@ -2465,7 +2467,7 @@ impl<'source> RustResolutionBuilder<'source> {
                 Some(lowered)
                     if lowered.indirection == 0
                         && lowered.reference_indirection == 0
-                        && rust_is_supported_inherent_impl_target(target, self.source) =>
+                        && rust_has_nominal_type_head(target, self.source) =>
                 {
                     (
                         self.lower_nominal_type_identity(target)
@@ -2476,9 +2478,7 @@ impl<'source> RustResolutionBuilder<'source> {
                 }
                 // The subject's type syntax carries an identity this fragment
                 // cannot name, or none at all: a reference, a slice, a tuple, a
-                // primitive, a `dyn` object, or a wrapper head that projects
-                // its payload and would attach these members to the payload's
-                // declaration. The impl still has members, and their bodies are
+                // primitive, or a `dyn` object. The impl still has members, and their bodies are
                 // ordinary source, so it takes a frontier that resolves to
                 // nothing and says so rather than losing the whole body.
                 Some(_) | None => {
@@ -2553,9 +2553,8 @@ impl<'source> RustResolutionBuilder<'source> {
                     | "scoped_identifier"
                     | "generic_type"
             ) || rust_is_unmodelled_primitive_spelling(target, self.source)
-                || reference_member_owner.is_some_and(|owner| {
-                    rust_is_supported_inherent_impl_target(owner, self.source)
-                }),
+                || reference_member_owner
+                    .is_some_and(|owner| rust_has_nominal_type_head(owner, self.source)),
         };
         assert!(
             self.inherent_impls.insert(node.id(), context).is_none(),
@@ -4019,6 +4018,19 @@ impl<'source> RustResolutionBuilder<'source> {
                 slot: declared,
                 role: DeclarationTypeRole::Return,
             });
+        let signature = self
+            .facts
+            .callable_signatures
+            .iter_mut()
+            .find(|signature| signature.callable == declaration)
+            .expect("a callable return belongs to its signature");
+        assert!(signature.result_types.is_empty(), "one Rust return type");
+        signature
+            .result_types
+            .push(ResolutionCallableResultTypeFact {
+                ordinal: 0,
+                value_type: declared,
+            });
         if let Some(lowered) = type_identity {
             self.facts.type_transfers.push(ResolutionTypeTransferFact {
                 input: lowered.identity,
@@ -4373,50 +4385,29 @@ impl<'source> RustResolutionBuilder<'source> {
                     let head = node
                         .child_by_field_name("type")
                         .expect("Rust generic_type has a type field");
-                    if let Some(application) = self
-                        .lower_declared_type_identity(head)
-                        .map(|lowered| lowered.identity)
-                        && !self.lower_type_application_arguments(arguments, application)
-                    {
+                    let application = self.lower_declared_type_identity(head)?.identity;
+                    let (complete, nested_applications) =
+                        self.lower_type_application_arguments(arguments, application);
+                    if !complete {
                         frontier_gaps.push(ResolutionGapKind::UnsupportedTypeSyntax);
                     }
-                    match rust_projected_payload(head, arguments, self.source) {
-                        Some(RustProjectedPayload::Dereferenced(payload)) => {
-                            // `Box<T>`, `Arc<T>` and `Rc<T>` dereference to
-                            // `T`, so member lookup on such a value reaches
-                            // `T` with no explicit operation. Project the
-                            // payload at the same depth as the pointer and
-                            // leave the head identifier to the ordinary
-                            // walker, which keeps it in the reference
-                            // inventory. The payload is proven, so the
-                            // arguments carry no gap.
-                            node = payload;
-                            continue;
-                        }
-                        Some(RustProjectedPayload::Unwrapped(payload)) => {
-                            // `Option<T>` and `Result<T, E>` are not
-                            // transparent: their payload is reached only
-                            // through an explicit `?`, `.unwrap()` or
-                            // `.expect(..)`. Project the payload behind one
-                            // unproven indirection layer, which member lookup
-                            // already refuses, so an un-unwrapped receiver
-                            // cannot reach the payload's members. An `Unwrap`
-                            // transfer at the unwrap site discharges exactly
-                            // that layer.
-                            let Some(next_indirection) = indirection.checked_add(1) else {
-                                self.add_semantic_gap(
-                                    node,
-                                    ResolutionGapKind::UnsupportedTypeSyntax,
-                                );
-                                return None;
-                            };
-                            indirection = next_indirection;
-                            node = payload;
-                            continue;
-                        }
-                        None => {}
+                    // Written argument rows remain nominal, as they do in impl
+                    // subjects. Receiver payloads have separate conditional
+                    // outputs, selected only when an enclosing wrapper projects.
+                    for (nested, nominal) in nested_applications {
+                        self.conditional_type_application(nested, nominal);
                     }
-                    node = head;
+                    let identity = self.conditional_type_application(node, application);
+                    self.add_frontier_gaps(
+                        self.facts.type_slots[application.index()].site,
+                        &frontier_gaps,
+                    );
+                    return Some(LoweredDeclaredType {
+                        identity,
+                        indirection,
+                        reference_indirection,
+                        head_name: None,
+                    });
                 }
                 "dynamic_type" | "abstract_type" | "bounded_type" => {
                     let mut head = node;
@@ -5119,7 +5110,13 @@ impl<'source> RustResolutionBuilder<'source> {
             .expect("generic parameters have an item owner");
         let formal_owner = matches!(
             item.kind(),
-            "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item"
+            "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "type_item"
+                | "function_item"
+                | "function_signature_item"
         )
         .then(|| self.declaration_sites[&item.id()]);
         // Match written application positions: skip lifetimes, but reserve a
@@ -5529,7 +5526,10 @@ impl<'source> RustResolutionBuilder<'source> {
                     let arguments = node
                         .child_by_field_name("type_arguments")
                         .expect("Rust generic_type has type_arguments");
-                    if !self.lower_type_application_arguments(arguments, lowered.identity) {
+                    if !self
+                        .lower_type_application_arguments(arguments, lowered.identity)
+                        .0
+                    {
                         self.add_semantic_gap(arguments, ResolutionGapKind::UnsupportedTypeSyntax);
                     }
                     let lowered = LoweredDeclaredType {
@@ -5690,7 +5690,38 @@ impl<'source> RustResolutionBuilder<'source> {
         } else {
             (expression, None)
         };
-        let mut lowered = self.lower_declared_type_identity(head)?;
+        // A formal inside a callable's applied return is a symbolic identity
+        // for selected result instantiation. Its ordinary Identity frontier
+        // remains the bound surface used for parameter/member lookup.
+        let mut ancestor = head.parent();
+        let mut symbolic_formal = false;
+        while let Some(item) = ancestor {
+            if matches!(item.kind(), "function_item" | "function_signature_item") {
+                if item
+                    .child_by_field_name("return_type")
+                    .is_some_and(|result| {
+                        result.start_byte() <= head.start_byte()
+                            && head.end_byte() <= result.end_byte()
+                    })
+                    && head.kind() == "type_identifier"
+                {
+                    let name = self.intern_name(head);
+                    symbolic_formal = self.callable_type_parameters(item).0.contains(&Some(name));
+                }
+                break;
+            }
+            ancestor = item.parent();
+        }
+        let mut lowered = if symbolic_formal {
+            LoweredDeclaredType {
+                identity: self.lower_nominal_type_identity(head)?,
+                indirection: 0,
+                reference_indirection: 0,
+                head_name: None,
+            }
+        } else {
+            self.lower_declared_type_identity(head)?
+        };
         lowered.indirection = indirection.saturating_add(lowered.indirection);
         lowered.reference_indirection =
             reference_indirection.saturating_add(lowered.reference_indirection);
@@ -5736,15 +5767,51 @@ impl<'source> RustResolutionBuilder<'source> {
         Some(slot)
     }
 
+    /// Keep the written nominal application separate from its query-time
+    /// receiver projection. The map is scoped to this blob's lowering.
+    fn conditional_type_application(
+        &mut self,
+        node: Node<'_>,
+        input: ResolutionTypeSlotId,
+    ) -> ResolutionTypeSlotId {
+        let key = (node.id(), self.current_scope());
+        if let Some(&output) = self.conditional_type_applications.get(&key) {
+            return output;
+        }
+        let site = self.add_site(
+            node,
+            ResolutionSiteKind::TypeReference,
+            self.current_scope(),
+        );
+        let output = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
+            .expect("Rust type-slot count fits u32");
+        self.facts.type_slots.push(ResolutionTypeSlotFact {
+            id: output,
+            site,
+            role: ResolutionTypeSlotRole::TargetTypeIdentity,
+        });
+        self.facts.type_transfers.push(ResolutionTypeTransferFact {
+            input,
+            output,
+            kind: ResolutionTypeTransferKind::ConditionalPayload,
+            indirection_delta: 0,
+            reference_indirection_delta: 0,
+            value_transform: ResolutionTypeTransferValueTransform::Preserve,
+        });
+        self.conditional_type_applications.insert(key, output);
+        output
+    }
+
     /// Persist supported arguments without shifting unknown positions. Nested
     /// applications use an explicit stack rather than recursive Rust calls.
-    fn lower_type_application_arguments(
+    fn lower_type_application_arguments<'tree>(
         &mut self,
-        arguments: Node<'_>,
+        arguments: Node<'tree>,
         application: ResolutionTypeSlotId,
-    ) -> bool {
+    ) -> (bool, Vec<(Node<'tree>, ResolutionTypeSlotId)>) {
         let mut pending = vec![(arguments, application)];
         let mut complete = true;
+        let mut applications = Vec::new();
         while let Some((arguments, application)) = pending.pop() {
             let mut cursor = arguments.walk();
             let mut ordinal = 0_u32;
@@ -5780,11 +5847,15 @@ impl<'source> RustResolutionBuilder<'source> {
                     });
                 }
                 if let Some(nested) = nested {
+                    applications.push((
+                        nested.parent().expect("type arguments have an application"),
+                        lowered.identity,
+                    ));
                     pending.push((nested, lowered.identity));
                 }
             }
         }
-        complete
+        (complete, applications)
     }
 
     fn lower_module(&mut self, node: Node<'_>) {
@@ -10216,93 +10287,6 @@ fn rust_unwrapped_receiver_operand<'tree>(
         .then_some((operand, layers))
 }
 
-/// How a declared wrapper type's payload reaches member lookup.
-enum RustProjectedPayload<'tree> {
-    /// `Box<T>`, `Arc<T>` and `Rc<T>` dereference to `T`, so a receiver of one
-    /// reaches `T`'s members at the pointer's own depth.
-    Dereferenced(Node<'tree>),
-    /// `Option<T>` and `Result<T, E>` yield `T` only through an explicit
-    /// unwrap, so the payload sits behind one unproven indirection layer.
-    Unwrapped(Node<'tree>),
-}
-
-/// The payload argument a `generic_type` wrapper head projects in place of the
-/// head itself, when the argument has a shape `lower_declared_type_identity`
-/// already understands.
-///
-/// These five heads are library types, so no workspace ever declares them and
-/// the head reference resolves to nothing. Their payload is what a receiver of
-/// that type can reach, which is why the deleted incumbent Rust graph projected
-/// the same first argument and refused an un-unwrapped `Result` receiver; the
-/// `Unwrap` typed transfer carries that refusal now.
-///
-/// The head name is read from the AST's terminal path segment, never from
-/// display text of the whole path. An argument list of an unexpected arity, or
-/// a first argument that is a lifetime, a const argument or a binding, leaves
-/// the head unprojected so it keeps its existing treatment instead of an
-/// invented payload. `Result` accepts one argument as well as two because the
-/// standard single-argument aliases such as `io::Result<T>` carry the same
-/// payload in the same position.
-fn rust_projected_payload<'tree>(
-    head: Node<'_>,
-    arguments: Node<'tree>,
-    source: &str,
-) -> Option<RustProjectedPayload<'tree>> {
-    let name = rust_nominal_head_name(head, source)?;
-    let mut cursor = arguments.walk();
-    let named = arguments.named_children(&mut cursor).collect::<Vec<_>>();
-    let first = *named.first()?;
-    if !matches!(
-        first.kind(),
-        "type_identifier"
-            | "identifier"
-            | "primitive_type"
-            | "scoped_type_identifier"
-            | "scoped_identifier"
-            | "qualified_type"
-            | "generic_type"
-            | "reference_type"
-            | "pointer_type"
-            | "dynamic_type"
-            | "abstract_type"
-            | "bounded_type"
-    ) {
-        return None;
-    }
-    match (name, named.len()) {
-        ("Box" | "Arc" | "Rc", 1) => Some(RustProjectedPayload::Dereferenced(first)),
-        ("Option", 1) | ("Result", 1 | 2) => Some(RustProjectedPayload::Unwrapped(first)),
-        _ => None,
-    }
-}
-
-/// Whether a nominal type head names a wrapper whose declared type is its
-/// payload rather than the head itself.
-///
-/// An inherent impl written against such a head would attach its members to
-/// the payload. Rust's orphan rule makes that impl impossible outside the crate
-/// that declares the wrapper, so the impl target is refused as an unsupported
-/// member scope rather than recorded with the wrong owner.
-fn rust_head_projects_its_payload(head: Node<'_>, source: &str) -> bool {
-    matches!(
-        rust_nominal_head_name(head, source),
-        Some("Box" | "Arc" | "Rc" | "Option" | "Result")
-    )
-}
-
-/// The terminal path segment of a nominal type head, read from the AST's
-/// `name` field rather than from display text of the whole path.
-fn rust_nominal_head_name<'source>(head: Node<'_>, source: &'source str) -> Option<&'source str> {
-    let terminal = match head.kind() {
-        "type_identifier" | "identifier" => head,
-        "scoped_type_identifier" | "scoped_identifier" => spelled_name(head)?,
-        _ => return None,
-    };
-    Some(strip_raw_identifier_prefix(
-        rust_node_text(terminal, source).trim(),
-    ))
-}
-
 /// The projection a Rust path is rooted at, when the path has no lexical root.
 ///
 /// `<Service as Runner>::Output` and `<Service>::Output` both spell their head
@@ -10343,20 +10327,9 @@ fn rust_reference_impl_member_owner(mut node: Node<'_>) -> Option<Node<'_>> {
     saw_reference.then_some(node)
 }
 
-fn rust_is_supported_inherent_impl_target(mut node: Node<'_>, source: &str) -> bool {
+// Grammar eligibility only; selected resolution establishes the head's identity.
+fn rust_has_nominal_type_head(mut node: Node<'_>, source: &str) -> bool {
     while node.kind() == "generic_type" {
-        // A wrapper head projects its payload as the declared type, so an impl
-        // written against one would attach its members to the payload rather
-        // than to the wrapper. Rust's orphan rule makes such an impl impossible
-        // outside the crate that declares the wrapper; refuse it as an
-        // unsupported member scope rather than record the wrong owner.
-        if rust_head_projects_its_payload(
-            node.child_by_field_name("type")
-                .expect("Rust generic_type has a type field"),
-            source,
-        ) {
-            return false;
-        }
         node = node
             .child_by_field_name("type")
             .expect("Rust generic_type has a type field");
@@ -17010,7 +16983,6 @@ cfg_if::cfg_if! {
     #[brokk_bifrost_test_macros::hardwon(
         "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: local wrapper names lost nominal impl owners"
     )]
-    #[ignore = "finds real bug (#6844): local wrapper names are classified as std types before resolution"]
     fn quicksilver_local_wrapper_impl_has_nominal_subject() {
         for name in ["Box", "Option", "Result", "Arc", "Rc"] {
             let source =
@@ -17036,7 +17008,6 @@ cfg_if::cfg_if! {
     #[brokk_bifrost_test_macros::hardwon(
         "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: legal local trait impls for foreign wrappers lost their subjects"
     )]
-    #[ignore = "finds real bug (#6844): local trait impls for foreign wrappers lose their nominal subjects"]
     fn quicksilver_local_trait_foreign_wrapper_has_nominal_subject() {
         let source = "trait Local { fn method(&self); } impl Local for std::boxed::Box<u8> { fn method(&self) {} }";
         let facts = parse_and_extract(source);

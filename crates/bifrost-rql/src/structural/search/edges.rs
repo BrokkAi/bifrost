@@ -21,7 +21,7 @@ use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryRange,
     CodeQueryReferenceEdge,
 };
-use super::{DeclarationValue, rel_path_string};
+use super::{DeclarationValue, DerivationExecutionCause, rel_path_string};
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
@@ -288,16 +288,25 @@ impl EdgeTraversalCache {
     /// adapter the axis claims belong to.
     pub(super) fn report_completeness(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         subject: &str,
         language: Language,
         result: &EdgeDerivationResult,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
-        self.report_completeness_for_subject(subject, None, language, result, diagnostics);
+        self.report_completeness_for_subject(
+            analyzer,
+            subject,
+            None,
+            language,
+            result,
+            diagnostics,
+        );
     }
 
     pub(super) fn report_inverse_completeness(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         declaration: &CodeUnit,
         language: Language,
         result: &EdgeDerivationResult,
@@ -305,6 +314,7 @@ impl EdgeTraversalCache {
     ) {
         let subject = declaration.fq_name();
         self.report_completeness_for_subject(
+            analyzer,
             &subject,
             Some(declaration),
             language,
@@ -315,6 +325,7 @@ impl EdgeTraversalCache {
 
     fn report_completeness_for_subject(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         subject: &str,
         _inverse_declaration: Option<&CodeUnit>,
         language: Language,
@@ -382,11 +393,25 @@ impl EdgeTraversalCache {
                 | EdgeIncompleteReason::InverseIndexTargetUncovered
                 | EdgeIncompleteReason::TimeBudgetExceeded
                 | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => {
+                    let cause = match reason {
+                        EdgeIncompleteReason::Cancelled => {
+                            Some(DerivationExecutionCause::Cancelled)
+                        }
+                        EdgeIncompleteReason::TimeBudgetExceeded
+                        | EdgeIncompleteReason::UsageListingTruncated => {
+                            Some(DerivationExecutionCause::Budget)
+                        }
+                        EdgeIncompleteReason::UsageAnalysisFailed { .. }
+                        | EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => {
+                            Some(DerivationExecutionCause::Provider)
+                        }
+                        _ => None,
+                    };
                     let code = CodeQueryDiagnosticCode::EdgeDerivationIncomplete;
                     if !self.reported.insert((subject.to_string(), code)) {
                         continue;
                     }
-                    diagnostics.push(CodeQueryDiagnostic {
+                    diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic {
                         related: Vec::new(),
                         source: None,
                         code,
@@ -399,7 +424,7 @@ impl EdgeTraversalCache {
                         ),
                     exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
-                    });
+                    }, cause));
                 }
             }
         }

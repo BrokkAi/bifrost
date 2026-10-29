@@ -27,7 +27,7 @@
 use crate::workspace_packages::WorkspacePackageIndex;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::project::Project;
-use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -64,6 +64,8 @@ pub struct AliasResolver {
     /// `config file path` → its fully-resolved alias map (extends already followed).
     /// `None` means the file was unreadable/unparseable or declared no usable `paths`.
     maps: Mutex<HashMap<PathBuf, Arc<Option<AliasMap>>>>,
+    /// Same lifetime and growth as `maps`; contains config paths consulted by resolution.
+    read_config_paths: Mutex<HashSet<PathBuf>>,
     /// The workspace's own npm packages, built on the first bare specifier that no
     /// alias claims.
     packages: OnceLock<Arc<WorkspacePackageIndex>>,
@@ -157,6 +159,7 @@ impl AliasResolver {
             project,
             nearest: Mutex::new(HashMap::default()),
             maps: Mutex::new(HashMap::default()),
+            read_config_paths: Mutex::new(HashSet::default()),
             packages: OnceLock::new(),
         }
     }
@@ -189,6 +192,14 @@ impl AliasResolver {
             bases.push(relative.to_path_buf());
         }
         bases
+    }
+
+    /// Whether config resolution read or attempted to read this workspace file.
+    pub fn read_config_path(&self, file: &ProjectFile) -> bool {
+        self.read_config_paths
+            .lock()
+            .unwrap()
+            .contains(&file.abs_path().normalize())
     }
 
     /// Candidate entry paths (relative to the repo root) for a bare `specifier`
@@ -229,7 +240,14 @@ impl AliasResolver {
                 "no governing tsconfig could be found for TypeScript library selection",
             );
         };
-        effective_library_selection_for_config(&config_path, &self.canonical_root)
+        let mut reads = HashSet::default();
+        let selection = effective_library_selection_for_config_with_reads(
+            &config_path,
+            &self.canonical_root,
+            &mut reads,
+        );
+        self.read_config_paths.lock().unwrap().extend(reads);
+        selection
     }
 
     /// The workspace package index, built once per resolver on first use.
@@ -253,18 +271,25 @@ impl AliasResolver {
         if let Some(cached) = self.nearest.lock().unwrap().get(&dir) {
             return cached.clone();
         }
-        let resolved = self.find_config_from(&dir);
+        let mut reads = HashSet::default();
+        let resolved = self.find_config_from(&dir, &mut reads);
+        self.read_config_paths.lock().unwrap().extend(reads);
         self.nearest.lock().unwrap().insert(dir, resolved.clone());
         resolved
     }
 
-    fn find_config_from(&self, start_rel_dir: &Path) -> Option<PathBuf> {
+    fn find_config_from(
+        &self,
+        start_rel_dir: &Path,
+        reads: &mut HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
         let mut current: Option<&Path> = Some(start_rel_dir);
         loop {
             let rel_dir = current.unwrap_or_else(|| Path::new(""));
             let abs_dir = self.root.join(rel_dir);
             for name in CONFIG_FILENAMES {
-                let candidate = abs_dir.join(name);
+                let candidate = abs_dir.join(name).normalize();
+                reads.insert(candidate.clone());
                 if candidate.is_file() {
                     return Some(candidate);
                 }
@@ -279,7 +304,13 @@ impl AliasResolver {
         if let Some(cached) = self.maps.lock().unwrap().get(config_path) {
             return cached.clone();
         }
-        let resolved = Arc::new(build_alias_map(config_path, &self.canonical_root));
+        let mut reads = HashSet::default();
+        let resolved = Arc::new(build_alias_map(
+            config_path,
+            &self.canonical_root,
+            &mut reads,
+        ));
+        self.read_config_paths.lock().unwrap().extend(reads);
         self.maps
             .lock()
             .unwrap()
@@ -294,6 +325,18 @@ impl AliasResolver {
 pub fn effective_library_selection_for_config(
     config_path: &Path,
     canonical_root: &Path,
+) -> TypeScriptLibrarySelection {
+    effective_library_selection_for_config_with_reads(
+        config_path,
+        canonical_root,
+        &mut HashSet::default(),
+    )
+}
+
+fn effective_library_selection_for_config_with_reads(
+    config_path: &Path,
+    canonical_root: &Path,
+    reads: &mut HashSet<PathBuf>,
 ) -> TypeScriptLibrarySelection {
     let Some(root) = canonical_root
         .canonicalize()
@@ -314,7 +357,7 @@ pub fn effective_library_selection_for_config(
         );
     };
     let mut budget = MAX_CONFIG_READS;
-    let Some(effective) = resolve_effective(&config, &[], &mut budget, &root) else {
+    let Some(effective) = resolve_effective(&config, &[], &mut budget, &root, reads) else {
         return TypeScriptLibrarySelection::incomplete(
             "tsconfig could not be parsed or its extends chain is unavailable",
         );
@@ -366,9 +409,13 @@ fn best_match(entries: &[AliasEntry], specifier: &str) -> Option<Vec<String>> {
 
 /// Parse a config file and flatten its `extends` chain into a single alias map.
 /// `canonical_root` bounds `extends` resolution to the repo (see [`existing_config_path`]).
-fn build_alias_map(config_path: &Path, canonical_root: &Path) -> Option<AliasMap> {
+fn build_alias_map(
+    config_path: &Path,
+    canonical_root: &Path,
+    reads: &mut HashSet<PathBuf>,
+) -> Option<AliasMap> {
     let mut budget = MAX_CONFIG_READS;
-    let effective = resolve_effective(config_path, &[], &mut budget, canonical_root)?;
+    let effective = resolve_effective(config_path, &[], &mut budget, canonical_root, reads)?;
     let (paths_dir, entries) = effective.paths?;
     if entries.is_empty() {
         return None;
@@ -457,6 +504,7 @@ fn resolve_effective(
     ancestors: &[PathBuf],
     budget: &mut u32,
     canonical_root: &Path,
+    reads: &mut HashSet<PathBuf>,
 ) -> Option<EffectiveConfig> {
     if ancestors.len() > MAX_EXTENDS_DEPTH
         || ancestors.iter().any(|seen| seen == config_path)
@@ -465,6 +513,7 @@ fn resolve_effective(
         return None;
     }
     *budget -= 1;
+    reads.insert(config_path.to_path_buf().normalize());
 
     // Cap the read so a hostile repo can't OOM the analyzer with a giant config.
     if std::fs::metadata(config_path).ok()?.len() > MAX_CONFIG_BYTES {
@@ -501,11 +550,11 @@ fn resolve_effective(
         },
     };
     for target in extends {
-        let Some(path) = resolve_extends_path(&dir, &target, canonical_root) else {
+        let Some(path) = resolve_extends_path(&dir, &target, canonical_root, reads) else {
             inherited.library_invalid = true;
             continue;
         };
-        match resolve_effective(&path, &chain, budget, canonical_root) {
+        match resolve_effective(&path, &chain, budget, canonical_root, reads) {
             Some(parent) => inherited = inherited.overlay(parent),
             None => inherited.library_invalid = true,
         }
@@ -603,18 +652,19 @@ fn resolve_extends_path(
     from_dir: &Path,
     specifier: &str,
     canonical_root: &Path,
+    reads: &mut HashSet<PathBuf>,
 ) -> Option<PathBuf> {
     if Path::new(specifier).is_absolute() {
         return None;
     }
     if specifier.starts_with('.') {
-        return existing_config_path(&from_dir.join(specifier), canonical_root);
+        return existing_config_path(&from_dir.join(specifier), canonical_root, reads);
     }
     // Bare/package specifier: search `node_modules` from this dir upward.
     let mut current = Some(from_dir);
     while let Some(dir) = current {
         let base = dir.join("node_modules").join(specifier);
-        if let Some(found) = existing_config_path(&base, canonical_root) {
+        if let Some(found) = existing_config_path(&base, canonical_root, reads) {
             return Some(found);
         }
         current = dir.parent();
@@ -627,16 +677,23 @@ fn resolve_extends_path(
 /// files whose symlink-resolved location stays under `canonical_root` are returned, so a
 /// malicious `extends` (`"../../../etc/passwd"`, or a repo symlink pointing out of tree)
 /// can never be read.
-fn existing_config_path(path: &Path, canonical_root: &Path) -> Option<PathBuf> {
+fn existing_config_path(
+    path: &Path,
+    canonical_root: &Path,
+    reads: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
     let direct = path.to_path_buf().normalize();
+    reads.insert(direct.clone());
     if is_contained_file(&direct, canonical_root) {
         return Some(direct);
     }
     let with_json = PathBuf::from(format!("{}.json", path.to_string_lossy())).normalize();
+    reads.insert(with_json.clone());
     if is_contained_file(&with_json, canonical_root) {
         return Some(with_json);
     }
     let nested = path.join("tsconfig.json").normalize();
+    reads.insert(nested.clone());
     if is_contained_file(&nested, canonical_root) {
         return Some(nested);
     }
@@ -1331,8 +1388,14 @@ mod tests {
         let missing = resolver.effective_library_selection(&source);
         assert!(!missing.is_complete());
         std::fs::write(root.join("tsconfig.json"), r#"{"compilerOptions": []}"#).unwrap();
-        let malformed_options = resolver.effective_library_selection(&source);
+        let malformed_options = resolver_for(root).effective_library_selection(&source);
         assert!(!malformed_options.is_complete());
+        assert!(
+            malformed_options
+                .diagnostics()
+                .iter()
+                .any(|d| d.contains("compilerOptions"))
+        );
         std::fs::write(
             root.join("base.json"),
             r#"{"compilerOptions":{"lib":["es5"]}}"#,
@@ -1343,7 +1406,7 @@ mod tests {
             r#"{"extends":["./base.json",42]}"#,
         )
         .unwrap();
-        let malformed_extends = resolver.effective_library_selection(&source);
+        let malformed_extends = resolver_for(root).effective_library_selection(&source);
         assert!(!malformed_extends.is_complete());
         assert!(canonical_library_name("es2015.full").is_none());
         assert!(canonical_library_name("esnext.iterator").is_none());
@@ -1377,5 +1440,132 @@ mod tests {
         assert!(es2020.contains(&"es2019".to_owned()));
         assert!(es2020.contains(&"es2020.promise".to_owned()));
         assert!(!es2020.contains(&"dom".to_owned()));
+    }
+    #[test]
+    fn jsonc_library_defaults_and_aliases_cross_the_reader_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        for (options, expected, explicit) in [
+            (r#"{}"#, "es5", false),
+            (r#"{"target":"ES6"}"#, "es2015", false),
+            (r#"{"lib":["es6",],}"#, "es2015", true),
+        ] {
+            std::fs::write(
+                dir.path().join("tsconfig.json"),
+                format!(r#"{{"compilerOptions":{options}}}"#),
+            )
+            .unwrap();
+            let selection =
+                resolver_for(dir.path()).effective_library_selection(&deliver_in(dir.path()));
+            assert!(selection.is_complete(), "{selection:?}");
+            assert_eq!(selection.is_explicit(), explicit);
+            assert!(
+                selection.libraries().contains(&expected.to_owned()),
+                "{selection:?}"
+            );
+            assert!(
+                !selection.libraries().contains(&"es2016".to_owned()),
+                "{selection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_candidates_keep_fallback_order_and_child_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(root.join("base.json"), r#"{"compilerOptions":{"baseUrl":"old","paths":{"@lib":["../../outside/lib","lib"],"@/*":["first/*"],"@/*.ts":["second/*"]}}}"#).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"extends":"./base.json","compilerOptions":{"baseUrl":"new"}}"#,
+        )
+        .unwrap();
+        let resolver = resolver_for(root);
+        assert_eq!(
+            resolver.candidate_bases(&deliver_in(root), "@lib"),
+            [PathBuf::from("new/lib")]
+        );
+        assert_eq!(
+            resolver.candidate_bases(&deliver_in(root), "@/file.ts"),
+            [PathBuf::from("new/first/file.ts")]
+        );
+    }
+
+    #[test]
+    fn extends_chain_accepts_exact_depth_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for depth in [15, 16, 17] {
+            for index in 0..=depth {
+                let config = if index == depth {
+                    serde_json::json!({"compilerOptions":{"lib":["es2015"]}})
+                } else {
+                    serde_json::json!({"extends":format!("./{}.json",index+1)})
+                };
+                std::fs::write(dir.path().join(format!("{index}.json")), config.to_string())
+                    .unwrap();
+            }
+            let selection =
+                effective_library_selection_for_config(&dir.path().join("0.json"), dir.path());
+            assert_eq!(
+                selection.is_complete(),
+                depth <= 16,
+                "depth {depth}: {selection:?}"
+            );
+            if depth <= 16 {
+                assert_eq!(selection.libraries(), ["es2015"]);
+            }
+        }
+    }
+
+    struct UnavailableProject {
+        root: PathBuf,
+    }
+    impl Project for UnavailableProject {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+        fn analyzer_languages(
+            &self,
+        ) -> std::collections::BTreeSet<brokk_bifrost_core::analyzer::Language> {
+            unimplemented!()
+        }
+        fn all_files(&self) -> std::io::Result<std::collections::BTreeSet<ProjectFile>> {
+            Err(std::io::Error::other("inventory unavailable"))
+        }
+        fn analyzable_files(
+            &self,
+            _: brokk_bifrost_core::analyzer::Language,
+        ) -> std::io::Result<std::collections::BTreeSet<ProjectFile>> {
+            unimplemented!()
+        }
+        fn file_by_rel_path(&self, _: &Path) -> Option<ProjectFile> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn unavailable_inventory_and_delayed_root_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let resolver = AliasResolver::new(Arc::new(UnavailableProject { root: root.clone() }));
+        assert!(resolver.workspace_package_bases("not-present").is_empty());
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(dir.path().join("outside.json"), OUT_OF_ROOT_CONFIG).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"extends":"../outside.json"}"#,
+        )
+        .unwrap();
+        assert!(
+            resolver
+                .candidate_bases(&deliver_in(&root), "@/lib")
+                .is_empty()
+        );
+        assert!(
+            !resolver
+                .effective_library_selection(&deliver_in(&root))
+                .is_complete()
+        );
     }
 }

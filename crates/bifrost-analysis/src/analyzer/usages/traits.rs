@@ -29,6 +29,30 @@ pub trait PreparedUsageQuery: Send + Sync {
 
 /// Strategy for resolving usages of one or more overloads within a candidate file set.
 pub trait UsageAnalyzer: Send + Sync {
+    /// Independent queries with the same admission as `find_usages`.
+    ///
+    /// Memo hits replay publications but not read-ledger keys. Policy units must
+    /// not route through this batch API until hits also replay their read keys
+    /// (#7262). Dead-code reports are neither persisted nor policy units.
+    fn find_usages_batch(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        queries: &[GraphUsageBatchQuery<'_>],
+        max_usages: usize,
+    ) -> Vec<FuzzyResult> {
+        queries
+            .iter()
+            .map(|query| {
+                self.find_usages(
+                    analyzer,
+                    query.overloads,
+                    query.scope.candidate_files(),
+                    max_usages,
+                )
+            })
+            .collect()
+    }
+
     fn find_usages(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -59,6 +83,30 @@ pub trait GraphUsageAnalyzer: Send + Sync {
     /// in one.
     fn proof_authority(&self) -> UsageProofAuthority {
         UsageProofAuthority::Legacy
+    }
+
+    /// Prepare a complete target-directed inventory without generic candidate
+    /// discovery. A returned plan owns every nomination, including unproven
+    /// sites, so importer and hierarchy prepasses cannot add useful coverage.
+    /// The framework still applies file and source-byte admission to its files.
+    /// Explicit candidate providers bypass this hook; returning None preserves
+    /// generic discovery and prepare_usage_query. Preparation must preserve the
+    /// complete inventory and proof/completion evidence, not merely proven hits.
+    ///
+    /// PythonNativeUsageStrategy is the only current opt-in: its selected reverse
+    /// operation owns all nominations independently of generic candidates. Java
+    /// and Kotlin production strategies still consume generic discovery; explicit
+    /// native JVM test queries already bypass it. Go uses canonical per-file
+    /// hierarchy facts and Rust uses trait-directed hierarchy reads, neither the
+    /// all-declaration hydration prepass removed for Python. They retain their
+    /// existing preparation/scoping contracts rather than opt in implicitly.
+    fn prepare_target_usage_query(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _overloads: &[CodeUnit],
+        _cancellation: &CancellationToken,
+    ) -> Option<Box<dyn PreparedUsageQuery>> {
+        None
     }
 
     /// Prepare language-specific candidate and resolver state before generic
@@ -103,6 +151,18 @@ impl<T> UsageAnalyzer for T
 where
     T: GraphUsageAnalyzer,
 {
+    fn find_usages_batch(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        queries: &[GraphUsageBatchQuery<'_>],
+        max_usages: usize,
+    ) -> Vec<FuzzyResult> {
+        self.find_graph_usages_batch(analyzer, queries, max_usages)
+            .into_iter()
+            .map(GraphUsageOutcome::into_fuzzy_result)
+            .collect()
+    }
+
     fn find_usages(
         &self,
         analyzer: &dyn IAnalyzer,

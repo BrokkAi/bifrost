@@ -22,18 +22,35 @@ mod default_arguments;
 pub(crate) mod diagnostics;
 mod exception_identity;
 pub mod external;
+#[doc(hidden)]
+pub mod external_authority;
 mod guard_summary;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
 #[cfg(any(test, feature = "test-support"))]
+mod native_dead_code;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use crate::analyzer::usages::python_graph::python_legacy_dead_code_requests_for_test;
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod native_environment;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod native_graph;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod native_request;
+#[cfg(any(test, feature = "test-support"))]
+mod native_usages;
 pub mod packaging;
 pub mod runtime_artifact;
 pub(crate) mod runtime_binding;
 pub(crate) mod runtime_environment;
 pub(crate) mod runtime_provider;
+#[cfg(any(test, feature = "test-support"))]
+mod selected_reverse;
 mod semantic;
 pub(crate) mod source_publication;
 #[doc(hidden)]
@@ -263,6 +280,9 @@ const FILE_STATE_BATCH_SIZE: usize = 256;
 #[derive(Clone)]
 pub struct PythonAnalyzer {
     inner: TreeSitterAnalyzer<PythonAdapter>,
+    #[cfg(any(test, feature = "test-support"))]
+    native_environment_reconcile:
+        Arc<std::sync::RwLock<native_request::PythonEnvironmentReconcileState>>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     source_facts: Cache<
@@ -510,7 +530,7 @@ impl PythonAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, brokk_bifrost_analysis::analyzer::store::StoreError> {
-        TreeSitterAnalyzer::try_wrap_with_config(
+        let analyzer = TreeSitterAnalyzer::try_wrap_with_config(
             config,
             |config| {
                 TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -522,12 +542,21 @@ impl PythonAnalyzer {
                 )
             },
             Self::from_inner,
-        )
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        if trial_native_python_selected() {
+            analyzer.reconcile_native_environment(
+                &brokk_bifrost_core::cancellation::CancellationToken::new(),
+            )?;
+        }
+        Ok(analyzer)
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<PythonAdapter>, memo_budget: u64) -> Self {
         Self {
             inner,
+            #[cfg(any(test, feature = "test-support"))]
+            native_environment_reconcile: Arc::new(std::sync::RwLock::new(None)),
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             source_facts: build_weighted_cache(
@@ -562,7 +591,11 @@ impl PythonAnalyzer {
     pub(crate) fn saved_default_argument_safety(&self) -> Arc<SavedDefaultArgumentSafety> {
         self.saved_default_arguments
             .get_or_build_pool_independent(|| {
-                default_arguments::saved_default_argument_safety(self)
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "python.saved_default_arguments",
+                    || default_arguments::saved_default_argument_safety(self),
+                )
             })
     }
 
@@ -591,7 +624,10 @@ impl PythonAnalyzer {
         scan: impl FnOnce() -> bool,
     ) -> bool {
         self.class_member_mutation_free
-            .get_with(PythonClassMutationKey::new(identity_groups, member), scan)
+            .try_get_with(PythonClassMutationKey::new(identity_groups, member), || {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, scan)
+            })
+            .unwrap_or_else(|value| *value)
     }
 
     pub(crate) fn cached_module_member_mutation_free(
@@ -625,30 +661,57 @@ impl PythonAnalyzer {
     }
 
     /// The cached re-export/importer index, built once per analyzer generation.
-    fn usage_index(&self, token: QueryToken<'_>) -> Arc<PythonUsageIndex> {
-        self.usage_index.get_or_build(
-            || PythonUsageIndex::build(self, token),
-            || PythonUsageIndex::build(self, token),
+    fn usage_index(
+        &self,
+        token: QueryToken<'_>,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<Arc<PythonUsageIndex>> {
+        // The attribution wrapper does not store the value. A cancelled build
+        // returns None, so the memo never publishes a partial index.
+        self.usage_index.get_or_build_while(
+            keep_going,
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "python.usage_index",
+                    || PythonUsageIndex::build(self, token, keep_going),
+                )
+            },
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "python.usage_index",
+                    || PythonUsageIndex::build(self, token, keep_going),
+                )
+            },
         )
     }
 
     /// Coalesce concurrent first lookups of the same source-owned export facts.
     pub fn export_index_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Arc<ExportIndex> {
-        self.export_index.get_with(file.clone(), || {
-            Arc::new(compute_export_index_of(self, token, file))
-        })
+        self.export_index
+            .try_get_with(file.clone(), || {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                    Arc::new(compute_export_index_of(self, token, file))
+                })
+            })
+            .unwrap_or_else(|value| Arc::clone(value.as_ref()))
     }
 
     /// `get_with` for the same reason as `export_index_of`: the receiver-type and annotation
     /// resolvers ask for this from the parallelized candidate walk.
     pub fn import_binder_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Arc<ImportBinder> {
-        self.import_binder.get_with(file.clone(), || {
-            Arc::new(import_binder_from_imports(
-                self,
-                file,
-                &self.inner.import_info_of(token, file),
-            ))
-        })
+        self.import_binder
+            .try_get_with(file.clone(), || {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                    Arc::new(import_binder_from_imports(
+                        self,
+                        file,
+                        &self.inner.import_info_of(token, file),
+                    ))
+                })
+            })
+            .unwrap_or_else(|value| Arc::clone(value.as_ref()))
     }
 
     /// The set of files any of `file`'s imports resolve into, cached per file. Unlike
@@ -665,6 +728,7 @@ impl PythonAnalyzer {
         file: &ProjectFile,
     ) -> Arc<HashSet<ProjectFile>> {
         brokk_bifrost_analysis::analyzer::common::import_target_files_from_cache(
+            self,
             &self.imported_target_files,
             file,
             || {
@@ -681,8 +745,20 @@ impl PythonAnalyzer {
 
     fn build_reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.reverse_import_index.get_or_build(
-            || self.compute_reverse_import_index(true),
-            || self.compute_reverse_import_index(false),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "python.reverse_import_index",
+                    || self.compute_reverse_import_index(true),
+                )
+            },
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "python.reverse_import_index",
+                    || self.compute_reverse_import_index(false),
+                )
+            },
         )
     }
 
@@ -742,15 +818,27 @@ impl PythonSource for PythonAnalyzer {
         // the evidence this snapshot's roots rest on (#3506).
         self.module_spellings.get_or_build(
             || {
-                PythonModuleSpellings::build(
-                    self.inner.workspace_language_files(),
-                    self.inner.adapter().shared_project(),
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "python.module_spellings",
+                    || {
+                        PythonModuleSpellings::build(
+                            self.inner.workspace_language_files(),
+                            self.inner.adapter().shared_project(),
+                        )
+                    },
                 )
             },
             || {
-                PythonModuleSpellings::build(
-                    self.inner.workspace_language_files(),
-                    self.inner.adapter().shared_project(),
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "python.module_spellings",
+                    || {
+                        PythonModuleSpellings::build(
+                            self.inner.workspace_language_files(),
+                            self.inner.adapter().shared_project(),
+                        )
+                    },
                 )
             },
         )
@@ -779,13 +867,20 @@ impl PythonSource for PythonAnalyzer {
     fn visit_file_facts(
         &self,
         files: &[ProjectFile],
+        keep_going: &dyn Fn() -> bool,
         visit: &mut dyn FnMut(&ProjectFile, Option<&dyn IndexedFileFacts>),
     ) {
         for batch in files.chunks(FILE_STATE_BATCH_SIZE) {
+            if !keep_going() {
+                return;
+            }
             let file_states = self
                 .inner
                 .bulk_file_states(batch.iter().cloned(), BulkFileStateSource::Include);
             for file in batch {
+                if !keep_going() {
+                    return;
+                }
                 visit(
                     file,
                     file_states
@@ -801,7 +896,16 @@ impl PythonUsageSource for PythonAnalyzer {
     fn usage_index(&self) -> Arc<PythonUsageIndex> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        self.usage_index(token)
+        self.usage_index(token, &|| true)
+            .expect("uncancelled Python usage index")
+    }
+
+    fn usage_index_with_cancellation(
+        &self,
+        cancellation: &brokk_bifrost_core::CancellationToken,
+    ) -> Option<Arc<PythonUsageIndex>> {
+        let scope = AnalyzerQueryScope::new(self);
+        self.usage_index(scope.token(), &|| !cancellation.is_cancelled())
     }
 }
 
@@ -1776,6 +1880,57 @@ fn python_imports_ctypes(
 }
 
 impl LanguageSupport for PythonSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn trial_definition(
+        &self,
+        query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution>
+    {
+        native_request::definitions::trial_definition(query)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn supports_selected_resolution_overlays(&self) -> bool {
+        true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn reconcile_workspace_build_context(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer,
+        _changed: Option<&BTreeSet<ProjectFile>>,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        if !trial_native_python_selected() {
+            return Ok(());
+        }
+        let Some(python) = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()) else {
+            return Ok(());
+        };
+        let snapshots = python.inner.selected_workspace_snapshots();
+        let snapshot = snapshots.get("python").expect("selected Python snapshot");
+        if python.reconcile_outcome_for(snapshot).is_some() {
+            return Ok(());
+        }
+        python.reconcile_native_environment(
+            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn open_receiver_request<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Option<Box<dyn brokk_bifrost_analysis::analyzer::languages::ReceiverRequest + 'a>> {
+        if !trial_native_python_selected() {
+            return None;
+        }
+        let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+        Some(Box::new(
+            native_request::definition_lookup::PythonReceiverRequest::open(python, cancellation),
+        ))
+    }
+
     /// Prove exact external receiver identities using this language's type flow.
     fn exact_external_receiver_identities(
         &self,
@@ -2076,12 +2231,32 @@ impl LanguageSupport for PythonSupport {
     fn reference_usage_strategy(
         &self,
     ) -> &'static dyn brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer {
+        #[cfg(any(test, feature = "test-support"))]
+        if trial_native_python_selected() {
+            return &native_usages::PythonNativeUsageStrategy;
+        }
         &PYTHON_USAGE_STRATEGY
+    }
+
+    fn selected_inverse_reference_provider(
+        &self,
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseReferenceProvider>{
+        #[cfg(any(test, feature = "test-support"))]
+        if trial_native_python_selected() {
+            return Some(&selected_reverse::PythonNativeSelectedInverseProvider);
+        }
+        None
     }
 
     fn reference_graph_backend(
         &self,
     ) -> brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend {
+        #[cfg(any(test, feature = "test-support"))]
+        if trial_native_python_selected() {
+            return brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Native(
+                &native_graph::PythonNativeWorkspaceGraphProvider,
+            );
+        }
         brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(&PythonEdgePass)
     }
 
@@ -2198,9 +2373,73 @@ impl LanguageSupport for PythonSupport {
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
+        #[cfg(any(test, feature = "test-support"))]
+        if trial_native_python_selected() {
+            return DeadCodeSupport {
+                strategy: Some(&native_usages::PythonNativeUsageStrategy),
+                bulk: None,
+            };
+        }
         DeadCodeSupport {
             strategy: None,
             bulk: Some(&PythonDeadCodeBulk),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn dead_code_coverage(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::languages::DeadCodeCoverage,
+    > {
+        if trial_native_python_selected() {
+            native_dead_code::coverage(analyzer, candidates)
+        } else {
+            Ok(Default::default())
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn dead_code_reason_is_scope(
+        &self,
+        reason: &brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason,
+    ) -> bool {
+        trial_native_python_selected() && native_dead_code::reason_is_scope(reason)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn dead_code_reason_is_attributed(
+        &self,
+        reason: &brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason,
+    ) -> bool {
+        use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason;
+        trial_native_python_selected()
+            && matches!(reason,
+            EdgeIncompleteReason::UsageAnalysisFailed { reason_kind, .. }
+            if matches!(reason_kind.as_str(), "python_provider_open" | "python_import_activation_open"))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn dead_code_reference_scope(&self, analyzer: &dyn IAnalyzer) -> Option<HashSet<ProjectFile>> {
+        trial_native_python_selected().then(|| {
+            analyzer
+                .analyzed_files_for_language(Language::Python)
+                .into_iter()
+                .collect()
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn dead_code_usage_result(
+        &self,
+        result: brokk_bifrost_core::analyzer::usages::model::FuzzyResult,
+    ) -> brokk_bifrost_core::analyzer::usages::model::FuzzyResult {
+        if trial_native_python_selected() {
+            native_dead_code::usage_result(result)
+        } else {
+            result
         }
     }
 
@@ -2219,6 +2458,10 @@ impl LanguageSupport for PythonSupport {
     /// which the generic import-graph walk misses whenever the import goes through a
     /// package `__init__` re-export rather than the defining module.
     fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        #[cfg(any(test, feature = "test-support"))]
+        if trial_native_python_selected() {
+            return None;
+        }
         Some(CandidateAugmentation::protected(
             python_usage_candidate_files(ctx.analyzer, ctx.target),
         ))
@@ -2237,6 +2480,7 @@ impl LanguageEdgePass for PythonEdgePass {
             ctx.analyzer,
             ctx.fqns,
             ctx.keep_file,
+            ctx.cancellation,
         )
         .map(LanguageEdgeSites::Fqn)
     }
@@ -2248,6 +2492,11 @@ impl LanguageEdgePass for PythonEdgePass {
 }
 
 impl StructuralReceiverResolver for PythonSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn reuses_request_scoped_native_points(&self) -> bool {
+        trial_native_python_selected()
+    }
+
     fn resolve_type_bounded(
         &self,
         query: BoundedReceiverQuery<'_>,
@@ -2270,6 +2519,10 @@ impl StructuralReceiverResolver for PythonSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
+        #[cfg(any(test, feature = "test-support"))]
+        if trial_native_python_selected() {
+            return native_request::definition_lookup::resolve_definition_bounded(query);
+        }
         brokk_bifrost_analysis::analyzer::languages::with_bounded_receiver_query(
             query,
             |query, token| {
@@ -2718,6 +2971,58 @@ use brokk_bifrost_analysis::{
 use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSupport {
+    fn publishes_own_module_file_anchors(&self) -> bool {
+        true
+    }
+
+    fn selected_definition_module_anchor(
+        &self,
+        selection: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        mount: brokk_bifrost_analysis::analyzer::resolution::SelectedResolutionMountOrdinal,
+        project: &dyn brokk_bifrost_analysis::analyzer::Project,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Option<brokk_bifrost_core::analyzer::fq_name::FqName>,
+    > {
+        if selection
+            .mount_record_by_ordinal(mount)?
+            .file_version_id()
+            .is_none()
+        {
+            // An unpublished overlay has no retained file projection yet.
+            return Ok(Some(brokk_bifrost_python::declarations::python_module_fq(
+                project, file,
+            )));
+        }
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::python_definition_module_anchor(selection, mount, file)
+    }
+
+    fn selected_module_definition(
+        &self,
+        project: &dyn brokk_bifrost_analysis::analyzer::Project,
+        file: &ProjectFile,
+        module_anchor: Option<&brokk_bifrost_core::analyzer::fq_name::FqName>,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<CodeUnit>> {
+        match module_anchor {
+            Some(anchor) => {
+                let name = anchor.display_native(
+                    Language::Python,
+                    brokk_bifrost_core::analyzer::fq_name::segment_interner(),
+                );
+                brokk_bifrost_python::declarations::module_code_unit_from_name(file, &name)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        brokk_bifrost_analysis::analyzer::store::StoreError::corrupt(
+                            "selected module anchor is not a suffix of its mounted path",
+                        )
+                    })
+            }
+            None => Ok(brokk_bifrost_python::declarations::module_code_unit(
+                project, file,
+            )),
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn namespace_definition_provider(
         &self,
@@ -2865,9 +3170,55 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSup
     }
 
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
-        matches!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("pyproject.toml" | "setup.py" | "__init__.py")
-        )
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                brokk_bifrost_python::declarations::PYTHON_CONFIGURATION_INPUT_NAMES.contains(&name)
+            })
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::cell::Cell;
+
+    #[test]
+    #[hardwon("#7515: cancelled Python usage index builds must not publish partial state")]
+    fn cancelled_usage_index_can_retry_without_partial_state() {
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .file("a.py", "class Target:\n    pass\n")
+            .file("b.py", "from a import Target\n")
+            .build();
+        let analyzer = PythonAnalyzer::new(fixture.project_dyn());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let polls = Cell::new(0);
+        let keep_going = || {
+            let next = polls.get() + 1;
+            polls.set(next);
+            next < 6
+        };
+        assert!(analyzer.usage_index(scope.token(), &keep_going).is_none());
+        assert!(
+            polls.get() >= 6,
+            "the build reached the cancellation cutoff"
+        );
+        assert!(!analyzer.usage_index.is_ready());
+
+        let index = analyzer
+            .usage_index(scope.token(), &|| true)
+            .expect("retry completes");
+        assert_eq!(
+            index.resolve_module_files(&fixture.file("b.py"), "a"),
+            vec![fixture.file("a.py")]
+        );
+        assert!(Arc::ptr_eq(
+            &index,
+            &analyzer
+                .usage_index(scope.token(), &|| true)
+                .expect("complete index cached")
+        ));
     }
 }

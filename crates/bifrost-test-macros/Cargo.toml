@@ -12,3 +12,6 @@ proc-macro = true
 
 [lints]
 workspace = true
+
+[dependencies]
+workspace-hack.workspace = true

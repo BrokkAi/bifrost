@@ -243,6 +243,10 @@ globs:
 bifrost --root /path/to/project --policy-file policies/security.rqlp --sources src/auth
 ```
 
+`--policy-cost-hints <path>` reads a JSON object mapping non-empty policy IDs
+to non-negative integer milliseconds. Parallel batches start unknown policies
+first, then hinted policies from longest to shortest; hints never change the report.
+
 `--policy-timings` adds each policy's elapsed time to the report's work
 metrics.
 

@@ -217,7 +217,7 @@ fn named_child_after_token<'tree>(node: Node<'tree>, token: &str) -> Option<Node
 /// expression of a `by …` delegate. A property with neither (`val x: String`
 /// in an interface, or one defined solely by a getter) binds nothing and is
 /// not an assignment.
-fn property_value_node<'tree>(property: Node<'tree>) -> Option<Node<'tree>> {
+pub(crate) fn property_value_node<'tree>(property: Node<'tree>) -> Option<Node<'tree>> {
     if let Some(value) = kotlin_property_delegate_expression(property) {
         return Some(value);
     }

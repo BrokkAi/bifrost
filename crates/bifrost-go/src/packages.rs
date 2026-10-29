@@ -730,10 +730,11 @@ pub fn read_go_module_path(dir: &Path) -> Option<String> {
 ///
 /// This is deliberately a conservative recognizer, not a claim that the whole
 /// `go.mod` is valid. It accepts exactly one top-level `module` directive in
-/// either the direct or parenthesized grammar form. Identifiers, interpreted
-/// strings, and raw strings are decoded according to the go.mod lexical rules,
-/// then checked against the module-path element restrictions. Other directives
-/// may surround the module directive, including blocks. Malformed lexical
+/// either the direct or parenthesized grammar form. Identifiers and interpreted
+/// strings are decoded according to the go.mod lexical rules; raw backtick
+/// strings are rejected. Decoded paths are checked against the module-path
+/// element restrictions. Other directives may surround the module directive,
+/// including blocks. Malformed lexical
 /// input, duplicate directives, extra module arguments, or invalid module paths
 /// return `None`, making workspace authority incomplete rather than publishing
 /// a guessed identity.
@@ -1300,9 +1301,12 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "a23aa6f37f80: quicksilver round 11 on brokk-bifrost-go: raw go.mod strings are invalid"
+    )]
     fn raw_quoted_module_path() {
         assert_eq!(
-            Some("example.com/repo".to_string()),
+            None,
             go_module_path_from_source("module `example.com/repo`\n")
         );
     }

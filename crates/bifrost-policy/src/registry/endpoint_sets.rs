@@ -318,6 +318,64 @@ impl PolicyRegistry {
                         .push(document.identity().clone());
                     closure.selectors.insert(resolved.path.clone(), resolved);
                 }
+                for entry in &mut typed.spec.sanitizers.entries {
+                    if let TaintSanitizerKind::Conditional { requires, .. } = &mut entry.kind {
+                        for (index, requirement) in requires.iter_mut().enumerate() {
+                            let TaintSanitizerCondition::ResultOf(authored) =
+                                &mut requirement.condition
+                            else {
+                                continue;
+                            };
+                            resolve_selector_locators(authored, locators)?;
+                            let source_base = format!(
+                                "/set/entries/{}/selector",
+                                json_pointer_segment(entry.id.as_str())
+                            );
+                            let source_path = selector_path(sanitizer_requirement_selector_path(
+                                &source_base,
+                                index,
+                            ))?;
+                            let loaded = resolve_parsed_selector(
+                                Some(root),
+                                &document,
+                                source_path,
+                                authored,
+                                locators,
+                            )
+                            .map_err(|error| {
+                                import_error(&frame, "endpoint-set-selector", error.to_string())
+                            })?;
+                            if let Some(reference) = &loaded.referenced {
+                                self.charge_local(
+                                    &mut closure.retained_bytes,
+                                    reference.document().source().len(),
+                                )?;
+                            }
+                            let mut resolved = loaded.selector;
+                            let segment = if typed.kind.is_flow() {
+                                FLOW_SET_SEGMENTS.sanitizers
+                            } else {
+                                TAINT_SET_SEGMENTS.sanitizers
+                            };
+                            let base = format!(
+                                "/analysis/{segment}/entries/{}/selector",
+                                json_pointer_segment(entry.id.as_str())
+                            );
+                            resolved.path =
+                                selector_path(sanitizer_requirement_selector_path(&base, index))?;
+                            let requirement_key = crate::canonical::sanitizer_requirement_to_json(
+                                &TaintSanitizerRequirement {
+                                    operand: requirement.operand,
+                                    condition: TaintSanitizerCondition::ResultOf(authored.clone()),
+                                },
+                            );
+                            // Hash the loaded query while preserving the authored file provenance.
+                            selector_values.push(json!({"requirement": requirement_key,
+                                "selector": crate::canonical_loaded::resolved_selector_to_json(&resolved)}));
+                            closure.selectors.insert(resolved.path.clone(), resolved);
+                        }
+                    }
+                }
                 for barrier in &typed.spec.barriers.entries {
                     if !ids.insert(barrier.id.clone()) {
                         return Err(import_error(
@@ -400,7 +458,19 @@ impl PolicyRegistry {
                     .collect();
                 endpoint_hashes.sort();
                 endpoint_hashes.dedup();
-                let mut catalog_hashes = Vec::new();
+                // Selectors carry exactly the catalog identities that contributed
+                // entries, including auxiliary entries. Wildcard candidates
+                // that contributed nothing must not rotate executable identity.
+                let mut catalog_hashes: Vec<_> = catalog_selectors
+                    .values()
+                    .chain(catalog_dependencies.values())
+                    .filter_map(|selector| match &selector.origin {
+                        SelectorOrigin::Catalog { catalog } => {
+                            Some(catalog.semantic_hash.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 for refs in [
                     &typed.spec.sources.include_sets,
                     &typed.spec.sinks.include_sets,
@@ -410,12 +480,14 @@ impl PolicyRegistry {
                     &typed.spec.external_models.include_sets,
                 ] {
                     for reference in refs {
-                        catalog_hashes.push(
-                            self.catalogs
-                                .resolve(reference)?
-                                .semantic_hash()
-                                .to_string(),
-                        );
+                        // Named references retain their identity even if the
+                        // selected role has no entries in that catalog.
+                        if !matches!(reference, CatalogRef::Named { .. }) {
+                            continue;
+                        }
+                        for catalog in self.catalogs.select(reference)? {
+                            catalog_hashes.push(catalog.semantic_hash().to_string());
+                        }
                     }
                 }
                 catalog_hashes.sort();
@@ -928,13 +1000,27 @@ fn resolved_set_projection(typed: &EndpointSetDocument, selectors: &[Value]) -> 
         }
     };
     let mut value = crate::canonical::policy_analysis_authored_json(&analysis);
+    let requirements: HashMap<_, _> = selectors
+        .iter()
+        .filter_map(|entry| {
+            entry.get("requirement").map(|requirement| {
+                (
+                    serde_json_canonicalizer::to_vec(requirement)
+                        .expect("a requirement encodes as JSON"),
+                    &entry["selector"],
+                )
+            })
+        })
+        .collect();
     let selectors: HashMap<_, _> = selectors
         .iter()
-        .map(|entry| {
-            (
-                entry["id"].as_str().expect("entry ID is a string"),
-                &entry["selector"],
-            )
+        .filter_map(|entry| {
+            entry.get("id").map(|id| {
+                (
+                    id.as_str().expect("entry ID is a string"),
+                    &entry["selector"],
+                )
+            })
         })
         .collect();
     // Walk the normalized typed projection, replacing selector bodies by their
@@ -948,6 +1034,13 @@ fn resolved_set_projection(typed: &EndpointSetDocument, selectors: &[Value]) -> 
                 object.remove("include_sets");
                 object.remove("include_matches");
                 object.remove("include_files");
+                if object.contains_key("result_of") {
+                    let key = serde_json_canonicalizer::to_vec(object)
+                        .expect("a requirement encodes as JSON");
+                    if let Some(selector) = requirements.get(&key) {
+                        object.insert("result_of".into(), (*selector).clone());
+                    }
+                }
                 if let Some(id) = object.get("id").and_then(Value::as_str)
                     && let Some(selector) = selectors.get(id)
                     && object.contains_key("selector")

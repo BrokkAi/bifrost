@@ -190,7 +190,8 @@ pub(super) fn authored_pack(
 /// shape of its output. It is not the crate version: checked-in packs are
 /// gated on byte equality with the generator, and reading the crate version
 /// would break that gate at every release bump without any content change.
-pub const FOUNDRY_PRODUCER_VERSION: &str = "0.9.0";
+// #7202: generated JDK root value returns classify receiver identity.
+pub const FOUNDRY_PRODUCER_VERSION: &str = "0.11.0";
 
 /// The report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -690,7 +691,7 @@ fn round_trip(
         version: "0.0.0".to_owned(),
         producer: Producer {
             name: "bifrost-summary-foundry".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: FOUNDRY_PRODUCER_VERSION.to_owned(),
         },
         language: "java".to_owned(),
         ecosystem: "maven".to_owned(),
@@ -760,29 +761,46 @@ fn render_diagnostic(diagnostic: &Diagnostic) -> String {
 
 /// Read every Models-as-Data file in a directory, in file-name order.
 pub fn read_codeql_models(directory: &Path) -> Result<Vec<(String, Vec<u8>)>, FoundryError> {
-    let mut names = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|error| FoundryError::Io {
-        path: directory.to_path_buf(),
-        error,
-    })? {
-        let entry = entry.map_err(|error| FoundryError::Io {
-            path: directory.to_path_buf(),
+    let mut pending = vec![directory.to_owned()];
+    let mut paths = Vec::new();
+    while let Some(parent) = pending.pop() {
+        for entry in fs::read_dir(&parent).map_err(|error| FoundryError::Io {
+            path: parent.clone(),
             error,
-        })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(MODEL_FILE_SUFFIX) {
-            names.push(name);
-        }
-    }
-    names.sort();
-    names
-        .into_iter()
-        .map(|name| {
-            let path = directory.join(&name);
-            let bytes = fs::read(&path).map_err(|error| FoundryError::Io {
+        })? {
+            let entry = entry.map_err(|error| FoundryError::Io {
+                path: parent.clone(),
+                error,
+            })?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| FoundryError::Io {
                 path: path.clone(),
                 error,
             })?;
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(MODEL_FILE_SUFFIX)
+            {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .strip_prefix(directory)
+                .expect("walk stays under corpus root")
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let bytes = fs::read(&path).map_err(|error| FoundryError::Io { path, error })?;
             Ok((name, bytes))
         })
         .collect()

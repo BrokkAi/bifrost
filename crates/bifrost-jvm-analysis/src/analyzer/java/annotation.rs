@@ -1,4 +1,11 @@
-//! Query-local annotation type proof; external route spelling is not proof.
+//! Query-local annotation type proof.
+//!
+//! An annotation's type is proved by the tier that decides its written name.
+//! A workspace declaration proves itself. A single-type import, or a qualified
+//! name whose head is proven not to be a type in scope, fixes the qualified
+//! name by the JLS even when no declaration of it is indexed; an artifact or
+//! pack declaration of that name adds provenance and must be an annotation
+//! type (owner decision, #3734, 2026-10-27).
 
 use crate::analyzer::java::JavaAnalyzer;
 
@@ -14,7 +21,12 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
-use brokk_bifrost_core::analyzer::query_token::QueryScope;
+use brokk_bifrost_core::analyzer::query_token::{QueryScope, QueryToken};
+
+use crate::analyzer::jvm::external::{JvmExternalDeclarationSource, JvmExternalTypeKind};
+use brokk_bifrost_core::analyzer::tree_walk::node_range;
+use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_jvm::java::graph_support::JavaSource;
 
 use brokk_bifrost_core::analyzer::model::Range;
 
@@ -44,12 +56,58 @@ pub enum JavaAnnotationTypeStatus {
     Cancelled,
 }
 
+/// Which tier decided a resolved annotation's qualified name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JavaAnnotationTypeRoute {
+    /// A workspace `annotation_type_declaration` with an exact indexed range.
+    SourceDeclaration,
+    /// A single-type import that no workspace type reads or owns a prefix of.
+    SingleTypeImport,
+    /// A qualified name whose head is not a type in scope.
+    QualifiedName,
+}
+
+impl JavaAnnotationTypeRoute {
+    pub const LABELS: &'static [&'static str] =
+        &["source_declaration", "single_type_import", "qualified_name"];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SourceDeclaration => Self::LABELS[0],
+            Self::SingleTypeImport => Self::LABELS[1],
+            Self::QualifiedName => Self::LABELS[2],
+        }
+    }
+}
+
+/// The external declaration that publishes a route-resolved annotation type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum JavaAnnotationArtifact {
+    SourceJar {
+        artifact_path: String,
+        source_path: String,
+    },
+    ClassFile {
+        artifact_path: String,
+        class_entry: String,
+    },
+    SemanticPack {
+        pack_id: String,
+        declaration_id: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct JavaAnnotationTypeResolution {
     pub status: JavaAnnotationTypeStatus,
     pub reason: Option<String>,
+    pub route: Option<JavaAnnotationTypeRoute>,
+    pub fq_name: Option<String>,
     pub source_declaration: Option<CodeUnit>,
     pub declaration_range: Option<Range>,
+    pub artifact: Option<JavaAnnotationArtifact>,
 }
 
 impl JavaAnnotationTypeResolution {
@@ -57,8 +115,11 @@ impl JavaAnnotationTypeResolution {
         Self {
             status,
             reason: Some(reason.into()),
+            route: None,
+            fq_name: None,
             source_declaration: None,
             declaration_range: None,
+            artifact: None,
         }
     }
 }
@@ -132,21 +193,11 @@ pub fn resolve_java_annotation_type(
             "a type parameter shadows the annotation type name",
         );
     }
-    // The lexical helper can skip a nearer inherited member type while
-    // resolving a declaration in an outer scope. Until that tier has proof,
-    // neither an outer declaration nor an import is an exact answer.
-    let mut owner = name.parent();
-    while let Some(node) = owner {
-        if node.child_by_field_name("superclass").is_some()
-            || node.child_by_field_name("interfaces").is_some()
-            || node.kind() == "object_creation_expression"
-        {
-            return JavaAnnotationTypeResolution::gap(
-                Status::Incomplete,
-                "inherited annotation member-type proof unavailable",
-            );
-        }
-        owner = node.parent();
+    // A member type inherited by an enclosing class shadows outer lexical
+    // types and every import. The lexical helper does not search that tier,
+    // so prove it empty before trusting a lexical or import answer.
+    if let Some(gap) = inherited_member_type_gap(java, analyzer, file, name, &components[0]) {
+        return gap;
     }
     let resolution =
         brokk_bifrost_analysis::analyzer::relational_frontier::resolve_relational_frontier(
@@ -184,15 +235,6 @@ pub fn resolve_java_annotation_type(
                                 "static annotation type-import proof unavailable",
                             );
                         }
-                        if components.len() > 1 {
-                            // A dotted annotation can start with a type binding,
-                            // not only a package. Source-only route lookup cannot
-                            // close same-package/on-demand/external type heads.
-                            return JavaAnnotationTypeResolution::gap(
-                                Status::Incomplete,
-                                "qualified annotation type-head proof unavailable",
-                            );
-                        }
                         let file_types = java
                             .top_level_declarations(file)
                             .into_iter()
@@ -211,6 +253,16 @@ pub fn resolve_java_annotation_type(
                                 Status::Ambiguous,
                                 format!(
                                     "annotation file type/import binding conflict: {file_types:?}, imports: {imports:?}"
+                                ),
+                            );
+                        }
+                        if components.len() > 1 && !file_types.is_empty() {
+                            // The head is a same-file type, so the name is a
+                            // member-type route the lexical tier did not close.
+                            return JavaAnnotationTypeResolution::gap(
+                                Status::Incomplete,
+                                format!(
+                                    "qualified annotation head is a same-file type: {file_types:?}"
                                 ),
                             );
                         }
@@ -241,6 +293,27 @@ pub fn resolve_java_annotation_type(
                                     format!(
                                         "annotation dependency route or candidate coverage is incomplete: {candidates:?}"
                                     ),
+                                );
+                            }
+                            JavaSourceTypeCandidates::Route(route) => {
+                                let route_kind = if imports.iter().any(|import| {
+                                    !import.is_wildcard
+                                        && non_static_import_path(import).is_some()
+                                        && import.identifier.as_deref()
+                                            == Some(components[0].as_str())
+                                }) {
+                                    JavaAnnotationTypeRoute::SingleTypeImport
+                                } else {
+                                    JavaAnnotationTypeRoute::QualifiedName
+                                };
+                                return external_route_resolution(
+                                    analyzer,
+                                    java,
+                                    token,
+                                    file,
+                                    &components,
+                                    &route,
+                                    route_kind,
                                 );
                             }
                             JavaSourceTypeCandidates::Unresolved => {
@@ -306,8 +379,11 @@ pub fn resolve_java_annotation_type(
                 JavaAnnotationTypeResolution {
                     status: Status::Resolved,
                     reason: None,
+                    route: Some(JavaAnnotationTypeRoute::SourceDeclaration),
+                    fq_name: Some(unit.fq_name()),
                     source_declaration: Some(unit),
                     declaration_range: Some(*range),
+                    artifact: None,
                 }
             },
         );
@@ -326,5 +402,178 @@ pub fn resolve_java_annotation_type(
             Status::Incomplete,
             format!("annotation resolution frontier failed: {error:?}"),
         ),
+    }
+}
+
+/// Prove that no class enclosing `name` inherits a member type spelled `head`.
+///
+/// Every supertype of each enclosing class must resolve to a workspace type,
+/// and no transitive workspace ancestor may declare a member type `head`.
+/// The member types an external supertype declares are not indexed, so one
+/// keeps the annotation incomplete rather than proving the tier empty.
+fn inherited_member_type_gap(
+    java: &JavaAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    name: tree_sitter::Node<'_>,
+    head: &str,
+) -> Option<JavaAnnotationTypeResolution> {
+    use crate::analyzer::java::annotation::JavaAnnotationTypeStatus as Status;
+    let mut enclosing = name.parent();
+    while let Some(node) = enclosing {
+        enclosing = node.parent();
+        if node.kind() == "object_creation_expression" {
+            return Some(JavaAnnotationTypeResolution::gap(
+                Status::Incomplete,
+                "anonymous class annotation member-type proof unavailable",
+            ));
+        }
+        if !matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) {
+            continue;
+        }
+        // Member types are in scope in the body only, not in the modifiers or
+        // header of the declaration itself.
+        let Some(body) = node
+            .child_by_field_name("body")
+            .filter(|body| body.byte_range().contains(&name.start_byte()))
+        else {
+            continue;
+        };
+        let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
+            return Some(JavaAnnotationTypeResolution::gap(
+                Status::Incomplete,
+                "Java type hierarchy unavailable for inherited annotation member types",
+            ));
+        };
+        let Some(owner) = analyzer
+            .enclosing_code_unit(file, &node_range(body))
+            .filter(CodeUnit::is_class)
+        else {
+            return Some(JavaAnnotationTypeResolution::gap(
+                Status::Incomplete,
+                "enclosing class declaration identity unavailable",
+            ));
+        };
+        let mut seen = HashSet::default();
+        let mut pending = vec![owner];
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let written = java.raw_supertypes_of(&current);
+            let ancestors = hierarchy.get_direct_ancestors(&current);
+            if ancestors.len() != written.len() {
+                return Some(JavaAnnotationTypeResolution::gap(
+                    Status::Incomplete,
+                    format!(
+                        "inherited annotation member types of {} are unproven: supertypes {written:?} resolve only to workspace types {:?}",
+                        current.fq_name(),
+                        ancestors.iter().map(CodeUnit::fq_name).collect::<Vec<_>>()
+                    ),
+                ));
+            }
+            for ancestor in ancestors {
+                let shadows = analyzer
+                    .get_direct_children(&ancestor)
+                    .into_iter()
+                    .filter(|child| child.is_class() && child.identifier() == head)
+                    .map(|child| child.fq_name())
+                    .collect::<Vec<_>>();
+                if !shadows.is_empty() {
+                    return Some(JavaAnnotationTypeResolution::gap(
+                        Status::Incomplete,
+                        format!("inherited member types {shadows:?} shadow annotation name {head}"),
+                    ));
+                }
+                pending.push(ancestor);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a route no workspace declaration reads to the qualified name it
+/// spells, with the external declaration's provenance when one is indexed.
+fn external_route_resolution(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    components: &[String],
+    route: &[String],
+    route_kind: JavaAnnotationTypeRoute,
+) -> JavaAnnotationTypeResolution {
+    use crate::analyzer::java::annotation::JavaAnnotationTypeStatus as Status;
+    let overlay = analyzer.semantic_model_overlay();
+    if route_kind == JavaAnnotationTypeRoute::QualifiedName
+        && let Some(head) =
+            java.resolve_type_name_with_external(token, overlay.clone(), file, &components[0])
+    {
+        return JavaAnnotationTypeResolution::gap(
+            Status::Incomplete,
+            format!("qualified annotation head is an external type in scope: {head:?}"),
+        );
+    }
+    let external = java.external_declarations(overlay);
+    let fq_name = route.join(".");
+    let declared = external.get(&fq_name);
+    if declared.is_none()
+        && let Some(owner) =
+            (1..route.len()).find_map(|length| external.get(&route[..length].join(".")))
+    {
+        return JavaAnnotationTypeResolution::gap(
+            Status::Incomplete,
+            format!(
+                "external type {owner:?} owns a prefix of annotation route {fq_name}; its inherited member types are unproven"
+            ),
+        );
+    }
+    let artifact = match declared {
+        Some(declared) if declared.kind() != JvmExternalTypeKind::Annotation => {
+            return JavaAnnotationTypeResolution::gap(
+                Status::Unsupported,
+                format!("external declaration {declared:?} of {fq_name} is not an annotation type"),
+            );
+        }
+        Some(declared) => Some(match declared.source() {
+            JvmExternalDeclarationSource::SourceJar {
+                artifact_path,
+                source_path,
+            } => JavaAnnotationArtifact::SourceJar {
+                artifact_path: artifact_path.to_string_lossy().into_owned(),
+                source_path: source_path.clone(),
+            },
+            JvmExternalDeclarationSource::ClassFile {
+                artifact_path,
+                class_entry,
+            } => JavaAnnotationArtifact::ClassFile {
+                artifact_path: artifact_path.to_string_lossy().into_owned(),
+                class_entry: class_entry.clone(),
+            },
+            JvmExternalDeclarationSource::SemanticPack {
+                pack_id,
+                declaration_id,
+            } => JavaAnnotationArtifact::SemanticPack {
+                pack_id: pack_id.clone(),
+                declaration_id: declaration_id.clone(),
+            },
+        }),
+        None => None,
+    };
+    JavaAnnotationTypeResolution {
+        status: Status::Resolved,
+        reason: None,
+        route: Some(route_kind),
+        fq_name: Some(fq_name),
+        source_declaration: None,
+        declaration_range: None,
+        artifact,
     }
 }

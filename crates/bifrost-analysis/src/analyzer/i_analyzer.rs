@@ -99,6 +99,16 @@ macro_rules! forward_relational_definition_batch {
             )
         }
 
+        fn reference_names_in_files(
+            &self,
+            request: $crate::analyzer::i_analyzer::ReferenceNamesInFilesRequest<'_>,
+        ) -> Result<
+            $crate::analyzer::i_analyzer::ReferenceNamesInFilesResult,
+            $crate::analyzer::store::StoreError,
+        > {
+            self.inner.reference_names_in_files(request)
+        }
+
         fn source_file_inventory(
             &self,
         ) -> $crate::analyzer::QueryBatch<$crate::analyzer::ProjectFile> {
@@ -148,6 +158,19 @@ macro_rules! forward_query_read_ledger {
 
         fn record_unattributed_read(&self) {
             $crate::analyzer::IAnalyzer::record_unattributed_read(&self.inner);
+        }
+
+        fn mark_execution_dependent(&self) {
+            $crate::analyzer::IAnalyzer::mark_execution_dependent(&self.inner);
+        }
+
+        #[track_caller]
+        fn record_degraded_persistent_fill(&self, cache: &str, cause: &str) {
+            $crate::analyzer::IAnalyzer::record_degraded_persistent_fill(&self.inner, cache, cause);
+        }
+
+        fn degraded_persistent_fills(&self) -> usize {
+            $crate::analyzer::IAnalyzer::degraded_persistent_fills(&self.inner)
         }
 
         fn read_ledger_attached(&self) -> bool {
@@ -692,6 +715,18 @@ pub enum QueryReadIncomplete {
     StoreFailure(StoreError),
 }
 
+impl QueryReadIncomplete {
+    /// Structural admission refusals are snapshot-deterministic content gaps.
+    /// Semantic evidence still combines content gaps with timeouts and bounded
+    /// work, so it cannot establish a reusable fill without more precise typing.
+    pub fn is_execution_dependent(&self) -> bool {
+        match self {
+            Self::StructureUnavailable(_) => false,
+            Self::Cancelled | Self::StoreFailure(_) | Self::SemanticEvidenceUnavailable(_) => true,
+        }
+    }
+}
+
 /// Failure state and deadline for one top-level analyzer request.
 ///
 /// The analyzer trait intentionally retains best-effort collection-returning APIs, so persisted
@@ -740,17 +775,11 @@ pub struct AnalyzerQueryContext {
     /// ordinary case and costs nothing: every funnel checks the analyzer's
     /// attached-ledger count before it builds a key.
     read_ledger: Option<Arc<crate::analyzer::read_ledger::ReadLedger>>,
-    /// The thread that opened `read_ledger`.
-    ///
-    /// Funnel reads may run on worker threads and still broadcast to this
-    /// ledger. The owner only identifies the enclosing ledger when that thread
-    /// opens a nested capture.
-    read_ledger_owner: Option<std::thread::ThreadId>,
     /// The enclosing ledger this nested capture replaces.
     ///
-    /// Other concurrently open ledgers still receive the read. This explicit
-    /// edge preserves the analyzer's sound broadcast contract while letting a
-    /// replayable funnel hide its implementation reads from its own caller.
+    /// Other ledgers in the current attribution frame still receive the read.
+    /// Explicit Broadcast uses this edge to narrow the analyzer-wide registry
+    /// without exposing implementation reads to the linked caller.
     shadowed_read_ledger: Option<Arc<crate::analyzer::read_ledger::ReadLedger>>,
 }
 
@@ -766,7 +795,6 @@ impl Default for AnalyzerQueryContext {
             active_semantic_model_snapshot_override: None,
             tier_accesses: Default::default(),
             read_ledger: None,
-            read_ledger_owner: None,
             shadowed_read_ledger: None,
         }
     }
@@ -1152,7 +1180,6 @@ impl AnalyzerQueryContext {
     fn with_read_ledger(ledger: Arc<crate::analyzer::read_ledger::ReadLedger>) -> Self {
         Self {
             read_ledger: Some(ledger),
-            read_ledger_owner: Some(std::thread::current().id()),
             ..Self::default()
         }
     }
@@ -1163,7 +1190,6 @@ impl AnalyzerQueryContext {
     ) -> Self {
         Self {
             read_ledger: Some(ledger),
-            read_ledger_owner: Some(std::thread::current().id()),
             shadowed_read_ledger: Some(shadowed),
             ..Self::default()
         }
@@ -1172,16 +1198,6 @@ impl AnalyzerQueryContext {
     /// The read ledger this request records into, if its opener attached one.
     pub fn read_ledger(&self) -> Option<&Arc<crate::analyzer::read_ledger::ReadLedger>> {
         self.read_ledger.as_ref()
-    }
-
-    pub(crate) fn current_thread_read_ledger(
-        &self,
-    ) -> Option<&Arc<crate::analyzer::read_ledger::ReadLedger>> {
-        if self.read_ledger_owner == Some(std::thread::current().id()) {
-            self.read_ledger.as_ref()
-        } else {
-            None
-        }
     }
 
     pub(crate) fn shadows_read_ledger(
@@ -1227,6 +1243,16 @@ impl AnalyzerQueryContext {
     }
 
     pub fn record_store_error(&self, error: StoreError) {
+        if let Some(ledger) = &self.read_ledger {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=store",
+                    file!(),
+                    line!()
+                )
+            });
+            ledger.mark_execution_dependent();
+        }
         self.capture_read_incomplete(QueryReadIncomplete::StoreFailure(error.clone()));
         let mut slot = self
             .first_store_error
@@ -1248,6 +1274,18 @@ impl AnalyzerQueryContext {
     /// complete read. The reason is sticky so an outer scope retains an inner
     /// scope's cancellation after that inner scope closes.
     pub fn record_read_incomplete(&self, reason: QueryReadIncomplete) {
+        if reason.is_execution_dependent()
+            && let Some(ledger) = &self.read_ledger
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=read_incomplete detail={reason:?}",
+                    file!(),
+                    line!(),
+                )
+            });
+            ledger.mark_execution_dependent();
+        }
         self.capture_read_incomplete(reason.clone());
         let mut slot = self
             .first_read_incomplete
@@ -1368,6 +1406,20 @@ fn structural_index_inputs(
     }
 }
 
+/// A bounded name selection over an explicit source-file set.
+#[doc(hidden)]
+pub struct ReferenceNamesInFilesRequest<'a> {
+    pub files: &'a [ProjectFile],
+    pub names: &'a [String],
+}
+
+/// One example source for each referenced normalized terminal name.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ReferenceNamesInFilesResult {
+    pub by_name: HashMap<String, ProjectFile>,
+}
+
 pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// Read live dynamic import source paths from the selected workspace
     /// publication. `seed_files` scopes `imports-of`; `None` asks for every
@@ -1435,12 +1487,12 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
-    /// Return query-lifetime, AST-owned C++ statement facts for one file.
-    /// Languages without the C++ adapter return `None`.
-    fn cpp_statement_source_facts(
+    /// Return bounded, AST-owned statement facts for one source snapshot.
+    /// Adapters without statement-fact support return `None`.
+    fn statement_source_facts(
         &self,
         _file: &ProjectFile,
-    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>> {
+    ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         None
     }
 
@@ -1549,14 +1601,13 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// usage-ranking graph acquisition, the direct-import layer, the reference
     /// candidate derivation, the descendant index, the dispatch oracle -- use
     /// to reach the request boundary, exactly as `begin_query` and `end_query`
-    /// do. Implementations broadcast to every open context, because a funnel
-    /// crossed on an analyzer-internal worker thread was still paid for by
-    /// every request that is open around it. An explicit nested capture
-    /// replaces only the enclosing ledger it names.
+    /// do. Reads follow this thread's attribution frame. Helper tasks transport
+    /// that frame; shared builders explicitly broadcast to active contexts.
+    /// An explicit nested capture replaces only the enclosing ledger it names.
     fn record_read(&self, _key: crate::analyzer::read_ledger::ReadKey) {}
 
-    /// Records one funnel crossing this analyzer could not name, on every read
-    /// ledger open around it.
+    /// Records one funnel crossing this analyzer could not name through the
+    /// current attribution frame.
     ///
     /// This is the contract for a funnel that reaches a derived value it has
     /// no identity for: it says so instead of staying silent, and the ledger's
@@ -1564,6 +1615,20 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// silent crossing would leave the read set looking complete while an
     /// input it never named could move.
     fn record_unattributed_read(&self) {}
+
+    /// Mark transient execution state through the same worker broadcasting and
+    /// nested-capture attribution used by reads.
+    fn mark_execution_dependent(&self) {}
+
+    /// Persistent products built from failed providers remain unsafe until rebuild.
+    #[doc(hidden)]
+    #[track_caller]
+    fn record_degraded_persistent_fill(&self, _cache: &str, _cause: &str) {}
+
+    #[doc(hidden)]
+    fn degraded_persistent_fills(&self) -> usize {
+        0
+    }
 
     /// Whether any open request boundary carries a read ledger.
     ///
@@ -1577,11 +1642,10 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// The innermost ledger opened by the current thread, if one is active.
     ///
     /// This identifies the one enclosing ledger a nested replayable funnel may
-    /// shadow. Funnel reads themselves remain thread-independent and broadcast
-    /// to all other active request ledgers.
+    /// shadow. Ledgers opened by other threads cannot be shadowed here.
     #[doc(hidden)]
     fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
-        None
+        current_thread_read_ledger()
     }
 
     /// Best-effort batch-warm the request-scoped `definitions()` memo for
@@ -1716,16 +1780,19 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// worker of the pool interactive requests fan out on.
     fn warm_structural_indexes(&self) {
         let providers = self.structural_fact_providers();
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         crate::analyzer::install_on_dedicated_build_pool(|| {
             use rayon::prelude::*;
             providers.into_par_iter().for_each(|provider| {
-                let Some((cache, content_identity)) = structural_index_inputs(provider) else {
-                    return;
-                };
-                let cache = cache.inner();
-                if cache.auto_build_outstanding(content_identity) {
-                    cache.acquire(provider, &crate::CancellationToken::default());
-                }
+                context.run(|| {
+                    let Some((cache, content_identity)) = structural_index_inputs(provider) else {
+                        return;
+                    };
+                    let cache = cache.inner();
+                    if cache.auto_build_outstanding(content_identity) {
+                        cache.acquire(provider, &crate::CancellationToken::default());
+                    }
+                })
             });
         });
     }
@@ -1783,6 +1850,21 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn update_all(&self) -> Self
     where
         Self: Sized;
+
+    /// Read source-owned reference identities without exposing store handles.
+    #[doc(hidden)]
+    fn reference_names_in_files(
+        &self,
+        request: ReferenceNamesInFilesRequest<'_>,
+    ) -> Result<ReferenceNamesInFilesResult, StoreError> {
+        if request.files.is_empty() || request.names.is_empty() {
+            Ok(ReferenceNamesInFilesResult::default())
+        } else {
+            Err(StoreError::new(
+                "reference names in files: unsupported analyzer",
+            ))
+        }
+    }
 
     /// Execute one typed relational definition batch through this analyzer's
     /// store-backed language projection. Composite analyzers override this to
@@ -2053,7 +2135,7 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
                 self.snapshot_caches()
                     .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
             });
-        if self.read_ledger_attached()
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached())
             && let Some(overlay) = overlay.as_ref()
         {
             self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
@@ -2075,7 +2157,7 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
                 self.snapshot_caches()
                     .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot)
             });
-        if self.read_ledger_attached()
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached())
             && let Some(snapshot) = snapshot.as_ref()
         {
             self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
@@ -2227,18 +2309,6 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         _edge_limit: usize,
     ) -> Result<Option<PersistedImportAdjacency>, StoreError> {
         Ok(None)
-    }
-
-    /// Atomically replace the durable import graph for this content identity.
-    /// A workspace without persistent analyzer storage returns `false`.
-    #[doc(hidden)]
-    fn publish_persisted_import_graph(
-        &self,
-        _content_identity: crate::analyzer::content_identity::WorkspaceContentIdentity,
-        _sources: &[ProjectFile],
-        _edges: &[PersistedImportEdge],
-    ) -> Result<bool, StoreError> {
-        Ok(false)
     }
 
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
@@ -2753,17 +2823,121 @@ pub struct NoOpAnalyzerTestHooks;
 #[cfg(any(test, feature = "test-support"))]
 impl AnalyzerTestHooks for NoOpAnalyzerTestHooks {}
 
+type AttributionLedger = (Arc<crate::analyzer::ReadLedger>, std::thread::ThreadId);
+
+#[derive(Clone)]
+enum AttributionFrame {
+    Broadcast,
+    Ledgers(Vec<AttributionLedger>),
+}
+
+use brokk_bifrost_core::analyzer::carried_context::{self, CarriedContextGuard};
+
+static READ_ATTRIBUTION_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of read recorder crossings using implicit broadcast with a ledger attached.
+pub fn read_attribution_fallback_count() -> u64 {
+    READ_ATTRIBUTION_FALLBACKS.load(AtomicOrdering::Relaxed)
+}
+
+/// Request read attribution that can be transported to a helper task.
+#[derive(Clone)]
+pub struct ReadAttribution(AttributionFrame);
+
+impl ReadAttribution {
+    /// Start a request. A thread that already records into ledgers -- its
+    /// caller wrapped the request in a ledger scope, or handed the request to
+    /// this worker -- keeps them, exactly as a serial run records. Any other
+    /// thread records nothing until the request opens its own ledger scopes,
+    /// so its reads never reach another request's ledgers through the
+    /// broadcast fallback.
+    pub fn for_request() -> Self {
+        match attribution_frame().as_deref() {
+            Some(frame @ AttributionFrame::Ledgers(_)) => Self(frame.clone()),
+            _ => Self(AttributionFrame::Ledgers(Vec::new())),
+        }
+    }
+
+    /// Attribute background reads to all active analyzer ledgers.
+    pub fn broadcast() -> Self {
+        Self(AttributionFrame::Broadcast)
+    }
+
+    /// Install this attribution for the lifetime of the returned guard.
+    pub fn install(&self) -> ReadAttributionGuard {
+        ReadAttributionGuard {
+            _guard: carried_context::push(Some(Arc::new(self.0.clone()))),
+        }
+    }
+}
+
+/// Restores the previous attribution on the installing thread.
+pub struct ReadAttributionGuard {
+    _guard: CarriedContextGuard,
+}
+
+fn attribution_frame() -> Option<Arc<AttributionFrame>> {
+    carried_context::top::<AttributionFrame>().flatten()
+}
+
+fn ledger_attribution(context: &AnalyzerQueryContext) -> Option<ReadAttributionGuard> {
+    let ledger = context.read_ledger()?;
+    let mut ledgers = match attribution_frame().as_deref() {
+        Some(AttributionFrame::Ledgers(ledgers)) => ledgers.clone(),
+        _ => Vec::new(),
+    };
+    ledgers.retain(|(ledger, _)| !context.shadows_read_ledger(ledger));
+    ledgers.push((Arc::clone(ledger), std::thread::current().id()));
+    Some(ReadAttribution(AttributionFrame::Ledgers(ledgers)).install())
+}
+
+pub(crate) fn current_thread_read_ledger() -> Option<Arc<crate::analyzer::ReadLedger>> {
+    match attribution_frame().as_deref() {
+        Some(AttributionFrame::Ledgers(ledgers)) => ledgers
+            .iter()
+            .rev()
+            .find(|(_, owner)| *owner == std::thread::current().id())
+            .map(|(ledger, _)| Arc::clone(ledger)),
+        _ => None,
+    }
+}
+
+/// Whether a read has consumers. A ledger frame owns its attribution even
+/// when its ledgers were registered on a different analyzer; only broadcast
+/// needs the destination analyzer's attached-ledger count.
+pub fn read_attribution_records_reads(analyzer_has_ledger: impl FnOnce() -> bool) -> bool {
+    match attribution_frame().as_deref() {
+        Some(AttributionFrame::Ledgers(ledgers)) => !ledgers.is_empty(),
+        _ => analyzer_has_ledger(),
+    }
+}
+
+/// True when recording can use the thread frame without analyzer contexts.
+pub(crate) fn has_read_attribution_ledgers() -> bool {
+    matches!(
+        attribution_frame().as_deref(),
+        Some(AttributionFrame::Ledgers(_))
+    )
+}
+
 /// Releases request-scoped analyzer memoization on every return path.
 pub struct AnalyzerQueryScope<'a> {
     analyzer: &'a dyn IAnalyzer,
     context: Arc<AnalyzerQueryContext>,
+    attribution: Option<ReadAttributionGuard>,
 }
 
 impl<'a> AnalyzerQueryScope<'a> {
     fn with_context(analyzer: &'a dyn IAnalyzer, context: AnalyzerQueryContext) -> Self {
         let context = Arc::new(context);
         analyzer.begin_query(&context);
-        Self { analyzer, context }
+        let attribution = ledger_attribution(&context);
+        Self {
+            analyzer,
+            context,
+            attribution,
+        }
     }
 
     pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
@@ -2851,8 +3025,8 @@ impl<'a> AnalyzerQueryScope<'a> {
     /// Ordinarily only the outermost scope of a unit's execution carries one.
     /// Nested scopes without a ledger -- the RQL executor opens at least two
     /// of them per execution -- keep recording on that outer ledger. Analyzer
-    /// funnels use a private constructor for nested capture so they shadow one
-    /// explicit enclosing ledger without hiding reads from concurrent requests.
+    /// funnels shadow only their explicit enclosing ledger. Reads follow this
+    /// thread's attribution frame; helper tasks must transport that frame.
     pub fn with_read_ledger(
         analyzer: &'a dyn IAnalyzer,
         ledger: Arc<crate::analyzer::read_ledger::ReadLedger>,
@@ -2860,7 +3034,7 @@ impl<'a> AnalyzerQueryScope<'a> {
         Self::with_context(analyzer, AnalyzerQueryContext::with_read_ledger(ledger))
     }
 
-    fn with_nested_read_ledger(
+    pub(crate) fn with_nested_read_ledger(
         analyzer: &'a dyn IAnalyzer,
         ledger: Arc<crate::analyzer::read_ledger::ReadLedger>,
         shadowed: Arc<crate::analyzer::read_ledger::ReadLedger>,
@@ -2905,6 +3079,7 @@ pub fn with_query_scope<R>(analyzer: &dyn IAnalyzer, query: impl FnOnce(QueryTok
 
 impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {
+        drop(self.attribution.take());
         self.analyzer.end_query(&self.context);
     }
 }
@@ -2944,7 +3119,7 @@ pub(crate) fn capture_usage_lookup_reads<T>(
     analyzer: &dyn IAnalyzer,
     lookup: impl FnOnce() -> T,
 ) -> T {
-    if !analyzer.read_ledger_attached() {
+    if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return lookup();
     }
 
@@ -2976,12 +3151,14 @@ pub fn capture_nested_reads<T>(
     read: impl FnOnce() -> T,
 ) -> (T, Vec<crate::analyzer::read_ledger::ReadKey>) {
     let Some(enclosing) = analyzer.current_thread_read_ledger() else {
-        // Another request can have a ledger attached while this thread has no
-        // enclosing request. Preserve the ordinary broadcast in that case;
-        // there is no caller ledger whose inputs this funnel needs to narrow.
+        // No scope in this frame was opened by this thread. Keep recording
+        // through the frame without a private capture.
         return (read(), Vec::new());
     };
     let (result, captured) = capture_with_read_ledger_scope(analyzer, Some(&enclosing), read);
+    for _ in 0..captured.execution_dependences() {
+        enclosing.mark_execution_dependent();
+    }
     (result, captured.keys())
 }
 
@@ -3008,10 +3185,25 @@ fn capture_with_read_ledger_scope<T>(
 /// Replay all dependencies of a completed query into its current caller.
 #[doc(hidden)]
 pub fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::ReadLedger) {
-    for key in reads.keys() {
+    replay_query_read_keys(analyzer, reads.keys(), reads.unattributed_reads());
+    for _ in 0..reads.execution_dependences() {
+        analyzer.mark_execution_dependent();
+    }
+}
+
+/// Replay an owned snapshot of a query's named and unattributed reads.
+/// Named keys are sets in each ledger; unattributed crossings are counts and
+/// must be replayed only for a consumer, never again after its own capture.
+#[doc(hidden)]
+pub fn replay_query_read_keys(
+    analyzer: &dyn IAnalyzer,
+    keys: impl IntoIterator<Item = crate::analyzer::ReadKey>,
+    unattributed_reads: usize,
+) {
+    for key in keys {
         analyzer.record_read(key);
     }
-    for _ in 0..reads.unattributed_reads() {
+    for _ in 0..unattributed_reads {
         analyzer.record_unattributed_read();
     }
 }
@@ -3023,9 +3215,9 @@ pub fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::Rea
 ///
 /// A separate ordinary ledger would become the parent of nested resolver
 /// captures, exposing their implementation reads to the original caller. Link
-/// the capture to that caller explicitly instead. Unrelated concurrent ledgers
-/// continue receiving the original broadcasts and must not receive a second
-/// unattributed charge during forwarding.
+/// the capture to that caller explicitly instead. Other threads' ledgers remain
+/// visible beside the capture and receive reads directly; only a ledger whose
+/// scope was opened by this thread is shadowed and receives reads on completion.
 #[doc(hidden)]
 pub fn capture_query_reads<T>(
     analyzer: &dyn IAnalyzer,
@@ -3034,18 +3226,28 @@ pub fn capture_query_reads<T>(
     let enclosing = analyzer.current_thread_read_ledger();
     let (result, captured) = capture_with_read_ledger_scope(analyzer, enclosing.as_ref(), query);
     if let Some(enclosing) = enclosing {
-        for key in captured.keys() {
-            enclosing.record(key);
-        }
-        for _ in 0..captured.unattributed_reads() {
-            enclosing.record_unattributed();
-        }
+        forward_captured_query_reads(&enclosing, &captured);
     }
     (result, captured)
 }
 
-/// Record one funnel key on every active ledger except an explicitly shadowed
-/// enclosing ledger.
+pub(crate) fn forward_captured_query_reads(
+    enclosing: &crate::analyzer::ReadLedger,
+    captured: &crate::analyzer::ReadLedger,
+) {
+    for key in captured.keys() {
+        enclosing.record(key);
+    }
+    for _ in 0..captured.unattributed_reads() {
+        enclosing.record_unattributed();
+    }
+    for _ in 0..captured.execution_dependences() {
+        enclosing.mark_execution_dependent();
+    }
+}
+
+/// Record one funnel key through the current attribution frame. Broadcast
+/// visits active contexts except explicitly shadowed enclosing ledgers.
 pub(crate) fn record_read_on_active_ledgers(
     contexts: &[Arc<AnalyzerQueryContext>],
     key: crate::analyzer::read_ledger::ReadKey,
@@ -3057,6 +3259,32 @@ fn for_each_unshadowed_active_ledger(
     contexts: &[Arc<AnalyzerQueryContext>],
     mut record: impl FnMut(&crate::analyzer::read_ledger::ReadLedger),
 ) {
+    let handled = match attribution_frame().as_deref() {
+        Some(AttributionFrame::Ledgers(ledgers)) => {
+            for (ledger, _) in ledgers {
+                record(ledger);
+            }
+            true
+        }
+        Some(AttributionFrame::Broadcast) => false,
+        None => {
+            if carried_context::top::<AttributionFrame>().is_none()
+                && contexts
+                    .iter()
+                    .any(|context| context.read_ledger().is_some())
+            {
+                READ_ATTRIBUTION_FALLBACKS.fetch_add(1, AtomicOrdering::Relaxed);
+                debug_assert!(
+                    rayon::current_thread_index().is_none(),
+                    "#7116: rayon read with an attached ledger requires transported ReadAttribution or explicit Broadcast"
+                );
+            }
+            false
+        }
+    };
+    if handled {
+        return;
+    }
     for context in contexts {
         let Some(ledger) = context.read_ledger() else {
             continue;
@@ -3077,6 +3305,13 @@ pub(crate) fn record_unattributed_on_active_ledgers(contexts: &[Arc<AnalyzerQuer
     for_each_unshadowed_active_ledger(contexts, |ledger| ledger.record_unattributed());
 }
 
+/// Execution dependence follows the same frame routing as input attribution.
+pub(crate) fn record_execution_dependence_on_active_ledgers(
+    contexts: &[Arc<AnalyzerQueryContext>],
+) {
+    for_each_unshadowed_active_ledger(contexts, |ledger| ledger.mark_execution_dependent());
+}
+
 /// Record one usage lookup per overload the caller asked about, each carrying
 /// the digest of that overload's own answer.
 ///
@@ -3089,7 +3324,7 @@ pub(crate) fn record_usage_lookup(
     overloads: &[CodeUnit],
     result: &FuzzyResult,
 ) {
-    if !analyzer.read_ledger_attached() {
+    if !crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
         return;
     }
     for overload in overloads {
@@ -3407,6 +3642,114 @@ mod read_ledger_scope_tests {
 
     use std::sync::Arc;
 
+    #[test]
+    fn threaded_read_attribution_is_request_local_and_transportable() {
+        use super::{AnalyzerQueryScope, IAnalyzer, ReadAttribution, capture_query_reads};
+        use crate::analyzer::MultiAnalyzer;
+        use brokk_bifrost_core::analyzer::carried_context::CarriedContext;
+        use std::sync::Barrier;
+
+        let analyzer = MultiAnalyzer::default();
+        let empty_context = CarriedContext::current();
+        let ledgers = [Arc::new(ReadLedger::new()), Arc::new(ReadLedger::new())];
+        let barrier = Barrier::new(2);
+        let key = |value: &[u8]| ReadKey::Configuration(StableDigest::sha256(value));
+        let own = [key(b"owner-a"), key(b"owner-b")];
+        let transported = key(b"transported");
+        let broadcast = key(b"broadcast");
+        let nested = key(b"nested");
+        std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..2)
+                .map(|owner| {
+                    let analyzer = &analyzer;
+                    let ledgers = &ledgers;
+                    let barrier = &barrier;
+                    let own = &own;
+                    let transported = &transported;
+                    let broadcast = &broadcast;
+                    let nested = &nested;
+                    let empty_context = &empty_context;
+                    threads.spawn(move || {
+                        let _scope = AnalyzerQueryScope::with_read_ledger(
+                            analyzer,
+                            Arc::clone(&ledgers[owner]),
+                        );
+                        barrier.wait();
+                        // Both owners are live, but direct reads stay with their request.
+                        analyzer.record_read(own[owner].clone());
+                        barrier.wait();
+                        assert_eq!(ledgers[owner].keys(), vec![own[owner].clone()]);
+                        barrier.wait();
+                        if owner == 0 {
+                            let carried = CarriedContext::current();
+                            std::thread::scope(|helpers| {
+                                helpers
+                                    .spawn(|| {
+                                        carried.run(|| {
+                                            assert!(
+                                                analyzer.current_thread_read_ledger().is_none()
+                                            );
+                                            // The frame also owns reads through another analyzer
+                                            // whose registry has no attached ledger.
+                                            let other = MultiAnalyzer::default();
+                                            assert!(!other.read_ledger_attached());
+                                            other.record_read(transported.clone());
+                                            // A helper capture records beside the installed ledger.
+                                            let (_, captured) =
+                                                capture_query_reads(analyzer, || {
+                                                    analyzer.record_read(nested.clone())
+                                                });
+                                            assert_eq!(captured.keys(), vec![nested.clone()]);
+                                        })
+                                    })
+                                    .join()
+                                    .expect("transported helper panicked");
+                                assert!(ledgers[0].keys().contains(transported));
+                                assert!(ledgers[0].keys().contains(nested));
+                                assert_eq!(ledgers[1].keys(), vec![own[1].clone()]);
+                                // Generic transports retain owner IDs; an explicit empty
+                                // transport masks any frame on the receiving thread.
+                                helpers
+                                    .spawn(|| {
+                                        carried.run(|| {
+                                            assert!(
+                                                analyzer.current_thread_read_ledger().is_none()
+                                            );
+                                            analyzer.record_read(transported.clone());
+                                            empty_context
+                                                .run(|| analyzer.record_read(broadcast.clone()));
+                                            assert!(
+                                                analyzer.current_thread_read_ledger().is_none()
+                                            );
+                                            assert!(super::has_read_attribution_ledgers());
+                                        })
+                                    })
+                                    .join()
+                                    .expect("generic helper panicked");
+                                assert!(ledgers[1].keys().contains(broadcast));
+                                helpers
+                                    .spawn(|| {
+                                        let _attribution = ReadAttribution::broadcast().install();
+                                        analyzer.record_read(broadcast.clone());
+                                    })
+                                    .join()
+                                    .expect("broadcast helper panicked");
+                            });
+                        }
+                        barrier.wait();
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("owner thread panicked");
+            }
+        });
+        assert_eq!(ledgers[0].keys().len(), 4);
+        assert_eq!(ledgers[1].keys().len(), 2);
+        for ledger in ledgers {
+            assert!(ledger.keys().contains(&broadcast));
+        }
+    }
     #[test]
     fn a_nested_capture_shadows_only_its_explicit_enclosing_ledger() {
         let enclosing = Arc::new(ReadLedger::new());

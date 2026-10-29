@@ -508,35 +508,22 @@ pub fn resolver_proven_external_static_dispatch_discharges_gap(
 /// from answering for each other. The other member kinds C++ can write --
 /// constructors, operators, accessors -- keep the gap: their call sites are
 /// not the plain member calls this proof is written for.
+///
+/// A Ruby constructor is the exception. Ruby has no construction syntax:
+/// `Owner.new(...)` is a plain member call on the class object, and the
+/// `initialize` it runs is selected by ordinary method lookup on the new
+/// instance, so a closed proof of that call covers the constructor body
+/// exactly as it covers any other member (#3494).
 #[doc(hidden)]
 pub fn candidate_is_type_owned_member(candidate: &DispatchCandidate) -> bool {
-    matches!(candidate.target().semantics().kind(), ProcedureKind::Method)
-}
-
-/// Whether one Ruby call is written on a receiver the language itself fixes at
-/// compile time.
-///
-/// A Ruby constant path is not a temporary: `Net::HTTP` evaluates the one
-/// constant object the path names, so the member selected on it comes from
-/// that object's own method set rather than from a receiver class only known
-/// at run time. Other receiver spellings keep their blanket dynamic-dispatch
-/// gap, because a Ruby receiver value's class can be anything a subclass,
-/// mixin, or refinement supplies at run time.
-#[doc(hidden)]
-pub fn ruby_constant_receiver_selection(caller: &ProcedureHandle, gap: &SemanticGap) -> bool {
-    matches!(
-        caller.artifact().key().language(),
-        LanguageDialect::Standard(Language::Ruby)
-    ) && matches!(gap.subject, SemanticGapSubject::CallSite(id)
-    if matches!(
-        caller
-            .semantics()
-            .call_site(id)
-            .and_then(|call_site| call_site.receiver)
-            .and_then(|receiver| caller.semantics().value(receiver))
-            .map(|value| &value.kind),
-        Some(&SemanticValueKind::Constant)
-    ))
+    match candidate.target().semantics().kind() {
+        ProcedureKind::Method => true,
+        ProcedureKind::Constructor => matches!(
+            candidate.target().artifact().key().language(),
+            LanguageDialect::Standard(Language::Ruby)
+        ),
+        _ => false,
+    }
 }
 
 /// Whether a retained candidate's target is a *free* callable: one that no type

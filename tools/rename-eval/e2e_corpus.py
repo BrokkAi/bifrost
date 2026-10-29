@@ -11,7 +11,7 @@ false-positive guard (unrelated delete+add must NOT pair), and a real Java
 method lifted from RefactoringMiner's own test corpus, moved and renamed.
 
 Run after any change to diff_analysis.rs pairing/scoring:
-    cargo build --release --bin bifrost && python3 tools/rename-eval/e2e_corpus.py
+    cargo build --profile measure --bin bifrost && python3 tools/rename-eval/e2e_corpus.py
 Exit code 0 = all pass. Binary path override: BIFROST_BIN env var.
 """
 import json
@@ -22,7 +22,7 @@ import sys
 import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BF = os.environ.get("BIFROST_BIN", os.path.join(REPO_ROOT, "target", "release", "bifrost"))
+BF = os.environ.get("BIFROST_BIN", os.path.join(REPO_ROOT, "target", "measure", "bifrost"))
 ROOT = tempfile.mkdtemp(prefix="bifrost-e2e-corpus-")
 
 # A real method lifted verbatim from RefactoringMiner's test corpus

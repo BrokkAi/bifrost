@@ -793,33 +793,154 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ids_are_content_scoped_and_role_scoped() {
-        let content = ContentIdentity::hash_bytes(b"class Widget {}");
-        let other = ContentIdentity::hash_bytes(b"class Gadget {}");
+    fn persisted_multi_role_tokens_preserve_the_role_address_relation() {
+        use super::super::extract::extract_file_facts;
+        use super::super::occurrences::ALL_OCCURRENCE_ROLES;
+        use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+        let spec = &brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_rust::LANGUAGE.into();
+        let facts = extract_file_facts(spec, &grammar, "fn f() { let a = b; }").unwrap();
+        let mut persisted = facts.persisted_rows().unwrap();
+        let template = persisted.occurrence_roles[0].clone();
+        let roles = ALL_OCCURRENCE_ROLES
+            .iter()
+            .copied()
+            .filter(|role| spec.occurrence_namespace(*role, None).is_some())
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(roles.len(), 2);
+        persisted.occurrence_roles.clear();
+        for (id, count) in [(template.node_id, 2), (template.node_id + 1, 1)] {
+            for (ordinal, &role) in roles.iter().take(count).enumerate() {
+                let mut row = template.clone();
+                row.node_id = id;
+                row.role = role.code();
+                row.ordinal = ordinal as u32;
+                persisted.occurrence_roles.push(row);
+            }
+        }
+        let facts = FileFacts::from_persisted_rows(facts.source().into(), persisted).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path(), "example.rs");
+        for selected in [None, Some(roles.as_slice()), Some(&roles[..1])] {
+            let mut reasons = vec![];
+            let rows = classify_rows(spec, &file, &facts, selected, None, &mut reasons);
+            let actual = rows
+                .iter()
+                .map(|row| (row.node, row.role))
+                .collect::<Vec<_>>();
+            let expected = [
+                (template.node_id, roles[0]),
+                (template.node_id, roles[1]),
+                (template.node_id + 1, roles[0]),
+            ]
+            .into_iter()
+            .filter(|(_, role)| selected.is_none_or(|selected| selected.contains(role)))
+            .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            assert!(reasons.is_empty(), "{reasons:?}");
+        }
+    }
 
-        assert_eq!(
-            occurrence_id(content, 3, OccurrenceRole::Binder),
-            occurrence_id(content, 3, OccurrenceRole::Binder)
-        );
-        assert_ne!(
-            occurrence_id(content, 3, OccurrenceRole::Binder),
-            occurrence_id(other, 3, OccurrenceRole::Binder)
-        );
-        assert_ne!(
-            occurrence_id(content, 3, OccurrenceRole::Binder),
-            occurrence_id(content, 4, OccurrenceRole::Binder)
-        );
-        assert_ne!(
-            occurrence_id(content, 3, OccurrenceRole::Binder),
-            occurrence_id(content, 3, OccurrenceRole::ValueReference)
-        );
+    #[test]
+    fn cancelled_target_batches_stop_before_backend_access() {
+        use crate::analyzer::TestProject;
+        use crate::analyzer::workspace::EmptyAnalyzer;
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path(), "example.rs");
+        let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(
+            temp.path(),
+            crate::Language::Rust,
+        )));
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let spec = &brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC;
+        let facts = super::super::extract::extract_file_facts(
+            spec,
+            &tree_sitter_rust::LANGUAGE.into(),
+            "fn f() { let a = b; }",
+        )
+        .unwrap();
+        let mut reasons = vec![];
+        let populated = classify_rows(spec, &file, &facts, None, None, &mut reasons);
+        assert!(!populated.is_empty());
+        for mut rows in [vec![], populated] {
+            let before = format!("{rows:?}");
+            assert_eq!(
+                resolve_occurrence_targets_for_rows(&analyzer, &file, &mut rows, &cancellation),
+                Err(OccurrencesCancelled)
+            );
+            assert_eq!(format!("{rows:?}"), before);
+        }
+    }
 
-        assert_eq!(ast_id(content, 3), ast_id(content, 3));
-        assert_ne!(ast_id(content, 3), ast_id(other, 3));
-        assert_ne!(
-            ast_id(content, 3),
-            occurrence_id(content, 3, OccurrenceRole::Binder),
-            "the two domains must not collide"
-        );
+    #[test]
+    fn coverage_reasons_preserve_their_declared_role_scope() {
+        use super::super::occurrences::ALL_OCCURRENCE_ROLES;
+        for &role in ALL_OCCURRENCE_ROLES {
+            assert!(OccurrenceCompleteness::Complete.covers(role));
+            for reason in [
+                OccurrenceIncompleteReason::FactsUnavailable,
+                OccurrenceIncompleteReason::NoStructuralAdapter,
+            ] {
+                let coverage = OccurrenceCompleteness::Incomplete {
+                    unsupported_roles: vec![],
+                    reasons: vec![reason],
+                };
+                assert!(!coverage.covers(role));
+            }
+            for &unsupported in ALL_OCCURRENCE_ROLES {
+                for reason in [
+                    OccurrenceIncompleteReason::RoleUnsupported(unsupported),
+                    OccurrenceIncompleteReason::NamespaceUnknown(unsupported),
+                ] {
+                    let coverage = OccurrenceCompleteness::Incomplete {
+                        unsupported_roles: vec![],
+                        reasons: vec![reason],
+                    };
+                    assert_eq!(coverage.covers(role), role != unsupported);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn published_ids_follow_the_v1_length_delimited_sha256_protocol() {
+        use super::super::occurrences::ALL_OCCURRENCE_ROLES;
+        use sha2::{Digest, Sha256};
+        fn reference(fields: &[&[u8]]) -> String {
+            let mut hash = Sha256::new();
+            for field in fields {
+                hash.update((field.len() as u64).to_le_bytes());
+                hash.update(field);
+            }
+            format!("{:x}", hash.finalize())
+        }
+        for source in [b"".as_slice(), b"class Widget {}".as_slice()] {
+            let content = ContentIdentity::hash_bytes(source);
+            for node in [0u32, 3, 0x01020304, u32::MAX] {
+                let node_bytes = node.to_le_bytes();
+                assert_eq!(
+                    ast_id(content, node),
+                    reference(&[
+                        b"bifrost.code_query.ast_node.v1",
+                        content.as_bytes(),
+                        &node_bytes
+                    ])
+                );
+                for role in ALL_OCCURRENCE_ROLES {
+                    assert_eq!(
+                        occurrence_id(content, node, *role),
+                        reference(&[
+                            b"bifrost.code_query.occurrence.v1",
+                            content.as_bytes(),
+                            &node_bytes,
+                            role.label().as_bytes()
+                        ])
+                    );
+                }
+            }
+        }
     }
 }

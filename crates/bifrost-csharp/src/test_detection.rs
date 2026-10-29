@@ -279,6 +279,22 @@ mod test_classification_tests {
     }
 
     #[test]
+    fn mixed_runnable_and_metadata_attributes_remain_tests() {
+        for attributes in [
+            "[Fact, Obsolete]",
+            "[Test, Category(\"slow\")]",
+            "[Fact][Obsolete]",
+            "[Test][Category(\"slow\")]",
+        ] {
+            let source = format!("class Suite {{ {attributes} void Runs() {{ }} }}");
+            assert!(contains_tests(&source), "{attributes}");
+        }
+        assert!(!contains_tests(
+            "class Suite { [Category(\"slow\"), Obsolete] void Helper() {} }"
+        ));
+    }
+
+    #[test]
     fn recognizes_custom_xunit_fact_and_theory_names() {
         for attribute in [
             "ConditionalTheory",

@@ -112,6 +112,7 @@ fn assert_incremental_matches_fresh(
     let fresh_workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let fresh = execute_code_query_detailed_eager_index(
         fresh_workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -320,6 +321,7 @@ fn persistent_rust_import_graph_reuses_edges_and_invalidates_reexport_routes() {
     );
     let fresh_moved_route = execute_code_query_detailed_eager_index(
         updated.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &importer_query_at("alternate_target", "source/src/other.rs"),
         limits,
         None,
@@ -358,8 +360,13 @@ fn persistent_rust_import_graph_reuses_edges_and_invalidates_reexport_routes() {
         leaf_edges_resolved, 0,
         "body-only edit reuses the unchanged leaf import edge"
     );
-    let fresh_leaf_result =
-        execute_code_query_detailed_eager_index(leaf_updated.analyzer(), &leaf_query, limits, None);
+    let fresh_leaf_result = execute_code_query_detailed_eager_index(
+        leaf_updated.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &leaf_query,
+        limits,
+        None,
+    );
     assert_eq!(
         serde_json::to_value(&leaf_result.result).expect("incremental leaf result"),
         serde_json::to_value(&fresh_leaf_result.result).expect("fresh leaf result")
@@ -583,6 +590,7 @@ fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates()
 
     let target = execute_code_query_detailed_eager_index(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &importer_query("exported_target", 1),
         CodeQueryExecutionLimits::default(),
         None,
@@ -604,6 +612,7 @@ fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates()
 
     let module = execute_code_query_detailed_eager_index(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &importer_query("root_marker", 1),
         CodeQueryExecutionLimits::default(),
         None,
@@ -616,6 +625,7 @@ fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates()
 
     let chained = execute_code_query_detailed_eager_index(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &importer_query("exported_target", 2),
         CodeQueryExecutionLimits::default(),
         None,
@@ -647,6 +657,7 @@ fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates()
     let updated = workspace.update(&BTreeSet::from([source_root]));
     let module_after_reorder = execute_code_query_detailed_eager_index(
         updated.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &importer_query("root_marker", 1),
         CodeQueryExecutionLimits::default(),
         None,
@@ -673,6 +684,7 @@ fn rust_import_graph_includes_block_local_importers() {
     .expect("persist the Rust import graph");
     let fresh = execute_code_query_detailed_eager_index(
         workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &query,
         CodeQueryExecutionLimits::default(),
         None,

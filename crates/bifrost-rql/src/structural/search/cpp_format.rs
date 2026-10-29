@@ -408,8 +408,7 @@ fn format_argument_origin(
             let is_parameter = value
                 .site
                 .shape
-                .source
-                .as_ref()
+                .source()
                 .and_then(|source| {
                     source
                         .get(argument.range.start_byte..argument.range.end_byte)
@@ -607,7 +606,7 @@ fn argument_kind(
         }
     }
 
-    let Some(source) = value.site.shape.source.as_ref() else {
+    let Some(source) = value.site.shape.source() else {
         return FormatValueKind::Unknown;
     };
     let name = source

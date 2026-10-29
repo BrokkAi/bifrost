@@ -132,8 +132,20 @@ impl RustAnalyzer {
     /// Repeated preparation retains and reports a prior publication failure.
     pub(crate) fn ensure_rust_facts_caught_up(&self) {
         self.fact_catch_up.settled.get_or_build(
-            || self.run_rust_fact_catch_up(),
-            || self.run_rust_fact_catch_up(),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "rust.settled",
+                    || self.run_rust_fact_catch_up(),
+                )
+            },
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "rust.settled",
+                    || self.run_rust_fact_catch_up(),
+                )
+            },
         );
         if let RustFactReadiness::Unavailable(error) = &*self
             .fact_catch_up

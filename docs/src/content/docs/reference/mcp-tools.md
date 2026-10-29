@@ -695,6 +695,7 @@ workspace snapshot.
 | `scope_file` | string | No | `.bifrost/policy-scope.json` | 1 to 1,024 bytes | `--scope-file` | Directory-scope file. |
 | `diff_base` | string | No | - | 1 to 256 bytes | `--diff-base` | Git revision. Bifrost also evaluates that revision, labels each finding new or persisting, and only new findings count toward `fail_on`. |
 | `incremental` | boolean | No | `true` | - | `--no-incremental` sets false | Reuse verified policy units from the analyzer cache. Findings and status are the same either way. |
+| `policy_cost_hints` | object | No | Empty | At most 256 entries; non-empty keys, non-negative integer milliseconds | `--policy-cost-hints <path>` (JSON file) | Parallel batches start unknown policies first, then hinted policies from longest to shortest; hints never change the report. |
 | `include_stage_timings` | boolean | No | `false` | - | `--policy-timings` (CLI reports per-policy time instead) | Add a `stage_timings` field with wall-clock time per stage. |
 
 Selector rules: values within one selector array form a union. Different

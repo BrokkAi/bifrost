@@ -160,6 +160,8 @@ where
     let mut edges: BTreeMap<(UsageNodeKey, UsageNodeKey), Vec<CallSite>> = BTreeMap::new();
     let mut truncated: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
     let mut unproven_inbound: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
+    let mut unproven_sites: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut unproven_sites_complete = true;
     let mut any = false;
 
     for language in JS_TS_LANGUAGES {
@@ -200,6 +202,10 @@ where
                 },
             )
         });
+        unproven_sites_complete &= result.unproven_sites_complete;
+        for (key, sites) in result.unproven_sites {
+            unproven_sites.entry(key).or_default().extend(sites);
+        }
         for (key, sites) in result.edges {
             edges.entry(key).or_default().extend(sites);
         }
@@ -218,6 +224,8 @@ where
         edges,
         truncated,
         unproven_inbound,
+        unproven_sites,
+        unproven_sites_complete,
     })
 }
 

@@ -1,12 +1,93 @@
 //! Protected package peers selected by exact canonical Go package membership.
 
+use super::file_context::{PackagePeerRelation, PeerSelection};
 use super::go_context::{GoContextSelection, GoDotImportContext};
 use super::package_bridges::{
-    PackageBridgeAdmission, PackageBridgePair, PackageBridgeRules, assemble_package_bridges,
+    PackageBridgeAdmission, PackageBridgePair, PackageBridgeRules, PackageBridgeTarget,
+    PackagePairingRules, PackagePlanRules, drive_package_bridges,
 };
 use super::package_context::{SelectedPackageRows, unique_package_references_by_token};
+use super::placement_access::read_placement_rows;
 use super::*;
-use crate::analyzer::resolution::SelectedPackageBridgeDescriptor;
+use crate::analyzer::resolution::{
+    LoweredPackageMember, LoweredPackageReference, SelectedPackageBridgeDescriptor,
+};
+
+impl PackagePeerRelation for PeerSelection {
+    const RELATION: &'static str = PACKAGE_PEER_MOUNTS;
+
+    fn params(&self) -> impl rusqlite::Params {
+        (self.context_id, self.package, self.source_role.as_str())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const PACKAGE_MEMBER_READ_STATEMENTS_FOR_TEST: [&str; 2] = [
+    super::package_context::ORDINARY_MEMBERS_BY_MOUNT,
+    super::package_context::STAGED_MEMBERS_BY_MOUNT,
+];
+
+struct GoPackagePlanRules<'a, 'store, 'operation> {
+    operation: &'a SelectedResolutionOperation<'store, 'operation>,
+    request: &'a super::file_context::PeerSelection,
+}
+
+struct GoPackageIndex {
+    target_fragment: BindingFragmentId,
+    members: Arc<HashMap<SemanticId, Vec<LoweredPackageMember>>>,
+}
+
+impl PackagePlanRules for GoPackagePlanRules<'_, '_, '_> {
+    type Source = SelectedResolutionMountOrdinal;
+    type Index = GoPackageIndex;
+
+    fn read_index(
+        &self,
+        peer: &Self::Source,
+        _references: &[LoweredPackageReference],
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedPackageRows<Self::Index>> {
+        let Some(members) =
+            self.operation
+                .read_package_peer_members(self.request, *peer, cancellation)?
+        else {
+            return Ok(SelectedPackageRows::Cancelled);
+        };
+        let target = self
+            .operation
+            .ready
+            .inventory
+            .mount_record_by_ordinal(*peer)?;
+        Ok(SelectedPackageRows::Ready(GoPackageIndex {
+            target_fragment: target.fragment_id(),
+            members,
+        }))
+    }
+}
+
+impl PackagePairingRules for GoPackagePlanRules<'_, '_, '_> {
+    type Bridges = GoPackageBridgeRules;
+
+    fn matching_members<'a>(
+        &'a self,
+        peer: &'a Self::Source,
+        index: &'a Self::Index,
+        reference: &'a LoweredPackageReference,
+    ) -> impl Iterator<Item = PackageBridgeTarget<'a, ()>> {
+        index
+            .members
+            .get(&reference.lookup)
+            .into_iter()
+            .flatten()
+            .map(move |member| PackageBridgeTarget {
+                member,
+                target_fragment: index.target_fragment,
+                target_mount: *peer,
+                extra: (),
+            })
+    }
+}
 
 struct GoPackageBridgeRules {
     source: BindingFragmentId,
@@ -54,7 +135,7 @@ FROM ({}) caller
 JOIN main.go_package_instances package
   ON package.context_id=caller.context_id AND package.package_id=caller.package_id
 WHERE caller.context_id=?1 AND caller.file_version_id=?2 AND caller.source_role=?3
- AND ((?3='go' AND package.for_test='')
+ AND ((?3 IN ('go','ignored') AND package.for_test='')
    OR (?3 IN ('test','xtest') AND package.for_test<>'')
    OR (?3='test' AND package.for_test='' AND package.complete=0
        AND NOT EXISTS(
@@ -150,27 +231,42 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
     });
 
 impl SelectedResolutionOperation<'_, '_> {
+    /// Exercise the private production peer reader from real-language tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn go_package_peers_for_test(
+        &self,
+        context_id: i64,
+        package: i64,
+        source_role: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<SelectedResolutionMountOrdinal>>> {
+        self.read_package_peers(
+            &PeerSelection {
+                context_id,
+                package,
+                source_role: source_role.to_owned(),
+            },
+            cancellation,
+        )
+    }
+
     pub(super) fn go_selected_package_id(
         &self,
         context_id: i64,
         file_version_id: i64,
         source_role: &str,
     ) -> Result<Option<i64>> {
-        let mut statement = self
-            .ready
-            .inventory
-            .connection()
-            .prepare_cached(&CALLER_PACKAGE)?;
-        let mut rows =
-            statement.query(rusqlite::params![context_id, file_version_id, source_role])?;
-        let Some(row) = rows.next()? else {
+        let rows = read_placement_rows(
+            &self.ready.inventory,
+            CALLER_PACKAGE.as_str(),
+            rusqlite::params![context_id, file_version_id, source_role],
+            |row: &rusqlite::Row<'_>| Ok(row.get(0)?),
+        )?;
+        let [package_id] = rows.as_slice() else {
             return Ok(None);
         };
-        let package_id = row.get(0)?;
-        if rows.next()?.is_some() {
-            return Ok(None);
-        }
-        Ok(Some(package_id))
+        Ok(Some(*package_id))
     }
 
     /// Name the package whose own unselected-source gap or constrained source
@@ -307,44 +403,14 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GoDotImportContext::Cancelled);
         };
         let references = unique_package_references_by_token(&references)?;
-        let mut targets = Vec::new();
-        if !references.is_empty() {
-            for &peer in &peers {
-                if cancellation.is_cancelled() {
-                    return Ok(GoDotImportContext::Cancelled);
-                }
-                let Some(members) =
-                    self.read_package_peer_members(&peer_request, peer, cancellation)?
-                else {
-                    return Ok(GoDotImportContext::Cancelled);
-                };
-                let target = self.ready.inventory.mount_record_by_ordinal(peer)?;
-                targets.push((peer, target.fragment_id(), members));
-            }
-        }
-        let pairs = targets
-            .iter()
-            .flat_map(|(peer, target_fragment, members_by_lookup)| {
-                references
-                    .iter()
-                    .take_while(|_| !cancellation.is_cancelled())
-                    .flat_map(move |reference| {
-                        members_by_lookup
-                            .get(&reference.lookup)
-                            .into_iter()
-                            .flatten()
-                            .map(move |member| PackageBridgePair {
-                                reference,
-                                member,
-                                target_fragment: *target_fragment,
-                                target_mount: *peer,
-                                extra: (),
-                            })
-                    })
-            });
-        let assembly = assemble_package_bridges(
+        let assembly = drive_package_bridges(
             &self.ready,
-            pairs,
+            &peers,
+            &references,
+            &GoPackagePlanRules {
+                operation: self,
+                request: &peer_request,
+            },
             &GoPackageBridgeRules {
                 source: source.fragment(),
                 completion: context.inventory_completion().clone(),

@@ -7,13 +7,15 @@ use tree_sitter::Language as TsLanguage;
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
-/// The immutable grammar/query base is cached. C++ and Python configuration is
-/// folded outside that cache on each call, so a later analyzer construction observes
-/// the current policy. Other languages retain their existing borrowed epoch.
+/// The immutable grammar/query base is cached. The source-admission policy of
+/// the languages that admit structural line data (C++, Python, JavaScript and
+/// TypeScript) is folded outside that cache on each call, so a later analyzer
+/// construction observes the current policy. Other languages retain their
+/// existing borrowed epoch.
 /// Always pass the canonical parser for `language`.
 #[doc(hidden)]
 pub fn epoch_for(language: Language, ts_language: &TsLanguage) -> Cow<'static, str> {
-    let policy = if matches!(language, Language::Cpp | Language::Python) {
+    let policy = if has_configured_epoch(language) {
         SourceAdmissionPolicy::current()
     } else {
         SourceAdmissionPolicy::from_setting(None)
@@ -27,10 +29,14 @@ fn epoch_for_policy(
     policy: SourceAdmissionPolicy,
 ) -> Cow<'static, str> {
     let base = crate::analyzer::store::epoch::base_epoch_for(language, ts_language);
-    if matches!(language, Language::Cpp | Language::Python) {
+    if has_configured_epoch(language) {
         let domain: &[u8] = match language {
             Language::Cpp => b"bifrost-configured-cpp-analysis-epoch:v1",
             Language::Python => b"bifrost-configured-python-analysis-epoch:v1",
+            // #4479: JavaScript and TypeScript joined when they began admitting
+            // string line data and grammar-proven NUL payloads.
+            Language::JavaScript => b"bifrost-configured-javascript-analysis-epoch:v1",
+            Language::TypeScript => b"bifrost-configured-typescript-analysis-epoch:v1",
             _ => unreachable!("only structural-line adapters have configured epochs"),
         };
         let mut hasher = CanonicalHasher::new(domain);
@@ -40,6 +46,13 @@ fn epoch_for_policy(
     } else {
         Cow::Borrowed(base)
     }
+}
+
+fn has_configured_epoch(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Cpp | Language::Python | Language::JavaScript | Language::TypeScript
+    )
 }
 
 #[cfg(test)]

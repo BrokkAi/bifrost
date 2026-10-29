@@ -512,13 +512,13 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports, from
-`2` through `19`. The field is mandatory: omitted, zero, and unsupported versions
+`2` through `20`. The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
 
-The newest schema is `19`. Packs generated from pinned artifacts declare the
+The newest schema is `20`. Packs generated from pinned artifacts declare the
 lowest schema their content needs, never below `8`, so a reader that predates a
 field still accepts a pack that does not use it.
 
@@ -576,7 +576,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v19.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v19.schema.json).
+[`schemas/semantic-model-pack-v20.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v20.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen

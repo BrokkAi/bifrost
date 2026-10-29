@@ -484,7 +484,10 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                 types,
                 members,
                 relations,
+                type_forwards,
+                ..
             } => {
+                type_forwards.sort_by(|left, right| left.name.cmp(&right.name));
                 for fact in &mut *types {
                     fact.aliases.sort_unstable();
                     fact.aliases.dedup();
@@ -648,7 +651,11 @@ fn compile_payload(
             types,
             members,
             relations,
+            assembly_identity,
+            type_forwards,
         } => CompiledPayload::DeclarationFacts {
+            assembly_identity: assembly_identity.clone(),
+            type_forwards: type_forwards.clone(),
             types: types.iter().cloned().map(std::sync::Arc::new).collect(),
             members: members.iter().cloned().map(std::sync::Arc::new).collect(),
             relations: relations.iter().cloned().map(std::sync::Arc::new).collect(),

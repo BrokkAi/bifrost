@@ -299,14 +299,15 @@ policy_records! {
     CvssSeverity { labels: ["cvss-severity"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(cvss-severity :when-unscored unrated|note|warning|error)", description: "Derive severity from CVSS with an explicit unscored fallback." }
     Argument { labels: ["argument"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(argument :index N) | (argument :name \"NAME\")", description: "Bind a zero-based argument index or exact formal argument name." }
     ArgumentCondition { labels: ["argument-condition"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(argument-condition :argument (argument :index N) :equals true|false)", description: "Require one direct call argument to have an exact Boolean value." }
-    Result { labels: ["result"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(result :index N)", description: "Bind one zero-based normal call result." }
+    Result { labels: ["result"], layout: Mixed, owner: OwnerApplicability::BOTH, signature: "(result :index N) | (result true|false|nil|non-nil [:index N])", description: "Bind one zero-based normal call result, or name the accepting result of a conditional sanitizer." }
+    ReceiverRequirement { labels: ["receiver"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(receiver (:constant true | :equals LITERAL | :result-of SELECTOR))", description: "Require one property of the sanitizer call receiver." }
     SourceSemantics { labels: ["source-semantics"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(source-semantics :labels [LABEL...] [:evidence EVIDENCE])", description: "Attach diagnostic-neutral taint source semantics to a source endpoint." }
     SinkSemantics { labels: ["sink-semantics"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(sink-semantics :accepts [LABEL...] [:tags [...]] [:impacts [...]])", description: "Attach diagnostic-neutral taint sink semantics to a sink endpoint." }
     Evidence { labels: ["evidence"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(evidence [:trust-boundary VALUE] [:system-entry VALUE])", description: "Record coherent source evidence; at least one field is required." }
     Report { labels: ["report"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(report [:witness WITNESS] [:witnesses-per-finding N] [:origins-per-finding N])", description: "Bound witness and origin retention for each finding." }
     Witness { labels: ["witness"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(witness [:max-steps N] [:max-bytes N])", description: "Bound the retained steps and encoded bytes of one witness." }
     EndpointSet { labels: ["endpoint-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(endpoint-set [:include-sets [...]] [:include-matches [...]] [:entries [...]])", description: "Compose a typed endpoint set from catalogs, endpoint matches, and local entries. A flow analysis composes only local entries." }
-    Catalog { labels: ["catalog"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(catalog :name ID :version N [:sha256 HEX])", description: "Reference an explicitly registered, optionally content-pinned taint catalog." }
+    Catalog { labels: ["catalog"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(catalog :name ID :version N [:sha256 HEX]) | (catalog :any-registered true :categories (any|all [CATEGORY...]))", description: "Reference a named catalog or select categorized entries across catalogs registered for this run." }
     MatchDirectory { labels: ["match-directory"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(match-directory :path PATH :scope direct|recursive [:role source|sink] [:phase PHASE] :categories (any|all [...]) [:manifest-sha256 HEX])", description: "Select endpoint leaves transactionally from an explicit capability-rooted directory." }
     MatchEndpoints { labels: ["match-endpoints"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(match-endpoints :ids [ENDPOINT-ID...] [:role source|sink] [:phase PHASE])", description: "Select exact endpoint IDs already present in the immutable endpoint index." }
     CategoryAny { labels: ["any"], layout: Positional, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(any [CATEGORY...])", description: "Require at least one exact category from a non-empty set." }
@@ -316,16 +317,16 @@ policy_records! {
     EndpointRef { labels: ["endpoint-ref"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(endpoint-ref (:local ID | :catalog CATALOG :entry ID | :match-endpoint ID))", description: "Name one endpoint in the current policy, an explicit catalog, or the endpoint index." }
     Source { labels: ["source"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(source :id ID :display-name TEXT :categories [...] :selector SELECTOR :bind PORT :labels [...] [:threat-model KIND] [:evidence EVIDENCE])", description: "Declare one policy-local taint source." }
     Sink { labels: ["sink"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sink :id ID :display-name TEXT :categories [...] :selector SELECTOR :dangerous-operand PORT :accepts [...] [:tags [...]] [:impacts [...]])", description: "Declare one policy-local taint sink." }
-    Barrier { labels: ["barrier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(barrier :id ID :value-type (intrinsic bool)|(enum :fieldless true))", description: "Stop this policy's taint at value observations proven to satisfy the type predicate." }
-    IntrinsicValueType { labels: ["intrinsic"], layout: Positional, owner: OwnerApplicability::POLICY_TAINT, signature: "(intrinsic bool)", description: "Require the resolved intrinsic Boolean identity, never a source spelling." }
+    Barrier { labels: ["barrier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(barrier :id ID :value-type (intrinsic bool|numeric)|(enum :fieldless true))", description: "Stop this policy's taint at value observations proven to satisfy the type predicate." }
+    IntrinsicValueType { labels: ["intrinsic"], layout: Positional, owner: OwnerApplicability::POLICY_TAINT, signature: "(intrinsic bool|numeric)", description: "Require a resolved intrinsic Boolean or integer/floating-point type identity, never a source spelling." }
     FieldlessEnumValueType { labels: ["enum"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(enum :fieldless true)", description: "Require an exhaustive enum variant inventory with no payload fields." }
-    Sanitizer { labels: ["sanitizer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sanitizer :id ID :selector SELECTOR :input PORT :output PORT :removes [LABEL...])", description: "Declare one policy-local sanitizer transfer." }
+    Sanitizer { labels: ["sanitizer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sanitizer :id ID :selector SELECTOR (:input PORT :output PORT | :when (result VALUE [:index N]) :sanitizes OPERAND [:requires [...]]) :removes [LABEL...])", description: "Declare a transfer sanitizer or a branch-conditioned sanitizer, exclusively." }
     StoreWrite { labels: ["store-write"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(store-write :id ID :selector SELECTOR :store STORE [:key PORT] [:instance PORT] :input PORT)", description: "Declare that the selected call writes its input port's value into the named persistence store, optionally discriminated by a key port and an instance port." }
     StoreRead { labels: ["store-read"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(store-read :id ID :selector SELECTOR :store STORE [:key PORT] [:instance PORT] :output PORT)", description: "Declare that the selected call's output port returns data from the named persistence store under the same optional key and instance dimensions." }
     EntryPoint { labels: ["entry-point"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(entry-point :id ID :selector SELECTOR :parameter (argument ...) :labels [LABEL...])", description: "Declare one framework-invoked entry point: the analysis roots the selected procedure declaration and taints the bound formal parameter on entry." }
     Origin { labels: ["origin"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(origin :id ID :display-name TEXT :selector SELECTOR :bind PORT)", description: "Declare one value-flow origin: the site and typed port where the tracked value is established." }
     Observation { labels: ["observation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(observation :id ID :display-name TEXT :selector SELECTOR :observed-operand PORT)", description: "Declare one value-flow observation: the site and typed port that consumes the tracked value." }
-    Kill { labels: ["kill"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(kill :id ID :selector SELECTOR :input PORT :output PORT)", description: "Declare one value-flow kill: at this site the output port no longer carries the tracked value established at the input port." }
+    Kill { labels: ["kill"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(kill :id ID :selector SELECTOR (:input PORT :output PORT | :when (result VALUE [:index N]) :sanitizes OPERAND [:requires [...]]))", description: "Declare a value-flow kill as a transfer or a branch-conditioned operand sanitizer." }
     TransformEntry { labels: ["transform"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(transform :id ID :selector SELECTOR :input PORT :output PORT [:removes [...]] [:adds [...]])", description: "Declare one policy-local input-to-output transform; taint may also rewrite labels." }
     ExternalModel { labels: ["external-model"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(external-model :id ID :selector SELECTOR :transfers [TRANSFER...])", description: "Declare typed transfer behavior for one external API." }
     Transfer { labels: ["transfer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(transfer :from PORT :to PORT :labels [LABEL...] :effect EFFECT)", description: "Move selected labels between two typed external-model ports." }
@@ -572,6 +573,8 @@ macro_rules! value_shapes {
             /// shapes return `None` and are decoded by their typed shape.
             pub fn atom_domain(self) -> Option<AtomDomain> {
                 match self {
+                    Self::SanitizerResult => Some(AtomDomain::SanitizerResult),
+                    Self::SanitizerOperand => Some(AtomDomain::SanitizerOperand),
                     Self::AnalysisType => Some(AtomDomain::AnalysisType),
                     Self::GeneratedRelation => Some(AtomDomain::GeneratedRelation),
                     Self::Severity | Self::FixedOrUnratedSeverity => Some(AtomDomain::Severity),
@@ -618,7 +621,7 @@ macro_rules! value_shapes {
                     Self::RouteHop => Some(AtomDomain::RouteHop),
                     Self::RowJoinKind => Some(AtomDomain::RowJoinKind),
                     Self::RowAggregateOp => Some(AtomDomain::RowAggregateOp),
-                    Self::CaptureName
+                    Self::SanitizerWhen | Self::SanitizerRequires | Self::SanitizerLiteral | Self::CaptureName
                     | Self::TypestateArgumentCondition
                     | Self::AssertCardinality
                     | Self::AssertEntries
@@ -730,6 +733,10 @@ macro_rules! value_shapes {
             /// `atom_domain` and `description`.
             pub fn accepted_records(self) -> &'static [PolicyRecord] {
                 match self {
+                    Self::SanitizerWhen => &[PolicyRecord::Result],
+                    Self::SanitizerOperand => &[PolicyRecord::Argument],
+                    Self::SanitizerRequires => &[PolicyRecord::ReceiverRequirement, PolicyRecord::Argument],
+                    Self::SanitizerResult | Self::SanitizerLiteral => &[],
                     Self::AnalysisRecord => &[PolicyRecord::Analysis],
                     Self::ReportOptions => &[PolicyRecord::Report],
                     Self::WitnessOptions => &[PolicyRecord::Witness],
@@ -1025,6 +1032,11 @@ value_shapes! {
     EndpointBinding => "matched-value, receiver, return-value, an indexed result record, or an argument record",
     EndpointSemantics => "source-semantics or sink-semantics matching the endpoint role",
     PolicyPort => "matched-value, receiver, return-value, an indexed result record, or an argument record",
+    SanitizerWhen => "a result condition: true, false, nil, or non-nil, with optional result index",
+    SanitizerResult => "true, false, nil, or non-nil",
+    SanitizerOperand => "receiver or an indexed argument",
+    SanitizerRequires => "a non-empty vector of receiver or indexed-argument requirements",
+    SanitizerLiteral => "a string, number, or Boolean literal",
     TaintMode => "the may analysis mode",
     ThreatModel => "remote, commandargs, environment, stdin, file, or database",
     ThreatModels => "a non-empty set of threat-model values",
@@ -1080,7 +1092,7 @@ value_shapes! {
     SanitizerEntries => "policy-local sanitizer records",
     BarrierEntries => "policy-local value-type barriers",
     ValueTypePredicate => "an intrinsic or fieldless enum type predicate",
-    IntrinsicValueType => "the intrinsic bool type identity",
+    IntrinsicValueType => "an intrinsic bool or numeric type identity",
     FieldlessRequirement => "true (an exhaustive payload-free variant inventory)",
     StoreEntries => "policy-local store-write and store-read records",
     EntryPointEntries => "policy-local entry-point records",
@@ -1336,7 +1348,7 @@ policy_fields! {
     CvssSeverityWhenUnscored { record: CvssSeverity, labels: ["when-unscored"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: FixedOrUnratedSeverity, owner: OwnerApplicability::POLICY_ALL, signature: ":when-unscored unrated|note|warning|error", description: "Set the fallback when no complete CVSS assessment exists." }
     ArgumentIndex { record: Argument, labels: ["index"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::BOTH, signature: ":index N", description: "Bind a zero-based argument index; mutually exclusive with name." }
     ArgumentName { record: Argument, labels: ["name"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::BOTH, signature: ":name \"formal-name\"", description: "Bind an exact formal argument name; mutually exclusive with index." }
-    ResultIndex { record: Result, labels: ["index"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::BOTH, signature: ":index N", description: "Bind the zero-based normal result ordinal." }
+    ResultIndex { record: Result, labels: ["index"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::BOTH, signature: ":index N", description: "Bind the zero-based normal result ordinal." }
 
     SourceSemanticsLabels { record: SourceSemantics, labels: ["labels"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::ENDPOINT, signature: ":labels [LABEL...]", description: "Declare the non-empty labels introduced by the endpoint." }
     SourceSemanticsEvidence { record: SourceSemantics, labels: ["evidence"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SourceEvidence, owner: OwnerApplicability::ENDPOINT, signature: ":evidence (evidence ...)", description: "Attach coherent source trust/entry evidence." }
@@ -1366,8 +1378,13 @@ policy_fields! {
     EndpointSetObservationEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: ObservationEntries, owner: OwnerApplicability::POLICY_FLOW, context: FlowObservationsOnly, signature: ":entries [(observation ...)...]", description: "Add bounded policy-local value-flow observation entries." }
     EndpointSetKillEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: KillEntries, owner: OwnerApplicability::POLICY_FLOW, context: FlowKillsOnly, signature: ":entries [(kill ...)...]", description: "Add bounded policy-local value-flow kill entries." }
     EndpointSetExternalModelEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: ExternalModelEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintExternalModelsOnly, signature: ":entries [(external-model ...)...]", description: "Add bounded policy-local external-model entries." }
-    CatalogName { record: Catalog, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyId, owner: OwnerApplicability::POLICY_TAINT, signature: ":name \"catalog.id\"", description: "Name an explicitly registered catalog." }
-    CatalogVersion { record: Catalog, labels: ["version"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PositiveInteger, owner: OwnerApplicability::POLICY_TAINT, signature: ":version N", description: "Select an exact positive catalog version." }
+    CatalogAnyRegistered { record: Catalog, labels: ["any-registered"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_TAINT, signature: ":any-registered true", description: "Select entries across every catalog registered for this run. Requires :categories; excludes :name, :version and :sha256." }
+    CatalogCategories { record: Catalog, labels: ["categories"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CategoryPredicate, owner: OwnerApplicability::POLICY_TAINT, signature: ":categories (any|all [CATEGORY...])", description: "Filter wildcard catalog entries by declared categories before applying endpoint limits." }
+    SanitizerCategories { record: Sanitizer, labels: ["categories"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: Categories, owner: OwnerApplicability::POLICY_TAINT, signature: ":categories [CATEGORY...]", description: "Classify this sanitizer for catalog wildcard selection; omission excludes it from wildcards." }
+    TransformCategories { record: TransformEntry, labels: ["categories"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: Categories, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":categories [CATEGORY...]", description: "Classify this transform for catalog wildcard selection; omission excludes it from wildcards." }
+    ExternalModelCategories { record: ExternalModel, labels: ["categories"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: Categories, owner: OwnerApplicability::POLICY_TAINT, signature: ":categories [CATEGORY...]", description: "Classify this external model for catalog wildcard selection; omission excludes it from wildcards." }
+    CatalogName { record: Catalog, labels: ["name"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyId, owner: OwnerApplicability::POLICY_TAINT, signature: ":name \"catalog.id\"", description: "Name an explicitly registered catalog." }
+    CatalogVersion { record: Catalog, labels: ["version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PositiveInteger, owner: OwnerApplicability::POLICY_TAINT, signature: ":version N", description: "Select an exact positive catalog version." }
     CatalogSha256 { record: Catalog, labels: ["sha256"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Sha256, owner: OwnerApplicability::POLICY_TAINT, signature: ":sha256 \"64-lower-hex\"", description: "Optionally pin canonical typed catalog content." }
     MatchDirectoryPath { record: MatchDirectory, labels: ["path"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: WorkspacePath, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":path \"policies/endpoints\"", description: "Name the capability-rooted endpoint directory." }
     MatchDirectoryScope { record: MatchDirectory, labels: ["scope"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DirectoryScope, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":scope direct|recursive", description: "Choose direct children or bounded recursive traversal." }
@@ -1414,16 +1431,29 @@ policy_fields! {
     ObservationOperand { record: Observation, labels: ["observed-operand"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":observed-operand PORT", description: "Bind the operand whose value the observation consumes." }
     KillId { record: Kill, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_FLOW, signature: ":id \"entry-id\"", description: "Set the policy-local kill identity." }
     KillSelector { record: Kill, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_FLOW, signature: ":selector SELECTOR", description: "Select the kill sites." }
-    KillInput { record: Kill, labels: ["input"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":input PORT", description: "Bind the value the kill consumes." }
-    KillOutput { record: Kill, labels: ["output"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":output PORT", description: "Bind the value the kill establishes; it no longer carries the tracked provenance." }
+    KillInput { record: Kill, labels: ["input"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":input PORT", description: "Bind the value the kill consumes." }
+    KillOutput { record: Kill, labels: ["output"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":output PORT", description: "Bind the value the kill establishes; it no longer carries the tracked provenance." }
     BarrierId { record: Barrier, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id ID", description: "Name this barrier in policy evidence." }
-    BarrierValueType { record: Barrier, labels: ["value-type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ValueTypePredicate, owner: OwnerApplicability::POLICY_TAINT, signature: ":value-type (intrinsic bool)|(enum :fieldless true)", description: "Choose the resolved value-type proof required to stop taint." }
-    IntrinsicValueTypeKind { record: IntrinsicValueType, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: IntrinsicValueType, owner: OwnerApplicability::POLICY_TAINT, signature: "bool", description: "Require the intrinsic Boolean identity." }
+    BarrierValueType { record: Barrier, labels: ["value-type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ValueTypePredicate, owner: OwnerApplicability::POLICY_TAINT, signature: ":value-type (intrinsic bool|numeric)|(enum :fieldless true)", description: "Choose the resolved value-type proof required to stop taint." }
+    IntrinsicValueTypeKind { record: IntrinsicValueType, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: IntrinsicValueType, owner: OwnerApplicability::POLICY_TAINT, signature: "bool|numeric", description: "Require a Boolean or numeric intrinsic identity." }
     EnumFieldless { record: FieldlessEnumValueType, labels: ["fieldless"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: FieldlessRequirement, owner: OwnerApplicability::POLICY_TAINT, signature: ":fieldless true", description: "Require exhaustive payload-free enum variants." }
     SanitizerId { record: Sanitizer, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the sanitizer identity." }
     SanitizerSelector { record: Sanitizer, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select sanitizer calls or values." }
-    SanitizerInput { record: Sanitizer, labels: ["input"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":input PORT", description: "Bind the sanitizer input value." }
-    SanitizerOutput { record: Sanitizer, labels: ["output"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":output PORT", description: "Bind the sanitizer output value." }
+    SanitizerInput { record: Sanitizer, labels: ["input"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":input PORT", description: "Bind the sanitizer input value." }
+    SanitizerOutput { record: Sanitizer, labels: ["output"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":output PORT", description: "Bind the sanitizer output value." }
+    SanitizerWhen { record: Sanitizer, labels: ["when"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerWhen, owner: OwnerApplicability::POLICY_TAINT, signature: ":when (result true|false|nil|non-nil [:index N])", description: "Name the accepting branch result; exclusive with input/output." }
+    SanitizerSanitizes { record: Sanitizer, labels: ["sanitizes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerOperand, owner: OwnerApplicability::POLICY_TAINT, signature: ":sanitizes receiver|(argument :index N)", description: "Name the call operand cleaned on the accepting branch." }
+    SanitizerRequires { record: Sanitizer, labels: ["requires"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerRequires, owner: OwnerApplicability::POLICY_TAINT, signature: ":requires [REQUIREMENT...]", description: "Require constant, equals, or result-of properties of call operands." }
+    KillWhen { record: Kill, labels: ["when"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerWhen, owner: OwnerApplicability::POLICY_FLOW, signature: ":when (result true|false|nil|non-nil [:index N])", description: "Name the accepting branch result; exclusive with input/output." }
+    KillSanitizes { record: Kill, labels: ["sanitizes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerOperand, owner: OwnerApplicability::POLICY_FLOW, signature: ":sanitizes receiver|(argument :index N)", description: "Name the call operand cleaned on the accepting branch." }
+    KillRequires { record: Kill, labels: ["requires"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerRequires, owner: OwnerApplicability::POLICY_FLOW, signature: ":requires [REQUIREMENT...]", description: "Require constant, equals, or result-of properties of call operands." }
+    SanitizerResultValue { record: Result, labels: ["value"], placement: FieldPlacement::Positional { index: 0 }, required: Optional, multiplicity: SCALAR, shape: SanitizerResult, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "true|false|nil|non-nil", description: "The accepting result value for a conditional sanitizer." }
+    ArgumentConstant { record: Argument, labels: ["constant"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":constant true", description: "Require a compile-time constant operand." }
+    ArgumentEquals { record: Argument, labels: ["equals"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerLiteral, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":equals LITERAL", description: "Require an operand equal to the decoded string, number or Boolean literal." }
+    ArgumentResultOf { record: Argument, labels: ["result-of"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":result-of SELECTOR", description: "Require the operand to originate from a call selected by SELECTOR." }
+    ReceiverRequirementConstant { record: ReceiverRequirement, labels: ["constant"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":constant true", description: "Require a compile-time constant operand." }
+    ReceiverRequirementEquals { record: ReceiverRequirement, labels: ["equals"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SanitizerLiteral, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":equals LITERAL", description: "Require an operand equal to the decoded string, number or Boolean literal." }
+    ReceiverRequirementResultOf { record: ReceiverRequirement, labels: ["result-of"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: ":result-of SELECTOR", description: "Require the operand to originate from a call selected by SELECTOR." }
     SanitizerRemoves { record: Sanitizer, labels: ["removes"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":removes [LABEL...]", description: "Declare the non-empty labels removed by the sanitizer." }
     StoreWriteId { record: StoreWrite, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the store-write identity in the shared local taint entry namespace." }
     StoreWriteSelector { record: StoreWrite, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select the store-writing calls." }
@@ -1698,6 +1728,8 @@ pub fn variadic_positional_field(record: PolicyRecord) -> Option<&'static Policy
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AtomDomain {
+    SanitizerOperand,
+    SanitizerResult,
     AnalysisType,
     GeneratedRelation,
     Severity,
@@ -1815,6 +1847,11 @@ macro_rules! atom_values {
 }
 
 atom_values! {
+    SanitizerReceiver { domain: SanitizerOperand, spellings: ["receiver"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Sanitize the call receiver on its accepting branch." }
+    SanitizerTrue { domain: SanitizerResult, spellings: ["true"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Accept the branch proving the call result is true." }
+    SanitizerFalse { domain: SanitizerResult, spellings: ["false"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Accept the branch proving the call result is false." }
+    SanitizerNil { domain: SanitizerResult, spellings: ["nil"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Accept the branch proving the call result is nil." }
+    SanitizerNonNil { domain: SanitizerResult, spellings: ["non-nil"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "Accept the branch proving the call result is non-nil." }
     AnalysisMatch { domain: AnalysisType, spellings: ["match"], owner: OwnerApplicability::POLICY_MATCH, description: "Execute a direct location-bearing selector." }
     AnalysisTaint { domain: AnalysisType, spellings: ["taint"], owner: OwnerApplicability::POLICY_TAINT, description: "Declare set-oriented taint propagation inputs." }
     AnalysisTypestate { domain: AnalysisType, spellings: ["typestate"], owner: OwnerApplicability::POLICY_TYPESTATE, description: "Declare endpoint-bound protocol tracking." }
@@ -1830,6 +1867,7 @@ atom_values! {
     EndpointSetSources { domain: EndpointSetKind, spellings: ["sources"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone source endpoint set." }
     EndpointSetSinks { domain: EndpointSetKind, spellings: ["sinks"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone sink endpoint set." }
     EndpointSetBarriers { domain: EndpointSetKind, spellings: ["barriers"], owner: OwnerApplicability::POLICY_TAINT, description: "A standalone value-type barrier set." }
+    IntrinsicNumeric { domain: IntrinsicValueType, spellings: ["numeric"], owner: OwnerApplicability::POLICY_TAINT, description: "Integer and floating-point types; Go includes named numeric underlying types. Excludes complex numbers and untyped constants." }
     IntrinsicBool { domain: IntrinsicValueType, spellings: ["bool"], owner: OwnerApplicability::POLICY_TAINT, description: "The resolved intrinsic Boolean identity." }
     FieldlessTrue { domain: FieldlessRequirement, spellings: ["true"], owner: OwnerApplicability::POLICY_TAINT, description: "Require an exhaustive inventory with no payload fields." }
     EndpointSetSanitizers { domain: EndpointSetKind, spellings: ["sanitizers"], owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, description: "A standalone sanitizer endpoint set." }

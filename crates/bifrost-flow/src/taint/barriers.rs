@@ -32,7 +32,7 @@ use super::{
     TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction, TaintFact, TaintFinding,
     TaintFindingCollectionLimits, TaintFindingError, TaintFindingReport,
     TaintOriginFindingEvidence, TaintOriginStatus, TaintSolveError, TaintSummaryResult,
-    collect_taint_findings_with_limits,
+    collect_taint_findings_with_attribution_budget,
 };
 
 /// Classifier failures propagate outside discovery's infallible callbacks.
@@ -92,6 +92,7 @@ impl IcfgBarrierSession {
         max_origins: usize,
         witnesses: crate::dataflow::WitnessReconstructionLimits,
         collection: TaintFindingCollectionLimits,
+        attribution: &mut super::TaintAttributionBudget,
     ) -> Result<Self, IcfgBarrierError> {
         if root != plan.value_flow().root() {
             return Err(IcfgBarrierError::Solve(TaintSolveError::RootMismatch));
@@ -110,9 +111,15 @@ impl IcfgBarrierSession {
         )
         .map_err(|e| IcfgBarrierError::Solve(TaintSolveError::from(e)))?;
         let result = TaintSummaryResult::from_result(plan, result);
-        let baseline =
-            collect_taint_findings_with_limits(plan, result, max_origins, witnesses, collection)
-                .map_err(IcfgBarrierError::Findings)?;
+        let baseline = collect_taint_findings_with_attribution_budget(
+            plan,
+            result,
+            max_origins,
+            witnesses,
+            collection,
+            attribution,
+        )
+        .map_err(IcfgBarrierError::Findings)?;
         Ok(Self {
             predicates: plan.value_type_barriers().into(),
             baseline,

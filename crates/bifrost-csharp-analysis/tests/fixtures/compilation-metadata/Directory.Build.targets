@@ -1,0 +1,7 @@
+<Project>
+  <ItemGroup>
+    <Using Remove="Shared.RemoveByTargets" />
+    <Using Include="Shared.Targets" />
+    <InternalsVisibleTo Remove="RemoveMe" />
+  </ItemGroup>
+</Project>

@@ -144,11 +144,24 @@ pub fn test_assertion_source(
     }
     // A candidate whose source cannot be read yields no findings; record why,
     // so the report is not complete with nothing decided.
-    let source = analyzer.project().read_source(file).ok();
-    if source.is_none() {
-        analyzer.record_query_incomplete(QueryReadIncomplete::StructureUnavailable(file.clone()));
+    match analyzer.project().read_source(file) {
+        Ok(source) => Some(source),
+        Err(error)
+            if error.get_ref().is_some_and(|cause| {
+                cause.is::<brokk_bifrost_core::analyzer::project::BinarySourceRejection>()
+            }) =>
+        {
+            analyzer
+                .record_query_incomplete(QueryReadIncomplete::StructureUnavailable(file.clone()));
+            None
+        }
+        Err(error) => {
+            analyzer.record_query_failure(store::StoreError::new(format!(
+                "reading test assertion source for {file:?}: {error}"
+            )));
+            None
+        }
     }
-    source
 }
 
 #[doc(hidden)]
@@ -368,7 +381,7 @@ pub use i_analyzer::SearchSymbolCandidates;
 pub use i_analyzer::SearchSymbolPatternBatch;
 pub use i_analyzer::WorkspaceFileIndex;
 pub use i_analyzer::WorkspaceFileIndexCell;
-pub use i_analyzer::capture_query_reads;
+pub use i_analyzer::{capture_query_reads, replay_query_read_keys};
 
 pub use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::InformationTier;
@@ -615,3 +628,9 @@ pub(crate) mod selected_services;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod store_support;
+
+pub use brokk_bifrost_core::analyzer::carried_context::CarriedContext;
+pub use i_analyzer::{
+    ReadAttribution, ReadAttributionGuard, read_attribution_fallback_count,
+    read_attribution_records_reads,
+};

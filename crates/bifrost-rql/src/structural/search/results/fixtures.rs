@@ -279,6 +279,8 @@ pub fn code_query_result_fixtures_json() -> Value {
                     ..Default::default()
                 })),
                 annotation_status: Some(crate::analyzer::JavaAnnotationTypeStatus::Resolved),
+                annotation_fq_name: Some("fixture.annotations.TraceMarker".to_owned()),
+                annotation_route: Some(crate::analyzer::JavaAnnotationTypeRoute::SourceDeclaration),
                 ..Default::default()
             }),
         },

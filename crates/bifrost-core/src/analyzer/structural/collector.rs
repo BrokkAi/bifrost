@@ -237,12 +237,13 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         let string_value = if normalized_kind == NormalizedKind::StringLiteral {
             let value = self.spec.string_literal_value(node, self.source);
             let requires_string_value = self.spec.supports_string_literal_value()
-                && matches!(node.kind(), "string_literal" | "raw_string_literal")
-                && !self
-                    .spec
-                    .string_literal_value_may_be_absent(node, self.source);
+                && matches!(node.kind(), "string_literal" | "raw_string_literal");
             assert!(
-                !requires_string_value || value.is_some(),
+                value.is_some()
+                    || !requires_string_value
+                    || self
+                        .spec
+                        .string_literal_value_may_be_absent(node, self.source),
                 "{} structural adapter declares string-literal value support but grammar node {} has no exact value",
                 self.spec.language().config_label(),
                 node.grammar_name()
@@ -305,6 +306,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             duplicate_key,
             is_async,
             unsafe_context,
+            declaration_attributes: self.spec.declaration_attributes(node, self.source),
             string_value,
             construct: self
                 .spec
@@ -371,6 +373,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
                 duplicate_key: None,
                 is_async: None,
                 unsafe_context: None,
+                declaration_attributes: None,
                 string_value: None,
                 construct: embedded.construct.clone(),
                 parent: Some(

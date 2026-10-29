@@ -174,11 +174,12 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
         if let Some(entry) = self.source_roles.get(&mount) {
             return Ok(Some(entry.role.clone()));
         }
-        let role = self.operation.go_source_role_for_mount(
-            self.demand.context_id,
-            mount,
-            self.cancellation,
-        )?;
+        // An ignored row identifies a point caller's production package, but
+        // does not authorize remote source admission or a root certificate.
+        let role = self
+            .operation
+            .go_source_role_for_mount(self.demand.context_id, mount, self.cancellation)?
+            .filter(|role| role != "ignored");
         if let Some(role) = &role {
             self.source_roles.insert(
                 mount,
@@ -229,6 +230,11 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
                 selection.identity.revision,
                 mount,
                 selection.identity.context_id,
+                self.operation
+                    .ready
+                    .go_active_package
+                    .get()
+                    .map(|(_, package, role)| (package, role)),
                 record.persisted_relative_path(),
                 self.cancellation,
             )?
@@ -1482,6 +1488,55 @@ impl SelectedResolutionOperation<'_, '_> {
             &self.ready.go_package_inventory_complete,
             &self.ready.go_package_inventory_fragments,
         );
+        let caller_record = self
+            .ready
+            .inventory
+            .mount_record_by_ordinal(caller.ordinal())?;
+        let caller_version = super::go_context::go_placement_file_version(
+            self.ready.inventory.connection(),
+            &caller_record,
+        )?
+        .expect("a prepared Go caller has a selected placement");
+        let caller_role = self.go_source_role_for_mount(
+            context.demand.context_id,
+            caller.ordinal(),
+            context.cancellation,
+        )?;
+        let caller_package = if let Some(role) = caller_role {
+            let selected_role = match role.as_str() {
+                "go" => Some("go"),
+                "test" => Some("test"),
+                "xtest" => Some("xtest"),
+                "ignored" => None,
+                _ => unreachable!("a prepared caller has a selected Go source role: {role}"),
+            };
+            Some((
+                self.go_selected_package_id(context.demand.context_id, caller_version, &role)?
+                    .expect("a prepared Go caller has one selected package variant"),
+                selected_role,
+            ))
+        } else {
+            assert!(
+                context.cancellation.is_cancelled(),
+                "a prepared Go caller has a selected source role"
+            );
+            None
+        };
+        struct ActivePackageGuard<'a> {
+            slot: &'a std::cell::Cell<Option<(i64, i64, Option<&'static str>)>>,
+            previous: Option<(i64, i64, Option<&'static str>)>,
+        }
+        impl Drop for ActivePackageGuard<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+        let _active_package = ActivePackageGuard {
+            slot: &self.ready.go_active_package,
+            previous: self.ready.go_active_package.replace(
+                caller_package.map(|(package, role)| (context.demand.context_id, package, role)),
+            ),
+        };
         let base_context_mounts = context.demand.context_completions.keys().copied().collect();
         let mut language = GoDemandState {
             operation: self,

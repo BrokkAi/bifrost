@@ -55,6 +55,7 @@ MAJOR_TAG="${RELEASE_TAG%%.*}"
 
 for source_file in \
   .github/actions/policy-scan/action.yml \
+  .github/actions/policy-scan/check-open-pack-selection.sh \
   packaging/policy-scan-action/README.md \
   LICENSE.md; do
   if [ ! -f "${source_file}" ]; then
@@ -67,6 +68,9 @@ stage="$(mktemp -d)"
 trap 'rm -rf "${stage}"' EXIT
 
 cp .github/actions/policy-scan/action.yml "${stage}/action.yml"
+# The action runs this check from its own directory, so it sits next to
+# action.yml in the alias exactly as it does here.
+cp -p .github/actions/policy-scan/check-open-pack-selection.sh "${stage}/check-open-pack-selection.sh"
 cp packaging/policy-scan-action/README.md "${stage}/README.md"
 cp LICENSE.md "${stage}/LICENSE.md"
 
@@ -117,8 +121,8 @@ git -C "${clone}" config user.email "41898282+github-actions[bot]@users.noreply.
 branch="$(git -C "${clone}" symbolic-ref --short HEAD)"
 
 find "${clone}" -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +
-cp "${stage}/action.yml" "${stage}/README.md" "${stage}/LICENSE.md" \
-  "${clone}/"
+cp -p "${stage}/action.yml" "${stage}/check-open-pack-selection.sh" "${stage}/README.md" \
+  "${stage}/LICENSE.md" "${clone}/"
 
 git -C "${clone}" add -A
 changed=1

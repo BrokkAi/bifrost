@@ -4,6 +4,8 @@
 //! reparse source, infer identities from names, or upgrade allocation-site
 //! identities into runtime singletons.
 
+use crate::analyzer::semantic::MemoryLocationKind;
+
 use crate::analyzer::semantic::workspace_oracle::common::Interruption;
 
 use crate::analyzer::semantic::workspace_oracle::common::WorkStager;
@@ -1192,6 +1194,8 @@ pub fn rust_field_identity_is_supported(
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct IncomingActualQuery {
+    /// The caller storage whose address supplies a deferred receiver.
+    pub addressed_root: Option<AccessPathRoot>,
     #[doc(hidden)]
     pub observation: ValueAtPoint,
     #[doc(hidden)]
@@ -1614,18 +1618,15 @@ fn fresh_object_seed_value(
 
 #[doc(hidden)]
 pub fn call_names_any(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
     call: &SemanticCallSite,
     names: &HashSet<crate::analyzer::semantic::ValueId>,
 ) -> bool {
-    names.contains(&call.callee)
-        || call.receiver.is_some_and(|value| names.contains(&value))
-        || call
-            .arguments
-            .iter()
-            .any(|argument| names.contains(&argument.value))
+    first_call_name(semantics, call, names).is_some()
 }
 
 fn first_call_name(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
     call: &SemanticCallSite,
     names: &HashSet<crate::analyzer::semantic::ValueId>,
 ) -> Option<crate::analyzer::semantic::ValueId> {
@@ -1633,9 +1634,116 @@ fn first_call_name(
         .chain(call.receiver)
         .chain(call.arguments.iter().map(|argument| argument.value))
         .find(|value| names.contains(value))
+        .or_else(|| {
+            let selection = call.member_selection.as_ref()?;
+            if selection
+                .receiver_pointer_depth
+                .is_some_and(|depth| depth > 0)
+            {
+                return None;
+            }
+            match selection.receiver_place.as_ref()? {
+                crate::analyzer::semantic::SemanticPlace::MemoryLocation(location) => {
+                    let kind = &semantics.memory_location(*location)?.kind;
+                    names.iter().copied().find(|name| kind.uses_value(*name))
+                }
+                crate::analyzer::semantic::SemanticPlace::LocalBinding(expected) => {
+                    names.iter().copied().find(|name| {
+                        semantics
+                            .value(*name)
+                            .and_then(|value| semantics.source_mapping(value.source))
+                            .is_some_and(|mapping| same_place_source(&mapping.locator, expected))
+                    })
+                }
+            }
+        })
 }
 
-fn effect_names_any(
+fn same_place_source(
+    actual: &crate::analyzer::semantic::SemanticLocator,
+    expected: &crate::analyzer::semantic::SemanticLocator,
+) -> bool {
+    actual.mount() == expected.mount()
+        && actual.path() == expected.path()
+        && actual.language() == expected.language()
+        && actual.declaration() == expected.declaration()
+        && actual.anchor() == expected.anchor()
+}
+
+/// Convert a retained addressable frame place into its existing object root.
+/// Complex places without an exact object root remain open in the caller.
+#[doc(hidden)]
+pub fn addressed_place_root(
+    procedure: &ProcedureHandle,
+    place: &crate::analyzer::semantic::SemanticPlace,
+) -> Option<AccessPathRoot> {
+    use crate::analyzer::semantic::{MemoryLocationKind, SemanticPlace};
+    let semantics = procedure.semantics();
+    let location = match place {
+        SemanticPlace::MemoryLocation(location) => *location,
+        SemanticPlace::LocalBinding(expected) => {
+            let binding = semantics.values().iter().find(|value| {
+                matches!(
+                    value.kind,
+                    crate::analyzer::semantic::SemanticValueKind::Local
+                        | crate::analyzer::semantic::SemanticValueKind::Parameter { .. }
+                        | crate::analyzer::semantic::SemanticValueKind::Receiver { .. }
+                ) && semantics
+                    .source_mapping(value.source)
+                    .is_some_and(|mapping| same_place_source(&mapping.locator, expected))
+            })?;
+            semantics.binding_memory_location(binding.id)?
+        }
+    };
+    match semantics.memory_location(location)?.kind {
+        MemoryLocationKind::LexicalCell { .. } => Some(AccessPathRoot::LexicalCell(
+            procedure.memory_location_handle(location)?,
+        )),
+        MemoryLocationKind::Capture { .. } => Some(AccessPathRoot::CaptureSlot(
+            ProcedurePortHandle::new(
+                procedure.clone(),
+                ProcedurePortKind::Capture { slot: location },
+            )
+            .expect("a capture memory location has a capture port"),
+        )),
+        _ => None,
+    }
+}
+
+/// An exact address of a frame place, with the alias and origin's own proof.
+/// Pointer variables and offset/may aliases cannot establish this identity.
+#[doc(hidden)]
+pub fn exact_addressed_pointer_root(
+    procedure: &ProcedureHandle,
+    alias: &crate::analyzer::semantic::PointerAlias,
+) -> Option<AccessPathRoot> {
+    use crate::analyzer::semantic::{
+        PointerByteOffset, PointerOriginKind, PointerRelationStrength, SemanticValueKind,
+    };
+    let semantics = procedure.semantics();
+    if semantics.value(alias.pointer)?.kind != SemanticValueKind::Address
+        || alias.byte_offset != PointerByteOffset::Exact(0)
+        || alias.strength != PointerRelationStrength::Must
+    {
+        return None;
+    }
+    let origin = semantics.pointer_origins().get(alias.origin.index())?;
+    for evidence in [alias.evidence, origin.evidence] {
+        let evidence = semantics.evidence_row(evidence)?;
+        if !evidence
+            .proof
+            .establishes_complete_evidence(&evidence.completeness)
+        {
+            return None;
+        }
+    }
+    let PointerOriginKind::StackPlace { place } = &origin.kind else {
+        return None;
+    };
+    addressed_place_root(procedure, place)
+}
+
+pub(super) fn effect_names_any(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     effect: &SemanticEffect,
     names: &HashSet<crate::analyzer::semantic::ValueId>,
@@ -1697,7 +1805,7 @@ fn effect_names_any(
         SemanticEffect::Invoke { call_site }
         | SemanticEffect::CallContinuation { call_site, .. } => semantics
             .call_site(*call_site)
-            .is_some_and(|call| call_names_any(call, names)),
+            .is_some_and(|call| call_names_any(semantics, call, names)),
         SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
             value.is_some_and(|value| names.contains(&value))
         }
@@ -1707,10 +1815,15 @@ fn effect_names_any(
         SemanticEffect::AsyncResume { result, .. } => {
             result.is_some_and(|value| names.contains(&value))
         }
+        SemanticEffect::Synchronization {
+            subject, payload, ..
+        } => {
+            names.contains(subject)
+                || matches!(payload, Some(crate::analyzer::semantic::SynchronizationPayload::Send { value, .. }) if names.contains(value))
+        }
         SemanticEffect::Entry
         | SemanticEffect::NormalExit
         | SemanticEffect::ExceptionalExit
-        | SemanticEffect::Synchronization { .. }
         | SemanticEffect::Allocation { .. }
         | SemanticEffect::Gap { .. } => false,
     }
@@ -1748,7 +1861,7 @@ pub fn publication_gap_affects_names(
         SemanticGapSubject::CallSite(call_site)
         | SemanticGapSubject::CallContinuation { call_site, .. } => semantics
             .call_site(call_site)
-            .is_some_and(|call| call_names_any(call, names)),
+            .is_some_and(|call| call_names_any(semantics, call, names)),
         SemanticGapSubject::AsyncContinuation { suspend, .. } => {
             semantics.point(suspend).is_some_and(|point| {
                 point
@@ -1800,7 +1913,17 @@ pub fn mapped_formals_for_actual(
                 actual: binding_actual,
                 formal,
                 ..
-            } if binding_actual.id() == actual => formals.push(formal.clone()),
+            } if binding_actual.id() == actual
+                && !matches!(
+                    bindings.candidate().member_receiver_preparation(),
+                    Some(
+                        crate::analyzer::semantic::MemberReceiverPreparation::CopyValue
+                            | crate::analyzer::semantic::MemberReceiverPreparation::CopyPointee
+                    )
+                ) =>
+            {
+                formals.push(formal.clone())
+            }
             crate::analyzer::semantic::CallBinding::ArgumentGroup(group) => {
                 formals.extend(
                     group
@@ -1835,6 +1958,13 @@ pub fn resolve_fresh_object_publications(
     limits: crate::analyzer::semantic::OracleLimits,
     staged: &mut WorkStager,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    mut private_cell_binding: impl FnMut(
+        crate::analyzer::semantic::MemoryLocationId,
+        &mut WorkStager,
+    ) -> Result<
+        Option<crate::analyzer::semantic::ValueId>,
+        InterruptionOrProvider,
+    >,
 ) -> Result<DraftSet<PublicationDraft>, InterruptionOrProvider> {
     let procedure = query.observation().procedure();
     let semantics = procedure.semantics();
@@ -1964,6 +2094,25 @@ pub fn resolve_fresh_object_publications(
                         .map_err(InterruptionOrProvider::Provider)?,
                     identity_preserving: true,
                 }),
+                SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } if matches!(
+                    semantics
+                        .memory_location(location)
+                        .map(|location| &location.kind),
+                    Some(MemoryLocationKind::LexicalCell { .. })
+                ) =>
+                {
+                    if let Some(binding) = private_cell_binding(location, staged)? {
+                        copies.push(NameCopy {
+                            source: binding,
+                            target: result,
+                            evidence: evidence_handle(procedure, event.evidence)
+                                .map_err(InterruptionOrProvider::Provider)?,
+                            identity_preserving: true,
+                        });
+                    }
+                }
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::LanguageDefined,
                     source,
@@ -2062,15 +2211,26 @@ pub fn resolve_fresh_object_publications(
             .expect("validated publication slice retains its program point");
         for (event_index, event) in point.events.iter().enumerate() {
             let publication = match &event.effect {
-                SemanticEffect::MemoryStore { value, .. } if names.contains(value) => Some((
-                    FreshObjectPublication::at_event(
-                        point_handle.clone(),
-                        event_index,
-                        FreshObjectPublicationKind::MemoryStore,
-                    )
-                    .expect("matched memory store is a valid publication event"),
-                    *value,
-                )),
+                SemanticEffect::MemoryStore {
+                    location, value, ..
+                } if names.contains(value)
+                    && !(matches!(
+                        semantics
+                            .memory_location(*location)
+                            .map(|location| &location.kind),
+                        Some(MemoryLocationKind::LexicalCell { .. })
+                    ) && private_cell_binding(*location, staged)?.is_some()) =>
+                {
+                    Some((
+                        FreshObjectPublication::at_event(
+                            point_handle.clone(),
+                            event_index,
+                            FreshObjectPublicationKind::MemoryStore,
+                        )
+                        .expect("matched memory store is a valid publication event"),
+                        *value,
+                    ))
+                }
                 SemanticEffect::ProcedureReturn { value }
                     if value.is_some_and(|value| names.contains(&value)) =>
                 {
@@ -2127,7 +2287,12 @@ pub fn resolve_fresh_object_publications(
                 | SemanticEffect::CallableReference { callable, .. }
                     if callable
                         .bound_receiver
-                        .is_some_and(|receiver| names.contains(&receiver)) =>
+                        .is_some_and(|receiver| names.contains(&receiver))
+                        && !super::value_flow::callable_selection_is_non_escaping(
+                            semantics,
+                            point.id,
+                            event_index,
+                        ) =>
                 {
                     Some((
                         FreshObjectPublication::at_event(
@@ -2161,8 +2326,8 @@ pub fn resolve_fresh_object_publications(
                         // A call is one publication even when several
                         // operands name the object. Preserve an exact witness
                         // when it coexists with a conversion-derived candidate.
-                        first_call_name(call, &exact_names)
-                            .or_else(|| first_call_name(call, &candidate_names))
+                        first_call_name(semantics, call, &exact_names)
+                            .or_else(|| first_call_name(semantics, call, &candidate_names))
                             .map(|name| (call, name))
                     })
                     .and_then(|(call, name)| {

@@ -59,8 +59,15 @@ pub(super) fn finish(p: &mut Producer<'_, '_>, scopes: &[Scope<'_>]) {
         .iter()
         .filter_map(|timing| {
             let event = p.facts.binding_events[timing.event as usize];
-            (event.kind == ResolutionBindingEventKind::Assign)
-                .then_some((event.target, timing.commit_byte))
+            // Import targets retain their entry observation: retiming them
+            // creates extra inbound uses and incomplete self-import demands.
+            matches!(
+                event.kind,
+                ResolutionBindingEventKind::Assign
+                    | ResolutionBindingEventKind::Class
+                    | ResolutionBindingEventKind::Function
+            )
+            .then_some((event.target, timing.commit_byte))
         })
         .collect::<HashMap<_, _>>();
     for identifier in &p.facts.identifiers {

@@ -335,40 +335,44 @@ fn prefetch_file_groups<'a, A: WorkerAnswer>(
     }
     let input = selected.worker_input();
     let results = files.iter().map(|_| Mutex::new(None)).collect::<Vec<_>>();
+    let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
     rayon::scope(|scope| {
         for ((file, ranges), result) in files.iter().zip(&results) {
             if cancellation.soft_deadline_passed() || cancellation.is_cancelled() {
                 break;
             }
+            let context = &context;
             let factory = &factory;
             let snapshot = &snapshot;
             let work = &work;
             scope.spawn(move |_| {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _cancellation =
-                        AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
-                    let _models = AnalyzerQueryScope::with_active_semantic_model_snapshot(
-                        analyzer,
-                        snapshot.clone(),
-                    );
-                    run_selected_worker(store, input, cancellation, |operation| {
-                        let (value, reads) = capture_query_reads(analyzer, || {
-                            work(factory, operation, file, ranges)
-                        });
-                        Ok(SelectedResolutionOperationOutcome::Native(FileAnswer {
-                            value: value?,
-                            reads,
-                        }))
-                    })
-                }));
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(panic) => Err(StoreError::new(format!(
-                        "caller native worker panicked for {file}: {}",
-                        brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref()),
-                    ))),
-                };
-                *result.lock().expect("caller worker result lock") = Some(outcome);
+                context.run(|| {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _cancellation =
+                            AnalyzerQueryScope::with_cancellation(analyzer, cancellation);
+                        let _models = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                            analyzer,
+                            snapshot.clone(),
+                        );
+                        run_selected_worker(store, input, cancellation, |operation| {
+                            let (value, reads) = capture_query_reads(analyzer, || {
+                                work(factory, operation, file, ranges)
+                            });
+                            Ok(SelectedResolutionOperationOutcome::Native(FileAnswer {
+                                value: value?,
+                                reads,
+                            }))
+                        })
+                    }));
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(panic) => Err(StoreError::new(format!(
+                            "caller native worker panicked for {file}: {}",
+                            brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref()),
+                        ))),
+                    };
+                    *result.lock().expect("caller worker result lock") = Some(outcome);
+                })
             });
         }
     });

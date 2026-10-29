@@ -140,7 +140,8 @@ use brokk_bifrost_core::hash::HashSet;
 // #6912 changed macro_matcher's item fragment and attribute lowering, which
 // the lowerer imports (ExportedMacroDefinitions,
 // macro_invocation_is_locally_bound) but does not reach, so it kept v51.
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v51";
+// #6844: standard-path proofs use lexical identity, including for ? residuals.
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v52";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -428,11 +429,16 @@ fn enumerate_procedures<'tree>(
             })
             .map_err(Some)
     };
-    let ownership = match RustOwnershipIndex::build(root, prepared.source(), &mut charge_ownership)
-        .and_then(|mut ownership| {
-            ownership.register_embedded_syntax(forest, &mut charge_ownership)?;
-            Ok(ownership)
-        }) {
+    let ownership = match RustOwnershipIndex::build(
+        root,
+        prepared.source(),
+        budget.limits().nested_entries,
+        &mut charge_ownership,
+    )
+    .and_then(|mut ownership| {
+        ownership.register_embedded_syntax(forest, &mut charge_ownership)?;
+        Ok(ownership)
+    }) {
         Ok(ownership) => ownership,
         Err(Some(stop)) => return Ok(stop.into_outcome()),
         Err(None) => return Ok(inventory.cancelled()),
@@ -2087,23 +2093,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         metadata: PointMetadata,
     ) -> PointerOriginId {
-        if let Some(id) = self.pointer_origins_by_place.get(&place).copied() {
-            return id;
-        }
-        let id = PointerOriginId::try_from_index(self.pointer_origins.len())
-            .expect("Rust pointer origin IDs fit the validated dense-ID domain");
-        self.pointer_origins.push(PointerOrigin {
-            id,
-            point,
-            kind: PointerOriginKind::StackPlace {
-                place: place.clone(),
-            },
+        brokk_bifrost_semantic::analyzer::semantic::lowering::intern_stack_pointer_origin(
+            &mut self.pointer_origins,
+            &mut self.pointer_origins_by_place,
+            place,
             byte_extent,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        });
-        self.pointer_origins_by_place.insert(place, id);
-        id
+            point,
+            metadata,
+        )
     }
 
     fn add_allocation_pointer_origin(
@@ -2145,15 +2142,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return;
         }
         aliases.push((origin, byte_offset));
-        self.pointer_aliases.push(PointerAlias {
+        brokk_bifrost_semantic::analyzer::semantic::lowering::append_pointer_alias(
+            &mut self.pointer_aliases,
             point,
             pointer,
             origin,
             byte_offset,
             strength,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        });
+            metadata,
+        );
     }
 
     fn register_pointer_fact_target(
@@ -7512,8 +7509,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let returns_option = self.return_type.is_some_and(|ty| {
             ty.kind() == "generic_type"
                 && ty.child_by_field_name("type").is_some_and(|name| {
-                    name.kind() == "type_identifier"
-                        && node_text(self.source, name) == Some("Option")
+                    self.ownership
+                        .resolves_standard_path(name, &["core", "option", "Option"])
+                        || self
+                            .ownership
+                            .resolves_standard_path(name, &["std", "option", "Option"])
                 })
         });
         self.append_effect(
@@ -7905,6 +7905,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver: None,
+                member_selection: None,
                 arguments: Box::new([]),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -8388,6 +8389,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: call_arguments.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -8796,6 +8798,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: argument_values.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -12369,6 +12372,68 @@ mod semantic_lowering_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6844: a local Option alias suppressed operand flow through the question-mark residual"
+    )]
+    fn rust_question_mark_residual_requires_standard_option_identity() {
+        let source = r#"
+mod local {
+    pub type Option<T> = std::result::Result<T, u8>;
+    fn local_alias(value: Option<u8>) -> Option<u8> { let output = value?; Ok(output) }
+}
+mod glob_import {
+    use crate::local::*;
+    fn imported_local(value: Option<u8>) -> Option<u8> { let output = value?; Ok(output) }
+}
+fn prelude(value: Option<u8>) -> Option<u8> { let output = value?; Some(output) }
+mod explicit {
+    use std::option::Option;
+    fn imported(value: Option<u8>) -> Option<u8> { let output = value?; Some(output) }
+}
+fn qualified(value: std::option::Option<u8>) -> std::option::Option<u8> {
+    let output = value?; Some(output)
+}
+"#;
+        let procedures = lower_fixture(source);
+        for (name, general_residual) in [
+            ("local_alias", true),
+            ("imported_local", true),
+            ("prelude", false),
+            ("imported", false),
+            ("qualified", false),
+        ] {
+            let procedure = procedures
+                .iter()
+                .find(|procedure| procedure.locator.declaration().last_segment_name() == Some(name))
+                .expect("residual control procedure was lowered");
+            let residual = procedure
+                .gaps
+                .iter()
+                .find(|gap| gap.discharge == SemanticGapDischarge::ResidualConversion);
+            assert_eq!(residual.is_some(), general_residual, "{name}");
+            if let Some(residual) = residual {
+                let SemanticGapSubject::Value(returned) = residual.subject else {
+                    panic!("residual gap names the return port");
+                };
+                let payload = procedure
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .find_map(|event| match event.effect {
+                        SemanticEffect::ValueFlow { source, target, .. } if target == returned => {
+                            Some(source)
+                        }
+                        _ => None,
+                    })
+                    .expect("residual publishes a return value");
+                assert!(procedure.points.iter().flat_map(|point| &point.events).any(|event| {
+                    matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == payload)
+                }), "general residual must retain the operand");
+            }
+        }
+    }
+
+    #[test]
     fn rust_exceptional_exit_discharge_corpus() {
         // Keep this public unit test self-contained: the private root golden
         // Rust sources are absent from the projected public workspace, so
@@ -13031,7 +13096,7 @@ fn variable(sh: ((), usize)) -> usize {
 macro_rules! forward { ($($tokens:tt)*) => { $($tokens)* }; }
 unsafe fn f(pointer: *const u8) {
     unsafe { core::ptr::read(pointer); }
-    forward!(core::ptr::read(pointer));
+    { forward!(core::ptr::read(pointer)); }
 }
 "#;
         let procedures = lower_fixture(SOURCE);

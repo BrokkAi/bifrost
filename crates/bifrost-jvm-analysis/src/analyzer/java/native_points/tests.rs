@@ -2268,3 +2268,82 @@ fn java_native_binary_actuals_promote_together_and_string_decides_unknown_operan
         "binary actual mismatches: {failures:?}"
     );
 }
+
+// Java erases a single bound; intersections remain undecided. Array element
+// types must never establish the carrier's nominal immutability.
+#[test]
+fn java_native_carrier_frontier_preserves_type_variables_and_arrays() {
+    use brokk_bifrost_analysis::analyzer::semantic::{
+        ObservedValueType, ValueShape, ValueTypeBarrierReason,
+    };
+    let source = "package p; interface Bound {} class Use<S extends String, O extends Object, I extends Object & Comparable<I>, J extends String & java.io.Serializable> { void test(S single, O object, I objectIntersection, J stringIntersection, Bound[] array, Missing absent, Bound nominal) { consume(single); consume(object); consume(objectIntersection); consume(stringIntersection); consume(array); consume(absent); consume(nominal); } void consume(Object value) {} }";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("p/Use.java", source)
+        .file(
+            "java/lang/String.java",
+            "package java.lang; public final class String {}",
+        )
+        .file(
+            "java/lang/Object.java",
+            "package java.lang; public class Object {}",
+        )
+        .file(
+            "java/lang/Comparable.java",
+            "package java.lang; public interface Comparable<T> {}",
+        )
+        .file(
+            "java/io/Serializable.java",
+            "package java.io; public interface Serializable {}",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let file = fixture.file("p/Use.java");
+    for (name, expected) in [
+        (
+            "single",
+            ObservedValueType::Named {
+                canonical: "java.lang.String".to_owned(),
+            },
+        ),
+        // Object is a resolved static type, but the immutable whitelist rejects it.
+        (
+            "object",
+            ObservedValueType::Named {
+                canonical: "java.lang.Object".to_owned(),
+            },
+        ),
+        (
+            "objectIntersection",
+            ObservedValueType::Undecided(ValueTypeBarrierReason::AmbiguousType),
+        ),
+        (
+            "stringIntersection",
+            ObservedValueType::Undecided(ValueTypeBarrierReason::AmbiguousType),
+        ),
+        ("array", ObservedValueType::NonNamed(ValueShape::Array)),
+        (
+            "absent",
+            ObservedValueType::Undecided(ValueTypeBarrierReason::IncompleteType),
+        ),
+        (
+            "nominal",
+            ObservedValueType::Named {
+                canonical: "p.Bound".to_owned(),
+            },
+        ),
+    ] {
+        let site = site_at("p/Use.java", source, &format!("consume({name})"), name);
+        let mut evidence = None;
+        let result = brokk_bifrost_analysis::analyzer::native_points::resolve_native_observed_value_type_bounded(
+            &analyzer.inner,
+            BoundedReceiverQuery { analyzer: &analyzer, file: &file, source, tree: None,
+                site: &site, budget: ReceiverAnalysisBudget::default(), cancellation: None },
+            prepare_context,
+            |answer| { evidence = Some(answer.answer.clone()); java_observed_value_type(answer) },
+        );
+        let BoundedResolution::Complete { value, .. } = result else {
+            panic!("{name}: {result:?}");
+        };
+        assert_eq!(value, expected, "{name}: {evidence:#?}");
+    }
+}

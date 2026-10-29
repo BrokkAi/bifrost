@@ -53,6 +53,7 @@ use brokk_bifrost_php::aliases::{
     PhpFileContext, PhpFileContextIndex, parse_php_tree, php_namespace_to_fq, resolve_php_type,
 };
 use brokk_bifrost_php::graph::syntax::declaration_doc_comment;
+use brokk_bifrost_php::graph_support::php_is_constructor_name;
 
 /// The ecosystem term that binds every Composer declaration identity.
 pub(crate) const COMPOSER_ECOSYSTEM: &str = "composer";
@@ -310,7 +311,7 @@ pub(crate) fn project_php_source(
                     continue;
                 };
                 let name = declaration_name(work.node, source).unwrap_or_default();
-                let kind = if name == "__construct" {
+                let kind = if php_is_constructor_name(&name) {
                     MemberKind::Constructor
                 } else {
                     MemberKind::Method

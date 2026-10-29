@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::StoreError;
-use super::python_binding_rows::{self, EnvironmentSourceRow};
+use super::python_binding_rows;
 use crate::hash::{HashMap, HashSet};
 
 use super::AnalyzerStore;
@@ -23,10 +23,6 @@ use crate::CancellationToken;
 use crate::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 
-use brokk_bifrost_core::analyzer::resolution_facts::{
-    PythonNativeCuratedSurface, PythonNativeExportOperationKind, PythonNativeImportForm,
-    PythonNativeWildcardPolicy,
-};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Authority for placement, separate from execution or installed-provider proof.
@@ -123,6 +119,13 @@ impl PythonSummaryProfile {
     }
 }
 
+/// Scalar authority for one selected Python environment within a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PythonSelectedEnvironment {
+    pub summary: i64,
+    pub python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
+}
+
 /// Receipt counts summary reconciliation separately from parse/lowering input work.
 #[derive(Debug)]
 pub struct PythonSummaryReceipt {
@@ -135,7 +138,7 @@ pub struct PythonSummaryReceipt {
     pub failed: Vec<(String, String)>,
 }
 
-const STAGING: &str = "
+pub(crate) const STAGING: &str = "
 CREATE TEMP TABLE IF NOT EXISTS py_env_files(
  rel_path TEXT PRIMARY KEY, blob_id INTEGER NOT NULL, blob_oid TEXT NOT NULL, scope INTEGER NOT NULL
 ) WITHOUT ROWID;
@@ -146,6 +149,7 @@ CREATE TEMP TABLE IF NOT EXISTS py_env_candidates(
  state TEXT NOT NULL DEFAULT 'open', provider_digest BLOB NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS temp.py_env_candidates_name ON py_env_candidates(module,root,kind);
+CREATE INDEX IF NOT EXISTS temp.py_env_candidates_path ON py_env_candidates(rel_path,blob_id);
 CREATE INDEX IF NOT EXISTS temp.py_env_candidates_parent ON py_env_candidates(parent,state,root);
 CREATE TEMP TABLE IF NOT EXISTS py_env_imports(
  rel_path TEXT NOT NULL, site INTEGER NOT NULL, level INTEGER NOT NULL, form TEXT NOT NULL,
@@ -163,14 +167,120 @@ CREATE TEMP TABLE IF NOT EXISTS py_env_names(
  rel_path TEXT NOT NULL, surface TEXT NOT NULL, name TEXT NOT NULL, site INTEGER,
  PRIMARY KEY(rel_path,surface,name)
 ) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS py_env_route_inputs(
+ rel_path TEXT NOT NULL, site INTEGER NOT NULL, importer TEXT NOT NULL,
+ module TEXT NOT NULL, valid INTEGER NOT NULL, PRIMARY KEY(rel_path,site,importer)
+) WITHOUT ROWID;
 CREATE TEMP TABLE IF NOT EXISTS py_env_routes(
  rel_path TEXT NOT NULL, site INTEGER NOT NULL, importer TEXT NOT NULL, target TEXT NOT NULL,
  module TEXT NOT NULL, level INTEGER NOT NULL, requested TEXT NOT NULL, bound TEXT NOT NULL,
  form TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(rel_path,site,importer,target)
 ) WITHOUT ROWID;";
-const CLEAR: &str = "DELETE FROM temp.py_env_routes; DELETE FROM temp.py_env_names;
+const CLEAR: &str = "DELETE FROM temp.py_env_route_inputs; DELETE FROM temp.py_env_routes; DELETE FROM temp.py_env_names;
 DELETE FROM temp.py_env_surfaces; DELETE FROM temp.py_env_segments; DELETE FROM temp.py_env_imports;
 DELETE FROM temp.py_env_candidates; DELETE FROM temp.py_env_roots; DELETE FROM temp.py_env_files;";
+
+pub(crate) const SELECT_FILES: &str = "SELECT f.rel_path,f.blob_oid,b.id,s.format
+FROM workspace_file_versions AS f
+LEFT JOIN blobs AS b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation
+LEFT JOIN python_binding_source AS s ON s.blob_id=b.id
+WHERE f.workspace_id=?1 AND f.lang='python' AND f.generation=?2 AND f.input_kind='source'
+ AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)
+ORDER BY f.rel_path";
+pub(crate) const STAGE_FILES: &str = "INSERT INTO temp.py_env_files
+SELECT f.rel_path,b.id,f.blob_oid,0 FROM workspace_file_versions AS f
+CROSS JOIN blobs AS b ON b.blob_oid=f.blob_oid AND b.lang=f.lang AND b.generation=f.generation
+WHERE f.workspace_id=?1 AND f.lang='python' AND f.generation=?2 AND f.input_kind='source'
+ AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)";
+// row_batch completes these prefixes with VALUES tuples; they are not
+// standalone statements for the production query-plan registry.
+pub(crate) fn stage_roots_prefix() -> &'static str {
+    "INSERT OR IGNORE INTO temp.py_env_roots VALUES"
+}
+pub(crate) const STAGE_ROOT_ROW: &str = "(?,?)";
+pub(crate) fn stage_candidates_prefix() -> &'static str {
+    "INSERT OR IGNORE INTO temp.py_env_candidates
+(container,module,parent,depth,root,kind,rel_path,blob_id,scope,provider_digest) VALUES"
+}
+pub(crate) const STAGE_CANDIDATE_ROW: &str = "(?,?,?,?,?,?,?,?,?,?)";
+pub(crate) const STAGE_IMPORTS: &str = "INSERT INTO temp.py_env_imports
+SELECT f.rel_path,i.import_site,i.relative_level,
+ CASE i.form WHEN 0 THEN 'module' WHEN 1 THEN 'from' WHEN 2 THEN 'star' END,
+ CASE WHEN i.form=1 THEN json_extract(i.route,'$[' || i.module_segments || ']') ELSE '' END,
+ CASE WHEN i.form=2 THEN '' ELSE slots.name END
+FROM temp.py_env_files AS f
+CROSS JOIN python_binding_imports AS i ON i.blob_id=f.blob_id
+LEFT JOIN resolution_binding_events AS e ON e.blob_id=i.blob_id AND e.event=i.binding_event
+LEFT JOIN resolution_binding_slots AS slots ON slots.blob_id=e.blob_id AND slots.slot=e.slot";
+pub(crate) const STAGE_SEGMENTS: &str = "INSERT INTO temp.py_env_segments
+SELECT f.rel_path,i.import_site,CAST(j.key AS INTEGER),j.value
+FROM temp.py_env_files AS f
+CROSS JOIN python_binding_imports AS i ON i.blob_id=f.blob_id
+CROSS JOIN json_each(i.route) AS j WHERE CAST(j.key AS INTEGER)<i.module_segments";
+pub(crate) const STAGE_SURFACES: &str = "INSERT INTO temp.py_env_surfaces
+SELECT f.rel_path,surface.value,
+ CASE surface.value WHEN 'module' THEN 'slots'
+ WHEN 'curated' THEN CASE s.export_curated WHEN 0 THEN 'absent' WHEN 1 THEN 'curated' WHEN 2 THEN 'unknown' END
+ WHEN 'wildcard' THEN CASE s.export_wildcard WHEN 0 THEN 'public_names' WHEN 1 THEN 'curated' WHEN 2 THEN 'unknown' END END
+FROM temp.py_env_files AS f
+CROSS JOIN python_binding_source AS s ON s.blob_id=f.blob_id
+CROSS JOIN json_each('[\"module\",\"curated\",\"wildcard\"]') AS surface";
+pub(crate) const STAGE_MODULE_NAMES: &str = "INSERT INTO temp.py_env_names
+SELECT f.rel_path,'module',slots.name,min(slots.slot)
+FROM temp.py_env_files AS f
+CROSS JOIN resolution_binding_slots AS slots ON slots.blob_id=f.blob_id
+WHERE slots.scope=0 GROUP BY f.rel_path,slots.name";
+// A Listed surface implies readable operations after the last reset. The
+// producer in bifrost-python/src/resolution/exports.rs::produce sets Listed
+// only for a readable operation, and non-replacement operations require the
+// preceding surface to be Listed. Thus only a readable replacement can recover
+// from an unreadable operation; a deferred mutation also makes it Unreadable.
+// Only members at or after that last replacement survive the straight-line fold.
+pub(crate) const STAGE_CURATED_NAMES: &str = "INSERT OR IGNORE INTO temp.py_env_names
+SELECT f.rel_path,'curated',member.value,slots.site
+FROM temp.py_env_surfaces AS surface
+CROSS JOIN temp.py_env_files AS f ON f.rel_path=surface.rel_path
+CROSS JOIN python_binding_export_operations AS op ON op.blob_id=f.blob_id
+CROSS JOIN json_each(op.members) AS member
+LEFT JOIN temp.py_env_names AS slots
+ ON slots.rel_path=f.rel_path AND slots.surface='module' AND slots.name=member.value
+WHERE surface.surface='curated' AND surface.policy='curated'
+ AND op.ordinal>=(SELECT max(reset.ordinal) FROM python_binding_export_operations AS reset
+  WHERE reset.blob_id=f.blob_id AND reset.kind IN (0,1,6))";
+pub(crate) const STAGE_WILDCARD_NAMES: &str = "INSERT INTO temp.py_env_names
+SELECT names.rel_path,'wildcard',names.name,names.site
+FROM temp.py_env_surfaces AS surface
+CROSS JOIN temp.py_env_names AS names ON names.rel_path=surface.rel_path
+ AND names.surface=CASE surface.policy WHEN 'public_names' THEN 'module' WHEN 'curated' THEN 'curated' END
+WHERE surface.surface='wildcard'
+ AND (surface.policy<>'public_names' OR substr(names.name,1,1)<>'_')";
+pub(crate) const SELECT_ROUTE_INPUTS: &str = "SELECT imports.rel_path,imports.site,imports.level,providers.container,roots.path,
+ (SELECT json_group_array(name) FROM
+  (SELECT segments.name FROM temp.py_env_segments AS segments
+   WHERE segments.rel_path=imports.rel_path AND segments.site=imports.site ORDER BY segments.ordinal))
+FROM temp.py_env_imports AS imports
+CROSS JOIN temp.py_env_candidates AS providers
+ ON providers.rel_path=imports.rel_path AND providers.blob_id IS NOT NULL
+CROSS JOIN temp.py_env_roots AS roots ON roots.slot=providers.root
+ORDER BY imports.rel_path,imports.site,providers.container";
+pub(crate) fn stage_route_inputs_prefix() -> &'static str {
+    "INSERT INTO temp.py_env_route_inputs VALUES"
+}
+pub(crate) const STAGE_ROUTE_INPUT_ROW: &str = "(?,?,?,?,?)";
+pub(crate) const STAGE_ROUTES: &str = "INSERT INTO temp.py_env_routes
+SELECT context.rel_path,context.site,context.importer,coalesce(target.container,''),context.module,
+ imports.level,imports.requested,imports.bound,imports.form,
+ CASE WHEN target.container IS NOT NULL THEN 'activation_open'
+ WHEN context.valid THEN 'provider_open' ELSE 'relative_context_open' END
+FROM temp.py_env_route_inputs AS context
+CROSS JOIN temp.py_env_imports AS imports ON imports.rel_path=context.rel_path AND imports.site=context.site
+LEFT JOIN temp.py_env_candidates AS target
+ ON target.module=context.module AND target.state IN ('selected','alternative') AND context.valid";
+pub(crate) const STAGE_UNPLACED_ROUTES: &str = "INSERT INTO temp.py_env_routes
+SELECT rel_path,site,'','','',level,requested,bound,form,'relative_context_open'
+FROM temp.py_env_imports AS imports
+WHERE NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS provider
+ WHERE provider.rel_path=imports.rel_path AND provider.blob_id IS NOT NULL)";
 
 pub fn portable(path: &Path) -> String {
     path.components()
@@ -222,7 +332,11 @@ impl PythonEnvironmentSnapshotInputs {
         let mut rows = statement.query(params![
             snapshot.workspace_id.as_str(),
             snapshot.generation.get(),
-            snapshot.revision
+            snapshot.revision,
+            serde_json::to_string(
+                &brokk_bifrost_python::declarations::PYTHON_CONFIGURATION_INPUT_NAMES
+            )
+            .expect("configuration names are JSON strings")
         ])?;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
@@ -260,12 +374,34 @@ LEFT JOIN workspace_input_sources AS retained
 WHERE v.workspace_id=?1 AND v.lang='python' AND v.generation=?2
  AND v.valid_from<=?3 AND (v.valid_until IS NULL OR ?3<v.valid_until)
  AND (v.input_kind='source' OR (v.input_kind='configuration'
-  AND (v.rel_path IN ('pyproject.toml','setup.py','__init__.py')
-   OR v.rel_path LIKE '%/pyproject.toml' OR v.rel_path LIKE '%/setup.py'
-   OR v.rel_path LIKE '%/__init__.py')))
+  AND EXISTS (SELECT 1 FROM json_each(?4) AS name
+   WHERE v.rel_path=name.value OR substr(v.rel_path, -length(name.value) - 1) = '/' || name.value)))
 ORDER BY v.rel_path,v.input_kind";
 
 impl AnalyzerStore {
+    /// Select the live summary for one exact snapshot and environment profile.
+    pub fn python_selected_summary(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        profile: &PythonSummaryProfile,
+    ) -> Result<Option<i64>> {
+        // A per-request lookup reads a pooled WAL snapshot, so it never waits
+        // behind the writer, including a running reconcile.
+        let language = PythonUnitSummaries {
+            profile: profile.clone(),
+            staging: None,
+        };
+        let conn = self.read_conn()?;
+        let epoch: String = conn.query_row(
+            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(language
+            .live_summary(&conn, snapshot, &epoch, &unit_key())?
+            .map(|(id, _)| id))
+    }
+
     /// Reconcile one selected environment from retained inputs on one writer job.
     /// The root hook reads only the supplied operation-local snapshot inputs.
     pub fn reconcile_python_environment<F>(
@@ -357,20 +493,7 @@ impl PythonEnvironmentPublication {
     pub fn selected_summary(&self, revision: i64) -> Result<Option<i64>> {
         let mut snapshot = self.snapshot.clone();
         snapshot.revision = revision;
-        let language = PythonUnitSummaries {
-            profile: self.profile.clone(),
-            staging: None,
-        };
-        self.store.conn.execute(move |conn| -> Result<Option<i64>> {
-            let epoch: String = conn.query_row(
-                "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(language
-                .live_summary(conn, &snapshot, &epoch, &unit_key())?
-                .map(|(id, _)| id))
-        })
+        self.store.python_selected_summary(&snapshot, &self.profile)
     }
 
     /// Read only persisted rows under the selected profile and revision.
@@ -384,23 +507,75 @@ impl PythonEnvironmentPublication {
     }
 }
 
-fn stage_file(conn: &Connection, rows: &[EnvironmentSourceRow], roots: &[PathBuf]) -> Result<()> {
-    let EnvironmentSourceRow::File {
-        path,
-        oid,
-        blob: blob_id,
-        curated,
-        wildcard,
-    } = rows.first().expect("nonempty file rows")
-    else {
-        panic!("leading Python file row")
-    };
+// Staging retains no workspace-sized row arrays. Each relation owns one
+// chunk; row_batch selects the cached 64/8/1-row statement shapes on flush.
+struct StagingRows<R> {
+    insert_prefix: &'static str,
+    row_sql: &'static str,
+    rows: Vec<R>,
+}
+impl<R: super::row_batch::RowBindings> StagingRows<R> {
+    const CAPACITY: usize = 64;
+
+    fn new(insert_prefix: &'static str, row_sql: &'static str) -> Self {
+        Self {
+            insert_prefix,
+            row_sql,
+            rows: Vec::with_capacity(Self::CAPACITY),
+        }
+    }
+
+    fn push(&mut self, conn: &Connection, row: R, cancellation: &CancellationToken) -> Result<()> {
+        debug_assert!(self.rows.len() < Self::CAPACITY);
+        self.rows.push(row);
+        if self.rows.len() == Self::CAPACITY {
+            self.flush(conn, cancellation)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, conn: &Connection, cancellation: &CancellationToken) -> Result<()> {
+        if !super::row_batch::insert_typed_rows(
+            conn,
+            self.insert_prefix,
+            self.row_sql,
+            &self.rows,
+            cancellation,
+        )? {
+            return Err(StoreError::cancelled(
+                python_binding_rows::ENVIRONMENT_SOURCE_CANCELLED,
+            ));
+        }
+        self.rows.clear();
+        check_cancelled(cancellation)
+    }
+}
+
+type CandidateRow = (
+    String,
+    String,
+    String,
+    usize,
+    i64,
+    &'static str,
+    String,
+    Option<i64>,
+    Option<i64>,
+    [u8; 32],
+);
+
+// Path placement uses the platform's Path semantics, including CurDir normalization.
+// Each relation buffers at most one chunk during the selected-file query.
+fn place_file(
+    path: &str,
+    blob_id: i64,
+    roots: &[PathBuf],
+    root_rows: &mut StagingRows<(i64, String)>,
+    candidates: &mut StagingRows<CandidateRow>,
+    conn: &Connection,
+    cancellation: &CancellationToken,
+) -> Result<()> {
     let file_path = Path::new(path);
-    let scope = 0;
-    conn.execute(
-        "INSERT INTO temp.py_env_files VALUES(?1,?2,?3,?4)",
-        params![path, blob_id, oid, scope],
-    )?;
     for (ordinal, root) in roots.iter().enumerate() {
         let root = root
             .components()
@@ -417,10 +592,7 @@ fn stage_file(conn: &Connection, rows: &[EnvironmentSourceRow], roots: &[PathBuf
         } else {
             ordinal as i64
         };
-        conn.execute(
-            "INSERT OR IGNORE INTO temp.py_env_roots VALUES(?1,?2)",
-            params![slot, root_path],
-        )?;
+        root_rows.push(conn, (slot, root_path.clone()), cancellation)?;
         let Ok(relative) = file_path.strip_prefix(&root) else {
             continue;
         };
@@ -448,8 +620,23 @@ fn stage_file(conn: &Connection, rows: &[EnvironmentSourceRow], roots: &[PathBuf
             let directory: PathBuf = parent.components().take(components.len()).collect();
             let absolute_relative = root.join(&directory);
             let provider = container(slot, &absolute_relative, "namespace");
-            conn.execute("INSERT OR IGNORE INTO temp.py_env_candidates(container,module,parent,depth,root,kind,rel_path,provider_digest) VALUES(?1,?2,?3,?4,?5,'namespace',?6,?7)",
-                params![provider,module,parent_module,components.len() as i64,slot,portable(&absolute_relative),key(b"python-namespace-provider:v1", &[&root_path,&module]).as_slice()])?;
+            let provider_digest = key(b"python-namespace-provider:v1", &[&root_path, &module]);
+            candidates.push(
+                conn,
+                (
+                    provider,
+                    module,
+                    parent_module,
+                    components.len(),
+                    slot,
+                    "namespace",
+                    portable(&absolute_relative),
+                    None,
+                    None,
+                    provider_digest,
+                ),
+                cancellation,
+            )?;
         }
         let parent_module;
         let kind;
@@ -472,146 +659,23 @@ fn stage_file(conn: &Connection, rows: &[EnvironmentSourceRow], roots: &[PathBuf
         }
         let module = components.join(".");
         let provider = container(slot, file_path, kind);
-        conn.execute("INSERT INTO temp.py_env_candidates(container,module,parent,depth,root,kind,rel_path,blob_id,scope,provider_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![provider,module,parent_module,components.len() as i64,slot,kind,path,blob_id,scope,key(b"python-source-provider:v1", &[&root_path,path,kind]).as_slice()])?;
-    }
-    for row in rows {
-        match row {
-            EnvironmentSourceRow::File { path: selected, .. } => assert_eq!(selected, path),
-            EnvironmentSourceRow::ModuleSlot {
-                path: selected,
+        let provider_digest = key(b"python-source-provider:v1", &[&root_path, path, kind]);
+        candidates.push(
+            conn,
+            (
+                provider,
+                module,
+                parent_module,
+                components.len(),
                 slot,
-                name,
-            } => {
-                assert_eq!(selected, path);
-                conn.execute(
-                    "INSERT OR IGNORE INTO temp.py_env_names VALUES(?1,'module',?2,?3)",
-                    params![path, name, slot],
-                )?;
-            }
-            EnvironmentSourceRow::Import {
-                path: selected,
-                site,
-                form,
-                relative_level,
-                module_segments,
-                local_name,
-            } => {
-                assert_eq!(selected, path);
-                let mut segments = rows.iter().filter_map(|row| match row {
-                    EnvironmentSourceRow::ImportSegment {
-                        site: segment_site,
-                        ordinal,
-                        spelling,
-                        ..
-                    } if segment_site == site => Some((*ordinal, spelling)),
-                    _ => None,
-                });
-                for (ordinal, spelling) in segments.by_ref().take(*module_segments as usize) {
-                    conn.execute(
-                        "INSERT INTO temp.py_env_segments VALUES(?1,?2,?3,?4)",
-                        params![path, site, ordinal, spelling],
-                    )?;
-                }
-                let requested = if *form == PythonNativeImportForm::From {
-                    segments.next().expect("From requested member").1.as_str()
-                } else {
-                    ""
-                };
-                let form = match form {
-                    PythonNativeImportForm::Module => "module",
-                    PythonNativeImportForm::From => "from",
-                    PythonNativeImportForm::Star => "star",
-                };
-                conn.execute(
-                    "INSERT INTO temp.py_env_imports VALUES(?1,?2,?3,?4,?5,?6)",
-                    params![path, site, relative_level, form, requested, local_name],
-                )?;
-            }
-            _ => {}
-        }
-    }
-    let curated = match curated {
-        PythonNativeCuratedSurface::Absent => "absent",
-        PythonNativeCuratedSurface::Listed => "curated",
-        PythonNativeCuratedSurface::Unreadable => "unknown",
-    };
-    let wildcard = match wildcard {
-        PythonNativeWildcardPolicy::PublicNames => "public_names",
-        PythonNativeWildcardPolicy::Curated => "curated",
-        PythonNativeWildcardPolicy::Unknown => "unknown",
-    };
-    for (surface, policy) in [
-        ("module", "slots"),
-        ("wildcard", wildcard),
-        ("curated", curated),
-    ] {
-        conn.execute(
-            "INSERT INTO temp.py_env_surfaces VALUES(?1,?2,?3)",
-            params![path, surface, policy],
+                kind,
+                path.to_owned(),
+                Some(blob_id),
+                Some(0),
+                provider_digest,
+            ),
+            cancellation,
         )?;
-    }
-    // Only the producer's readable straight-line fold certifies membership.
-    // Literal observations inside an unreadable operation are not final names.
-    if curated == "curated" {
-        let replacement = rows
-            .iter()
-            .rposition(|row| {
-                matches!(
-                    row,
-                    EnvironmentSourceRow::ExportOperation {
-                        readable: true,
-                        kind: PythonNativeExportOperationKind::ReplaceList
-                            | PythonNativeExportOperationKind::ReplaceTuple,
-                        ..
-                    }
-                )
-            })
-            .expect("listed exports have a readable replacement");
-        for row in &rows[replacement..] {
-            let EnvironmentSourceRow::ExportOperation {
-                ordinal,
-                kind,
-                readable,
-                ..
-            } = row
-            else {
-                continue;
-            };
-            assert!(readable);
-            if matches!(
-                kind,
-                PythonNativeExportOperationKind::ReplaceList
-                    | PythonNativeExportOperationKind::ReplaceTuple
-                    | PythonNativeExportOperationKind::Delete
-            ) {
-                conn.execute(
-                    "DELETE FROM temp.py_env_names WHERE rel_path=?1 AND surface='curated'",
-                    [path],
-                )?;
-            }
-            for member in rows.iter().filter_map(|row| match row {
-                EnvironmentSourceRow::ExportMember {
-                    operation, name, ..
-                } if operation == ordinal => Some(name),
-                _ => None,
-            }) {
-                conn.execute(
-                    "INSERT OR IGNORE INTO temp.py_env_names VALUES(?1,'curated',?2,NULL)",
-                    params![path, member],
-                )?;
-            }
-        }
-        conn.execute("UPDATE temp.py_env_names SET site=(SELECT slots.site FROM temp.py_env_names AS slots WHERE slots.rel_path=?1 AND slots.surface='module' AND slots.name=py_env_names.name) WHERE rel_path=?1 AND surface='curated'", [&path])?;
-    }
-    match wildcard {
-        "public_names" => {
-            conn.execute("INSERT INTO temp.py_env_names SELECT rel_path,'wildcard',name,site FROM temp.py_env_names WHERE rel_path=?1 AND surface='module' AND substr(name,1,1)<>'_'", [&path])?;
-        }
-        "curated" => {
-            conn.execute("INSERT INTO temp.py_env_names SELECT rel_path,'wildcard',name,site FROM temp.py_env_names WHERE rel_path=?1 AND surface='curated'", [&path])?;
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -677,32 +741,65 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         } else {
             PythonEnvironmentSnapshotInputs::default()
         };
-        let mut file_rows = Vec::new();
-        let flush = |rows: &[EnvironmentSourceRow]| -> Result<()> {
-            if let Some(EnvironmentSourceRow::File { path, .. }) = rows.first() {
-                let roots = if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
-                    vec![(staging.workspace_root)(Path::new(path), &inputs)?]
-                } else {
-                    self.profile.roots.clone()
-                };
-                stage_file(conn, rows, &roots)?;
-            }
-            Ok(())
-        };
-        python_binding_rows::read_environment_source_rows(
-            conn,
-            snapshot,
-            &staging.cancellation,
-            |_, row| {
-                if matches!(row, EnvironmentSourceRow::File { .. }) {
-                    flush(&file_rows)?;
-                    file_rows.clear();
-                }
-                file_rows.push(row);
-                Ok(())
-            },
+        let mut statement = conn.prepare_cached(SELECT_FILES)?;
+        let mut rows = statement.query(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            snapshot.revision
+        ])?;
+        let mut roots_batch = StagingRows::new(stage_roots_prefix(), STAGE_ROOT_ROW);
+        let mut candidates = StagingRows::new(stage_candidates_prefix(), STAGE_CANDIDATE_ROW);
+        while let Some(row) = rows.next()? {
+            check_cancelled(&staging.cancellation)?;
+            let path: String = row.get(0)?;
+            let oid: String = row.get(1)?;
+            let blob: Option<i64> = row.get(2)?;
+            let format: Option<i64> = row.get(3)?;
+            let Some(blob_id) =
+                blob.filter(|_| format == Some(python_binding_rows::NATIVE_SOURCE_FORMAT))
+            else {
+                return Err(StoreError::missing_required_source_facts(format!(
+                    "python_retained_input_unavailable: path={path:?} oid={oid:?} blob={blob:?} format={format:?}"
+                )));
+            };
+            let roots = if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
+                vec![(staging.workspace_root)(Path::new(&path), &inputs)?]
+            } else {
+                self.profile.roots.clone()
+            };
+            place_file(
+                &path,
+                blob_id,
+                &roots,
+                &mut roots_batch,
+                &mut candidates,
+                conn,
+                &staging.cancellation,
+            )?;
+        }
+        check_cancelled(&staging.cancellation)?;
+        conn.execute(
+            STAGE_FILES,
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.get(),
+                snapshot.revision
+            ],
         )?;
-        flush(&file_rows)?;
+        roots_batch.flush(conn, &staging.cancellation)?;
+        candidates.flush(conn, &staging.cancellation)?;
+        for sql in [
+            STAGE_IMPORTS,
+            STAGE_SEGMENTS,
+            STAGE_SURFACES,
+            STAGE_MODULE_NAMES,
+            STAGE_CURATED_NAMES,
+            STAGE_WILDCARD_NAMES,
+        ] {
+            check_cancelled(&staging.cancellation)?;
+            conn.execute(sql, [])?;
+        }
+        check_cancelled(&staging.cancellation)?;
         let members: i64 = conn.query_row("SELECT count(*) FROM temp.py_env_files", [], |row| {
             row.get(0)
         })?;
@@ -730,7 +827,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
             }
             conn.execute("UPDATE temp.py_env_candidates AS candidate SET state='selected' WHERE depth=?1 AND state='alternative' AND (parent='' OR EXISTS(SELECT 1 FROM temp.py_env_candidates AS enclosing WHERE enclosing.module=candidate.parent AND enclosing.root=candidate.root AND enclosing.state='selected')) AND (NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS other WHERE other.module=candidate.module AND other.state='alternative' AND other.container<>candidate.container) OR NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS concrete WHERE concrete.module=candidate.module AND concrete.state='alternative' AND concrete.kind<>'namespace'))", [depth])?;
         }
-        build_routes(conn)?;
+        build_routes(conn, &staging.cancellation)?;
         Ok(())
     }
     fn clear_stage(&self, conn: &Connection) -> Result<()> {
@@ -921,18 +1018,29 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
     }
 }
 
-fn build_routes(conn: &Connection) -> Result<()> {
-    let mut statement=conn.prepare("SELECT imports.rel_path,imports.site,imports.level,imports.form,imports.requested,imports.bound,providers.container,roots.path FROM temp.py_env_imports AS imports JOIN temp.py_env_candidates AS providers ON providers.rel_path=imports.rel_path AND providers.blob_id IS NOT NULL JOIN temp.py_env_roots AS roots ON roots.slot=providers.root ORDER BY imports.rel_path,imports.site,providers.container")?;
+fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(StoreError::cancelled(
+            python_binding_rows::ENVIRONMENT_SOURCE_CANCELLED,
+        ));
+    }
+    Ok(())
+}
+
+fn build_routes(conn: &Connection, cancellation: &CancellationToken) -> Result<()> {
+    // Relative import context follows Path components, not textual slash splitting.
+    // Read all structured segments in the same query, then batch the contexts.
+    let mut statement = conn.prepare_cached(SELECT_ROUTE_INPUTS)?;
     let mut rows = statement.query([])?;
+    let mut contexts = StagingRows::new(stage_route_inputs_prefix(), STAGE_ROUTE_INPUT_ROW);
     while let Some(row) = rows.next()? {
+        check_cancelled(cancellation)?;
         let path: String = row.get(0)?;
         let site: i64 = row.get(1)?;
         let level: usize = row.get(2)?;
-        let form: String = row.get(3)?;
-        let requested: String = row.get(4)?;
-        let bound: String = row.get(5)?;
-        let importer: String = row.get(6)?;
-        let root: String = row.get(7)?;
+        let importer: String = row.get(3)?;
+        let root: String = row.get(4)?;
+        let segments: String = row.get(5)?;
         let mut components = Vec::new();
         let mut valid = true;
         if level > 0 {
@@ -951,48 +1059,23 @@ fn build_routes(conn: &Connection) -> Result<()> {
                 components.truncate(components.len() - (level - 1));
             }
         }
-        let mut segments = conn.prepare(
-            "SELECT name FROM temp.py_env_segments WHERE rel_path=?1 AND site=?2 ORDER BY ordinal",
+        components.extend(
+            serde_json::from_str::<Vec<String>>(&segments)
+                .expect("JSON array of retained segment names"),
+        );
+        contexts.push(
+            conn,
+            (path, site, importer, components.join("."), valid),
+            cancellation,
         )?;
-        for segment in segments.query_map(params![path, site], |row| row.get::<_, String>(0))? {
-            components.push(segment?);
-        }
-        let module = components.join(".");
-        let mut targets=conn.prepare("SELECT container FROM temp.py_env_candidates WHERE module=?1 AND state IN ('selected','alternative') ORDER BY container")?;
-        let targets = if valid {
-            targets
-                .query_map([&module], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        if targets.is_empty() {
-            conn.execute(
-                "INSERT INTO temp.py_env_routes VALUES(?1,?2,?3,'',?4,?5,?6,?7,?8,?9)",
-                params![
-                    path,
-                    site,
-                    importer,
-                    module,
-                    level as i64,
-                    requested,
-                    bound,
-                    form,
-                    if valid {
-                        "provider_open"
-                    } else {
-                        "relative_context_open"
-                    }
-                ],
-            )?;
-        } else {
-            for target in targets {
-                conn.execute("INSERT INTO temp.py_env_routes VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'activation_open')",params![path,site,importer,target,module,level as i64,requested,bound,form])?;
-            }
-        }
     }
-    // Files without any selected-root placement still retain their import sites.
-    conn.execute("INSERT INTO temp.py_env_routes SELECT rel_path,site,'','','',level,requested,bound,form,'relative_context_open' FROM temp.py_env_imports AS imports WHERE NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS provider WHERE provider.rel_path=imports.rel_path AND provider.blob_id IS NOT NULL)",[])?;
+    check_cancelled(cancellation)?;
+    contexts.flush(conn, cancellation)?;
+    check_cancelled(cancellation)?;
+    conn.execute(STAGE_ROUTES, [])?;
+    check_cancelled(cancellation)?;
+    conn.execute(STAGE_UNPLACED_ROUTES, [])?;
+    check_cancelled(cancellation)?;
     Ok(())
 }
 

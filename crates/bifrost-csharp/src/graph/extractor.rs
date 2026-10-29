@@ -19,7 +19,7 @@ use crate::graph::resolver::{
     usage_member_declared_type_fq_name, usage_relational_generic_call_has_type_argument,
     usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
-use crate::graph_support::{self, CSharpSource};
+use crate::graph_support::CSharpSource;
 use crate::syntax::{
     CSharpNamedArgumentLabel, csharp_attribute_terminal_name,
     csharp_cast_relational_generic_call_for_name, csharp_conditional_member_access,
@@ -109,7 +109,7 @@ pub fn scan_prepared_file(
 
     // Every lookup this file's scan makes is held to the file's compilation
     // membership.
-    let membership = MembershipScopedSource::new(csharp.shared_source(), file);
+    let membership = MembershipScopedSource::new(csharp, file);
     let mut ctx = ScanCtx::new(
         &membership,
         &membership,
@@ -137,7 +137,7 @@ pub fn scan_prepared_file_batch<'a>(
     prepared: &'a PreparedCSharpFile,
     scans: &'a mut [BatchScanState<'a>],
 ) {
-    let membership = MembershipScopedSource::new(csharp.shared_source(), file);
+    let membership = MembershipScopedSource::new(csharp, file);
     let mut contexts: Vec<_> = scans
         .iter_mut()
         .map(|scan| {
@@ -164,7 +164,7 @@ type NearestMemberTargetKey = (String, Option<usize>, Option<usize>);
 pub(super) struct ScanCtx<'a> {
     pub(super) csharp: &'a dyn CSharpSource,
     /// The same source as `csharp`, for its doubt count.
-    pub(super) membership: &'a MembershipScopedSource,
+    pub(super) membership: &'a MembershipScopedSource<'a>,
     /// Doubt admitted before the node now being scanned: a hit whose
     /// derivation admitted more is not proven.
     pub(super) site_doubt: usize,
@@ -195,7 +195,7 @@ impl<'a> ScanCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         csharp: &'a dyn CSharpSource,
-        membership: &'a MembershipScopedSource,
+        membership: &'a MembershipScopedSource<'a>,
         graph: &'a CSharpGraphSource<'a>,
         file: &'a ProjectFile,
         prepared: &'a PreparedCSharpFile,
@@ -511,15 +511,6 @@ fn scan_structured_type_candidate(
             push_hit(candidate, ctx);
             true
         }
-        Some(resolved)
-            if role == TypeCandidateRole::Receiver
-                && csharp_receiver_member_selects_visible_target(
-                    candidate, token, &reference, &resolved, ctx,
-                ) =>
-        {
-            push_hit(candidate, ctx);
-            true
-        }
         Some(_) => true,
         None if role == TypeCandidateRole::Receiver => {
             push_unproven_hit(candidate, ctx);
@@ -527,42 +518,6 @@ fn scan_structured_type_candidate(
         }
         None => false,
     }
-}
-
-fn csharp_receiver_member_selects_visible_target(
-    receiver: Node<'_>,
-    token: QueryToken<'_>,
-    reference: &str,
-    resolved_fqn: &str,
-    ctx: &mut ScanCtx<'_>,
-) -> bool {
-    let Some(visible) =
-        graph_support::resolve_usage_visible_type(ctx.csharp, token, ctx.file, reference)
-    else {
-        return false;
-    };
-    if !type_identity_matches(&visible.fq_name(), &ctx.spec.target.fq_name()) {
-        return false;
-    }
-    let Some(access) = receiver.parent().filter(|parent| {
-        parent.kind() == "member_access_expression"
-            && member_access_receiver(*parent).is_some_and(|node| same_node(node, receiver))
-    }) else {
-        return false;
-    };
-    let Some(member) = member_access_name(access).and_then(csharp_member_name) else {
-        return false;
-    };
-    let member = node_text(member.identifier, ctx.source);
-    let Some(resolved_owner) = class_unit_for_fq_name(ctx.csharp, token, resolved_fqn) else {
-        return false;
-    };
-    nearest_member_candidates_for_owner(ctx.graph, ctx.csharp, token, &resolved_owner, member, None)
-        .is_empty()
-        && !nearest_member_candidates_for_owner(
-            ctx.graph, ctx.csharp, token, &visible, member, None,
-        )
-        .is_empty()
 }
 
 fn scan_attribute_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
@@ -827,14 +782,9 @@ fn scan_member_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCt
 /// `base` and a static reference to the same type from a *different* enclosing
 /// type stay external. Mirrors Java's `method_receiver_object_is_same_owner`.
 fn csharp_static_receiver_is_same_owner(receiver_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    match receiver_node.kind() {
-        "this_expression" | "this" => true,
-        "base_expression" | "base" => false,
-        _ => ctx
-            .class_ranges
-            .enclosing(receiver_node.start_byte())
-            .is_some_and(|enclosing| enclosing == ctx.spec.owner.fq_name()),
-    }
+    ctx.class_ranges
+        .enclosing(receiver_node.start_byte())
+        .is_some_and(|enclosing| enclosing == ctx.spec.owner.fq_name())
 }
 
 fn extension_call_resolution(

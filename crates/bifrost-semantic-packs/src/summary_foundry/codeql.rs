@@ -12,6 +12,8 @@
 //! `sourceModel` and `sinkModel` rows are out of scope for this milestone and
 //! are counted as skipped rows, never dropped in silence.
 
+pub mod jdk;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 

@@ -723,6 +723,30 @@ impl fmt::Debug for WorkspaceValueFlowProvider<'_> {
     }
 }
 
+// A finished partial outcome can still hide a lower operational stop. Never
+// retain that attempt across requests: its mark belongs to this request only.
+fn complete_provider_fill<T>(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    request: &mut SemanticRequest<'_>,
+    build: impl FnOnce(&mut SemanticRequest<'_>) -> T,
+) -> (T, bool) {
+    let refusals_before = request.budget.refusal_count();
+    let filled =
+        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
+            let value = build(request);
+            if request.budget.refusal_count() > refusals_before
+                || request.cancellation.is_cancelled()
+            {
+                analyzer.mark_execution_dependent();
+            }
+            value
+        });
+    match filled {
+        Ok(value) => (value, true),
+        Err(value) => (value, false),
+    }
+}
+
 impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
     type Error = SemanticProviderError;
 
@@ -750,14 +774,17 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .snapshot_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let outcome = self
-                    .oracle
-                    .procedure_relations(procedure, context, request)?;
+                let (outcome, retainable) = complete_provider_fill(
+                    self.oracle.workspace().analyzer(),
+                    request,
+                    |request| self.oracle.procedure_relations(procedure, context, request),
+                );
+                let outcome = outcome?;
                 // A finished verdict is retained whether or not it is complete
                 // (#2284). Dropping the permit on a budget-exhausted or
                 // cancelled outcome wakes followers to retry, so a shortfall of
                 // this request never enters the ready cache.
-                if let Some(memoized) = outcome.completed_replay() {
+                if retainable && let Some(memoized) = outcome.completed_replay() {
                     permit.publish_complete(Arc::new(memoized));
                     self.retained_writes.store(true, Ordering::Release);
                 }
@@ -793,8 +820,13 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .dispatch_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let outcome = self.dispatch_sessions.resolve_call(call, request)?;
-                if let Some(memoized) = outcome.completed_replay() {
+                let (outcome, retainable) = complete_provider_fill(
+                    self.oracle.workspace().analyzer(),
+                    request,
+                    |request| self.dispatch_sessions.resolve_call(call, request),
+                );
+                let outcome = outcome?;
+                if retainable && let Some(memoized) = outcome.completed_replay() {
                     permit.publish_complete(Arc::new(memoized));
                     self.retained_writes.store(true, Ordering::Release);
                 }
@@ -868,12 +900,15 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .binding_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let outcome = self
-                    .oracle
-                    .call_bindings(call, candidate, context, request)?;
+                let (outcome, retainable) = complete_provider_fill(
+                    self.oracle.workspace().analyzer(),
+                    request,
+                    |request| self.oracle.call_bindings(call, candidate, context, request),
+                );
+                let outcome = outcome?;
                 // A finished binding verdict is retained whether or not it is
                 // complete, on the same terms as a snapshot (#2289).
-                if let Some(memoized) = outcome.completed_replay() {
+                if retainable && let Some(memoized) = outcome.completed_replay() {
                     permit.publish_complete(Arc::new(memoized));
                     self.retained_writes.store(true, Ordering::Release);
                 }

@@ -83,7 +83,7 @@ fn shared_statement_fact_and_language_rule_vocabulary_is_schema_driven() {
 
     let statement_help = query_source_help_at(source, source.find("statement-facts").unwrap())
         .expect("statement fact help");
-    assert!(statement_help.description.contains("C/C++-only"));
+    assert!(statement_help.description.contains("Java"));
     let rule_help = query_source_help_at(source, source.find(":language-rule").unwrap())
         .expect("language rule help");
     assert_eq!(&source[rule_help.range], ":language-rule");
@@ -431,7 +431,11 @@ fn string_parts_role_help_and_validation_are_schema_driven() {
     let help =
         query_source_help_at(source, source.find(":parts").unwrap()).expect("parts role help");
     assert_eq!(&source[help.range], ":parts");
-    assert!(help.description.contains("implicitly concatenated string"));
+    assert!(
+        help.description
+            .contains("implicitly concatenated literals")
+    );
+    assert!(help.description.contains("interpolated expressions"));
 
     let invalid = "(collection_literal :parts [(string_literal)])";
     let diagnostic = validate_query_source(invalid)
@@ -1271,6 +1275,48 @@ fn unsafe_context_call_property_has_help_and_diagnostic_ranges() {
                 .iter()
                 .any(|diagnostic| !source[diagnostic.range.clone()].is_empty()),
             "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn declaration_attributes_and_expression_roles_have_editor_support() {
+    for source in [
+        r#"(class :type-kind "interface" :modifier "sealed")"#,
+        r#"(class :and [(type-kind "record") (modifier "public")])"#,
+        r#"(cast :type (identifier) :value (identifier))"#,
+        r#"(instance_of :operand (identifier) :type (identifier) :binding (identifier))"#,
+        r#"(subscript :object (identifier) :indices ((numeric_literal)))"#,
+        r#"(array_creation :type (identifier) :dimensions ((capture "dimension")) :value (collection_literal))"#,
+        r#"(unary_expression :operator (capture "op") :operand (identifier))"#,
+        r#"(lock :value (identifier) :body (block))"#,
+        r#"(if :test (identifier) :consequence (identifier) :alternative (identifier))"#,
+        r#"(continue :label (name "outer"))"#,
+    ] {
+        assert!(
+            validate_query_source(source).is_empty(),
+            "{source}: {:#?}",
+            validate_query_source(source)
+        );
+        super::super::CodeQuery::from_source(source).expect("parse registered syntax");
+        let help = query_source_help_at(source, 1).expect("kind/form hover");
+        assert!(!help.description.is_empty());
+    }
+    let source = r#"(class :type-kind "interface" :modifier "volatile")"#;
+    for token in [":type-kind", ":modifier"] {
+        assert!(query_source_help_at(source, source.find(token).unwrap()).is_some());
+    }
+    for (source, token) in [
+        (r#"(class :type-kind "misspelled")"#, "misspelled"),
+        (r#"(class :modifier "misspelled")"#, "misspelled"),
+        (r#"(call :indices ((identifier)))"#, ":indices"),
+    ] {
+        let diagnostics = validate_query_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| source[diagnostic.range.clone()].contains(token)),
+            "{source}: {diagnostics:#?}"
         );
     }
 }

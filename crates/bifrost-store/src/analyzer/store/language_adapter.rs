@@ -39,8 +39,12 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
     fn storage_file_content_qualifier(&self, package_name: &str) -> String {
         package_storage_content_qualifier(package_name)
     }
-    fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
-        content_qualifier.to_string()
+    fn hydrate_content_qualifier(
+        &self,
+        content_qualifier: &str,
+        _file: &ProjectFile,
+    ) -> Result<String> {
+        Ok(content_qualifier.to_string())
     }
     fn default_package_anchor(&self) -> Option<PackageAnchor> {
         None
@@ -52,6 +56,16 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
         _file: &ProjectFile,
     ) -> Option<FqName> {
         None
+    }
+    /// Hydration may reuse a published placement. Publication must instead call
+    /// resolve_package_anchor so a configuration edit recomputes the placement.
+    fn hydrate_package_anchor(
+        &self,
+        anchor: PackageAnchor,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> Result<Option<FqName>> {
+        Ok(self.resolve_package_anchor(anchor, content_qualifier, file))
     }
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
         !code_unit.is_file_scope()
@@ -67,7 +81,8 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
         _file: &ProjectFile,
         _source: &str,
         _state: &mut FileState,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
     fn synthesize_summary_projection(
         &self,
@@ -79,6 +94,10 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
     }
     fn path_synthetic_module_unit(&self, _file: &ProjectFile) -> Option<CodeUnit> {
         None
+    }
+    /// Query-side module hydration can reuse the selected path publication.
+    fn hydrate_path_synthetic_module_unit(&self, file: &ProjectFile) -> Result<Option<CodeUnit>> {
+        Ok(self.path_synthetic_module_unit(file))
     }
     fn has_path_synthetic_module_units(&self) -> bool {
         false

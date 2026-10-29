@@ -588,6 +588,8 @@ fn finish_production(
             id: "declarations.external".to_owned(),
             activation: request.activation.clone(),
             payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
                 types,
                 members,
                 relations: Vec::new(),
@@ -745,12 +747,7 @@ pub(crate) fn java_api_facts(
                         member.member_kind,
                         MemberKind::Constructor | MemberKind::Method
                     )
-                    && member.signature.as_ref().is_some_and(|signature| {
-                        signature
-                            .parameters
-                            .iter()
-                            .all(|parameter| !parameter.variadic)
-                    }),
+                    && member.signature.is_some(),
                 exact_return_classes: Vec::new(),
                 signature: member.signature,
                 receiver: None,
@@ -2454,14 +2451,24 @@ fn class_api_type(
     } else {
         TypeKind::Class
     };
-    // Visibility filtering and undecodable signatures leave that namespace
-    // open: a complete public API is not a complete owner inventory.
+    // Count declarations selectable from Java source. JLS 13.1 distinguishes
+    // synthetic constructs from implicit declarations, and javac excludes
+    // synthetic symbols from member lookup. Keep mandated/implicit members
+    // (default constructors, enum values/valueOf, record accessors) counted.
+    // Kotlin's @JvmSynthetic is a known exception: a real declaration hidden
+    // from Java. Kotlin/Scala producers currently emit jvm_inventory = None;
+    // revisit this rule before a Kotlin viewer consumes this inventory.
+    // Decode failures and exhausted budgets still leave the namespace open.
     let values_complete = !*record_limit_hit
         && members
             .iter()
             .filter(|member| matches!(member.member_kind, MemberKind::Field | MemberKind::Constant))
             .count()
-            == class_file.fields().len();
+            == class_file
+                .fields()
+                .iter()
+                .filter(|field| !field.access_flags().contains(FieldFlags::ACC_SYNTHETIC))
+                .count();
     let callables_complete = !*record_limit_hit
         && all_callable_families_complete
         && incomplete_callable_names.is_empty()
@@ -2477,7 +2484,12 @@ fn class_api_type(
             == class_file
                 .methods()
                 .iter()
-                .filter(|method| utf8_at(&class_file, method.name_index()) != Some("<clinit>"))
+                .filter(|method| {
+                    !method
+                        .access_flags()
+                        .intersects(MethodFlags::ACC_SYNTHETIC | MethodFlags::ACC_BRIDGE)
+                        && utf8_at(&class_file, method.name_index()) != Some("<clinit>")
+                })
                 .count();
     let mut nested_types = Vec::new();
     let mut types_complete = true;
@@ -2702,6 +2714,22 @@ fn class_field_member(
             symbol: format!("{class_entry}#{name}:{descriptor}"),
         },
     })
+}
+
+/// Recover erased parameter identities from a class member's artifact locator.
+/// Offline model expansion needs JVM erasure rather than generic type variables.
+pub(crate) fn erased_class_method_parameters(
+    locator: &Locator,
+    max_depth: usize,
+) -> Option<Vec<TypeRef>> {
+    let Locator::Artifact { symbol, .. } = locator else {
+        return None;
+    };
+    let (_, method) = symbol.split_once('#')?;
+    let descriptor = &method[method.find('(')?..];
+    let mut cursor = SignatureCursor::new(descriptor.as_bytes(), max_depth);
+    let (parameters, _) = cursor.parse_method_descriptor()?;
+    cursor.at_end().then_some(parameters)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3543,6 +3571,70 @@ mod tests {
         eprintln!("Pinned generated executeQuery identity: {generated:#?}");
     }
 
+    #[test]
+    #[hardwon("#7781: dropped synthetic and bridge members kept indexed JDK owners incomplete")]
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    fn real_jdk_java_source_inventory_excludes_only_synthetic_members() {
+        let home =
+            PathBuf::from(std::env::var_os("BIFROST_JDK_HOME").expect("set BIFROST_JDK_HOME"));
+        let mut archive =
+            ZipArchive::new(fs::File::open(home.join("jmods/java.base.jmod")).unwrap()).unwrap();
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        for name in ["java/io/File", "java/nio/file/Path", "java/time/DayOfWeek"] {
+            let entry = format!("classes/{name}.class");
+            let mut bytes = Vec::new();
+            archive
+                .by_name(&entry)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            let class = jclassfile::class_file::parse(&bytes).unwrap();
+            if name != "java/time/DayOfWeek" {
+                assert!(
+                    class
+                        .methods()
+                        .iter()
+                        .any(|method| method.access_flags().contains(MethodFlags::ACC_BRIDGE))
+                );
+            }
+            if name == "java/io/File" {
+                assert!(
+                    class
+                        .fields()
+                        .iter()
+                        .any(|field| field.access_flags().contains(FieldFlags::ACC_SYNTHETIC))
+                );
+            }
+            let mut remaining = limits.max_records;
+            let mut truncated = false;
+            let ClassEntryResult::Declaration(owner) = class_api_type(
+                "java.base.jmod",
+                &entry,
+                &bytes,
+                limits.max_signature_depth,
+                &mut remaining,
+                &mut truncated,
+                &mut diagnostics,
+            ) else {
+                panic!("JDK class must declare {name}");
+            };
+            assert!(!truncated);
+            let inventory = owner.jvm_inventory.as_ref().unwrap();
+            assert!(inventory.callables_complete, "{name}: {inventory:?}");
+            assert!(inventory.values_complete, "{name}: {inventory:?}");
+            if name == "java/time/DayOfWeek" {
+                for method in ["values", "valueOf"] {
+                    assert!(
+                        owner.members.iter().any(|member| member.name == method),
+                        "{method} stays counted"
+                    );
+                }
+            }
+        }
+        assert!(diagnostics.is_empty(), "{:?}", diagnostics.finish());
+    }
+
     struct JavaFixture {
         _temp: tempfile::TempDir,
         source_jar: PathBuf,
@@ -3830,9 +3922,9 @@ mod tests {
                         .signature
                         .as_ref()
                         .is_some_and(|signature| signature.parameters.iter().any(|p| p.variadic))
-                        && !member.callable_family_complete
+                        && member.callable_family_complete
                 }),
-            "variadic declarations must not claim fixed-family completeness"
+            "complete classfile inventories include variable-arity declarations"
         );
 
         for member_name in ["<init>", "value", "copy", "convert"] {
@@ -3983,7 +4075,16 @@ mod tests {
         let pack = production
             .pack
             .expect("the readable class members remain inspectable");
-        let (_, members) = declarations(&pack);
+        let (types, members) = declarations(&pack);
+        let inventory = types[0].jvm_inventory.as_ref().unwrap();
+        assert!(
+            !inventory.callables_complete,
+            "a decode failure keeps the owner open"
+        );
+        assert!(
+            inventory.values_complete,
+            "the empty field table is still complete"
+        );
         let target = members
             .iter()
             .find(|member| member.name == "target")

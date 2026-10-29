@@ -58,12 +58,14 @@ use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v33";
+// The lowerer reaches the changed import-binder and structural-index code.
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v34";
 // Bumping this rotates every public wire id hashed from the adapter
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v38";
+// The lowerer reaches the changed import-binder and structural-index code.
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v39";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {

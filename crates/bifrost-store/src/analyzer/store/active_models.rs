@@ -407,6 +407,9 @@ pub struct SemanticModelActivationReport {
     pub working_bytes: u64,
     pub retained_bytes: u64,
     pub phase_measurements: SemanticModelActivationPhaseMeasurements,
+    /// Runtime-only rejection measurements; never written to the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_budget_exceeded: Option<SemanticModelOverlayBudgetExceeded>,
 }
 
 /// A database-local key is meaningful only together with its publishing database.
@@ -476,7 +479,10 @@ impl ActiveSemanticModelShard {
     /// cannot enter this declaration inventory.
     pub fn admits_jvm_owner_declaration(&self, owner: &TypeFact) -> bool {
         owner.guard.is_none()
-            && matches!(self.manifest.language.as_str(), "java" | "kotlin" | "scala")
+            && super::resolution_operation::nominal_rules::nominal_package_rules_for_storage(
+                &self.manifest.language,
+            )
+            .is_some()
     }
 
     pub fn independently_enumerates_jvm_owner(&self, owner: &TypeFact) -> bool {
@@ -524,6 +530,18 @@ pub struct ResolvedActiveSemanticModels {
 }
 
 impl ResolvedActiveSemanticModels {
+    /// Every defining provider in this activation, including metadata-only shards.
+    pub fn model_provider_selection(
+        &self,
+    ) -> crate::analyzer::semantic_model::overlay::ModelProviderSelection {
+        use crate::analyzer::semantic_model::overlay::{ModelProvider, ModelProviderSelection};
+        ModelProviderSelection::new(self.shards.iter().map(|shard| ModelProvider {
+            pack_id: shard.manifest.pack_id.clone(),
+            pack_version: shard.manifest.version.clone(),
+            pack_digest: shard.manifest.semantic_sha256.clone(),
+        }))
+    }
+
     /// Fixed SQL handles belonging to this activation publication. Source rows
     /// are read on demand and remain owned by one query.
     #[doc(hidden)]
@@ -1004,6 +1022,94 @@ impl ResolvedActiveSemanticModels {
         query_or_posting(rows, self.all_type_records(posting))
     }
 
+    /// Unranked decoded postings for selected composition, including mixed
+    /// active sets whose other languages use catalog rows.
+    #[doc(hidden)]
+    pub fn decoded_type_records_with_id<'a>(
+        &'a self,
+        id: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a {
+        self.all_type_records(self.indexes.types_by_id.get(id))
+    }
+
+    #[doc(hidden)]
+    pub fn decoded_type_records_named<'a>(
+        &'a self,
+        name: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a {
+        self.all_type_records(self.indexes.types_by_name.get(name))
+    }
+
+    #[doc(hidden)]
+    pub fn decoded_member_records_with_id<'a>(
+        &'a self,
+        id: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<MemberFact>> + 'a {
+        self.all_records(self.indexes.members_by_id.get(id), |shard, index| {
+            &shard
+                .decoded()
+                .payload()
+                .declaration_facts()
+                .expect("member posting")
+                .1[index]
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn decoded_member_ids_by_owner(&self, owner: &str) -> Vec<String> {
+        let mut addresses = self
+            .indexes
+            .members_by_owner_name
+            .get(owner)
+            .into_iter()
+            .flat_map(|names| names.values())
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        addresses.sort_unstable_by_key(|address| (address.shard, address.record));
+        addresses.dedup();
+        self.all_records(Some(&addresses), |shard, index| {
+            &shard
+                .decoded()
+                .payload()
+                .declaration_facts()
+                .expect("member posting")
+                .1[index]
+        })
+        .map(|record| record.record.id.clone())
+        .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn decoded_relation_records_with_id<'a>(
+        &'a self,
+        id: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<RelationFact>> + 'a {
+        self.all_records(self.indexes.relations_by_id.get(id), |shard, index| {
+            &shard
+                .decoded()
+                .payload()
+                .declaration_facts()
+                .expect("relation posting")
+                .2[index]
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn decoded_relation_records_from<'a>(
+        &'a self,
+        owner: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<RelationFact>> + 'a {
+        self.all_records(self.indexes.relations_by_from.get(owner), |shard, index| {
+            &shard
+                .decoded()
+                .payload()
+                .declaration_facts()
+                .expect("relation posting")
+                .2[index]
+        })
+    }
+
     fn all_type_records<'a>(
         &'a self,
         posting: Option<&'a Vec<RecordAddress>>,
@@ -1332,6 +1438,21 @@ impl ResolvedActiveSemanticModels {
     ) -> ProcedureSummaryMatch {
         self.applicable_member_summaries(target, &[target.parameter_count], |_, _| {
             ProcedureSummaryAcceptance::Accept(None)
+        })
+    }
+
+    /// Restrict the shared language realm to the target's exact manifest
+    /// language before evidence ranking and claim deduplication.
+    pub fn procedure_summaries_for_member_in_language(
+        &self,
+        target: ProcedureSummaryMemberKey<'_>,
+    ) -> ProcedureSummaryMatch {
+        self.applicable_member_summaries(target, &[target.parameter_count], |shard, _| {
+            if shard.manifest.language == target.language {
+                ProcedureSummaryAcceptance::Accept(None)
+            } else {
+                ProcedureSummaryAcceptance::Reject
+            }
         })
     }
 
@@ -2926,6 +3047,73 @@ pub fn resolve_procedure_records(
     }
 }
 
+/// Translate a resolver-selected provider row to its published record identity.
+/// Keep the publisher's owner-member order; overlay composition order is unrelated.
+pub fn selected_external_descriptor(
+    active: &ResolvedActiveSemanticModels,
+    selected: &crate::analyzer::resolution::ExternalMemberIdentity,
+) -> Option<(String, String)> {
+    for owner in active.all_type_records_named(&selected.owner.owner_fqn) {
+        if owner.shard.manifest.semantic_sha256 != selected.owner.provider_id.as_ref() {
+            continue;
+        }
+        if owner.shard.decoded.is_none() {
+            let identity = owner
+                .shard
+                .row_store
+                .expect("row-backed owner has catalog coordinates");
+            let source = match identity.database {
+                CatalogShardDatabase::Durable => "durable",
+                CatalogShardDatabase::Session => "session",
+            };
+            let records = crate::analyzer::store::model_catalog::semantic_catalog_question(
+                "SELECTED_EXTERNAL_DESCRIPTOR", selected,
+                active.source_reader().expect("row-backed set has its reader").raw_rows(
+                    r#"SELECT source_db,shard_key,record_id FROM (
+                      SELECT m.source_db,m.shard_key,m.record_id,0 AS origin,m.record_key AS position
+                      FROM active_catalog_declaration_members m
+                      WHERE m.source_db=:source AND m.shard_key=:shard AND m.owner_id=:owner
+                        AND json_extract(m.record_json,'$.guard') IS NULL
+                      UNION ALL
+                      SELECT t.source_db,t.shard_key,json_extract(extra.value,'$.id'),1,CAST(extra.key AS INTEGER)
+                      FROM active_catalog_declaration_types t,
+                           json_each(t.record_json,'$.jvm_inventory.additional_members') extra
+                      WHERE t.source_db=:source AND t.shard_key=:shard AND t.record_id=:owner
+                        AND json_extract(extra.value,'$.guard') IS NULL
+                        AND json_extract(extra.value,'$.owner')=:owner
+                    ) ORDER BY origin,position LIMIT 1 OFFSET :ordinal"#,
+                    named_params! { ":source": source, ":shard": identity.shard_key,
+                        ":owner": owner.record.id, ":ordinal": selected.ordinal },
+                    &active.shards, |row| row.get::<_, String>("record_id")),
+            );
+            return records.first().map(|record| {
+                (
+                    record.shard.manifest.semantic_sha256.clone(),
+                    record.record.as_ref().clone(),
+                )
+            });
+        }
+        let (_, members, _) = owner.shard.decoded().payload().declaration_facts()?;
+        let member = members
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(
+                owner
+                    .record
+                    .jvm_inventory
+                    .iter()
+                    .flat_map(|inventory| &inventory.additional_members),
+            )
+            .filter(|member| member.owner == owner.record.id && member.guard.is_none())
+            .nth(usize::try_from(selected.ordinal).expect("provider ordinal fits usize"))?;
+        return Some((
+            owner.shard.manifest.semantic_sha256.clone(),
+            member.id.clone(),
+        ));
+    }
+    None
+}
+
 /// Canonical identity for a fully-qualified external callee that never
 /// materializes to a workspace or classpath artifact, yet whose name lets an
 /// activated authored procedure summary bind (#1978).
@@ -2952,6 +3140,9 @@ pub struct UnmaterializedExternalTarget {
     /// against the selected external declaration. Model and dispatch
     /// applicability still require separate proofs.
     selected_jdk_artifact: Option<SemanticModelActivationEvidence>,
+    /// Exact provider inventory row selected by call resolution.
+    #[doc(hidden)]
+    pub selected_external_descriptor: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
     /// Exact PyPI distribution artifact selected for a Python external
     /// declaration by resolver-owned installed-artifact and active-profile
     /// evidence. Model and dispatch applicability still require separate
@@ -3066,6 +3257,7 @@ impl UnmaterializedExternalTarget {
             resolver_owned_call_shape: false,
             normalized_static_owner,
             selected_jdk_artifact: None,
+            selected_external_descriptor: None,
             selected_python_artifact: None,
             selected_python_model_manifest_sha256: None,
             python_formal_call_shape: None,
@@ -3454,7 +3646,8 @@ impl UnmaterializedExternalTarget {
                         | Language::Cpp
                         | Language::Python
                         | Language::Java
-                        | Language::Rust,
+                        | Language::Rust
+                        | Language::Go,
                 )
             )
         {

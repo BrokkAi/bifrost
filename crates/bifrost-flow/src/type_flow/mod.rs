@@ -126,4 +126,4 @@ pub use solve::{
     TypeFlowSolveAttempt, TypeFlowSolvePhase, solve_type_flow_for_root,
     solve_type_flow_for_root_with_refinements, sort_unknown_reasons,
 };
-pub use summary::{TypeFlowSummaryProfile, TypeFlowSummaryState};
+pub use summary::{TypeFlowSummaryPartitions, TypeFlowSummaryProfile, TypeFlowSummaryState};

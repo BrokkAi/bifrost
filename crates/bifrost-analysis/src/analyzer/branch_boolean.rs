@@ -133,27 +133,19 @@ fn kotlin_result_context(node: Node<'_>, source: &str) -> Option<KotlinResultCon
             "function_body"
                 if single_named_child(parent).is_some_and(|child| child.id() == current.id()) =>
             {
-                let function = parent
-                    .parent()
-                    .filter(|owner| owner.kind() == "function_declaration")?;
+                let function = parent.parent().filter(|owner| {
+                    matches!(owner.kind(), "function_declaration" | "anonymous_function")
+                })?;
                 return Some(kotlin_declared_function_context(function, source));
             }
-            // A lambda or anonymous function's final statement is its result,
-            // including a braced `if` whose two arms each contain one Boolean
-            // literal. A named function's block body is intentionally absent:
-            // Kotlin requires an explicit return there.
+            // Only a lambda takes its final statement as its result. An
+            // anonymous function follows named-function block return rules.
             "statements"
-                if kotlin_result_owner(parent).is_some_and(|owner| {
-                    matches!(owner.kind(), "lambda_literal" | "anonymous_function")
-                }) && last_named_child(parent)
-                    .is_some_and(|child| child.id() == current.id()) =>
+                if kotlin_result_owner(parent)
+                    .is_some_and(|owner| owner.kind() == "lambda_literal")
+                    && last_named_child(parent).is_some_and(|child| child.id() == current.id()) =>
             {
-                let owner = kotlin_result_owner(parent)?;
-                return Some(if owner.kind() == "anonymous_function" {
-                    kotlin_declared_function_context(owner, source)
-                } else {
-                    KotlinResultContext::Boolean
-                });
+                return Some(KotlinResultContext::Boolean);
             }
             "parenthesized_expression" => current = parent,
             _ => return None,
@@ -173,7 +165,7 @@ fn kotlin_result_owner(statements: Node<'_>) -> Option<Node<'_>> {
 fn kotlin_enclosing_function_context(node: Node<'_>, source: &str) -> KotlinResultContext {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if parent.kind() == "function_declaration" {
+        if matches!(parent.kind(), "function_declaration" | "anonymous_function") {
             return kotlin_declared_function_context(parent, source);
         }
         current = parent.parent();
@@ -254,7 +246,10 @@ fn kotlin_when_boolean_result(source: &str, entry: Node<'_>) -> Option<(bool, bo
 }
 
 fn kotlin_is_return_arm(node: Node<'_>) -> bool {
-    node.kind() == "jump_expression" && node.child(0).is_some_and(|child| child.kind() == "return")
+    node.kind() == "jump_expression"
+        && node
+            .child(0)
+            .is_some_and(|child| matches!(child.kind(), "return" | "return@"))
 }
 
 fn kotlin_boolean_literal(source: &str, node: Node<'_>) -> Option<bool> {
@@ -544,7 +539,7 @@ fn returned_boolean(language: Language, source: &str, mut body: Node<'_>) -> Opt
         Language::JavaScript | Language::TypeScript => &["statement_block"],
         Language::Go => &["block", "statement_list"],
         Language::Kotlin => &["control_structure_body", "block", "statements"],
-        Language::Rust => &["block", "expression_statement"],
+        Language::Rust => &["block"],
         Language::Scala => &["block", "indented_block"],
         Language::Php => &["compound_statement", "colon_block"],
         Language::Cpp => &["compound_statement"],
@@ -585,6 +580,11 @@ fn returned_boolean(language: Language, source: &str, mut body: Node<'_>) -> Opt
             if body.kind() == "boolean_literal" {
                 body
             } else {
+                // A semicolon statement is unit-valued, but an explicit
+                // return inside that statement still leaves the function.
+                if body.kind() == "expression_statement" {
+                    body = single_runtime_named_child(body)?;
+                }
                 if body.kind() != "return_expression" {
                     return None;
                 }
@@ -640,6 +640,7 @@ fn single_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
     fn classify_kotlin_value(source: &str) -> KotlinBooleanBranchClassification {
@@ -668,12 +669,371 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: anonymous Kotlin functions own returns and require explicit block returns"
+    )]
+    fn kotlin_anonymous_functions_own_their_result_context() {
+        for source in [
+            "fun outer(): Boolean { val g = fun(c: Boolean): Any { return if (c) true else false }; return true }",
+            "val g = fun(c: Boolean): Any { return if (c) true else false }",
+        ] {
+            assert_eq!(
+                classify_kotlin_value(source),
+                KotlinBooleanBranchClassification::Open,
+                "{source}"
+            );
+        }
+        for source in [
+            "val g = fun(c: Boolean): Boolean { if (c) true else false }",
+            "val g = fun(c: Boolean) { if (c) true else false }",
+            "fun f(c: Boolean): Boolean { val g = fun(x: Boolean): Boolean { if (x) { true } else { false } }; return g(c) }\n",
+        ] {
+            assert_eq!(
+                classify_kotlin_value(source),
+                KotlinBooleanBranchClassification::NotApplicable,
+                "{source}"
+            );
+        }
+        assert_eq!(
+            classify_kotlin_value(
+                "val g = fun(c: Boolean): Boolean { return if (c) true else false }"
+            ),
+            KotlinBooleanBranchClassification::Proven(BooleanBranchOutcome::Condition)
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: Rust semicolon statements have unit value rather than Boolean tail value"
+    )]
+    fn rust_semicolon_statements_are_not_boolean_tails() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        for (result_type, arms, expected) in [
+            ("", "{ true; } else { false; }", None),
+            (
+                " -> bool",
+                "{ true } else { false }",
+                Some(BooleanBranchOutcome::Condition),
+            ),
+            (
+                " -> bool",
+                "{ return true; } else { return false; }",
+                Some(BooleanBranchOutcome::Condition),
+            ),
+        ] {
+            let source = format!("fn f(c: bool){result_type} {{ if c {arms} }}");
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let node = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                tree.root_node(),
+                "if_expression",
+            )[0];
+            let first = node.child_by_field_name("consequence").unwrap();
+            let second = node
+                .child_by_field_name("alternative")
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            assert_eq!(
+                classify_boolean_branches(Language::Rust, &source, first, second),
+                expected,
+                "{source}: {}",
+                node.to_sexp()
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: labeled returns leak into the expression-only Boolean classifier"
+    )]
+    fn kotlin_result_owners_and_jump_tokens_follow_the_grammar() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::kotlin::language::LANGUAGE.into())
+            .unwrap();
+        for (source, parent_kind, statement_index, expected) in [
+            (
+                "fun f(c: Boolean): Boolean = (if (c) true else false)",
+                "parenthesized_expression",
+                None,
+                KotlinBooleanBranchClassification::Proven(BooleanBranchOutcome::Condition),
+            ),
+            (
+                "fun f(c: Boolean): Boolean = (if (c) false else true)",
+                "parenthesized_expression",
+                None,
+                KotlinBooleanBranchClassification::Proven(BooleanBranchOutcome::NegatedCondition),
+            ),
+            (
+                "fun f(c: Boolean) { val g = { println(1); if (c) true else false } }",
+                "statements",
+                Some(1),
+                KotlinBooleanBranchClassification::Proven(BooleanBranchOutcome::Condition),
+            ),
+            (
+                "fun f(c: Boolean) { val g = { if (c) true else false; println(1) } }",
+                "statements",
+                Some(0),
+                KotlinBooleanBranchClassification::NotApplicable,
+            ),
+            (
+                "fun f(c: Boolean): Boolean = if (c) return true else false",
+                "function_body",
+                None,
+                KotlinBooleanBranchClassification::NotApplicable,
+            ),
+            (
+                "fun f(c: Boolean): Boolean = if (c) true else return false",
+                "function_body",
+                None,
+                KotlinBooleanBranchClassification::NotApplicable,
+            ),
+            (
+                "fun f(c: Boolean): Boolean = if (c) return@f true else false",
+                "function_body",
+                None,
+                KotlinBooleanBranchClassification::NotApplicable,
+            ),
+            (
+                "fun f(c: Boolean): Boolean = if (c) true else return@f false",
+                "function_body",
+                None,
+                KotlinBooleanBranchClassification::NotApplicable,
+            ),
+            (
+                "fun f(c: Boolean): Boolean = if (c) return true else return false",
+                "function_body",
+                None,
+                KotlinBooleanBranchClassification::NotApplicable,
+            ),
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let conditionals =
+                brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                    tree.root_node(),
+                    "if_expression",
+                );
+            assert_eq!(conditionals.len(), 1);
+            let conditional = conditionals[0];
+            assert!(conditional.child_by_field_name("consequence").is_some());
+            assert!(conditional.child_by_field_name("alternative").is_some());
+            let jumps = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                conditional,
+                "jump_expression",
+            );
+            for jump in jumps {
+                let keyword = jump.child(0).unwrap().kind();
+                assert!(matches!(keyword, "return" | "return@"));
+                assert!(kotlin_is_return_arm(jump));
+                if keyword == "return@" {
+                    assert_eq!(jump.named_child(0).unwrap().kind(), "label");
+                }
+            }
+            let parent = conditional.parent().unwrap();
+            assert_eq!(parent.kind(), parent_kind);
+            if let Some(index) = statement_index {
+                assert_eq!(parent.named_child_count(), 2);
+                assert_eq!(parent.named_child(index).unwrap(), conditional);
+                assert_eq!(parent.parent().unwrap().kind(), "lambda_literal");
+            }
+            assert_eq!(classify_kotlin_value(source), expected, "{source}");
+        }
+        for (keyword, is_return) in [("return", true), ("throw", false)] {
+            let source = format!(
+                "fun f(c: Boolean): Boolean {{ when {{ c -> {keyword} true; else -> {keyword} false }} }}"
+            );
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let jumps = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                tree.root_node(),
+                "jump_expression",
+            );
+            assert_eq!(jumps.len(), 2);
+            for jump in jumps {
+                assert_eq!(jump.child(0).unwrap().kind(), keyword);
+                assert_eq!(kotlin_is_return_arm(jump), is_return);
+            }
+            let whens = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                tree.root_node(),
+                "when_expression",
+            );
+            assert_eq!(whens.len(), 1);
+            assert_eq!(kotlin_when_is_a6_shape(&source, whens[0]), is_return);
+        }
+    }
+
+    #[test]
+    fn kotlin_recovered_results_are_rejected_at_the_grammar_boundary() {
+        let source = "fun f(c: Boolean): Boolean = if(c) foo(1 + ) else false";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::kotlin::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(tree.root_node().has_error());
+        let nodes = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+            tree.root_node(),
+            "call_expression",
+        );
+        assert!(!nodes.is_empty());
+        let call = nodes[0];
+        assert!(
+            call.has_error() && !call.is_missing(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        assert!(kotlin_direct_result(call).is_none());
+    }
+
+    #[test]
+    fn scala_recovered_boolean_wrappers_cannot_establish_values() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::scala::language::LANGUAGE.into())
+            .unwrap();
+        for (source, valid) in [
+            ("def f = { true;", false),
+            ("def f = { true\n", false),
+            ("def f = { true }", true),
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            let wrappers = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                tree.root_node(),
+                "block",
+            );
+            assert_eq!(wrappers.len(), 1, "{}", tree.root_node().to_sexp());
+            let wrapper = wrappers[0];
+            assert_eq!(wrapper.has_error(), !valid);
+            assert!(!wrapper.is_missing());
+            assert_eq!(wrapper.named_child(0).unwrap().kind(), "boolean_literal");
+            assert_eq!(scala_branch_value(source, wrapper).is_some(), valid);
+        }
+    }
+
+    #[test]
+    fn scala_named_type_walk_completes_at_its_inclusive_node_limit() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::scala::language::LANGUAGE.into())
+            .unwrap();
+        // Each literal has a named and anonymous node; an extra comment adds
+        // one node, so these flat syntax trees
+        // straddle the limit without exercising depth or ancestor limits.
+        for count in [4095, 4096, 4097] {
+            let mut source = "true\n".repeat((count - 1) / 2);
+            if count % 2 == 0 {
+                source.push_str("/* boundary */");
+            }
+            let tree = parser.parse(&source, None).unwrap();
+            let mut cursor = tree.walk();
+            let mut actual = 1;
+            loop {
+                if cursor.goto_first_child() {
+                    actual += 1;
+                    continue;
+                }
+                loop {
+                    if cursor.goto_next_sibling() {
+                        actual += 1;
+                        break;
+                    }
+                    if !cursor.goto_parent() {
+                        break;
+                    }
+                }
+                if cursor.node() == tree.root_node() {
+                    break;
+                }
+            }
+            assert_eq!(actual, count);
+            assert_eq!(
+                scala_defines_named_type_bounded(tree.root_node(), &source, "Boolean", || true),
+                if count <= 4096 { Some(false) } else { None }
+            );
+        }
+        let source = "class Boolean";
+        let tree = parser.parse(source, None).unwrap();
+        assert_eq!(
+            scala_defines_named_type_bounded(tree.root_node(), source, "Boolean", || true),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn scala_boolean_arm_fields_preserve_literal_polarity() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::scala::language::LANGUAGE.into())
+            .unwrap();
+        for (first, second, expected) in [
+            ("true", "false", BooleanBranchOutcome::Condition),
+            ("false", "true", BooleanBranchOutcome::NegatedCondition),
+        ] {
+            for (expression, is_result) in [
+                (format!("if (c) {first} else {second}"), true),
+                (format!("if (c) {{ {first} }} else {{ {second} }}"), true),
+                (format!("if (c) return {first} else return {second}"), true),
+                (format!("return (if (c) {first} else {second})"), true),
+                (
+                    format!("{{ println(c); /* before tail */ if (c) {first} else {second} }}"),
+                    true,
+                ),
+                (
+                    format!("{{ if (c) {first} else {second}; /* later result */ true }}"),
+                    false,
+                ),
+            ] {
+                let source = format!("def f(c: Boolean): Boolean = {expression}");
+                let tree = parser.parse(&source, None).unwrap();
+                assert!(
+                    !tree.root_node().has_error(),
+                    "{}",
+                    tree.root_node().to_sexp()
+                );
+                let nodes = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                    tree.root_node(),
+                    "if_expression",
+                );
+                assert_eq!(nodes.len(), 1);
+                let node = nodes[0];
+                let consequence = node.child_by_field_name("consequence").unwrap();
+                let alternative = node.child_by_field_name("alternative").unwrap();
+                let literals =
+                    brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                        node,
+                        "boolean_literal",
+                    );
+                assert_eq!(literals.len(), 2);
+                assert_eq!(&source[literals[0].byte_range()], first);
+                assert_eq!(&source[literals[1].byte_range()], second);
+                assert_eq!(
+                    classify_scala_boolean_branches(&source, consequence, alternative, Some(node)),
+                    if is_result {
+                        ScalaBooleanBranchClassification::Proven(expected)
+                    } else {
+                        ScalaBooleanBranchClassification::Open
+                    },
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn kotlin_expression_result_boolean_pairs_are_context_scoped() {
         for source in [
             "fun f(c: Boolean): Boolean { return if (c) true else false }\n",
             "fun f(c: Boolean): Boolean = if (c) true else false\n",
             "fun f(c: Boolean): Boolean { val g = { if (c) { true } else { false } }; return g() }\n",
-            "fun f(c: Boolean): Boolean { val g = fun(x: Boolean): Boolean { if (x) { true } else { false } }; return g(c) }\n",
         ] {
             assert!(
                 matches!(

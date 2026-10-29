@@ -87,19 +87,19 @@ mod tests {
     /// `declaration_ranges_limited` need an analyzer and a `CodeUnit`. Each is pinned by its
     /// own behavior test instead.
     const CAPABILITY_MATRIX: &str = "\
-language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow
-Java       | Jvm                  | Java   | legacy | .   | yes      | Java   | -    | -     | yes | -
-Go         | Go                   | Go     | legacy | /   | yes      | Go     | yes  | -     | yes | -
-Cpp        | Cpp                  | Cpp    | legacy | ::  | -        | Cpp    | yes  | -     | yes | -
-JavaScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes
-TypeScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes
-Python     | Python               | Python | legacy | .   | -        | Python | yes  | -     | yes | yes
-Rust       | Rust                 | Rust   | native | .   | yes      | Rust   | yes  | -     | yes | -
-Php        | Php                  | Php    | legacy | .   | yes      | Php    | yes  | -     | yes | yes
-Scala      | Jvm                  | Scala  | legacy | .   | yes      | Scala  | yes  | -     | yes | -
-CSharp     | CSharp               | CSharp | legacy | .   | yes      | CSharp | yes  | -     | yes | -
-Ruby       | Ruby                 | Ruby   | legacy | .   | yes      | Ruby   | yes  | -     | yes | yes
-Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | yes  | -     | yes | -
+language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow | overlays
+Java       | Jvm                  | Java   | legacy | .   | yes      | Java   | -    | -     | yes | - | yes
+Go         | Go                   | Go     | native | /   | yes      | Go     | yes  | -     | yes | - | yes
+Cpp        | Cpp                  | Cpp    | legacy | ::  | -        | Cpp    | yes  | -     | yes | - | -
+JavaScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes | -
+TypeScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes | -
+Python     | Python               | Python | legacy | .   | -        | Python | yes  | -     | yes | yes | yes
+Rust       | Rust                 | Rust   | native | .   | yes      | Rust   | yes  | -     | yes | - | yes
+Php        | Php                  | Php    | legacy | .   | yes      | Php    | yes  | -     | yes | yes | -
+Scala      | Jvm                  | Scala  | legacy | .   | yes      | Scala  | yes  | -     | yes | - | yes
+CSharp     | CSharp               | CSharp | legacy | .   | yes      | CSharp | yes  | -     | yes | - | yes
+Ruby       | Ruby                 | Ruby   | legacy | .   | yes      | Ruby   | yes  | -     | yes | yes | -
+Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | yes  | -     | yes | - | yes
 ";
 
     fn mark(present: bool) -> &'static str {
@@ -108,7 +108,7 @@ Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | 
 
     fn capability_matrix() -> String {
         let mut rendered = String::from(
-            "language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow\n",
+            "language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow | overlays\n",
         );
         for language in ANALYZABLE {
             let support = support_of(language);
@@ -123,7 +123,7 @@ Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | 
                 LanguageGraphBackend::Legacy(_) => dead_code.bulk.map(|bulk| bulk.id()),
             };
             rendered.push_str(&format!(
-                "{:<10} | {:<20} | {:<6} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {:<3} | {}\n",
+                "{:<10} | {:<20} | {:<6} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {:<3} | {} | {}\n",
                 format!("{language:?}"),
                 format!("{:?}", support.ecosystem()),
                 format!("{:?}", backend.id()),
@@ -135,6 +135,7 @@ Kotlin     | Jvm                  | Kotlin | legacy | .   | yes      | Kotlin | 
                 mark(support.receiver_facts().is_some()),
                 mark(support.knowledge().highlight_query().is_some()),
                 mark(support.type_flow_adapter().is_some()),
+                mark(support.supports_selected_resolution_overlays()),
             ));
         }
         rendered

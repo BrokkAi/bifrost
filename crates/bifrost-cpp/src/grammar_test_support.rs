@@ -61,3 +61,31 @@ pub(crate) fn field(node: Node<'_>, name: &str, kind: &str, span: std::ops::Rang
     let child = node.child_by_field_name(name).expect(name);
     assert_eq!((child.kind(), child.byte_range()), (kind, span));
 }
+
+/// Assert the pinned grammar's reading of a class head decorated by a
+/// function-like export macro, `class API(2, 0) Name ...`: a clean tree with a
+/// `class_specifier` named `name` whose first decoration is a `macro_modifier`
+/// carrying the invocation's `argument_list` (brokk-tree-sitter-cpp 0.24.7,
+/// #6902). Fixtures written for the error geometry of older
+/// grammars use this to state that the head no longer needs recovery.
+pub(crate) fn assert_function_like_export_class_head(tree: &Tree, source: &str, name: &str) {
+    let root = tree.root_node();
+    assert!(!root.has_error(), "{name}: {}", root.to_sexp());
+    assert!(
+        nodes(root).into_iter().any(|node| {
+            node.kind() == "class_specifier"
+                && node
+                    .child_by_field_name("name")
+                    .and_then(|class_name| class_name.utf8_text(source.as_bytes()).ok())
+                    == Some(name)
+                && node.named_child(0).is_some_and(|decoration| {
+                    decoration.kind() == "macro_modifier"
+                        && decoration
+                            .named_child(1)
+                            .is_some_and(|arguments| arguments.kind() == "argument_list")
+                })
+        }),
+        "{name}: {}",
+        root.to_sexp()
+    );
+}

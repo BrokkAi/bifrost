@@ -155,8 +155,8 @@ call_binding_enum! {
     /// - `Exhaustive`: every actual of this call is bound exactly. A call that
     ///   passes no arguments is exhaustive.
     /// - `Partial`: some actuals are bound exactly and some are not.
-    /// - `Incomplete`: the actuals bind against one selected source candidate,
-    ///   but the resolver's candidate frontier remains open.
+    /// - `Incomplete`: the callee frontier or the actual-value partition is
+    ///   still open; retained rows cannot establish exhaustive bindings.
     /// - `Unknown`: no actual could be bound, because the callee or its formals
     ///   could not be established.
     /// - `Unsupported`: the call's own argument structure is unreadable.
@@ -183,8 +183,8 @@ call_binding_enum! {
     ///   name mismatch against the bound callable.
     /// - `UnknownKeyword`: this Python keyword actual names no formal and the
     ///   callable has no `**kwargs` slot that accepts it.
-    /// - `SpreadNotExpanded`: this actual expands a pack whose members are not
-    ///   statically known.
+    /// - `SpreadNotExpanded`: this actual expands into values which the
+    ///   binding report has not individually enumerated.
     /// - `ReceiverBindingUnsupported`: the language binds a receiver into the
     ///   declared parameter list, and this seam does not carry the receiver
     ///   evidence needed to decide whether it did.
@@ -376,17 +376,38 @@ impl CallReceiverBinding {
 /// then argument order, so the result is a deterministic function of the report
 /// and never of result order. The formal side is [`OrdinaryFormalSlots`].
 pub fn call_binding_report(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     file: &ProjectFile,
     shape: &CallShapeReport,
     target: CallBindingTarget,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> CallBindingReport {
     let outcome = &shape.outcome;
     let site_id = outcome.site_id.clone();
     let base = |target: Option<CodeUnit>,
-                coverage: CallBindingCoverage,
+                mut coverage: CallBindingCoverage,
                 actual_count: usize,
-                bound_count: usize,
-                rows: Vec<CallBindingRow>| {
+                mut bound_count: usize,
+                mut rows: Vec<CallBindingRow>| {
+        let partition_complete = crate::analyzer::languages::language_support_for_hook(
+            crate::analyzer::common::language_for_file(file),
+            "call_argument_partition_is_complete",
+        )
+        .is_some_and(|support| {
+            support.call_argument_partition_is_complete(analyzer, shape, cancellation)
+        });
+        if !partition_complete {
+            // #7208: written arguments do not yet enumerate expanded values.
+            // No consumer may observe a provisional exact argument partition.
+            coverage = CallBindingCoverage::Incomplete;
+            bound_count = 0;
+            for row in &mut rows {
+                if row.argument_id.is_some() {
+                    row.mapping = CallBindingMapping::Incomplete;
+                    row.reason = Some(CallBindingReason::SpreadNotExpanded);
+                }
+            }
+        }
         let conversion_facts = rows
             .iter()
             .map(|row| {
@@ -876,6 +897,20 @@ mod tests {
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
     use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
     use std::env;
+
+    fn call_binding_report(
+        file: &ProjectFile,
+        shape: &CallShapeReport,
+        target: CallBindingTarget,
+    ) -> CallBindingReport {
+        let language = crate::analyzer::common::language_for_file(file);
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[language]);
+        let analyzer = crate::analyzer::workspace::EmptyAnalyzer::new(std::sync::Arc::new(
+            crate::TestProject::new(std::env::temp_dir(), language),
+        ));
+        super::call_binding_report(&analyzer, file, shape, target, None)
+    }
 
     fn file(name: &str) -> ProjectFile {
         ProjectFile::new(env::temp_dir().join("bifrost-call-binding"), name)

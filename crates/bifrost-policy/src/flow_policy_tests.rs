@@ -160,8 +160,13 @@ fn the_neutral_records_decode_into_the_shared_taint_shaped_model() {
     let [kill] = spec.sanitizers.entries.as_slice() else {
         panic!("expected exactly one kill");
     };
-    assert_eq!(kill.input, PolicyPort::ArgumentIndex { index: 0 });
-    assert_eq!(kill.output, PolicyPort::ReturnValue);
+    assert!(matches!(
+        &kill.kind,
+        crate::definition::TaintSanitizerKind::Transfer {
+            input: PolicyPort::ArgumentIndex { index: 0 },
+            output: PolicyPort::ReturnValue
+        }
+    ));
     assert_eq!(
         kill.removes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
         vec![FLOW_INTERNAL_LABEL]

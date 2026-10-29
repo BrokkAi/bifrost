@@ -108,15 +108,11 @@ pub struct PhpImportSyntax<'tree> {
 
 #[derive(Debug, Clone)]
 struct PhpAliasEvent {
-    start: usize,
     end: usize,
     aliases: PhpUseAliases,
-    bindings: Vec<PhpUseBinding>,
 }
 
-/// Read one `use` declaration into the event the index stores: the byte span
-/// the declaration occupies, the alias maps it contributes, and the binder
-/// token of every local name it introduces.
+/// Read one `use` declaration into its activation boundary and alias maps.
 fn php_alias_event(
     declaration: Node<'_>,
     source: &str,
@@ -125,10 +121,8 @@ fn php_alias_event(
     let bindings = php_use_bindings_from_node(declaration, source, step)?;
     let aliases = php_use_aliases_from_bindings(&bindings);
     Some(PhpAliasEvent {
-        start: declaration.start_byte(),
         end: declaration.end_byte(),
         aliases,
-        bindings,
     })
 }
 
@@ -159,7 +153,6 @@ pub struct PhpFileContextIndex {
     source_len: usize,
     segments: Vec<PhpContextSegment>,
     merged_aliases: PhpUseAliases,
-    use_declarations: Vec<PhpUseDeclaration>,
 }
 
 impl PhpFileContextIndex {
@@ -263,7 +256,6 @@ impl PhpFileContextIndex {
         }
 
         let mut segments = Vec::new();
-        let mut use_declarations = Vec::new();
         for scope in scopes {
             let mut aliases = PhpUseAliases::default();
             let mut cursor = scope.start;
@@ -277,12 +269,6 @@ impl PhpFileContextIndex {
                     end: event.end,
                     context,
                 });
-                use_declarations.push(PhpUseDeclaration {
-                    namespace: scope.namespace.clone(),
-                    start_byte: event.start,
-                    end_byte: event.end,
-                    bindings: event.bindings,
-                });
                 aliases.extend(event.aliases);
                 cursor = event.end;
             }
@@ -295,22 +281,11 @@ impl PhpFileContextIndex {
                 },
             });
         }
-        // Namespace scopes are assembled in the order they close, not the
-        // order they open, so declarations are put back into source order
-        // here.
-        use_declarations.sort_by_key(|declaration| declaration.start_byte);
         Some(Self {
             source_len: source.len(),
             segments,
             merged_aliases,
-            use_declarations,
         })
-    }
-
-    /// Every `use` declaration of the file in source order, with the namespace
-    /// each is written in and the binder token of every name it introduces.
-    pub fn use_declarations(&self) -> &[PhpUseDeclaration] {
-        &self.use_declarations
     }
 
     /// Return the exact namespace/import context visible at `byte`.
@@ -497,16 +472,6 @@ pub struct PhpUseBinding {
     /// clause renames, the tail segment of the imported path otherwise.
     pub binder_start: usize,
     pub binder_end: usize,
-}
-
-/// One `use` declaration of a file, with the namespace it is written in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhpUseDeclaration {
-    /// The namespace in force at the declaration; empty for the global one.
-    pub namespace: String,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub bindings: Vec<PhpUseBinding>,
 }
 
 fn php_alias_events_from_children(
@@ -1001,8 +966,8 @@ const PHP_DYNAMIC_TYPE_NAMES: &[&str] = &["object", "mixed"];
 /// The builtin non-nominal type `raw` names, if any.
 ///
 /// `raw` is stored-signature or declaration text, the one boundary in the PHP
-/// resolver where no parser node exists, so it is split on `|` exactly as
-/// [`resolve_php_type_arms`] splits it. A union with a dynamic arm is dynamic:
+/// resolver where no parser node exists. Each stored union arm is classified
+/// independently. A union with a dynamic arm is dynamic:
 /// `A|object` admits any object, so the declaration bounds nothing.
 pub fn php_dynamic_type_keyword(raw: &str) -> Option<&'static str> {
     raw.split('|').find_map(|piece| {
@@ -1028,8 +993,8 @@ pub fn php_dynamic_type_keyword_node(
             return None;
         }
         match current.kind() {
-            // `mixed` is a `primitive_type` and `object` is a `named_type`
-            // wrapping a bare `name`, so both leaf shapes are read here.
+            // Lowercase builtins are primitive_type; uppercase spellings can
+            // be named_type wrappers over name in the pinned grammar.
             "primitive_type" | "name" => {
                 if let Some(keyword) =
                     php_leaf_text(current, source).and_then(php_dynamic_type_name)
@@ -1157,17 +1122,16 @@ pub fn resolve_php_type_node(
     }
 
     let path = php_structured_path(node, source, &mut step)?;
-    // `object` parses as a `named_type` over a bare `name`, so without this
-    // guard the namespace join below would answer it as a class named `object`
-    // in the current namespace -- a nominal owner no PHP file can declare.
+    // Uppercase builtin spellings can parse as named_type over name.
+    // They still name builtins, never nominal owners in this namespace.
     if !path.absolute
         && !path.namespace_relative
         && let [only] = path.segments.as_slice()
-        && php_dynamic_type_name(only).is_some()
+        && php_non_nominal_type_name(only)
     {
         return None;
     }
-    resolve_php_structured_path(path, ctx, &ctx.aliases.type_aliases, &mut step)
+    resolve_php_structured_path(path, ctx, &mut step)
 }
 
 /// Resolves every nominal arm a declared PHP type node names, in declaration
@@ -1215,9 +1179,15 @@ pub fn resolve_php_type_node_arms(
     php_capped_type_arms(arms)
 }
 
-/// The `null` arm of a union, which the grammar spells as a `primitive_type`.
-fn php_is_null_type_node(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "primitive_type"
+/// The `null` arm is a primitive or, for mixed/uppercase spellings, a named type.
+fn php_is_null_type_node(mut node: Node<'_>, source: &str) -> bool {
+    while node.kind() == "named_type" {
+        let Some(child) = php_only_named_child(node, &mut || true) else {
+            return false;
+        };
+        node = child;
+    }
+    matches!(node.kind(), "primitive_type" | "name")
         && php_leaf_text(node, source).is_some_and(|text| text.eq_ignore_ascii_case("null"))
 }
 
@@ -1236,7 +1206,12 @@ pub fn resolve_php_function_node(
         return None;
     }
     let path = php_structured_path(node, source, &mut step)?;
-    resolve_php_structured_callable(path, ctx, &ctx.aliases.function_aliases, &mut step)
+    resolve_php_structured_callable(
+        path,
+        ctx,
+        |name| php_case_insensitive_alias(&ctx.aliases.function_aliases, name),
+        &mut step,
+    )
 }
 
 /// Resolves one literal PHP constant name from parser structure and maps the
@@ -1254,7 +1229,12 @@ pub fn resolve_php_constant_node(
         return None;
     }
     let path = php_structured_path(node, source, &mut step)?;
-    let public = resolve_php_structured_callable(path, ctx, &ctx.aliases.const_aliases, &mut step)?;
+    let public = resolve_php_structured_callable(
+        path,
+        ctx,
+        |name| ctx.aliases.const_aliases.get(name),
+        &mut step,
+    )?;
     if !step() {
         return None;
     }
@@ -1343,15 +1323,18 @@ fn php_path_has_leading_separator(
 fn resolve_php_structured_path(
     path: PhpStructuredPath,
     ctx: &PhpFileContext,
-    aliases: &HashMap<String, String>,
     step: &mut impl FnMut() -> bool,
 ) -> Option<String> {
     let segments = path.segments.as_slice();
     let first = segments.first()?;
-    if matches!(
-        first.to_ascii_lowercase().as_str(),
-        "self" | "static" | "parent"
-    ) {
+    if !path.absolute
+        && !path.namespace_relative
+        && segments.len() == 1
+        && matches!(
+            first.to_ascii_lowercase().as_str(),
+            "self" | "static" | "parent"
+        )
+    {
         return None;
     }
 
@@ -1364,7 +1347,7 @@ fn resolve_php_structured_path(
     if !step() {
         return None;
     }
-    if let Some(imported) = aliases.get(first) {
+    if let Some(imported) = php_case_insensitive_alias(&ctx.aliases.type_aliases, first) {
         return php_join_structured_segments(imported, &segments[1..], step);
     }
     php_join_structured_segments(&ctx.namespace, segments, step)
@@ -1375,24 +1358,48 @@ fn resolve_php_structured_path(
 /// The base helper is shared with TYPE resolution, where PHP has no such
 /// fallback, so the extra candidate is added here -- on the function and
 /// constant entry points -- rather than in the shared walk (#1866).
-fn resolve_php_structured_callable(
+fn resolve_php_structured_callable<'a>(
     path: PhpStructuredPath,
-    ctx: &PhpFileContext,
-    aliases: &HashMap<String, String>,
+    ctx: &'a PhpFileContext,
+    lookup: impl Fn(&str) -> Option<&'a String>,
     step: &mut impl FnMut() -> bool,
 ) -> Option<PhpCallableCandidates> {
-    let unqualified = !path.absolute
-        && !path.namespace_relative
-        && path.segments.len() == 1
-        && !aliases.contains_key(&path.segments[0]);
-    let global = unqualified.then(|| path.segments[0].clone());
-    let primary = resolve_php_structured_path(path, ctx, aliases, step)?;
-    Some(match global {
-        Some(global) if !ctx.namespace.is_empty() => {
-            PhpCallableCandidates::shadowing(primary, global)
-        }
-        _ => PhpCallableCandidates::exact(primary),
+    if !step() {
+        return None;
+    }
+    if path.absolute || path.namespace_relative || path.segments.len() > 1 {
+        return resolve_php_structured_path(path, ctx, step).map(PhpCallableCandidates::exact);
+    }
+    let name = path.segments.first()?;
+    if let Some(imported) = lookup(name) {
+        return Some(PhpCallableCandidates::exact(imported.clone()));
+    }
+    let primary = php_join_structured_segments(&ctx.namespace, &path.segments, step)?;
+    Some(if ctx.namespace.is_empty() {
+        PhpCallableCandidates::exact(primary)
+    } else {
+        PhpCallableCandidates::shadowing(primary, name.clone())
     })
+}
+
+// Preserve source spellings in public/import facts. PHP compares class and
+// function aliases without ASCII case; constants use their own exact map.
+fn php_case_insensitive_alias<'a>(
+    aliases: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    aliases
+        .iter()
+        .find_map(|(local, target)| local.eq_ignore_ascii_case(name).then_some(target))
+}
+
+fn php_non_nominal_type_name(name: &str) -> bool {
+    [
+        "int", "float", "string", "bool", "array", "callable", "iterable", "void", "never", "true",
+        "false", "null", "object", "mixed",
+    ]
+    .iter()
+    .any(|builtin| name.eq_ignore_ascii_case(builtin))
 }
 
 fn php_join_structured_segments(
@@ -1482,32 +1489,29 @@ pub fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
 /// Resolves every nominal arm a declared PHP type string names, in declaration
 /// order and deduplicated.
 ///
-/// `raw` is stored-signature or declaration text. It is the one boundary in the
-/// PHP resolver where no parser node exists for the declared type, so it is the
-/// one place a `|` split is legitimate; the node path uses
-/// [`resolve_php_type_node_arms`] and must not gain string parsing.
-///
-/// `null` arms are dropped, and a leading `?` on a piece marks that piece's own
-/// null arm. An empty or relative (`self`/`static`/`parent`) arm yields no arms
-/// at all, and so does a union wider than [`PHP_MAX_TYPE_ARMS`]: truncating it
-/// would claim a narrower ambiguity than the declaration has.
+/// Stored signatures are parsed with the same grammar as source declarations;
+/// the node resolver owns unions, nullable types, and non-nominal rejection.
 pub fn resolve_php_type_arms(raw: &str, ctx: &PhpFileContext) -> Vec<String> {
-    let mut arms: Vec<String> = Vec::new();
-    for piece in raw.split('|') {
-        let piece = piece.trim();
-        let piece = piece.strip_prefix('?').map(str::trim).unwrap_or(piece);
-        if piece.eq_ignore_ascii_case("null") {
-            continue;
-        }
-        if piece.is_empty() || matches!(piece, "self" | "static" | "parent") {
-            return Vec::new();
-        }
-        let Some(arm) = resolve_php_nominal_type(piece, ctx) else {
-            return Vec::new();
-        };
-        push_unique_php_type_arm(&mut arms, arm);
+    let source = format!("<?php function __bifrost_type({raw} $value) {{}}");
+    let Some(tree) = parse_php_tree(&source) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
     }
-    php_capped_type_arms(arms)
+    let Some(function) = tree.root_node().named_child(1) else {
+        return Vec::new();
+    };
+    let Some(parameters) = function.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let Some(parameter) = parameters.named_child(0) else {
+        return Vec::new();
+    };
+    let Some(ty) = parameter.child_by_field_name("type") else {
+        return Vec::new();
+    };
+    resolve_php_type_node_arms(ty, &source, ctx, || true)
 }
 
 fn php_capped_type_arms(arms: Vec<String>) -> Vec<String> {
@@ -1523,100 +1527,35 @@ fn push_unique_php_type_arm(arms: &mut Vec<String>, arm: String) {
     }
 }
 
-/// Resolves one already isolated nominal type name against the file's imports
-/// and namespace.
-fn resolve_php_nominal_type(first: &str, ctx: &PhpFileContext) -> Option<String> {
-    if first.starts_with('\\') {
-        return Some(php_namespace_to_fq(first));
-    }
-    // The builtins `object` and `mixed` name no class, and joining them onto
-    // the file's namespace would manufacture one (#2030).
-    if php_dynamic_type_name(first).is_some() {
+pub fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<PhpCallableCandidates> {
+    let source = format!("<?php {raw}();");
+    let tree = parse_php_tree(&source)?;
+    if tree.root_node().has_error() {
         return None;
     }
-    let normalized = php_namespace_to_fq(first);
-    let local = normalized.split('.').next().unwrap_or(normalized.as_str());
-    if let Some(imported) = ctx.aliases.type_aliases.get(local) {
-        if normalized == local {
-            return Some(imported.clone());
-        }
-        let suffix = normalized
-            .strip_prefix(local)
-            .unwrap_or("")
-            .trim_start_matches('.');
-        return Some(if suffix.is_empty() {
-            imported.clone()
-        } else {
-            format!("{imported}.{suffix}")
-        });
-    }
-    Some(join_namespace(&ctx.namespace, &normalized))
-}
-
-pub fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<PhpCallableCandidates> {
-    if raw.starts_with('\\') {
-        return Some(PhpCallableCandidates::exact(php_namespace_to_fq(raw)));
-    }
-    let normalized = php_namespace_to_fq(raw);
-    if let Some(imported) = ctx.aliases.function_aliases.get(&normalized) {
-        return Some(PhpCallableCandidates::exact(imported.clone()));
-    }
-    let namespaced = join_namespace(&ctx.namespace, &normalized);
-    Some(match php_global_fallback_applies(&normalized, ctx) {
-        true => PhpCallableCandidates::shadowing(namespaced, normalized),
-        false => PhpCallableCandidates::exact(namespaced),
-    })
+    let statement = tree.root_node().named_child(1)?;
+    let call = statement.named_child(0)?;
+    let name = call.child_by_field_name("function")?;
+    resolve_php_function_node(name, &source, ctx, || true)
 }
 
 pub fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<PhpCallableCandidates> {
-    if raw.starts_with('\\') {
-        return Some(php_constant_candidates(php_namespace_to_fq(raw), None));
+    let source = format!("<?php {raw};");
+    let tree = parse_php_tree(&source)?;
+    if tree.root_node().has_error() {
+        return None;
     }
-    let normalized = php_namespace_to_fq(raw);
-    if let Some(imported) = ctx.aliases.const_aliases.get(&normalized) {
-        return Some(php_constant_candidates(imported.clone(), None));
-    }
-    let namespaced = join_namespace(&ctx.namespace, &format!("_module_.{normalized}"));
-    let global_fallback = php_global_fallback_applies(&normalized, ctx).then_some(normalized);
-    Some(php_constant_candidates(namespaced, global_fallback))
+    let statement = tree.root_node().named_child(1)?;
+    resolve_php_constant_node(statement.named_child(0)?, &source, ctx, || true)
 }
 
-/// Whether PHP's global-namespace fallback applies to an already normalized,
-/// non-absolute, non-aliased function or constant name.
-///
-/// The rule is the one `diagnostics.rs` states: an unqualified -- that is,
-/// single-segment -- function or constant name reaches the global namespace
-/// after the current one. A qualified name (`Sub\name`), the `namespace\name`
-/// relative form and a file with no namespace at all each have exactly one
-/// candidate: the first two are not unqualified, and in the global namespace the
-/// two candidates coincide.
-fn php_global_fallback_applies(normalized: &str, ctx: &PhpFileContext) -> bool {
-    !ctx.namespace.is_empty() && !normalized.contains('.')
-}
-
+/// Convert a public PHP constant name to its declaration identity. Every
+/// caller supplies a public name; a real namespace may itself be _module_.
 pub(crate) fn module_constant_fq(fq_name: &str) -> String {
-    if fq_name.contains("._module_.") {
-        return fq_name.to_string();
-    }
-    let public = public_php_fq_name(fq_name);
-    if let Some((namespace, name)) = public.rsplit_once('.') {
+    if let Some((namespace, name)) = fq_name.rsplit_once('.') {
         format!("{namespace}._module_.{name}")
     } else {
-        format!("_module_.{public}")
-    }
-}
-
-fn public_php_fq_name(fq_name: &str) -> String {
-    fq_name.replace("._module_.", ".")
-}
-
-fn join_namespace(namespace: &str, name: &str) -> String {
-    if namespace.is_empty() {
-        name.to_string()
-    } else if name.is_empty() {
-        namespace.to_string()
-    } else {
-        format!("{namespace}.{name}")
+        format!("_module_.{fq_name}")
     }
 }
 
@@ -1825,7 +1764,6 @@ mod source_alias_tests {
     }
 
     #[test]
-    #[hardwon("#3026: the statement API bypassed complete structured PHP parsing")]
     fn raw_statement_apis_route_through_complete_php_parse() {
         let aliases = parse_php_use_aliases("use Vendor\\Widget\\Renderable as Renderer;");
         assert_eq!(aliases["Renderer"], "Vendor.Widget.Renderable");
@@ -1940,5 +1878,281 @@ mod source_alias_tests {
                 .type_targets()
                 .any(|target| target == "Vendor.Manual")
         );
+    }
+}
+
+#[cfg(test)]
+mod alias_resolution_regression_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive as find;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn context() -> PhpFileContext {
+        PhpFileContext {
+            namespace: "N".into(),
+            aliases: parse_php_use_aliases_by_kind(
+                "use Vendor\\Package as P; use Vendor\\Thing as Alias; use function Vendor\\run as Go; use const Vendor\\FLAG as Flag;",
+            ),
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: callable qualifiers and case-insensitive imports resolved incorrectly"
+    )]
+    fn callable_namespace_and_alias_rules() {
+        let ctx = context();
+        assert_eq!(resolve_php_type("alias", &ctx), Some("Vendor.Thing".into()));
+        for (raw, expected) in [
+            ("go", vec!["Vendor.run"]),
+            ("P\\run", vec!["Vendor.Package.run"]),
+            ("namespace\\run", vec!["N.run"]),
+            ("other", vec!["N.other", "other"]),
+        ] {
+            let source = format!("<?php {raw}();");
+            let tree = parse_php_tree(&source).unwrap();
+            let call = find(tree.root_node(), "function_call_expression").unwrap();
+            let node = call.child_by_field_name("function").unwrap();
+            for actual in [
+                resolve_php_function(raw, &ctx),
+                resolve_php_function_node(node, &source, &ctx, || true),
+            ] {
+                assert_eq!(
+                    actual.unwrap().iter().collect::<Vec<_>>(),
+                    expected,
+                    "{raw}"
+                );
+            }
+        }
+        for (raw, expected) in [
+            ("Flag", vec!["Vendor._module_.FLAG"]),
+            ("flag", vec!["N._module_.flag", "_module_.flag"]),
+            ("P\\FLAG", vec!["Vendor.Package._module_.FLAG"]),
+            ("namespace\\FLAG", vec!["N._module_.FLAG"]),
+            ("Sub\\FLAG", vec!["N.Sub._module_.FLAG"]),
+        ] {
+            let source = format!("<?php {raw};");
+            let tree = parse_php_tree(&source).unwrap();
+            let expression = find(tree.root_node(), "expression_statement")
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            for actual in [
+                resolve_php_constant(raw, &ctx),
+                resolve_php_constant_node(expression, &source, &ctx, || true),
+            ] {
+                assert_eq!(
+                    actual.unwrap().iter().collect::<Vec<_>>(),
+                    expected,
+                    "{raw}"
+                );
+            }
+        }
+        let global = PhpFileContext {
+            namespace: String::new(),
+            aliases: PhpUseAliases::default(),
+        };
+        assert_eq!(
+            resolve_php_constant("FLAG", &global)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            ["_module_.FLAG"]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: global constants acquired duplicate module markers"
+    )]
+    fn global_constant_identity_has_one_module_scope() {
+        let ctx = PhpFileContext {
+            namespace: String::new(),
+            aliases: PhpUseAliases::default(),
+        };
+        assert_eq!(
+            resolve_php_constant("FLAG", &ctx)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            ["_module_.FLAG"]
+        );
+        // _module_ is also a legal user namespace. Conversion always adds
+        // the synthetic leaf scope; it must not infer syntax from this value.
+        for (name, expected) in [
+            ("\\_module_\\FLAG", "_module_._module_.FLAG"),
+            ("\\N\\_module_\\FLAG", "N._module_._module_.FLAG"),
+        ] {
+            assert_eq!(
+                resolve_php_constant(name, &ctx)
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: raw relative and scalar type arms fabricated nominal owners"
+    )]
+    fn declared_types_match_grammar_boundary() {
+        let ctx = context();
+        for (raw, expected) in [
+            ("PARENT", vec![]),
+            ("SELF", vec![]),
+            ("STATIC", vec![]),
+            ("A|int", vec![]),
+            ("A|INT", vec![]),
+            ("A|null", vec!["N.A"]),
+            ("A|B|C|D", vec!["N.A", "N.B", "N.C", "N.D"]),
+            ("A|B|C|D|E", vec![]),
+            ("OBJECT", vec![]),
+            ("MIXED", vec![]),
+        ] {
+            let source = format!("<?php function f({raw} $value) {{}}");
+            let tree = parse_php_tree(&source).unwrap();
+            let parameter = find(tree.root_node(), "simple_parameter").unwrap();
+            let ty = parameter.child_by_field_name("type").unwrap();
+            assert_eq!(resolve_php_type_arms(raw, &ctx), expected, "raw {raw}");
+            assert_eq!(
+                resolve_php_type_node_arms(ty, &source, &ctx, || true),
+                expected,
+                "node {raw}"
+            );
+        }
+        for (raw, keyword) in [
+            ("? object", "object"),
+            ("OBJECT", "object"),
+            ("MIXED", "mixed"),
+        ] {
+            assert_eq!(php_dynamic_type_keyword(raw), Some(keyword));
+            let source = format!("<?php function f({raw} $value) {{}}");
+            let tree = parse_php_tree(&source).unwrap();
+            let ty = find(tree.root_node(), "simple_parameter")
+                .unwrap()
+                .child_by_field_name("type")
+                .unwrap();
+            assert_eq!(
+                php_dynamic_type_keyword_node(ty, &source, || true),
+                Some(keyword)
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#7228: review: uppercase NULL erased nominal union arms")]
+    fn nullable_builtin_spellings() {
+        let ctx = context();
+        for spelling in ["null", "NULL", "NuLl"] {
+            let raw = format!("A|{spelling}");
+            assert_eq!(resolve_php_type_arms(&raw, &ctx), ["N.A"], "{raw}");
+        }
+        for builtin in [
+            "int", "float", "string", "bool", "array", "callable", "iterable", "void", "never",
+            "true", "false", "object", "mixed",
+        ] {
+            for spelling in [builtin.to_string(), builtin.to_ascii_uppercase()] {
+                assert_eq!(resolve_php_type(&spelling, &ctx), None, "{spelling}");
+                assert!(
+                    resolve_php_type_arms(&format!("A|{spelling}"), &ctx).is_empty(),
+                    "{spelling}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#7228: review: relative-scope keywords rejected namespace segments")]
+    fn keyword_namespace_segments() {
+        let ctx = context();
+        for (raw, expected) in [
+            (r"\Self\Thing", "Self.Thing"),
+            (r"Parent\Thing", "N.Parent.Thing"),
+            (r"\Static\Thing", "Static.Thing"),
+            (r"namespace\Self\Thing", "N.Self.Thing"),
+            (r"\Self", "Self"),
+        ] {
+            assert_eq!(
+                resolve_php_type(raw, &ctx).as_deref(),
+                Some(expected),
+                "{raw}"
+            );
+        }
+        for raw in ["self", "STATIC", "Parent"] {
+            assert_eq!(resolve_php_type(raw, &ctx), None);
+        }
+    }
+
+    #[test]
+    fn import_grammar_and_activation_boundaries() {
+        let source = "<?php namespace N { use Vendor\\Thing; use function Vendor\\Pkg\\{run, stop as halt}; use const Vendor\\Pkg\\{FLAG, LIMIT as Cap}; class C {} }";
+        let tree = parse_php_tree(source).unwrap();
+        let root = tree.root_node();
+        let body = find(root, "namespace_definition")
+            .unwrap()
+            .child_by_field_name("body")
+            .unwrap();
+        let mut cursor = body.walk();
+        let declarations: Vec<_> = body
+            .named_children(&mut cursor)
+            .filter(|n| n.kind() == "namespace_use_declaration")
+            .collect();
+        assert_eq!(declarations.len(), 3);
+        for declaration in &declarations {
+            let syntax =
+                parse_php_import_syntax_bounded(*declaration, source, &mut || true).unwrap();
+            let bindings = php_use_bindings_from_node(*declaration, source, &mut || true).unwrap();
+            assert_eq!(syntax.imports.len(), bindings.len());
+            for (import, binding) in syntax.imports.iter().zip(bindings) {
+                assert_eq!(import.kind, binding.kind);
+                assert_eq!(
+                    &source[binding.binder_start..binding.binder_end],
+                    binding.local
+                );
+                assert_eq!(import.path_segments, binding.segments);
+                let map = match binding.kind {
+                    PhpUseKind::Type => &syntax.aliases.type_aliases,
+                    PhpUseKind::Function => &syntax.aliases.function_aliases,
+                    PhpUseKind::Const => &syntax.aliases.const_aliases,
+                };
+                assert_eq!(map.get(&binding.local), Some(&binding.segments.join(".")));
+            }
+            for byte in [
+                declaration.start_byte(),
+                declaration.start_byte() + 1,
+                declaration.end_byte() - 1,
+                declaration.end_byte(),
+            ] {
+                let ctx = php_file_context_from_tree_at(root, source, byte, || true).unwrap();
+                let completed = declarations.iter().filter(|n| n.end_byte() <= byte).count();
+                let actual = ctx.aliases.type_aliases.len()
+                    + ctx.aliases.function_aliases.len()
+                    + ctx.aliases.const_aliases.len();
+                assert_eq!(actual, [0, 1, 3, 5][completed], "byte {byte}");
+            }
+        }
+        let aliases = php_use_aliases_from_tree(root, source);
+        assert_eq!(aliases.type_aliases["Thing"], "Vendor.Thing");
+        assert_eq!(aliases.function_aliases["run"], "Vendor.Pkg.run");
+        assert_eq!(aliases.const_aliases["FLAG"], "Vendor.Pkg.FLAG");
+        assert_eq!(aliases.merged().len(), 5);
+        assert_eq!(aliases.merged()["Cap"], "Vendor.Pkg.LIMIT");
+        let ctx = PhpFileContext {
+            namespace: "N".into(),
+            aliases,
+        };
+        let candidates = resolve_php_function("missing", &ctx).unwrap();
+        for (indexed, expected) in [
+            (vec![], "N.missing"),
+            (vec!["missing"], "missing"),
+            (vec!["N.missing", "missing"], "N.missing"),
+        ] {
+            assert_eq!(
+                candidates.first_indexed(|name| indexed.contains(&name)),
+                expected
+            );
+        }
     }
 }

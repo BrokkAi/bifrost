@@ -117,7 +117,7 @@ impl<'a> JavaResolutionSession<'a> {
         }
     }
 
-    fn unbounded(support: &'a dyn BoundedDefinitionLookup) -> Self {
+    pub(crate) fn unbounded(support: &'a dyn BoundedDefinitionLookup) -> Self {
         Self::new(support, None, None)
     }
 

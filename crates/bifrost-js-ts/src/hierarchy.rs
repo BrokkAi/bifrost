@@ -12,12 +12,6 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 pub fn extract_js_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
-    if let Some(superclass) = declaration.child_by_field_name("superclass")
-        && let Some(text) = type_reference_text(superclass, source)
-    {
-        return vec![text];
-    }
-
     let name_id = declaration
         .child_by_field_name("name")
         .map(|name| name.id());
@@ -51,19 +45,20 @@ fn collect_ts_heritage_types(
     raw: &mut Vec<String>,
     seen: &mut HashSet<String>,
 ) {
-    if node.kind() == "class_body" || node.kind() == "object_type" {
-        return;
-    }
-    if matches!(
-        node.kind(),
-        "class_heritage" | "extends_type_clause" | "implements_clause"
-    ) {
-        collect_heritage_clause_types(node, source, raw, seen);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_ts_heritage_types(child, source, raw, seen);
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "class_body" || node.kind() == "object_type" {
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "class_heritage" | "extends_type_clause" | "implements_clause"
+        ) {
+            collect_heritage_clause_types(node, source, raw, seen);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(index).expect("named child in bounds"));
+        }
     }
 }
 
@@ -82,14 +77,9 @@ pub fn resolve_direct_ancestors(
     let mut ancestors = Vec::new();
     let mut seen = HashSet::default();
     for raw in raw_supertypes {
-        let Some(ancestor) = resolve_unique_type(
-            analyzer,
-            index,
-            language,
-            alias_resolver,
-            code_unit.source(),
-            raw,
-        ) else {
+        let Some(ancestor) =
+            resolve_unique_type(analyzer, index, language, alias_resolver, code_unit, raw)
+        else {
             continue;
         };
         if seen.insert(ancestor.clone()) {
@@ -169,26 +159,20 @@ fn collect_heritage_clause_types(
     }
 }
 
-fn type_reference_text(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier"
-        | "type_identifier"
-        | "property_identifier"
-        | "member_expression"
-        | "nested_type_identifier" => non_empty_node_text(node, source),
-        "generic_type" => {
-            first_named_child(node).and_then(|child| type_reference_text(child, source))
-        }
-        "type_query" => node
-            .child_by_field_name("name")
-            .and_then(|name| type_reference_text(name, source)),
-        _ => {
-            if node.named_child_count() == 1 {
-                first_named_child(node).and_then(|child| type_reference_text(child, source))
-            } else {
-                None
-            }
-        }
+fn type_reference_text(mut node: Node<'_>, source: &str) -> Option<String> {
+    loop {
+        node = match node.kind() {
+            "identifier"
+            | "type_identifier"
+            | "property_identifier"
+            | "member_expression"
+            | "nested_type_identifier" => return non_empty_node_text(node, source),
+            "generic_type" => node.child_by_field_name("name")?,
+            "extends_clause" => node.child_by_field_name("value")?,
+            "type_query" => node.child_by_field_name("name")?,
+            _ if node.named_child_count() == 1 => first_named_child(node)?,
+            _ => return None,
+        };
     }
 }
 
@@ -197,18 +181,62 @@ fn resolve_unique_type(
     index: &JsTsUsageIndex,
     language: Language,
     alias_resolver: &AliasResolver,
-    source_file: &ProjectFile,
+    owner: &CodeUnit,
     raw: &str,
 ) -> Option<CodeUnit> {
+    let source_file = owner.source();
+    // The persisted heritage spelling has a textual API, as do textual type
+    // annotations. Recover its grammar structure before selecting qualifiers.
+    let synthetic_source = format!("type __BifrostHeritage = {raw};");
+    let tree =
+        crate::syntax::parse_js_ts_tree(source_file, &synthetic_source, Language::TypeScript)?;
+    let mut node = tree
+        .root_node()
+        .named_child(0)?
+        .child_by_field_name("value")?;
+    let mut segments = Vec::new();
+    while let Some((module, name)) = crate::syntax::nested_type_identifier_parts(node) {
+        segments.push(crate::syntax::slice(name, &synthetic_source).to_string());
+        node = module;
+    }
+    if !matches!(node.kind(), "type_identifier" | "identifier") {
+        return None;
+    }
+    segments.push(crate::syntax::slice(node, &synthetic_source).to_string());
+    segments.reverse();
+
+    // The structured owner segments retain namespace nesting. Resolve the
+    // qualified spelling at the nearest owner before considering outer scopes.
+    let mut prefix: Vec<_> = owner
+        .fq()
+        .resolved_segments()
+        .map(|(name, _)| name)
+        .collect();
+    prefix.pop();
+    loop {
+        let qualified = prefix
+            .iter()
+            .copied()
+            .chain(segments.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(".");
+        let mut local = type_declarations_in_file(analyzer, source_file, &qualified);
+        dedupe_candidates(&mut local);
+        if !local.is_empty() {
+            return (local.len() == 1).then(|| local.pop().expect("one candidate"));
+        }
+        if prefix.pop().is_none() {
+            break;
+        }
+    }
     let mut candidates = Vec::new();
-    candidates.extend(type_declarations_in_file(analyzer, source_file, raw));
     candidates.extend(resolve_imported_type(
         analyzer,
         index,
         language,
         alias_resolver,
         source_file,
-        raw,
+        &segments,
     ));
     dedupe_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.pop().expect("one candidate"))
@@ -220,18 +248,22 @@ fn resolve_imported_type(
     language: Language,
     alias_resolver: &AliasResolver,
     source_file: &ProjectFile,
-    raw: &str,
+    segments: &[String],
 ) -> Vec<CodeUnit> {
-    let Some((local_name, namespace_export)) = raw.split_once('.') else {
+    let (local_name, tail) = segments
+        .split_first()
+        .expect("heritage has a root identifier");
+    if tail.is_empty() {
         return resolve_local_import_binding(
             analyzer,
             index,
             language,
             alias_resolver,
             source_file,
-            raw,
+            local_name,
         );
-    };
+    }
+    let namespace_export = tail.join(".");
 
     let mut candidates = Vec::new();
     for binding in index
@@ -245,7 +277,7 @@ fn resolve_imported_type(
             alias_resolver,
             source_file,
             &binding.module_specifier,
-            namespace_export,
+            &namespace_export,
         ));
     }
     sort_and_deduplicate_type_candidates(&mut candidates);
@@ -324,13 +356,50 @@ fn type_declarations_in_file(
     identifier: &str,
 ) -> Vec<CodeUnit> {
     analyzer
-        .top_level_declarations(file)
+        .declarations(file)
         .into_iter()
-        .filter(|candidate| candidate.is_class() && candidate.identifier() == identifier)
+        .filter(|candidate| candidate.is_class() && candidate.fq_name_str() == identifier)
         .collect()
 }
 
 fn dedupe_candidates(candidates: &mut Vec<CodeUnit>) {
     let mut seen = HashSet::default();
     candidates.retain(|candidate| seen.insert(candidate.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: extends type arguments hid the base expression"
+    )]
+    fn heritage_grammar_keeps_clause_order_and_body_boundaries() {
+        for (source, expected) in [
+            ("class C extends B implements I, J {}", vec!["B", "I", "J"]),
+            ("interface K extends I, J {}", vec!["I", "J"]),
+            (
+                "class Outer extends Base { method() { class Inner extends Other {} } }",
+                vec!["Base"],
+            ),
+            (
+                "class C extends ns.Base<A> implements N.I {}",
+                vec!["ns.Base", "N.I"],
+            ),
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let declaration = tree.root_node().named_child(0).unwrap();
+            assert_eq!(
+                extract_ts_supertypes(declaration, source),
+                expected,
+                "{source}"
+            );
+        }
+    }
 }

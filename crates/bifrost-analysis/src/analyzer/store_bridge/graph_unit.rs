@@ -226,6 +226,16 @@ pub(crate) fn stage_unit_reference_edges(
                     projection_cancelled = true;
                     return Ok(());
                 }
+                let binding_declarations = ready
+                    .lexical_source()
+                    .binding_declaration_projection_facts(batch, cancellation)?;
+                if cancellation.is_cancelled() {
+                    projection_cancelled = true;
+                    return Ok(());
+                }
+                projector
+                    .catalog_mut()
+                    .replace_binding_declarations(binding_declarations)?;
                 projector
                     .catalog_mut()
                     .replace_reference_facts(projection_facts);

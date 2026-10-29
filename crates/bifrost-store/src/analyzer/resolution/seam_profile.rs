@@ -300,6 +300,7 @@ seam_methods! {
     QualifySelectionPath => "qualify_selection_path", "SelectedTypedFactSource";
     RustCrateAccess => "rust_crate_access", "SelectedTypedFactSource";
     RustCrateSetAccess => "rust_crate_set_access", "SelectedTypedFactSource";
+    RustReceiverImplTargets => "rust_receiver_impl_targets", "SelectedTypedFactSource";
     RustTraitNameableAt => "rust_trait_nameable_at", "SelectedTypedFactSource";
     RustImplementedTraitsNameableAt => "rust_implemented_traits_nameable_at", "SelectedTypedFactSource";
     RustImplItemTraits => "rust_impl_item_traits", "SelectedTypedFactSource";
@@ -1840,6 +1841,19 @@ where
         outcome
     }
 
+    fn rust_receiver_impl_targets(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<SemanticId>> {
+        record_call(SeamMethod::RustReceiverImplTargets, 1);
+        let outcome = self.inner.rust_receiver_impl_targets(owner, cancellation);
+        if let Ok(targets) = &outcome {
+            record_rows(SeamMethod::RustReceiverImplTargets, targets.len());
+        }
+        outcome
+    }
+
     fn rust_implemented_traits_nameable_at(
         &self,
         owner: SemanticId,
@@ -2556,7 +2570,7 @@ mod tests {
         );
         // #5671: the root-inventory admission session is forwarded and counted too.
         assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 92, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 93, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -2585,7 +2599,7 @@ mod tests {
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
         // #5671: profile the root-inventory session accessor with the other methods.
-        assert_eq!(METHOD_COUNT, 127);
+        assert_eq!(METHOD_COUNT, 128);
     }
 
     #[cfg(test)]

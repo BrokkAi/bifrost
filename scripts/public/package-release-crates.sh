@@ -12,6 +12,10 @@ set -euo pipefail
 
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "$script_directory/../.." && pwd)"
+if [[ -d "$repository_root/crates/workspace-hack" ]]; then
+  exec node "$repository_root/scripts/public/with-release-workspace.mjs" \
+    bash scripts/public/package-release-crates.sh "$@"
+fi
 # shellcheck source=scripts/lib/release-crates.sh
 source "$script_directory/../lib/release-crates.sh"
 # shellcheck source=scripts/lib/fail.sh
@@ -58,6 +62,8 @@ for package in "${RELEASE_CRATES[@]}"; do
     die "$publish_metadata does not describe version $RELEASE_VERSION"
   jq -e '.deps | type == "array"' "$publish_metadata" >/dev/null ||
     die "$publish_metadata has no dependency array"
+  jq -e 'all(.deps[]; .name != "workspace-hack")' "$publish_metadata" >/dev/null ||
+    die "$publish_metadata retains the unpublished workspace-hack dependency"
 done
 
 echo "Packaged ${#RELEASE_CRATES[@]} release crates at version $RELEASE_VERSION into $dist_dir"

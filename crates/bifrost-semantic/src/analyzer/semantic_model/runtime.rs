@@ -287,6 +287,15 @@ pub struct SemanticModelActivationPhaseMeasurements {
     pub catalog_sql_statements: u64,
 }
 
+/// Measurements captured when the combined model and overlay budget is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SemanticModelOverlayBudgetExceeded {
+    pub loaded_records: usize,
+    pub models_retained_bytes: u64,
+    pub overlay_working_bytes: u64,
+    pub combined_budget_bytes: u64,
+}
+
 /// Cost and retained size of the declaration overlay paired with one active
 /// semantic-model publication.
 ///

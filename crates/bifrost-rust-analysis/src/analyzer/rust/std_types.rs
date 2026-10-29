@@ -803,46 +803,10 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
     /// declaration. Accept only the exact standard Result aliases that the
     /// resolver names; an arbitrary `io::Result` remains open.
     fn external_result_alias(&self, source: &RustSource, name: Node<'_>) -> bool {
-        let name_is_result = match name.kind() {
-            "scoped_type_identifier" => {
-                name.child_by_field_name("name")
-                    .and_then(|last| source.node_text(last))
-                    == Some("Result")
-            }
-            // An imported alias is represented by a bare type identifier. Its
-            // resolver claim, rather than its spelling, is the proof that it
-            // names one of the reviewed standard Result declarations.
-            "type_identifier" => true,
-            _ => false,
-        };
-        if !name_is_result {
-            return false;
-        }
-        let Some(outcome) = self.resolve(source, name) else {
-            return false;
-        };
-        outcome
-            .diagnostics
-            .iter()
-            .filter_map(|diagnostic| diagnostic.claim.as_ref())
-            .filter(|claim| {
-                matches!(
-                    claim.kind,
-                    UnindexedClaimKind::ResolvedExternal | UnindexedClaimKind::ExternalBoundary
-                )
-            })
-            .flat_map(|claim| claim.subjects.iter())
-            .any(|subject| {
-                matches!(
-                    subject.as_str(),
-                    "std::result::Result"
-                        | "core::result::Result"
-                        | "std::io::Result"
-                        | "std.result.Result"
-                        | "core.result.Result"
-                        | "std.io.Result"
-                )
-            })
+        self.resolve(source, name)
+            .as_ref()
+            .and_then(standard_wrapper_owner)
+            .is_some_and(|path| path.last().is_some_and(|name| name == "Result"))
     }
 
     fn workspace_return_kind(&self, unit: &CodeUnit, depth: usize) -> RustNativeReturnKind {
@@ -2028,7 +1992,9 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             if !outcome.definitions.is_empty() || outcome.lexical_definition.is_some() {
                 return None;
             }
-            if let Some(prelude) = prelude_item_of(&outcome, "type") {
+            if let Some(path) = standard_wrapper_owner(&outcome) {
+                path.join(".")
+            } else if let Some(prelude) = prelude_item_of(&outcome, "type") {
                 rust_std_type_fact(&prelude)?.path.join(".")
             } else {
                 let subjects = outcome
@@ -2462,6 +2428,70 @@ pub(crate) fn prelude_item_of(
     prelude_item_identity_of(outcome, namespace).map(|(_, name)| name)
 }
 
+/// Translate public selected evidence into the same wrapper identity proof the
+/// store evaluator uses. Splitting resolver identities here inspects values,
+/// never source syntax.
+pub(crate) fn standard_wrapper_owner(outcome: &DefinitionLookupOutcome) -> Option<Vec<String>> {
+    use super::SelectedTypeHeadEvidence;
+    if outcome.status != DefinitionLookupStatus::UnresolvableImportBoundary
+        || !outcome.definitions.is_empty()
+        || outcome.lexical_definition.is_some()
+    {
+        return None;
+    }
+    if let Some((root, name)) = prelude_item_identity_of(outcome, "type") {
+        let evidence = SelectedTypeHeadEvidence {
+            prelude_item: Some((&root, &name, "type")),
+            external_path: &[],
+        };
+        if crate::analyzer::rust::standard_wrapper_payload(&evidence).is_some() {
+            let fact = rust_std_type_fact(&name)?;
+            let mut path = fact
+                .path
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>();
+            path[0] = root;
+            return Some(path);
+        }
+    }
+    let mut subjects = outcome
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.claim.as_ref())
+        .filter(|claim| {
+            matches!(
+                claim.kind,
+                UnindexedClaimKind::ResolvedExternal | UnindexedClaimKind::ExternalBoundary
+            )
+        })
+        .flat_map(|claim| claim.subjects.iter())
+        .collect::<Vec<_>>();
+    subjects.sort_unstable();
+    subjects.dedup();
+    let mut owner = None;
+    for subject in subjects {
+        let path = if subject.contains("::") {
+            subject.split("::").map(str::to_owned).collect::<Vec<_>>()
+        } else {
+            subject.split('.').map(str::to_owned).collect::<Vec<_>>()
+        };
+        let evidence = SelectedTypeHeadEvidence {
+            prelude_item: None,
+            external_path: &path,
+        };
+        crate::analyzer::rust::standard_wrapper_payload(&evidence)?;
+        if let Some(selected) = &owner {
+            if selected != &path {
+                return None;
+            }
+        } else {
+            owner = Some(path);
+        }
+    }
+    owner
+}
+
 /// The selected prelude crate and item, preserving core/std route authority.
 pub(crate) fn prelude_item_identity_of(
     outcome: &DefinitionLookupOutcome,
@@ -2870,6 +2900,63 @@ mod tests {
     use crate::analyzer::rust::std_types::*;
 
     #[test]
+    fn standard_wrapper_owner_accepts_agreeing_external_claims() {
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+            ClaimSubjectRole, DefinitionLookupDiagnostic, UnindexedClaim,
+        };
+        let source =
+            "use std::io::Result as IoResult;\nfn fallible() -> IoResult<()> { todo!() }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let proof = RustTypeProof::new(fixture.analyzer.analyzer()).expect("Rust proof");
+        let source = proof.source(&file).expect("prepared source");
+        let callable = named_children(source.tree().root_node())
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .expect("fixture callable");
+        let head = callable
+            .child_by_field_name("return_type")
+            .expect("return type")
+            .child_by_field_name("type")
+            .expect("generic head");
+        let mut outcome = proof
+            .resolve(&source, head)
+            .expect("selected type-head lookup");
+        let expected = Some(vec!["std".into(), "io".into(), "Result".into()]);
+        assert_eq!(standard_wrapper_owner(&outcome), expected);
+        // The public lookup contract permits a resolved-external claim beside
+        // the native boundary claim, with either qualified-path rendering.
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "resolved_external".into(),
+            message: "selected external type".into(),
+            claim: Some(UnindexedClaim::resolved_external(
+                "std::io::Result",
+                ClaimSubjectRole::Type,
+            )),
+        });
+        assert_eq!(standard_wrapper_owner(&outcome), expected);
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "unindexed_import_boundary".into(),
+            message: "selected routes".into(),
+            claim: Some(UnindexedClaim::external_boundary_many(
+                ["std.io.Result", "std::io::Result"],
+                ClaimSubjectRole::Any,
+            )),
+        });
+        assert_eq!(standard_wrapper_owner(&outcome), expected);
+        outcome
+            .diagnostics
+            .last_mut()
+            .unwrap()
+            .claim
+            .as_mut()
+            .unwrap()
+            .subjects
+            .push("std.thread.Result".into());
+        assert_eq!(standard_wrapper_owner(&outcome), None);
+    }
+
+    #[test]
     fn nested_receiver_completion_preserves_values_and_unwinds() {
         for status in [
             DefinitionLookupStatus::Unavailable,
@@ -3130,31 +3217,43 @@ pub fn run() { let first = Item; let second = Item; }
             ]
         );
 
-        let method_start = source.find("arg(").expect("fixture contains arg");
-        let rust_source = RustTypeProof::new(fixture.analyzer.analyzer())
-            .expect("Rust type proof")
-            .source(&file)
-            .expect("prepared Rust source");
-        let file_evidence = ExternalCalleeFileEvidence::default();
-        let external_site = ExternalCalleeSite {
-            source: rust_source.text(),
-            tree: rust_source.tree(),
-            callee_start_byte: method_start,
-            file_evidence: &file_evidence,
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+            DefinitionLookupRequest, resolve_call_target_batch_with_source,
         };
-        let imported = crate::analyzer::rust::expand_rust_imported_external_callee(
+
+        let requests = source
+            .match_indices("arg(")
+            .map(|(method_start, _)| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(method_start),
+                end_byte: Some(method_start + 3),
+            })
+            .collect();
+        let outcomes = resolve_call_target_batch_with_source(
             fixture.analyzer.analyzer(),
-            &file,
-            "",
-            Some(&external_site),
-        )
-        .expect("imported receiver method reaches the external proof fallback");
-        let identity = imported
-            .external_callee_identity
-            .as_ref()
-            .expect("receiver fallback publishes the selected identity");
-        assert_eq!(identity.owner_fqn(), "std.process.Command");
-        assert_eq!(identity.member(), "arg");
+            scope.token(),
+            requests,
+            file,
+            Arc::from(source),
+            None,
+        );
+        assert_eq!(outcomes.len(), 3);
+        for outcome in outcomes {
+            assert!(
+                outcome.exact_external_call.is_some(),
+                "imported receiver method carries its resolver proof: {outcome:#?}"
+            );
+            let identity = outcome
+                .external_callee_identity
+                .as_ref()
+                .unwrap_or_else(|| {
+                    panic!("receiver resolver publishes the selected identity: {outcome:#?}")
+                });
+            assert_eq!(identity.owner_fqn(), "std.process.Command");
+            assert_eq!(identity.member(), "arg");
+        }
     }
 
     #[test]

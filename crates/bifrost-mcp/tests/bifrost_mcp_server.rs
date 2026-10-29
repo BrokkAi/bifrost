@@ -1516,9 +1516,18 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     );
     assert_eq!(attributed["result"]["isError"], false, "{attributed}");
     let attributed = &attributed["result"]["structuredContent"];
-    // Requested timings ride beside the report as `stage_timings`, plus one
-    // per-policy split inside each run's work (`evaluation.elapsed_ms`,
-    // #2893). With that metric removed the report is the unattributed run's.
+    // Requested timings ride beside the report as `stage_timings`, plus
+    // per-policy splits inside each run's work: `evaluation.elapsed_ms`
+    // (#2893) and, for a policy that ran unit by unit, its four disjoint
+    // `units.*_ms` phases. With those metrics removed the report is the
+    // unattributed run's.
+    const POLICY_TIMING_METRICS: [&str; 5] = [
+        "evaluation.elapsed_ms",
+        "units.lookup_replay_ms",
+        "units.prefetch_ms",
+        "units.recompute_ms",
+        "units.verify_ms",
+    ];
     let mut report_without_timings = attributed["report"].clone();
     let mut removed_timings = Vec::new();
     for (index, run) in report_without_timings["runs"]
@@ -1530,11 +1539,15 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
         let metrics = run["work"]["metrics"].as_array_mut().expect("work metrics");
         removed_timings.extend(
             metrics
-                .extract_if(.., |metric| metric["name"] == "evaluation.elapsed_ms")
-                .map(|metric| metric["unit"].clone()),
+                .extract_if(.., |metric| {
+                    POLICY_TIMING_METRICS
+                        .iter()
+                        .any(|name| metric["name"] == *name)
+                })
+                .map(|metric| (metric["name"].clone(), metric["unit"].clone())),
         );
-        // The metric's own bytes count toward the run's retained size, so
-        // that one field is larger than the baseline's by the metric's
+        // The metrics' own bytes count toward the run's retained size, so
+        // that one field is larger than the baseline's by the metrics'
         // serialized footprint.
         let baseline_bytes = expected_report["runs"][index]["work"]["retained_report_bytes"]
             .as_u64()
@@ -1548,7 +1561,14 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
         );
         run["work"]["retained_report_bytes"] = json!(baseline_bytes);
     }
-    assert_eq!(removed_timings, vec![json!("milliseconds")], "{attributed}");
+    assert_eq!(
+        removed_timings,
+        POLICY_TIMING_METRICS
+            .iter()
+            .map(|name| (json!(name), json!("milliseconds")))
+            .collect::<Vec<_>>(),
+        "{attributed}"
+    );
     assert_eq!(report_without_timings, expected_report, "{attributed}");
     assert_eq!(
         attributed["report"]["execution"]["stage_timings"],

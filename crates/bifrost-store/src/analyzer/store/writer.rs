@@ -1041,6 +1041,7 @@ mod tests {
         }));
     }
 
+    #[cfg(debug_assertions)]
     fn writer_entry_panics(writer: &StoreWriter) -> bool {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.execute(|_| ()))).is_err()
     }

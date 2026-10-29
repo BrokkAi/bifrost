@@ -6,7 +6,7 @@ use crate::analyzer::semantic::invalidation::DerivedArtifactId;
 
 use crate::analyzer::semantic::ids::StableDigest;
 
-use brokk_bifrost_core::analyzer::model::CodeUnit;
+use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType};
 
 use brokk_bifrost_core::analyzer::model::Language;
 
@@ -423,10 +423,12 @@ pub enum LookupQuestion {
         language: Option<Language>,
         name: Box<str>,
     },
-    /// One declaration, by the file it is declared in and its qualified name.
+    /// One declaration, by its file, qualified name, kind, and signature.
     Declaration {
         rel_path: Box<str>,
         fq_name: Box<str>,
+        kind: CodeUnitType,
+        signature: Option<String>,
     },
     /// One file.
     File { rel_path: Box<str> },
@@ -481,6 +483,8 @@ impl LookupQuestion {
         Self::Declaration {
             rel_path: Box::from(rel_path_string(unit.source()).as_str()),
             fq_name: Box::from(unit.fq_name().as_str()),
+            kind: unit.kind(),
+            signature: unit.signature().map(str::to_owned),
         }
     }
 
@@ -567,9 +571,22 @@ impl LookupQuestion {
                 }
                 hasher.field("name", name.as_bytes());
             }
-            Self::Declaration { rel_path, fq_name } => {
+            Self::Declaration {
+                rel_path,
+                fq_name,
+                kind,
+                signature,
+            } => {
                 hasher.field("rel_path", rel_path.as_bytes());
                 hasher.field("fq_name", fq_name.as_bytes());
+                hasher.field("decl_kind", kind.identity_label().as_bytes());
+                match signature {
+                    Some(signature) => {
+                        hasher.field("signature_present", &[1]);
+                        hasher.field("signature", signature.as_bytes());
+                    }
+                    None => hasher.field("signature_present", &[0]),
+                }
             }
             Self::File { rel_path } => hasher.field("rel_path", rel_path.as_bytes()),
             Self::CallSite {

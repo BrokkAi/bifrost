@@ -1,0 +1,24 @@
+SOURCE declare global { type Token = string; }
+Class [("Path", "surface.ts"), ("Type", "Token")] lookup=false signatures=["type Token = string"] labels=[] supers=[]
+SOURCE export type Token = string; namespace N {export type Config={}; export const Config=1;}
+Class [("Path", "surface.ts"), ("Type", "Token")] lookup=false signatures=["export type Token = string"] labels=[] supers=[]
+Class [("Type", "N"), ("Type", "Config")] lookup=false signatures=["export type Config={}"] labels=[] supers=[]
+Class [("Type", "N")] lookup=false signatures=["namespace N {"] labels=[] supers=[]
+Field [("Type", "N"), ("Member", "Config")] lookup=false signatures=["export const Config = 1"] labels=[] supers=[]
+export Some("Token") Local { local_name: "Token" }
+materialized Named "Token" target=None
+SOURCE export default { run() {}, key: 1 };
+Field [("Member", "default"), ("Member", "key")] lookup=false signatures=["key: 1"] labels=[] supers=[]
+Field [("Member", "default")] lookup=false signatures=["export default { run() {}, key: 1 }"] labels=[] supers=[]
+Function [("Member", "default"), ("Member", "run")] lookup=false signatures=["run() {}"] labels=[] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Member", "default")])
+SOURCE export default class extends Base {run(){return 1;}}
+Class [("Type", "default")] lookup=false signatures=["export default class extends Base {"] labels=[] supers=["Base"]
+Function [("Type", "default"), ("Member", "run")] lookup=false signatures=["run() { ... }"] labels=[([], false, false)] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Type", "default")])
+SOURCE export default (value: string)=>value;
+Function [("Member", "default")] lookup=false signatures=["export default (value: string) => { ... }"] labels=[(["value"], true, false)] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Member", "default")])

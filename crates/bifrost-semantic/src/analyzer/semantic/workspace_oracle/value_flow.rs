@@ -1050,6 +1050,83 @@ impl HandlerBindings {
 /// operand position. A value that only appears as the base of a memory row is
 /// deliberately absent: the adapters lower a base into an operand of its own
 /// before the access, so the operand position is the one that names it.
+/// A callable selected solely for its exact invocation does not publish its
+/// bound receiver at selection time. Assignment, capture, storage, argument
+/// passing, or any other use retains the ordinary capture publication.
+#[doc(hidden)]
+pub fn callable_selection_is_non_escaping(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    point: ProgramPointId,
+    index: usize,
+) -> bool {
+    let Some(event) = semantics
+        .point(point)
+        .and_then(|point| point.events.get(index))
+    else {
+        return false;
+    };
+    let SemanticEffect::CallableReference { result, .. } = event.effect else {
+        return false;
+    };
+    let calls = semantics
+        .call_sites()
+        .iter()
+        .filter(|call| call.callee == result)
+        .collect::<Vec<_>>();
+    if calls.is_empty() {
+        return false;
+    }
+    for call in &calls {
+        if call.receiver == Some(result)
+            || call
+                .arguments
+                .iter()
+                .any(|argument| argument.value == result)
+        {
+            return false;
+        }
+        let Some(evidence) = semantics.evidence_row(call.evidence) else {
+            return false;
+        };
+        if !evidence
+            .proof
+            .establishes_complete_evidence(&evidence.completeness)
+            || !semantics
+                .callable_selection_events(call.id)
+                .iter()
+                .any(|(selected, ordinal, _)| *selected == point && *ordinal == index)
+        {
+            return false;
+        }
+    }
+    let names = HashSet::from_iter([result]);
+    for candidate in semantics.points() {
+        for event in &candidate.events {
+            match &event.effect {
+                SemanticEffect::CallableReference { result: target, .. }
+                    if *target == result && candidate.id == point =>
+                {
+                    let Some(evidence) = semantics.evidence_row(event.evidence) else {
+                        return false;
+                    };
+                    if !evidence
+                        .proof
+                        .establishes_complete_evidence(&evidence.completeness)
+                    {
+                        return false;
+                    }
+                }
+                SemanticEffect::Invoke { call_site }
+                | SemanticEffect::CallContinuation { call_site, .. }
+                    if calls.iter().any(|call| call.id == *call_site) => {}
+                effect if super::heap::effect_names_any(semantics, effect, &names) => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 fn read_values(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
 ) -> impl Iterator<Item = (ProgramPointId, ValueId)> + '_ {
@@ -3370,6 +3447,7 @@ fn materialize_flow_snapshot(
     coverage: CandidateCoverage,
     limits: crate::analyzer::semantic::OracleLimits,
     discharged_gaps: Vec<crate::analyzer::semantic::SemanticGapId>,
+    member_receivers: Vec<crate::analyzer::semantic::MemberReceiverFlow>,
 ) -> Result<ValueFlowSnapshot, SemanticProviderError> {
     let records = drafts
         .iter()
@@ -3420,13 +3498,14 @@ fn materialize_flow_snapshot(
             })
         })
         .collect::<Result<Vec<_>, SemanticProviderError>>()?;
-    ValueFlowSnapshot::with_discharged_gaps(
+    ValueFlowSnapshot::with_member_receivers_and_discharged_gaps(
         procedure.clone(),
         context.clone(),
         relations,
         coverage,
         limits,
         discharged_gaps,
+        member_receivers,
     )
     .map_err(|error| internal_contract("invalid value-flow snapshot", error))
 }
@@ -3815,6 +3894,30 @@ pub struct LocalCallableTarget {
 /// `false`, which keeps the gap open or the store a weak update.
 #[doc(hidden)]
 pub trait RelationProjectionHost {
+    /// Select receiver semantics from the exact member declaration bound by
+    /// dispatch. Parse-time hosts abstain without inventing a method kind.
+    fn member_receiver_flow(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        _context: &OracleCallContext,
+        _place: Option<ValueFlowEndpoint>,
+        _request: &mut SemanticRequest<'_>,
+        limits: OracleLimits,
+    ) -> Result<SemanticOutcome<crate::analyzer::semantic::MemberReceiverFlow>, SemanticProviderError>
+    {
+        let value = crate::analyzer::semantic::MemberReceiverFlow::new(
+            call.clone(),
+            None,
+            Vec::new(),
+            limits,
+        )
+        .map_err(|error| internal_contract("invalid open member receiver", error))?;
+        Ok(SemanticOutcome::Complete {
+            value,
+            work: SemanticWork::default(),
+        })
+    }
+
     /// Runtime-value refinements for JS, TS and Python procedures.
     fn runtime_refinements(
         &self,
@@ -5297,6 +5400,161 @@ pub fn project_procedure_relations(
         }
     }
 
+    let mut member_receivers = Vec::new();
+    if interrupted.is_none() {
+        for call in procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter(|call| call.member_selection.is_some())
+        {
+            if let Err(stop) = staged.admit(SemanticWork {
+                call_sites: 1,
+                nested_entries: 1,
+                ..SemanticWork::default()
+            }) {
+                interrupted = Some(stop);
+                break;
+            }
+            let place = match call
+                .member_selection
+                .as_ref()
+                .and_then(|selection| selection.receiver_place.as_ref())
+            {
+                Some(crate::analyzer::semantic::SemanticPlace::MemoryLocation(location)) => {
+                    match resolve_access_path(
+                        *location,
+                        origins,
+                        limits.access_path_length(),
+                        request.cancellation,
+                        |id| {
+                            procedure
+                                .semantics()
+                                .memory_location(id)
+                                .map(|row| &row.kind)
+                        },
+                        exact_integer,
+                        |work| staged.admit(work),
+                    )? {
+                        AccessPathResolution::Resolved(path) => {
+                            let (location, summary) =
+                                materialize_abstract_location(procedure, path, limits)?;
+                            (!summary).then(|| ValueFlowEndpoint::Location(Box::new(location)))
+                        }
+                        AccessPathResolution::Interrupted(stop) => {
+                            interrupted = Some(stop);
+                            break;
+                        }
+                    }
+                }
+                Some(crate::analyzer::semantic::SemanticPlace::LocalBinding(expected)) => {
+                    if let Err(stop) = staged.admit(SemanticWork {
+                        values: procedure.semantics().values().len(),
+                        ..SemanticWork::default()
+                    }) {
+                        interrupted = Some(stop);
+                        break;
+                    }
+                    let mut values = procedure.semantics().values().iter().filter(|value| {
+                        if !matches!(
+                            value.kind,
+                            SemanticValueKind::Local
+                                | SemanticValueKind::Parameter { .. }
+                                | SemanticValueKind::Receiver { .. }
+                        ) {
+                            return false;
+                        }
+                        let actual = &procedure
+                            .semantics()
+                            .source_mapping(value.source)
+                            .expect("a value source exists")
+                            .locator;
+                        actual.mount() == expected.mount()
+                            && actual.path() == expected.path()
+                            && actual.language() == expected.language()
+                            && actual.declaration() == expected.declaration()
+                            && actual.anchor() == expected.anchor()
+                    });
+                    match (values.next(), values.next()) {
+                        (Some(value), None) => Some(ValueFlowEndpoint::for_value(value_handle(
+                            procedure, value.id,
+                        )?)),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            let call = procedure
+                .call_site_handle(call.id)
+                .expect("a projected call exists");
+            let outcome = host.member_receiver_flow(
+                &call,
+                context,
+                place,
+                &mut staged.request(request.cancellation),
+                limits,
+            )?;
+            staged.work = staged.work.conservative_add(outcome.work());
+            match outcome {
+                SemanticOutcome::Complete { value, .. } => {
+                    open |= !value.selection_is_complete();
+                    member_receivers.push(value);
+                }
+                SemanticOutcome::Cancelled { .. } => {
+                    interrupted = Some(Interruption::Cancelled);
+                    break;
+                }
+                SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                    interrupted = Some(Interruption::Budget(exceeded));
+                    break;
+                }
+                other => {
+                    open = true;
+                    if let Some(value) = other.available_value() {
+                        member_receivers.push(value.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Publish selected receiver dependencies in the ordinary relation arena,
+    // so every snapshot consumer observes the same call-side storage effects.
+    'receivers: for receiver in &member_receivers {
+        for transfer in receiver.transfers() {
+            if let Err(stop) = staged.admit(SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::default()
+            }) {
+                interrupted = Some(stop);
+                break 'receivers;
+            }
+            let call = procedure
+                .semantics()
+                .call_site(receiver.call().id())
+                .expect("a projected member call exists");
+            let draft = FlowRelationDraft {
+                payload: ValueFlowRelationPayload {
+                    point: transfer.point,
+                    event_index: transfer.event_index,
+                    kind: ValueFlowRelationKind::LanguageDefined,
+                    transfer: None,
+                    source: transfer.source,
+                    target: transfer.target,
+                    proof: transfer.proof,
+                    completeness: transfer.completeness,
+                    strong_update: false,
+                    direct_cell_overwrite: false,
+                },
+                memory_origin: None,
+                evidence: vec![evidence_handle(procedure, call.evidence)?],
+            };
+            if !push_flow_relation(&mut drafts, &mut retained_evidence, limits, draft) {
+                truncated = true;
+                break 'receivers;
+            }
+        }
+    }
     let has_unproven_relation = drafts.iter().any(|draft| {
         !matches!(draft.payload.proof, ProofStatus::Proven)
             || !matches!(draft.payload.completeness, EvidenceCompleteness::Complete)
@@ -5315,6 +5573,7 @@ pub fn project_procedure_relations(
         coverage,
         limits,
         discharged_gaps,
+        member_receivers,
     )?;
     if interrupted.is_none() && request.cancellation.is_cancelled() {
         interrupted = Some(Interruption::Cancelled);

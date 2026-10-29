@@ -2500,30 +2500,6 @@ pub(super) fn detach_reverse_sql_work_trace(connection: &rusqlite::Connection) {
     assert_eq!(status, rusqlite::ffi::SQLITE_OK);
 }
 
-/// Whether a callable reference's forward confirmation failed to decide what
-/// the call names, rather than deciding against the reverse target.
-///
-/// An empty forward target set disproves a candidate site only when the
-/// forward answer is complete. A receiver the route could not type -- a bare
-/// generic parameter, an inference failure -- is *more* uncertain than a
-/// receiver whose named type simply lacks the member, so its structurally
-/// matching site must stay unproven instead of being dropped as a complete
-/// negative; dropping it published a false "dead" for the target.
-///
-/// The receiver origin is what keeps this narrow. Crate-root rows nominate
-/// every structured component of a qualified route, and forward confirmation
-/// rejects the prefix components with an unowned gap that
-/// [`retain_owned_reverse_rejection`] exists to discard. Those components
-/// carry no callable receiver origin, so they stay disproved; only a site
-/// whose source syntax supplied a receiver -- and whose receiver the route
-/// could not resolve -- is retained.
-fn undecided_callable_receiver(answer: &FactResolutionAnswer) -> bool {
-    crate::analyzer::resolution::callable_receiver_is_incomplete(
-        answer.callable_receiver_origin(),
-        answer.binding().completion(),
-    )
-}
-
 fn retain_owned_reverse_rejection(
     selected: &SelectedResolutionOperation<'_, '_>,
     completion: ResolutionCompletion,
@@ -3725,9 +3701,7 @@ impl RustReverseQueries<'_, '_, '_> {
         if answer.binding().targets().contains(&definition) || binds_target_unit {
             answer_bound = true;
             binding = Some(candidate_binding);
-        } else if answer.binding().targets().is_empty()
-            && (candidate_binding.type_bound_receiver() || undecided_callable_receiver(&answer))
-        {
+        } else if crate::analyzer::resolution::undecided_callable_receiver(&answer) {
             let completion =
                 candidate_binding
                     .completion()
@@ -4733,8 +4707,13 @@ impl RustReverseQueries<'_, '_, '_> {
                     .iter()
                     .map(|(_, handle)| handle.clone())
                     .collect::<Vec<_>>();
-                let rejected =
-                    reverse::reverse_completion_for_obligations(&dependency_evidence, &handles);
+                let Some(rejected) = reverse::reverse_completion_for_obligations(
+                    &dependency_evidence,
+                    &handles,
+                    &mut || self.cancellation.is_cancelled(),
+                ) else {
+                    return Ok(SelectedRustReverseBatchOutcome::Cancelled);
+                };
                 debug_assert!(
                     original_rejection == ResolutionCompletion::Complete || !handles.is_empty()
                 );
@@ -5506,7 +5485,7 @@ mod tests {
                     &[
                         "SEARCH site USING PRIMARY KEY (blob_id=? AND site=?)",
                         "SEARCH obligation USING PRIMARY KEY (blob_id=? AND callee_reference=?)",
-                        "SEARCH gap USING COVERING INDEX resolution_rust_reverse_gap_candidates_site (blob_id=? AND site=?)",
+                        "SEARCH gap USING PRIMARY KEY (blob_id=? AND site=?)",
                     ][..],
                 ),
             ] {

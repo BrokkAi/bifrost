@@ -1,0 +1,13 @@
+# Test-only synthetic servlet declarations and rows; see LICENSE.
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sourceModel
+    data:
+      - ["javax.servlet", "ServletRequest", true, "getParameter", "(String)", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet", "ServletRequest", false, "missing", "()", "", "ReturnValue", "remote", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sinkModel
+    data:
+      - ["javax.servlet", "ServletResponse", false, "setContentType", "(String)", "", "Argument[0]", "response-splitting", "manual"]

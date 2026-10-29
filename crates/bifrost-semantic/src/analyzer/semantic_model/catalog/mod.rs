@@ -5,6 +5,9 @@ pub mod rows;
 pub mod statements;
 
 #[doc(hidden)]
+pub mod type_forwards;
+
+#[doc(hidden)]
 pub mod db;
 #[doc(hidden)]
 pub mod storage;
@@ -227,7 +230,22 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 // 62: schema-19 extraction authority and Rust implementation inventories.
 // #6898: C++ header-pack owner records are class-first instead of HashMap-order-dependent.
 // Grammar 0.24.6 changes unnamed enum-base trees (#6902).
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 64;
+// #7082: grammar 0.24.8 changes C/C++ external-header declarations (export-class
+// members, member attribute macros, member-pointer signatures) for unchanged headers.
+// #7188: PHP dependency projection classifies `__Construct` as a constructor for
+// unchanged packages.
+// Quicksilver round 9: the PHP dependency projection resolves types through
+// corrected alias and type helpers for unchanged packages.
+// #6704: Rust rustdoc member signatures preserve qualified associated projections
+// instead of wildcards.
+// #7204: generated Java descriptors keep complete variadic declaration families.
+// Quicksilver round 11: Go dependency projections retain corrected declaration
+// and import facts for unchanged source bytes, including decoded import names.
+// #7337: C# assembly packs certify callable families per owner and name and decode
+// pointer signatures for unchanged assemblies.
+// #7338: C# assembly packs record their own assembly identity and the type-forward
+// records of facades for unchanged assemblies.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 73;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -1572,7 +1590,7 @@ pub fn acquisition_request_satisfied(
             let row = connection
                 .query_row(
                     "SELECT gp.input_digest, gp.producer_name, gp.producer_version,
-                            gp.schema_version, gp.manifest_digest, p.manifest_bytes
+                            gp.schema_version, gp.manifest_digest
                      FROM catalog_generated_productions AS gp
                      JOIN catalog_packs AS p ON p.manifest_digest = gp.manifest_digest
                      JOIN catalog_sources AS source
@@ -1588,7 +1606,6 @@ pub fn acquisition_request_satisfied(
                             row.get::<_, String>(2)?,
                             row.get::<_, u32>(3)?,
                             row.get::<_, String>(4)?,
-                            row.get::<_, Vec<u8>>(5)?,
                         ))
                     },
                 )
@@ -1596,8 +1613,7 @@ pub fn acquisition_request_satisfied(
                 .map_err(|error| {
                     CatalogError::sqlite("lookup receipt generated production", error)
                 })?;
-            let Some((input, producer, producer_version, schema, digest, manifest_bytes)) = row
-            else {
+            let Some((input, producer, producer_version, schema, digest)) = row else {
                 return Ok(false);
             };
             let stored_key =
@@ -1606,6 +1622,10 @@ pub fn acquisition_request_satisfied(
                     Err(CatalogError::Integrity(_)) => return Ok(false),
                     Err(error) => return Err(error),
                 };
+            let Some(manifest_bytes) = read_available_manifest_on(root, connection, &digest)?
+            else {
+                return Ok(false);
+            };
             let manifest = match decode_manifest(&manifest_bytes, limits) {
                 Ok(manifest) => manifest,
                 Err(_) => return Ok(false),
@@ -1622,7 +1642,7 @@ pub fn acquisition_request_satisfied(
                 let manifest = match manifests
                     .entry(row.manifest_digest.clone())
                     .or_insert_with(|| {
-                        stored_manifest_bytes_on(connection, &row.manifest_digest)
+                        read_manifest_on(root, connection, &row.manifest_digest)
                             .ok()
                             .flatten()
                             .and_then(|bytes| decode_manifest(&bytes, limits).ok())
@@ -1667,18 +1687,48 @@ pub fn acquisition_request_satisfied(
 /// The catalog's own readers go through its decoded-manifest memo instead; this
 /// is for the receipt proof, which runs on a catalog transaction.
 #[doc(hidden)]
-pub fn stored_manifest_bytes_on(
+pub fn read_manifest_on(
+    root: &Path,
     connection: &Connection,
     manifest_digest: &str,
 ) -> Result<Option<Vec<u8>>, CatalogError> {
-    connection
+    let object = connection
         .query_row(
-            "SELECT manifest_bytes FROM catalog_packs WHERE manifest_digest = ?1",
+            "SELECT objects.relative_path, objects.stored_digest, objects.stored_size
+             FROM catalog_packs AS packs JOIN catalog_objects AS objects
+               ON objects.stored_digest = packs.manifest_object_digest
+             WHERE packs.manifest_digest = ?1",
             [manifest_digest],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
         )
         .optional()
-        .map_err(|error| CatalogError::sqlite("read stored manifest", error))
+        .map_err(|error| CatalogError::sqlite("read stored manifest object", error))?;
+    object
+        .map(|(path, digest, size)| storage::read(root, &path, &digest, size))
+        .transpose()
+}
+
+/// Read a manifest for an availability proof, treating missing or corrupt files as absent.
+#[doc(hidden)]
+pub fn read_available_manifest_on(
+    root: &Path,
+    connection: &Connection,
+    manifest_digest: &str,
+) -> Result<Option<Vec<u8>>, CatalogError> {
+    match read_manifest_on(root, connection, manifest_digest) {
+        Ok(bytes) => Ok(bytes),
+        Err(CatalogError::Integrity(_)) => Ok(None),
+        Err(CatalogError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[doc(hidden)]
@@ -1847,7 +1897,7 @@ pub fn reconcile_storage(root: &Path, connection: &mut Connection) -> Result<(),
 pub fn insert_manifest(
     transaction: &Transaction<'_>,
     manifest: &CompiledPackManifest,
-    bytes: &[u8],
+    object_digest: &str,
     now: i64,
 ) -> Result<bool, CatalogError> {
     let existed: bool = transaction
@@ -1880,7 +1930,7 @@ pub fn insert_manifest(
     transaction
         .execute(
             "INSERT INTO catalog_packs(
-               manifest_digest, semantic_digest, manifest_bytes, schema_version,
+               manifest_digest, semantic_digest, manifest_object_digest, schema_version,
                pack_id, pack_version, producer_name, producer_version,
                language, ecosystem, bifrost_compatibility, provenance_json,
                license, completeness, state, installed_at, verified_at, extraction_kind, extraction_input_kind, extraction_digest
@@ -1890,7 +1940,7 @@ pub fn insert_manifest(
              )
              ON CONFLICT(manifest_digest) DO UPDATE SET
                semantic_digest = excluded.semantic_digest,
-               manifest_bytes = excluded.manifest_bytes,
+               manifest_object_digest = excluded.manifest_object_digest,
                schema_version = excluded.schema_version,
                pack_id = excluded.pack_id,
                pack_version = excluded.pack_version,
@@ -1910,7 +1960,7 @@ pub fn insert_manifest(
             params![
                 &manifest.content_sha256,
                 &manifest.semantic_sha256,
-                bytes,
+                object_digest,
                 manifest.schema_version,
                 &manifest.pack_id,
                 &manifest.version,
@@ -2271,7 +2321,10 @@ pub fn insert_generated_production(
 #[doc(hidden)]
 pub fn insert_object(
     transaction: &Transaction<'_>,
-    descriptor: &CompiledShardDescriptor,
+    stored_digest: &str,
+    stored_size: u64,
+    raw_size: u64,
+    encoding: ArtifactEncoding,
     relative_path: &Path,
     now: i64,
 ) -> Result<(), CatalogError> {
@@ -2287,11 +2340,11 @@ pub fn insert_object(
                encoding = excluded.encoding,
                verified_at = excluded.verified_at",
             params![
-                &descriptor.stored_sha256,
+                stored_digest,
                 relative_path.to_string_lossy(),
-                descriptor.stored_size,
-                descriptor.raw_size,
-                encoding_name(descriptor.encoding),
+                stored_size,
+                raw_size,
+                encoding_name(encoding),
                 now
             ],
         )
@@ -2769,6 +2822,14 @@ pub fn open_session_semantic_catalog_in(
             db::SEMANTIC_PAYLOAD_FAMILIES_SQL
         ))
         .map_err(|error| CatalogError::sqlite("create session semantic record rows", error))?;
+    connection
+        .execute_batch(
+            db::ASSEMBLY_TYPE_FORWARDS_SQL
+                .split_once("-- Session assembly-forward rows.\n")
+                .expect("migration has its session-row boundary")
+                .1,
+        )
+        .map_err(|error| CatalogError::sqlite("create session assembly forward rows", error))?;
     connection
         .execute_batch(db::EXACT_GO_SOURCE_ROWS_SQL)
         .map_err(|error| CatalogError::sqlite("create session exact Go source rows", error))?;
@@ -3614,23 +3675,37 @@ mod extraction_storage_tests {
         // (#4604), and production passes canonical paths.
         let root = std::fs::canonicalize(directory.path()).unwrap();
         let mut connection = db::open(&root, CatalogOpenMode::ReadWrite).unwrap();
+        storage::prepare_root(&root).unwrap();
         let transaction = connection.transaction().unwrap();
-        insert_manifest(
+        let digest = crate::analyzer::semantic_model::csmi::sha256_hex(&compiled.manifest_bytes);
+        let (path, _) = storage::publish(&root, &digest, &compiled.manifest_bytes).unwrap();
+        let size = compiled.manifest_bytes.len() as u64;
+        insert_object(
             &transaction,
-            &compiled.manifest,
-            &compiled.manifest_bytes,
+            &digest,
+            size,
+            size,
+            ArtifactEncoding::Raw,
+            &path,
             1,
         )
         .unwrap();
+        insert_manifest(&transaction, &compiled.manifest, &digest, 1).unwrap();
         transaction.commit().unwrap();
-        let row: (String, String, String, Vec<u8>) = connection.query_row(
-            "SELECT extraction_kind, extraction_input_kind, extraction_digest, manifest_bytes FROM catalog_packs",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        let row: (String, String, String) = connection.query_row(
+            "SELECT extraction_kind, extraction_input_kind, extraction_digest FROM catalog_packs",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
         assert_eq!(
             (&*row.0, &*row.1, &*row.2),
             ("java_class_jar", "single", &*"a".repeat(64))
         );
-        let manifest = decode_manifest(&row.3, &DecodeLimits::default()).unwrap();
+        let manifest = decode_manifest(
+            &read_manifest_on(&root, &connection, &compiled.manifest.content_sha256)
+                .unwrap()
+                .unwrap(),
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         let shard = crate::analyzer::semantic_model::artifact::hydrate_certified_shard(
             &manifest,
             &compiled.shards[0].descriptor,

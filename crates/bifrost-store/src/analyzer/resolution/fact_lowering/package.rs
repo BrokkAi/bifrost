@@ -322,6 +322,8 @@ pub fn namespaces(
     reference_namespace: ResolutionNamespace,
 ) -> &'static [ResolutionNamespace] {
     match (language, reference_namespace) {
+        // ECMA-334 14.7 and 12.8.4: namespace members are types, never values.
+        (Language::CSharp, _) => &[ResolutionNamespace::Type],
         (Language::Java, ResolutionNamespace::TypeOrValue) => {
             &[ResolutionNamespace::Value, ResolutionNamespace::Type]
         }
@@ -487,7 +489,10 @@ fn package_precedence(
             assert_eq!(ordinal, 0);
             go_spelling_precedence(identities, scope, None, 0)
         }
-        Language::Java => {
+        // ECMA-334 7.8: namespace members are considered after enclosing
+        // lexical declarations. Namespace-level origin ranks are selected
+        // context rules, separate from this package-route lowering tier.
+        Language::CSharp | Language::Java => {
             vec![identities.register_precedence_namespace(
                 PrecedenceStep {
                     tier: PrecedenceTier::PackageOrModule,

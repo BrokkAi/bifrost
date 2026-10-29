@@ -489,6 +489,7 @@ pub(crate) mod tests {
             types,
             members,
             relations,
+            ..
         } = &mut pack.shards[0].payload
         else {
             panic!("declaration fixture has no declaration facts");
@@ -1870,6 +1871,7 @@ pub(crate) mod tests {
             types,
             members: _,
             relations,
+            ..
         } = &mut pack.shards[0].payload
         else {
             panic!("declaration fixture has no declaration facts");

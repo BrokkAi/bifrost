@@ -1,0 +1,32 @@
+# Test-only synthetic Models-as-Data rows covering M7 mappings, not product content.
+# CodeQL format and representative Runtime.exec model: github/codeql ae741615f3 (MIT).
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sinkModel
+    data:
+      - ["java.lang", "String", false, "concat", "(String)", "", "Argument[0]", "test-mapping", "manual"]
+      - ["java.lang", "String", false, "concat", "(String)", "", "Argument[0]", "sql-injection", "generated"]
+      - ["java.lang", "String", false, "join", "", "", "Argument[0..1]", "test-mapping", "manual"]
+      - ["java.lang", "Iterable", true, "iterator", "()", "", "Argument[this]", "test-mapping", "manual"]
+      - ["java.lang", "Runtime", false, "exec", "(String[])", "", "Argument[0].ArrayElement", "command-injection", "manual"]
+      - ["java.lang", "ProcessBuilder", false, "ProcessBuilder", "(String[])", "", "Argument[0]", "path-injection", "manual"]
+      - ["java.lang", "ProcessBuilder", false, "ProcessBuilder", "(String[])", "", "Argument[0]", "path-injection[read]", "manual"]
+      - ["java.lang", "String", false, "concat", "(String)", "", "Argument[0]", "regex-use[0]", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sourceModel
+    data:
+      - ["java.lang", "String", false, "getBytes", "()", "", "ReturnValue", "remote", "manual"]
+      - ["java.lang", "String", false, "concat", "(String)", "", "Argument[0]", "file", "manual"]
+      - ["java.lang", "String", false, "concat", "(String)", "", "Parameter[0]", "remote", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: barrierModel
+    data:
+      - ["java.lang", "String", false, "concat", "(String)", "", "ReturnValue", "command-injection", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: barrierGuardModel
+    data:
+      - ["java.lang", "String", false, "isEmpty", "()", "", "Argument[this]", true, "command-injection", "manual"]

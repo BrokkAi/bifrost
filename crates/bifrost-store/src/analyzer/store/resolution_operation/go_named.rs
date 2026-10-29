@@ -1,6 +1,7 @@
 //! File-local Go import bindings from selected source and package authority.
 
 use super::go_context::{GoContextSelection, GoDotImportContext, GoPackageInventoryState};
+use super::placement_access::read_placement_rows;
 use super::*;
 use crate::analyzer::resolution::{
     LoweredGoPackageImport, SelectedGoImportBindingDescriptor, SharedNameInterner,
@@ -151,12 +152,60 @@ pub(crate) struct GoPreparedImportContextSnapshot {
     shared_names: HashMap<SemanticId, [u8; 32]>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl SelectedResolutionOperation<'_, '_> {
+    /// Exercise the request-only mint boundary before preparing another file.
+    #[doc(hidden)]
+    pub fn mint_go_external_owner_for_test(&self) -> SemanticId {
+        use crate::analyzer::resolution::{ExternalOwnerIdentity, ExternalOwnerLanguage};
+        let identities = &self.ready.context_identities;
+        let identity = identities.external_owner_semantic_for_language(
+            ExternalOwnerLanguage::Go,
+            &ExternalOwnerIdentity {
+                provider_id: Arc::from("test-model-provider"),
+                owner_fqn: Arc::from("example.test/model.Owner"),
+            },
+            &self.ready.shared_names(),
+        );
+        identities.record_jvm_external_provider_type_identity(
+            ExternalOwnerLanguage::Go,
+            identity,
+            identity,
+            identity,
+            identity,
+        );
+        assert!(!identities.is_jvm_external_type_identity(identity));
+        assert_eq!(
+            identities.jvm_external_provider_type_identity_for_reference(
+                ExternalOwnerLanguage::Jvm,
+                identity
+            ),
+            None
+        );
+        assert_eq!(
+            identities.jvm_external_provider_type_identity_for_reference(
+                ExternalOwnerLanguage::Go,
+                identity
+            ),
+            Some(identity)
+        );
+        identity
+    }
+}
+
 impl GoPreparedImportContext {
+    /// Allowed snapshot identities are bridges in unindexed_go_imports and
+    /// their canonical numbers/named reasons. GoPreparedContextCacheKey covers
+    /// their routing digest, publication identity, caller file/role, derivation
+    /// version and active model-set hash. They travel through cache_snapshot,
+    /// insert_go_prepared_context and restored_for_request under that key.
+    /// Request-minted model owners, members and slots cannot travel this route.
     fn cache_snapshot(
         &self,
         source: &dyn BatchResolutionFragmentSource,
         cancellation: &CancellationToken,
     ) -> Result<Option<GoPreparedImportContextSnapshot>> {
+        self.context.identity_space().assert_go_snapshot_safe();
         let identities = self.context.identity_space().isolated_clone();
         let mut context = self.context.clone().with_identity_space(identities);
         let mut shared_names = HashMap::default();
@@ -187,6 +236,10 @@ impl GoPreparedImportContextSnapshot {
         identities: &SelectedContextIdentities,
         names: &dyn SharedNameInterner,
     ) -> Result<GoPreparedImportContext> {
+        self.prepared
+            .context
+            .identity_space()
+            .assert_go_snapshot_safe();
         let mut context = self.prepared.context.clone();
         context.remap_shared_names(|identity| {
             let digest = self
@@ -348,6 +401,11 @@ CROSS JOIN main.go_package_instances package
   ON package.context_id=caller.context_id AND package.package_id=caller.package_id
 WHERE caller.context_id=?1 AND caller.file_version_id=?2
  AND ((caller.source_role='go' AND package.for_test='')
+   OR (caller.source_role='ignored' AND package.for_test='' AND NOT EXISTS (
+       SELECT 1 FROM main.go_package_files participating
+       WHERE participating.package_id=caller.package_id
+         AND participating.rel_path=caller.rel_path AND participating.source_role<>'ignored'
+   ))
    OR (caller.source_role IN ('test','xtest') AND package.for_test<>'')
    OR (caller.source_role='test' AND package.for_test='' AND package.complete=0
        AND NOT EXISTS(
@@ -413,7 +471,12 @@ pub static GO_FILE_IMPORT_ROWS: std::sync::LazyLock<String> = std::sync::LazyLoc
         r#"
 SELECT requested.value ->> 0, imports.source_spelling, imports.complete,
        json(imports.gaps), NULLIF(target.package_name,''), target.package_id,
-       mounted.semantic_language, requested.value ->> 1, requested.value ->> 2
+       mounted.semantic_language, requested.value ->> 1, requested.value ->> 2,
+       EXISTS(SELECT 1 FROM temp.selected_go_context_source_files provider
+              WHERE provider.context_id=target.context_id
+                AND provider.package_id=target.package_id
+                AND (provider.source_role='go'
+                     OR (provider.source_role='test' AND target.for_test<>'')))
 FROM json_each(?2) requested
 CROSS JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=requested.value ->> 0
 CROSS JOIN ({}) caller
@@ -476,6 +539,8 @@ pub(super) struct GoFileImportRow {
     /// Retained as provider evidence even when its package clause is unknown.
     pub(super) package_id: Option<i64>,
     pub(super) modeled_provider: Option<GoSelectedExternalImport>,
+    /// Selected package files can supply native member declarations.
+    pub(super) has_source_declarations: bool,
 }
 
 /// Syntax inputs of one mounted Go file. Neither bindings nor dot aliases
@@ -534,6 +599,11 @@ pub struct GoImportInputCache {
 
 #[cfg(any(test, feature = "test-support"))]
 impl GoImportInputCache {
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.mounts.len()
+    }
+
     #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
         self.mounts.is_empty()
@@ -793,14 +863,20 @@ impl SelectedResolutionOperation<'_, '_> {
         else {
             return Ok(None);
         };
-        let mut statement = connection.prepare_cached(&CALLER_SOURCE_ROLE)?;
-        let mut rows = statement.query(rusqlite::params![context_id, version])?;
+        let roles = read_placement_rows(
+            &self.ready.inventory,
+            CALLER_SOURCE_ROLE.as_str(),
+            rusqlite::params![context_id, version],
+            |row: &rusqlite::Row<'_>| {
+                let role: String = row.get(0)?;
+                Ok(role)
+            },
+        )?;
         let mut source_role = None;
-        while let Some(row) = rows.next()? {
+        for role in roles {
             if cancellation.is_cancelled() {
                 return Ok(None);
             }
-            let role: String = row.get(0)?;
             if source_role
                 .as_ref()
                 .is_some_and(|previous| previous != &role)
@@ -809,8 +885,6 @@ impl SelectedResolutionOperation<'_, '_> {
             }
             source_role = Some(role);
         }
-        drop(rows);
-        drop(statement);
         Ok(source_role)
     }
 
@@ -1295,6 +1369,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         package_name,
                         package_id,
                         modeled_provider,
+                        has_source_declarations: row.get(9)?,
                     },
                 );
         }
@@ -1500,11 +1575,13 @@ impl SelectedResolutionOperation<'_, '_> {
                 .semantic(&names),
                 import_completion,
             );
-            bindings.push(if presumed {
-                binding.with_presumed_provider(spelling.into(), package_id)
-            } else {
-                binding
-            });
+            bindings.push(
+                if !selected.is_some_and(|row| row.has_source_declarations) {
+                    binding.with_unindexed_provider(spelling.into(), package_id)
+                } else {
+                    binding
+                },
+            );
         }
         let mounts = self.mount_table();
         let Some(context) = context.extend_go_import_bindings(
@@ -1904,5 +1981,92 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
         }
         heap.map(&self.prepared.package_inventory.fragments);
         heap.total()
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::analyzer::resolution::local_identity::PerRequestSharedNames;
+    use crate::analyzer::resolution::{ExternalOwnerIdentity, ExternalOwnerLanguage};
+    use crate::analyzer::semantic_model::{ModelProvider, ModelSymbolRef};
+
+    fn snapshot(identities: SelectedContextIdentities) -> GoPreparedImportContextSnapshot {
+        GoPreparedImportContextSnapshot {
+            prepared: GoPreparedImportContext {
+                context: SelectedResolutionContextSet::new(identities, Vec::new(), 0, &|_| {
+                    Ok(None)
+                })
+                .unwrap(),
+                demand: GoDemandContext {
+                    context_id: 1,
+                    import_packages: HashMap::default(),
+                    context_completions: HashMap::default(),
+                    modeled_imports: HashMap::default(),
+                },
+                package_inventory: GoPackageInventoryState::default(),
+                blueprint: None,
+            },
+            shared_names: HashMap::default(),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "external owners cannot enter a prepared-context snapshot")]
+    fn prepared_context_snapshot_rejects_go_external_owner() {
+        let names = PerRequestSharedNames::new();
+        let identities = SelectedContextIdentities::new();
+        identities.external_owner_semantic_for_language(
+            ExternalOwnerLanguage::Go,
+            &ExternalOwnerIdentity {
+                provider_id: Arc::from("test-provider"),
+                owner_fqn: Arc::from("example.test/Owner"),
+            },
+            &names,
+        );
+        let _prepared =
+            snapshot(identities).restored_for_request(&SelectedContextIdentities::new(), &names);
+    }
+
+    /// A kind outside the Go allow-list, here a JVM owner, is refused in
+    /// release builds too, not only by a debug assertion.
+    #[test]
+    #[should_panic(expected = "external owners cannot enter a prepared-context snapshot")]
+    fn prepared_context_snapshot_rejects_identity_outside_go_allow_list() {
+        let names = PerRequestSharedNames::new();
+        let identities = SelectedContextIdentities::new();
+        identities.external_owner_semantic_for_language(
+            ExternalOwnerLanguage::Jvm,
+            &ExternalOwnerIdentity {
+                provider_id: Arc::from("test-provider"),
+                owner_fqn: Arc::from("example.Owner"),
+            },
+            &names,
+        );
+        let _prepared =
+            snapshot(identities).restored_for_request(&SelectedContextIdentities::new(), &names);
+    }
+
+    #[test]
+    #[should_panic(expected = "model member tokens cannot enter a prepared-context snapshot")]
+    fn prepared_context_snapshot_rejects_model_member_token() {
+        let names = PerRequestSharedNames::new();
+        let identities = SelectedContextIdentities::new();
+        let member = ModelSymbolRef {
+            symbol_id: "owner.method".into(),
+            provider: ModelProvider {
+                pack_id: "test-pack".into(),
+                pack_version: "1".into(),
+                pack_digest: "digest".into(),
+            },
+        };
+        let token = identities.model_member_semantic(&member, &names);
+        assert_eq!(identities.model_member_identity(token), Some(member));
+        let isolated = identities.isolated_clone();
+        let restored = SelectedContextIdentities::new();
+        restored.copy_from_empty(&isolated);
+        assert!(!restored.is_empty());
+        let _prepared =
+            snapshot(restored).restored_for_request(&SelectedContextIdentities::new(), &names);
     }
 }

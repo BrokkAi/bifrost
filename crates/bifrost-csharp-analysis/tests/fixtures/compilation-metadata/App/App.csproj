@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><AssemblyName>Product.Assembly</AssemblyName></PropertyGroup>
+  <ItemGroup>
+    <Using Include="System.Numerics" />
+    <Using Remove="System.Net.Http" />
+    <Using Include="System.Math" Static="true" />
+    <Using Include="System.Environment" Alias="Env" />
+    <InternalsVisibleTo Include="Friend.Assembly" />
+  </ItemGroup>
+</Project>

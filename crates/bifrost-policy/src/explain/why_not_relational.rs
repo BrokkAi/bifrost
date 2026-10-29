@@ -169,6 +169,7 @@ pub(super) fn explain_relational_candidate(
             let detailed = if let Some(workspace) = context.workspace {
                 execute_code_query_detailed_eager_index_workspace(
                     workspace,
+                    context.flow_resources(),
                     &query,
                     budget.query_limits(),
                     context.cancellation,
@@ -176,6 +177,7 @@ pub(super) fn explain_relational_candidate(
             } else {
                 execute_code_query_detailed_eager_index(
                     context.analyzer,
+                    context.flow_resources(),
                     &query,
                     budget.query_limits(),
                     context.cancellation,

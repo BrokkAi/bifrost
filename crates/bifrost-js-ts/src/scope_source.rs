@@ -455,3 +455,48 @@ fn interface_and_namespace_use_structured_scope() {
             .any(|(name, is_program)| name == "Item" && !*is_program)
     );
 }
+
+#[test]
+fn declaration_binder_grammar_preserves_exact_names_and_scopes() {
+    for (source, kind, name, program) in [
+        ("type A = string;", "type_alias_declaration", "A", true),
+        ("interface I {}", "interface_declaration", "I", true),
+        ("class C {}", "class_declaration", "C", true),
+        ("namespace N {}", "internal_module", "N", true),
+        (
+            "namespace N { type A = string; }",
+            "type_alias_declaration",
+            "A",
+            false,
+        ),
+    ] {
+        assert!(
+            declaration_bindings_for(source, kind).contains(&(name.to_string(), program)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn catch_parameter_grammar_has_distinct_binding_scope_segments() {
+    let source =
+        "let error; try {} catch (error) { let first; } try {} catch (error) { let second; }";
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let scopes = JsTsDeclarationScopeIndex::new(tree.root_node(), source);
+    let mut stack = vec![tree.root_node()];
+    let mut segments = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.kind() == "catch_clause" {
+            let parameter = node.child_by_field_name("parameter").unwrap();
+            assert_eq!(parameter.utf8_text(source.as_bytes()).unwrap(), "error");
+            segments.push(scopes.scope_segment(node).expect("catch binding scope"));
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    assert_eq!(segments.len(), 2);
+    assert_ne!(segments[0], segments[1]);
+}

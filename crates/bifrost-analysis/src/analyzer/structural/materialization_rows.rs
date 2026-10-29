@@ -534,3 +534,60 @@ fn completeness(
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialization_sites_rejoin_the_extracted_grammar_node() {
+        use crate::analyzer::structural::extract::extract_file_facts;
+        use crate::analyzer::usages::get_definition::parse_tree_for_language;
+        use brokk_bifrost_core::analyzer::usages::reference_site::node_range;
+        let dir = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(dir.path(), "accessors.rb");
+        let source = "class Widget\n attr_accessor :name\n alias_method :label, :name\nend\n";
+        let tree = parse_tree_for_language(&file, Language::Ruby, source).unwrap();
+        let facts = extract_file_facts(
+            structural_spec_for(Language::Ruby).unwrap(),
+            &tree_sitter_ruby::LANGUAGE.into(),
+            source,
+        )
+        .unwrap();
+        let facts =
+            FileFacts::from_persisted_rows(source.to_string(), facts.persisted_rows().unwrap())
+                .unwrap();
+        let content = ContentIdentity::hash_bytes(source.as_bytes());
+        let mut stack = vec![tree.root_node()];
+        let mut sites = Vec::new();
+        let mut calls = 0;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call" {
+                let range = Range {
+                    start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + 1,
+                    ..node_range(node)
+                };
+                assert!(range.start_byte < range.end_byte);
+                let row = site_row(
+                    &mut sites,
+                    &file,
+                    content,
+                    &facts,
+                    range,
+                    GenerationKind::AccessorMacro,
+                );
+                let id = row
+                    .node
+                    .expect("materialization must correlate to the extracted call");
+                assert_eq!(facts.node(id).range, range);
+                assert_eq!(row.ast_id(), Some(ast_id(content, id)));
+                calls += 1;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(calls, 2);
+        assert_eq!(sites.len(), 2);
+    }
+}

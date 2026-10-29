@@ -168,17 +168,15 @@ fn populate_lexical_captures<'tree>(
     use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
 
     use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus;
-    use brokk_bifrost_jvm::java::structural::java_pattern_binding_name;
+    use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus_with_visibility;
 
     if !specs.iter().any(|spec| spec.kind == ProcedureKind::Lambda) {
         return Ok(());
     }
     let mut bindings = HashMap::default();
-    let mut pattern_names = Vec::new();
     let mut writes = Vec::new();
     for spec in specs.iter() {
         charge_capture_inventory(inventory, cancellation)?;
-        let mut names = HashSet::default();
         for (slot, node) in
             formal_parameter_slots_for_owner_with_nodes(Language::Java, spec.callable, source)
                 .unwrap_or_default()
@@ -212,9 +210,6 @@ fn populate_lexical_captures<'tree>(
             if matches!(node.kind(), "assignment_expression" | "update_expression") {
                 writes.push((spec.id, node));
             }
-            if let Some(name) = java_pattern_binding_name(node) {
-                names.insert(node_text(source, name).expect("pattern binder is source-backed"));
-            }
             if let Some(binding) = java_local_binding(node) {
                 bindings.insert(
                     (binding.name.start_byte(), binding.name.end_byte()),
@@ -223,7 +218,6 @@ fn populate_lexical_captures<'tree>(
             }
             Ok(WalkControl::Continue)
         })?;
-        pattern_names.push(names);
     }
 
     let mut binding_writes = HashMap::<(usize, usize), Vec<(ProcedureId, Node<'tree>)>>::default();
@@ -342,29 +336,19 @@ fn populate_lexical_captures<'tree>(
             let Some(name) = node_text(source, node) else {
                 continue;
             };
-            // The common lexical resolver deliberately omits Java pattern
-            // binders. Do not accidentally bind such a name to an outer local.
-            let mut ancestor = Some(spec.id);
-            let mut pattern_open = false;
-            while let Some(id) = ancestor {
-                charge_capture_inventory(inventory, cancellation)?;
-                if pattern_names[id.index()].contains(name) {
-                    pattern_open = true;
-                }
-                ancestor = specs[id.index()].lexical_parent;
-            }
-            if pattern_open {
-                incomplete[spec.id.index()] = true;
-                continue;
-            }
-            let Some(resolution) = resolve_lexical_binding_from_focus(
+            let resolution = match resolve_lexical_binding_from_focus_with_visibility(
                 Language::Java,
                 node,
                 source,
                 node.start_byte(),
                 name,
-            ) else {
-                continue;
+            ) {
+                Ok(Some(resolution)) => resolution,
+                Ok(None) => continue,
+                Err(_) => {
+                    incomplete[spec.id.index()] = true;
+                    continue;
+                }
             };
             let definition = match resolution {
                 LexicalBindingResolution::Parameter(definition)
@@ -378,6 +362,13 @@ fn populate_lexical_captures<'tree>(
                 incomplete[spec.id.index()] = true;
                 continue;
             };
+            if brokk_bifrost_jvm::java::structural::java_pattern_binding_name(binding.declaration)
+                .is_some()
+                && !java_pattern_has_value(binding.declaration)
+            {
+                incomplete[spec.id.index()] = true;
+                continue;
+            }
             if owner == spec.id {
                 continue;
             }

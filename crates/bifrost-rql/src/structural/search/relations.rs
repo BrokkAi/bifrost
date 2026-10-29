@@ -2,6 +2,7 @@ use super::super::matcher::{
     CallableSignatureFacts, CallableSignatureOracle, DeclarationOwnerOracle,
 };
 use super::*;
+use crate::analyzer::DeclarationKind;
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -247,9 +248,16 @@ fn call_site_identity_facts(
         None => resolve_definition_batch_with_source(analyzer, requests, site.file.clone(), source),
     };
     for (index, outcome) in request_indices.into_iter().zip(outcomes) {
-        facts.argument_identities[index] = outcome
-            .lexical_definition
-            .map(|definition| lexical_identity(&site.file, definition.declaration_range));
+        facts.argument_identities[index] = outcome.lexical_definition.map(|definition| {
+            // A deconstruction pattern can declare several names in one
+            // declaration range. Its individual binders have distinct IDs.
+            let range = if definition.kind == DeclarationKind::PatternVariable {
+                definition.name_range
+            } else {
+                definition.declaration_range
+            };
+            lexical_identity(&site.file, range)
+        });
     }
     facts
 }
@@ -286,14 +294,16 @@ fn strip_csharp_argument_wrappers(mut node: Node<'_>) -> Option<Node<'_>> {
                     let child = children.next()?;
                     children.next().is_none().then_some(child)
                 })?,
-            "cast_expression" | "parenthesized_expression" => {
-                node.child_by_field_name("expression").or_else(|| {
-                    let mut cursor = node.walk();
-                    let mut children = node.named_children(&mut cursor);
-                    let child = children.next()?;
-                    children.next().is_none().then_some(child)
-                })?
-            }
+            // Unwrap only for binding identity. The call site's original
+            // argument (including its target type) remains the authority for
+            // overload selection; a cast is not an untyped call argument.
+            "cast_expression" => node.child_by_field_name("value")?,
+            "parenthesized_expression" => node.child_by_field_name("expression").or_else(|| {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor);
+                let child = children.next()?;
+                children.next().is_none().then_some(child)
+            })?,
             _ => return Some(node),
         };
     }

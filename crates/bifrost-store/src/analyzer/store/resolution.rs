@@ -781,8 +781,10 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         Language::Java => {
             "resolution-bundle-java-v52-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
+        // v68 (#7509): an initialized type-switch clause binder no longer
+        // carries an InferredType gap row.
         Language::Go => {
-            "resolution-bundle-go-v67-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10"
+            "resolution-bundle-go-v68-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
         }
         Language::Cpp => "resolution-bundle-cpp-v26-opaque-guard-implication-6902-2026-10",
         Language::JavaScript => {
@@ -802,8 +804,10 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // (#6949).
         // v123: attributed items bind item fragments in macro replay, and derive
         // paths publish Macro-namespace reference sites (#6912).
+        // v124: wrapper projection is a selected ConditionalPayload transfer
+        // decided by resolved identity, not producer spelling (#6844).
         Language::Rust => {
-            "resolution-bundle-rust-v123-duplicate-export-uncertainty-replay-call-roles-6861-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10-generic-default-reference-6950-cfg-if-self-frontier-6949-macro-item-attributes-derive-sites-6912"
+            "resolution-bundle-rust-v124-duplicate-export-uncertainty-replay-call-roles-6861-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10-generic-default-reference-6950-cfg-if-self-frontier-6949-macro-item-attributes-derive-sites-6912-wrapper-identity-conditional-payload-6844"
         }
         Language::Php => {
             "resolution-bundle-php-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
@@ -819,11 +823,13 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // An up-call's `super` receiver is the enclosing template's parent
         // identity, and an abstract or opaque type alias projects itself
         // instead of publishing an unproduced identity slot (#5685).
+        // A qualified parent's type-constructor path is looked up in the scope enclosing
+        // its template, not the template's own member scope (#5104).
         Language::Scala => {
-            "resolution-bundle-scala-v81-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
+            "resolution-bundle-scala-v82-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
         }
         Language::CSharp => {
-            "resolution-bundle-csharp-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+            "resolution-bundle-csharp-v25-lexical-producer-7314-review-boundaries-2026-10"
         }
         Language::Ruby => {
             "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
@@ -1490,19 +1496,23 @@ pub(super) fn insert_prepared_bundle_tx(
     )? {
         return Ok(false);
     }
-    let payload_bytes = tx
-        .prepare_cached(resolution_manifest::COMPLETE_PUBLICATION_COST_SQL)?
-        .query_row([blob_id], |row| {
-            for (index, expected) in bundle.family_counts.iter().enumerate() {
-                let actual: usize = row.get(index)?;
-                assert_eq!(
-                    actual, *expected,
-                    "complete resolution family {}",
-                    RESOLUTION_MANIFEST_COUNT_COLUMNS[index]
-                );
-            }
-            row.get::<_, i64>(RESOLUTION_MANIFEST_COUNT_COLUMNS.len())
-        })?;
+    if crate::cache_db::seal_validates(blob_id) {
+        tx.prepare_cached(resolution_manifest::COMPLETE_PUBLICATION_COUNTS_SQL)?
+            .query_row([blob_id], |row| {
+                for (index, expected) in bundle.family_counts.iter().enumerate() {
+                    let actual: usize = row.get(index)?;
+                    assert_eq!(
+                        actual, *expected,
+                        "complete resolution family {}",
+                        RESOLUTION_MANIFEST_COUNT_COLUMNS[index]
+                    );
+                }
+                Ok(())
+            })?;
+    }
+    let payload_bytes: i64 = tx
+        .prepare_cached(resolution_manifest::COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL)?
+        .query_row([blob_id], |row| row.get(0))?;
     tx.execute(
         "UPDATE resolution_fragment_interiors SET payload_bytes = ?2 WHERE blob_id = ?1",
         params![blob_id, payload_bytes],
@@ -2428,6 +2438,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn store_tests_validate_every_seal() {
+        assert!(
+            crate::cache_db::seal_validates(1),
+            "store tests must enable brokk-bifrost-core/test-support, or production sampling skips 63 of 64 seal checks"
+        );
+    }
+
+    #[test]
     fn json_publication_chunks_preserve_sqlite_values_and_rowids() {
         let mut connection = crate::cache_db::open_in_memory_store_connection().unwrap();
         connection.execute_batch("CREATE TABLE batched(id INTEGER PRIMARY KEY, ordinal INTEGER, body BLOB, optional TEXT, flag INTEGER);
@@ -3141,3 +3159,7 @@ impl SharedNameInterner for StoreSharedNames<'_> {
         id
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "resolution_dump.rs"]
+mod resolution_dump;

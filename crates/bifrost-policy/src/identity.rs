@@ -94,14 +94,23 @@ define_sha256_identity!(TypestateAuthoringProjectionHash);
 pub struct PolicySemanticHash([u8; 32]);
 
 impl PolicySemanticHash {
+    /// Inventory identity for a catalog policy before its run closes dependencies.
+    /// Executable hashes are still minted only by LoadedPolicy construction.
+    pub(crate) fn from_authored_catalog_policy(document: &super::definition::RqlpDocument) -> Self {
+        Self(hash_canonical_value(
+            b"bifrost.policy.catalog-authored.v1",
+            &document.to_normalized_authored_json(),
+        ))
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
     /// The semantic hash these wire bytes spell.
     ///
-    /// Crate-internal on purpose: a semantic hash is minted only by validated
-    /// `LoadedPolicy` construction, and this mints nothing. It exists for the
+    /// Crate-internal on purpose: executable semantic hashes are minted only by
+    /// validated `LoadedPolicy` construction, and this mints nothing. It exists for the
     /// one reader that takes a finding back out of the analyzer cache, where
     /// the hash the finding was published under is part of the stored value.
     pub(crate) fn from_lower_hex(value: &str) -> Result<Self, Sha256ValueError> {
@@ -274,7 +283,7 @@ fn hash_fields<'a>(domain: &[u8], fields: impl IntoIterator<Item = &'a [u8]>) ->
     hasher.finalize().into()
 }
 
-fn hash_canonical_value(domain: &[u8], value: &Value) -> [u8; 32] {
+fn hash_canonical_value(domain: &[u8], value: &impl serde::Serialize) -> [u8; 32] {
     let bytes = serde_json_canonicalizer::to_vec(value)
         .expect("validated policy values have a canonical JSON encoding");
     hash_fields(domain, [bytes.as_slice()])
@@ -295,6 +304,7 @@ mod tests {
         ResolvedPolicySelector, RqlpDocument, SelectorOrigin, parse_rqlp_source,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn hash_domains_are_distinct_for_equal_bytes() {
@@ -312,17 +322,33 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("01f6d9bccf74: embedding features changed policy semantic hashes")]
     fn canonical_value_hash_ignores_object_insertion_order() {
-        let mut ascending = serde_json::Map::new();
-        ascending.insert("alpha".to_owned(), Value::from(1));
-        ascending.insert("omega".to_owned(), Value::from(2));
-        let mut descending = serde_json::Map::new();
-        descending.insert("omega".to_owned(), Value::from(2));
-        descending.insert("alpha".to_owned(), Value::from(1));
+        use serde::ser::SerializeMap;
+
+        struct OrderedEntries<'a>(&'a [(&'a str, u32)]);
+
+        impl serde::Serialize for OrderedEntries<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(Some(self.0.len()))?;
+                for (key, value) in self.0 {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+
+        let ascending = OrderedEntries(&[("alpha", 1), ("omega", 2)]);
+        let descending = OrderedEntries(&[("omega", 2), ("alpha", 1)]);
+        assert_ne!(
+            serde_json::to_vec(&ascending).unwrap(),
+            serde_json::to_vec(&descending).unwrap(),
+            "the regression must exercise distinct object-key orders"
+        );
 
         assert_eq!(
-            hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &Value::Object(ascending)),
-            hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &Value::Object(descending))
+            hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &ascending),
+            hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &descending)
         );
     }
 

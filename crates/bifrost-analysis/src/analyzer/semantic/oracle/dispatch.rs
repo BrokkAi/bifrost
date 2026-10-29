@@ -277,6 +277,8 @@ pub struct DispatchResult {
     returned_callable: Option<Box<ReturnedCallableProvenance>>,
     argument_callable: Option<Box<ArgumentCallableProvenance>>,
     stable_package_values: Box<[StablePackageValueProvenance]>,
+    member_field_anchor: Option<crate::analyzer::semantic::SourceAnchor>,
+    member_receiver_preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
 }
 
 impl DispatchResult {
@@ -312,6 +314,8 @@ impl DispatchResult {
             returned_callable: None,
             argument_callable: None,
             stable_package_values: Box::new([]),
+            member_field_anchor: None,
+            member_receiver_preparation: None,
         };
         let has_unresolved = result
             .boundaries
@@ -388,6 +392,36 @@ impl DispatchResult {
     /// ineligible for feedback.
     pub const fn complete_receiver_hint_refinable(&self) -> bool {
         self.complete_receiver_hint_refinable
+    }
+
+    pub(crate) fn mark_member_field_anchor(
+        &mut self,
+        anchor: Option<crate::analyzer::semantic::SourceAnchor>,
+    ) {
+        self.member_field_anchor = anchor;
+    }
+
+    pub const fn member_field_anchor(&self) -> Option<crate::analyzer::semantic::SourceAnchor> {
+        self.member_field_anchor
+    }
+
+    pub(crate) fn mark_member_receiver_preparation(
+        &mut self,
+        preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
+    ) {
+        if self.proven_receiver_shape() != Some(true) || self.candidates.len() > 1 {
+            return;
+        }
+        self.member_receiver_preparation = preparation;
+        if let (Some(preparation), [candidate]) = (preparation, self.candidates.as_mut()) {
+            candidate.mark_member_receiver_preparation(preparation);
+        }
+    }
+
+    pub const fn member_receiver_preparation(
+        &self,
+    ) -> Option<crate::analyzer::semantic::MemberReceiverPreparation> {
+        self.member_receiver_preparation
     }
 
     pub(crate) fn mark_complete_receiver_hint_refinable(&mut self) {

@@ -65,64 +65,6 @@ pub fn path_suffixes(path: &str) -> impl Iterator<Item = &str> {
     suffixes.into_iter()
 }
 
-/// Canonical package identity (import path) of a file, taken from any of its
-/// declarations. `None` for files with no top-level declarations.
-pub fn go_package_of(index: &dyn CodeUnitIndex, file: &ProjectFile) -> Option<String> {
-    index
-        .top_level_declarations(file)
-        .into_iter()
-        .next()
-        .map(|unit| unit.package_name().to_string())
-}
-
-/// Files grouped by their canonical Go package (import path).
-pub fn build_go_package_files(
-    index: &dyn CodeUnitIndex,
-    files: &[ProjectFile],
-) -> HashMap<String, Arc<Vec<ProjectFile>>> {
-    group_go_files_by_key(index, files, |_, package| vec![package.to_string()])
-}
-
-/// Go files grouped by their parent directory path.
-pub fn build_go_dir_parent_files(
-    index: &dyn CodeUnitIndex,
-    files: &[ProjectFile],
-) -> HashMap<String, Arc<Vec<ProjectFile>>> {
-    group_go_files_by_key(index, files, |file, _| vec![parent_path_key(file)])
-}
-
-/// Go files grouped by every path suffix of their parent directory.
-pub fn build_go_dir_parent_suffix_files(
-    index: &dyn CodeUnitIndex,
-    files: &[ProjectFile],
-) -> HashMap<String, Arc<Vec<ProjectFile>>> {
-    group_go_files_by_key(index, files, |file, _| {
-        path_suffixes(&parent_path_key(file))
-            .map(str::to_owned)
-            .collect()
-    })
-}
-
-fn group_go_files_by_key(
-    index: &dyn CodeUnitIndex,
-    files: &[ProjectFile],
-    mut keys_for_file: impl FnMut(&ProjectFile, &str) -> Vec<String>,
-) -> HashMap<String, Arc<Vec<ProjectFile>>> {
-    let mut files_by_key: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-    for file in files {
-        let Some(package) = go_package_of(index, file) else {
-            continue;
-        };
-        for key in keys_for_file(file, &package) {
-            files_by_key.entry(key).or_default().push(file.clone());
-        }
-    }
-    files_by_key
-        .into_iter()
-        .map(|(key, files)| (key, Arc::new(files)))
-        .collect()
-}
-
 /// The prebuilt import-resolution tables an `ImportAnalysisProvider` memoizes.
 ///
 /// Grouping the three maps keeps the free functions below from taking the same

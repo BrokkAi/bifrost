@@ -789,18 +789,6 @@ pub fn build_direct_import_topology(
             fallback: Some(request_graph),
         };
     }
-    if let Err(error) = request_graph.publish_persisted_import_graph(analyzer) {
-        metrics.elapsed_ns = elapsed_ns(started);
-        return DirectImportTopologyBuild {
-            outcome: DerivedLayerBuildOutcome::Unavailable {
-                reason: format!("publishing persistent import graph failed: {error}"),
-                over_budget: false,
-                rejection_scope: None,
-                metrics,
-            },
-            fallback: Some(request_graph),
-        };
-    }
     let topology = request_graph.into_topology(retained_bytes);
     DirectImportTopologyBuild {
         outcome: DerivedLayerBuildOutcome::Complete {
@@ -972,23 +960,6 @@ impl RequestLocalDirectImportGraph {
 
     pub(crate) fn has_resolution_dependencies(&self, file: &ProjectFile) -> bool {
         self.resolution_dependencies.contains_key(file)
-    }
-
-    pub fn publish_persisted_import_graph(
-        &self,
-        analyzer: &dyn IAnalyzer,
-    ) -> Result<bool, crate::analyzer::store::StoreError> {
-        if !self.reverse_relation_complete() {
-            return Ok(false);
-        }
-        let Some(content_identity) = analyzer.workspace_content_identity() else {
-            return Ok(false);
-        };
-        if !analyzer.workspace_content_matches(content_identity) {
-            return Ok(false);
-        }
-        let edges = self.persisted_edges();
-        analyzer.publish_persisted_import_graph(content_identity, &self.all_files, &edges)
     }
 
     fn freeze(&mut self) {
@@ -1550,6 +1521,286 @@ mod tests {
     /// second content builds beside the first instead of rotating it away, and
     /// returning to the first content still hits. That is the cross-branch and
     /// undo case the old whole-cache rotation could not serve.
+    struct FiniteImports {
+        project: crate::TestProject,
+        files: Vec<ProjectFile>,
+        edges: Vec<(usize, usize)>,
+        unsupported: Option<usize>,
+        calls: AtomicUsize,
+    }
+
+    impl FiniteImports {
+        fn new(count: usize, edges: &[(usize, usize)]) -> Self {
+            let root = std::env::temp_dir();
+            Self {
+                project: crate::TestProject::new(root.clone(), Language::Java),
+                files: (0..count)
+                    .map(|id| ProjectFile::new(root.clone(), format!("{id}.java")))
+                    .collect(),
+                edges: edges.to_vec(),
+                unsupported: None,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn assert_projection(&self, graph: &RequestLocalDirectImportGraph) {
+            for (id, file) in self.files.iter().enumerate() {
+                let forward: Vec<_> = self
+                    .edges
+                    .iter()
+                    .filter(|(source, _)| *source == id)
+                    .map(|(_, target)| self.files[*target].clone())
+                    .collect();
+                let reverse: Vec<_> = self
+                    .edges
+                    .iter()
+                    .filter(|(_, target)| *target == id)
+                    .map(|(source, _)| self.files[*source].clone())
+                    .collect();
+                assert_eq!(graph.imports_of(file), forward, "forward {id}");
+                assert_eq!(graph.importers_of(file), reverse, "reverse {id}");
+            }
+        }
+    }
+
+    impl crate::analyzer::CodeUnitIndex for FiniteImports {
+        fn project(&self) -> &dyn crate::analyzer::Project {
+            &self.project
+        }
+        fn languages(&self) -> std::collections::BTreeSet<Language> {
+            [Language::Java].into_iter().collect()
+        }
+        fn analyzed_files(&self) -> Vec<ProjectFile> {
+            self.files.clone()
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::analyzer::CodeUnit> + '_> {
+            Box::new(std::iter::empty())
+        }
+        fn search_definitions(
+            &self,
+            _: &str,
+            _: bool,
+        ) -> std::collections::BTreeSet<crate::analyzer::CodeUnit> {
+            Default::default()
+        }
+        fn enclosing_code_unit(
+            &self,
+            _: &ProjectFile,
+            _: &crate::analyzer::Range,
+        ) -> Option<crate::analyzer::CodeUnit> {
+            None
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<crate::analyzer::CodeUnit> {
+            None
+        }
+        fn get_skeleton(&self, _: &crate::analyzer::CodeUnit) -> Option<String> {
+            None
+        }
+        fn get_skeleton_header(&self, _: &crate::analyzer::CodeUnit) -> Option<String> {
+            None
+        }
+        fn get_sources(
+            &self,
+            _: &crate::analyzer::CodeUnit,
+            _: bool,
+        ) -> std::collections::BTreeSet<String> {
+            Default::default()
+        }
+    }
+
+    impl IAnalyzer for FiniteImports {
+        fn update(&self, _: &std::collections::BTreeSet<ProjectFile>) -> Self {
+            unimplemented!()
+        }
+        fn update_all(&self) -> Self {
+            unimplemented!()
+        }
+        fn is_access_expression(&self, _: &ProjectFile, _: usize, _: usize) -> bool {
+            false
+        }
+        fn find_nearest_declaration(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+            _: &str,
+        ) -> Option<crate::analyzer::DeclarationInfo> {
+            None
+        }
+        fn import_analysis_provider_for_file(
+            &self,
+            file: &ProjectFile,
+        ) -> Option<&dyn crate::analyzer::ImportAnalysisProvider> {
+            (!self.unsupported.is_some_and(|id| self.files[id] == *file)).then_some(self)
+        }
+    }
+
+    impl crate::analyzer::ImportAnalysisProvider for FiniteImports {
+        fn imported_code_units_of(
+            &self,
+            _: &ProjectFile,
+        ) -> Arc<HashSet<crate::analyzer::CodeUnit>> {
+            Arc::new(HashSet::default())
+        }
+        fn referencing_files_of(&self, _: &ProjectFile) -> HashSet<ProjectFile> {
+            unimplemented!()
+        }
+        fn imported_files_from_infos(
+            &self,
+            file: &ProjectFile,
+            _: &[crate::analyzer::ImportInfo],
+        ) -> Option<HashSet<ProjectFile>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Some(
+                self.edges
+                    .iter()
+                    .filter(|(source, _)| self.files[*source] == *file)
+                    .map(|(_, target)| self.files[*target].clone())
+                    .collect(),
+            )
+        }
+    }
+
+    #[test]
+    fn import_graph_file_budgets_are_inclusive() {
+        use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+        let cancellation = CancellationToken::default();
+        for count in [0usize, 3] {
+            let analyzer = FiniteImports::new(count, &[]);
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            for limit in [count.saturating_sub(1), count, count + 1] {
+                let built = build_direct_import_topology(
+                    &analyzer,
+                    scope.token(),
+                    &cancellation,
+                    DirectImportTopologyLimits {
+                        max_files: limit,
+                        max_edges: 10,
+                        max_retained_bytes: 1024 * 1024,
+                    },
+                );
+                assert_eq!(
+                    matches!(built.outcome, DerivedLayerBuildOutcome::Complete { .. }),
+                    count <= limit
+                );
+                let mut graph = RequestLocalDirectImportGraph::new(&analyzer);
+                assert_eq!(
+                    graph.ensure_complete(&analyzer, scope.token(), limit, 10, None),
+                    count > limit
+                );
+                assert_eq!(graph.reverse_relation_complete(), count <= limit);
+                if count <= limit {
+                    analyzer.assert_projection(&graph);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn import_graph_projection_and_incremental_completion_match_edge_set() {
+        use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+        let analyzer = FiniteImports::new(5, &[(0, 1), (0, 3), (1, 2)]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let mut graph = RequestLocalDirectImportGraph::new(&analyzer);
+        assert!(!graph.reverse_relation_complete());
+        assert!(graph.ensure_complete(&analyzer, token, 2, 10, None));
+        assert!(!graph.is_complete());
+        assert!(!graph.reverse_relation_complete());
+        assert!(!graph.ensure_complete(&analyzer, token, 5, 10, None));
+        assert!(graph.reverse_relation_complete());
+        analyzer.assert_projection(&graph);
+        let calls = analyzer.calls.load(Ordering::Relaxed);
+        assert!(!graph.ensure_complete(&analyzer, token, 5, 10, None));
+        assert_eq!(analyzer.calls.load(Ordering::Relaxed), calls);
+        let mut fresh = RequestLocalDirectImportGraph::new(&analyzer);
+        assert!(!fresh.ensure_forward(&analyzer, token, &analyzer.files, 5, 10, None));
+        for file in &analyzer.files {
+            assert_eq!(fresh.imports_of(file), graph.imports_of(file));
+        }
+        assert!(!fresh.ensure_complete(&analyzer, token, 5, 10, None));
+        analyzer.assert_projection(&fresh);
+
+        let cancellation = CancellationToken::default();
+        let mut snapshot = RequestLocalDirectImportGraph::new(&analyzer);
+        assert_eq!(
+            snapshot.resolve_complete_for_snapshot(
+                &analyzer,
+                token,
+                2,
+                10,
+                &cancellation,
+                u64::MAX
+            ),
+            (true, false)
+        );
+        assert!(!snapshot.is_complete());
+        let calls = analyzer.calls.load(Ordering::Relaxed);
+        assert!(!snapshot.ensure_complete(&analyzer, token, 5, 10, None));
+        assert!(analyzer.calls.load(Ordering::Relaxed) > calls);
+        analyzer.assert_projection(&snapshot);
+
+        // A snapshot rejected by its edge budget also keeps the fallback incomplete.
+        let built = build_direct_import_topology(
+            &analyzer,
+            token,
+            &cancellation,
+            DirectImportTopologyLimits {
+                max_files: 5,
+                max_edges: 1,
+                max_retained_bytes: 1024 * 1024,
+            },
+        );
+        assert!(matches!(
+            built.outcome,
+            DerivedLayerBuildOutcome::Unavailable { .. }
+        ));
+        assert!(!built.fallback.unwrap().is_complete());
+
+        let mut unsupported = FiniteImports::new(5, &[]);
+        unsupported.unsupported = Some(4);
+        let mut graph = RequestLocalDirectImportGraph::new(&unsupported);
+        assert!(!graph.ensure_complete(&unsupported, token, 5, 10, None));
+        assert!(graph.is_complete());
+        assert!(!graph.reverse_relation_complete());
+    }
+
+    #[test]
+    fn import_graph_forward_input_order_and_duplicates_do_not_spend_budget() {
+        use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+        let analyzer = FiniteImports::new(2, &[(0, 1)]);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        for input in [vec![0, 1], vec![1, 0], vec![1, 0, 1, 0], vec![0, 0, 1]] {
+            let files: Vec<_> = input
+                .into_iter()
+                .map(|id| analyzer.files[id].clone())
+                .collect();
+            let mut graph = RequestLocalDirectImportGraph::new(&analyzer);
+            assert!(!graph.ensure_forward(&analyzer, scope.token(), &files, 2, 10, None));
+            assert_eq!(graph.resolved_files(), 2);
+            assert!(!graph.ensure_complete(&analyzer, scope.token(), 2, 10, None));
+            analyzer.assert_projection(&graph);
+            let mut selected = RequestLocalDirectImportGraph::new(&analyzer);
+            assert!(!selected.ensure_forward_selected(
+                &analyzer,
+                scope.token(),
+                &files,
+                &HashMap::default(),
+                2,
+                10,
+                None
+            ));
+            assert_eq!(selected.resolved_files(), 2);
+            assert!(!selected.ensure_complete(&analyzer, scope.token(), 2, 10, None));
+            analyzer.assert_projection(&selected);
+        }
+    }
+
     #[test]
     fn snapshot_cache_reuses_by_workspace_content_and_retains_both() {
         let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
@@ -1938,6 +2189,59 @@ mod tests {
             }
         ));
         assert_eq!(builds.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn import_graph_foreign_and_unvisited_sources_preserve_indexed_edges() {
+        use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+        for count in [0, 2] {
+            let edges = if count == 0 { vec![] } else { vec![(0, 1)] };
+            let analyzer = FiniteImports::new(count, &edges);
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let foreign = ProjectFile::new(std::env::temp_dir(), "foreign.java");
+            let graph = RequestLocalDirectImportGraph::new(&analyzer);
+            for file in analyzer.files.iter().chain(std::iter::once(&foreign)) {
+                assert!(graph.imports_of(file).is_empty());
+            }
+            // Vary the finite foreign-source relation and input order. Freezing
+            // must preserve all indexed edges regardless of hash iteration.
+            for foreign_count in 1..=16 {
+                let mut graph = RequestLocalDirectImportGraph::new(&analyzer);
+                let mut files = analyzer.files.clone();
+                files.extend((0..foreign_count).map(|index| {
+                    ProjectFile::new(std::env::temp_dir(), format!("foreign{index}.java"))
+                }));
+                files.rotate_left(foreign_count);
+                assert!(!graph.ensure_forward(&analyzer, scope.token(), &files, 100, 100, None));
+                graph.freeze();
+                analyzer.assert_projection(&graph);
+            }
+            let built = build_direct_import_topology(
+                &analyzer,
+                scope.token(),
+                &CancellationToken::default(),
+                DirectImportTopologyLimits {
+                    max_files: 100,
+                    max_edges: 100,
+                    max_retained_bytes: 1024 * 1024,
+                },
+            );
+            let DerivedLayerBuildOutcome::Complete {
+                layer: DerivedLayer::DirectImportTopology(topology),
+                ..
+            } = built.outcome
+            else {
+                panic!("complete topology")
+            };
+            assert_eq!(topology.imports_of(&foreign), None);
+            for (id, file) in analyzer.files.iter().enumerate() {
+                let expected: Vec<_> = edges
+                    .iter()
+                    .filter(|(source, _)| *source == id)
+                    .map(|(_, target)| analyzer.files[*target].clone())
+                    .collect();
+                assert_eq!(topology.imports_of(file), Some(expected));
+            }
+        }
     }
 }
 

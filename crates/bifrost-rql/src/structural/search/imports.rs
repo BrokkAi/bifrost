@@ -2,19 +2,32 @@ use super::*;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(super) fn push_seed_provider_omission(
+    analyzer: &dyn IAnalyzer,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     language: Language,
     file: &ProjectFile,
     unavailable: &str,
 ) {
-    diagnostics.push(incomplete_diagnostic(
-        CodeQueryDiagnosticCode::SemanticResultsOmitted,
-        language.config_label(),
+    brokk_bifrost_core::profiling::note_with(|| {
         format!(
-            "structural seed omitted {} because its provider returned no {unavailable}",
-            rel_path_string(file)
+            "policy.units unbounded origin={}:{} cause=provider:imports detail={unavailable}",
+            file!(),
+            line!()
+        )
+    });
+    analyzer.mark_execution_dependent();
+    diagnostics.push(QueryExecutionState::diagnostic(
+        analyzer,
+        incomplete_diagnostic(
+            CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            language.config_label(),
+            format!(
+                "structural seed omitted {} because its provider returned no {unavailable}",
+                rel_path_string(file)
+            ),
+            Vec::new(),
         ),
-        Vec::new(),
+        Some(DerivationExecutionCause::Provider),
     ));
 }
 
@@ -65,7 +78,9 @@ pub(super) fn acquire_direct_import_layer(
         }
         return None;
     };
-    if state.analyzer.read_ledger_attached() {
+    if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        state.analyzer.read_ledger_attached()
+    }) {
         // The direct-import topology is whole-workspace: its cache key is the
         // request shape, which is constant here, plus this identity.
         let languages = state.analyzer.languages().into_iter().collect::<Vec<_>>();

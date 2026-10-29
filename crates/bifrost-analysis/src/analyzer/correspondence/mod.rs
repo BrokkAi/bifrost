@@ -302,14 +302,6 @@ impl WorkspaceScope {
         Self { roots, exclusions }
     }
 
-    pub fn roots(&self) -> &[WorkspaceRelativePath] {
-        &self.roots
-    }
-
-    pub fn exclusions(&self) -> &[WorkspaceRelativePath] {
-        &self.exclusions
-    }
-
     /// Whether `path` is inside this scope.
     ///
     /// Containment is compared by path component, not by string prefix, so
@@ -451,10 +443,6 @@ impl RevisionSide {
 
     pub const fn scope(&self) -> &WorkspaceScope {
         &self.scope
-    }
-
-    pub fn gaps(&self) -> &[AcquisitionGap] {
-        &self.gaps
     }
 
     /// Completeness is derived from the gap list rather than stored beside it,
@@ -926,6 +914,238 @@ impl CorrespondenceLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Independent protocol oracle: each atom is u64-BE byte length + bytes;
+    // fields are two atoms, sequences are a label and framed u64-BE count.
+    // Keep literal v1 domains and field names here for deliberate format review.
+    pub(super) struct Frames(Vec<Vec<u8>>);
+
+    impl Frames {
+        pub(super) fn new(domain: &str) -> Self {
+            Self(vec![domain.as_bytes().to_vec()])
+        }
+        pub(super) fn atom(&mut self, value: impl AsRef<[u8]>) {
+            self.0.push(value.as_ref().to_vec());
+        }
+        pub(super) fn field(&mut self, name: &str, value: impl AsRef<[u8]>) {
+            self.atom(name);
+            self.atom(value);
+        }
+        pub(super) fn sequence(&mut self, name: &str, count: usize) {
+            self.field(name, (count as u64).to_be_bytes());
+        }
+        pub(super) fn digest(self) -> StableDigest {
+            use sha2::{Digest, Sha256};
+            let bytes: Vec<u8> = self
+                .0
+                .into_iter()
+                .flat_map(|v| {
+                    (v.len() as u64)
+                        .to_be_bytes()
+                        .into_iter()
+                        .chain(v)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            StableDigest::from_array(Sha256::digest(bytes).into())
+        }
+    }
+
+    pub(super) fn expected_pin(pin: &RevisionPin) -> StableDigest {
+        let mut schema = Frames::new("bifrost.correspondence.analyzer-schema.v1");
+        assert_eq!(CORRESPONDENCE_SCHEMA_VERSION, 1);
+        schema.field("correspondence_schema", 1u32.to_be_bytes());
+        // The semantic IR schema is another component's version; the vector
+        // pins how it is framed, not its value.
+        schema.field(
+            "semantic_ir_schema",
+            SEMANTIC_IR_SCHEMA_VERSION.to_be_bytes(),
+        );
+        let schema = schema.digest();
+        assert_eq!(pin.analyzer_schema(), schema);
+        let mut frames = Frames::new("bifrost.correspondence.revision-pin.v1");
+        for (name, side) in [("base", pin.base()), ("target", pin.target())] {
+            frames.field("side", name);
+            let (kind, object) = match side.endpoint() {
+                RevisionEndpoint::Commit(n) => ("commit", n.as_str()),
+                RevisionEndpoint::Tree(n) => ("tree", n.as_str()),
+                RevisionEndpoint::WorkingTree => ("working_tree", ""),
+            };
+            frames.field("endpoint_kind", kind);
+            frames.field("endpoint_object", object);
+            for (label, paths) in [
+                ("roots", &side.scope.roots),
+                ("exclusions", &side.scope.exclusions),
+            ] {
+                frames.sequence(label, paths.len());
+                for path in paths {
+                    frames.atom(path.as_str());
+                }
+            }
+            frames.sequence("gaps", side.gaps.len());
+            for gap in &side.gaps {
+                let (label, text) = match gap {
+                    AcquisitionGap::SourceUnreadable { path } => (
+                        "source_unreadable",
+                        format!("source of {} could not be read", path.as_str()),
+                    ),
+                    AcquisitionGap::DeclarationSliceUnavailable { path } => (
+                        "declaration_slice_unavailable",
+                        format!(
+                            "a declaration in {} has no usable source slice",
+                            path.as_str()
+                        ),
+                    ),
+                    AcquisitionGap::EntityLimitExceeded { limit } => (
+                        "entity_limit_exceeded",
+                        format!("acquisition stopped at {limit} entities"),
+                    ),
+                };
+                frames.atom(label);
+                frames.atom(text);
+            }
+        }
+        frames.field("analyzer_schema", schema.as_bytes());
+        for (name, axis) in [
+            ("configuration", pin.configuration()),
+            ("model", pin.model()),
+        ] {
+            match axis {
+                PinnedIdentity::Unknown => frames.field(name, b"unknown"),
+                PinnedIdentity::Pinned(d) => frames.field(name, d.as_bytes()),
+            }
+        }
+        frames.digest()
+    }
+
+    #[test]
+    fn revision_pin_v1_known_answer_vectors() {
+        for endpoint in [
+            RevisionEndpoint::WorkingTree,
+            RevisionEndpoint::Commit(ObjectName::new("a".repeat(40)).unwrap()),
+            RevisionEndpoint::Tree(ObjectName::new("b".repeat(64)).unwrap()),
+        ] {
+            for pinned in [false, true] {
+                let mut base = RevisionSide::new(
+                    endpoint.clone(),
+                    WorkspaceScope::new([path("src"), path("tests")], [path("src/generated")]),
+                );
+                base.record_gap(AcquisitionGap::SourceUnreadable {
+                    path: path("src/a"),
+                });
+                base.record_gap(AcquisitionGap::DeclarationSliceUnavailable {
+                    path: path("src/b"),
+                });
+                base.record_gap(AcquisitionGap::EntityLimitExceeded { limit: 23 });
+                let mut pin = RevisionPin::new(
+                    base,
+                    RevisionSide::new(
+                        RevisionEndpoint::WorkingTree,
+                        WorkspaceScope::whole_workspace(),
+                    ),
+                );
+                if pinned {
+                    pin = pin
+                        .with_configuration(PinnedIdentity::Pinned(StableDigest::from_array(
+                            [3; 32],
+                        )))
+                        .with_model(PinnedIdentity::Pinned(StableDigest::from_array([7; 32])));
+                }
+                assert_eq!(pin.digest(), expected_pin(&pin));
+            }
+        }
+    }
+
+    #[test]
+    fn git_object_spellings_require_every_lowercase_hex_digit() {
+        for length in [40, 64] {
+            for valid in ["0", "9", "a", "f"] {
+                assert!(ObjectName::new(valid.repeat(length)).is_ok());
+            }
+            for position in 0..length {
+                for invalid in ["G", "A", "!", " "] {
+                    let mut value = "a".repeat(length);
+                    value.replace_range(position..position + 1, invalid);
+                    assert_eq!(
+                        ObjectName::new(value),
+                        Err(ObjectNameError::NotLowercaseHex)
+                    );
+                }
+            }
+            for position in 0..length - 1 {
+                let mut value = "a".repeat(length);
+                value.replace_range(position..position + 2, "\u{e9}");
+                assert_eq!(
+                    ObjectName::new(value),
+                    Err(ObjectNameError::NotLowercaseHex)
+                );
+            }
+        }
+        for length in (0..=65).filter(|length| ![40, 64].contains(length)) {
+            assert_eq!(
+                ObjectName::new("a".repeat(length)),
+                Err(ObjectNameError::Length { bytes: length })
+            );
+        }
+    }
+
+    #[test]
+    fn scope_and_acquisition_are_idempotent_sets() {
+        let canonical = WorkspaceScope::new(
+            [path("src/a"), path("tests/b")],
+            [path("src/a/gen"), path("tests/b/gen")],
+        );
+        let side = |scope| RevisionSide::new(RevisionEndpoint::WorkingTree, scope);
+        let pin = |scope| RevisionPin::new(side(scope), side(WorkspaceScope::whole_workspace()));
+        for reversed in [false, true] {
+            let mut roots = vec![path("src/a"), path("tests/b"), path("src/a")];
+            let mut exclusions = vec![path("src/a/gen"), path("tests/b/gen"), path("src/a/gen")];
+            if reversed {
+                roots.reverse();
+                exclusions.reverse();
+            }
+            let scope = WorkspaceScope::new(roots, exclusions);
+            assert_eq!(scope, canonical);
+            assert_eq!(pin(scope.clone()).digest(), pin(canonical.clone()).digest());
+            for (p, inside) in [
+                ("src/a/f", true),
+                ("tests/b/f", true),
+                ("src/ab/f", false),
+                ("tests/b/gen/f", false),
+                ("src/a/gen/f", false),
+                ("other/f", false),
+            ] {
+                assert_eq!(scope.contains(&path(p)), inside, "{p}");
+            }
+        }
+        assert_ne!(
+            pin(canonical).digest(),
+            pin(WorkspaceScope::new([path("tests")], [])).digest()
+        );
+        let gaps = [
+            AcquisitionGap::SourceUnreadable { path: path("a") },
+            AcquisitionGap::DeclarationSliceUnavailable { path: path("b") },
+            AcquisitionGap::EntityLimitExceeded { limit: 4 },
+        ];
+        let mut unique = side(WorkspaceScope::whole_workspace());
+        for gap in &gaps {
+            unique.record_gap(gap.clone());
+        }
+        for order in [[0, 1, 2], [2, 1, 0]] {
+            let mut repeated = side(WorkspaceScope::whole_workspace());
+            for index in order {
+                for _ in 0..2 {
+                    repeated.record_gap(gaps[index].clone());
+                    assert_eq!(repeated.completeness(), AcquisitionCompleteness::Partial);
+                }
+            }
+            assert_eq!(repeated, unique);
+            assert_eq!(
+                RevisionPin::new(repeated, unique.clone()).digest(),
+                RevisionPin::new(unique.clone(), unique.clone()).digest()
+            );
+        }
+    }
 
     fn path(value: &str) -> WorkspaceRelativePath {
         WorkspaceRelativePath::new(value).expect("portable test path")

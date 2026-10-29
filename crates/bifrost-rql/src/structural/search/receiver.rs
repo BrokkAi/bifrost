@@ -228,8 +228,13 @@ pub(super) fn receiver_evidence_kind(value: &ReceiverValue) -> &'static str {
     }
 }
 
-pub(super) type ReceiverDiagnostics =
-    BTreeMap<(CodeQueryDiagnosticCode, Language, &'static str, String), usize>;
+pub(super) type ReceiverDiagnostics = Vec<(
+    CodeQueryDiagnosticCode,
+    Language,
+    &'static str,
+    String,
+    Option<DerivationExecutionCause>,
+)>;
 pub(super) const RECEIVER_PIPELINE_OUTPUT_CAP_REASON: &str =
     "pipeline output cap omitted receiver inputs";
 
@@ -263,7 +268,10 @@ pub(super) fn structural_receiver_ranges(
                         .role_targets(fact_id, Role::Receiver)
                         .next()
                         .map(|target| target.span)
-                } else if fact.kind == NormalizedKind::FieldAccess {
+                } else if matches!(
+                    fact.kind,
+                    NormalizedKind::FieldAccess | NormalizedKind::Subscript
+                ) {
                     seed.facts
                         .role_targets(fact_id, Role::Object)
                         .next()
@@ -603,14 +611,21 @@ pub(super) fn receiver_analysis_expansions(
                 break;
             }
             Err(ReceiverQueryError::SemanticProvider(error)) => {
-                *receiver_diagnostics
-                    .entry((
-                        CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
-                        crate::analyzer::common::language_for_file(file),
-                        operation.as_str(),
-                        error.to_string(),
-                    ))
-                    .or_default() += 1;
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=provider:receiver detail={error:?}",
+                        file!(),
+                        line!()
+                    )
+                });
+                analyzer.mark_execution_dependent();
+                receiver_diagnostics.push((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
+                    crate::analyzer::common::language_for_file(file),
+                    operation.as_str(),
+                    error.to_string(),
+                    None,
+                ));
                 break;
             }
         };
@@ -643,28 +658,34 @@ pub(super) fn receiver_analysis_expansions(
                 } else {
                     format!("unsupported provider or shape: {reason}")
                 };
-                *receiver_diagnostics
-                    .entry((
-                        CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
-                        language,
-                        operation.as_str(),
-                        detail,
-                    ))
-                    .or_default() += 1;
+                receiver_diagnostics.push((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                    language,
+                    operation.as_str(),
+                    detail,
+                    None,
+                ));
             }
             ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::ExceededBudget { limit })
             | ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
                 limit,
             }) => {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause=budget:receiver",
+                        file!(),
+                        line!()
+                    )
+                });
+                analyzer.mark_execution_dependent();
                 *receiver_truncated = true;
-                *receiver_diagnostics
-                    .entry((
-                        CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
-                        language,
-                        operation.as_str(),
-                        format!("exceeded receiver limit {limit}"),
-                    ))
-                    .or_default() += 1;
+                receiver_diagnostics.push((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                    language,
+                    operation.as_str(),
+                    format!("exceeded receiver limit {limit}"),
+                    Some(DerivationExecutionCause::Budget),
+                ));
             }
             ReceiverQueryAnalysis::Values(
                 ReceiverAnalysisOutcome::Precise(_)
@@ -678,28 +699,34 @@ pub(super) fn receiver_analysis_expansions(
             ) => {}
         }
         if let Some(capability) = report.semantic_unsupported {
-            *receiver_diagnostics
-                .entry((
-                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
-                    language,
-                    operation.as_str(),
-                    format!(
-                        "semantic evidence is incomplete because {} is unsupported",
-                        capability.label()
-                    ),
-                ))
-                .or_default() += 1;
+            receiver_diagnostics.push((
+                CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                language,
+                operation.as_str(),
+                format!(
+                    "semantic evidence is incomplete because {} is unsupported",
+                    capability.label()
+                ),
+                None,
+            ));
         }
         if report.candidates_truncated {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=budget:receiver_candidates",
+                    file!(),
+                    line!()
+                )
+            });
+            analyzer.mark_execution_dependent();
             *receiver_truncated = true;
-            *receiver_diagnostics
-                .entry((
-                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
-                    language,
-                    operation.as_str(),
-                    "truncated candidates at max_targets".to_string(),
-                ))
-                .or_default() += 1;
+            receiver_diagnostics.push((
+                CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                language,
+                operation.as_str(),
+                "truncated candidates at max_targets".to_string(),
+                Some(DerivationExecutionCause::Budget),
+            ));
         }
         let (site_id, site_ast_id) = receiver_site_identity(analyzer, &report, structural_facts);
         let value = ReceiverAnalysisValue {
@@ -786,14 +813,15 @@ pub(super) fn record_receiver_pipeline_output_omission(
     operation: ReceiverQueryOperation,
     omitted: usize,
 ) {
-    *diagnostics
-        .entry((
+    diagnostics.extend((0..omitted).map(|_| {
+        (
             CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
             crate::analyzer::common::language_for_file(file),
             operation.as_str(),
             RECEIVER_PIPELINE_OUTPUT_CAP_REASON.to_string(),
-        ))
-        .or_default() += omitted;
+            Some(DerivationExecutionCause::Budget),
+        )
+    }));
 }
 
 pub(super) fn receiver_budget_for_remaining_work(

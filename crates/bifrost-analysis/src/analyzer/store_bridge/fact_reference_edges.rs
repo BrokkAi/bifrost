@@ -5,9 +5,9 @@
 //! inventory without collapsing positive routes into its incompleteness gap.
 
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    FileResolutionFacts, PositionedIdentifierFact, ResolutionIdentifierRole, ResolutionMemberKind,
-    ResolutionMemberOwnerFact, ResolutionNamespace, ResolutionSiteFact, ResolutionSiteId,
-    ResolutionSiteKind, ResolutionTypeTransferKind,
+    FileResolutionFacts, PositionedIdentifierFact, ResolutionCallableReceiverOrigin,
+    ResolutionIdentifierRole, ResolutionMemberKind, ResolutionMemberOwnerFact, ResolutionNamespace,
+    ResolutionSiteFact, ResolutionSiteId, ResolutionSiteKind, ResolutionTypeTransferKind,
 };
 
 use crate::analyzer::resolution::LoweredTypedFragment;
@@ -532,6 +532,8 @@ pub struct FactReferenceEdgeCatalog<'analyzer> {
     // Query-local crosswalk, including internal synthetic references whose
     // metadata is deliberately not published by the resolver.
     reference_facts: HashMap<SemanticId, (String, FactReferenceSiteMetadata)>,
+    // Exact binder-reference to authored-definition identities, query-local.
+    binding_declarations: HashMap<SemanticId, SemanticId>,
 }
 
 /// Request-scoped catalog and memo shared by native forward graph providers.
@@ -651,7 +653,34 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
             lookup_impacts_by_reference: HashMap::default(),
             targets_by_lookup: HashMap::default(),
             reference_facts: HashMap::default(),
+            binding_declarations: HashMap::default(),
         }
+    }
+
+    pub(crate) fn replace_binding_declarations(
+        &mut self,
+        declarations: impl IntoIterator<Item = (SemanticId, SemanticId)>,
+    ) -> StoreResult<()> {
+        self.binding_declarations.clear();
+        for (reference, declaration) in declarations {
+            self.insert_binding_declaration(reference, declaration)?;
+        }
+        Ok(())
+    }
+
+    fn insert_binding_declaration(
+        &mut self,
+        reference: SemanticId,
+        declaration: SemanticId,
+    ) -> StoreResult<()> {
+        if let Some(previous) = self.binding_declarations.insert(reference, declaration)
+            && previous != declaration
+        {
+            return Err(StoreError::corrupt(format!(
+                "binding target {reference:?} has conflicting authored declarations: {previous:?}, {declaration:?}"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn replace_reference_facts(
@@ -1158,13 +1187,11 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
         for (&reference, &origin) in &callable_receiver_origins {
             let expected = expected_semantics.get(&(reference, LoweredSemanticRole::Reference));
             if expected.is_none_or(|expected| {
-                expected.identifier.namespace != ResolutionNamespace::Callable
-                    || !matches!(
-                        expected.site.kind,
-                        ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
-                    )
-                    || !origin
-                        .is_reference_qualification_valid(expected.identifier.qualifier.is_none())
+                !origin.is_reference_valid(
+                    expected.identifier.namespace,
+                    expected.site.kind,
+                    expected.identifier.qualifier.is_none(),
+                )
             }) {
                 return Err(StoreError::new(format!(
                     "selected native reference-edge callable receiver origin is misaligned in {file:?}: reference={reference:?}, origin={origin:?}, expected={expected:?}"
@@ -1240,6 +1267,17 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
         drop(expected_receiver_input_slots);
         let mut lowered_receiver_dependency_sites = HashSet::default();
 
+        let binding_sites: HashSet<_> = facts
+            .binding_events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .authored_declaration
+                    .map(|authored| (event.target, authored))
+            })
+            .flat_map(|(target, authored)| [target, authored])
+            .collect();
+        let mut binding_semantics = HashMap::default();
         let mut definitions = Vec::new();
         let mut receiver_dependencies = HashSet::default();
         for lowered in lexical.semantics() {
@@ -1277,6 +1315,9 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
                 return Err(StoreError::new(format!(
                     "selected native reference-edge lowering is misaligned in {file:?}: lowered={lowered:?}, expected={expected:?}"
                 )));
+            }
+            if binding_sites.contains(&lowered.site()) {
+                binding_semantics.insert(key, lowered.semantic());
             }
             match lowered.role() {
                 LoweredSemanticRole::Definition => {
@@ -1331,7 +1372,7 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
                             != (expected.identifier.qualifier.is_none()
                                 && !root_references.contains(&expected.site.id))
                         || metadata.reference_owner() != expected_owner
-                        || metadata.callable_receiver_origin() != expected_receiver_origin
+                        || metadata.receiver_origin() != expected_receiver_origin
                     {
                         return Err(StoreError::new(format!(
                             "selected native reference-edge reference metadata is misaligned in {file:?}: lowered={lowered:?}, expected={expected:?}, reference_owner={expected_owner:?}, callable_receiver_origin={expected_receiver_origin:?}"
@@ -1412,6 +1453,21 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
             return Err(StoreError::new(format!(
                 "selected native reference-edge facts have no aligned lowered semantics in {file:?}: {expected_semantics:?}"
             )));
+        }
+        // Resolve through the aligned artifact rather than recreating semantic
+        // identities from site numbers: mounted macro identities can differ.
+        for event in &facts.binding_events {
+            let Some(authored) = event.authored_declaration else {
+                continue;
+            };
+            let reference = binding_semantics.get(&(event.target, LoweredSemanticRole::Reference));
+            let declaration = binding_semantics.get(&(authored, LoweredSemanticRole::Definition));
+            let (Some(&reference), Some(&declaration)) = (reference, declaration) else {
+                return Err(StoreError::new(format!(
+                    "selected binding event lacks aligned reference/definition semantics in {file:?}: {event:?}"
+                )));
+            };
+            self.insert_binding_declaration(reference, declaration)?;
         }
         // Every lowered receiver dependency belongs to a lexical semantic the
         // loop above visited, so the two counts agree unless the typed
@@ -3052,10 +3108,10 @@ pub fn classify_fact_reference_binding(
 /// One uniquely selected current target carries the incumbent `Proven` value
 /// even when strict semantic completion remains open. An inconsistent
 /// precedence marks ambiguous selection, separately from incompleteness, and
-/// cannot prove an edge even if its paths reach one declaration. Multiple retained alternatives
-/// remain `Unproven`. The projection status continues to report complete,
-/// ambiguous, binding-incomplete, and receiver-incomplete states without
-/// suppressing or relabeling the current target inventory. Structured
+/// withholds all graph targets even if its paths reach one declaration. Other
+/// multiple retained alternatives remain `Unproven`. The projection status
+/// continues to report complete, ambiguous, binding-incomplete, and
+/// receiver-incomplete states. Structured
 /// dependencies and out-of-domain occurrences emit neither inventory nor a
 /// graph gap.
 pub fn project_fact_reference_targets<'answer>(
@@ -3120,7 +3176,15 @@ pub fn project_fact_reference_targets<'answer>(
             completion,
         } => FactReferenceTargetProjection {
             binding_shape,
-            targets: retained_targets,
+            // The language refused to order these candidates, so none is a
+            // graph target, even when several paths reach one declaration.
+            targets: if matches!(completion, ResolutionCompletion::Incomplete(reasons)
+                if reasons.iter().any(|reason| matches!(reason, ResolutionIncompleteReason::InconsistentPrecedence(_))))
+            {
+                &[]
+            } else {
+                retained_targets
+            },
             proof: current_target_usage_proof(binding),
             status: FactReferenceProjectionStatus::Incomplete(completion),
         },
@@ -3139,7 +3203,7 @@ pub fn project_fact_reference_targets<'answer>(
 /// that compiles does not call a member its receiver lacks.
 ///
 /// The reverse route keeps exactly these sites as unproven candidates for a
-/// same-named member (`rust_reverse_rows::undecided_callable_receiver`), so
+/// same-named member (`resolution::undecided_callable_receiver`), so
 /// answering the same site here as a decided absence is the two routes
 /// contradicting each other about one occurrence. This is the reverse's
 /// predicate: a receiver that is an independent declared bound, or one whose
@@ -3147,19 +3211,13 @@ pub fn project_fact_reference_targets<'answer>(
 /// enumerated. A receiver the route resolved to one exact type whose member
 /// set it did close is a decided absence, and stays one.
 ///
-/// A published receiver origin already asserts the callable namespace and a
-/// terminal callable reference site; `FactReferenceSiteMetadata::new` refuses
-/// any other combination, so the site shape is read from the origin alone.
+/// `FactReferenceSiteMetadata::new` also permits field origins on `Value` or
+/// `TypeOrValue` member-reference sites. This predicate sees only callable
+/// origins because `callable_receiver_origin()` filters by namespace and site
+/// kind.
 fn undecided_callable_receiver_site(answer: &FactBatchedReferenceAnswer) -> bool {
-    let binding = answer.answer().binding();
-    let origin = answer.callable_receiver_origin();
-    binding.targets().is_empty()
-        && origin.is_some()
-        && (answer.answer().type_bound_receiver()
-            || crate::analyzer::resolution::callable_receiver_is_incomplete(
-                origin,
-                binding.completion(),
-            ))
+    answer.callable_receiver_origin().is_some()
+        && crate::analyzer::resolution::undecided_callable_receiver(answer.answer())
 }
 
 /// Attribute withheld edges without changing drawn-edge admission.
@@ -3358,9 +3416,17 @@ pub fn finish_fact_reference_edge_batch(
 
 fn graph_target(
     catalog: &FactReferenceEdgeCatalog<'_>,
+    reference: SemanticId,
     semantic: SemanticId,
     source_language: Language,
 ) -> StoreResult<Option<CodeUnit>> {
+    // A binder selecting its own authored definition is a declaration site,
+    // not a use. Exclude it before owner, withheld-reference, and kind accounting.
+    // Recursive calls are different reference identities even when their target
+    // and owner are equal; imports selecting another declaration remain uses.
+    if catalog.binding_declarations.get(&reference) == Some(&semantic) {
+        return Ok(None);
+    }
     let target = match catalog.declaration(semantic)? {
         FactReferenceEdgeDeclaration::Graph(declaration) => declaration.clone(),
         FactReferenceEdgeDeclaration::OutOfGraphDomain => return Ok(None),
@@ -3762,6 +3828,13 @@ pub fn project_fact_reference_edge_batch(
                 .push((site.clone(), name));
         }
 
+        let projection =
+            project_fact_reference_targets(binding, FactReferenceGraphAdmission::GraphCandidate);
+        if projection.targets().is_empty() {
+            // Incomplete sites were retained above for the named withheld pass.
+            continue;
+        }
+
         if metadata.namespace() == ResolutionNamespace::Callable
             && metadata.site_kind() != ResolutionSiteKind::ImportDeclaration
         {
@@ -3786,6 +3859,7 @@ pub fn project_fact_reference_edge_batch(
                 let admission = projection.admission();
                 let Some(target) = graph_target(
                     catalog,
+                    answer.reference(),
                     projection.target(),
                     file.file().declaration_language(),
                 )?
@@ -3880,8 +3954,6 @@ pub fn project_fact_reference_edge_batch(
             continue;
         }
 
-        let projection =
-            project_fact_reference_targets(binding, FactReferenceGraphAdmission::GraphCandidate);
         let Some(proof) = projection.proof() else {
             continue;
         };
@@ -3890,8 +3962,12 @@ pub fn project_fact_reference_edge_batch(
             if cancellation.is_cancelled() {
                 return Ok(cancelled_edge_batch(batch.fragment(), catalog.generation));
             }
-            let Some(target) =
-                graph_target(catalog, target_semantic, file.file().declaration_language())?
+            let Some(target) = graph_target(
+                catalog,
+                answer.reference(),
+                target_semantic,
+                file.file().declaration_language(),
+            )?
             else {
                 continue;
             };
@@ -3954,7 +4030,9 @@ pub fn project_fact_reference_edge_batch(
                 continue;
             }
             let same_owner_inventory = value_like
-                && (owner_relation == OwnerRelation::SelfReference
+                && (metadata.receiver_origin()
+                    == Some(ResolutionCallableReceiverOrigin::CurrentInstance)
+                    || owner_relation == OwnerRelation::SelfReference
                     || (metadata.unqualified()
                         && is_same_owner_member_reference(owner_relation, &target)));
             push_reference_edges(
@@ -3968,7 +4046,15 @@ pub fn project_fact_reference_edge_batch(
                 owner_relation,
                 proof,
                 projection.status() == FactReferenceProjectionStatus::Ambiguous,
-                if metadata.site_kind() == ResolutionSiteKind::ImportDeclaration {
+                if metadata.site_kind() == ResolutionSiteKind::ImportDeclaration
+                    || file.classifier.as_ref().is_some_and(|classifier| {
+                        classifier.is_import_binding_reference(
+                            file.file(),
+                            range.start_byte,
+                            range.end_byte,
+                        )
+                    })
+                {
                     &[UsageHitKind::Import]
                 } else if same_owner_inventory {
                     &[UsageHitKind::SelfReceiver]

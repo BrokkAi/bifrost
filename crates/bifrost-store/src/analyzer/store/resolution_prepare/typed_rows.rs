@@ -53,7 +53,7 @@ use crate::analyzer::resolution::{
     LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
     LoweredDeferredMemberOwner, LoweredDefinitionPropertyGap, LoweredGenericTypeAliasParameter,
     LoweredIntrinsicSeed, LoweredIntrinsicTypeDescriptor, LoweredMemberOwnerProperty,
-    LoweredQualifiedSeededRoute, LoweredSupertypeProperty, LoweredTypeArgument,
+    LoweredQualifiedSeededRoute, LoweredSourceSupertypeProperty, LoweredTypeArgument,
     LoweredTypeComponent, LoweredTypeTransfer, LoweredTypedFragment, LoweredTypedFrontier,
     LoweredUnderlyingType, PartialPathId, ResolutionCompletion, ResolutionIdentityCatalog,
     ResolutionIncompleteReason, ResolutionSlotValue, ResolutionTypeRef, SemanticId, SharedNameId,
@@ -1947,7 +1947,7 @@ pub(crate) fn decode_supertype(
     frontier: i64,
     kind: i64,
     parent_ordinal: i64,
-) -> LoweredSupertypeProperty {
+) -> LoweredSourceSupertypeProperty {
     decode_supertype_fields(
         context.semantic(definition),
         context.semantic(reference),
@@ -1963,8 +1963,8 @@ pub(crate) fn decode_supertype_fields(
     frontier: SemanticId,
     kind: i64,
     parent_ordinal: i64,
-) -> LoweredSupertypeProperty {
-    LoweredSupertypeProperty::new(
+) -> LoweredSourceSupertypeProperty {
+    LoweredSourceSupertypeProperty::new(
         definition,
         reference,
         frontier,

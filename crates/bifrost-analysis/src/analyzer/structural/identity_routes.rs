@@ -941,4 +941,287 @@ pub const IDENTITY_ROUTE_PRODUCER_AXES: &[IdentityAxis] = &[
 pub mod test_support;
 
 #[cfg(test)]
-mod tests {}
+pub(super) mod tests {
+    use super::*;
+    use crate::analyzer::{
+        CodeUnitIndex, CodeUnitType, DeclarationInfo, FqName, Language, Project, SignatureMetadata,
+        TestProject,
+    };
+    use std::collections::BTreeSet;
+
+    pub(crate) struct MetadataAnalyzer {
+        project: TestProject,
+        pub metadata: Vec<SignatureMetadata>,
+        pub units: Vec<CodeUnit>,
+        pub imports: Vec<crate::analyzer::ImportInfo>,
+    }
+    impl MetadataAnalyzer {
+        pub fn new(root: &std::path::Path) -> Self {
+            Self {
+                project: TestProject::new(root.to_path_buf(), Language::Python),
+                metadata: vec![],
+                units: vec![],
+                imports: vec![],
+            }
+        }
+    }
+    impl CodeUnitIndex for MetadataAnalyzer {
+        fn project(&self) -> &dyn Project {
+            &self.project
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([Language::Python])
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(self.units.iter().cloned())
+        }
+        fn declarations(&self, _: &ProjectFile) -> BTreeSet<CodeUnit> {
+            self.units.iter().cloned().collect()
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+            None
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            None
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+        fn signature_metadata(&self, _: &CodeUnit) -> Vec<SignatureMetadata> {
+            self.metadata.clone()
+        }
+    }
+    impl crate::analyzer::ImportAnalysisProvider for MetadataAnalyzer {
+        fn imported_code_units_of(
+            &self,
+            _: &ProjectFile,
+        ) -> std::sync::Arc<crate::hash::HashSet<CodeUnit>> {
+            unimplemented!()
+        }
+        fn referencing_files_of(&self, _: &ProjectFile) -> crate::hash::HashSet<ProjectFile> {
+            unimplemented!()
+        }
+        fn import_info_of(
+            &self,
+            _: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+            _: &ProjectFile,
+        ) -> Vec<crate::analyzer::ImportInfo> {
+            self.imports.clone()
+        }
+    }
+    impl IAnalyzer for MetadataAnalyzer {
+        fn import_analysis_provider(&self) -> Option<&dyn crate::analyzer::ImportAnalysisProvider> {
+            Some(self)
+        }
+
+        fn update(&self, _: &BTreeSet<ProjectFile>) -> Self {
+            unimplemented!()
+        }
+        fn update_all(&self) -> Self {
+            unimplemented!()
+        }
+        fn is_access_expression(&self, _: &ProjectFile, _: usize, _: usize) -> bool {
+            unimplemented!()
+        }
+        fn find_nearest_declaration(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+            _: &str,
+        ) -> Option<DeclarationInfo> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn canonical_arity_is_consensus_over_recorded_renderings() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut analyzer = MetadataAnalyzer::new(temp.path());
+        let unit = CodeUnit::new(
+            ProjectFile::new(temp.path(), "example.py"),
+            CodeUnitType::Class,
+            "p",
+            "C",
+        );
+        for arities in [
+            vec![],
+            vec![0],
+            vec![1, 1, 1],
+            vec![0, 1, 2],
+            vec![2, 0, 1],
+            vec![1, 2, 0],
+            vec![2, 2, 0],
+        ] {
+            let unique = arities.iter().copied().collect::<BTreeSet<_>>();
+            let expected = if unique.len() == 1 {
+                unique.first().copied()
+            } else {
+                None
+            };
+            for reverse in [false, true] {
+                analyzer.metadata = arities
+                    .iter()
+                    .map(|&arity| {
+                        SignatureMetadata::new("rendering", vec![]).with_recorded_type_parameters(
+                            (0..arity).map(|i| format!("T{i}")).collect(),
+                        )
+                    })
+                    .collect();
+                analyzer
+                    .metadata
+                    .push(SignatureMetadata::new("unrecorded", vec![]));
+                if reverse {
+                    analyzer.metadata.reverse();
+                }
+                assert_eq!(
+                    canonical_identity_of(&analyzer, &unit).generic_arity,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_owner_rows_follow_supplied_declaration_tree() {
+        use crate::analyzer::fq_name::{SegmentKind, segment_interner};
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path(), "example.py");
+        let mut analyzer = MetadataAnalyzer::new(temp.path());
+        // The indices are lexical parents, independent of identity depth.
+        let tree = [
+            ("p", None),
+            ("Outer", Some(0)),
+            ("Inner", Some(1)),
+            ("member", Some(2)),
+            ("sibling", Some(0)),
+        ];
+        for (index, (name, parent)) in tree.iter().enumerate() {
+            let mut fq =
+                parent.map_or_else(FqName::new, |parent| analyzer.units[parent].fq().clone());
+            fq.push(segment_interner().intern(
+                name,
+                if index == 0 {
+                    SegmentKind::Package
+                } else {
+                    SegmentKind::Type
+                },
+            ));
+            analyzer.units.push(CodeUnit::from_fq(
+                file.clone(),
+                if index == 0 {
+                    CodeUnitType::Module
+                } else {
+                    CodeUnitType::Class
+                },
+                fq,
+                if index == 0 { 0 } else { 1 },
+                None,
+                false,
+            ));
+        }
+        let expected = BTreeSet::from([
+            ("Inner".to_owned(), "Outer".to_owned()),
+            ("member".to_owned(), "Inner".to_owned()),
+        ]);
+        for reverse in [false, true] {
+            if reverse {
+                analyzer.units.reverse();
+            }
+            let mut rows = vec![];
+            let mut reasons = vec![];
+            let support = super::super::routes::IdentityRouteSupport::NONE
+                .supported_relation(RouteHopKind::NestedOwner);
+            declaration_relation_rows(&analyzer, &file, &support, &mut rows, &mut reasons);
+            let actual = rows
+                .iter()
+                .filter(|row| row.kind == RouteHopKind::NestedOwner)
+                .map(|row| {
+                    let RouteEndpoint::Declaration(from) = &row.from else {
+                        panic!("declaration")
+                    };
+                    let RouteEndpoint::Declaration(to) = &row.to else {
+                        panic!("declaration")
+                    };
+                    (from.identifier().to_owned(), to.identifier().to_owned())
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+    #[test]
+    fn route_fanout_is_truncated_only_when_a_relation_is_omitted() {
+        use crate::analyzer::fq_name::{SegmentKind, segment_interner};
+        let temp = tempfile::tempdir().unwrap();
+        let mut owner_fq = FqName::new();
+        owner_fq.push(segment_interner().intern("Owner", SegmentKind::Type));
+        let mut child_fq = owner_fq.clone();
+        child_fq.push(segment_interner().intern("Child", SegmentKind::Type));
+        for count in [
+            MAX_ROUTE_FAN_OUT - 1,
+            MAX_ROUTE_FAN_OUT,
+            MAX_ROUTE_FAN_OUT + 1,
+        ] {
+            let mut analyzer = MetadataAnalyzer::new(temp.path());
+            let child = CodeUnit::from_fq(
+                ProjectFile::new(temp.path(), "child.py"),
+                CodeUnitType::Class,
+                child_fq.clone(),
+                0,
+                None,
+                false,
+            );
+            analyzer.units.push(child.clone());
+            let owners: BTreeSet<_> = (0..count)
+                .map(|id| {
+                    CodeUnit::from_fq(
+                        ProjectFile::new(temp.path(), format!("owner{id}.py")),
+                        CodeUnitType::Class,
+                        owner_fq.clone(),
+                        0,
+                        None,
+                        false,
+                    )
+                })
+                .collect();
+            analyzer.units.extend(owners.iter().cloned());
+            let routes = identity_routes_from(
+                &analyzer,
+                &RouteEndpoint::Declaration(child),
+                Some(&[RouteHopKind::NestedOwner]),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+            let terminals: BTreeSet<_> = routes
+                .iter()
+                .filter_map(|route| route.terminal_declaration().cloned())
+                .collect();
+            assert_eq!(terminals.len(), count.min(MAX_ROUTE_FAN_OUT));
+            assert!(terminals.is_subset(&owners));
+            if count <= MAX_ROUTE_FAN_OUT {
+                assert_eq!(terminals, owners);
+            }
+            assert_eq!(
+                routes
+                    .iter()
+                    .filter(|route| route.termination == RouteTermination::FanOutTruncated)
+                    .count(),
+                usize::from(count > MAX_ROUTE_FAN_OUT)
+            );
+        }
+    }
+}

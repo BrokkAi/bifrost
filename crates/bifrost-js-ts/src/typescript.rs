@@ -964,19 +964,9 @@ fn ts_source_function_preserves_parameter_shape(
     function_name: &str,
     parameter_index: usize,
 ) -> ShapePreservation {
-    let root = root_node(anchor);
-    let mut functions = Vec::new();
-    collect_function_nodes(root, source, function_name, &mut functions);
-    if functions.is_empty() {
-        return ShapePreservation::Unknown;
-    }
-    if functions.into_iter().any(|function| {
+    source_function_shape_preservation(anchor, source, function_name, |function| {
         ts_function_node_preserves_parameter_shape(function, source, parameter_index)
-    }) {
-        ShapePreservation::Preserves
-    } else {
-        ShapePreservation::DoesNotPreserve
-    }
+    })
 }
 
 fn ts_surface_call_object_argument<'tree>(
@@ -1363,9 +1353,9 @@ fn visit_ts_method(
     let signature = match node.kind() {
         "method_definition" => format!(
             "{} {{ ... }}",
-            trim_statement(node_text(node, source).split('{').next().unwrap_or(""))
+            trim_statement(declaration_header(node, source))
         ),
-        _ => trim_statement(node_text(node, source).split('{').next().unwrap_or("")),
+        _ => trim_statement(declaration_header(node, source)),
     };
     // A bodiless `method_signature` in a class body is an overload signature
     // (or an ambient member): declaration-only, like `function_signature` at
@@ -1486,41 +1476,26 @@ fn visit_ts_enum_member(
         Some(top_level.clone()),
     );
     let raw = trim_statement(node_text(node, source));
-    let suffix = source
-        .get(node.end_byte()..)
-        .map(str::trim_start)
-        .filter(|tail| tail.starts_with(','))
-        .map(|_| ",")
-        .unwrap_or("");
+    let mut following = node.next_sibling();
+    while let Some(sibling) = following {
+        if !sibling.is_extra() {
+            break;
+        }
+        following = sibling.next_sibling();
+    }
+    let suffix = if following.is_some_and(|sibling| sibling.kind() == ",") {
+        ","
+    } else {
+        ""
+    };
     parsed.add_signature(code_unit, format!("{raw}{suffix}"));
 }
 
 fn ts_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-    let text = if node.kind() == "export_statement" {
-        node_text(node, source)
-    } else {
-        node_text(definition, source)
-    };
-    let head = trim_statement(text.split('{').next().unwrap_or(text));
-    if definition.kind() == "enum_declaration" {
-        let open = format!(
-            "{} {{",
-            if exported && !head.starts_with("export ") {
-                format!("export {head}")
-            } else {
-                head
-            }
-        );
-        return open;
-    }
+    let head = trim_statement(declaration_header(node, source));
     format!(
         "{} {{",
-        if exported && !head.starts_with("export ") {
+        if exported && node.kind() != "export_statement" {
             format!("export {head}")
         } else {
             head
@@ -1529,8 +1504,7 @@ fn ts_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
 }
 
 fn ts_default_export_class_signature(export: Node<'_>, source: &str) -> String {
-    let text = node_text(export, source);
-    let head = trim_statement(text.split('{').next().unwrap_or(text));
+    let head = trim_statement(declaration_header(export, source));
     format!("{head} {{")
 }
 
@@ -1540,17 +1514,8 @@ fn ts_function_signature(node: Node<'_>, source: &str, exported: bool) -> String
     } else {
         node
     };
-    let head = trim_statement(
-        if node.kind() == "export_statement" {
-            node_text(node, source)
-        } else {
-            node_text(definition, source)
-        }
-        .split('{')
-        .next()
-        .unwrap_or(node_text(definition, source)),
-    );
-    let head = if exported && !head.starts_with("export ") {
+    let head = trim_statement(declaration_header(node, source));
+    let head = if exported && node.kind() != "export_statement" {
         format!("export {head}")
     } else {
         head
@@ -1563,8 +1528,7 @@ fn ts_function_signature(node: Node<'_>, source: &str, exported: bool) -> String
 }
 
 fn ts_default_export_function_signature(function: Node<'_>, source: &str) -> String {
-    let text = node_text(function, source);
-    let async_prefix = if text.trim_start().starts_with("async ") {
+    let async_prefix = if is_async_callable(function) {
         "async "
     } else {
         ""
@@ -1652,12 +1616,7 @@ fn ts_field_signature(node: Node<'_>, source: &str) -> String {
     if let Some(value) = node.child_by_field_name("value")
         && !is_simple_js_ts_initializer(value)
     {
-        return raw
-            .split('=')
-            .next()
-            .map(trim_statement)
-            .filter(|header| !header.is_empty())
-            .unwrap_or(raw);
+        return trim_statement(declaration_initializer_header(node, source));
     }
     raw
 }
@@ -1909,6 +1868,170 @@ mod recovered_member_name_tests {
             minted(&parsed),
             vec![("C".to_string(), false)],
             "a nameless recovered field is unaddressable and is skipped: {parsed:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod typescript_declaration_surface_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: brace and equals scans truncate TypeScript declaration signatures"
+    )]
+    fn typescript_signature_syntax_boundaries() {
+        let mut failures = Vec::new();
+        for (source, expected) in [
+            (
+                "export/*comment*/interface Box {}",
+                "export/*comment*/interface Box {",
+            ),
+            (
+                "export/*comment*/function f() {}",
+                "export/*comment*/function f() { ... }",
+            ),
+            (
+                "class Box { method({x}: {x:number}): {x:number} {return {x};} }",
+                "method({x}: {x:number}): {x:number} { ... }",
+            ),
+            (
+                "interface Box { method(): {x:number}; }",
+                "method(): {x:number}",
+            ),
+            ("enum Box { A /*comment*/, B }", "A,"),
+            (
+                "export interface Box<T = {x:number}> {}",
+                "export interface Box<T = {x:number}> {",
+            ),
+            (
+                "export function f({x}: {x:number}) {}",
+                "export function f({x}: {x:number}) { ... }",
+            ),
+            (
+                "export default class<T extends {x:number}> {run(){return 1;}}",
+                "export default class<T extends {x:number}> {",
+            ),
+            (
+                "class Box { handler: (x:number)=>number = external(); }",
+                "handler: (x:number)=>number",
+            ),
+        ] {
+            let tree = crate::test_support::parse_typescript(source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let dir = tempfile::tempdir().unwrap();
+            let file = ProjectFile::new(dir.path().canonicalize().unwrap(), "signature.ts");
+            let parsed = parse_typescript_file(&file, source, &tree);
+            let signatures: Vec<_> = parsed
+                .signatures
+                .values()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            if !signatures.contains(&expected) {
+                failures.push(format!(
+                    "{source}: expected {expected:?}, got {signatures:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn ts_export_forms() {
+        crate::javascript::declaration_surface_tests::assert_surface_golden(
+            "ts_export_forms",
+            &[
+                "declare global { type Token = string; }",
+                "export type Token = string; namespace N {export type Config={}; export const Config=1;}",
+                "export default { run() {}, key: 1 };",
+                "export default class extends Base {run(){return 1;}}",
+                "export default (value: string)=>value;",
+            ],
+            typescript_declaration_snapshot,
+        );
+    }
+
+    #[test]
+    fn ts_factory_scopes() {
+        crate::javascript::declaration_surface_tests::assert_surface_golden(
+            "ts_factory_scopes",
+            &[
+                "function outer(){function inner(){return {ghost:1};}return {};}",
+                "function build(x){const helper={m(){return x;}}; return 0;} export const value=build({ghost:1});",
+                "class C { constructor(){const helper={m(){this.ghost=1;}};this.own=1;} }",
+                "function wrap(config: Object){return config;} export const api=wrap({run(){}});",
+            ],
+            typescript_declaration_snapshot,
+        );
+    }
+    #[test]
+    fn object_key_grammar_boundary() {
+        let source = "const value: I = { pair: 1, shorthand, run() {} };";
+        let tree = crate::test_support::parse_typescript(source);
+        assert!(!tree.root_node().has_error());
+        let object = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("value")
+            .unwrap();
+        for index in 0..object.named_child_count() {
+            let property = object.named_child(index).unwrap();
+            let key = crate::syntax::object_literal_property_key_node(property).unwrap();
+            for node in [property, key] {
+                let (selected, owner, name) =
+                    ts_object_literal_property_at_key(node, source).unwrap();
+                assert_eq!(selected, property);
+                assert_eq!(owner, object);
+                assert_eq!(name, crate::syntax::slice(key, source));
+            }
+        }
+    }
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: variable headers truncate function types"
+    )]
+    fn variable_function_type_header_keeps_arrow() {
+        let source = "export const handler: (x:number)=>number = external;";
+        let snapshot = typescript_declaration_snapshot(source);
+        assert!(
+            snapshot.contains("export const handler: (x:number)=>number = external"),
+            "{snapshot}"
+        );
+    }
+    fn typescript_declaration_snapshot(source: &str) -> String {
+        let tree = crate::test_support::parse_typescript(source);
+        assert!(
+            !tree.root_node().has_error(),
+            "{source}: {}",
+            tree.root_node().to_sexp()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(dir.path().canonicalize().unwrap(), "surface.ts");
+        crate::javascript::declaration_surface_tests::parsed_snapshot(parse_typescript_file(
+            &file, source, &tree,
+        ))
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: an outer factory supplied a shadowed inner call's return shape"
+    )]
+    fn shadowed_factory_shape() {
+        let source = "function identity(x){return x;} function scope(){function identity(x){return 0;} const v=identity({ghost:1});}";
+        let tree = crate::test_support::parse_typescript(source);
+        let call = crate::test_support::first_named_node_matching_reverse_preorder(
+            tree.root_node(),
+            |node| node.kind() == "call_expression",
+        )
+        .unwrap();
+        assert_eq!(
+            ts_call_object_argument_shape_preservation(call, call, source, 0),
+            ShapePreservation::DoesNotPreserve
         );
     }
 }

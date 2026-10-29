@@ -129,6 +129,12 @@ where
 
 pub(crate) struct CSharpMemoCaches {
     budget_bytes: u64,
+    /// Source-local rows, capped at memo budget / 16 bytes (16 MiB by default),
+    /// with the same key and retained-byte weighting as Java's statement cache.
+    pub(crate) statement_facts: Cache<
+        (brokk_bifrost_analysis::analyzer::Oid, ProjectFile),
+        Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>,
+    >,
     /// Immutable candidate and target facts, shared by all queries in this
     /// generation. Updates and project overlays replace the entire memo bundle.
     pub(crate) reachability: PoolSafeMemo<
@@ -214,6 +220,18 @@ impl CSharpMemoCaches {
     pub(crate) fn new(budget_bytes: u64) -> Self {
         Self {
             budget_bytes,
+            statement_facts:
+                build_weighted_cache(
+                    budget_bytes / 16,
+                    |key: &(brokk_bifrost_analysis::analyzer::Oid, ProjectFile),
+                     rows: &Arc<
+                        brokk_bifrost_core::analyzer::statement_facts::StatementFactRows,
+                    >| {
+                        weight_bytes(
+                            estimate_project_file(&key.1) + rows.estimated_retained_bytes() as u64,
+                        )
+                    },
+                ),
             reachability: PoolSafeMemo::new(),
             namespace_by_file: build_weighted_cache(budget_bytes / 16, weight_string),
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),

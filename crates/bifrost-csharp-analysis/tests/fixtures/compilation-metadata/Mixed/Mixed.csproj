@@ -1,0 +1,3 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework /><TargetFrameworks>net48;net8.0</TargetFrameworks><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+</Project>

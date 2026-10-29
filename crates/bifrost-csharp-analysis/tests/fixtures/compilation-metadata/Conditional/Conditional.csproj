@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><ImplicitUsings Condition="'$(Configuration)' == 'Debug'">enable</ImplicitUsings><AssemblyName>$(ComputedName)</AssemblyName></PropertyGroup>
+  <ItemGroup Condition="'$(Configuration)' == 'Debug'">
+    <Using Include="Conditional.Namespace" />
+    <InternalsVisibleTo Include="Conditional.Friend" />
+  </ItemGroup>
+</Project>

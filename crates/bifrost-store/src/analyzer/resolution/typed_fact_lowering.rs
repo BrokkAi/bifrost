@@ -963,7 +963,17 @@ pub struct LoweredSupertypeProperty {
     target: LoweredSupertypeTarget,
 }
 
-impl LoweredSupertypeProperty {
+/// A supertype edge lowered from source and eligible for persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoweredSourceSupertypeProperty {
+    definition: SemanticId,
+    reference: SemanticId,
+    frontier: SemanticId,
+    kind: ResolutionSupertypeKind,
+    parent_ordinal: u32,
+}
+
+impl LoweredSourceSupertypeProperty {
     pub const fn new(
         definition: SemanticId,
         reference: SemanticId,
@@ -975,12 +985,64 @@ impl LoweredSupertypeProperty {
             definition,
             reference,
             frontier,
-            kind: Some(kind),
+            kind,
             parent_ordinal,
-            target: LoweredSupertypeTarget::SelectedReference(reference),
         }
     }
+    pub const fn definition(&self) -> SemanticId {
+        self.definition
+    }
+    pub const fn reference(&self) -> SemanticId {
+        self.reference
+    }
+    pub const fn frontier(&self) -> SemanticId {
+        self.frontier
+    }
+    pub const fn kind(&self) -> ResolutionSupertypeKind {
+        self.kind
+    }
+    pub const fn parent_ordinal(&self) -> u32 {
+        self.parent_ordinal
+    }
+}
 
+impl From<LoweredSourceSupertypeProperty> for LoweredSupertypeProperty {
+    fn from(source: LoweredSourceSupertypeProperty) -> Self {
+        Self {
+            definition: source.definition,
+            reference: source.reference,
+            frontier: source.frontier,
+            kind: Some(source.kind),
+            parent_ordinal: source.parent_ordinal,
+            target: LoweredSupertypeTarget::SelectedReference(source.reference),
+        }
+    }
+}
+
+impl super::mounted::SpliceMount for LoweredSupertypeProperty {
+    fn splice<T: super::local_identity::ResolutionIdentityTranslation>(
+        &self,
+        translation: &T,
+    ) -> Self {
+        Self {
+            definition: translation.semantic(self.definition),
+            reference: translation.semantic(self.reference),
+            frontier: translation.semantic(self.frontier),
+            kind: self.kind,
+            parent_ordinal: self.parent_ordinal,
+            target: match &self.target {
+                LoweredSupertypeTarget::SelectedReference(reference) => {
+                    LoweredSupertypeTarget::SelectedReference(translation.semantic(*reference))
+                }
+                LoweredSupertypeTarget::External(target) => {
+                    LoweredSupertypeTarget::External(target.clone())
+                }
+            },
+        }
+    }
+}
+
+impl LoweredSupertypeProperty {
     pub fn external(
         definition: SemanticId,
         reference: SemanticId,
@@ -1014,12 +1076,6 @@ impl LoweredSupertypeProperty {
         self.frontier
     }
 
-    pub const fn kind(&self) -> ResolutionSupertypeKind {
-        match self.kind {
-            Some(kind) => kind,
-            None => panic!("external inventory does not fabricate a source edge kind"),
-        }
-    }
     pub const fn source_kind(&self) -> Option<ResolutionSupertypeKind> {
         self.kind
     }
@@ -1273,6 +1329,33 @@ impl LoweredCallApplicabilityObligation {
 
     pub fn eligible_rules(&self) -> &[ResolutionEngineRuleKind] {
         &self.eligible_rules
+    }
+
+    /// Effective runtime binding authority; the persisted rule array is unchanged.
+    pub(crate) fn argument_independent_binding(
+        &self,
+        source: &dyn super::fact_source::SelectedTypedFactSource,
+    ) -> crate::analyzer::store::Result<bool> {
+        if self
+            .eligible_rules
+            .contains(&ResolutionEngineRuleKind::ArgumentIndependentBinding)
+        {
+            return Ok(true);
+        }
+        let language = if self.language == Language::None {
+            let fragment = BindingFragmentId::at_ordinal(
+                self.call
+                    .ordinal()
+                    .expect("a call obligation belongs to a source fragment"),
+            );
+            source.fragment_language(fragment)?
+        } else {
+            self.language
+        };
+        Ok(
+            crate::analyzer::semantic::languages::language_knowledge(language)
+                .is_some_and(|knowledge| !knowledge.call_applicability_may_select_callee()),
+        )
     }
 
     pub const fn explicit_type_argument_count(&self) -> u32 {
@@ -1907,7 +1990,7 @@ pub struct LoweredTypedFragment {
     member_owners: Vec<LoweredMemberOwnerProperty>,
     deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
     construction_requirements: Vec<LoweredConstructionRequirementProperty>,
-    supertypes: Vec<LoweredSupertypeProperty>,
+    supertypes: Vec<LoweredSourceSupertypeProperty>,
     property_gaps: Vec<LoweredDefinitionPropertyGap>,
     call_obligations: Vec<LoweredCallApplicabilityObligation>,
     callable_signatures: Vec<LoweredCallableSignatureProperty>,
@@ -2031,7 +2114,7 @@ impl LoweredTypedFragment {
         member_owners: Vec<LoweredMemberOwnerProperty>,
         deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
         construction_requirements: Vec<LoweredConstructionRequirementProperty>,
-        supertypes: Vec<LoweredSupertypeProperty>,
+        supertypes: Vec<LoweredSourceSupertypeProperty>,
         property_gaps: Vec<LoweredDefinitionPropertyGap>,
         call_obligations: Vec<LoweredCallApplicabilityObligation>,
         callable_signatures: Vec<LoweredCallableSignatureProperty>,
@@ -2080,7 +2163,7 @@ impl LoweredTypedFragment {
         mut member_owners: Vec<LoweredMemberOwnerProperty>,
         mut deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
         mut construction_requirements: Vec<LoweredConstructionRequirementProperty>,
-        mut supertypes: Vec<LoweredSupertypeProperty>,
+        mut supertypes: Vec<LoweredSourceSupertypeProperty>,
         mut property_gaps: Vec<LoweredDefinitionPropertyGap>,
         mut call_obligations: Vec<LoweredCallApplicabilityObligation>,
         mut callable_signatures: Vec<LoweredCallableSignatureProperty>,
@@ -2436,12 +2519,15 @@ impl LoweredTypedFragment {
                 transfer.rule.value_transform(),
             );
             match transfer.kind {
-                ResolutionTypeTransferKind::TypeIdentity => validate_type_identity_transfer(
-                    source_role,
-                    transfer.rule.indirection_delta(),
-                    transfer.rule.reference_indirection_delta(),
-                    transfer.rule.value_transform(),
-                ),
+                ResolutionTypeTransferKind::TypeIdentity
+                | ResolutionTypeTransferKind::ConditionalPayload => {
+                    validate_type_identity_transfer(
+                        source_role,
+                        transfer.rule.indirection_delta(),
+                        transfer.rule.reference_indirection_delta(),
+                        transfer.rule.value_transform(),
+                    )
+                }
                 ResolutionTypeTransferKind::TypeUnion | ResolutionTypeTransferKind::TypeAlias => {
                     assert_eq!(
                         source_role,
@@ -3143,7 +3229,7 @@ impl LoweredTypedFragment {
         &self.construction_requirements
     }
 
-    pub fn supertypes(&self) -> &[LoweredSupertypeProperty] {
+    pub fn supertypes(&self) -> &[LoweredSourceSupertypeProperty] {
         &self.supertypes
     }
 
@@ -3165,7 +3251,7 @@ struct LoweredDefinitionProperties {
     declaration_visibilities: Vec<LoweredDeclarationVisibilityProperty>,
     member_owners: Vec<LoweredMemberOwnerProperty>,
     construction_requirements: Vec<LoweredConstructionRequirementProperty>,
-    supertypes: Vec<LoweredSupertypeProperty>,
+    supertypes: Vec<LoweredSourceSupertypeProperty>,
     property_gaps: Vec<LoweredDefinitionPropertyGap>,
 }
 
@@ -3382,10 +3468,14 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                     | ResolutionSiteKind::TypeAliasDeclaration
                     | ResolutionSiteKind::CallableDeclaration
             ));
-            assert!(matches!(
-                index.definition_identifier(fact.owner).namespace,
-                ResolutionNamespace::Type | ResolutionNamespace::Callable
-            ));
+            assert!(
+                matches!(
+                    index.definition_identifier(fact.owner).namespace,
+                    ResolutionNamespace::Type | ResolutionNamespace::Callable
+                ) || (owner.kind == ResolutionSiteKind::CallableDeclaration
+                    && index.definition_identifier(fact.owner).namespace
+                        == ResolutionNamespace::Value)
+            );
             assert_eq!(
                 index.site(fact.parameter).kind,
                 ResolutionSiteKind::TypeDeclaration
@@ -4564,7 +4654,7 @@ fn lower_definition_properties_with_index(
             "duplicate supertype property: {fact:?}"
         );
         validate_supertype(fact, index, facts);
-        supertypes.push(LoweredSupertypeProperty::new(
+        supertypes.push(LoweredSourceSupertypeProperty::new(
             identities.source_definition_semantic(fact.subtype),
             identities.source_reference_semantic(fact.supertype_reference),
             identities.semantic(type_slot_semantic_identity(fact.supertype_slot)),
@@ -5462,7 +5552,8 @@ fn validate_transfer_roles(
         lower_value_transform(fact.value_transform),
     );
     match fact.kind {
-        ResolutionTypeTransferKind::TypeIdentity => validate_type_identity_transfer(
+        ResolutionTypeTransferKind::TypeIdentity
+        | ResolutionTypeTransferKind::ConditionalPayload => validate_type_identity_transfer(
             input,
             i64::from(fact.indirection_delta),
             i64::from(fact.reference_indirection_delta),
@@ -5730,7 +5821,10 @@ fn transfer_accepts_output_role(
     let expected = match kind {
         ResolutionTypeTransferKind::TypeIdentity
         | ResolutionTypeTransferKind::TypeUnion
-        | ResolutionTypeTransferKind::TypeAlias => ResolutionTypeSlotRole::TargetTypeIdentity,
+        | ResolutionTypeTransferKind::TypeAlias
+        | ResolutionTypeTransferKind::ConditionalPayload => {
+            ResolutionTypeSlotRole::TargetTypeIdentity
+        }
         ResolutionTypeTransferKind::DeclaredType => ResolutionTypeSlotRole::DeclaredValue,
         ResolutionTypeTransferKind::Initialization => ResolutionTypeSlotRole::DeclaredValue,
         ResolutionTypeTransferKind::Contextual => ResolutionTypeSlotRole::ExpressionValue,
@@ -6586,12 +6680,13 @@ fn construction_requirement_sort_key(
 }
 
 fn supertype_sort_key(
-    row: &LoweredSupertypeProperty,
-) -> (SemanticId, u32, u8, SemanticId, SemanticId) {
+    row: &LoweredSourceSupertypeProperty,
+) -> (SemanticId, u32, Option<u8>, SemanticId, SemanticId) {
+    let row = LoweredSupertypeProperty::from(*row);
     (
         row.definition,
         row.parent_ordinal,
-        supertype_kind_rank(row.kind()),
+        row.source_kind().map(supertype_kind_rank),
         row.reference,
         row.frontier,
     )
@@ -6727,6 +6822,8 @@ const fn transfer_kind_rank(kind: ResolutionTypeTransferKind) -> u8 {
         ResolutionTypeTransferKind::StringConcatenation => 19,
         ResolutionTypeTransferKind::IndexOperand => 25,
         ResolutionTypeTransferKind::ElementOperand => 26,
+        // Semantic hashing ranks are append-only and must never be reordered.
+        ResolutionTypeTransferKind::ConditionalPayload => 27,
     }
 }
 
@@ -7674,7 +7771,7 @@ mod tests {
                 )
             })),
             reversed(lowered.supertypes().iter().map(|row| {
-                LoweredSupertypeProperty::new(
+                LoweredSourceSupertypeProperty::new(
                     row.definition(),
                     row.reference(),
                     row.frontier(),

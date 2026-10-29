@@ -171,6 +171,11 @@ impl ImportAnalysisProvider for PhpAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-php-analysis/src/analyzer/php/imports.rs",
+            );
 
         let names: Vec<String> = self
             .inner
@@ -192,8 +197,12 @@ impl ImportAnalysisProvider for PhpAnalyzer {
         }
 
         let imported = Arc::new(imported);
-        self.imported_code_units
-            .insert(file.clone(), Arc::clone(&imported));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&imported);
+            persistent_fill_guard.installed("imported_code_units");
+            self.imported_code_units.insert(cache_key, cache_value);
+        };
         imported
     }
 
@@ -209,8 +218,20 @@ impl ImportAnalysisProvider for PhpAnalyzer {
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
             &self.reverse_import_index,
-            || self.inner.all_files(),
-            |candidate| self.imported_code_units_of(candidate),
+            || {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "php.reverse_file_index",
+                    || self.inner.all_files(),
+                )
+            },
+            |candidate| {
+                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                    self,
+                    "php.reverse_file_index",
+                    || self.imported_code_units_of(candidate),
+                )
+            },
         )
         .get(file)
         .map(|files| (**files).clone())

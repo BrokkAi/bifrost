@@ -69,6 +69,7 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_php::graph::syntax::{clone_object_operand, object_creation_type};
+use brokk_bifrost_php::graph_support::php_is_constructor_name;
 
 // Bumping this rotates every public wire id hashed from the adapter
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
@@ -335,7 +336,7 @@ fn callable_shape<'tree>(
             let constructor = node
                 .child_by_field_name("name")
                 .and_then(|name| node_text(source, name))
-                .is_some_and(|name| name.eq_ignore_ascii_case("__construct"));
+                .is_some_and(php_is_constructor_name);
             (
                 if constructor {
                     ProcedureKind::Constructor
@@ -3383,6 +3384,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
+                member_selection: None,
                 arguments: arguments.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),

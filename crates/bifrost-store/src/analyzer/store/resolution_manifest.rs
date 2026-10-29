@@ -489,7 +489,8 @@ pub(super) fn body_counts(
 
 // One complete publication scans only the blob it just wrote. Warm admission
 // reads the sealed totals and never repeats these body scans.
-pub(super) const COMPLETE_PUBLICATION_COST_SQL: &str = "SELECT (SELECT COUNT(*) FROM resolution_root_imports WHERE blob_id = ?1),
+pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
+    "SELECT (SELECT COUNT(*) FROM resolution_root_imports WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_root_import_segments WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_root_import_demands WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_rust_reference_contexts WHERE blob_id = ?1),
@@ -557,8 +558,10 @@ pub(super) const COMPLETE_PUBLICATION_COST_SQL: &str = "SELECT (SELECT COUNT(*) 
        (SELECT COUNT(*) FROM resolution_callable_parameter_owners WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_inputs WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_declarations WHERE blob_id = ?1),
-       (SELECT COUNT(*) FROM resolution_capsule_reference_contexts WHERE blob_id = ?1),
-       (SELECT COALESCE(SUM(length(CAST(anchor AS BLOB)) + length(CAST(kind AS BLOB)) + coalesce(length(CAST(bound_name AS BLOB)),0)),0) FROM resolution_root_imports WHERE blob_id=?1)
+       (SELECT COUNT(*) FROM resolution_capsule_reference_contexts WHERE blob_id = ?1)";
+
+// This byte sum always runs, even when consistency validation is sampled.
+pub(super) const COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL: &str = "SELECT (SELECT COALESCE(SUM(length(CAST(anchor AS BLOB)) + length(CAST(kind AS BLOB)) + coalesce(length(CAST(bound_name AS BLOB)),0)),0) FROM resolution_root_imports WHERE blob_id=?1)
        + (SELECT COALESCE(SUM(length(CAST(segment AS BLOB))),0) FROM resolution_root_import_segments WHERE blob_id=?1)
        + (SELECT COALESCE(SUM(length(CAST(name AS BLOB)) + coalesce(length(CAST(target_kind AS BLOB)),0) + coalesce(length(CAST(target_name AS BLOB)),0)),0) FROM resolution_root_import_demands WHERE blob_id=?1)
        +(SELECT COALESCE(SUM(COALESCE(length(CAST(cfg_condition AS BLOB)),0)),0) FROM resolution_rust_reference_contexts WHERE blob_id = ?1)

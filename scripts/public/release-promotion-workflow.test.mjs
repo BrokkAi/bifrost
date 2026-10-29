@@ -380,7 +380,7 @@ test("publisher dependency order and protected identities remain explicit", () =
       /^    needs: \[release-context, promote-qualification, publish-crate-analysis\]$/mu,
     );
   }
-  for (const [consumer, base] of [["tools", []], ["semantic-packs", ["publish-crate-flow", "publish-crate-tools"]], ["rql", ["publish-crate-flow", "publish-crate-tools"]]]) {
+  for (const [consumer, base] of [["tools", []], ["semantic-packs", ["publish-crate-policy", "publish-crate-flow", "publish-crate-tools"]], ["rql", ["publish-crate-flow", "publish-crate-tools"]]]) {
     const expected = ["release-context", "promote-qualification", ...base,
       ...implementations.filter(({ consumers }) => consumers.includes(consumer))
         .map(({ name }) => `publish-crate-${name}`)];
@@ -390,7 +390,7 @@ test("publisher dependency order and protected identities remain explicit", () =
   }
   assert.match(
     jobBlock(release, "publish-crate-policy"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs, publish-crate-tools, publish-crate-rust-analysis\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-rql, publish-crate-tools, publish-crate-rust-analysis\]$/mu,
   );
   assert.match(
     jobBlock(release, "publish-crate-runtime"),
@@ -407,7 +407,7 @@ test("publisher dependency order and protected identities remain explicit", () =
   );
   assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis, publish-crate-jvm-analysis\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-semantic-packs, publish-crate-tools, publish-crate-rust-analysis, publish-crate-jvm-analysis\]$/mu,
   );
   assert.match(cratePublisher, /^      id-token:\s*write$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);

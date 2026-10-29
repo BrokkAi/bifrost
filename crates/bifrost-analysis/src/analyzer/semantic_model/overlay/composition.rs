@@ -4,10 +4,22 @@ use super::*;
 pub use crate::analyzer::store::semantic_composition::{
     ComposedGroup, CompositionGroupKey, RepresentativeIdentity, SemanticModelCompositionDiagnostic,
 };
+mod decoded;
 mod rows;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::CatalogError;
+pub(super) use decoded::SelectedDecodedReads;
 pub use rows::RowCompositionReads;
+pub(super) use rows::{GroupInput, GroupProjection};
 type ReadResult<T> = Result<T, CatalogError>;
+
+fn check_composition_cancellation(
+    cancellation: Option<&crate::CancellationToken>,
+) -> ReadResult<()> {
+    if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        return Err(CatalogError::Cancelled);
+    }
+    Ok(())
+}
 
 use crate::analyzer::semantic_model::{
     ActivatedSemanticModelRecord, CompiledProcedureSummary, ProcedureSummaryMemberKey,
@@ -38,39 +50,98 @@ pub trait CompositionReads {
 
 struct DecodedCompositionReads<'a> {
     active: &'a ResolvedActiveSemanticModels,
+    language: &'a str,
+    rows: Option<RowCompositionReads<'a>>,
+}
+
+impl<'a> DecodedCompositionReads<'a> {
+    fn new(
+        active: &'a ResolvedActiveSemanticModels,
+        language: &'a str,
+        rows: Option<&RowCompositionReads<'a>>,
+    ) -> Self {
+        Self {
+            active,
+            language,
+            rows: rows.map(|rows| rows.for_language(language)),
+        }
+    }
+}
+
+/// Match the active set's backing choice once per build. Language scopes are
+/// then prepared once per language, rather than scanning shards for each group.
+fn mixed_composition_rows(
+    active: &ResolvedActiveSemanticModels,
+) -> Option<RowCompositionReads<'_>> {
+    active
+        .source_reader()
+        .filter(|_| active.shards.iter().any(|shard| shard.decoded.is_none()))
+        .map(|reader| RowCompositionReads::new(active, reader, &[], &[]))
 }
 impl CompositionReads for DecodedCompositionReads<'_> {
     fn all_type_records_with_id(
         &self,
         id: &str,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(self.active.all_type_records_with_id(id).collect())
+        if let Some(rows) = &self.rows {
+            return rows.all_type_records_with_id(id);
+        }
+        Ok(self
+            .active
+            .all_type_records_with_id(id)
+            .filter(|r| r.shard.manifest.language == self.language)
+            .collect())
     }
     fn types_with_id(&self, id: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(self.active.types_with_id(id).records)
+        Ok(crate::analyzer::store::active_models::resolve_records(
+            self.all_type_records_with_id(id)?,
+        )
+        .records)
     }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(self.active.types_named(name).records)
+        if let Some(rows) = &self.rows {
+            return rows.types_named(name);
+        }
+        Ok(crate::analyzer::store::active_models::resolve_records(
+            self.active
+                .all_type_records_named(name)
+                .filter(|r| r.shard.manifest.language == self.language)
+                .collect(),
+        )
+        .records)
     }
     fn all_member_records_with_id(
         &self,
         id: &str,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
-        Ok(self.active.all_member_records_with_id(id).collect())
+        if let Some(rows) = &self.rows {
+            return rows.all_member_records_with_id(id);
+        }
+        Ok(self
+            .active
+            .all_member_records_with_id(id)
+            .filter(|r| r.shard.manifest.language == self.language)
+            .collect())
     }
     fn members_with_id(
         &self,
         id: &str,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
-        Ok(self.active.members_with_id(id).records)
+        Ok(crate::analyzer::store::active_models::resolve_records(
+            self.all_member_records_with_id(id)?,
+        )
+        .records)
     }
     fn procedure_summaries_for_member(
         &self,
         key: ProcedureSummaryMemberKey<'_>,
     ) -> ReadResult<Vec<Arc<CompiledProcedureSummary>>> {
+        if let Some(rows) = &self.rows {
+            return rows.procedure_summaries_for_member(key);
+        }
         Ok(self
             .active
-            .procedure_summaries_for_member(key)
+            .procedure_summaries_for_member_in_language(key)
             .records
             .into_iter()
             .map(|r| r.record)
@@ -78,10 +149,82 @@ impl CompositionReads for DecodedCompositionReads<'_> {
     }
 }
 
+fn procedure_owner_names(
+    declarations: Vec<ActivatedSemanticModelRecord<TypeFact>>,
+    key: ProcedureSummaryMemberKey<'_>,
+) -> Vec<String> {
+    let realm = brokk_bifrost_core::analyzer::model::semantic_pack_realm(key.language);
+    let mut owners = HashSet::default();
+    for declaration in declarations {
+        if declaration.shard.manifest.extraction.is_some()
+            && brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                &declaration.shard.manifest.language,
+            ) == realm
+        {
+            owners.insert(declaration.record.name.clone());
+            owners.extend(declaration.record.aliases.iter().cloned());
+        }
+    }
+    owners.remove(key.owner);
+    let mut owners = owners.into_iter().collect::<Vec<_>>();
+    owners.sort_unstable();
+    owners.push(key.owner.to_owned());
+    owners
+}
+
+fn select_procedure_summaries(
+    records: Vec<ActivatedSemanticModelRecord<CompiledProcedureSummary>>,
+    owners: &[String],
+    key: ProcedureSummaryMemberKey<'_>,
+) -> ReadResult<Vec<Arc<CompiledProcedureSummary>>> {
+    use crate::analyzer::semantic::oracle::dispatch::authored_procedure_target_identity;
+    use crate::analyzer::store::active_models::resolve_procedure_records;
+    use brokk_bifrost_semantic::analyzer::semantic_model::runtime::{
+        ProcedureSummaryAcceptance, procedure_claims_agree, procedure_summary_minimum_actual_count,
+    };
+    let mut candidates = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let target = &record.record.target;
+        let (owner, _) = authored_procedure_target_identity(&target.path, &target.symbol)
+            .expect("member question has target identity");
+        let owner = owners
+            .iter()
+            .position(|name| name == &owner)
+            .expect("question restricts owners");
+        if !target.variadic && target.parameter_count == key.parameter_count {
+            candidates.push(((0, 0, 0, owner, index), record.clone()));
+        }
+        let minimum = procedure_summary_minimum_actual_count(target);
+        if target.variadic && minimum <= key.parameter_count {
+            candidates.push(((1, minimum, 0, owner, index), record.clone()));
+        }
+        if !target.formals.is_empty() && target.formals.iter().any(|f| f.optional) {
+            let minimum = u32::try_from(target.formals.iter().filter(|f| !f.optional).count())
+                .expect("validated formal count");
+            if minimum <= key.parameter_count && target.parameter_count >= key.parameter_count {
+                candidates.push((
+                    (2, minimum, target.parameter_count, owner, index),
+                    record.clone(),
+                ));
+            }
+        }
+    }
+    candidates.sort_by_key(|(order, _)| *order);
+    Ok(resolve_procedure_records(
+        candidates.into_iter().map(|(_, r)| r),
+        procedure_claims_agree,
+        |_, _| ProcedureSummaryAcceptance::Accept(None),
+    )
+    .records
+    .into_iter()
+    .map(|r| r.record)
+    .collect())
+}
+
 /// Derive endpoint identity from owners alone. No member or relation is composed.
 pub fn representative_identity(
     owners: &[&SemanticModelSymbol],
-    active: &impl CompositionReads,
+    active: &(impl CompositionReads + ?Sized),
 ) -> ReadResult<RepresentativeIdentity> {
     let mut result = RepresentativeIdentity {
         representative_id: None,
@@ -208,7 +351,7 @@ pub(super) fn record_origin_identities(
 pub(super) fn compose(
     mut symbols: Vec<SemanticModelSymbol>,
     relations: Vec<(usize, SemanticModelRelation)>,
-    active: &impl CompositionReads,
+    active: &(impl CompositionReads + ?Sized),
     representatives: &HashMap<String, String>,
     composed_owners: &HashSet<String>,
     origin_identities: &OriginRewrites,
@@ -605,7 +748,7 @@ fn untyped(ty: &TypeRef) -> bool {
 fn compatible(
     curated: &TypeRef,
     artifact: &TypeRef,
-    active: &impl CompositionReads,
+    active: &(impl CompositionReads + ?Sized),
 ) -> ReadResult<bool> {
     let mut pending = vec![(curated, artifact)];
     while let Some((curated, artifact)) = pending.pop() {
@@ -698,7 +841,7 @@ fn compatible(
 fn member_corresponds(
     curated: &SemanticModelSymbol,
     artifact: &SemanticModelSymbol,
-    active: &impl CompositionReads,
+    active: &(impl CompositionReads + ?Sized),
 ) -> ReadResult<bool> {
     if let Some(a) = &curated.extension_receiver {
         let Some(b) = &artifact.extension_receiver else {
@@ -746,7 +889,7 @@ fn diagnostic(
 fn structural_diagnostics(
     curated: &SemanticModelSymbol,
     artifact: &SemanticModelSymbol,
-    active: &impl CompositionReads,
+    active: &(impl CompositionReads + ?Sized),
     out: &mut Vec<SemanticModelCompositionDiagnostic>,
 ) -> ReadResult<()> {
     let curated_records = active.members_with_id(&curated.id)?;
@@ -877,7 +1020,7 @@ fn check_flow_agreement(
     curated: &SemanticModelSymbol,
     corresponding: &[usize],
     symbols: &[SemanticModelSymbol],
-    active: &impl CompositionReads,
+    active: &(impl CompositionReads + ?Sized),
     diagnostics: &mut Vec<SemanticModelCompositionDiagnostic>,
 ) -> ReadResult<()> {
     use crate::analyzer::semantic_model::{ProcedureSummaryMemberKey, compiled_flow_claims_agree};
@@ -945,7 +1088,7 @@ pub(super) fn identity_groups<'a>(
     Some(groups)
 }
 
-fn alias_groups(
+pub(super) fn alias_groups(
     symbols: &[SemanticModelSymbol],
     cancellation: &crate::CancellationToken,
 ) -> Result<Vec<Vec<usize>>, SemanticModelOverlayBuildError> {
@@ -996,15 +1139,32 @@ pub(super) fn compose_eager(
 ) -> Result<Vec<SemanticModelCompositionDiagnostic>, SemanticModelOverlayBuildError> {
     freeze_symbol_order(symbols);
     freeze_relation_order(relations.iter_mut());
-    let reads = DecodedCompositionReads { active };
     let groups = alias_groups(symbols, cancellation)?;
+    let languages = groups
+        .iter()
+        .map(|group| symbols[group[0]].language.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mixed_rows = mixed_composition_rows(active);
+    let reads_by_language = languages
+        .iter()
+        .map(|language| {
+            (
+                language.as_str(),
+                DecodedCompositionReads::new(active, language, mixed_rows.as_ref()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let mut replacements = HashMap::default();
     let mut composed_owners = HashSet::default();
     let mut origin_identities = OriginRewrites::default();
     let mut symbol_groups = HashMap::default();
     for (group_index, group) in groups.iter().enumerate() {
         let owners = group.iter().map(|&i| &symbols[i]).collect::<Vec<_>>();
-        let representative = representative_identity(&owners, &reads)
+        let reads = &reads_by_language[owners[0].language.as_str()];
+        let representative = representative_identity(&owners, reads)
             .expect("decoded composition reads are infallible");
         if representative.composed {
             composed_owners.extend(owners.iter().map(|s| s.id.clone()));
@@ -1017,11 +1177,11 @@ pub(super) fn compose_eager(
                 .or_insert(group_index);
         }
     }
-    let mut members_by_owner = HashMap::<String, Vec<usize>>::default();
+    let mut members_by_owner = HashMap::<(String, String), Vec<usize>>::default();
     for (index, symbol) in symbols.iter().enumerate() {
         if let Some(owner) = &symbol.owner_id {
             members_by_owner
-                .entry(owner.clone())
+                .entry((symbol.language.clone(), owner.clone()))
                 .or_default()
                 .push(index);
         }
@@ -1033,7 +1193,7 @@ pub(super) fn compose_eager(
             for &owner in group {
                 indices.extend(
                     members_by_owner
-                        .get(&symbols[owner].id)
+                        .get(&(symbols[owner].language.clone(), symbols[owner].id.clone()))
                         .into_iter()
                         .flatten(),
                 );
@@ -1068,10 +1228,11 @@ pub(super) fn compose_eager(
             .map(|&i| symbols[i].clone())
             .collect::<Vec<_>>();
         debug_assert_group_backing(&group_symbols, active);
+        let reads = &reads_by_language[symbols[indices[0]].language.as_str()];
         let result = compose(
             group_symbols,
             group_relations,
-            &reads,
+            reads,
             &replacements,
             &composed_owners,
             &origin_identities,
@@ -1168,19 +1329,31 @@ pub(super) fn assert_group_parity(
     generated_relations: &[SemanticModelRelation],
 ) -> (usize, usize) {
     let groups = alias_groups(symbols, &crate::CancellationToken::new()).unwrap();
-    let decoded = DecodedCompositionReads { active };
-    let rows = RowCompositionReads {
-        active,
-        reader,
-        generated,
-        generated_relations,
-    };
+    let languages = groups
+        .iter()
+        .map(|group| symbols[group[0]].language.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mixed_rows = mixed_composition_rows(active);
+    let reads_by_language = languages
+        .iter()
+        .map(|language| {
+            (
+                language.as_str(),
+                DecodedCompositionReads::new(active, language, mixed_rows.as_ref()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let rows = RowCompositionReads::new(active, reader, generated, generated_relations);
     let mut replacements = HashMap::default();
     let mut composed_owners = HashSet::default();
     let mut origin_identities = OriginRewrites::default();
     for group in &groups {
         let owners = group.iter().map(|&i| &symbols[i]).collect::<Vec<_>>();
-        let representative = representative_identity(&owners, &decoded).unwrap();
+        let decoded = &reads_by_language[owners[0].language.as_str()];
+        let representative = representative_identity(&owners, decoded).unwrap();
         if representative.composed {
             composed_owners.extend(owners.iter().map(|s| s.id.clone()));
         }
@@ -1191,12 +1364,13 @@ pub(super) fn assert_group_parity(
     for group in &groups {
         let owners = group.iter().map(|&i| &symbols[i]).collect::<Vec<_>>();
         let key = group_key(&owners);
+        let decoded = &reads_by_language[key.language.as_str()];
         let ids = owners.iter().map(|s| s.id.as_str()).collect::<HashSet<_>>();
         let mut input = symbols
             .iter()
             .filter(|s| {
                 if let Some(owner) = &s.owner_id {
-                    ids.contains(owner.as_str())
+                    s.language == key.language && ids.contains(owner.as_str())
                 } else {
                     owners.iter().any(|owner| std::ptr::eq(*owner, *s))
                 }
@@ -1222,7 +1396,7 @@ pub(super) fn assert_group_parity(
         let expected = compose(
             input,
             input_relations,
-            &decoded,
+            decoded,
             &replacements,
             &composed_owners,
             &origin_identities,

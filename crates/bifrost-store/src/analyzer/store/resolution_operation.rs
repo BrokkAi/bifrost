@@ -42,8 +42,12 @@ mod jvm_hierarchy_order;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod jvm_reverse_rows;
+pub(in crate::analyzer) mod nominal_rules;
 #[cfg(any(test, feature = "test-support"))]
 pub(in crate::analyzer::store) mod python_demand;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use python_demand::PythonSelectedImportBoundary;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "resolution_operation/python_demand/lexical.rs"]
 pub(crate) mod python_lexical;
@@ -137,6 +141,7 @@ pub mod reverse_candidates;
 #[path = "reverse_nomination.rs"]
 #[doc(hidden)]
 pub mod reverse_nomination;
+mod unit_access;
 
 pub(crate) use reverse_candidates::REVERSE_CANDIDATE_KEYS_DDL;
 
@@ -1605,6 +1610,8 @@ pub struct ReadySelectedResolution<'store, 'input> {
     go_publications: RefCell<HashMap<i64, super::GoContextIdentity>>,
     go_snapshot: Option<super::WorkspaceSnapshotId>,
     go_base_profile: std::cell::Cell<Option<[u8; 32]>>,
+    // One forward request selects one caller package variant, restored on exit.
+    go_active_package: std::cell::Cell<Option<(i64, i64, Option<&'static str>)>>,
     // Dropped with this request, including cached absent context reads.
     go_definition_contexts: RefCell<go_context::GoDefinitionContextMemo>,
     /// Whether this request encountered any complete selected Go package.
@@ -1621,6 +1628,10 @@ pub struct ReadySelectedResolution<'store, 'input> {
     #[doc(hidden)]
     pub jvm_context_profile: RefCell<Option<jvm_context::JvmContextReadProfile>>,
     package_reference_read_memo: std::rc::Rc<RefCell<ExactReadMemo<PackageReferenceReadKey, bool>>>,
+    // One selected file has one immutable module anchor for this operation.
+    // In particular, an unpublished overlay computes its anchor only once.
+    definition_module_anchors:
+        RefCell<HashMap<SelectedResolutionMountOrdinal, Option<crate::analyzer::fq_name::FqName>>>,
 }
 
 /// One request's answers to the textual-macro module walk.
@@ -1765,10 +1776,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
 
     #[doc(hidden)]
     pub fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
-        let mut providers = self
-            .analyzer
-            .map(|analyzer| analyzer.external_inventory_providers())
-            .unwrap_or_default();
+        let mut providers = nominal_rules::jvm_external_owner_relations().providers(self.analyzer);
         let external_models = self.analyzer.and_then(|analyzer| analyzer.active_models());
         if let Some(models) = &external_models {
             providers.extend(
@@ -2325,7 +2333,7 @@ pub struct SelectedResolutionOperation<'store, 'input> {
     /// Provider registrations shared by named contexts in this query only.
     jvm_context_registrations: RefCell<jvm_demand::JvmContextRegistrationMemo>,
     /// Visibility evidence for exact source pairs in this query's selection.
-    jvm_source_access_memo: RefCell<jvm_context::JvmSourceAccessMemo>,
+    jvm_source_access_memo: RefCell<unit_access::UnitAccessMemo>,
     /// Interned paths keep source-pair memo hits allocation-free.
     jvm_source_paths: RefCell<HashMap<String, usize>>,
     jvm_source_domains: jvm_context::JvmSourceDomainMemo,
@@ -2647,6 +2655,13 @@ pub enum SelectedRustBindingDefinitionUnitsOutcome {
 /// producer and the native definition adapter its only reader.
 #[doc(hidden)]
 pub struct SelectedRustMemberAttribution {
+    /// The receiver identity actually searched, after built-in dereferences.
+    #[doc(hidden)]
+    pub receiver: SemanticId,
+    #[doc(hidden)]
+    pub receiver_kind: Option<rust_facts::RustDeclarationKind>,
+    #[doc(hidden)]
+    pub receiver_is_intrinsic: bool,
     #[doc(hidden)]
     pub target: SemanticId,
     #[doc(hidden)]
@@ -6756,7 +6771,8 @@ pub fn project_rust_source_definitions(
                         row.source_file = Some(source_file);
                         SelectedRustSourceDefinition::Lexical(row)
                     }
-                    SelectedDeclarationDefinition::WithoutUnit(declaration_range) => {
+                    SelectedDeclarationDefinition::WithoutUnit(declaration_range)
+                    | SelectedDeclarationDefinition::Module(declaration_range) => {
                         SelectedRustSourceDefinition::WithoutUnit {
                             source_file,
                             declaration_range: Some(declaration_range),
@@ -7512,6 +7528,20 @@ fn assemble_rust_reference_answer<T>(
 /// implementation is reported as trait dispatch without any hierarchy walk.
 ///
 /// `None` reports cancellation.
+pub(super) const RUST_RECEIVER_KIND_SQL: &str = "SELECT property.declaration_kind
+         FROM temp.selected_resolution_mounts AS mount
+         CROSS JOIN main.resolution_semantic_sites AS semantic
+           ON semantic.blob_id = mount.blob_id
+          AND semantic.semantic_role = 'definition'
+          AND semantic.semantic_key = ?2
+         CROSS JOIN main.source_native_declaration_bridges AS native
+           ON native.blob_id = semantic.blob_id
+          AND native.source_site = semantic.source_site
+         CROSS JOIN main.source_rust_declaration_properties AS property
+           ON property.blob_id = native.blob_id
+          AND property.declaration_id = native.declaration_id
+         WHERE mount.mount_ordinal = ?1";
+
 fn project_rust_member_attributions(
     ready: &ReadySelectedResolution<'_, '_>,
     mounts: SelectedMountTable<'_, '_>,
@@ -7543,6 +7573,12 @@ fn project_rust_member_attributions(
         SelectedRustSourceDefinitionProjection::Unavailable => return Ok(Some(Vec::new())),
         SelectedRustSourceDefinitionProjection::Cancelled => return Ok(None),
     };
+    let intrinsic_owners = owners
+        .iter()
+        .filter_map(|(identity, definition)| {
+            matches!(definition, SelectedRustSourceDefinition::UniverseEntry).then_some(*identity)
+        })
+        .collect::<HashSet<_>>();
     let owner_units = owners
         .into_iter()
         .filter_map(|(identity, definition)| match definition {
@@ -7553,6 +7589,12 @@ fn project_rust_member_attributions(
         })
         .collect::<HashMap<_, _>>();
     let lexical = ready.lexical_source();
+    // Read canonical properties on this operation's selected connection.
+    // Re-entering the analyzer here could acquire an exclusive reader twice.
+    let mut receiver_kinds = ready
+        .inventory
+        .connection()
+        .prepare_cached(RUST_RECEIVER_KIND_SQL)?;
     let mut attributions = Vec::with_capacity(rows.len());
     for row in rows {
         if !session.scope_step() {
@@ -7594,8 +7636,30 @@ fn project_rust_member_attributions(
                 }
             }
         };
+        let Some(receiver_provenance) =
+            lexical.semantic_provenance(row.receiver(), cancellation)?
+        else {
+            return Ok(None);
+        };
+        let receiver_kind = match receiver_provenance {
+            SelectedSemanticProvenance::FragmentLocal(provenance) => receiver_kinds
+                .query_row(
+                    rusqlite::params![
+                        provenance.mount().ordinal().get(),
+                        provenance.local_key().get()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .map(super::source_facts::decode_rust_declaration_kind)
+                .transpose()?,
+            SelectedSemanticProvenance::Stage(_) | SelectedSemanticProvenance::Shared(_) => None,
+        };
         attributions.push(SelectedRustMemberAttribution {
             target: row.target(),
+            receiver: row.receiver(),
+            receiver_kind,
+            receiver_is_intrinsic: intrinsic_owners.contains(&row.receiver()),
             owner: owner.clone(),
             reach,
         });
@@ -8780,6 +8844,7 @@ impl AnalyzerStore {
                 go_publications: RefCell::default(),
                 go_snapshot: input.snapshots.get("go").cloned(),
                 go_base_profile: std::cell::Cell::new(None),
+                go_active_package: std::cell::Cell::new(None),
                 go_definition_contexts: RefCell::default(),
                 go_package_inventory_complete: RefCell::new(None),
                 go_package_inventory_fragments: RefCell::default(),
@@ -8793,6 +8858,7 @@ impl AnalyzerStore {
                         .then(jvm_context::JvmContextReadProfile::default),
                 ),
                 package_reference_read_memo: std::rc::Rc::new(RefCell::default()),
+                definition_module_anchors: RefCell::default(),
             },
         )))
     }
@@ -9080,6 +9146,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 ));
             }
         };
+        let family = nominal_rules::nominal_package_rules_for_storage(locator.storage_language());
         let ready = &self.ready;
         let mut resolution_metrics = ResolutionBatchMetrics::default();
         let (projected, completion) = {
@@ -9087,8 +9154,7 @@ impl SelectedResolutionOperation<'_, '_> {
             let persisted_typed = ready.typed_source();
             let observed_lexical = SeamProfiled::observing(&persisted_lexical);
             let observed_typed = SeamProfiled::observing(&persisted_typed);
-            let memo = jvm_demand::jvm_demand_storage_language(locator.storage_language())
-                .then_some(&self.jvm_context_blueprints);
+            let memo = family.map(|_| &self.jvm_context_blueprints);
             let construction = ready.collect_blueprint_with_projection_memo(
                 context,
                 memo,
@@ -9142,7 +9208,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 reference,
                                 &mut resolution_metrics,
                             )?;
-                            if jvm_demand::jvm_demand_storage_language(locator.storage_language()) {
+                            if family.is_some() {
                                 self.profile_jvm_read("native_point_answer", (reference, &answer));
                             }
                             let completion = answer.completion().clone();
@@ -9153,7 +9219,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 completion,
                             ))
                         };
-                    if jvm_demand::jvm_demand_storage_language(locator.storage_language()) {
+                    if family.is_some() {
                         self.with_jvm_forward_operation(
                             locator.storage_language(),
                             &blueprint,
@@ -9423,26 +9489,29 @@ impl SelectedResolutionOperation<'_, '_> {
     /// The declaration a range denotes by being one, or `None` when the range
     /// has no declaration answer of its own.
     ///
-    /// One range can carry both roles. A Rust pattern token in a match arm or
-    /// a `let` condition is a reference to a visible unit variant or constant
-    /// and, only when no such declaration is visible, the binder it looks
-    /// like; the producer publishes both halves at the same range and pairs
-    /// them in a `ResolutionConditionalBinderFact`. Which one the token is, is
-    /// exactly what the reference route decides, so a range that also carries
-    /// a reference has no declaration answer here and this route stands down.
+    /// One range can carry both roles. For example, a Rust pattern token in a
+    /// match arm or a `let` condition is a reference to a visible unit variant
+    /// or constant and, only when no such declaration is visible, the binder it
+    /// looks like; the producer publishes both halves at the same range and
+    /// pairs them in a `ResolutionConditionalBinderFact`. Which one the token
+    /// is, is exactly what the reference route decides, so a range that also
+    /// carries a reference has no declaration answer here and this route stands
+    /// down. The language supplies only the projection of the found
+    /// declarations, and the value to return when the lookup was cancelled.
     #[doc(hidden)]
-    pub fn rust_declaration_at_range_bounded(
+    pub fn declaration_at_range_bounded<P>(
         &mut self,
         locator: &SelectedSemanticLocator,
         budget: ReceiverAnalysisBudget,
         cancellation: &CancellationToken,
-    ) -> Result<
-        Option<
-            BoundedResolution<
-                SelectedResolutionOperationOutcome<SelectedRustSourceDefinitionProjection>,
-            >,
-        >,
-    > {
+        project: impl FnOnce(
+            &ReadySelectedResolution<'_, '_>,
+            &[SemanticId],
+            &CancellationToken,
+            &ResolutionSession,
+        ) -> Result<P>,
+        cancelled: P,
+    ) -> Result<Option<BoundedResolution<SelectedResolutionOperationOutcome<P>>>> {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
         let persisted = self.ready.lexical_source();
         let (start_byte, end_byte) = locator
@@ -9467,18 +9536,12 @@ impl SelectedResolutionOperation<'_, '_> {
             &session,
         )? {
             LocatedSemantics::Missing => return Ok(None),
-            LocatedSemantics::Cancelled => SelectedRustSourceDefinitionProjection::Cancelled,
+            LocatedSemantics::Cancelled => cancelled,
             LocatedSemantics::Found(definitions) => {
                 if !cancellation.is_cancelled() && session.scope_step() {
-                    project_rust_source_definitions(
-                        &self.ready,
-                        self.mount_table(),
-                        &definitions,
-                        cancellation,
-                        &session,
-                    )?
+                    project(&self.ready, &definitions, cancellation, &session)?
                 } else {
-                    SelectedRustSourceDefinitionProjection::Cancelled
+                    cancelled
                 }
             }
         };
@@ -10271,11 +10334,17 @@ impl SelectedResolutionOperation<'_, '_> {
             }
         };
         let completion = match &attempt {
-            SelectedResolutionLocated::Found(answers) => answers
-                .iter()
-                .fold(ResolutionCompletion::Complete, |completion, answer| {
-                    completion.combine(answer.resolution.completion())
-                }),
+            SelectedResolutionLocated::Found(answers) => {
+                let Some(completion) = ResolutionCompletion::combine_all_with_poll(
+                    answers.iter().map(|answer| answer.resolution.completion()),
+                    &mut || cancellation.is_cancelled(),
+                ) else {
+                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                        cancelled_completion(),
+                    ));
+                };
+                completion
+            }
             SelectedResolutionLocated::Missing => ResolutionCompletion::Complete,
         };
         note_rust_point_work("search_answers", session);
@@ -10581,9 +10650,13 @@ impl SelectedResolutionOperation<'_, '_> {
                         work,
                     } => {
                         if let SelectedResolutionLocated::Found(answers) = &attempt {
-                            completion = answers.iter().fold(completion, |completion, answer| {
-                                completion.combine(answer.resolution.completion())
-                            });
+                            completion = ResolutionCompletion::combine_all_with_poll(
+                                std::iter::once(&completion).chain(
+                                    answers.iter().map(|answer| answer.resolution.completion()),
+                                ),
+                                &mut || cancellation.is_cancelled(),
+                            )
+                            .unwrap_or_else(cancelled_completion);
                         }
                         attempts.push(attempt);
                         results.push(BoundedResolution::Complete {

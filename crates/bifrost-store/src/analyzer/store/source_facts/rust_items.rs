@@ -13,7 +13,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
     RustTypeSourceFact, RustTypeSourceShape, RustTypeWrapperSourceKind,
 };
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
-use rusqlite::{ToSql, Transaction, params};
+use rusqlite::{Transaction, params};
 
 use super::super::{Result, usize_to_i64};
 use super::check_cancelled;
@@ -280,11 +280,7 @@ pub fn insert_rust_item_source_facts_tx(
         ],
     )?;
 
-    let mut syntax = tx.prepare_cached(
-        "INSERT INTO source_rust_item_syntax(
-           blob_id, occurrence_id, has_error
-         ) VALUES(?1, ?2, ?3)",
-    )?;
+    let mut syntax = Vec::new();
     // Most occurrence ids below are either looked up in the arena for their
     // inline span or are foreign keys to rows whose ids were. The rest are
     // checked against the arena where they are written.
@@ -298,13 +294,17 @@ pub fn insert_rust_item_source_facts_tx(
     for row in &item_facts.syntax {
         check_cancelled(cancellation)?;
         assert_in_arena("item syntax", row.occurrence);
-        syntax.execute(params![
-            blob_id,
-            i64::from(row.occurrence.get()),
-            row.has_error
-        ])?;
+        syntax.push((blob_id, i64::from(row.occurrence.get()), row.has_error));
     }
-    drop(syntax);
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_item_syntax(
+           blob_id, occurrence_id, has_error
+         ) VALUES",
+        "(?, ?, ?)",
+        &syntax,
+        cancellation,
+    )?;
 
     // Spans go inline beside the occurrence id wherever a statement reads one
     // (milestone 5, lane ST); the arena is the facts value's own.
@@ -312,16 +312,10 @@ pub fn insert_rust_item_source_facts_tx(
         let range = facts.occurrences.occurrence(occurrence).range;
         (range.start_byte, range.end_byte)
     };
-    let mut contexts = tx.prepare_cached(
-        "INSERT INTO source_rust_item_contexts(
-           blob_id, occurrence_id, ordinal, parent_occurrence_id,
-           owner_declaration_id, context_kind, start_byte, end_byte, provenance,
-           expanding_attribute_starts
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, jsonb(?10))",
-    )?;
+    let mut contexts = Vec::new();
     for (ordinal, row) in item_facts.contexts.iter().enumerate() {
         check_cancelled(cancellation)?;
-        contexts.execute(params![
+        contexts.push((
             blob_id,
             i64::from(row.context.get()),
             usize_to_i64(ordinal)?,
@@ -335,20 +329,26 @@ pub fn insert_rust_item_source_facts_tx(
             )),
             serde_json::to_string(&row.expanding_attribute_starts)
                 .expect("Rust expanding attribute starts serialize as JSON"),
-        ])?;
+        ));
     }
-    drop(contexts);
-
-    let mut impls = tx.prepare_cached(
-        "INSERT INTO source_rust_impl_items(
-           blob_id, declaration_id, context_occurrence_id, trait_type_occurrence_id, negation_occurrence_id, target_type_occurrence_id, body_occurrence_id, body_start_byte, body_end_byte, negation_start_byte, negation_end_byte
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_item_contexts(
+           blob_id, occurrence_id, ordinal, parent_occurrence_id,
+           owner_declaration_id, context_kind, start_byte, end_byte, provenance,
+           expanding_attribute_starts
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, jsonb(?))",
+        &contexts,
+        cancellation,
     )?;
+
+    let mut impls = Vec::new();
     for row in &item_facts.impls {
         check_cancelled(cancellation)?;
         let inline_body_occurrence = (row.body).map(|id| facts.occurrences.occurrence(id));
         let inline_negation_occurrence = (row.negation).map(|id| facts.occurrences.occurrence(id));
-        impls.execute(params![
+        impls.push((
             blob_id,
             i64::from(row.declaration.get()),
             i64::from(row.context.get()),
@@ -368,19 +368,23 @@ pub fn insert_rust_item_source_facts_tx(
             inline_negation_occurrence
                 .map(|occurrence| usize_to_i64(occurrence.range.end_byte))
                 .transpose()?,
-        ])?;
+        ));
     }
-    drop(impls);
-
-    let mut traits = tx.prepare_cached(
-        "INSERT INTO source_rust_trait_items(
-           blob_id, declaration_id, context_occurrence_id, body_occurrence_id, body_start_byte, body_end_byte
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_impl_items(
+           blob_id, declaration_id, context_occurrence_id, trait_type_occurrence_id, negation_occurrence_id, target_type_occurrence_id, body_occurrence_id, body_start_byte, body_end_byte, negation_start_byte, negation_end_byte
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &impls,
+        cancellation,
     )?;
+
+    let mut traits = Vec::new();
     for row in &item_facts.traits {
         check_cancelled(cancellation)?;
         let inline_body_occurrence = (row.body).map(|id| facts.occurrences.occurrence(id));
-        traits.execute(params![
+        traits.push((
             blob_id,
             i64::from(row.declaration.get()),
             i64::from(row.context.get()),
@@ -391,36 +395,44 @@ pub fn insert_rust_item_source_facts_tx(
             inline_body_occurrence
                 .map(|occurrence| usize_to_i64(occurrence.range.end_byte))
                 .transpose()?,
-        ])?;
+        ));
     }
-    drop(traits);
-
-    let mut aliases = tx.prepare_cached(
-        "INSERT INTO source_rust_alias_items(
-           blob_id, declaration_id, context_occurrence_id, target_type_occurrence_id
-         ) VALUES(?1, ?2, ?3, ?4)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_trait_items(
+           blob_id, declaration_id, context_occurrence_id, body_occurrence_id, body_start_byte, body_end_byte
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?)",
+        &traits,
+        cancellation,
     )?;
+
+    let mut aliases = Vec::new();
     for row in &item_facts.aliases {
         check_cancelled(cancellation)?;
-        aliases.execute(params![
+        aliases.push((
             blob_id,
             i64::from(row.declaration.get()),
             i64::from(row.context.get()),
             row.target_type.map(|id| i64::from(id.get())),
-        ])?;
+        ));
     }
-    drop(aliases);
-
-    let mut callables = tx.prepare_cached(
-        "INSERT INTO source_rust_callable_items(
-           blob_id, declaration_id, context_occurrence_id, parameters_occurrence_id, return_type_occurrence_id, parameters_start_byte, parameters_end_byte
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_alias_items(
+           blob_id, declaration_id, context_occurrence_id, target_type_occurrence_id
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &aliases,
+        cancellation,
     )?;
+
+    let mut callables = Vec::new();
     for row in &item_facts.callables {
         check_cancelled(cancellation)?;
         let inline_parameters_occurrence =
             (row.parameters).map(|id| facts.occurrences.occurrence(id));
-        callables.execute(params![
+        callables.push((
             blob_id,
             i64::from(row.declaration.get()),
             i64::from(row.context.get()),
@@ -432,31 +444,39 @@ pub fn insert_rust_item_source_facts_tx(
             inline_parameters_occurrence
                 .map(|occurrence| usize_to_i64(occurrence.range.end_byte))
                 .transpose()?,
-        ])?;
+        ));
     }
-    drop(callables);
-
-    let mut values = tx.prepare_cached(
-        "INSERT INTO source_rust_value_items(
-           blob_id, declaration_id, context_occurrence_id, declared_type_occurrence_id
-         ) VALUES(?1, ?2, ?3, ?4)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_callable_items(
+           blob_id, declaration_id, context_occurrence_id, parameters_occurrence_id, return_type_occurrence_id, parameters_start_byte, parameters_end_byte
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?)",
+        &callables,
+        cancellation,
     )?;
+
+    let mut values = Vec::new();
     for row in &item_facts.values {
         check_cancelled(cancellation)?;
-        values.execute(params![
+        values.push((
             blob_id,
             i64::from(row.declaration.get()),
             i64::from(row.context.get()),
             row.declared_type.map(|id| i64::from(id.get())),
-        ])?;
+        ));
     }
-    drop(values);
-
-    let mut generic_parameters = tx.prepare_cached(
-        "INSERT INTO source_rust_item_generic_parameters(
-           blob_id, declaration_id, ordinal, occurrence_id, syntax_kind, name_occurrence_id, name, start_byte, end_byte, name_start_byte, name_end_byte
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_value_items(
+           blob_id, declaration_id, context_occurrence_id, declared_type_occurrence_id
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &values,
+        cancellation,
     )?;
+
+    let mut generic_parameters = Vec::new();
     for group in &item_facts.generics {
         assert!(
             !group.parameters.is_empty(),
@@ -467,7 +487,7 @@ pub fn insert_rust_item_source_facts_tx(
             let inline_occurrence = facts.occurrences.occurrence(row.occurrence);
             let inline_name_occurrence = (row.name.as_ref().map(|name| name.occurrence))
                 .map(|id| facts.occurrences.occurrence(id));
-            generic_parameters.execute(params![
+            generic_parameters.push((
                 blob_id,
                 i64::from(group.declaration.get()),
                 usize_to_i64(ordinal)?,
@@ -485,16 +505,20 @@ pub fn insert_rust_item_source_facts_tx(
                 inline_name_occurrence
                     .map(|occurrence| usize_to_i64(occurrence.range.end_byte))
                     .transpose()?,
-            ])?;
+            ));
         }
     }
-    drop(generic_parameters);
-
-    let mut body_children = tx.prepare_cached(
-        "INSERT INTO source_rust_item_body_children(
-           blob_id, owner_declaration_id, ordinal, occurrence_id, declaration_id, syntax_kind, start_byte, end_byte
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_item_generic_parameters(
+           blob_id, declaration_id, ordinal, occurrence_id, syntax_kind, name_occurrence_id, name, start_byte, end_byte, name_start_byte, name_end_byte
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &generic_parameters,
+        cancellation,
     )?;
+
+    let mut body_children = Vec::new();
     for (declaration, rows) in item_facts
         .impls
         .iter()
@@ -509,7 +533,7 @@ pub fn insert_rust_item_source_facts_tx(
         for (ordinal, row) in rows.iter().enumerate() {
             check_cancelled(cancellation)?;
             let inline_occurrence = facts.occurrences.occurrence(row.occurrence);
-            body_children.execute(params![
+            body_children.push((
                 blob_id,
                 i64::from(declaration.get()),
                 usize_to_i64(ordinal)?,
@@ -518,23 +542,27 @@ pub fn insert_rust_item_source_facts_tx(
                 &row.syntax_kind,
                 usize_to_i64(inline_occurrence.range.start_byte)?,
                 usize_to_i64(inline_occurrence.range.end_byte)?,
-            ])?;
+            ));
         }
     }
-    drop(body_children);
-
-    let mut callable_parameters = tx.prepare_cached(
-        "INSERT INTO source_rust_callable_parameters(
-           blob_id, declaration_id, ordinal, occurrence_id, syntax_kind, label_occurrence_id, label, start_byte, end_byte, label_start_byte, label_end_byte
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_item_body_children(
+           blob_id, owner_declaration_id, ordinal, occurrence_id, declaration_id, syntax_kind, start_byte, end_byte
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?)",
+        &body_children,
+        cancellation,
     )?;
+
+    let mut callable_parameters = Vec::new();
     for row in &item_facts.callables {
         for (ordinal, parameter) in row.parameter_children.iter().enumerate() {
             check_cancelled(cancellation)?;
             let inline_occurrence = facts.occurrences.occurrence(parameter.occurrence);
             let inline_label_occurrence = (parameter.label.as_ref().map(|label| label.occurrence))
                 .map(|id| facts.occurrences.occurrence(id));
-            callable_parameters.execute(params![
+            callable_parameters.push((
                 blob_id,
                 i64::from(row.declaration.get()),
                 usize_to_i64(ordinal)?,
@@ -553,25 +581,27 @@ pub fn insert_rust_item_source_facts_tx(
                 inline_label_occurrence
                     .map(|occurrence| usize_to_i64(occurrence.range.end_byte))
                     .transpose()?,
-            ])?;
+            ));
         }
     }
-    drop(callable_parameters);
-
-    let mut macros = tx.prepare_cached(
-        "INSERT INTO source_rust_item_macro_expansions(
-           blob_id, invocation_occurrence_id, context_occurrence_id,
-           expansion_kind, root_occurrence_id, source_position,
-           invocation_start_byte, invocation_end_byte
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_callable_parameters(
+           blob_id, declaration_id, ordinal, occurrence_id, syntax_kind, label_occurrence_id, label, start_byte, end_byte, label_start_byte, label_end_byte
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &callable_parameters,
+        cancellation,
     )?;
+
+    let mut macros = Vec::new();
     for row in &item_facts.macros {
         check_cancelled(cancellation)?;
         if let RustItemMacroExpansion::Parsed(root) = row.expansion {
             assert_in_arena("item macro expansion root", root);
         }
         let (kind, expansion) = macro_expansion_kind(row.expansion);
-        macros.execute(params![
+        macros.push((
             blob_id,
             i64::from(row.invocation.get()),
             i64::from(row.context.get()),
@@ -584,17 +614,27 @@ pub fn insert_rust_item_source_facts_tx(
             },
             usize_to_i64(span_of(row.invocation).0)?,
             usize_to_i64(span_of(row.invocation).1)?,
-        ])?;
+        ));
     }
-    drop(macros);
-    let mut inputs = tx.prepare_cached("INSERT INTO source_rust_macro_inputs(blob_id, invocation_occurrence_id, macro_name, start_byte, source, native_gap_site, native_scope, invocation_start_byte, cfg_condition) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?;
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_item_macro_expansions(
+           blob_id, invocation_occurrence_id, context_occurrence_id,
+           expansion_kind, root_occurrence_id, source_position,
+           invocation_start_byte, invocation_end_byte
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?)",
+        &macros,
+        cancellation,
+    )?;
+    let mut inputs = Vec::new();
     // The blob's tokens go out together after its inputs, in multi-row
     // statements (#6390). Both of their foreign keys are deferred, and the
     // tokens keep their order among themselves.
     let mut token_rows = Vec::<(i64, i64, i64, Option<i64>, &str, i64, i64, i64)>::new();
     for input in &item_facts.macro_inputs {
         check_cancelled(cancellation)?;
-        inputs.execute(params![
+        inputs.push((
             blob_id,
             i64::from(input.invocation.get()),
             input.macro_name.as_deref(),
@@ -606,9 +646,9 @@ pub fn insert_rust_item_source_facts_tx(
                 .map(|(_, scope)| i64::from(scope.get())),
             usize_to_i64(span_of(input.invocation).0)?,
             brokk_bifrost_core::analyzer::rust_facts::encode_rust_cfg_condition(
-                &input.cfg_condition
+                &input.cfg_condition,
             ),
-        ])?;
+        ));
         assert_eq!(
             input.tree.tokens.len(),
             input.occurrences.len(),
@@ -637,65 +677,38 @@ pub fn insert_rust_item_source_facts_tx(
             ));
         }
     }
-    drop(inputs);
-    let mut token_values = Vec::<&dyn ToSql>::with_capacity(token_rows.len() * 8);
-    for row in &token_rows {
-        token_values.extend([
-            &row.0 as &dyn ToSql,
-            &row.1,
-            &row.2,
-            &row.3,
-            &row.4,
-            &row.5,
-            &row.6,
-            &row.7,
-        ]);
-    }
-    let inserted = super::super::row_batch::insert_rows(
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_macro_inputs(blob_id, invocation_occurrence_id, macro_name, start_byte, source, native_gap_site, native_scope, invocation_start_byte, cfg_condition) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &inputs,
+        cancellation,
+    )?;
+    super::insert_rows(
         tx,
         "INSERT INTO source_rust_macro_input_tokens(blob_id, invocation_occurrence_id, ordinal, parent_ordinal, syntax_kind, start_byte, end_byte, source_occurrence_id) VALUES",
         "(?, ?, ?, ?, ?, ?, ?, ?)",
-        8,
-        &token_values,
+        &token_rows,
         cancellation,
     )?;
-    check_cancelled(cancellation)?;
-    debug_assert!(inserted, "only cancellation stops the token insert");
 
-    let mut macro_definitions = tx.prepare_cached(
-        "INSERT INTO source_rust_macro_definitions(
-           blob_id, declaration_id, ordinal, is_macro_rules, context_occurrence_id
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-    )?;
-    let mut macro_arms = tx.prepare_cached(
-        "INSERT INTO source_rust_macro_arms(
-           blob_id, declaration_id, ordinal, occurrence_id, pattern_occurrence_id,
-           start_byte, end_byte, provenance, transcriber_identifiers
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
-    let mut macro_pattern_nodes = tx.prepare_cached(
-        "INSERT INTO source_rust_macro_pattern_nodes(
-           blob_id, declaration_id, arm_ordinal, ordinal, occurrence_id, parent_occurrence_id, node_kind, literal_kind, literal_text, binding_name, fragment_kind, delimiter, separator, operator, start_byte, end_byte, provenance
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-    )?;
-    let mut macro_ident_roles = tx.prepare_cached(
-        "INSERT INTO source_rust_macro_ident_roles(
-           blob_id, declaration_id, arm_ordinal, ordinal, name, role
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
+    let mut macro_definitions = Vec::new();
+    let mut macro_arms = Vec::new();
+    let mut macro_pattern_nodes = Vec::new();
+    let mut macro_ident_roles = Vec::new();
     for (definition_ordinal, definition) in item_facts.macro_definitions.iter().enumerate() {
         check_cancelled(cancellation)?;
-        macro_definitions.execute(params![
+        macro_definitions.push((
             blob_id,
             i64::from(definition.declaration.get()),
             usize_to_i64(definition_ordinal)?,
             definition.is_macro_rules,
             i64::from(definition.context.get()),
-        ])?;
+        ));
         for (arm_ordinal, arm) in definition.arms.iter().enumerate() {
             check_cancelled(cancellation)?;
             let inline_occurrence = facts.occurrences.occurrence(arm.occurrence);
-            macro_arms.execute(params![
+            macro_arms.push((
                 blob_id,
                 i64::from(definition.declaration.get()),
                 usize_to_i64(arm_ordinal)?,
@@ -708,7 +721,7 @@ pub fn insert_rust_item_source_facts_tx(
                     serde_json::to_string(names)
                         .expect("Rust macro transcriber identifiers serialize as JSON")
                 }),
-            ])?;
+            ));
             for (pattern_ordinal, pattern) in arm.patterns.iter().enumerate() {
                 check_cancelled(cancellation)?;
                 let (
@@ -769,7 +782,7 @@ pub fn insert_rust_item_source_facts_tx(
                     }
                 };
                 let inline_occurrence = facts.occurrences.occurrence(pattern.occurrence);
-                macro_pattern_nodes.execute(params![
+                macro_pattern_nodes.push((
                     blob_id,
                     i64::from(definition.declaration.get()),
                     usize_to_i64(arm_ordinal)?,
@@ -787,49 +800,82 @@ pub fn insert_rust_item_source_facts_tx(
                     usize_to_i64(inline_occurrence.range.start_byte)?,
                     usize_to_i64(inline_occurrence.range.end_byte)?,
                     crate::analyzer::store::source_facts::provenance_code(
-                        inline_occurrence.provenance
+                        inline_occurrence.provenance,
                     ),
-                ])?;
+                ));
             }
             for (role_ordinal, role) in arm.ident_roles.iter().enumerate() {
                 check_cancelled(cancellation)?;
-                macro_ident_roles.execute(params![
+                macro_ident_roles.push((
                     blob_id,
                     i64::from(definition.declaration.get()),
                     usize_to_i64(arm_ordinal)?,
                     usize_to_i64(role_ordinal)?,
                     &role.name,
                     macro_ident_role(role.role),
-                ])?;
+                ));
             }
         }
     }
-    drop(macro_definitions);
-    drop(macro_arms);
-    drop(macro_pattern_nodes);
-    drop(macro_ident_roles);
-
-    let mut import_contexts = tx.prepare_cached(
-        "INSERT INTO source_rust_item_import_contexts(
-           blob_id, declaration_occurrence_id, context_occurrence_id
-         ) VALUES(?1, ?2, ?3)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_macro_definitions(
+           blob_id, declaration_id, ordinal, is_macro_rules, context_occurrence_id
+         ) VALUES",
+        "(?, ?, ?, ?, ?)",
+        &macro_definitions,
+        cancellation,
     )?;
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_macro_arms(
+           blob_id, declaration_id, ordinal, occurrence_id, pattern_occurrence_id,
+           start_byte, end_byte, provenance, transcriber_identifiers
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &macro_arms,
+        cancellation,
+    )?;
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_macro_pattern_nodes(
+           blob_id, declaration_id, arm_ordinal, ordinal, occurrence_id, parent_occurrence_id, node_kind, literal_kind, literal_text, binding_name, fragment_kind, delimiter, separator, operator, start_byte, end_byte, provenance
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &macro_pattern_nodes,
+        cancellation,
+    )?;
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_macro_ident_roles(
+           blob_id, declaration_id, arm_ordinal, ordinal, name, role
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?)",
+        &macro_ident_roles,
+        cancellation,
+    )?;
+
+    let mut import_contexts = Vec::new();
     for row in &item_facts.import_contexts {
         check_cancelled(cancellation)?;
         assert_in_arena("item import declaration", row.declaration);
-        import_contexts.execute(params![
+        import_contexts.push((
             blob_id,
             i64::from(row.declaration.get()),
             i64::from(row.context.get()),
-        ])?;
+        ));
     }
-    drop(import_contexts);
-
-    let mut type_headers = tx.prepare_cached(
-        "INSERT INTO source_rust_types(
-           blob_id, occurrence_id, path_kind, leading_absolute, unsupported_occurrence_id, unsupported_syntax_kind, compound_occurrence_id, type_parameters_occurrence_id, start_byte, end_byte, provenance, unsupported_start_byte, unsupported_end_byte, unsupported_provenance, compound_start_byte, compound_end_byte, compound_provenance, type_parameters_start_byte, type_parameters_end_byte, type_parameters_provenance
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_item_import_contexts(
+           blob_id, declaration_occurrence_id, context_occurrence_id
+         ) VALUES",
+        "(?, ?, ?)",
+        &import_contexts,
+        cancellation,
     )?;
+
+    let mut type_headers = Vec::new();
     for row in facts.rust_types.iter() {
         check_cancelled(cancellation)?;
         let (leading_absolute, unsupported_occurrence, unsupported, compound, parameters) =
@@ -853,7 +899,7 @@ pub fn insert_rust_item_source_facts_tx(
         let inline_compound_occurrence = (compound).map(|id| facts.occurrences.occurrence(id));
         let inline_type_parameters_occurrence =
             (parameters).map(|id| facts.occurrences.occurrence(id));
-        type_headers.execute(params![
+        type_headers.push((
             blob_id,
             i64::from(row.occurrence.get()),
             path_kind(&row.shape),
@@ -892,15 +938,19 @@ pub fn insert_rust_item_source_facts_tx(
             inline_type_parameters_occurrence.map(|occurrence| {
                 crate::analyzer::store::source_facts::provenance_code(occurrence.provenance)
             }),
-        ])?;
+        ));
     }
-    drop(type_headers);
-
-    let mut type_children = tx.prepare_cached(
-        "INSERT INTO source_rust_type_children(
-           blob_id, type_occurrence_id, ordinal, occurrence_id
-         ) VALUES(?1, ?2, ?3, ?4)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_types(
+           blob_id, occurrence_id, path_kind, leading_absolute, unsupported_occurrence_id, unsupported_syntax_kind, compound_occurrence_id, type_parameters_occurrence_id, start_byte, end_byte, provenance, unsupported_start_byte, unsupported_end_byte, unsupported_provenance, compound_start_byte, compound_end_byte, compound_provenance, type_parameters_start_byte, type_parameters_end_byte, type_parameters_provenance
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &type_headers,
+        cancellation,
     )?;
+
+    let mut type_children = Vec::new();
     for row in &facts.rust_types {
         check_cancelled(cancellation)?;
         let RustTypeSourceShape::Compound { children, .. } = &row.shape else {
@@ -908,26 +958,30 @@ pub fn insert_rust_item_source_facts_tx(
         };
         for (ordinal, child) in children.iter().enumerate() {
             check_cancelled(cancellation)?;
-            type_children.execute(params![
+            type_children.push((
                 blob_id,
                 i64::from(row.occurrence.get()),
                 usize_to_i64(ordinal)?,
                 i64::from(child.get()),
-            ])?;
+            ));
         }
     }
-    drop(type_children);
-
-    let mut type_wrappers = tx.prepare_cached(
-        "INSERT INTO source_rust_type_wrappers(
-           blob_id, type_occurrence_id, ordinal, occurrence_id, wrapper_kind, start_byte, end_byte, provenance
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_type_children(
+           blob_id, type_occurrence_id, ordinal, occurrence_id
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &type_children,
+        cancellation,
     )?;
+
+    let mut type_wrappers = Vec::new();
     for row in &facts.rust_types {
         for (ordinal, wrapper) in row.wrappers.iter().enumerate() {
             check_cancelled(cancellation)?;
             let inline_occurrence = facts.occurrences.occurrence(wrapper.occurrence);
-            type_wrappers.execute(params![
+            type_wrappers.push((
                 blob_id,
                 i64::from(row.occurrence.get()),
                 usize_to_i64(ordinal)?,
@@ -936,27 +990,22 @@ pub fn insert_rust_item_source_facts_tx(
                 usize_to_i64(inline_occurrence.range.start_byte)?,
                 usize_to_i64(inline_occurrence.range.end_byte)?,
                 crate::analyzer::store::source_facts::provenance_code(inline_occurrence.provenance),
-            ])?;
+            ));
         }
     }
-    drop(type_wrappers);
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_type_wrappers(
+           blob_id, type_occurrence_id, ordinal, occurrence_id, wrapper_kind, start_byte, end_byte, provenance
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?)",
+        &type_wrappers,
+        cancellation,
+    )?;
 
-    let mut type_segments = tx.prepare_cached(
-        "INSERT INTO source_rust_type_segments(
-           blob_id, type_occurrence_id, ordinal, occurrence_id, name, start_byte, end_byte, provenance
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
-    let mut type_generic_lists = tx.prepare_cached(
-        "INSERT INTO source_rust_type_generic_lists(
-           blob_id, type_occurrence_id, segment_ordinal, occurrence_id, start_byte, end_byte, provenance
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    let mut type_generic_arguments = tx.prepare_cached(
-        "INSERT INTO source_rust_type_generic_arguments(
-           blob_id, type_occurrence_id, segment_ordinal, ordinal,
-           occurrence_id
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-    )?;
+    let mut type_segments = Vec::new();
+    let mut type_generic_lists = Vec::new();
+    let mut type_generic_arguments = Vec::new();
     for row in &facts.rust_types {
         let RustTypeSourceShape::Path { segments, .. } = &row.shape else {
             continue;
@@ -964,7 +1013,7 @@ pub fn insert_rust_item_source_facts_tx(
         for (segment_ordinal, segment) in segments.iter().enumerate() {
             check_cancelled(cancellation)?;
             let inline_occurrence = facts.occurrences.occurrence(segment.occurrence);
-            type_segments.execute(params![
+            type_segments.push((
                 blob_id,
                 i64::from(row.occurrence.get()),
                 usize_to_i64(segment_ordinal)?,
@@ -973,13 +1022,13 @@ pub fn insert_rust_item_source_facts_tx(
                 usize_to_i64(inline_occurrence.range.start_byte)?,
                 usize_to_i64(inline_occurrence.range.end_byte)?,
                 crate::analyzer::store::source_facts::provenance_code(inline_occurrence.provenance),
-            ])?;
+            ));
             let Some(generic_arguments) = segment.generic_arguments.as_ref() else {
                 continue;
             };
             check_cancelled(cancellation)?;
             let inline_occurrence = facts.occurrences.occurrence(generic_arguments.occurrence);
-            type_generic_lists.execute(params![
+            type_generic_lists.push((
                 blob_id,
                 i64::from(row.occurrence.get()),
                 usize_to_i64(segment_ordinal)?,
@@ -987,21 +1036,46 @@ pub fn insert_rust_item_source_facts_tx(
                 usize_to_i64(inline_occurrence.range.start_byte)?,
                 usize_to_i64(inline_occurrence.range.end_byte)?,
                 crate::analyzer::store::source_facts::provenance_code(inline_occurrence.provenance),
-            ])?;
+            ));
             for (ordinal, argument) in generic_arguments.arguments.iter().enumerate() {
                 check_cancelled(cancellation)?;
-                type_generic_arguments.execute(params![
+                type_generic_arguments.push((
                     blob_id,
                     i64::from(row.occurrence.get()),
                     usize_to_i64(segment_ordinal)?,
                     usize_to_i64(ordinal)?,
                     i64::from(argument.get()),
-                ])?;
+                ));
             }
         }
     }
-    drop(type_segments);
-    drop(type_generic_lists);
-    drop(type_generic_arguments);
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_type_segments(
+           blob_id, type_occurrence_id, ordinal, occurrence_id, name, start_byte, end_byte, provenance
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?)",
+        &type_segments,
+        cancellation,
+    )?;
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_type_generic_lists(
+           blob_id, type_occurrence_id, segment_ordinal, occurrence_id, start_byte, end_byte, provenance
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?)",
+        &type_generic_lists,
+        cancellation,
+    )?;
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_type_generic_arguments(
+           blob_id, type_occurrence_id, segment_ordinal, ordinal,
+           occurrence_id
+         ) VALUES",
+        "(?, ?, ?, ?, ?)",
+        &type_generic_arguments,
+        cancellation,
+    )?;
     Ok(())
 }

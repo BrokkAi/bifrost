@@ -18,10 +18,10 @@ use crate::analyzer::usages::python_class_hierarchy::{
 };
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::{
-    ClassIdentity, MemberAccessKind, MemberLookup, UnknownReason, type_flow_adapter,
+    ClassIdentity, MemberAccessKind, MemberLookup, type_flow_adapter,
 };
 use brokk_bifrost_core::analyzer::tree_walk::children_by_field_name;
-use brokk_bifrost_flow::type_flow::{ClassSetStatus, ReceiverClassSet, TypeFlowSitePurpose};
+use brokk_bifrost_flow::type_flow::{ClassSetStatus, TypeFlowSitePurpose};
 use brokk_bifrost_python::declarations::{
     PythonParameterSplat, python_parameter_label_node, python_parameter_splat,
 };
@@ -2992,7 +2992,7 @@ fn python_exception_is_subclass(
 pub(super) fn python_result_use_for_call_shape(
     shape: &CallShapeValue,
 ) -> Result<&'static str, &'static str> {
-    let source = shape.source.as_deref().ok_or("missing_call")?;
+    let source = shape.source().ok_or("missing_call")?;
     let call_span = shape.report.outcome.range.start_byte..shape.report.outcome.range.end_byte;
     let tree = parse_python(source).ok_or("unsupported_syntax")?;
     if tree.root_node().has_error() {
@@ -3521,30 +3521,19 @@ pub(super) fn procedure_return_profile_expansions(
     )))]
 }
 
-fn iterator_return_site_key(set: &ReceiverClassSet) -> (String, u32, u32, String) {
+fn iterator_return_site_key(
+    set: &super::type_flow::OwnedReceiverClassSet,
+) -> (String, u32, u32, String) {
     (
         rel_path_string(&set.site.file),
         set.site.span.start_byte(),
         set.site.span.end_byte(),
-        super::semantic::procedure_wire_id(&set.site.procedure),
+        set.site.procedure.public_digest().to_string(),
     )
 }
 
-fn iterator_set_has_complete_classes(set: &ReceiverClassSet) -> bool {
-    if !set.flow_unknown.is_empty() {
-        return false;
-    }
-    match set.status {
-        ClassSetStatus::Known => set.unknown.is_empty(),
-        ClassSetStatus::Partial => {
-            !set.unknown.is_empty()
-                && set
-                    .unknown
-                    .iter()
-                    .all(|reason| *reason == UnknownReason::ExternalNotModeled)
-        }
-        ClassSetStatus::NoInformation | ClassSetStatus::Inconclusive => false,
-    }
+fn iterator_set_has_complete_classes(set: &super::type_flow::OwnedReceiverClassSet) -> bool {
+    set.status == ClassSetStatus::Known && set.unknown.is_empty() && set.flow_unknown.is_empty()
 }
 
 fn iterator_protocol_members(
@@ -3611,25 +3600,10 @@ fn iterator_protocol_members(
     HierarchyDecision { value, premises }
 }
 
-fn builtin_iterator_protocol_members(name: &str) -> Option<(bool, bool)> {
-    match name {
-        "builtins.list" | "builtins.tuple" | "builtins.dict" | "builtins.set"
-        | "builtins.frozenset" | "builtins.str" | "builtins.bytes" | "builtins.range" | "list"
-        | "tuple" | "dict" | "set" | "frozenset" | "str" | "bytes" | "range" => Some((true, false)),
-        "builtins.list_iterator"
-        | "builtins.tuple_iterator"
-        | "builtins.str_iterator"
-        | "builtins.bytes_iterator"
-        | "builtins.range_iterator"
-        | "builtins.generator" => Some((true, true)),
-        _ => None,
-    }
-}
-
 pub(super) fn iterator_return_protocol_expansions(
     analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
-    class_sets: &[ReceiverClassSet],
+    class_sets: &[super::type_flow::OwnedReceiverClassSet],
     cancellation: Option<&CancellationToken>,
 ) -> Vec<PipelineExpansion> {
     let mut by_return = HashMap::default();
@@ -3676,47 +3650,14 @@ pub(super) fn iterator_return_protocol_expansions(
             .expect("an iterator return sink retains its source file");
         let return_anchor =
             iter_set.site.span.start_byte() as usize..iter_set.site.span.end_byte() as usize;
-        let procedure_id = super::semantic::procedure_wire_id(&iter_set.site.procedure);
-        let (method_anchor, returns_receiver, builtin_return_class, syntax_return_class) =
-            python_iterator_return_facts(
-                analyzer,
-                &iter_set.site.file,
-                &iter_set.site.procedure,
-                &source,
-                return_anchor,
-                cancellation,
-            );
+        let procedure_id = iter_set.site.procedure.public_digest().to_string();
+        let (method_anchor, returns_receiver) = python_iterator_return_facts(
+            &iter_set.site.procedure,
+            iter_set.site.is_generator,
+            &source,
+            return_anchor,
+        );
         let method_range = row_range(&source, method_anchor.clone());
-        if let Some(target_id) = builtin_return_class {
-            let (has_iter, has_next) = builtin_iterator_protocol_members(target_id)
-                .expect("a recognized builtin return class has a known iterator protocol");
-            let is_iterator = has_iter && has_next;
-            let mut fact = make_row(
-                "iterator_return_protocol",
-                &iter_set.site.file,
-                method_anchor.clone(),
-                method_range,
-                Some(procedure_id.clone()),
-                if is_iterator {
-                    "iterator"
-                } else {
-                    "non_iterator"
-                },
-                "proven",
-                true,
-                None,
-            );
-            fact.row.target_id = Some(target_id.to_owned());
-            fact.row.returns_receiver = returns_receiver;
-            let mut digest = LengthDelimitedDigest::new(PYTHON_RULE_FACT_ID_DOMAIN);
-            digest.push(fact.row.id.as_bytes());
-            digest.push(target_id.as_bytes());
-            fact.row.id = digest.finish().to_string();
-            expansions.push(pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
-                fact,
-            ))));
-            continue;
-        }
         let same_classes = iter_set.classes.len() == next_set.classes.len()
             && iter_set
                 .classes
@@ -3735,11 +3676,6 @@ pub(super) fn iterator_return_protocol_expansions(
                     .map(|(class, _)| class.clone())
                     .collect::<Vec<_>>(),
             )
-        } else if same_classes && iter_set.classes.is_empty() {
-            syntax_return_class
-                .filter(|class| !analyzer.ranges(class).is_empty())
-                .map(ClassIdentity::Workspace)
-                .map(|class| vec![class])
         } else {
             None
         };
@@ -3870,30 +3806,18 @@ pub(super) fn iterator_return_protocol_expansions(
 }
 
 fn python_iterator_return_facts(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    procedure: &crate::analyzer::semantic::ProcedureHandle,
+    procedure: &crate::analyzer::semantic::SemanticProcedureReference,
+    is_generator: bool,
     source: &str,
     return_range: std::ops::Range<usize>,
-    cancellation: Option<&CancellationToken>,
-) -> (
-    std::ops::Range<usize>,
-    Option<bool>,
-    Option<&'static str>,
-    Option<CodeUnit>,
-) {
-    let span = procedure.semantics().locator().anchor().span();
+) -> (std::ops::Range<usize>, Option<bool>) {
+    let span = procedure.locator.anchor().span();
     let procedure_range = span.start_byte() as usize..span.end_byte() as usize;
-    if procedure.semantics().properties().is_generator {
-        return (
-            procedure_range,
-            Some(false),
-            Some("builtins.generator"),
-            None,
-        );
+    if is_generator {
+        return (procedure_range, Some(false));
     }
     let Some(tree) = parse_python(source).filter(|tree| !tree.root_node().has_error()) else {
-        return (procedure_range, None, None, None);
+        return (procedure_range, None);
     };
     let function = find_exact_node(tree.root_node(), &procedure_range, &["function_definition"])
         .or_else(|| {
@@ -3907,94 +3831,44 @@ fn python_iterator_return_facts(
                 .find(|child| child.kind() == "function_definition")
         });
     let Some(function) = function else {
-        return (procedure_range, None, None, None);
+        return (procedure_range, None);
     };
     let Some(parameters) = function.child_by_field_name("parameters") else {
-        return (procedure_range, None, None, None);
+        return (procedure_range, None);
     };
     let Some(receiver) = named_children(parameters)
         .into_iter()
         .find_map(|parameter| parameter_name(parameter, source))
     else {
-        return (procedure_range, None, None, None);
+        return (procedure_range, None);
     };
     let Some(return_node) = tree
         .root_node()
         .named_descendant_for_byte_range(return_range.start, return_range.end)
     else {
-        return (procedure_range, None, None, None);
+        return (procedure_range, None);
     };
     if return_node.start_byte() != return_range.start || return_node.end_byte() != return_range.end
     {
-        return (procedure_range, None, None, None);
+        return (procedure_range, None);
     }
     let expression = if return_node.kind() == "return_statement" {
         let expressions = named_children(return_node);
         let [expression] = expressions.as_slice() else {
-            return (procedure_range, Some(false), None, None);
+            return (procedure_range, Some(false));
         };
         *expression
     } else {
         return_node
     };
     let Some(expression) = unwrap_parenthesized(expression) else {
-        return (procedure_range, None, None, None);
+        return (procedure_range, None);
     };
     let returns_receiver = Some(
         expression.kind() == "identifier"
             && node_text(source, expression) == Some(receiver.as_str()),
     );
-    let builtin_return_class = match expression.kind() {
-        "list" | "list_comprehension" => Some("builtins.list"),
-        "tuple" => Some("builtins.tuple"),
-        "dictionary" | "dictionary_comprehension" => Some("builtins.dict"),
-        "set" | "set_comprehension" => Some("builtins.set"),
-        _ => None,
-    };
-    let syntax_return_class = if returns_receiver == Some(true) {
-        analyzer
-            .declarations(file)
-            .into_iter()
-            .find(|unit| {
-                unit.is_function()
-                    && analyzer.ranges(unit).iter().any(|range| {
-                        range.start_byte == procedure_range.start
-                            && range.end_byte == procedure_range.end
-                    })
-            })
-            .and_then(|method| analyzer.parent_of(&method))
-            .filter(CodeUnit::is_class)
-    } else if expression.kind() == "call" {
-        expression
-            .child_by_field_name("function")
-            .and_then(|function| {
-                resolve_identifier_range(
-                    analyzer,
-                    file,
-                    source,
-                    function.start_byte(),
-                    function.end_byte(),
-                    cancellation,
-                )
-            })
-            .and_then(|outcome| {
-                if outcome.status != DefinitionLookupStatus::Resolved {
-                    return None;
-                }
-                let [target] = outcome.definitions.as_slice() else {
-                    return None;
-                };
-                target.is_class().then(|| target.clone())
-            })
-    } else {
-        None
-    };
-    (
-        procedure_range,
-        returns_receiver,
-        builtin_return_class,
-        syntax_return_class,
-    )
+    (procedure_range, returns_receiver)
 }
 
 pub(super) fn builtin_identity_expansions(
@@ -4488,7 +4362,7 @@ fn builtin_identity_resolution(
     name: &str,
     position: usize,
     namespace: Option<crate::analyzer::structural::Namespace>,
-    resolver_selects_declaration: bool,
+    resolver_has_declaration_candidate: bool,
 ) -> BuiltinIdentityResolution {
     let maybe_wildcard_binding = environment.innermost_scope(position).is_some_and(|scope| {
         let ancestry = environment.scope_ancestry(scope);
@@ -4501,7 +4375,7 @@ fn builtin_identity_resolution(
                     .is_some_and(|import| import.wildcard)
         })
     });
-    if resolver_selects_declaration {
+    if resolver_has_declaration_candidate {
         return BuiltinIdentityResolution {
             outcome: "shadowed",
             proof: "none",
@@ -4553,16 +4427,17 @@ fn resolve_builtin_identity(
     definition: Option<&DefinitionLookupOutcome>,
 ) -> Option<BuiltinIdentityResolution> {
     brokk_bifrost_python::diagnostics::is_python_builtin_or_constant(name).then(|| {
-        let resolver_selects_declaration = definition.is_some_and(|outcome| {
-            outcome.status == DefinitionLookupStatus::Resolved
-                && (!outcome.definitions.is_empty() || outcome.lexical_definition.is_some())
+        let resolver_has_declaration_candidate = definition.is_some_and(|outcome| {
+            // An incomplete native candidate still prevents proving builtin
+            // identity. Binding certainty and absence of a shadow are distinct.
+            !outcome.definitions.is_empty() || outcome.lexical_definition.is_some()
         });
         builtin_identity_resolution(
             environment,
             name,
             position,
             namespace,
-            resolver_selects_declaration,
+            resolver_has_declaration_candidate,
         )
     })
 }
@@ -5045,8 +4920,7 @@ pub(super) fn call_result_use_expansions(
         return Vec::new();
     }
     let source = shape
-        .source
-        .as_deref()
+        .source()
         .expect("public call-shape rows retain their exact source snapshot");
     let call_span = shape.report.outcome.range.start_byte..shape.report.outcome.range.end_byte;
     let result_use = python_result_use_for_call_shape(shape).ok();

@@ -353,7 +353,13 @@ fn selected_inverse_uncovered_target_never_falls_back_to_legacy_usage() {
     assert_eq!(metrics.uncovered_target_lookups, 1);
 
     let mut diagnostics = Vec::new();
-    cache.report_inverse_completeness(&uncovered, Language::Java, &result, &mut diagnostics);
+    cache.report_inverse_completeness(
+        fixture.workspace.analyzer(),
+        &uncovered,
+        Language::Java,
+        &result,
+        &mut diagnostics,
+    );
     assert_eq!(diagnostics.len(), 1);
     assert!(
         diagnostics[0]
@@ -389,6 +395,7 @@ fn selected_inverse_covered_empty_status_is_generation_bound_and_honest() {
     assert_eq!(complete.completeness, EdgeCompleteness::Complete);
     let mut complete_diagnostics = Vec::new();
     complete_cache.report_inverse_completeness(
+        fixture.workspace.analyzer(),
         &target,
         Language::Java,
         &complete,
@@ -412,6 +419,7 @@ fn selected_inverse_covered_empty_status_is_generation_bound_and_honest() {
     );
     let mut incomplete_diagnostics = Vec::new();
     incomplete_cache.report_inverse_completeness(
+        fixture.workspace.analyzer(),
         &target,
         Language::Java,
         &incomplete,
@@ -453,6 +461,7 @@ fn selected_inverse_diagnostics_separate_global_and_target_local_reasons() {
     let mut global_diagnostics = Vec::new();
     for target in [&first, &second] {
         global_cache.report_inverse_completeness(
+            fixture.workspace.analyzer(),
             target,
             Language::Java,
             &result(EdgeIncompleteReason::InverseIndexResolutionIncomplete),
@@ -468,12 +477,14 @@ fn selected_inverse_diagnostics_separate_global_and_target_local_reasons() {
     );
     let mut local_diagnostics = Vec::new();
     local_cache.report_inverse_completeness(
+        fixture.workspace.analyzer(),
         &first,
         Language::Java,
         &result(EdgeIncompleteReason::InverseIndexAdmissionIncomplete),
         &mut local_diagnostics,
     );
     local_cache.report_inverse_completeness(
+        fixture.workspace.analyzer(),
         &second,
         Language::Java,
         &EdgeDerivationResult {
@@ -489,6 +500,7 @@ fn selected_inverse_diagnostics_separate_global_and_target_local_reasons() {
     assert!(!local_diagnostics[0].message.contains(second_name.as_str()));
 
     local_cache.report_inverse_completeness(
+        fixture.workspace.analyzer(),
         &second,
         Language::Java,
         &result(EdgeIncompleteReason::AxisUnsupported(
@@ -543,7 +555,13 @@ fn selected_inverse_target_local_diagnostics_deduplicate_by_exact_overload() {
     };
     let mut diagnostics = Vec::new();
     for overload in [first, second] {
-        cache.report_inverse_completeness(overload, Language::Java, &incomplete, &mut diagnostics);
+        cache.report_inverse_completeness(
+            workspace.analyzer(),
+            overload,
+            Language::Java,
+            &incomplete,
+            &mut diagnostics,
+        );
     }
     assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
     assert!(diagnostics.iter().all(|diagnostic| {
@@ -552,7 +570,13 @@ fn selected_inverse_target_local_diagnostics_deduplicate_by_exact_overload() {
             .contains("does not cover every requested reference-edge axis")
     }));
 
-    cache.report_inverse_completeness(first, Language::Java, &incomplete, &mut diagnostics);
+    cache.report_inverse_completeness(
+        workspace.analyzer(),
+        first,
+        Language::Java,
+        &incomplete,
+        &mut diagnostics,
+    );
     assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
 }
 

@@ -1137,7 +1137,7 @@ pub(super) fn decode_decorator_binding_filter(
     reject_unknown_filter_fields(
         object,
         path,
-        &["module", "imported_name", "op"],
+        &["module", "imported_name", "annotation_type", "op"],
         "decorator-binding",
     )?;
     let decode_exact = |field: &str| -> Result<Option<String>, QueryError> {
@@ -1163,6 +1163,7 @@ pub(super) fn decode_decorator_binding_filter(
     Ok(DecoratorBindingFilter {
         module: decode_exact("module")?,
         imported_name: decode_exact("imported_name")?,
+        annotation_type: decode_exact("annotation_type")?,
     })
 }
 
@@ -2938,8 +2939,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::BindingNames
                     | QueryStepField::BindingHoisting,
                 ) if binding => {}
-                Some(QueryStepField::DecoratorModule | QueryStepField::DecoratorImportedName)
-                    if decorator_binding => {}
+                Some(
+                    QueryStepField::DecoratorModule
+                    | QueryStepField::DecoratorImportedName
+                    | QueryStepField::DecoratorAnnotationType,
+                ) if decorator_binding => {}
                 Some(
                     QueryStepField::CandidateTiers
                     | QueryStepField::CandidateOutcomes
@@ -3021,6 +3025,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::BindingHoisting
                     | QueryStepField::DecoratorModule
                     | QueryStepField::DecoratorImportedName
+                    | QueryStepField::DecoratorAnnotationType
                     | QueryStepField::IncludeShadowed
                     | QueryStepField::CandidateTiers
                     | QueryStepField::CandidateOutcomes
@@ -3901,6 +3906,7 @@ struct PatternFields<'a> {
     is_async: Option<&'a Value>,
     unsafe_context: Option<&'a Value>,
     modifier: Option<&'a Value>,
+    type_kind: Option<&'a Value>,
     string_value: Option<&'a Value>,
     language_rule: Option<&'a Value>,
     body_state: Option<&'a Value>,
@@ -3949,6 +3955,7 @@ fn collect_pattern_fields<'a>(
                 PatternField::Async => fields.is_async = Some(value),
                 PatternField::UnsafeContext => fields.unsafe_context = Some(value),
                 PatternField::Modifier => fields.modifier = Some(value),
+                PatternField::TypeKind => fields.type_kind = Some(value),
                 PatternField::StringValue => fields.string_value = Some(value),
                 PatternField::LanguageRule => fields.language_rule = Some(value),
                 PatternField::BodyState => fields.body_state = Some(value),
@@ -4096,6 +4103,23 @@ fn decode_pattern(
             value.as_bool().ok_or_else(|| {
                 QueryError::new(child_path(path, "async"), "expected a boolean literal")
             })
+        })
+        .transpose()?;
+
+    let type_kind = fields
+        .type_kind
+        .map(|value| {
+            let path = child_path(path, "type_kind");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&path, "expected a type-kind label"))?;
+            if !crate::query::schema::DECLARATION_TYPE_KINDS.contains(&label) {
+                return Err(QueryError::new(
+                    &path,
+                    format!("unknown type kind {label:?}"),
+                ));
+            }
+            Ok(label.to_owned())
         })
         .transpose()?;
 
@@ -4363,6 +4387,7 @@ fn decode_pattern(
         is_async,
         unsafe_context,
         modifier,
+        type_kind,
         string_value,
         language_rule,
         body_state,
@@ -4812,12 +4837,22 @@ fn decode_role_fields(
                 Role::Value => pattern.value = Some(sub_pattern),
                 Role::Key => pattern.key = Some(sub_pattern),
                 Role::Test => pattern.test = Some(sub_pattern),
+                Role::Type => pattern.type_operand = Some(sub_pattern),
+                Role::Operand => pattern.operand = Some(sub_pattern),
+                Role::Consequence => pattern.consequence = Some(sub_pattern),
+                Role::Alternative => pattern.alternative = Some(sub_pattern),
+                Role::Body => pattern.body = Some(sub_pattern),
+                Role::Label => pattern.label = Some(sub_pattern),
+                Role::Binding => pattern.binding = Some(sub_pattern),
+
                 Role::Arg
                 | Role::Kwarg
                 | Role::Decorator
                 | Role::Element
                 | Role::Attributes
                 | Role::Children
+                | Role::Indices
+                | Role::Dimensions
                 | Role::Part
                 | Role::TypeArguments => {
                     unreachable!("non-single role")
@@ -4855,6 +4890,9 @@ fn decode_role_fields(
                 Role::Attributes => pattern.attributes = patterns,
                 Role::Children => pattern.children = patterns,
                 Role::Part => pattern.parts = patterns,
+                Role::Indices => pattern.indices = patterns,
+                Role::Dimensions => pattern.dimensions = patterns,
+
                 Role::TypeArguments => pattern.type_arguments = patterns,
                 Role::Callee
                 | Role::Receiver
@@ -4869,7 +4907,14 @@ fn decode_role_fields(
                 | Role::Tag
                 | Role::Value
                 | Role::Key
-                | Role::Test => unreachable!("non-list role"),
+                | Role::Test
+                | Role::Type
+                | Role::Operand
+                | Role::Consequence
+                | Role::Alternative
+                | Role::Body
+                | Role::Label
+                | Role::Binding => unreachable!("non-list role"),
             }
         }
     }

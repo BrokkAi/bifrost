@@ -113,29 +113,38 @@ fn build_python_edges<Output, F>(
     domain: EdgeNodeDomain<'_>,
     targets: Option<&HashSet<String>>,
     keep_file: F,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Option<Output>
 where
     Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
+    // Initialize before entering the per-file walk: its helpers otherwise open
+    // the same memo without the request's cancellation authority.
+    brokk_bifrost_python::graph_support::PythonUsageSource::usage_index_with_cancellation(
+        py,
+        cancellation,
+    )?;
     let files: Vec<ProjectFile> = py.get_analyzed_files().into_iter().collect();
     let language = tree_sitter_python::LANGUAGE.into();
     let scan = targets.map_or_else(PythonEdgeScan::new_rooted, |targets| {
         PythonEdgeScan::new(domain.callers(), targets)
     });
     let scope = AnalyzerQueryScope::new(analyzer);
-    let result = build_edge_output_with_completeness(&files, keep_file, |file| {
-        let mut unavailable = false;
-        let edges = parse_and_collect_with_domain(
-            analyzer,
-            file,
-            domain,
-            ParseSpec::whole(&language),
-            |input| {
-                let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
-                match brokk_bifrost_analysis::analyzer::relational_frontier::resolve_relational_frontier(
+    let result = build_edge_output_with_completeness(
+        &files,
+        |file| !cancellation.is_cancelled() && keep_file(file),
+        |file| {
+            let mut unavailable = false;
+            let edges = parse_and_collect_with_domain(
+                analyzer,
+                file,
+                domain,
+                ParseSpec::whole(&language),
+                |input| {
+                    match brokk_bifrost_analysis::analyzer::relational_frontier::resolve_relational_frontier(
                     analyzer,
-                    &cancellation,
+                    cancellation,
                     |frontier| {
                         let graph = PythonGraphSource {
                             token: scope.token(),
@@ -144,12 +153,13 @@ where
                             imports: analyzer.import_analysis_provider(),
                             definitions: frontier,
                         };
-                        scan.scan_file(&graph, py, file, input)
+                        scan.scan_file(&graph, py, file, input, cancellation)
                     },
                 ) {
                     brokk_bifrost_core::analyzer::definition_lookup::RelationalFrontierOutcome::Complete(edges) => edges,
                     brokk_bifrost_core::analyzer::definition_lookup::RelationalFrontierOutcome::Cancelled => {
-                        unreachable!("an uncancelled Python edge frontier cannot cancel")
+                        unavailable = true;
+                        return Default::default();
                     }
                     brokk_bifrost_core::analyzer::definition_lookup::RelationalFrontierOutcome::Failed(error) => {
                         panic!("Python relational edge frontier failed: {error:?}")
@@ -159,10 +169,14 @@ where
                     unavailable = true;
                     Default::default()
                 })
-            },
-        );
-        (!unavailable).then_some(edges).flatten()
-    });
+                },
+            );
+            (!unavailable).then_some(edges).flatten()
+        },
+    );
+    if cancellation.is_cancelled() {
+        return None;
+    }
     match result {
         UsageEdgeBuildResult::Complete(output) => Some(output),
         UsageEdgeBuildResult::Uncacheable { omitted_files, .. } => {
@@ -178,6 +192,7 @@ pub(crate) fn build_rooted_python_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     callers: &HashSet<String>,
     keep_file: F,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Option<UsageEdges>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
@@ -189,7 +204,16 @@ where
         EdgeNodeDomain::Rooted(callers),
         None,
         keep_file,
+        cancellation,
     )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static DEAD_CODE_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn python_legacy_dead_code_requests_for_test() -> usize {
+    DEAD_CODE_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Build caller nodes for the whole Python graph while resolving only the
@@ -203,6 +227,8 @@ pub(crate) fn build_cached_python_usage_edges_for_targets(
     nodes: &HashSet<String>,
     targets: &HashSet<String>,
 ) -> Option<Arc<UsageEdges>> {
+    #[cfg(any(test, feature = "test-support"))]
+    DEAD_CODE_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let py = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
     py.usage_edges_for_targets(nodes, targets, || {
         let resolver = PythonEdgeResolver::try_new(analyzer)
@@ -213,6 +239,7 @@ pub(crate) fn build_cached_python_usage_edges_for_targets(
             EdgeNodeDomain::Closed(nodes),
             Some(targets),
             |_| true,
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
         )
     })
 }
@@ -533,6 +560,7 @@ impl<'a> PythonEdgeResolver<'a> {
             EdgeNodeDomain::Closed(nodes),
             Some(nodes),
             keep_file,
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
         )
     }
 }
@@ -851,8 +879,13 @@ mod tests {
         analyzer.reset_definition_prefetch_batch_count_for_test();
         analyzer.reset_definition_candidates_query_count_for_test();
 
-        let edges = build_rooted_python_usage_edges(&analyzer, &callers, |_| true)
-            .expect("Python files are present, so a rooted scan must produce a graph");
+        let edges = build_rooted_python_usage_edges(
+            &analyzer,
+            &callers,
+            |_| true,
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+        )
+        .expect("Python files are present, so a rooted scan must produce a graph");
 
         assert!(
             analyzer.definition_prefetch_batch_count_for_test() > 0,
@@ -1026,9 +1059,13 @@ mod tests {
             .map(|unit| unit.fq_name())
             .collect();
 
-        let edges = build_rooted_python_usage_edges(&analyzer, &callers, |_| true).expect(
-            "an empty package init contributes no edges and must not be reported as omitted",
-        );
+        let edges = build_rooted_python_usage_edges(
+            &analyzer,
+            &callers,
+            |_| true,
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+        )
+        .expect("an empty package init contributes no edges and must not be reported as omitted");
 
         assert!(
             edges

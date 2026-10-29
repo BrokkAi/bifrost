@@ -445,7 +445,7 @@ fn read_opened_workspace_document(
     }
 
     let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
-    file.take(max_bytes + 1)
+    file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|source| WorkspaceDocumentError::ReadFile {
             path: relative_path.clone(),
@@ -787,6 +787,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::test_support::create_fifo;
+    use brokk_bifrost_test_macros::hardwon;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -856,6 +857,186 @@ mod tests {
         assert_eq!(document.source(), source);
     }
 
+    #[test]
+    fn bounded_workspace_reads_accept_exact_limits_and_reject_overflow() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("données")).unwrap();
+        fs::write(workspace.path().join("données/entrée.rql"), "π").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+
+        let exact =
+            read_workspace_document(&root, Path::new("données/entrée.rql"), &["rql"], 2).unwrap();
+        assert_eq!(exact.source(), "π");
+        assert!(matches!(
+            read_workspace_document(&root, Path::new("données/entrée.rql"), &["rql"], 1,),
+            Err(WorkspaceDocumentError::TooLarge { bytes: Some(2), .. })
+        ));
+
+        let models = workspace.path().join("models");
+        fs::create_dir(&models).unwrap();
+        for name in ["a.rql", "b.rql", "c.rql", "d.rql"] {
+            fs::write(models.join(name), "x").unwrap();
+        }
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+        let directory = root.open_directory(Path::new("models")).unwrap();
+        assert!(directory.entries_up_to(0).unwrap().is_none());
+        assert!(directory.entries_up_to(3).unwrap().is_none());
+        assert_eq!(directory.entries_up_to(4).unwrap().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn optional_reads_keep_present_documents_and_distinguish_missing_files() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("present.rql"), "(rule)").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+
+        let present =
+            read_optional_workspace_document(&root, Path::new("present.rql"), &["rql"], 64)
+                .unwrap()
+                .unwrap();
+        assert_eq!(present.source(), "(rule)");
+        assert!(
+            read_optional_workspace_document(&root, Path::new("missing.rql"), &["rql"], 64,)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn directory_entry_reads_enforce_byte_limit() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("query.rql"), "π").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+
+        let read_at_limit = |limit| {
+            root.root_directory()
+                .unwrap()
+                .entries_up_to(1)
+                .unwrap()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .read_document(&["rql"], limit)
+        };
+        assert!(matches!(
+            read_at_limit(1),
+            Err(WorkspaceDocumentError::TooLarge { .. })
+        ));
+        assert_eq!(read_at_limit(2).unwrap().source(), "π");
+        assert_eq!(read_at_limit(3).unwrap().source(), "π");
+    }
+
+    #[test]
+    #[hardwon("3fdaa7196951: maximum byte limit overflowed during bounded reads")]
+    fn explicit_and_entry_reads_accept_the_maximum_byte_limit() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("query.rql"), "(rule π)").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+        let explicit =
+            read_workspace_document(&root, Path::new("query.rql"), &["rql"], u64::MAX).unwrap();
+        assert_eq!(explicit.source(), "(rule π)");
+
+        let entry = root
+            .root_directory()
+            .unwrap()
+            .entries_up_to(1)
+            .unwrap()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            entry.read_document(&["rql"], u64::MAX).unwrap().source(),
+            "(rule π)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_read_detects_proc_file_growth_beyond_metadata_size() {
+        // procfs reports a zero length for a file whose read returns bytes,
+        // so only the extra-byte probe can catch the overrun.
+        let root = WorkspaceRoot::open(Path::new("/proc/self")).unwrap();
+        assert_eq!(fs::metadata("/proc/self/cmdline").unwrap().len(), 0);
+
+        assert!(matches!(
+            read_workspace_document_without_extension(&root, Path::new("cmdline"), 1),
+            Err(WorkspaceDocumentError::TooLarge { bytes: None, .. })
+        ));
+    }
+
+    #[test]
+    fn extension_allow_list_is_case_sensitive_for_all_readers() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("query.RQL"), "(rule)").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+        assert!(matches!(
+            read_workspace_document(&root, Path::new("query.RQL"), &["rql"], 64),
+            Err(WorkspaceDocumentError::UnsupportedExtension { .. })
+        ));
+        let entry = root
+            .root_directory()
+            .unwrap()
+            .entries_up_to(1)
+            .unwrap()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(matches!(
+            entry.read_document(&["rql"], 64),
+            Err(WorkspaceDocumentError::UnsupportedExtension { .. })
+        ));
+        assert_eq!(
+            read_workspace_document(&root, Path::new("query.RQL"), &["RQL"], 64)
+                .unwrap()
+                .source(),
+            "(rule)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_reads_propagate_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("private.rql");
+        fs::write(&file, "(rule)").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o0)).unwrap();
+        let result =
+            read_optional_workspace_document(&root, Path::new("private.rql"), &["rql"], 64);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceDocumentError::OpenFile { source, .. })
+                if source.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn opened_directory_entries_remain_directories() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("models/nested")).unwrap();
+        fs::write(workspace.path().join("models/nested/item.rql"), "x").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+        let entry = root
+            .open_directory(Path::new("models"))
+            .unwrap()
+            .entries_up_to(2)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.relative_path() == Path::new("models/nested"))
+            .unwrap();
+
+        let directory = entry.open_directory().unwrap();
+        assert_eq!(directory.entries_up_to(2).unwrap().unwrap().len(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn explicit_directory_resolution_rejects_symlink_components() {
@@ -902,6 +1083,57 @@ mod tests {
         assert!(matches!(
             read_workspace_document(&root, Path::new("binary.rql"), &["rql"], 64),
             Err(WorkspaceDocumentError::InvalidUtf8 { .. })
+        ));
+    }
+
+    #[test]
+    fn directory_entries_are_sorted_by_workspace_path() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("z.rql"), "z").unwrap();
+        fs::create_dir(workspace.path().join("m-dir")).unwrap();
+        fs::write(workspace.path().join("a.rql"), "a").unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+        let paths = root
+            .root_directory()
+            .unwrap()
+            .entries_up_to(3)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.relative_path().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("a.rql"),
+                PathBuf::from("m-dir"),
+                PathBuf::from("z.rql")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_entry_open_rejects_replacement_by_internal_symlink() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("models/nested")).unwrap();
+        fs::create_dir(workspace.path().join("models/replacement")).unwrap();
+        let root = WorkspaceRoot::open(workspace.path()).unwrap();
+        let entry = root
+            .open_directory(Path::new("models"))
+            .unwrap()
+            .entries_up_to(2)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.relative_path() == Path::new("models/nested"))
+            .unwrap();
+        fs::remove_dir(workspace.path().join("models/nested")).unwrap();
+        symlink("replacement", workspace.path().join("models/nested")).unwrap();
+
+        assert!(matches!(
+            entry.open_directory(),
+            Err(WorkspaceDocumentError::OpenDirectory { .. })
         ));
     }
 

@@ -37,6 +37,8 @@ pub struct CppCompileContext {
     pub system_include_roots: Vec<PathBuf>,
     pub forced_includes: Vec<PathBuf>,
     pub defined_macros: HashSet<String>,
+    /// Explicit -D/-U flags invalidate the compiler's default builtin state.
+    pub(crate) cplusplus_macro_configured: bool,
     include_search_roots: Vec<CppIncludeSearchRoot>,
     /// The invocation's driver basename (`arguments[0]`, minus one trailing
     /// extension such as `.exe`), used by [`Self::tu_language`] only when
@@ -131,10 +133,23 @@ pub struct CppCompileContexts {
 
 impl CppCompileContexts {
     pub fn load(project: &dyn Project) -> Self {
+        Self::load_with_io_error(project, |_| {})
+    }
+
+    /// Keep the legacy best-effort value while its analyzer observes provider
+    /// failures before a persistent memo can install that value (#7311).
+    pub fn load_with_io_error(
+        project: &dyn Project,
+        on_error: impl FnOnce(&std::io::Error),
+    ) -> Self {
         let workspace_root = canonical_or_normalized_path(project.root());
         let database_path = workspace_root.join(COMPILATION_DATABASE_PATH);
-        let Ok(database) = std::fs::read_to_string(database_path) else {
-            return Self::default();
+        let database = match std::fs::read_to_string(database_path) {
+            Ok(database) => database,
+            Err(error) => {
+                on_error(&error);
+                return Self::default();
+            }
         };
         let Ok(entries) = serde_json::from_str::<Vec<CompilationDatabaseEntry>>(&database) else {
             return Self::default();
@@ -421,6 +436,7 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
     let mut system_include_roots = Vec::new();
     let mut forced_includes = Vec::new();
     let mut defined_macros = HashSet::default();
+    let mut cplusplus_macro_configured = false;
     let mut include_search_roots = Vec::new();
     let mut explicit_language = None;
     let mut std_language = None;
@@ -474,7 +490,9 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
                 index += 2;
             }
             "-D" => {
-                defined_macros.insert(macro_name(arguments.get(index + 1)?)?);
+                let name = macro_name(arguments.get(index + 1)?)?;
+                cplusplus_macro_configured |= name == "__cplusplus";
+                defined_macros.insert(name);
                 index += 2;
             }
             // The compiler applies -D and -U in command order, so a later -U
@@ -482,7 +500,9 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
             // can still define the name, so only the surviving defines are
             // positive facts (#2011).
             "-U" => {
-                defined_macros.remove(&macro_name(arguments.get(index + 1)?)?);
+                let name = macro_name(arguments.get(index + 1)?)?;
+                cplusplus_macro_configured |= name == "__cplusplus";
+                defined_macros.remove(&name);
                 index += 2;
             }
             _ => {
@@ -521,9 +541,13 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
                         kind: CppIncludeSearchRootKind::System,
                     });
                 } else if let Some(definition) = argument.strip_prefix("-D") {
-                    defined_macros.insert(macro_name(definition)?);
+                    let name = macro_name(definition)?;
+                    cplusplus_macro_configured |= name == "__cplusplus";
+                    defined_macros.insert(name);
                 } else if let Some(name) = argument.strip_prefix("-U") {
-                    defined_macros.remove(&macro_name(name)?);
+                    let name = macro_name(name)?;
+                    cplusplus_macro_configured |= name == "__cplusplus";
+                    defined_macros.remove(&name);
                 } else if let Some(value) = argument.strip_prefix("-std=") {
                     std_language = Some(if value.contains("++") {
                         CompiledLanguage::Cpp
@@ -545,6 +569,7 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
         system_include_roots,
         forced_includes,
         defined_macros,
+        cplusplus_macro_configured,
         include_search_roots,
         driver_basename,
         explicit_language,
@@ -725,6 +750,28 @@ mod tests {
         assert!(context.defined_macros.contains("REVIVED"));
         assert!(!context.defined_macros.contains("CANCELLED"));
         assert!(!context.defined_macros.contains("NEVER_DEFINED"));
+        assert!(!context.cplusplus_macro_configured);
+        for flags in [
+            vec!["c++", "-U__cplusplus"],
+            vec!["c++", "-U", "__cplusplus"],
+            vec!["c++", "-D__cplusplus=1", "-U__cplusplus"],
+            vec!["c++", "-U__cplusplus", "-D", "__cplusplus=1"],
+        ] {
+            let configured = super::parse_compile_arguments(
+                Path::new("."),
+                &flags
+                    .iter()
+                    .map(|flag| (*flag).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("compiler flags");
+            assert!(configured.cplusplus_macro_configured, "{flags:?}");
+            assert_eq!(
+                configured.defined_macros.contains("__cplusplus"),
+                flags.last() == Some(&"__cplusplus=1"),
+                "{flags:?}"
+            );
+        }
     }
 
     #[test]

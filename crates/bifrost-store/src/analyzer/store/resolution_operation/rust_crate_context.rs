@@ -5,8 +5,6 @@ use super::*;
 use crate::analyzer::resolution::SharedNameInterner;
 use crate::analyzer::resolution::mounted_site_semantic;
 use rusqlite::params;
-use rusqlite::params_from_iter;
-use rusqlite::types::Value;
 
 /// Production point-target query used by cross-crate planner regressions.
 #[cfg(any(test, feature = "test-support"))]
@@ -1207,7 +1205,7 @@ pub(super) const GAPS: &str = "SELECT gap.gap_kind, gap.subject, json(gap.detail
 pub const DETACHED_SCOPE_CRATES: &str = "SELECT COUNT(*) FROM selected_rust_unit_summaries AS unit
  CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id=unit.summary_id
- WHERE context.target_kind='detached' AND unit.unit_key IN ";
+ WHERE context.target_kind='detached' AND unit.unit_key IN (SELECT unhex(value) FROM json_each(?1))";
 /// The mounts of the crates in the transitive dependency closure of the
 /// requested crate keys.
 ///
@@ -1224,20 +1222,14 @@ pub const DETACHED_SCOPE_CRATES: &str = "SELECT COUNT(*) FROM selected_rust_unit
 /// it costs one primary-key range per summary and one index seek per member
 /// file rather than a pass over the selection or Rust topology sources.
 #[doc(hidden)]
-pub const CLOSURE_SCOPE_MOUNTS_HEAD: &str =
+pub const CLOSURE_SCOPE_MOUNTS: &str =
     "INSERT OR IGNORE INTO temp.selected_resolution_scope_mounts(mount_ordinal)
  SELECT DISTINCT mount.mount_ordinal
  FROM selected_rust_unit_closure AS closure
  CROSS JOIN selected_rust_unit_members AS member ON member.summary_id=closure.summary_id
  CROSS JOIN temp.selected_resolution_mounts AS mount
   ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
- WHERE closure.root_unit_key IN ";
-#[doc(hidden)]
-pub const CLOSURE_SCOPE_MOUNTS_TAIL: &str = "";
-#[cfg(any(test, feature = "test-support"))]
-static CLOSURE_SCOPE_MOUNTS_PIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("{CLOSURE_SCOPE_MOUNTS_HEAD}(?1){CLOSURE_SCOPE_MOUNTS_TAIL}")
-});
+ WHERE closure.root_unit_key IN (SELECT unhex(value) FROM json_each(?1))";
 
 /// The mounts no crate row can place, which a crate closure cannot narrow:
 /// another language's files, and a content mount carrying an editor buffer
@@ -1685,22 +1677,18 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         if crate_keys.is_empty() || cancellation.is_cancelled() {
             return Ok(None);
         }
-        let keys = crate_keys
-            .iter()
-            .map(|key| Value::Blob(key.to_vec()))
-            .collect::<Vec<_>>();
-        let placeholders = format!(
-            "({})",
-            (1..=crate_keys.len())
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let detached: i64 = self.inventory.connection().query_row(
-            &format!("{DETACHED_SCOPE_CRATES}{placeholders}"),
-            params_from_iter(keys.iter()),
-            |row| row.get(0),
-        )?;
+        let keys = serde_json::to_string(
+            &crate_keys
+                .iter()
+                .map(|key| super::super::resolution_lexical::hex_digest(*key))
+                .collect::<Vec<_>>(),
+        )
+        .expect("crate key strings are JSON serializable");
+        let detached: i64 = self
+            .inventory
+            .connection()
+            .prepare_cached(DETACHED_SCOPE_CRATES)?
+            .query_row([&keys], |row| row.get(0))?;
         if detached > 0 {
             return Ok(None);
         }
@@ -1710,10 +1698,8 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         // retained operation when the inventory drops.
         self.inventory.with_owned_temp_write(|conn| {
             conn.execute("DELETE FROM temp.selected_resolution_scope_mounts", [])?;
-            conn.execute(
-                &format!("{CLOSURE_SCOPE_MOUNTS_HEAD}{placeholders}{CLOSURE_SCOPE_MOUNTS_TAIL}"),
-                params_from_iter(keys.iter()),
-            )?;
+            conn.prepare_cached(CLOSURE_SCOPE_MOUNTS)?
+                .execute([&keys])?;
             conn.execute(UNPLACEABLE_SCOPE_MOUNTS, [])?;
             Ok(())
         })?;
@@ -4529,11 +4515,7 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         ("rust_point_file_crates", FILE_CRATES, 2),
         ("rust_graph_crates_reaching", CRATES_REACHING, 1),
         ("rust_point_modules", MODULES, 1),
-        (
-            "rust_scope_closure_mounts",
-            CLOSURE_SCOPE_MOUNTS_PIN.as_str(),
-            1,
-        ),
+        ("rust_scope_closure_mounts", CLOSURE_SCOPE_MOUNTS, 1),
         ("rust_point_module_placements", MODULE_PLACEMENTS, 2),
         ("rust_point_named", NAMED, 7),
         ("rust_point_import_root_name", IMPORT_ROOT_NAME, 3),

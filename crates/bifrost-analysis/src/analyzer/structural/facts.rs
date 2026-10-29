@@ -22,6 +22,7 @@ use brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows;
 
 use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
+use super::provider::LiveRegistration;
 use crate::analyzer::Range;
 use crate::analyzer::semantic::ContentIdentity;
 use crate::compact_graph::{CompactRows, CompactRowsBuilder};
@@ -54,6 +55,8 @@ pub struct NormalizedNode {
     pub is_async: Option<bool>,
     /// Rust call-site unsafe context; absent on other kinds and languages.
     pub unsafe_context: Option<bool>,
+    pub declaration_attributes:
+        Option<brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes>,
     pub string_value: Option<String>,
     pub construct: Option<String>,
     pub range: Range,
@@ -209,6 +212,7 @@ fn materialize_rows(
             duplicate_key: node.duplicate_key,
             is_async: node.is_async,
             unsafe_context: node.unsafe_context,
+            declaration_attributes: node.declaration_attributes.clone(),
             string_value: node.string_value.clone(),
             construct: node.construct.clone(),
             range: source_facts.occurrence(node.occurrence).range,
@@ -300,6 +304,7 @@ fn append_syntax_error_facts(
             duplicate_key: None,
             is_async: None,
             unsafe_context: None,
+            declaration_attributes: None,
             string_value: None,
             construct: None,
             range: region.range,
@@ -317,6 +322,7 @@ fn append_syntax_error_facts(
 /// byte offsets to 1-based lines for capture reporting.
 #[derive(Debug)]
 pub struct FileFacts {
+    pub(super) live_registration: std::sync::OnceLock<LiveRegistration>,
     source: String,
     source_identity: ContentIdentity,
     line_starts: Vec<usize>,
@@ -373,6 +379,7 @@ impl FileFacts {
         );
         let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
         Self {
+            live_registration: std::sync::OnceLock::new(),
             source,
             source_identity,
             line_starts,
@@ -464,6 +471,7 @@ impl FileFacts {
                     duplicate_key: node.duplicate_key,
                     is_async: node.is_async,
                     unsafe_context: node.unsafe_context,
+                    declaration_attributes: node.declaration_attributes.clone(),
                     string_value: node.string_value.clone(),
                     construct: node.construct.clone(),
                     span: persist_span(node.span())?,
@@ -687,6 +695,7 @@ impl FileFacts {
                 duplicate_key: node.duplicate_key,
                 is_async: node.is_async,
                 unsafe_context: node.unsafe_context,
+                declaration_attributes: node.declaration_attributes,
                 string_value: node.string_value,
                 construct: node.construct,
                 call_site,
@@ -701,14 +710,32 @@ impl FileFacts {
                 subtree_end: node.subtree_end,
             });
         }
+        // Preorder intervals must encode exactly the parent chain, including
+        // disjoint siblings and roots. Only the active ancestry is needed.
+        let mut ancestors: Vec<u32> = Vec::new();
         for (id, node) in nodes.iter().enumerate() {
-            if let Some(parent) = node.parent
-                && id as u32 >= nodes[parent as usize].subtree_end
+            let id = id as u32;
+            while ancestors
+                .last()
+                .is_some_and(|parent| id >= nodes[*parent as usize].subtree_end)
             {
+                ancestors.pop();
+            }
+            let interval_parent = ancestors.last().copied();
+            if node.parent != interval_parent {
                 return Err(StructuralFactsPersistenceError::invalid(format!(
-                    "structural node {id} lies outside parent {parent}'s subtree"
+                    "structural node {id} has parent {:?} but its interval parent is {interval_parent:?}",
+                    node.parent
                 )));
             }
+            if let Some(parent) = interval_parent
+                && node.subtree_end > nodes[parent as usize].subtree_end
+            {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "structural node {id}'s interval extends outside parent {parent}'s subtree"
+                )));
+            }
+            ancestors.push(id);
         }
 
         let mut role_offsets = Vec::with_capacity(nodes.len().saturating_add(1));
@@ -928,6 +955,24 @@ impl FileFacts {
                 (self.nodes.capacity() as u64)
                     .saturating_mul(std::mem::size_of::<NormalizedNode>() as u64),
             )
+            .saturating_add(
+                self.nodes
+                    .iter()
+                    .filter_map(|node| node.declaration_attributes.as_ref())
+                    .map(|attributes| {
+                        (attributes.modifiers.capacity() * std::mem::size_of::<String>()) as u64
+                            + attributes
+                                .modifiers
+                                .iter()
+                                .map(|word| word.capacity() as u64)
+                                .sum::<u64>()
+                            + attributes
+                                .type_kind
+                                .as_ref()
+                                .map_or(0, |kind| kind.capacity() as u64)
+                    })
+                    .sum::<u64>(),
+            )
             .saturating_add(self.roles.estimated_bytes())
             .saturating_add(self.occurrence_roles.estimated_bytes())
             .saturating_add(
@@ -948,11 +993,6 @@ impl FileFacts {
                     .map(|value| value.capacity() as u64)
                     .sum::<u64>(),
             )
-    }
-
-    /// Whether `ancestor` lies on `node`'s parent chain (strictly above it).
-    pub fn is_ancestor(&self, ancestor: u32, node: u32) -> bool {
-        ancestor < node && node < self.subtree_end(ancestor)
     }
 }
 
@@ -1003,6 +1043,7 @@ mod tests {
             duplicate_key: None,
             is_async: None,
             unsafe_context: None,
+            declaration_attributes: None,
             string_value: None,
             construct: None,
             range: Range {
@@ -1030,6 +1071,7 @@ mod tests {
                 duplicate_key: None,
                 is_async: None,
                 unsafe_context: None,
+                declaration_attributes: None,
                 string_value: None,
                 construct: Some("fixture_call".to_owned()),
                 range: Range {
@@ -1060,6 +1102,7 @@ mod tests {
                 duplicate_key: None,
                 is_async: None,
                 unsafe_context: None,
+                declaration_attributes: None,
                 string_value: None,
                 construct: None,
                 range: Range {
@@ -1125,6 +1168,186 @@ mod tests {
         )
     }
 
+    #[test]
+    fn relational_hydration_rejects_nonpreceding_parents_before_name_inheritance() {
+        let fixture = relational_fixture();
+        // The persisted preorder protocol requires parent < node_id, even
+        // when an otherwise valid source name would need ancestor lookup.
+        for parent in [1, 2, u32::MAX] {
+            for inherited in [false, true] {
+                let mut rows = fixture.persisted_rows().unwrap();
+                rows.nodes[1].parent = Some(parent);
+                if inherited {
+                    rows.nodes[1].name = rows.nodes[0].name;
+                }
+                let result: Result<_, super::StructuralFactsPersistenceError> =
+                    FileFacts::from_persisted_rows(fixture.source().into(), rows);
+                assert!(result.is_err(), "parent={parent}, inherited={inherited}");
+            }
+        }
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[0].parent = Some(1);
+        rows.nodes[1].parent = Some(0);
+        assert!(FileFacts::from_persisted_rows(fixture.source().into(), rows).is_err());
+    }
+
+    #[test]
+    #[hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: sibling subtree intervals overlap despite parent ancestry"
+    )]
+    fn relational_intervals_agree_with_parent_chains() {
+        let fixture = relational_fixture();
+        // Exhaust all parent links and interval endpoints for four preorder rows.
+        // The oracle follows parent links, independently of interval arithmetic.
+        for parent_code in 0..24usize {
+            let mut code = parent_code;
+            let mut parents = [None; 4];
+            for (id, parent) in parents.iter_mut().enumerate().skip(1) {
+                let choice = code % (id + 1);
+                code /= id + 1;
+                *parent = (choice < id).then_some(choice as u32);
+            }
+            for end_code in 0..120usize {
+                let mut code = end_code;
+                let mut rows = fixture.persisted_rows().unwrap();
+                let template = rows.nodes[0].clone();
+                rows.nodes = (0..4)
+                    .map(|id| {
+                        let mut row = template.clone();
+                        row.node_id = id;
+                        row.parent = parents[id as usize];
+                        row.subtree_end = id + (code % (5 - id as usize)) as u32;
+                        code /= 5 - id as usize;
+                        row
+                    })
+                    .collect();
+                rows.roles.clear();
+                rows.occurrence_roles.clear();
+                let valid = rows.nodes.iter().enumerate().all(|(ancestor, row)| {
+                    row.subtree_end > ancestor as u32
+                        && (0..4u32).all(|descendant| {
+                            let mut current = parents[descendant as usize];
+                            let mut in_chain = false;
+                            while let Some(parent) = current {
+                                in_chain |= parent == ancestor as u32;
+                                current = parents[parent as usize];
+                            }
+                            in_chain
+                                == ((ancestor as u32) < descendant && descendant < row.subtree_end)
+                        })
+                });
+                let description = format!("parents={parents:?}, nodes={:?}", rows.nodes);
+                assert_eq!(
+                    FileFacts::from_persisted_rows(fixture.source().into(), rows).is_ok(),
+                    valid,
+                    "{description}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integer_rows_preserve_bounded_decimal_and_signed_low_bits() {
+        let fixture = relational_fixture();
+        for negative in [false, true] {
+            for decimal in [
+                Some("0"),
+                Some("1"),
+                Some("4294967297"),
+                Some("18446744073709551615"),
+                Some("340282366920938463463374607431768211455"),
+                None,
+            ] {
+                let magnitude = decimal.map_or(17, |value| {
+                    (value.parse::<u128>().unwrap() % (1u128 << 32)) as u32
+                });
+                let value = IntegerLiteralValue {
+                    decimal: decimal.map(str::to_owned),
+                    negative,
+                    low_bits: if negative {
+                        0u32.wrapping_sub(magnitude)
+                    } else {
+                        magnitude
+                    },
+                };
+                let mut rows = fixture.persisted_rows().unwrap();
+                rows.nodes[0].kind = NormalizedKind::NumericLiteral.code();
+                rows.nodes[0].call_site = None;
+                rows.nodes[0].integer_literal_value = Some(value.clone());
+                let hydrated =
+                    FileFacts::from_persisted_rows(fixture.source().into(), rows).unwrap();
+                assert_eq!(hydrated.node(0).integer_literal_value, Some(value));
+            }
+        }
+        for decimal in ["00", "01", "", "+1", "-1", " 1", "1a"] {
+            let mut rows = fixture.persisted_rows().unwrap();
+            rows.nodes[0].kind = NormalizedKind::NumericLiteral.code();
+            rows.nodes[0].call_site = None;
+            rows.nodes[0].integer_literal_value = Some(IntegerLiteralValue {
+                decimal: Some(decimal.into()),
+                low_bits: if decimal == "00" { 0 } else { 1 },
+                negative: false,
+            });
+            assert!(
+                FileFacts::from_persisted_rows(fixture.source().into(), rows).is_err(),
+                "{decimal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_recovery_keeps_containment_unknown_until_hydration() {
+        use brokk_bifrost_core::analyzer::source_facts::SourceFactRows;
+        use brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows;
+        for span in [
+            Span {
+                start_byte: 0,
+                end_byte: 2,
+            },
+            Span {
+                start_byte: 3,
+                end_byte: 4,
+            },
+        ] {
+            let parsed = FileFacts::from_source_and_rows(
+                "\u{e9} ?".into(),
+                SourceFactRows::new(Vec::new(), Vec::new()),
+                StructuralFactRows::new(
+                    Vec::new(),
+                    CompactRows::from_parts(vec![0], Vec::new()),
+                    CompactRows::from_parts(vec![0], Vec::new()),
+                    vec![span],
+                ),
+            );
+            let unknown = parsed.recovered_regions()[0];
+            assert_eq!(unknown.inside_callable, None);
+            assert_eq!(unknown.range.start_byte, span.start_byte);
+            assert!(unknown.may_hide(&[NormalizedKind::Return]));
+            assert!(!unknown.may_hide(&[NormalizedKind::SyntaxError]));
+            for contained in [false, true] {
+                let rows = super::PersistedStructuralFacts {
+                    source_bytes: parsed.source().len() as u32,
+                    nodes: Vec::new(),
+                    roles: Vec::new(),
+                    occurrence_roles: Vec::new(),
+                    recovered_regions: vec![super::PersistedRecoveredRegion {
+                        span: PersistedSpan {
+                            start: span.start_byte as u32,
+                            end: span.end_byte as u32,
+                        },
+                        inside_callable: contained,
+                    }],
+                };
+                let hydrated =
+                    FileFacts::from_persisted_rows(parsed.source().into(), rows).unwrap();
+                assert_eq!(
+                    hydrated.recovered_regions()[0].may_hide(&[NormalizedKind::Return]),
+                    contained
+                );
+            }
+        }
+    }
+
     #[cfg(test)]
     #[test]
     fn relational_round_trip_reconstructs_identical_hot_facts() {
@@ -1150,6 +1373,10 @@ mod tests {
             assert_eq!(actual.integer_literal_value, expected.integer_literal_value);
             assert_eq!(actual.duplicate_key, expected.duplicate_key);
             assert_eq!(actual.construct, expected.construct);
+            assert_eq!(
+                actual.declaration_attributes,
+                expected.declaration_attributes
+            );
             assert_eq!(actual.range, expected.range);
             assert_eq!(actual.parent, expected.parent);
             assert_eq!(actual.name, expected.name);
@@ -1196,32 +1423,6 @@ mod tests {
             .expect("assignment shape persists as typed fields");
 
         assert_eq!(hydrated.nodes()[0].assignment_shape, Some(expected));
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn integer_literal_value_survives_relational_hydration() {
-        let fixture = relational_fixture();
-        let mut rows = fixture.persisted_rows().unwrap();
-        rows.nodes[0].kind = NormalizedKind::NumericLiteral.code();
-        rows.nodes[0].call_site = None;
-        rows.nodes[0].integer_literal_value = Some(IntegerLiteralValue {
-            decimal: Some("340282366920938463463374607431768211455".into()),
-            low_bits: u32::MAX,
-            negative: false,
-        });
-
-        let hydrated = FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
-            .expect("exact integer value persists as a scalar string");
-
-        assert_eq!(
-            hydrated.nodes()[0].integer_literal_value,
-            Some(IntegerLiteralValue {
-                decimal: Some("340282366920938463463374607431768211455".into()),
-                low_bits: u32::MAX,
-                negative: false,
-            })
-        );
     }
 
     #[cfg(test)]

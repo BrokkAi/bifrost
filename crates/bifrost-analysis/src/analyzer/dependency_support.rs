@@ -189,17 +189,29 @@ pub fn read_bounded_declaration_file(
     path: &Path,
     max_bytes: u64,
 ) -> Result<Option<String>, String> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("could not inspect declaration file: {error}")),
     };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect declaration file: {error}"))?;
     if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(format!(
             "declaration file is not a regular file within {max_bytes} bytes"
         ));
     }
-    std::fs::read_to_string(path)
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read declaration file: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "declaration file is not a regular file within {max_bytes} bytes"
+        ));
+    }
+    String::from_utf8(bytes)
         .map(Some)
         .map_err(|error| format!("could not read declaration file: {error}"))
 }
@@ -208,8 +220,84 @@ pub fn read_bounded_declaration_file(
 mod tests {
     use std::cell::Cell;
     use std::io::{self, Cursor, Read};
+    use std::path::Path;
 
-    use super::{BoundedReadError, read_bounded_bytes};
+    use super::{
+        BoundedReadError, dependency_producer_diagnostic, read_bounded_bytes,
+        read_bounded_declaration_file, require_non_empty_evidence_field,
+    };
+
+    #[test]
+    fn bounded_reads_accept_exact_and_zero_limits() {
+        for limit in [0, 4] {
+            for length in 0..=5 {
+                let bytes = vec![b'x'; length];
+                let result = read_bounded_bytes(Cursor::new(&bytes), limit);
+                if length as u64 <= limit {
+                    assert_eq!(result.unwrap(), bytes);
+                } else {
+                    assert!(matches!(result, Err(BoundedReadError::LimitExceeded)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_reads_respect_artifact_and_remaining_budgets() {
+        use crate::analyzer::semantic_model::DependencyPackLimits;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        std::fs::write(&path, b"1234").unwrap();
+        for (artifact_limit, total_limit, code) in [
+            (3, 10, "limit.artifact_bytes"),
+            (10, 7, "limit.total_artifact_bytes"),
+        ] {
+            let mut limits = DependencyPackLimits {
+                max_total_artifact_bytes: total_limit,
+                ..Default::default()
+            };
+            limits.producer.max_artifact_bytes = artifact_limit;
+            let mut used = if artifact_limit == 3 { 0 } else { 4 };
+            let before = used;
+            let error =
+                super::read_evidence_file_with_budget("fixture", &path, &limits, &mut used, None)
+                    .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(used, before);
+        }
+        let limits = DependencyPackLimits {
+            max_total_artifact_bytes: 7,
+            ..Default::default()
+        };
+        let mut used = 0;
+        let accepted =
+            super::read_evidence_file_with_budget("fixture", &path, &limits, &mut used, None)
+                .unwrap();
+        assert_eq!(accepted.bytes(), b"1234");
+        assert_eq!(used, 4);
+        assert_eq!(
+            super::read_evidence_file_with_budget("fixture", &path, &limits, &mut used, None)
+                .unwrap_err()
+                .code,
+            "limit.total_artifact_bytes"
+        );
+        assert_eq!(used, 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d92b993f1ef4: declaration files with underreported metadata escaped the byte cap"
+    )]
+    fn declaration_read_bounds_streams_with_underreported_metadata() {
+        let path = Path::new("/proc/version");
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+        assert!(
+            read_bounded_declaration_file(path, 1)
+                .unwrap_err()
+                .contains("within 1 bytes")
+        );
+    }
 
     struct CountingReader<'a> {
         inner: Cursor<&'a [u8]>,
@@ -223,6 +311,46 @@ mod tests {
                 .set(self.bytes_read.get().saturating_add(bytes_read));
             Ok(bytes_read)
         }
+    }
+
+    #[test]
+    fn dependency_evidence_boundaries_and_severities_are_preserved() {
+        use crate::analyzer::semantic_model::{
+            DependencyPackDiagnosticSeverity, ProducerDiagnostic, ProducerDiagnosticSeverity,
+        };
+        assert!(require_non_empty_evidence_field("maven", "bad", "coordinate", "   ").is_err());
+        assert!(require_non_empty_evidence_field("maven", "bad", "coordinate", "x").is_ok());
+        for (producer_severity, expected) in [
+            (
+                ProducerDiagnosticSeverity::Warning,
+                DependencyPackDiagnosticSeverity::Warning,
+            ),
+            (
+                ProducerDiagnosticSeverity::Error,
+                DependencyPackDiagnosticSeverity::Error,
+            ),
+        ] {
+            let diagnostic = dependency_producer_diagnostic(
+                Path::new("pom.xml"),
+                ProducerDiagnostic {
+                    severity: producer_severity,
+                    code: "x".into(),
+                    location: None,
+                    source_entry: None,
+                    declaration: None,
+                    message: "x".into(),
+                },
+            );
+            assert_eq!(diagnostic.severity, expected);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decl");
+        std::fs::write(&path, b"1234").unwrap();
+        assert_eq!(
+            read_bounded_declaration_file(&path, 4).unwrap().as_deref(),
+            Some("1234")
+        );
+        assert!(read_bounded_declaration_file(&path, 3).is_err());
     }
 
     #[test]

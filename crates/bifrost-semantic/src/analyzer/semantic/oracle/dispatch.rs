@@ -77,6 +77,7 @@ pub struct DispatchCandidate {
     #[doc(hidden)]
     pub completeness: EvidenceCompleteness,
     pub(crate) native_incomplete_source_reason: Option<Box<str>>,
+    member_receiver_preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
     #[doc(hidden)]
     pub provenance: Box<[OracleRelationHandle]>,
     #[doc(hidden)]
@@ -102,6 +103,7 @@ impl DispatchCandidate {
             proof,
             completeness,
             native_incomplete_source_reason: None,
+            member_receiver_preparation: None,
             provenance: collect_candidate_provenance(provenance, limits)?,
             excluded_targets: Box::new([]),
             sealed: false,
@@ -158,6 +160,21 @@ impl DispatchCandidate {
     #[doc(hidden)]
     pub fn unique_incomplete_native_source_reason(&self) -> Option<&str> {
         self.native_incomplete_source_reason.as_deref()
+    }
+
+    #[doc(hidden)]
+    pub const fn member_receiver_preparation(
+        &self,
+    ) -> Option<crate::analyzer::semantic::MemberReceiverPreparation> {
+        self.member_receiver_preparation
+    }
+
+    #[doc(hidden)]
+    pub fn mark_member_receiver_preparation(
+        &mut self,
+        preparation: crate::analyzer::semantic::MemberReceiverPreparation,
+    ) {
+        self.member_receiver_preparation = Some(preparation);
     }
 
     pub fn provenance(&self) -> &[OracleRelationHandle] {
@@ -530,9 +547,16 @@ pub fn split_qualified_member(symbol: &str) -> Option<(&str, &str)> {
 
 /// Split the final dotted segment of a caller-supplied qualified name value,
 /// not source text. Both sides must be non-empty and are returned trimmed.
+/// A member segment may itself begin with a dot, as CLR special names `.ctor`
+/// and `.cctor` do. Preserve that leading dot instead of moving it to the owner.
 /// Parameter lists remain part of the member spelling for exact-name lookup.
 pub fn split_owner_member(head: &str) -> Option<(&str, &str)> {
     let (owner, member) = head.rsplit_once('.')?;
+    let (owner, member) = if let Some(prefix) = owner.strip_suffix('.') {
+        (prefix, &head[owner.len()..])
+    } else {
+        (owner, member)
+    };
     (!owner.is_empty() && !member.is_empty()).then_some((owner.trim(), member.trim()))
 }
 
@@ -1060,9 +1084,35 @@ mod python_formal_binding_tests {
 #[cfg(test)]
 mod split_qualified_member_tests {
 
-    use crate::analyzer::semantic::oracle::dispatch::split_qualified_member;
+    use crate::analyzer::semantic::oracle::dispatch::{split_owner_member, split_qualified_member};
 
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#7560: the qualified-name split took a CLR special name's leading dot as the owner boundary, losing .ctor members"
+    )]
+    fn preserves_clr_special_member_names_in_qualified_values() {
+        for (name, expected) in [
+            ("Ns.Type..ctor", Some(("Ns.Type", ".ctor"))),
+            ("Ns.Type..cctor", Some(("Ns.Type", ".cctor"))),
+            ("Ns.List`1..ctor", Some(("Ns.List`1", ".ctor"))),
+            ("Ns.Type.Method", Some(("Ns.Type", "Method"))),
+            ("Type.Method", Some(("Type", "Method"))),
+            (" Ns.Type.Method ", Some(("Ns.Type", "Method"))),
+            ("Method", None),
+            (".Method", None),
+            ("Ns.Type.", None),
+            ("..ctor", None),
+        ] {
+            assert_eq!(split_owner_member(name), expected, "{name}");
+            assert_eq!(split_qualified_member(name), expected, "{name}");
+        }
+        assert_eq!(
+            split_qualified_member("Ns.Type..ctor(System.Int32)"),
+            Some(("Ns.Type", ".ctor")),
+        );
+    }
 
     #[test]
     #[hardwon(

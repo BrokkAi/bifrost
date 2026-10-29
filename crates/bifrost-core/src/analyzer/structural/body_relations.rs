@@ -7,6 +7,7 @@
 //! small [`BodySyntax`] hooks below; the ownership and state algorithms are
 //! shared by all adapters that opt in.
 
+use super::conditional_regions::{Activation, ConditionalRegions};
 use crate::analyzer::Language;
 use crate::analyzer::tree_walk::{is_comment_kind, named_children_iter};
 use tree_sitter::Node;
@@ -115,24 +116,58 @@ pub fn syntax_for(language: Language) -> Option<&'static BodySyntax> {
     }
 }
 
-/// Classify the direct contents of a grammar block.
-pub fn body_state(block: Node<'_>) -> BodyState {
+/// Uncertainty is an answer, not a fourth queryable body-state label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyStateAnswer {
+    Decided(BodyState),
+    Undecided,
+}
+
+/// Classify direct children, allowing handlers to supply their own no-op rules.
+/// A certain executable child proves code despite other uncertain children.
+pub fn classify_body(
+    block: Node<'_>,
+    regions: &ConditionalRegions,
+    is_no_op: impl Fn(Node<'_>) -> bool,
+) -> BodyStateAnswer {
     let mut saw_comment = false;
+    let mut saw_uncertain_comment = false;
+    let mut uncertain = false;
     for child in named_children_iter(block) {
+        let activation = regions.activation_at(child.start_byte());
+        if activation == Activation::DecidedInactive {
+            continue;
+        }
+        if is_no_op(child) {
+            continue;
+        }
         if is_comment_kind(child.kind()) {
-            saw_comment = true;
+            saw_comment |= activation == Activation::CertainActive;
+            saw_uncertain_comment |= activation == Activation::Uncertain;
             continue;
         }
-        if child.is_extra() || child.kind().starts_with("preproc_") {
+        if child.is_extra() {
             continue;
         }
-        return BodyState::Code;
+        if activation == Activation::CertainActive {
+            return BodyStateAnswer::Decided(BodyState::Code);
+        }
+        uncertain = true;
     }
-    if saw_comment {
-        BodyState::CommentOnly
+    if uncertain || regions.has_uncertain_omission(block.byte_range()) {
+        BodyStateAnswer::Undecided
+    } else if saw_comment {
+        BodyStateAnswer::Decided(BodyState::CommentOnly)
+    } else if saw_uncertain_comment {
+        BodyStateAnswer::Undecided
     } else {
-        BodyState::Empty
+        BodyStateAnswer::Decided(BodyState::Empty)
     }
+}
+
+/// Preserve preprocessor wrapper handling until C/C++ supplies regions (#7510).
+pub fn body_state(block: Node<'_>, regions: &ConditionalRegions) -> BodyStateAnswer {
+    classify_body(block, regions, |child| child.kind().starts_with("preproc_"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +175,7 @@ pub struct BodyRelation<'tree> {
     pub block: Node<'tree>,
     pub owner: Node<'tree>,
     pub owner_kind: BodyOwner,
-    pub state: BodyState,
+    pub state: BodyStateAnswer,
     /// CodeQL's empty-block rule excludes a `for` body when the header has an
     /// update expression.  The fact is retained here so every consumer uses
     /// the same structured exception.
@@ -152,6 +187,7 @@ pub struct BodyRelation<'tree> {
 pub fn body_relation_for_block<'tree>(
     block: Node<'tree>,
     language: Language,
+    regions: &ConditionalRegions,
 ) -> Option<BodyRelation<'tree>> {
     let syntax = syntax_for(language)?;
     if !syntax.block_kinds.contains(&block.kind()) {
@@ -187,7 +223,7 @@ pub fn body_relation_for_block<'tree>(
         block,
         owner,
         owner_kind,
-        state: body_state(block),
+        state: body_state(block, regions),
         for_has_update: syntax.for_kinds.contains(&owner.kind())
             && owner.child_by_field_name(syntax.update_field).is_some(),
     })
@@ -195,50 +231,64 @@ pub fn body_relation_for_block<'tree>(
 
 /// The structured state of one if arm.  A non-block statement is code unless
 /// the grammar explicitly represents it as an empty statement.
-pub fn if_arm_state(node: Node<'_>, language: Language) -> Option<BodyState> {
+pub fn if_arm_state(
+    node: Node<'_>,
+    language: Language,
+    regions: &ConditionalRegions,
+) -> Option<BodyStateAnswer> {
     let syntax = syntax_for(language)?;
     if syntax.empty_statement_kinds.contains(&node.kind()) {
-        Some(BodyState::Empty)
+        Some(BodyStateAnswer::Decided(BodyState::Empty))
     } else if syntax.block_kinds.contains(&node.kind()) {
-        Some(body_state(node))
+        Some(body_state(node, regions))
     } else {
-        Some(BodyState::Code)
+        Some(match regions.activation_at(node.start_byte()) {
+            Activation::CertainActive => BodyStateAnswer::Decided(BodyState::Code),
+            Activation::DecidedInactive => BodyStateAnswer::Decided(BodyState::Empty),
+            Activation::Uncertain => BodyStateAnswer::Undecided,
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct EmptyIfArmRelation<'tree> {
+    pub state: BodyStateAnswer,
     pub owner: Node<'tree>,
     pub consequence: Node<'tree>,
     pub alternative: Option<Node<'tree>>,
 }
 
-/// Return an if whose consequence is empty and whose alternative is absent or
-/// empty.  Comment-only blocks are deliberately not empty.
+/// Return an if whose arms are empty or undecided. A certainly nonempty arm
+/// excludes the relation. Comment-only blocks are deliberately not empty.
 pub fn empty_if_arm_relation<'tree>(
     node: Node<'tree>,
     language: Language,
+    regions: &ConditionalRegions,
 ) -> Option<EmptyIfArmRelation<'tree>> {
     let syntax = syntax_for(language)?;
     if !syntax.if_kinds.contains(&node.kind()) {
         return None;
     }
     let consequence = node.child_by_field_name(syntax.consequence_field)?;
-    if if_arm_state(consequence, language) != Some(BodyState::Empty) {
-        return None;
-    }
     let alternative = if_alternative_body(node, syntax);
-    if alternative.is_some_and(|body| if_arm_state(body, language) != Some(BodyState::Empty)) {
-        return None;
+    let mut state = BodyStateAnswer::Decided(BodyState::Empty);
+    for arm in [Some(consequence), alternative].into_iter().flatten() {
+        match if_arm_state(arm, language, regions)? {
+            BodyStateAnswer::Decided(BodyState::Empty) => {}
+            BodyStateAnswer::Decided(BodyState::Code | BodyState::CommentOnly) => return None,
+            BodyStateAnswer::Undecided => state = BodyStateAnswer::Undecided,
+        }
     }
     Some(EmptyIfArmRelation {
+        state,
         owner: node,
         consequence,
         alternative,
     })
 }
 
-fn if_alternative_body<'tree>(owner: Node<'tree>, syntax: &BodySyntax) -> Option<Node<'tree>> {
+/// Select the alternative body, unwrapping the grammar's else clause.
+pub fn if_alternative_body<'tree>(owner: Node<'tree>, syntax: &BodySyntax) -> Option<Node<'tree>> {
     let alternative = owner.child_by_field_name(syntax.alternative_field)?;
     if alternative.kind() == "else_clause" {
         let mut children = named_children_iter(alternative).filter(|child| {

@@ -66,6 +66,11 @@ impl ImportAnalysisProvider for GoAnalyzer {
         if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
             return cached;
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-go-analysis/src/analyzer/go/imports.rs",
+            );
 
         let resolved = Arc::new(go_imported_code_units_of(
             &self.inner,
@@ -74,9 +79,14 @@ impl ImportAnalysisProvider for GoAnalyzer {
             &self.inner.import_info_of(token, file),
         ));
 
-        self.memo_caches
-            .imported_code_units
-            .insert(file.clone(), Arc::clone(&resolved));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::clone(&resolved);
+            persistent_fill_guard.installed("imported_code_units");
+            self.memo_caches
+                .imported_code_units
+                .insert(cache_key, cache_value);
+        };
         resolved
     }
 
@@ -84,20 +94,42 @@ impl ImportAnalysisProvider for GoAnalyzer {
         if let Some(cached) = self.memo_caches.referencing_files.get(file) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-go-analysis/src/analyzer/go/imports.rs",
+            );
 
         let reverse_index =
             brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
                 &self.memo_caches.reverse_import_index,
-                || self.inner.all_files(),
-                |candidate| self.imported_code_units_of(candidate),
+                || {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "go.reverse_file_index",
+                        || self.inner.all_files(),
+                    )
+                },
+                |candidate| {
+                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                        self,
+                        "go.reverse_file_index",
+                        || self.imported_code_units_of(candidate),
+                    )
+                },
             );
         let referencing = reverse_index
             .get(file)
             .map(|files| (**files).clone())
             .unwrap_or_default();
-        self.memo_caches
-            .referencing_files
-            .insert(file.clone(), Arc::new(referencing.clone()));
+        {
+            let cache_key = file.clone();
+            let cache_value = Arc::new(referencing.clone());
+            persistent_fill_guard.installed("referencing_files");
+            self.memo_caches
+                .referencing_files
+                .insert(cache_key, cache_value);
+        };
         referencing
     }
 
@@ -261,54 +293,62 @@ impl GoAnalyzer {
     /// clause again.
     pub(crate) fn import_facts(&self) -> &GoImportFacts {
         self.memo_caches.import_facts.get_or_init(|| {
-            let files = self.inner.all_files();
-            let mut package_of_file: HashMap<ProjectFile, String> = HashMap::default();
-            for file in &files {
-                if let Some(package) = self.go_package_of(file) {
-                    package_of_file.insert(file.clone(), package);
-                }
-            }
-            // A file with no persisted package clause is the one shape
-            // `import_reachability` cannot decide, so name the size of that
-            // tail once per workspace rather than per undecided pair.
-            brokk_bifrost_core::profiling::note_with(|| {
-                format!(
-                    "go::import_facts[files={}, without_package_clause={}]",
-                    files.len(),
-                    files.len() - package_of_file.len()
-                )
-            });
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "go.import_facts",
+                || {
+                    let files = self.inner.all_files();
+                    let mut package_of_file: HashMap<ProjectFile, String> = HashMap::default();
+                    for file in &files {
+                        if let Some(package) = self.go_package_of(file) {
+                            package_of_file.insert(file.clone(), package);
+                        }
+                    }
+                    // A file with no persisted package clause is the one shape
+                    // `import_reachability` cannot decide, so name the size of that
+                    // tail once per workspace rather than per undecided pair.
+                    brokk_bifrost_core::profiling::note_with(|| {
+                        format!(
+                            "go::import_facts[files={}, without_package_clause={}]",
+                            files.len(),
+                            files.len() - package_of_file.len()
+                        )
+                    });
 
-            let mut package_files: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-            let mut dir_parent_files: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-            let mut dir_parent_suffix_files: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-            for file in &files {
-                let Some(package) = package_of_file.get(file) else {
-                    continue;
-                };
-                package_files
-                    .entry(package.clone())
-                    .or_default()
-                    .push(file.clone());
-                let parent = parent_path_key(file);
-                for suffix in path_suffixes(&parent) {
-                    dir_parent_suffix_files
-                        .entry(suffix.to_string())
-                        .or_default()
-                        .push(file.clone());
-                }
-                dir_parent_files
-                    .entry(parent)
-                    .or_default()
-                    .push(file.clone());
-            }
+                    let mut package_files: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+                    let mut dir_parent_files: HashMap<String, Vec<ProjectFile>> =
+                        HashMap::default();
+                    let mut dir_parent_suffix_files: HashMap<String, Vec<ProjectFile>> =
+                        HashMap::default();
+                    for file in &files {
+                        let Some(package) = package_of_file.get(file) else {
+                            continue;
+                        };
+                        package_files
+                            .entry(package.clone())
+                            .or_default()
+                            .push(file.clone());
+                        let parent = parent_path_key(file);
+                        for suffix in path_suffixes(&parent) {
+                            dir_parent_suffix_files
+                                .entry(suffix.to_string())
+                                .or_default()
+                                .push(file.clone());
+                        }
+                        dir_parent_files
+                            .entry(parent)
+                            .or_default()
+                            .push(file.clone());
+                    }
 
-            GoImportFacts {
-                package_of_file,
-                package_files: share(package_files),
-                dir_parent_files: share(dir_parent_files),
-                dir_parent_suffix_files: share(dir_parent_suffix_files),
-            }
+                    GoImportFacts {
+                        package_of_file,
+                        package_files: share(package_files),
+                        dir_parent_files: share(dir_parent_files),
+                        dir_parent_suffix_files: share(dir_parent_suffix_files),
+                    }
+                },
+            )
         })
     }
 }

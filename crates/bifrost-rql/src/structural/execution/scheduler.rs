@@ -113,6 +113,7 @@ impl BoundedReadyScheduler {
         let mut dispatch_overhead_ns = 0;
         let mut coordinator_wait_ns = 0;
 
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let mut indexed_results = std::thread::scope(|scope| {
             let spawn_started = Instant::now();
             let mut handles = Vec::with_capacity(workers_spawned);
@@ -149,7 +150,7 @@ impl BoundedReadyScheduler {
                         let now_active = active.fetch_add(1, Ordering::AcqRel).saturating_add(1);
                         peak_concurrency.fetch_max(now_active, Ordering::AcqRel);
                         let task_started = Instant::now();
-                        let result = run_task(task);
+                        let result = context.run(|| run_task(task));
                         worker_task_elapsed_ns
                             .fetch_add(elapsed_ns(task_started), Ordering::Relaxed);
                         active.fetch_sub(1, Ordering::AcqRel);

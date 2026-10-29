@@ -168,6 +168,30 @@ pub enum PolicyRangeRequest {
     Files(Vec<String>),
 }
 
+/// Advisory expected policy evaluation times, in milliseconds.
+///
+/// An ordered map permits empty hints in the const options constructor.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(try_from = "BTreeMap<String, u64>")]
+pub struct PolicyCostHints(BTreeMap<String, u64>);
+
+impl TryFrom<BTreeMap<String, u64>> for PolicyCostHints {
+    type Error = String;
+
+    fn try_from(hints: BTreeMap<String, u64>) -> Result<Self, Self::Error> {
+        let max_policies = PolicyBatchBudget::default().max_policies();
+        if hints.len() > max_policies {
+            return Err(format!(
+                "policy_cost_hints accepts at most {max_policies} entries"
+            ));
+        }
+        if hints.contains_key("") {
+            return Err("policy_cost_hints policy ids must be non-empty".to_string());
+        }
+        Ok(Self(hints))
+    }
+}
+
 /// Complete deterministic host contract for one policy-evaluation batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluationOptions {
@@ -191,6 +215,8 @@ pub struct PolicyEvaluationOptions {
     /// byte-identical across successful runs unless the caller asks for
     /// timings (`run_policy` asks with `include_stage_timings`).
     policy_timings: bool,
+    /// Request-owned scheduling advice, excluded from the report and its context.
+    policy_cost_hints: PolicyCostHints,
     /// The built-in selection this batch was resolved from, recorded in the
     /// report's evaluation context. Absent when no built-in policy was selected.
     builtin_selection: Option<BuiltInPolicySelectionRecord>,
@@ -203,6 +229,10 @@ pub struct PolicyEvaluationOptions {
 /// `policy_evaluation` stage timing is the sum over policies; this is the
 /// per-policy split of it.
 pub const EVALUATION_ELAPSED_METRIC: &str = "evaluation.elapsed_ms";
+const UNIT_PREFETCH_METRIC: &str = "units.prefetch_ms";
+const UNIT_VERIFY_METRIC: &str = "units.verify_ms";
+const UNIT_LOOKUP_REPLAY_METRIC: &str = "units.lookup_replay_ms";
+const UNIT_RECOMPUTE_METRIC: &str = "units.recompute_ms";
 
 impl PolicyEvaluationOptions {
     pub fn new(evaluation_date: PolicyEvaluationDate) -> Self {
@@ -226,6 +256,7 @@ impl PolicyEvaluationOptions {
             diff_base: None,
             incremental: true,
             policy_timings: false,
+            policy_cost_hints: PolicyCostHints(BTreeMap::new()),
             builtin_selection: None,
             range: PolicyRangeRequest::Workspace,
         }
@@ -277,6 +308,12 @@ impl PolicyEvaluationOptions {
     /// Record each policy's evaluation wall time in its run; see the field.
     pub const fn with_policy_timings(mut self, policy_timings: bool) -> Self {
         self.policy_timings = policy_timings;
+        self
+    }
+
+    /// Start unknown policies first, then policies with the largest expected cost.
+    pub fn with_policy_cost_hints(mut self, hints: PolicyCostHints) -> Self {
+        self.policy_cost_hints = hints;
         self
     }
 
@@ -334,6 +371,11 @@ impl RetainedSize for PolicyEvaluationOptions {
             .saturating_add(retained_extra(&self.scope))
             .saturating_add(retained_extra(&self.baseline))
             .saturating_add(retained_extra(&self.diff_base))
+            .saturating_add(self.policy_cost_hints.0.keys().fold(0usize, |bytes, id| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, u64)>())
+                    .saturating_add(id.capacity())
+            }))
             .saturating_add(match &self.range {
                 PolicyRangeRequest::Files(files) => retained_extra(files),
                 PolicyRangeRequest::Workspace | PolicyRangeRequest::DiffBase => 0,
@@ -588,6 +630,7 @@ impl PolicyEvaluationInput {
 }
 
 struct PreparedPolicy {
+    needs_catalog_registry: bool,
     source: PolicySourceIdentity,
     bytes: String,
     policy_id: PolicyId,
@@ -1940,14 +1983,46 @@ fn pack_activation_review(
         .map(String::as_str)
         .collect::<HashSet<_>>();
     for ecosystem in &activation.outcome.ecosystems {
+        for diagnostic in &ecosystem.discovery.diagnostics {
+            if diagnostic
+                .dependency_id
+                .as_deref()
+                .is_some_and(|id| standard_library_dependencies.contains(id))
+            {
+                continue;
+            }
+            decisions.push(PolicyPackDecision::new(
+                diagnostic
+                    .dependency_id
+                    .clone()
+                    .unwrap_or_else(|| diagnostic.code.clone()),
+                PolicyPackDecisionStatus::Missing,
+                Some(format!("{}: {}", diagnostic.code, diagnostic.message)),
+            ));
+        }
         let Some(preparation) = &ecosystem.preparation else {
             continue;
+        };
+        // Preparation already bounds diagnostics and their messages. Keep the
+        // retained warnings on the selected dependency rather than losing them
+        // when its partial pack remains usable.
+        let warning_reason = |dependency_id: &str| {
+            let warnings = preparation
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity == DependencyPackDiagnosticSeverity::Warning
+                        && diagnostic.dependency_id.as_deref() == Some(dependency_id)
+                })
+                .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>();
+            (!warnings.is_empty()).then(|| warnings.join("; "))
         };
         for pack in &preparation.packs {
             decisions.push(PolicyPackDecision::new(
                 pack.dependency_id.clone(),
                 PolicyPackDecisionStatus::Selected,
-                None,
+                warning_reason(&pack.dependency_id),
             ));
         }
         for pack in &preparation.installed_packs {
@@ -1957,7 +2032,7 @@ fn pack_activation_review(
             decisions.push(PolicyPackDecision::new(
                 pack.dependency_id.clone(),
                 PolicyPackDecisionStatus::Selected,
-                None,
+                warning_reason(&pack.dependency_id),
             ));
         }
         for diagnostic in &preparation.diagnostics {
@@ -2577,6 +2652,7 @@ fn evaluate_policy_once(
     evaluator: &DefaultPolicyEvaluator<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
     flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    root_memo: &brokk_bifrost_rql::TypeFlowRootMemo,
     cancellation: Option<&CancellationToken>,
     head_incremental: Option<&PolicyIncrementalContext<'_>>,
     scoped_files: &HashMap<PolicyId, Vec<ProjectFile>>,
@@ -2585,6 +2661,7 @@ fn evaluate_policy_once(
     options: &PolicyEvaluationOptions,
     workspace_has_analyzable_files: bool,
 ) -> Result<EvaluatedPolicy, PolicyCoordinatorError> {
+    let _attribution = brokk_bifrost_analysis::analyzer::ReadAttribution::for_request().install();
     let policy_id = policy.definition().metadata.id.clone();
     let mut evaluation_budget = per_policy_budget;
     if scoped_files.contains_key(&policy_id)
@@ -2601,6 +2678,7 @@ fn evaluate_policy_once(
         })?,
         workspace,
         flow_state,
+        root_memo: Some(root_memo),
         cancellation,
         cvss_overlays: &[],
         organizational_risk: &[],
@@ -2651,6 +2729,35 @@ fn evaluate_policy_once(
                 "failed to record the evaluation timing metric: {error}"
             ))
         })?;
+        // Read only after the evaluator returned: every unit-reuse state of
+        // this policy (typestate keeps its own inside the session) has dropped
+        // by then and flushed its metrics. Reading earlier would miss them.
+        if let Some(metrics) =
+            head_incremental.and_then(|context| context.unit_phase_metrics(&policy_id))
+        {
+            for (name, elapsed) in [
+                (UNIT_PREFETCH_METRIC, metrics.prefetch),
+                (UNIT_VERIFY_METRIC, metrics.verify),
+                (UNIT_LOOKUP_REPLAY_METRIC, metrics.lookup_replay),
+                (UNIT_RECOMPUTE_METRIC, metrics.recompute),
+            ] {
+                let metric = PolicyWorkMetric::try_new(
+                    name,
+                    PolicyWorkUnit::Milliseconds,
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                )
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to construct the unit timing metric: {error}"
+                    ))
+                })?;
+                run.work_mut().try_push_metric(metric).map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to record the unit timing metric: {error}"
+                    ))
+                })?;
+            }
+        }
     }
     if !workspace_has_analyzable_files && !policy_uses_only_file_facts(policy) {
         run.mark_inconclusive(PolicyIncompleteReason::NoAnalyzableFiles);
@@ -2870,18 +2977,24 @@ fn evaluate_prepared_policy_inputs(
     let catalogs = {
         let _scope =
             brokk_bifrost_analysis::profiling::scope("policy.registration.catalog_registry");
-        Arc::new(
-            TaintCatalogRegistry::new_for_workspace(
-                root.to_path_buf(),
-                CatalogRegistryLimits::default(),
-            )
-            .map_err(|error| {
-                PolicyCoordinatorError::new(format!(
-                    "failed to initialize policy catalog registry: {error}"
-                ))
-            })?,
+        let mut catalogs = TaintCatalogRegistry::new_for_workspace(
+            root.to_path_buf(),
+            CatalogRegistryLimits::default(),
         )
+        .map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to initialize policy catalog registry: {error}"
+            ))
+        })?;
+        // Installed roots become run inputs only for catalog-dependent policies.
+        if inputs.iter().any(|input| matches!(input, InputOutcome::Pending(prepared) if prepared.needs_catalog_registry)) {
+            super::builtin::register_run_catalogs(&mut catalogs).map_err(|error| {
+                PolicyCoordinatorError::new(format!("failed to register pack catalogs: {error}"))
+            })?;
+        }
+        Arc::new(catalogs)
     };
+
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
             options,
@@ -3334,6 +3447,7 @@ fn evaluate_prepared_policy_inputs(
     // follow the audited workspace (#1771).  Scaling is a per-lane max, so an
     // explicitly widened caller budget survives and an explicitly narrowed one
     // is raised back to the fixed defaults.
+    let root_memo = brokk_bifrost_rql::TypeFlowRootMemo::default();
     let per_policy_budget = policy_budget_for_workspace(*batch_budget.per_policy(), workspace);
     let activation_for_report = workspace_activation
         .as_ref()
@@ -3362,7 +3476,7 @@ fn evaluate_prepared_policy_inputs(
         .filter(|_| activation_for_report.is_some())
         .map(imported_node_builtin_modules)
         .unwrap_or_default();
-    let packs_review = match workspace_activation.as_ref() {
+    let mut packs_review = match workspace_activation.as_ref() {
         // Dependency activation or a reviewed workspace model earns an audit
         // row. Intrinsic shipped models can share the transaction without
         // changing the top-level wire shape by themselves.
@@ -3400,6 +3514,24 @@ fn evaluate_prepared_policy_inputs(
             )
         }),
     };
+    let mut catalog_identities = registry
+        .policies()
+        .flat_map(|policy| policy.catalogs().iter().cloned())
+        .collect::<Vec<_>>();
+    catalog_identities.sort();
+    catalog_identities.dedup();
+    if !catalog_identities.is_empty() {
+        let review = packs_review.get_or_insert_with(|| {
+            PolicyPackActivationReview::new_with_mode(
+                String::new(),
+                super::report::PolicyDependencyPackActivationMode::Disabled,
+                Vec::new(),
+                true,
+                Vec::new(),
+            )
+        });
+        review.set_catalogs(catalog_identities);
+    }
     if let Some(failure) = host_activation_failure {
         secondary_diagnostics.push(report_diagnostic(
             PolicyReportDiagnosticCode::PackActivationFailed,
@@ -3601,6 +3733,8 @@ fn evaluate_prepared_policy_inputs(
     let late_preparation_started = Instant::now();
     let taint = workspace.map_or_else(ProductionTaintPolicyEvaluator::default, |workspace| {
         ProductionTaintPolicyEvaluator::prepare_in_range(
+            brokk_bifrost_rql::SemanticFlowResources::from_workspace_state(flow_state)
+                .with_root_memo(Some(root_memo.clone())),
             registry
                 .policies()
                 .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
@@ -3669,6 +3803,7 @@ fn evaluate_prepared_policy_inputs(
                         head: head_snapshot,
                     },
                 )
+                .with_base_review(baseline.base_review.as_ref())
             })
         }
         (Some(store), None, Some(head), Some(head_snapshot)) => {
@@ -3720,6 +3855,7 @@ fn evaluate_prepared_policy_inputs(
         .collect::<Vec<_>>();
     let parallelism = super::policy_evaluation_parallelism();
     let evaluations = if parallelism <= 1 {
+        // With one worker the total time is independent of dispatch order.
         let mut evaluations = Vec::with_capacity(runnable_policies.len());
         for policy in runnable_policies.iter().copied() {
             if policy_deadline_reached(cancellation)? {
@@ -3730,6 +3866,7 @@ fn evaluate_prepared_policy_inputs(
                 &evaluator,
                 workspace,
                 flow_state,
+                &root_memo,
                 cancellation,
                 head_incremental,
                 &scoped_files,
@@ -3741,25 +3878,47 @@ fn evaluate_prepared_policy_inputs(
         }
         evaluations
     } else {
-        let results = super::parallel::map_bounded(parallelism, &runnable_policies, |policy| {
-            evaluate_policy_once(
-                policy,
-                &evaluator,
-                workspace,
-                flow_state,
-                cancellation,
-                head_incremental,
-                &scoped_files,
-                &workspace_files,
-                per_policy_budget,
-                options,
-                workspace_has_analyzable_files,
+        let mut dispatch = runnable_policies
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>();
+        dispatch.sort_by_key(|(index, policy)| {
+            let hint = options
+                .policy_cost_hints
+                .0
+                .get(policy.definition().metadata.id.as_str());
+            (
+                hint.is_some(),
+                std::cmp::Reverse(hint.copied().unwrap_or(0)),
+                *index,
             )
         });
+        let mut results =
+            super::parallel::map_bounded(parallelism, &dispatch, |(index, policy)| {
+                (
+                    index,
+                    evaluate_policy_once(
+                        policy,
+                        &evaluator,
+                        workspace,
+                        flow_state,
+                        &root_memo,
+                        cancellation,
+                        head_incremental,
+                        &scoped_files,
+                        &workspace_files,
+                        per_policy_budget,
+                        options,
+                        workspace_has_analyzable_files,
+                    ),
+                )
+            });
+        results.sort_unstable_by_key(|(index, _)| *index);
         // The first failure in policy order is the one the batch reports, so a
         // failure is deterministic whichever worker produced it.
         let mut evaluations = Vec::with_capacity(results.len());
-        for result in results {
+        for (_, result) in results {
             evaluations.push(result?);
         }
         evaluations
@@ -4947,7 +5106,8 @@ fn evaluate_policy_diff_baseline(
     // Its execution domain must match the head, even when the committed base
     // scope differs or the head intentionally has no scope document.
     let mut base_options = PolicyEvaluationOptions::new(head_options.evaluation_date())
-        .with_required_schema_versions(head_options.require_explicit_schema_versions());
+        .with_required_schema_versions(head_options.require_explicit_schema_versions())
+        .with_policy_cost_hints(head_options.policy_cost_hints.clone());
     base_options.scope_override = Some(head_scope.cloned());
     // The base evaluates unit by unit for the same reason the head does: a
     // whole execution cannot attribute its reads to seed files, so unit-wise
@@ -6020,6 +6180,7 @@ fn prepare_parsed_input(
 ) -> Result<InputOutcome, PolicyCoordinatorError> {
     match document {
         RqlpDocument::Policy { definition } => Ok(InputOutcome::Pending(PreparedPolicy {
+            needs_catalog_registry: super::builtin::policy_needs_catalog_registry(document),
             source,
             bytes,
             policy_id: definition.metadata.id.clone(),
@@ -6855,6 +7016,20 @@ mod tests {
         let parallel = evaluate_policy_inputs(workspace.path(), &sources, &options)
             .expect("parallel policy evaluation");
         let parallel_bytes = canonical_report_bytes(&parallel);
+        let hints = serde_json::from_value(serde_json::json!({
+            "test.parallel-alpha": 1,
+            "test.parallel-beta": 2,
+            "test.parallel-gamma": 3
+        }))
+        .expect("policy cost hints");
+        let hinted = evaluate_policy_inputs(
+            workspace.path(),
+            &sources,
+            &options.with_policy_cost_hints(hints),
+        )
+        .expect("hinted parallel policy evaluation");
+        assert_eq!(serial_bytes, canonical_report_bytes(&hinted));
+        assert_eq!(serial.exit_status(), hinted.exit_status());
 
         match prior {
             Some(value) => unsafe { std::env::set_var(env_key, value) },
@@ -6874,6 +7049,57 @@ mod tests {
         assert_eq!(
             serial_bytes, parallel_bytes,
             "the parallel report must match the serial report byte for byte"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#7336: a missing restored assembly made discovery incomplete but its diagnostic never reached the report"
+    )]
+    fn missing_restored_csharp_assembly_reaches_the_policy_report() {
+        let project = InlineTestProject::with_language(Language::CSharp)
+            .file("App.cs", "class App { static void Target() {} }\n")
+            .file("App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
+            .file("obj/project.assets.json", r#"{
+                "version": 3,
+                "targets": { "net8.0": { "Missing.Package/1.0.0": {
+                    "type": "package",
+                    "compile": { "lib/net8.0/Missing.Package.dll": {} }
+                }}},
+                "libraries": { "Missing.Package/1.0.0": {
+                    "type": "package", "path": "missing.package/1.0.0"
+                }},
+                "packageFolders": {}
+            }"#)
+            .build();
+        let policy = PolicyEvaluationInput::embedded(
+            PolicySourceIdentity::new("policies/target.rqlp"),
+            r#"(policy :schema-version 1 :id "test.csharp-discovery"
+                :name "C# discovery" :message "Target" :severity warning
+                :analysis (analysis :type match :selector
+                    (rql :schema-version 1
+                        (language csharp (function :name "Target")))) )"#,
+        );
+        let outcome = evaluate_policy_inputs(project.root(), &[policy], &evaluation_options())
+            .expect("C# policy evaluation");
+        assert_eq!(outcome.report().runs().len(), 1, "the policy ran");
+        let report = serde_json::to_value(outcome.report()).expect("policy report JSON");
+        assert_eq!(report["packs"]["complete"], false, "{report:#}");
+        assert!(
+            report["packs"]["decisions"]
+                .as_array()
+                .expect("pack decisions")
+                .iter()
+                .any(|decision| {
+                    decision["pack"] == "csharp.dependency_unresolved"
+                        && decision["status"] == "missing"
+                        && decision["reason"].as_str().is_some_and(|reason| {
+                            reason.starts_with("csharp.dependency_unresolved: ")
+                                && reason.contains("Missing.Package")
+                                && reason.contains("net8.0")
+                        })
+                }),
+            "{report:#}"
         );
     }
 
@@ -10120,5 +10346,500 @@ pub fn run() {
         assert_eq!(reversed.fixed().len(), 1);
         assert_eq!(reversed.fixed()[0].policy_id().as_str(), "test.diff");
         assert!(!reversed.fixed_truncated());
+    }
+}
+
+#[cfg(test)]
+mod pack_catalog_tests {
+    use super::*;
+    use crate::catalog::{CatalogRegistryLimits, TaintCatalogDefinition, TaintCatalogRegistry};
+    use crate::definition::*;
+    use crate::inline_project::InlineTestProject;
+    use serde_json::json;
+    use std::fs;
+
+    const POLICY: &str = r#"(policy :schema-version 1 :id "test.catalog-flow"
+      :name "Catalog flow" :message "tainted data reached sink" :severity warning
+      :analysis (analysis :type taint :mode may
+        :call-modeling (call-modeling :unmodeled optimistic)
+        :sources (endpoint-set :entries [
+          (source :id raw :display-name "raw" :categories [input.user]
+            :selector (rql :schema-version 1 (language rust (call :callee (name "source"))))
+            :bind return-value :labels [untrusted])])
+        :sinks (endpoint-set :include-sets [
+          (catalog :any-registered true :categories (any [sql-injection]))])))"#;
+
+    #[test]
+    fn installed_pack_catalogs_select_categories_and_record_provenance_per_run() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "fn source() -> String { String::new() }\nfn sink(s: String) {}\npub fn run() { sink(source()); }\n")
+            .build();
+        let packs = tempfile::tempdir().unwrap();
+        let pack = packs.path().join("test.catalogs");
+        fs::create_dir_all(pack.join("catalogs")).unwrap();
+        let mut fixture =
+            TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
+        let hash = fixture
+            .register(TaintCatalogDefinition {
+                schema_version: 1,
+                name: PolicyId::new("test.sinks").unwrap(),
+                version: 1,
+                categories: vec![
+                    PolicyCategoryId::new("sql-injection").unwrap(),
+                    PolicyCategoryId::new("path-injection").unwrap(),
+                ],
+                sources: Vec::new(),
+                sinks: vec![
+                    TaintSinkSpec {
+                        id: TaintEntryId::new("sql-execute").unwrap(),
+                        display_name: "SQL execute".into(),
+                        categories: vec![PolicyCategoryId::new("sql-injection").unwrap()],
+                        selector: crate::test_support::inline_match_selector("sink"),
+                        dangerous_operand: PolicyPort::ArgumentIndex { index: 0 },
+                        accepts: vec![TaintLabel::new("untrusted").unwrap()],
+                        tags: Vec::new(),
+                        impacts: Vec::new(),
+                    },
+                    TaintSinkSpec {
+                        id: TaintEntryId::new("path-use").unwrap(),
+                        display_name: "Path use".into(),
+                        categories: vec![PolicyCategoryId::new("path-injection").unwrap()],
+                        selector: crate::test_support::inline_match_selector("sink"),
+                        dangerous_operand: PolicyPort::ArgumentIndex { index: 0 },
+                        accepts: vec![TaintLabel::new("untrusted").unwrap()],
+                        tags: Vec::new(),
+                        impacts: Vec::new(),
+                    },
+                ],
+                sanitizers: Vec::new(),
+                transforms: Vec::new(),
+                external_models: Vec::new(),
+            })
+            .unwrap();
+        let document = fixture.iter().next().unwrap().canonical_json().to_vec();
+        let fixture = Arc::new(fixture);
+        let mut bounded_registry = PolicyRegistry::new_without_workspace(
+            fixture.clone(),
+            PolicyRegistryLimits::default()
+                .with_max_endpoints(2)
+                .unwrap(),
+        );
+        let loaded = bounded_registry
+            .register_policy_bytes(PolicySourceIdentity::new("bounded.rqlp"), POLICY.as_bytes())
+            .unwrap();
+        assert_eq!(
+            loaded.resolved_taint().unwrap().sinks.len(),
+            1,
+            "filter before endpoint budget"
+        );
+        let overlap_policy = POLICY.replace("(catalog :any-registered true :categories (any [sql-injection]))", "(catalog :name \"test.sinks\" :version 1) (catalog :any-registered true :categories (any [sql-injection]))");
+        let mut overlap_registry = PolicyRegistry::new_without_workspace(
+            fixture.clone(),
+            PolicyRegistryLimits::default()
+                .with_max_endpoints(3)
+                .unwrap(),
+        );
+        let overlap = overlap_registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("overlap.rqlp"),
+                overlap_policy.as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(overlap.resolved_taint().unwrap().sinks.len(), 2);
+        let auxiliary_policy = POLICY.replace(":sinks (endpoint-set", ":sanitizers (endpoint-set :include-sets [(catalog :any-registered true :categories (any [sql-injection]))]) :sinks (endpoint-set");
+        let mut auxiliary_registry =
+            PolicyRegistry::new_without_workspace(fixture, PolicyRegistryLimits::default());
+        let error = auxiliary_registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("empty-auxiliary.rqlp"),
+                auxiliary_policy.as_bytes(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resolved sanitizer endpoint set must not be empty"),
+            "{error}"
+        );
+
+        fs::write(pack.join("catalogs/sinks.json"), &document).unwrap();
+        fs::create_dir_all(pack.join("policies")).unwrap();
+        fs::write(pack.join("policies/flow.rqlp"), POLICY).unwrap();
+        let identity = crate::builtin::policy_source_identity(
+            PolicySourceIdentity::new("fixture.rqlp"),
+            POLICY.as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            identity.analyzer_free,
+            crate::builtin::PolicySourceIdentityResolution::WorkspaceRequired {
+                diagnostic_code: "catalogs-require-policy-run",
+                ..
+            }
+        ));
+        let manifest = json!({"schema_version": 2, "id": "test.catalogs", "version": "1.0.0",
+            "name": "Test-only catalogs", "description": "Synthetic engine test, no product content",
+            "policies": [{"path": "policies/flow.rqlp", "id": "test.catalog-flow", "authored_hash": identity.authored_hash.to_string(),
+              "resolved_semantic_hash": null, "category": "security", "supported_languages": ["rust"],
+              "required_capabilities": ["taint"], "severity_rationale": "Synthetic flow", "remediation": "Synthetic fixture"}],
+            "catalogs": [{"path": "catalogs/sinks.json", "semantic_hash": hash.to_string()}]});
+        fs::write(pack.join("manifest.json"), manifest.to_string()).unwrap();
+        // nextest isolates every test process, including environment and OnceLocks.
+        unsafe {
+            std::env::set_var(crate::builtin::POLICY_PACK_ROOT_ENV, packs.path());
+        }
+        let options = crate::test_support::evaluation_options("2026-10-26");
+        let evaluate = |policy: &str| {
+            evaluate_policy_inputs(
+                project.root(),
+                &[PolicyEvaluationInput::embedded(
+                    PolicySourceIdentity::new("catalog-test.rqlp"),
+                    policy,
+                )],
+                &options,
+            )
+            .unwrap()
+        };
+        let inventory = crate::builtin::built_in_policy_catalog().unwrap();
+        let selected = inventory
+            .select(&crate::builtin::BuiltInPolicySelection {
+                policy_ids: vec!["test.catalog-flow".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        let outcome = evaluate_policy_inputs(
+            project.root(),
+            &[PolicyEvaluationInput::selected_builtin(selected[0])],
+            &options,
+        )
+        .unwrap();
+        let report = serde_json::to_value(outcome.report()).unwrap();
+        assert_eq!(
+            report["runs"][0]["findings"].as_array().unwrap().len(),
+            1,
+            "{report:#}"
+        );
+        assert_eq!(
+            report["packs"]["catalogs"],
+            json!([{"name": "test.sinks", "version": 1, "sha256": hash.to_string()}])
+        );
+        let provenance = report["runs"][0]["findings"][0].to_string();
+        assert!(
+            provenance.contains("test.sinks") && provenance.contains("sql-execute"),
+            "{provenance}"
+        );
+        let typo = serde_json::to_value(
+            evaluate(&POLICY.replace("sql-injection", "sql-injectoin")).report(),
+        )
+        .unwrap();
+        assert!(
+            typo.to_string()
+                .contains("unknown catalog category `sql-injectoin`"),
+            "{typo:#}"
+        );
+        let bundle = tempfile::tempdir().unwrap();
+        fs::create_dir_all(bundle.path().join("catalogs")).unwrap();
+        fs::write(bundle.path().join("catalogs/sinks.json"), &document).unwrap();
+        use sha2::Digest;
+        let bundle_index = json!({"schema_version": 1, "repository": "test-only/catalogs",
+            "source_commit": "synthetic", "bifrost_pin": {}, "policies": [],
+            "files": [{"path": "catalogs/sinks.json", "sha256": format!("{:x}", sha2::Sha256::digest(&document)), "size": document.len()}],
+            "catalogs": [{"path": "catalogs/sinks.json", "semantic_hash": hash.to_string()}]});
+        fs::write(
+            bundle.path().join("policy-bundle.json"),
+            bundle_index.to_string(),
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var(crate::builtin::POLICY_PACK_ROOT_ENV);
+            std::env::set_var(crate::builtin::POLICY_BUNDLE_ROOT_ENV, bundle.path());
+        }
+        let bundled = serde_json::to_value(evaluate(POLICY).report()).unwrap();
+        assert_eq!(bundled["packs"]["catalogs"], report["packs"]["catalogs"]);
+        assert_eq!(
+            bundled["runs"][0]["findings"].as_array().unwrap().len(),
+            1,
+            "{bundled:#}"
+        );
+        // A manifest pin is checked independently of the archive byte digest.
+        let mut bad_pin = bundle_index.clone();
+        bad_pin["catalogs"][0]["semantic_hash"] = json!("0".repeat(64));
+        fs::write(
+            bundle.path().join("policy-bundle.json"),
+            bad_pin.to_string(),
+        )
+        .unwrap();
+        let failure = evaluate_policy_inputs(
+            project.root(),
+            &[PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new("pin.rqlp"),
+                POLICY,
+            )],
+            &options,
+        )
+        .err()
+        .expect("catalog loading must fail");
+        assert!(
+            failure.to_string().contains("semantic hash mismatch"),
+            "{failure}"
+        );
+        let mut unindexed = bundle_index;
+        unindexed["catalogs"][0]["path"] = json!("unindexed.json");
+        fs::write(
+            bundle.path().join("policy-bundle.json"),
+            unindexed.to_string(),
+        )
+        .unwrap();
+        let failure = evaluate_policy_inputs(
+            project.root(),
+            &[PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new("unindexed.rqlp"),
+                POLICY,
+            )],
+            &options,
+        )
+        .err()
+        .expect("catalog loading must fail");
+        assert!(failure.to_string().contains("unindexed file"), "{failure}");
+        unsafe {
+            std::env::remove_var(crate::builtin::POLICY_BUNDLE_ROOT_ENV);
+        }
+        // A new run rereads the installation rather than retaining catalog content.
+        fs::remove_dir_all(&pack).unwrap();
+        unsafe {
+            std::env::remove_var(crate::builtin::POLICY_PACK_ROOT_ENV);
+        }
+        let empty = serde_json::to_value(evaluate(POLICY).report()).unwrap();
+        assert!(
+            empty
+                .to_string()
+                .contains("resolved Sink endpoint set must not be empty"),
+            "{empty:#}"
+        );
+    }
+    #[test]
+    fn generated_jdk_sink_catalog_reports_exec_array_with_entry_provenance() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogOptions, CompilerOptions, SemanticModelActivationEvidence, SessionPackSource,
+            SessionPackSourceKind, SourceFormat, compile_source,
+        };
+        // This golden is generated and schema-validated by the sibling M7
+        // foundry test. It is a synthetic engine fixture, never product content.
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../bifrost-semantic-packs/testdata/summary-corpora/codeql-jdk-catalogs/expected.txt"
+        ))
+        .unwrap();
+        let name = "codeql-jdk-sinks-command-injection";
+        let document = &golden["catalogs"][name];
+        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
+        let hash = registry
+            .register_json_bytes(
+                crate::catalog::CatalogSourceIdentity::new("generated-jdk-fixture").unwrap(),
+                &serde_json::to_vec(document).unwrap(),
+            )
+            .unwrap();
+        let packs = tempfile::tempdir().unwrap();
+        let pack = packs.path().join("test.generated-jdk");
+        fs::create_dir_all(pack.join("catalogs")).unwrap();
+        fs::write(
+            pack.join("catalogs/sinks.json"),
+            serde_json::to_vec(document).unwrap(),
+        )
+        .unwrap();
+        fs::write(pack.join("manifest.json"), json!({
+            "schema_version": 2, "id": "test.generated-jdk", "version": "1.0.0",
+            "name": "Synthetic generated catalog", "description": "M7 engine fixture only",
+            "policies": [], "catalogs": [{"path": "catalogs/sinks.json", "semantic_hash": hash.to_string()}]
+        }).to_string()).unwrap();
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "Probe.java",
+                r#"class Probe {
+    static String[] source() { return new String[]{"x"}; }
+    void run(Runtime runtime, Other other) throws Exception {
+        runtime.exec(source());
+        other.exec(source());
+    }
+}
+class Other { void exec(String[] value) {} }
+"#,
+            )
+            .build();
+        let declarations = json!({
+            "schema_version": 19, "pack_id": "test.generated-jdk.declarations", "version": "1.0.0",
+            "producer": {"name": "bifrost-test-fixture", "version": "1.0.0"},
+            "language": "java", "ecosystem": "jdk", "compatibility": {"toolchains": []},
+            "provenance": {"source": "Synthetic test-only unnamed JMOD-style formal", "revision": "#4365"},
+            "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "test.runtime.declarations", "activation": [{}], "payload": {
+                "kind": "declaration_facts",
+                "types": [{"id": "test.runtime", "name": "java.lang.Runtime", "type_kind": "class", "visibility": "public",
+                    "locator": {"kind": "artifact", "path": "java.base/java/lang/Runtime.java", "symbol": "java.lang.Runtime"}}],
+                "members": [{"id": "test.runtime.exec", "owner": "test.runtime", "name": "exec", "member_kind": "method",
+                    "visibility": "public", "is_static": false, "callable_family_complete": true,
+                    "signature": {"parameters": [{"type": {"kind": "array", "element": {"kind": "named", "name": "java.lang.String"}}, "passing_mode": "positional_only"}]},
+                    "locator": {"kind": "artifact", "path": "java.base/java/lang/Runtime.java", "symbol": "exec(java.lang.String[])"}}]
+            }}]
+        });
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&declarations).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .register_session_pack(
+                &compiled,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:generated-jdk-declarations".into(),
+                },
+            )
+            .unwrap();
+        let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".into(),
+                ecosystem: "jdk".into(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: Default::default(),
+        };
+        let policy = POLICY
+            .replace("language rust", "language java")
+            .replace("sql-injection", "command-injection")
+            .replace("[untrusted]", "[attacker-controlled]");
+        unsafe {
+            std::env::set_var(crate::builtin::POLICY_PACK_ROOT_ENV, packs.path());
+        }
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let outcome = evaluate_policy_inputs_with_analyzer_and_semantic_models(
+            project.root(),
+            &[PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new("generated.rqlp"),
+                &policy,
+            )],
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            &crate::test_support::evaluation_options("2026-10-26"),
+            PolicySemanticModelContext {
+                catalog: &catalog,
+                request: &request,
+                persistence: None,
+            },
+            None,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var(crate::builtin::POLICY_PACK_ROOT_ENV);
+        }
+        let report = serde_json::to_value(outcome.report()).unwrap();
+        assert_eq!(
+            report["runs"][0]["findings"].as_array().unwrap().len(),
+            1,
+            "{report:#}"
+        );
+        let primary = outcome.report().runs()[0].findings()[0].primary();
+        assert_eq!(primary.path(), "Probe.java");
+        let region = primary
+            .region()
+            .expect("Runtime.exec finding has a source region");
+        assert_eq!(region.start_line(), 4);
+        assert_eq!(region.end_line(), 4);
+        assert_eq!(report["packs"]["catalogs"][0]["name"], name, "{report:#}");
+        let finding = report["runs"][0]["findings"][0].to_string();
+        let entry = document["sinks"][0]["id"].as_str().unwrap();
+        assert!(
+            finding.contains(name) && finding.contains(entry),
+            "{finding}"
+        );
+    }
+
+    #[test]
+    fn catalog_wildcard_vocabulary_decodes_validates_ranges_and_hovers() {
+        let parse = |source: &str| {
+            crate::parse_rqlp_source(source, PolicySourceIdentity::new("wildcard.rqlp"))
+        };
+        let parsed = parse(POLICY).unwrap();
+        let RqlpDocument::Policy { definition } = parsed.document() else {
+            panic!("policy");
+        };
+        let PolicyAnalysis::Taint { spec } = &definition.analysis else {
+            panic!("taint");
+        };
+        assert!(matches!(
+            spec.sinks.include_sets[0],
+            CatalogRef::AnyRegistered { .. }
+        ));
+        for (keyword, signature) in [
+            (":any-registered", ":any-registered true"),
+            (":categories (any", ":categories (any|all [CATEGORY...])"),
+        ] {
+            let offset = POLICY.find(keyword).unwrap() + 2;
+            let help = crate::source::rqlp_source_help_at(POLICY, offset).unwrap();
+            assert_eq!(help.signature, signature);
+        }
+        let invalid = POLICY.replace(":any-registered true", ":any-registered maybe");
+        let error = parse(&invalid).unwrap_err().diagnostic;
+        assert_eq!(&invalid[error.range], "maybe");
+        for reference in [
+            "(catalog :any-registered false :categories (any [sql-injection]))",
+            "(catalog :any-registered true)",
+            "(catalog :name test.sinks :version 1 :categories (any [sql-injection]))",
+            "(catalog :any-registered true :name test.sinks :categories (any [sql-injection]))",
+        ] {
+            let source = POLICY.replace(
+                "(catalog :any-registered true :categories (any [sql-injection]))",
+                reference,
+            );
+            assert_eq!(
+                parse(&source).unwrap_err().diagnostic.code,
+                "invalid-catalog-reference"
+            );
+        }
+        let exact = POLICY.replace(":sinks (endpoint-set", ":finding-combinations [(finding-combination :id exact :source (categories :any [input.user]) :sink (endpoints [(endpoint-ref :catalog (catalog :any-registered true :categories (any [sql-injection])) :entry sql-execute)]) :message \"M\")] :sinks (endpoint-set");
+        let error = parse(&exact).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-endpoint-reference", "{error:?}");
+        assert!(exact[error.range].starts_with("(catalog :any-registered"));
+        for (kind, entry) in [
+            (
+                "sanitizers",
+                "(sanitizer :id clean :categories [sql-injection] :selector (rql :schema-version 1 (name \"clean\")) :input (argument :index 0) :output return-value :removes [untrusted])",
+            ),
+            (
+                "transforms",
+                "(transform :id clean :categories [sql-injection] :selector (rql :schema-version 1 (name \"clean\")) :input (argument :index 0) :output return-value :adds [untrusted])",
+            ),
+            (
+                "external-models",
+                "(external-model :id clean :categories [sql-injection] :selector (rql :schema-version 1 (name \"clean\")) :transfers [(transfer :from (argument :index 0) :to return-value :labels [untrusted] :effect propagate)])",
+            ),
+        ] {
+            let source = format!(
+                "(endpoint-set-document :schema-version 1 :kind {kind} :set (endpoint-set :entries [{entry}]))"
+            );
+            let parsed = parse(&source).unwrap();
+            assert_eq!(
+                parsed.document().to_normalized_authored_json()["set"]["entries"][0]["categories"],
+                json!(["sql-injection"])
+            );
+            let offset = source.find(":categories").unwrap() + 2;
+            assert_eq!(
+                crate::source::rqlp_source_help_at(&source, offset)
+                    .unwrap()
+                    .signature,
+                ":categories [CATEGORY...]"
+            );
+        }
     }
 }

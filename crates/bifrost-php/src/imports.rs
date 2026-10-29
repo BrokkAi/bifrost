@@ -75,7 +75,16 @@ fn fold_include_expression(node: Node<'_>, source: &str) -> Option<IncludePath> 
     while let Some(action) = actions.pop() {
         match action {
             Action::Fold(node) => match node.kind() {
-                "string" => paths.push(IncludePath::Relative(decode_php_string(node, source)?)),
+                "string" | "encapsed_string" => {
+                    paths.push(IncludePath::Relative(decode_php_string(node, source)?));
+                }
+                "parenthesized_expression" => {
+                    let mut cursor = node.walk();
+                    actions.push(Action::Fold(
+                        node.named_children(&mut cursor)
+                            .find(|child| !child.is_extra())?,
+                    ));
+                }
                 "name" if node_text(node, source).eq_ignore_ascii_case("__DIR__") => {
                     paths.push(IncludePath::Directory {
                         parents: 0,
@@ -115,7 +124,7 @@ fn fold_include_expression(node: Node<'_>, source: &str) -> Option<IncludePath> 
                         };
                         IncludePath::Directory {
                             parents,
-                            suffix: suffix + trim_leading_path_separators(&right),
+                            suffix: suffix + &right,
                         }
                     }
                     IncludePath::FileAnchor => return None,
@@ -183,16 +192,9 @@ fn parse_positive_php_integer(node: Node<'_>, source: &str) -> Option<usize> {
     if node.kind() != "integer" {
         return None;
     }
-    let text = node_text(node, source).replace('_', "");
-    let value = if let Some(value) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        usize::from_str_radix(value, 16).ok()?
-    } else if let Some(value) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
-        usize::from_str_radix(value, 2).ok()?
-    } else if let Some(value) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
-        usize::from_str_radix(value, 8).ok()?
-    } else {
-        text.parse().ok()?
-    };
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+    let literal = crate::structural::PHP_STRUCTURAL_SPEC.integer_literal_value(node, source)?;
+    let value = literal.signed_decimal()?.parse::<usize>().ok()?;
     (value > 0).then_some(value)
 }
 
@@ -245,7 +247,16 @@ fn is_workspace_relative(value: &str) -> bool {
 }
 
 fn decode_php_string(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() != "string" {
+    if !matches!(node.kind(), "string" | "encapsed_string") {
+        return None;
+    }
+    // A double-quoted literal has the same grammar kind as interpolation.
+    // Accept only literal content and escapes, never embedded expressions.
+    let mut cursor = node.walk();
+    if node
+        .named_children(&mut cursor)
+        .any(|child| !matches!(child.kind(), "string_content" | "escape_sequence"))
+    {
         return None;
     }
     let raw = node_text(node, source);
@@ -298,13 +309,26 @@ fn decode_php_string(node: Node<'_>, source: &str) -> Option<String> {
                 u8::from_str_radix(std::str::from_utf8(&bytes[index + 2..end]).ok()?, 16).ok()?,
             );
             index = end;
+        } else if escaped == b'u' && bytes.get(index + 2) == Some(&b'{') {
+            let start = index + 3;
+            let length = bytes[start..].iter().position(|byte| *byte == b'}')?;
+            let end = start + length;
+            let scalar =
+                u32::from_str_radix(std::str::from_utf8(&bytes[start..end]).ok()?, 16).ok()?;
+            let character = char::from_u32(scalar)?;
+            let mut buffer = [0; 4];
+            decoded.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            index = end + 1;
         } else if escaped.is_ascii_digit() && escaped < b'8' {
             let mut end = index + 1;
             while end < bytes.len() && end < index + 4 && (b'0'..=b'7').contains(&bytes[end]) {
                 end += 1;
             }
             decoded.push(
-                u8::from_str_radix(std::str::from_utf8(&bytes[index + 1..end]).ok()?, 8).ok()?,
+                // PHP keeps only the low byte of a three-digit octal escape.
+                u16::from_str_radix(std::str::from_utf8(&bytes[index + 1..end]).ok()?, 8)
+                    .ok()?
+                    .to_le_bytes()[0],
             );
             index = end;
         } else {
@@ -428,4 +452,147 @@ pub fn project_alias_source_facts(
             import.to_alias_source_fact(id)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn parse(source: &str) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let file = brokk_bifrost_core::analyzer::ProjectFile::new(
+            std::env::current_dir().unwrap(),
+            "include.php",
+        );
+        crate::declarations::parse_php_file(&file, source, &tree)
+    }
+
+    #[test]
+    #[hardwon("#7228: review: parenthesized include comments hid static paths")]
+    fn parenthesized_include_extras() {
+        let parsed = parse("<?php require (/* audited */ __DIR__ . '/t.php');");
+        let path = parsed.imports[0].path.as_ref().unwrap();
+        assert_eq!(path.kind, Some(StructuredImportPathKind::FileInclude));
+        assert_eq!(path.segments, ["t.php"]);
+    }
+
+    #[test]
+    #[hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: include concatenation loses separators and rejects static strings and octal levels"
+    )]
+    fn static_include_facts_follow_php_literal_rules() {
+        // PHP string/integer language rules, independent expected path components.
+        let cases = [
+            ("'target.php'", vec!["target.php"]),
+            (r#""target.php""#, vec!["target.php"]),
+            (
+                "__DIR__ . '/sub' . '/target.php'",
+                vec!["sub", "target.php"],
+            ),
+            (
+                "__DIR__ . ('/sub' . '/target.php')",
+                vec!["sub", "target.php"],
+            ),
+            (
+                "dirname(__DIR__, 010) . '/target.php'",
+                vec!["..", "..", "..", "..", "..", "..", "..", "..", "target.php"],
+            ),
+            (
+                "dirname(__DIR__, 8) . '/target.php'",
+                vec!["..", "..", "..", "..", "..", "..", "..", "..", "target.php"],
+            ),
+            (
+                r"'literal\n.php'",
+                if cfg!(windows) {
+                    vec!["literal", "n.php"]
+                } else {
+                    vec![r"literal\n.php"]
+                },
+            ),
+            (r#""\x74arget.php""#, vec!["target.php"]),
+            (r#""\164arget.php""#, vec!["target.php"]),
+            (r#""\u{74}arget.php""#, vec!["target.php"]),
+            (r#""\564arget.php""#, vec!["target.php"]),
+        ];
+        let mut failures = Vec::new();
+        for (expression, expected) in cases {
+            let parsed = parse(&format!("<?php require {expression};"));
+            let import = &parsed.imports[0];
+            let path = import.path.as_ref().unwrap();
+            if path.kind != Some(StructuredImportPathKind::FileInclude) || path.segments != expected
+            {
+                failures.push(format!("{expression}: {path:?}; expected {expected:?}"));
+            }
+            assert!(!import.is_wildcard);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        for expression in [r#""$target.php""#, r#""{$target}.php""#] {
+            let parsed = parse(&format!("<?php require {expression};"));
+            assert_eq!(
+                parsed.imports[0].path.as_ref().unwrap().kind,
+                Some(StructuredImportPathKind::DynamicInclude)
+            );
+        }
+    }
+    #[test]
+    fn import_projection_preserves_grammar_order_and_provenance() {
+        let source = "<?php require 'target.php'; use Vendor\\{First as A, function second as B, const THIRD as C};";
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let include = &facts.imports[0];
+        assert_eq!(
+            include.path.as_ref().unwrap().kind,
+            Some(StructuredImportPathKind::FileInclude)
+        );
+        assert!(!include.is_wildcard);
+        assert!(include.identifier.is_none());
+        assert!(include.alias.is_none());
+        let aliases = &facts.php.as_ref().unwrap().aliases;
+        let expected = [
+            ("First", "A", PhpAliasKind::Type),
+            ("second", "B", PhpAliasKind::Function),
+            ("THIRD", "C", PhpAliasKind::Constant),
+        ];
+        assert_eq!(aliases.len(), expected.len());
+        let mut preceding_target_end = 0;
+        for (alias, (target, binder, kind)) in aliases.iter().zip(expected) {
+            let import = &facts.imports[alias.import.index()];
+            let target_range = facts.occurrences.occurrence(import.target.unwrap()).range;
+            assert!(target_range.start_byte > preceding_target_end);
+            preceding_target_end = target_range.end_byte;
+            assert_eq!(
+                &source[target_range.start_byte..target_range.end_byte],
+                target
+            );
+            let binder_range = facts
+                .occurrences
+                .occurrence(import.alias_occurrence.unwrap())
+                .range;
+            assert_eq!(
+                &source[binder_range.start_byte..binder_range.end_byte],
+                binder
+            );
+            assert_eq!(alias.kind, kind);
+            assert!(!import.is_wildcard);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_anchored_include_accepts_backslash_suffix() {
+        let parsed = parse(r"<?php require __DIR__ . '\\\\target.php';");
+        let path = parsed.imports[0].path.as_ref().unwrap();
+        assert_eq!(path.kind, Some(StructuredImportPathKind::FileInclude));
+        assert_eq!(path.segments, ["target.php"]);
+    }
 }

@@ -40,10 +40,6 @@ impl DeclarationNameRangeContext {
             .get_or_init(|| compute_line_starts(self.content.as_ref()))
     }
 
-    pub fn shared_content(&self) -> Arc<str> {
-        Arc::clone(&self.content)
-    }
-
     pub fn root_node(&self) -> Option<Node<'_>> {
         self.tree.as_ref().map(Tree::root_node)
     }
@@ -220,7 +216,8 @@ fn code_unit_declaration_name_ranges_in_tree(
         .collect()
 }
 
-pub(crate) fn code_unit_declaration_name_range_for_range(
+#[doc(hidden)]
+pub fn code_unit_declaration_name_range_for_range(
     content: &str,
     root: Node<'_>,
     code_unit: &CodeUnit,
@@ -522,6 +519,88 @@ mod tests {
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
     use crate::analyzer::{Language, ProjectFile};
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn recovered_extents_select_the_containing_declaration_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for prefix in ["", "/* \u{e9} */\n", "/* \u{e9} */\r\n"] {
+            let source = format!("{prefix}class A {{ m() {{ class A {{}} }} }}\n");
+            let file = ProjectFile::new(dir.path(), "Nested.js");
+            let context = DeclarationNameRangeContext::new(&file, source.clone());
+            let root = context.root_node().unwrap();
+            let mut cursor = root.walk();
+            let outer = root
+                .named_children(&mut cursor)
+                .find(|node| node.kind() == "class_declaration")
+                .unwrap();
+            let expected = node_byte_range(outer.child_by_field_name("name").unwrap());
+            let mut extent = node_byte_range(outer);
+            extent.end_byte = outer.start_byte() + "class A { m() { ".len();
+            // This range has no exact node. Check the AST boundary directly:
+            // the byte-containing declaration must be selected before the
+            // line-based recovery path (which cannot disambiguate all names).
+            let containing = node_for_smallest_containing_range(root, &extent).unwrap();
+            assert_eq!(containing.kind(), "class_declaration");
+            assert_eq!(
+                node_byte_range(containing.child_by_field_name("name").unwrap()),
+                expected
+            );
+            let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Class, "", "A");
+            assert_eq!(
+                context.name_range_for_declaration(&unit, extent),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn batched_names_match_exact_grammar_fields_in_any_request_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, source) in [
+            ("Nested.kt", "class A { fun m() { class A {} } }"),
+            ("Nested.kt", "class A {\n fun m() {\n class A {}\n }\n}"),
+            (
+                "Nested.kt",
+                "class A {\r\n fun m() {\r\n class A {}\r\n }\r\n}",
+            ),
+            ("Nested.js", "class A { m() { class A {} } }"),
+            ("Nested.js", "class A {\n m() {\n class A {}\n }\n}"),
+            ("Nested.js", "class A {\r\n m() {\r\n class A {}\r\n }\r\n}"),
+        ] {
+            let file = ProjectFile::new(dir.path(), path);
+            let context = DeclarationNameRangeContext::new(&file, source.to_string());
+            let unit = CodeUnit::new(file.clone(), crate::analyzer::CodeUnitType::Class, "", "A");
+            let mut stack = vec![context.root_node().unwrap()];
+            let mut declarations = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "class_declaration" {
+                    let name = node
+                        .child_by_field_name("name")
+                        .or_else(|| {
+                            let mut cursor = node.walk();
+                            node.named_children(&mut cursor)
+                                .find(|child| child.kind() == "type_identifier")
+                        })
+                        .unwrap();
+                    declarations.push((node_byte_range(node), node_byte_range(name)));
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(declarations.len(), 2);
+            for order in [[0, 1], [1, 0]] {
+                let requests = order.map(|i| (&unit, declarations[i].0));
+                let expected = order.map(|i| Some(declarations[i].1));
+                assert_eq!(context.name_ranges_for_declarations(&requests), expected);
+                for (i, (_, range)) in requests.iter().enumerate() {
+                    assert_eq!(
+                        context.name_range_for_declaration(&unit, *range),
+                        expected[i]
+                    );
+                }
+            }
+        }
+    }
 
     fn first_node_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
         crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {

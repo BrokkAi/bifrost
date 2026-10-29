@@ -289,6 +289,12 @@ pub(super) fn decorator_binding_filter_to_json(
             Value::String(imported_name.clone()),
         );
     }
+    if let Some(annotation_type) = &filter.annotation_type {
+        object.insert(
+            "annotation_type".to_string(),
+            Value::String(annotation_type.clone()),
+        );
+    }
     object
 }
 
@@ -1519,6 +1525,9 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     }
     if let Some(value) = pattern.modifier {
         object.insert("modifier".to_string(), json!(value.label()));
+    }
+    if let Some(value) = &pattern.type_kind {
+        object.insert("type_kind".to_string(), json!(value));
     }
     if let Some(value) = pattern.assignment_target_kind {
         object.insert(

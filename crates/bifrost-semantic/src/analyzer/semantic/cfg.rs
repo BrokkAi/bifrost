@@ -233,6 +233,16 @@ impl ProcedureCfgBuilder {
             .expect("a point's registered source mapping exists")
     }
 
+    #[doc(hidden)]
+    pub fn value_source_mapping(&self, id: ValueId) -> &SourceMapping {
+        let value = self
+            .parts
+            .values
+            .get(id.index())
+            .expect("a registered builder value exists");
+        self.source_mapping(value.source)
+    }
+
     pub(crate) fn add_loop_site(&mut self, site: LoopSite) -> Result<(), SemanticBudgetExceeded> {
         assert!(
             site.header.index() < self.points.len() && site.body.index() < self.points.len(),
@@ -450,12 +460,22 @@ impl ProcedureCfgBuilder {
                     })
             })
             .fold(0usize, usize::saturating_add);
-        self.reserve(SemanticWork {
+        let mut work = SemanticWork {
             call_sites: 1,
             nested_entries: call_site.arguments.len(),
             owned_text_bytes,
             ..SemanticWork::default()
-        })?;
+        };
+        if let Some(selection) = &call_site.member_selection {
+            work.nested_entries = work.nested_entries.saturating_add(1);
+            work.owned_text_bytes = work.owned_text_bytes.saturating_add(selection.member.len());
+            if let Some(crate::analyzer::semantic::SemanticPlace::LocalBinding(locator)) =
+                &selection.receiver_place
+            {
+                work = work.conservative_add(locator_work(locator, 1));
+            }
+        }
+        self.reserve(work)?;
         self.parts.call_sites.push(call_site);
         Ok(id)
     }
@@ -2043,6 +2063,7 @@ mod tests {
                     execution_timing: crate::analyzer::semantic::ExecutionTiming::SameEvaluation,
                     callee: ValueId::new(0),
                     receiver: None,
+                    member_selection: None,
                     arguments: Box::new([SemanticCallArgument {
                         value: ValueId::new(1),
                         expansion,

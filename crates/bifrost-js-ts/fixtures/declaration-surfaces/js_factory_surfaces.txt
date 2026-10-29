@@ -1,0 +1,61 @@
+SOURCE export default function(){return {run(){}};}
+Function [("Member", "default"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+Function [("Member", "default")] lookup=false signatures=["export default function() ..."] labels=[([], true, false)] supers=[]
+export Some("default") Default { local_name: None }
+materialized DefaultAnonymous "default" target=Some([("Member", "default")])
+SOURCE import {defineConfig} from 'library'; export const api=defineConfig({run(){}});
+Field [("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=true signatures=["run(){}"] labels=[] supers=[]
+Function [("Path", "surface.js"), ("Member", "api"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+Module [("Path", "surface.js")] lookup=false signatures=[] labels=[] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None
+SOURCE const preserve=(x)=>x; export const api=preserve({run(){}});
+Field [("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=true signatures=["run(){}"] labels=[] supers=[]
+Function [("Member", "preserve")] lookup=false signatures=["preserve(x) => ..."] labels=[(["x"], true, false)] supers=[]
+Function [("Path", "surface.js"), ("Member", "api"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None
+SOURCE const preserve=(x)=>{return x;}; export const api=preserve({run(){}});
+Field [("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=true signatures=["run(){}"] labels=[] supers=[]
+Function [("Member", "preserve")] lookup=false signatures=["preserve(x) => ..."] labels=[(["x"], true, false)] supers=[]
+Function [("Path", "surface.js"), ("Member", "api"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None
+SOURCE function wrap(config,other){return config;} export const api=wrap({run(){}},0);
+Field [("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=true signatures=["run(){}"] labels=[] supers=[]
+Function [("Member", "wrap")] lookup=false signatures=["function wrap(config,other) ..."] labels=[(["config", "other"], true, false)] supers=[]
+Function [("Path", "surface.js"), ("Member", "api"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None
+SOURCE function wrap(other,config){return config;} export const api=wrap(0,{run(){}});
+Field [("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "api"), ("Member", "run")] lookup=true signatures=["run(){}"] labels=[] supers=[]
+Function [("Member", "wrap")] lookup=false signatures=["function wrap(other,config) ..."] labels=[(["other", "config"], true, false)] supers=[]
+Function [("Path", "surface.js"), ("Member", "api"), ("Member", "run")] lookup=false signatures=["run(){}"] labels=[] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None
+SOURCE function wrap(config){const helper={m(){return config;}};return 0;} export const api=wrap({ghost(){}});
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "wrap"), ("Member", "helper"), ("Member", "m")] lookup=true signatures=["m(){return config;}"] labels=[] supers=[]
+Function [("Member", "wrap")] lookup=false signatures=["function wrap(config) ..."] labels=[(["config"], true, false)] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None
+SOURCE function wrap(config){return another;} export const api=wrap({ghost(){}});
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "wrap")] lookup=false signatures=["function wrap(config) ..."] labels=[(["config"], true, false)] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None
+SOURCE function wrap(){return 0;} export const api=wrap(1,{ghost(){}});
+Field [("Path", "surface.js"), ("Member", "api")] lookup=false signatures=["export const api"] labels=[] supers=[]
+Function [("Member", "wrap")] lookup=false signatures=["function wrap() ..."] labels=[([], true, false)] supers=[]
+export Some("api") Local { local_name: "api" }
+materialized Named "api" target=None

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "javax.servlet.ServletRequest",
+    "path": "javax/servlet/ServletRequest.java",
+    "supertypes": [],
+    "methods": [
+      { "name": "getParameter", "parameters": ["java.lang.String"], "has_receiver": true, "id": "test.ServletRequest.getParameter" }
+    ]
+  },
+  {
+    "name": "javax.servlet.http.HttpServletRequest",
+    "path": "javax/servlet/http/HttpServletRequest.java",
+    "supertypes": ["javax.servlet.ServletRequest"],
+    "methods": [
+      { "name": "getParameter", "parameters": ["java.lang.String"], "has_receiver": true, "id": "test.HttpServletRequest.getParameter" }
+    ]
+  },
+  {
+    "name": "javax.servlet.ServletResponse",
+    "path": "javax/servlet/ServletResponse.java",
+    "supertypes": [],
+    "methods": [
+      { "name": "setContentType", "parameters": ["java.lang.String"], "has_receiver": true, "id": "test.ServletResponse.setContentType" }
+    ]
+  }
+]

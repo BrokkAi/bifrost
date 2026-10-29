@@ -2055,13 +2055,134 @@ pub struct TaintBarrierSpec {
     pub value_type: ValueTypePredicate,
 }
 
+/// A sanitizer either cleans a transferred value or proves a carrier clean on a branch.
+#[derive(Debug, Clone)]
+pub enum TaintSanitizerKind {
+    Transfer {
+        input: PolicyPort,
+        output: PolicyPort,
+    },
+    Conditional {
+        when: TaintSanitizerWhen,
+        sanitizes: TaintSanitizerOperand,
+        requires: Vec<TaintSanitizerRequirement>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaintSanitizerWhen {
+    pub result: TaintSanitizerResult,
+    /// Omission selects the ordinary single result; an explicit ordinal selects a tuple result.
+    pub index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintSanitizerResult {
+    True,
+    False,
+    Nil,
+    NonNil,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintSanitizerOperand {
+    Receiver,
+    Argument { index: u32 },
+}
+
+#[derive(Debug, Clone)]
+pub struct TaintSanitizerRequirement {
+    pub operand: TaintSanitizerOperand,
+    pub condition: TaintSanitizerCondition,
+}
+
+#[derive(Debug, Clone)]
+pub enum TaintSanitizerCondition {
+    Constant,
+    Equals(serde_json::Value),
+    ResultOf(PolicySelector),
+}
+
 #[derive(Debug, Clone)]
 pub struct TaintSanitizerSpec {
+    pub categories: Vec<PolicyCategoryId>,
     pub id: TaintEntryId,
     pub selector: PolicySelector,
-    pub input: PolicyPort,
-    pub output: PolicyPort,
+    pub kind: TaintSanitizerKind,
     pub removes: Vec<TaintLabel>,
+}
+
+pub(crate) fn sanitizer_requirement_selector_path(base: &str, index: usize) -> String {
+    format!("{base}/requires/{index}/result_of")
+}
+
+impl TaintSanitizerKind {
+    pub(crate) fn requirement_selectors(&self) -> impl Iterator<Item = (usize, &PolicySelector)> {
+        let requirements = match self {
+            Self::Conditional { requires, .. } => requires.as_slice(),
+            Self::Transfer { .. } => &[],
+        };
+        requirements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match &item.condition {
+                TaintSanitizerCondition::ResultOf(selector) => Some((index, selector)),
+                _ => None,
+            })
+    }
+
+    pub fn transfer_ports(&self) -> Option<(&PolicyPort, &PolicyPort)> {
+        match self {
+            Self::Transfer { input, output } => Some((input, output)),
+            Self::Conditional { .. } => None,
+        }
+    }
+}
+
+/// Check authored argument bounds when the selector itself limits call arity.
+/// Result bounds require selected call signatures and are checked at binding.
+pub(crate) fn validate_sanitizer_arity(
+    selector: &PolicySelector,
+    kind: &TaintSanitizerKind,
+) -> Result<(), String> {
+    let PolicySelector::Inline { query, .. } = selector else {
+        return Ok(());
+    };
+    validate_sanitizer_query_arity(query, kind)
+}
+
+pub(crate) fn validate_sanitizer_query_arity(
+    query: &CodeQuery,
+    kind: &TaintSanitizerKind,
+) -> Result<(), String> {
+    let TaintSanitizerKind::Conditional {
+        sanitizes,
+        requires,
+        ..
+    } = kind
+    else {
+        return Ok(());
+    };
+    if !query.plan.steps.is_empty() {
+        return Ok(());
+    }
+    let Some(max) = query
+        .seed()
+        .and_then(|seed| seed.root.arity)
+        .and_then(|arity| arity.max)
+    else {
+        return Ok(());
+    };
+    for operand in std::iter::once(*sanitizes).chain(requires.iter().map(|item| item.operand)) {
+        if let TaintSanitizerOperand::Argument { index } = operand
+            && index >= max
+        {
+            return Err(format!(
+                "sanitizer argument index {index} is outside selector call arity {max}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One authored `(store-write ...)` entry: the selected call writes its
@@ -2104,6 +2225,7 @@ pub struct TaintEntryPointSpec {
 
 #[derive(Debug, Clone)]
 pub struct TaintTransformSpec {
+    pub categories: Vec<PolicyCategoryId>,
     pub id: TaintEntryId,
     pub selector: PolicySelector,
     pub input: PolicyPort,
@@ -2114,6 +2236,7 @@ pub struct TaintTransformSpec {
 
 #[derive(Debug, Clone)]
 pub struct TaintExternalModelSpec {
+    pub categories: Vec<PolicyCategoryId>,
     pub id: TaintEntryId,
     pub selector: PolicySelector,
     pub transfers: Vec<TaintTransferSpec>,
@@ -3309,13 +3432,27 @@ fn validate_selector_path(path: &str) -> Result<(), PolicySelectorPathError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CatalogRef {
-    pub name: PolicyId,
-    pub version: u32,
-    pub sha256: Option<TaintCatalogHash>,
+pub enum CatalogRef {
+    Named {
+        name: PolicyId,
+        version: u32,
+        sha256: Option<TaintCatalogHash>,
+    },
+    AnyRegistered {
+        predicate: CategoryPredicate,
+    },
 }
 
 impl CatalogRef {
+    pub(crate) fn includes_categories(&self, categories: &[PolicyCategoryId]) -> bool {
+        match self {
+            Self::Named { .. } => true,
+            Self::AnyRegistered { predicate } => {
+                !categories.is_empty() && predicate.matches_categories(categories)
+            }
+        }
+    }
+
     pub fn new(
         name: PolicyId,
         version: u32,
@@ -3324,7 +3461,7 @@ impl CatalogRef {
         if !catalog_version_is_valid(version) {
             return Err(CatalogRefError::ZeroVersion);
         }
-        Ok(Self {
+        Ok(Self::Named {
             name,
             version,
             sha256,

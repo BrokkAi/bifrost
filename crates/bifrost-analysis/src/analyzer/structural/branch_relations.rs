@@ -32,15 +32,19 @@ use crate::analyzer::branch_boolean::{
     classify_boolean_branches, classify_kotlin_boolean_branches, classify_scala_boolean_branches,
     kotlin_when_is_a6_shape, scala_defines_named_type_bounded,
 };
+use crate::analyzer::read_ledger::{DerivationExecutionCause, reason as derivation_reason};
 
 use crate::analyzer::java_integral_parameter::{
     JavaIntegralDomain, JavaScalarType, java_decimal_int_value,
 };
 
 use crate::analyzer::languages::{LanguageSupport, language_support_for_hook};
-use crate::analyzer::{Language, Range};
+use crate::analyzer::{Language, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
-use brokk_bifrost_core::analyzer::structural::body_relations::empty_if_arm_relation;
+use brokk_bifrost_core::analyzer::structural::body_relations::{
+    BodyState, BodyStateAnswer, empty_if_arm_relation,
+};
+use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
 use brokk_bifrost_core::analyzer::tree_walk::{has_child_of_kind as has_direct_token, node_range};
 use brokk_bifrost_core::analyzer::work_budget::{BudgetLedger, define_work_dimensions};
 use std::collections::HashMap;
@@ -95,22 +99,41 @@ pub enum BranchOpenReason {
     MemberResolutionUnavailable,
     AmbiguousMember,
     DeferredBody,
+    UnprovenActivation,
 }
 
 impl BranchOpenReason {
+    pub const fn execution_cause(self) -> Option<DerivationExecutionCause> {
+        match self {
+            Self::ComparisonBudget => Some(DerivationExecutionCause::Budget),
+            Self::SyntaxRecovery
+            | Self::MissingBranchField
+            | Self::LexicalBindingUnavailable
+            | Self::NonLocalReference
+            | Self::EffectfulBody
+            | Self::EffectfulCondition
+            | Self::UnsupportedCondition
+            | Self::MemberResolutionUnavailable
+            | Self::AmbiguousMember
+            | Self::DeferredBody
+            | Self::UnprovenActivation => None,
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
-            Self::SyntaxRecovery => "syntax_recovery",
-            Self::MissingBranchField => "missing_branch_field",
-            Self::LexicalBindingUnavailable => "lexical_binding_unavailable",
-            Self::NonLocalReference => "non_local_reference",
-            Self::EffectfulBody => "effectful_body",
-            Self::EffectfulCondition => "effectful_condition",
-            Self::UnsupportedCondition => "unsupported_condition",
-            Self::ComparisonBudget => "comparison_budget",
-            Self::MemberResolutionUnavailable => "member_resolution_unavailable",
-            Self::AmbiguousMember => "ambiguous_member",
-            Self::DeferredBody => "deferred_body",
+            Self::SyntaxRecovery => derivation_reason::SYNTAX_RECOVERY,
+            Self::MissingBranchField => derivation_reason::MISSING_BRANCH_FIELD,
+            Self::LexicalBindingUnavailable => derivation_reason::LEXICAL_BINDING_UNAVAILABLE,
+            Self::NonLocalReference => derivation_reason::NON_LOCAL_REFERENCE,
+            Self::EffectfulBody => derivation_reason::EFFECTFUL_BODY,
+            Self::EffectfulCondition => derivation_reason::EFFECTFUL_CONDITION,
+            Self::UnsupportedCondition => derivation_reason::UNSUPPORTED_CONDITION,
+            Self::ComparisonBudget => derivation_reason::COMPARISON_BUDGET,
+            Self::MemberResolutionUnavailable => derivation_reason::MEMBER_RESOLUTION_UNAVAILABLE,
+            Self::AmbiguousMember => derivation_reason::AMBIGUOUS_MEMBER,
+            Self::DeferredBody => derivation_reason::DEFERRED_BODY,
+            Self::UnprovenActivation => derivation_reason::UNPROVEN_ACTIVATION,
         }
     }
 }
@@ -132,16 +155,20 @@ pub struct BranchRelationRow {
 #[derive(Clone, Copy)]
 struct Arm<'tree> {
     condition: Option<Node<'tree>>,
+    initializer: Option<Node<'tree>>,
     body: Node<'tree>,
 }
 
 /// Exact reference targets supplied by the existing definition resolver.
-/// Java uses member identity; Rust only distinguishes unequal item targets.
+/// Existing Java member rules retain equality; new nonlocal proofs only
+/// distinguish unequal targets and grant no condition stability.
 /// A missing entry is never a negative lookup: it leaves this comparison open.
 #[derive(Default)]
 pub struct BranchReferenceProofs {
     pub sites: HashMap<(usize, usize), Result<CodeUnit, BranchOpenReason>>,
     pub collection_gap: Option<BranchOpenReason>,
+    /// Physical storage declarations, admitted separately from presentation identity.
+    pub storage_fields: HashMap<(usize, usize), BranchStorageField>,
 }
 
 impl BranchReferenceProofs {
@@ -167,9 +194,61 @@ pub struct BranchReferenceSite {
     pub kind: BranchReferenceKind,
 }
 
-/// Collect bounded reference sites in branch arms from one exact snapshot.
-/// Java keeps its selector rules. Rust uses existing occurrence roles for bare
-/// value reads and leaves item scope, activation and aliases to the resolver.
+/// Grammar facts for field reads on the current object, including its base view.
+/// These do not describe method dispatch or property evaluation.
+pub struct BranchCurrentObjectFields {
+    pub access_kind: &'static str,
+    pub receiver_field: &'static str,
+    pub member_field: &'static str,
+    pub current_kind: &'static str,
+    pub parent_kind: &'static str,
+    pub invocation_kind: &'static str,
+    pub invocation_target_field: &'static str,
+    /// Immediate ancestors of a storage field's declaration name, innermost first.
+    pub storage_ancestors: &'static [&'static str],
+}
+
+impl BranchCurrentObjectFields {
+    pub fn member<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        if node.kind() != self.access_kind
+            || node.parent().is_some_and(|parent| {
+                parent.kind() == self.invocation_kind
+                    && parent.child_by_field_name(self.invocation_target_field) == Some(node)
+            })
+        {
+            return None;
+        }
+        let receiver = node.child_by_field_name(self.receiver_field)?;
+        if receiver.kind() != self.current_kind && receiver.kind() != self.parent_kind {
+            return None;
+        }
+        node.child_by_field_name(self.member_field)
+    }
+
+    pub fn is_storage_declaration(&self, name: Node<'_>) -> bool {
+        let mut ancestor = name;
+        for kind in self.storage_ancestors {
+            let Some(parent) = ancestor.parent() else {
+                return false;
+            };
+            if parent.kind() != *kind {
+                return false;
+            }
+            ancestor = parent;
+        }
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchStorageField {
+    pub file: ProjectFile,
+    /// Exact declaration-name span distinguishes fields in one declaration list.
+    pub range: Range,
+}
+
+/// Collect bounded reference sites from one exact snapshot. Language hooks
+/// select grammar fields; shared code owns traversal and lexical admission.
 pub fn reference_sites(
     syntax: &PreparedSyntaxTree,
     language: Language,
@@ -178,91 +257,99 @@ pub fn reference_sites(
 ) -> Result<Vec<BranchReferenceSite>, BranchOpenReason> {
     const MAX_TREE_NODES: usize = 131_072;
     const MAX_REFERENCE_SITES: usize = 256;
-    // The candidate inventory is request-local and independently bounded. Its
-    // ranges come from occurrence facts, never from identifier spellings.
-    let mut value_references = Vec::new();
-    if language == Language::Rust {
-        debug_assert_eq!(facts.source(), syntax.source());
-        if facts.nodes().len() > MAX_TREE_NODES {
-            return Err(BranchOpenReason::ComparisonBudget);
-        }
-        for (index, node) in facts.nodes().iter().enumerate() {
-            let index = u32::try_from(index).expect("bounded facts count fits u32");
-            if facts
-                .occurrence_roles(index)
-                .contains(&OccurrenceRole::ValueReference)
-            {
-                value_references.push((node.range.start_byte, node.range.end_byte));
-            }
-        }
-        value_references.sort_unstable();
-        value_references.dedup();
+    let Some(support) = language_support_for_hook(language, "branch_reference_site") else {
+        return Ok(Vec::new());
+    };
+    debug_assert_eq!(facts.source(), syntax.source());
+    if facts.nodes().len() > MAX_TREE_NODES {
+        return Err(BranchOpenReason::ComparisonBudget);
     }
-    let mut stack = vec![(syntax.tree().root_node(), false)];
+    let value_roles_supported = support
+        .knowledge()
+        .structural_spec()
+        .occurrence_role_support()
+        .is_supported(OccurrenceRole::ValueReference);
+    let mut value_references = Vec::new();
+    let mut non_values = Vec::new();
+    for (index, node) in facts.nodes().iter().enumerate() {
+        let index = u32::try_from(index).expect("bounded facts count fits u32");
+        let roles = facts.occurrence_roles(index);
+        if roles.contains(&OccurrenceRole::ValueReference)
+            || roles.contains(&OccurrenceRole::ReceiverPosition)
+        {
+            value_references.push((node.range.start_byte, node.range.end_byte));
+        } else if !roles.is_empty() {
+            non_values.push((node.range.start_byte, node.range.end_byte));
+        }
+    }
+    non_values.sort_unstable();
+    non_values.dedup();
+    value_references.sort_unstable();
+    value_references.dedup();
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Region {
+        Outside,
+        Body,
+        Condition,
+    }
+    let mut stack = vec![(syntax.tree().root_node(), Region::Outside)];
     let mut sites = Vec::new();
     let mut visited = 0;
-    while let Some((node, in_arm)) = stack.pop() {
+    let mut role_budget = BranchWorkBudget::new();
+    while let Some((node, region)) = stack.pop() {
         visited += 1;
         if visited > MAX_TREE_NODES || node.child_count() > MAX_TREE_NODES {
             return Err(BranchOpenReason::ComparisonBudget);
         }
-        if in_arm && is_nested_callable(node, language) {
+        if region != Region::Outside && is_nested_callable(node, language) {
             continue;
         }
-        let site = if in_arm
-            && language == Language::Java
-            && matches!(node.kind(), "field_access" | "method_invocation")
-        {
-            let (field, kind) = if node.kind() == "field_access" {
-                ("field", BranchReferenceKind::Field)
-            } else {
-                ("name", BranchReferenceKind::Method)
-            };
-            let member = node
-                .child_by_field_name(field)
-                .ok_or(BranchOpenReason::MissingBranchField)?;
+        let site = match region {
+            Region::Body => support.branch_body_reference_site(node, syntax.source()),
+            Region::Condition => support.branch_condition_reference_site(node, syntax.source()),
+            Region::Outside => None,
+        }
+        .or_else(|| {
+            if region == Region::Outside {
+                return None;
+            }
+            let member = support.branch_current_object_fields()?.member(node)?;
             Some(BranchReferenceSite {
                 range: (member.start_byte(), member.end_byte()),
-                kind,
+                kind: BranchReferenceKind::Field,
             })
-        } else if in_arm
-            && language == Language::Rust
-            && node.kind() == "identifier"
-            && !node.parent().is_some_and(|parent| {
-                matches!(
-                    parent.kind(),
-                    "scoped_identifier" | "scoped_type_identifier"
-                )
-            })
-            && value_references
-                .binary_search(&(node.start_byte(), node.end_byte()))
-                .is_ok()
-        {
-            let name = &syntax.source()[node.byte_range()];
-            if matches!(
-                binding_of(env, name, node.start_byte(), Some(Namespace::Value)),
-                BindingOfOutcome::NoBinding
-            ) {
-                Some(BranchReferenceSite {
-                    range: (node.start_byte(), node.end_byte()),
-                    kind: BranchReferenceKind::Field,
-                })
-            } else {
-                // Known lexical bindings keep their existing comparison rules;
-                // incomplete environments must not acquire an item proof.
-                None
-            }
-        } else {
-            None
-        };
+        });
         if let Some(site) = site {
-            sites.push(site);
-            if sites.len() > MAX_REFERENCE_SITES {
-                return Err(BranchOpenReason::ComparisonBudget);
+            // Bare reads require occurrence evidence and a complete lexical
+            // negative. Selectors use the resolver's own grammar focus.
+            let bare = site.range == (node.start_byte(), node.end_byte());
+            let is_value = if value_roles_supported {
+                value_references.binary_search(&site.range).is_ok()
+            } else if bare && non_values.binary_search(&site.range).is_err() {
+                // Some adapters publish only binder/member roles. Reuse the
+                // comparator's structured AST role interpretation; do not
+                // change persisted occurrence production to select these reads.
+                identifier_role(node, &mut role_budget)? == IdentifierRole::Value
+            } else {
+                false
+            };
+            let unbound = matches!(
+                binding_of(
+                    env,
+                    &syntax.source()[site.range.0..site.range.1],
+                    site.range.0,
+                    Some(Namespace::Value)
+                ),
+                BindingOfOutcome::NoBinding
+            );
+            if (!bare || is_value) && (!is_value || unbound) {
+                sites.push(site);
+                if sites.len() > MAX_REFERENCE_SITES {
+                    return Err(BranchOpenReason::ComparisonBudget);
+                }
             }
         }
-        // Bound pending work before allocating the child vector or growing
-        // the stack; nested wide nodes can otherwise exceed the tree budget.
         if stack
             .len()
             .checked_add(node.child_count())
@@ -271,16 +358,16 @@ pub fn reference_sites(
             return Err(BranchOpenReason::ComparisonBudget);
         }
         stack.extend(non_extra_children(node).into_iter().map(|(field, child)| {
-            let in_child_arm = if language == Language::Rust && node.kind() == "if_expression" {
-                // A nested condition is not an arm reference, even when its
-                // entire conditional occurs inside another branch body.
-                matches!(field, Some("consequence" | "alternative"))
+            let region = if matches!(node.kind(), "if_statement" | "if_expression") {
+                match field {
+                    Some("condition") => Region::Condition,
+                    Some("consequence" | "alternative") => Region::Body,
+                    _ => region,
+                }
             } else {
-                in_arm
-                    || (node.kind() == "if_statement"
-                        && matches!(field, Some("consequence" | "alternative")))
+                region
             };
-            (child, in_child_arm)
+            (child, region)
         }));
     }
     sites.sort_unstable();
@@ -383,6 +470,7 @@ pub fn relations_for_if(
     range: Range,
     env: &EnvironmentFileResult,
     members: &BranchReferenceProofs,
+    regions: &ConditionalRegions,
 ) -> Vec<BranchRelationRow> {
     let if_kinds: &[&str] = match language {
         Language::Java
@@ -411,8 +499,9 @@ pub fn relations_for_if(
     if language == Language::Php && php_unsupported_lexical_ancestor(node) {
         return open_rows(range, BranchOpenReason::NonLocalReference);
     }
-    // Other conditionals share the `If` fact (a C# `switch`, a Kotlin
-    // `when`). Only a Kotlin `when` shaped like an A6 Boolean result gets a
+    // Other conditionals share the `If` fact (a C# ternary, a Kotlin
+    // `when`). Statement-arm relations do not admit ternary expressions.
+    // Only a Kotlin `when` shaped like an A6 Boolean result gets a
     // scoped open row; ordinary `when` expressions are outside this policy.
     if !if_kinds.contains(&node.kind()) {
         if language == Language::Kotlin
@@ -434,13 +523,21 @@ pub fn relations_for_if(
     }
     let mut rows = Vec::new();
     rows.extend(redundant_boolean_row(syntax, language, node, env));
-    if let Some(empty_arm) = empty_if_arm_relation(node, language) {
+    if let Some(empty_arm) = empty_if_arm_relation(node, language, regions) {
         let consequence = node_range(empty_arm.consequence);
         let alternative = empty_arm.alternative.map(node_range).unwrap_or(consequence);
         let has_alternative = empty_arm.alternative.is_some();
         rows.push(BranchRelationRow {
             kind: BranchRelationKind::EmptyArm,
-            verdict: BranchRelationVerdict::Proven,
+            verdict: match empty_arm.state {
+                BodyStateAnswer::Decided(state) => {
+                    assert_eq!(state, BodyState::Empty);
+                    BranchRelationVerdict::Proven
+                }
+                BodyStateAnswer::Undecided => {
+                    BranchRelationVerdict::Open(BranchOpenReason::UnprovenActivation)
+                }
+            },
             owner: node_range(empty_arm.owner),
             earlier: consequence,
             later: alternative,
@@ -485,17 +582,6 @@ pub fn relations_for_if(
     };
     let mut stability = vec![None; arms.len()];
     let condition_count = arms.iter().filter(|arm| arm.condition.is_some()).count();
-    // Item distinctions apply to arm operations, never to condition stability.
-    // Java keeps the same member proofs for both existing comparison paths.
-    let empty_proofs = BranchReferenceProofs::default();
-    let condition_chain = Chain {
-        members: if language == Language::Rust {
-            &empty_proofs
-        } else {
-            members
-        },
-        ..chain
-    };
     for later_ordinal in 1..arms.len() {
         let later = arms[later_ordinal];
         for earlier_ordinal in 0..later_ordinal {
@@ -534,12 +620,16 @@ pub fn relations_for_if(
             else {
                 continue;
             };
-            let verdict = compare_trees(
-                earlier_condition,
-                later_condition,
-                &condition_chain,
-                &mut budget,
-            );
+            // An initializer on a later arm executes between the tests. It
+            // affects their stability, never the independent body comparison.
+            let verdict = if arms[earlier_ordinal + 1..=later_ordinal]
+                .iter()
+                .any(|arm| arm.initializer.is_some())
+            {
+                BranchRelationVerdict::Open(BranchOpenReason::EffectfulCondition)
+            } else {
+                compare_trees(earlier_condition, later_condition, &chain, &mut budget)
+            };
             let verdict = if verdict == BranchRelationVerdict::Proven {
                 let mut verdict = BranchRelationVerdict::Proven;
                 for index in earlier_ordinal..=later_ordinal {
@@ -829,6 +919,7 @@ fn collect_arms<'tree>(
         }
         budget.arm()?;
         arms.push(Arm {
+            initializer: current.child_by_field_name("initializer"),
             condition: Some(
                 current
                     .child_by_field_name("condition")
@@ -844,6 +935,7 @@ fn collect_arms<'tree>(
                 budget.arm()?;
                 match alternative.kind() {
                     "elif_clause" => arms.push(Arm {
+                        initializer: None,
                         condition: Some(
                             alternative
                                 .child_by_field_name("condition")
@@ -854,6 +946,7 @@ fn collect_arms<'tree>(
                             .ok_or(BranchOpenReason::MissingBranchField)?,
                     }),
                     "else_clause" => arms.push(Arm {
+                        initializer: None,
                         condition: None,
                         body: alternative
                             .child_by_field_name("body")
@@ -876,6 +969,7 @@ fn collect_arms<'tree>(
                     "else_if_clause" => {
                         budget.arm()?;
                         arms.push(Arm {
+                            initializer: None,
                             condition: Some(
                                 alternative
                                     .child_by_field_name("condition")
@@ -889,6 +983,7 @@ fn collect_arms<'tree>(
                     "else_clause" => {
                         budget.arm()?;
                         arms.push(Arm {
+                            initializer: None,
                             condition: None,
                             body,
                         });
@@ -921,16 +1016,12 @@ fn collect_arms<'tree>(
             alternative.kind(),
             "if_statement" | "if_expression" | "elsif"
         ) {
-            // A Go `else if` initializer runs between two conditions of the
-            // chain.
-            if alternative.child_by_field_name("initializer").is_some() {
-                return Err(BranchOpenReason::EffectfulCondition);
-            }
             current = alternative;
             continue;
         }
         budget.arm()?;
         arms.push(Arm {
+            initializer: None,
             condition: None,
             body: alternative,
         });
@@ -1021,6 +1112,8 @@ fn compare_trees(
         members,
         condition_binders,
     } = *chain;
+    let current_object_fields = language_support_for_hook(language, "branch_current_object_fields")
+        .and_then(|support| support.branch_current_object_fields());
     // The flag records whether the pair lies inside a nested callable.
     let mut stack = vec![(earlier, later, false)];
     let mut renamed = HashMap::<usize, usize>::new();
@@ -1070,6 +1163,24 @@ fn compare_trees(
                     .rev()
                     .map(|(left, right)| (left, right, nested)),
             );
+            continue;
+        }
+        if !nested
+            && let Some(spec) = current_object_fields.as_ref()
+            && let (Some(left_member), Some(right_member)) = (spec.member(left), spec.member(right))
+            && let (Some(left_declaration), Some(right_declaration)) = (
+                members
+                    .storage_fields
+                    .get(&(left_member.start_byte(), left_member.end_byte())),
+                members
+                    .storage_fields
+                    .get(&(right_member.start_byte(), right_member.end_byte())),
+            )
+            && left_declaration == right_declaration
+        {
+            // Both receivers denote this object, and both strict targets name
+            // the same physical storage slot. Presentation identity alone does
+            // not justify this equality; properties and methods never enter it.
             continue;
         }
         if left.kind() != right.kind() {
@@ -1386,20 +1497,19 @@ fn compare_trees(
                 continue;
             }
             (BindingOfOutcome::NoBinding, BindingOfOutcome::NoBinding)
-                if language == Language::Rust
-                    && (members.collection_gap.is_some()
-                        || members
-                            .sites
-                            .contains_key(&(left.start_byte(), left.end_byte()))
-                        || members
-                            .sites
-                            .contains_key(&(right.start_byte(), right.end_byte()))) =>
+                if members.collection_gap.is_some()
+                    || members
+                        .sites
+                        .contains_key(&(left.start_byte(), left.end_byte()))
+                    || members
+                        .sites
+                        .contains_key(&(right.start_byte(), right.end_byte())) =>
             {
                 // Exact resolver targets may distinguish nonlocal operations,
                 // even when constants have equal values. Equal presentation
                 // CodeUnits can hide different canonical declarations, so they
-                // never establish a new equality proof. Collection excludes
-                // conditions; item identity grants no stability privilege.
+                // never establish a new equality proof. Distinction grants
+                // no stability privilege, including in conditions.
                 return match (members.target_at(left), members.target_at(right)) {
                     (Ok(a), Ok(b)) if a != b => BranchRelationVerdict::Distinct,
                     (Ok(_), Ok(_)) => {
@@ -1665,7 +1775,7 @@ fn position_dependent(node: Node<'_>, language: Language, source: &str) -> bool 
                     .get(node.byte_range())
                     .is_some_and(|name| name.eq_ignore_ascii_case("__LINE__"));
         }
-        // The Ruby grammar spells `__LINE__` as an identifier.
+        // Ruby uses an identifier in expressions and a `line` token in patterns.
         Language::Ruby => {
             return node.kind() == "line"
                 || (node.kind() == "identifier"
@@ -2163,7 +2273,7 @@ fn condition_stability(
     java_primitive_condition_stability(condition, syntax, env, budget)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalaConditionScalarType {
     Integer,
     Boolean,
@@ -2512,9 +2622,10 @@ fn scala_declared_condition_type(
     if scala_has_deferred_shape(declaration, budget)? {
         return Ok(None);
     }
-    if let Some(type_node) = typed
-        && let Some(scalar_type) = scala_condition_type_name(type_node, source, budget)?
-    {
+    if let Some(type_node) = typed {
+        let Some(scalar_type) = scala_condition_type_name(type_node, source, budget)? else {
+            return Ok(None);
+        };
         // A qualified scala type does not depend on an unqualified shadow
         // proof. An incomplete proof must not fall through to an initializer.
         let shadowed = if type_node.kind() == "type_identifier" {
@@ -2530,9 +2641,7 @@ fn scala_declared_condition_type(
         } else {
             false
         };
-        if !shadowed {
-            return Ok(Some(scalar_type));
-        }
+        return Ok((!shadowed).then_some(scalar_type));
     }
     if declaration.kind() != "parameter"
         && let Some(value) = declaration.child_by_field_name("value")
@@ -3422,4 +3531,716 @@ fn java_stable_binding(
 pub mod js_ts_tests_support;
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tree_sitter::{Parser, Tree};
+
+    fn parse(source: &str, language: Language, path: &str) -> Tree {
+        let grammar = crate::analyzer::parser_language_for_path(language, Path::new(path))
+            .expect("registered grammar");
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        tree
+    }
+
+    fn environment(source: &str, root: Node<'_>, names: &[Node<'_>]) -> EnvironmentFileResult {
+        use super::super::lexical_environment::{
+            BindingRow, EnvironmentCompleteness, PackageClauseRow, ScopeAnchor, ScopeRow,
+        };
+        use super::super::resolution::{DeclaredVisibility, HoistingClass};
+        let file = crate::analyzer::ProjectFile::new(std::env::temp_dir(), "case.scala");
+        let identity = crate::analyzer::semantic::ContentIdentity::hash_bytes(source.as_bytes());
+        let range = node_range(root);
+        EnvironmentFileResult::new(
+            vec![ScopeRow {
+                file: file.clone(),
+                content_identity: identity,
+                index: 0,
+                anchor: ScopeAnchor::File,
+                range,
+                parent_scope: None,
+            }],
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| BindingRow {
+                    file: file.clone(),
+                    content_identity: identity,
+                    node: None,
+                    range: node_range(*name),
+                    name: source[name.byte_range()].to_owned(),
+                    kind: BindingKind::Local,
+                    hoisting: HoistingClass::ScopeWide,
+                    declaring_scope: 0,
+                    activation: range,
+                    source_order: index as u32,
+                    visibility: DeclaredVisibility::Unknown,
+                    import: None,
+                })
+                .collect(),
+            PackageClauseRow {
+                file,
+                package_fq: None,
+                syntactic: false,
+            },
+            EnvironmentCompleteness::Complete,
+        )
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: explicit Scala custom types must not infer primitive stability from converted initializer literals"
+    )]
+    fn scala_converted_initializers_do_not_prove_custom_operators_stable() {
+        let source = "object O { class Meter { var n = 0; def <(rhs: scala.Int): Boolean = { n += 1; n == rhs } }; implicit def wrap(i: scala.Int): Meter = new Meter; def f(): Unit = { val x: Meter = 1; if (x < 2) () else if (x < 2) () } }";
+        let tree = parse(source, Language::Scala, "case.scala");
+        let declarations = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+            tree.root_node(),
+            "val_definition",
+        );
+        let declaration = declarations[0];
+        let name = declaration.child_by_field_name("pattern").unwrap();
+        assert_eq!(
+            declaration.child_by_field_name("type").unwrap().kind(),
+            "type_identifier"
+        );
+        assert_eq!(
+            declaration.child_by_field_name("value").unwrap().kind(),
+            "integer_literal"
+        );
+        let env = environment(source, tree.root_node(), &[name]);
+        assert_eq!(
+            scala_declared_condition_type(&env, 0, name, source, &mut BranchWorkBudget::new())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: shadowed Scala primitive annotations fell back to initializer inference"
+    )]
+    fn scalar_declarations_follow_grammar_types_and_lexical_shadowing() {
+        for (source, expected) in [
+            ("val x = 1", Some(ScalaConditionScalarType::Integer)),
+            ("val x: Int = 1", Some(ScalaConditionScalarType::Integer)),
+            (
+                "val x: scala.Int = 1",
+                Some(ScalaConditionScalarType::Integer),
+            ),
+            (
+                "val x: Boolean = true",
+                Some(ScalaConditionScalarType::Boolean),
+            ),
+            (
+                "val x: scala.Boolean = true",
+                Some(ScalaConditionScalarType::Boolean),
+            ),
+            ("class Int; val x: Int = 1", None),
+            (
+                "class Int; val x: scala.Int = 1",
+                Some(ScalaConditionScalarType::Integer),
+            ),
+            (
+                "class Long; val x: Int = 1",
+                Some(ScalaConditionScalarType::Integer),
+            ),
+        ] {
+            let tree = parse(source, Language::Scala, "case.scala");
+            let declaration =
+                brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                    tree.root_node(),
+                    "val_definition",
+                )[0];
+            let name = declaration.child_by_field_name("pattern").unwrap();
+            assert_eq!(name.kind(), "identifier");
+            let env = environment(source, tree.root_node(), &[name]);
+            assert_eq!(
+                scala_declared_condition_type(&env, 0, name, source, &mut BranchWorkBudget::new())
+                    .unwrap(),
+                expected,
+                "{source}"
+            );
+        }
+        for (source, declaration_kind, expected) in [
+            ("fn f(x: bool) {}", "parameter", true),
+            ("fn f(x: i32) {}", "parameter", false),
+            ("fn f() { let x = true; }", "let_declaration", true),
+        ] {
+            let tree = parse(source, Language::Rust, "case.rs");
+            let declarations =
+                brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
+                    tree.root_node(),
+                    declaration_kind,
+                );
+            let name = declarations[0].child_by_field_name("pattern").unwrap();
+            assert_eq!(name.kind(), "identifier");
+            let env = environment(source, tree.root_node(), &[name]);
+            assert_eq!(
+                rust_declared_boolean(&env, 0, name, source),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_literals_and_parentheses_respect_grammar_and_work_limits() {
+        for (value, expected) in [
+            ("true", Some(ScalaConditionScalarType::Boolean)),
+            ("false", Some(ScalaConditionScalarType::Boolean)),
+            (
+                "9223372036854775807L",
+                Some(ScalaConditionScalarType::Integer),
+            ),
+            ("9223372036854775808L", None),
+        ] {
+            let source = format!("val x = {value}");
+            let tree = parse(&source, Language::Scala, "case.scala");
+            let declaration = tree.root_node().named_child(0).unwrap();
+            let node = declaration.child_by_field_name("value").unwrap();
+            assert!(matches!(node.kind(), "boolean_literal" | "integer_literal"));
+            assert_eq!(&source[node.byte_range()], value);
+            assert_eq!(
+                scala_condition_literal_type(node, &source, &mut BranchWorkBudget::new()).unwrap(),
+                expected,
+                "{value}"
+            );
+        }
+        for wrappers in [62, 63, 64] {
+            let source = format!(
+                "val x = {}true{}",
+                "(".repeat(wrappers),
+                ")".repeat(wrappers)
+            );
+            let tree = parse(&source, Language::Scala, "case.scala");
+            let node = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("value")
+                .unwrap();
+            let mut leaf = node;
+            let mut depth = 0;
+            while leaf.kind() == "parenthesized_expression" {
+                assert_eq!(leaf.named_child_count(), 1);
+                depth += 1;
+                leaf = leaf.named_child(0).unwrap();
+            }
+            assert_eq!(depth, wrappers);
+            assert_eq!(leaf.kind(), "boolean_literal");
+            let env = environment(&source, tree.root_node(), &[]);
+            let result =
+                scala_condition_operand_type(node, &source, &env, &mut BranchWorkBudget::new());
+            assert_eq!(
+                result,
+                if wrappers < 64 {
+                    Ok(ScalaConditionScalarType::Boolean)
+                } else {
+                    Err(BranchOpenReason::ComparisonBudget)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn branch_arm_and_tree_work_limits_are_inclusive() {
+        for count in [3, MAX_CHAIN_COMPARISONS + 1] {
+            let source = format!(
+                "if True:\n pass\n{}",
+                "elif False:\n pass\n".repeat(count - 1)
+            );
+            let tree = parse(&source, Language::Python, "case.py");
+            let node = tree.root_node().named_child(0).unwrap();
+            let mut cursor = node.walk();
+            let expected = std::iter::once(node.child_by_field_name("consequence").unwrap())
+                .chain(
+                    node.children_by_field_name("alternative", &mut cursor)
+                        .map(|arm| arm.child_by_field_name("consequence").unwrap()),
+                )
+                .map(|body| body.byte_range())
+                .collect::<Vec<_>>();
+            assert_eq!(expected.len(), count);
+            for limit in [count - 1, count, count + 1] {
+                let mut budget = BranchWorkBudget {
+                    ledger: BudgetLedger::with_zero_usage(BranchWork {
+                        arms: limit,
+                        ..BranchWork::default_limits()
+                    }),
+                    exhausted: false,
+                };
+                match collect_arms(node, Language::Python, &mut budget) {
+                    Ok(arms) => {
+                        assert!(limit >= count);
+                        assert_eq!(
+                            arms.into_iter()
+                                .map(|arm| arm.body.byte_range())
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                    }
+                    Err(reason) => {
+                        assert!(limit < count);
+                        assert_eq!(reason, BranchOpenReason::ComparisonBudget);
+                    }
+                }
+            }
+        }
+        let source = "x\n".repeat(MAX_COMPARISON_TREE_NODES);
+        let tree = parse(&source, Language::Python, "case.py");
+        let mut cursor = tree.walk();
+        let mut leaves = Vec::new();
+        loop {
+            if cursor.node().kind() == "identifier" {
+                leaves.push(cursor.node());
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break;
+                }
+            }
+            if cursor.node().id() == tree.root_node().id() {
+                break;
+            }
+        }
+        assert_eq!(leaves.len(), MAX_COMPARISON_TREE_NODES);
+        for inspected in [4095, 4096, 4097] {
+            let mut budget = BranchWorkBudget::new();
+            let mut visited = 0;
+            for node in leaves.iter().cycle().take(inspected) {
+                let result = budget.visit(*node, &mut visited, 0);
+                assert_eq!(
+                    result,
+                    if visited <= MAX_COMPARISON_TREE_NODES {
+                        Ok(())
+                    } else {
+                        Err(BranchOpenReason::ComparisonBudget)
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_alternatives_own_only_their_else_if_chain() {
+        use brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind;
+        for (language, path, source, kind) in [
+            (
+                Language::Java,
+                "Case.java",
+                "class C { void f(boolean a, boolean b) { if (a) {} else if (b) {} } }",
+                "if_statement",
+            ),
+            (
+                Language::Rust,
+                "case.rs",
+                "fn f(a: bool, b: bool) { if a {} else if b {} }",
+                "if_expression",
+            ),
+            (
+                Language::Kotlin,
+                "case.kt",
+                "fun f(a: Boolean, b: Boolean) { if (a) {} else if (b) {} }",
+                "if_expression",
+            ),
+        ] {
+            let tree = parse(source, language, path);
+            let nodes = collect_nodes_by_kind(tree.root_node(), kind);
+            assert_eq!(nodes.len(), 2);
+            assert!(!is_chain_child(nodes[0]));
+            assert!(is_chain_child(nodes[1]), "{source}");
+            let arms = collect_arms(nodes[0], language, &mut BranchWorkBudget::new()).unwrap();
+            assert_eq!(arms.len(), 2, "{source}");
+            assert!(arms.iter().all(|arm| arm.condition.is_some()));
+            if language == Language::Kotlin {
+                let alternative = nodes[0].child_by_field_name("alternative").unwrap();
+                assert_eq!(alternative.kind(), "control_structure_body");
+                assert_eq!(alternative.named_child_count(), 1);
+                assert_eq!(kotlin_else_if(alternative), Some(nodes[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn ruby_position_values_and_method_boundaries_follow_the_grammar() {
+        use brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind;
+        let source = "if flag\n def f\n __LINE__\n end\nelse\n def g\n __LINE__\n end\nend\ncase x\nin __LINE__\n true\nend\ncase y\nin __LINE__\n false\nend";
+        let tree = parse(source, Language::Ruby, "case.rb");
+        // Pattern literals and ordinary expression identifiers have distinct
+        // grammar shapes even though both evaluate to the source line.
+        let mut stack = vec![tree.root_node()];
+        let mut lines = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "line" {
+                lines.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+        assert_eq!(lines.len(), 2, "{}", tree.root_node().to_sexp());
+        for line in lines {
+            assert_eq!(&source[line.byte_range()], "__LINE__");
+            assert!(position_dependent(line, Language::Ruby, source));
+        }
+        let methods = collect_nodes_by_kind(tree.root_node(), "method");
+        assert_eq!(methods.len(), 2);
+        for method in methods {
+            assert!(method.child_by_field_name("name").is_some());
+            assert!(is_nested_callable(method, Language::Ruby));
+        }
+    }
+
+    fn prepared(source: &str, tree: Tree, language: Language, path: &str) -> PreparedSyntaxTree {
+        use brokk_bifrost_core::analyzer::prepared_syntax::{
+            PreparedSourceOrigin, PreparedSyntaxSource,
+        };
+        PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(source.into()),
+            tree,
+            crate::text_utils::compute_line_starts(source),
+            crate::analyzer::LanguageDialect::for_path(language, Path::new(path)),
+            PreparedSourceOrigin::Disk,
+            None,
+        )
+    }
+
+    #[test]
+    fn primitive_condition_operators_match_their_literal_domains() {
+        use brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind;
+        for condition in [
+            "true",
+            "!false",
+            "1 < 2",
+            "true == false",
+            "1 == 2",
+            "true || false",
+            "!(true || false)",
+        ] {
+            let source = format!("if ({condition}) () else ()");
+            let tree = parse(&source, Language::Scala, "case.scala");
+            let node = collect_nodes_by_kind(tree.root_node(), "if_expression")[0]
+                .child_by_field_name("condition")
+                .unwrap();
+            let env = environment(&source, tree.root_node(), &[]);
+            assert_eq!(
+                scala_condition_stability(node, &source, &env, &mut BranchWorkBudget::new()),
+                BranchRelationVerdict::Proven,
+                "{condition}"
+            );
+        }
+        for condition in ["!true", "!(true || false)"] {
+            let source = format!("class C {{ void f() {{ if ({condition}) {{}} }} }}");
+            let tree = parse(&source, Language::Java, "Case.java");
+            let env = environment(&source, tree.root_node(), &[]);
+            let syntax = prepared(&source, tree, Language::Java, "Case.java");
+            let node = collect_nodes_by_kind(syntax.tree().root_node(), "if_statement")[0]
+                .child_by_field_name("condition")
+                .unwrap();
+            assert_eq!(
+                java_primitive_condition_stability(
+                    node,
+                    &syntax,
+                    &env,
+                    &mut BranchWorkBudget::new()
+                ),
+                BranchRelationVerdict::Proven
+            );
+        }
+        for condition in ["true", "!false", "(true)"] {
+            let source = format!("fn f() {{ if {condition} {{}} }}");
+            let tree = parse(&source, Language::Rust, "case.rs");
+            let node = collect_nodes_by_kind(tree.root_node(), "if_expression")[0]
+                .child_by_field_name("condition")
+                .unwrap();
+            let env = environment(&source, tree.root_node(), &[]);
+            assert_eq!(
+                rust_boolean_expression_bounded(node, &env, &source, &mut BranchWorkBudget::new()),
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn scala_callable_grammar_separates_eager_and_deferred_parameters() {
+        use brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind;
+        for (source, kind, exact) in [
+            ("val f = (x: Int) => x", "lambda_expression", true),
+            ("def f(x: Int): Int = x", "function_definition", true),
+            ("def f(x: => Int): Int = x", "function_definition", false),
+        ] {
+            let tree = parse(source, Language::Scala, "case.scala");
+            let nodes = collect_nodes_by_kind(tree.root_node(), kind);
+            assert_eq!(nodes.len(), 1);
+            let env = environment(source, tree.root_node(), &[]);
+            assert_eq!(
+                scala_nested_callable_is_exact(
+                    nodes[0],
+                    nodes[0],
+                    &env,
+                    &mut BranchWorkBudget::new()
+                )
+                .unwrap(),
+                exact,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn ruby_branch_children_are_complete_or_budget_exceeded() {
+        let source = "if flag\n # comment\n caf\u{e9} = 1; ping()\n if other\n nested()\n end\nelse\n # spare\n caf\u{e9} = 2\nend";
+        let tree = parse(source, Language::Ruby, "case.rb");
+        let branch = tree.root_node().named_child(0).unwrap();
+        for (field, kind, grammar_children, expected_statements) in [
+            (
+                "consequence",
+                "then",
+                vec![
+                    ("assignment", true, false, 20..29),
+                    (";", false, false, 29..30),
+                    ("call", true, false, 31..37),
+                    ("if", true, false, 39..62),
+                ],
+                vec![(20, 29), (31, 37), (39, 62)],
+            ),
+            (
+                "alternative",
+                "else",
+                vec![
+                    ("else", false, false, 63..67),
+                    ("comment", true, true, 69..76),
+                    ("assignment", true, false, 78..87),
+                ],
+                vec![(78, 87)],
+            ),
+        ] {
+            let arm = branch.child_by_field_name(field).unwrap();
+            assert_eq!(arm.kind(), kind);
+            let mut cursor = arm.walk();
+            assert_eq!(
+                arm.children(&mut cursor)
+                    .map(|child| (
+                        child.kind(),
+                        child.is_named(),
+                        child.is_extra(),
+                        child.byte_range(),
+                    ))
+                    .collect::<Vec<_>>(),
+                grammar_children
+            );
+
+            let cost = grammar_children.len();
+            for steps in 0..=cost + 1 {
+                for pending in [
+                    0,
+                    MAX_COMPARISON_TREE_NODES - cost,
+                    MAX_COMPARISON_TREE_NODES - cost + 1,
+                ] {
+                    let mut budget = BranchWorkBudget {
+                        ledger: BudgetLedger::with_zero_usage(BranchWork {
+                            steps,
+                            ..BranchWork::default_limits()
+                        }),
+                        exhausted: false,
+                    };
+                    let answer = bounded_named_statements(arm, pending, &mut budget);
+                    if steps < cost || pending + cost > MAX_COMPARISON_TREE_NODES {
+                        assert_eq!(
+                            answer.unwrap_err(),
+                            BranchOpenReason::ComparisonBudget,
+                            "{kind}, steps={steps}, pending={pending}"
+                        );
+                    } else {
+                        assert_eq!(
+                            answer
+                                .unwrap()
+                                .iter()
+                                .map(|node| (node.start_byte(), node.end_byte()))
+                                .collect::<Vec<_>>(),
+                            expected_statements
+                        );
+                    }
+                }
+            }
+        }
+        // A wide arm must be refused before retaining a prefix, even with an
+        // otherwise ample ledger. This is independent of the frontier bound.
+        let wide_source = format!(
+            "if flag\n{}end",
+            "ping()\n".repeat(MAX_COMPARISON_TREE_NODES + 1)
+        );
+        let wide = parse(&wide_source, Language::Ruby, "wide.rb");
+        let arm = wide
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("consequence")
+            .unwrap();
+        assert_eq!(arm.child_count(), MAX_COMPARISON_TREE_NODES + 1);
+        assert_eq!(
+            bounded_named_statements(arm, 0, &mut BranchWorkBudget::new()).unwrap_err(),
+            BranchOpenReason::ComparisonBudget
+        );
+    }
+
+    #[test]
+    fn php_capture_and_class_ancestors_follow_grammar_boundaries() {
+        let source = "<?php\n$a = function() use (&$caf\u{e9}) { /* ref */ if ($x) { yes(); } };\n$b = function() use ($caf\u{e9}) { /* value */ if ($x) { yes(); } };\n$c = fn() => $x ? yes() : no();\n$d = new class { function run() { /* class */ if ($x) { yes(); } } };\n";
+        let tree = parse(source, Language::Php, "case.php");
+        use brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind;
+        let root = tree.root_node();
+        let closures = collect_nodes_by_kind(root, "anonymous_function");
+        assert_eq!(closures.len(), 2);
+        for (closure, capture_kind, capture_range, variable_range, clause_range) in [
+            (closures[0], "by_ref", 27..34, 28..34, 22..35),
+            (closures[1], "variable_name", 91..97, 91..97, 86..98),
+        ] {
+            assert_eq!(
+                closure.child_by_field_name("parameters").unwrap().kind(),
+                "formal_parameters"
+            );
+            assert_eq!(
+                closure.child_by_field_name("body").unwrap().kind(),
+                "compound_statement"
+            );
+            let mut cursor = closure.walk();
+            let clause = closure
+                .named_children(&mut cursor)
+                .find(|node| node.kind() == "anonymous_function_use_clause")
+                .unwrap();
+            assert_eq!(clause.byte_range(), clause_range);
+            assert_eq!(clause.named_child_count(), 1);
+            let capture = clause.named_child(0).unwrap();
+            assert_eq!(
+                (capture.kind(), capture.byte_range()),
+                (capture_kind, capture_range)
+            );
+            let variable = if capture_kind == "by_ref" {
+                assert_eq!(capture.child(0).unwrap().kind(), "&");
+                capture.named_child(0).unwrap()
+            } else {
+                capture
+            };
+            assert_eq!(
+                (variable.kind(), variable.byte_range()),
+                ("variable_name", variable_range)
+            );
+            assert_eq!(&source[variable.byte_range()], "$caf\u{e9}");
+        }
+        let mut conditionals = collect_nodes_by_kind(root, "if_statement");
+        conditionals.extend(collect_nodes_by_kind(root, "conditional_expression"));
+        conditionals.sort_by_key(Node::start_byte);
+        assert_eq!(conditionals.len(), 4);
+        for (node, (kind, ancestors, unsupported)) in conditionals.into_iter().zip([
+            (
+                "if_statement",
+                vec![
+                    "compound_statement",
+                    "anonymous_function",
+                    "assignment_expression",
+                    "expression_statement",
+                    "program",
+                ],
+                true,
+            ),
+            (
+                "if_statement",
+                vec![
+                    "compound_statement",
+                    "anonymous_function",
+                    "assignment_expression",
+                    "expression_statement",
+                    "program",
+                ],
+                false,
+            ),
+            (
+                "conditional_expression",
+                vec![
+                    "arrow_function",
+                    "assignment_expression",
+                    "expression_statement",
+                    "program",
+                ],
+                false,
+            ),
+            (
+                "if_statement",
+                vec![
+                    "compound_statement",
+                    "method_declaration",
+                    "declaration_list",
+                    "anonymous_class",
+                    "object_creation_expression",
+                    "assignment_expression",
+                    "expression_statement",
+                    "program",
+                ],
+                true,
+            ),
+        ]) {
+            assert_eq!(node.kind(), kind);
+            assert!(node.child_by_field_name("condition").is_some());
+            let mut actual = Vec::new();
+            let mut parent = node.parent();
+            while let Some(ancestor) = parent {
+                actual.push(ancestor.kind());
+                parent = ancestor.parent();
+            }
+            assert_eq!(actual, ancestors);
+            assert_eq!(php_unsupported_lexical_ancestor(node), unsupported);
+        }
+    }
+    #[test]
+    fn compared_tree_node_allowance_matches_grammar_walk() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Python]);
+        for expected in [4095, 4096, 4097] {
+            let elements = (expected - 4) / 2;
+            let source = format!(
+                "[{}{}]",
+                vec!["0"; elements].join(","),
+                if expected % 2 == 1 { "," } else { "" }
+            );
+            let tree = parse(&source, Language::Python, "case.py");
+            let root = tree.root_node();
+            let mut nodes = vec![root];
+            let mut count = 0;
+            while let Some(node) = nodes.pop() {
+                count += 1;
+                let mut cursor = node.walk();
+                nodes.extend(node.children(&mut cursor));
+            }
+            assert_eq!(count, expected);
+            let env = environment(&source, root, &[]);
+            let members = BranchReferenceProofs::default();
+            let chain = Chain {
+                language: Language::Python,
+                owner: node_range(root),
+                source: &source,
+                env: &env,
+                members: &members,
+                condition_binders: &[],
+            };
+            assert_eq!(
+                compare_trees(root, root, &chain, &mut BranchWorkBudget::new()),
+                if count <= MAX_COMPARISON_TREE_NODES {
+                    BranchRelationVerdict::Proven
+                } else {
+                    BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget)
+                },
+                "{count} grammar nodes"
+            );
+        }
+    }
+}

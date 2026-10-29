@@ -248,6 +248,7 @@ impl<P: DemandRootProvider> DemandRootProvider for Observed<'_, P> {
 }
 
 struct Environment<'a, 'store, 'input> {
+    family: &'static dyn nominal_rules::NominalPackageRules,
     operation: &'a SelectedResolutionOperation<'store, 'input>,
     base: &'a dyn BatchResolutionFragmentSource,
     initial: crate::analyzer::resolution::SelectedContextPathToken,
@@ -258,6 +259,15 @@ struct Environment<'a, 'store, 'input> {
 impl<'a, 'store, 'input> Environment<'a, 'store, 'input> {
     fn language(&self, arena: &'a RefCell<ClosedRelations>) -> JvmDemandState<'a, 'store, 'input> {
         JvmDemandState {
+            rules: nominal_rules::nominal_language_rules(
+                self.operation
+                    .mount_table()
+                    .mount_by_ordinal(self.caller)
+                    .expect("test caller is mounted")
+                    .semantic_language(),
+            )
+            .expect("test caller belongs to a nominal family"),
+            family: self.family,
             operation: self.operation,
             base: self.base,
             initial: self.initial,
@@ -342,6 +352,8 @@ pub fn run_provider_only(
     );
     let lexical = operation.ready.lexical_source();
     let environment = Environment {
+        family: nominal_rules::nominal_package_rules(language)
+            .expect("caller belongs to a nominal family"),
         operation,
         base: &lexical,
         initial: blueprint.context_token(),
@@ -462,6 +474,8 @@ pub fn run_source_sweep(
     let lexical = operation.ready.lexical_source();
     let typed = operation.ready.typed_source();
     let environment = Environment {
+        family: nominal_rules::nominal_package_rules(language)
+            .expect("caller belongs to a nominal family"),
         operation,
         base: &lexical,
         initial: blueprint.context_token(),
@@ -591,6 +605,8 @@ pub fn run_terminal_descent(
     let lexical = operation.ready.lexical_source();
     let typed = operation.ready.typed_source();
     let environment = Environment {
+        family: nominal_rules::nominal_package_rules(Language::Scala)
+            .expect("caller belongs to a nominal family"),
         operation,
         base: &lexical,
         initial: blueprint.context_token(),
@@ -709,6 +725,8 @@ pub fn run(
     let lexical = operation.ready.lexical_source();
     let typed = operation.ready.typed_source();
     let environment = Environment {
+        family: nominal_rules::nominal_package_rules(Language::Scala)
+            .expect("caller belongs to a nominal family"),
         operation,
         base: &lexical,
         initial: blueprint.context_token(),
@@ -875,6 +893,8 @@ pub fn run_discovered(
     );
     let lexical = operation.ready.lexical_source();
     let environment = Environment {
+        family: nominal_rules::nominal_package_rules(language)
+            .expect("caller belongs to a nominal family"),
         operation,
         base: &lexical,
         initial: blueprint.context_token(),
@@ -1296,6 +1316,8 @@ fn order_attempt(
     let typed = operation.ready.typed_source();
     let arena = RefCell::new(ClosedRelations::default());
     let environment = Environment {
+        family: nominal_rules::nominal_package_rules(Language::Scala)
+            .expect("caller belongs to a nominal family"),
         operation,
         base: &lexical,
         initial: blueprint.context_token(),

@@ -200,7 +200,7 @@ pub fn prepare_lexical_fragment(
             owner_key,
             owner_shared,
             semantic
-                .callable_receiver_origin()
+                .receiver_origin()
                 .map(resolution_rows::receiver_origin_code),
             metadata
                 .and_then(|row| row.go_spelling_namespace())

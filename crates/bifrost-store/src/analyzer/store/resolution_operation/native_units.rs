@@ -1,9 +1,12 @@
 //! Public declaration identities for selected native definition semantics.
 //! Package anchors come from the selected revision, never live path discovery.
 
+use super::imports::SelectedImportRouteKind;
 use super::*;
 use crate::analyzer::PackageAnchor;
-use crate::analyzer::resolution::NamedArgumentLabelRead;
+use crate::analyzer::resolution::{LoweredDeclarationTypeProperty, NamedArgumentLabelRead};
+use brokk_bifrost_core::analyzer::model::DeclarationKind;
+use brokk_bifrost_core::analyzer::resolution_facts::DeclarationTypeRole;
 
 pub(in crate::analyzer::store) const GO_DEFINITION_PACKAGE_ANCHOR: &str =
     "SELECT package_name FROM main.workspace_file_anchor_rows AS anchors
@@ -29,6 +32,8 @@ pub enum SelectedNativeDefinitions {
 
 #[doc(hidden)]
 pub struct ProjectedNativeExternalMember {
+    #[doc(hidden)]
+    pub coordinate: crate::analyzer::resolution::ExternalMemberCoordinate,
     #[doc(hidden)]
     pub identity: crate::analyzer::resolution::ExternalMemberIdentity,
     #[doc(hidden)]
@@ -152,6 +157,14 @@ type NativeReferenceUnitsOutcome =
 type NativeReferenceTypesOutcome =
     SelectedResolutionOperationOutcome<SelectedResolutionLocated<SelectedNativeReferenceTypes>>;
 
+enum SelectedTypeSite {
+    Reference,
+    Missing,
+    Declaration((SelectedSemanticLocator, SemanticId)),
+    Incomplete(Box<SelectedNativeReferenceTypes>),
+    Cancelled,
+}
+
 // A declaration's value is already a published typed slot. Its canonical
 // source bridge supplies the name range; no synthetic reference or source-text
 // inference is needed. Value and parameter roles share the same value query.
@@ -237,7 +250,51 @@ fn assignment_value_answer(
     })
 }
 
+/// A selected local binder, with selected-inventory admission preserved.
+#[doc(hidden)]
+pub type SelectedLocalDeclarationOutcome =
+    SelectedResolutionOperationOutcome<Option<(SemanticId, LexicalDefinition)>>;
+
 impl SelectedResolutionOperation<'_, '_> {
+    /// Select only a certified, unique local declaration through lexical facts.
+    /// This does not dispatch members, imports, or callable definitions.
+    #[doc(hidden)]
+    pub fn resolve_local_declaration_bounded(
+        &mut self,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedResolution<SelectedLocalDeclarationOutcome>> {
+        use crate::analyzer::resolution::BatchResolutionFragmentSource;
+        let session = ResolutionSession::bounded(budget, Some(cancellation));
+        let lexical = self.ready.lexical_source();
+        let mut selected = None;
+        if let super::super::resolution_lexical::SelectedSemanticLookupOutcome::Found(sites) =
+            lexical.lookup_semantic_sites(locator, cancellation, &session)?
+            && let [site] = sites.as_slice()
+            && let Some(evidence) =
+                lexical.reference_local_path_evidence(site.semantic(), cancellation)?
+            && evidence.local_bindings_certified()
+            && let [identity] = evidence.local_definitions()
+            && let SelectedNativeDefinitions::Ready(mut definitions) =
+                project_native_definition_units(&self.ready, &[*identity], cancellation, &session)?
+            && definitions.len() == 1
+            && let Some((identity, SelectedNativeDefinition::Lexical(definition))) =
+                definitions.pop()
+            && matches!(
+                definition.kind,
+                DeclarationKind::LocalVariable
+                    | DeclarationKind::Parameter
+                    | DeclarationKind::ReceiverParameter
+            )
+        {
+            selected = Some((identity, definition));
+        }
+        let outcome =
+            self.finish_native(selected, &ResolutionCompletion::Complete, cancellation)?;
+        Ok(session.finish(outcome))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn resolve_native_assignment_value_bounded(
@@ -424,13 +481,28 @@ impl SelectedResolutionOperation<'_, '_> {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
         // Positioned references include their ordinary expression projections.
         // A declaration name instead selects its exact published value slot.
-        let lexical = self.ready.lexical_source();
-        let declaration = match lexical.lookup_semantic_sites(locator, cancellation, &session)? {
-            super::super::resolution_lexical::SelectedSemanticLookupOutcome::Found(_) => None,
-            super::super::resolution_lexical::SelectedSemanticLookupOutcome::Missing => {
-                self.selected_declaration_value_site(locator, cancellation)?
+        let declaration = match self.declaration_value_site_for_missing_reference(
+            locator,
+            cancellation,
+            &session,
+        )? {
+            SelectedTypeSite::Reference => None,
+            SelectedTypeSite::Missing => {
+                return Ok(session.finish(SelectedResolutionOperationOutcome::Native(
+                    SelectedResolutionLocated::Missing,
+                )));
             }
-            super::super::resolution_lexical::SelectedSemanticLookupOutcome::Cancelled => {
+            SelectedTypeSite::Declaration(site) => Some(site),
+            SelectedTypeSite::Incomplete(answer) => {
+                let completion = answer.answer.completion().clone();
+                let outcome = self.finish_native(
+                    SelectedResolutionLocated::Found(*answer),
+                    &completion,
+                    cancellation,
+                )?;
+                return Ok(session.finish(outcome));
+            }
+            SelectedTypeSite::Cancelled => {
                 return Ok(
                     session.finish(SelectedResolutionOperationOutcome::Cancelled(
                         cancelled_completion(),
@@ -465,22 +537,44 @@ impl SelectedResolutionOperation<'_, '_> {
         })
     }
 
+    /// A reference owns its expression projections; only a missing reference
+    /// may select a declaration by its name range.
+    fn declaration_value_site_for_missing_reference(
+        &self,
+        locator: &SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<SelectedTypeSite> {
+        let lexical = self.ready.lexical_source();
+        match lexical.lookup_semantic_sites(locator, cancellation, session)? {
+            super::super::resolution_lexical::SelectedSemanticLookupOutcome::Found(_) => {
+                Ok(SelectedTypeSite::Reference)
+            }
+            super::super::resolution_lexical::SelectedSemanticLookupOutcome::Missing => {
+                self.selected_declaration_value_site(locator, cancellation)
+            }
+            super::super::resolution_lexical::SelectedSemanticLookupOutcome::Cancelled => {
+                Ok(SelectedTypeSite::Cancelled)
+            }
+        }
+    }
+
     fn selected_declaration_value_site(
         &self,
         locator: &SelectedSemanticLocator,
         cancellation: &CancellationToken,
-    ) -> Result<Option<(SelectedSemanticLocator, SemanticId)>> {
+    ) -> Result<SelectedTypeSite> {
         let Some((start, end)) = locator.reference_range() else {
-            return Ok(None);
+            return Ok(SelectedTypeSite::Reference);
         };
         let Some(mount) = self
             .mount_table()
             .mount_for_path(locator.storage_language(), locator.relative_path())?
         else {
-            return Ok(None);
+            return Ok(SelectedTypeSite::Reference);
         };
         if cancellation.is_cancelled() {
-            return Ok(None);
+            return Ok(SelectedTypeSite::Cancelled);
         }
         let rows = self
             .ready
@@ -496,21 +590,171 @@ impl SelectedResolutionOperation<'_, '_> {
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        match rows.as_slice() {
-            [] => Ok(None),
-            [(site, slot)] => Ok(Some((
+        Ok(
+            match self.declaration_value_site_from_rows(
+                locator,
+                mount.ordinal(),
+                &rows,
+                cancellation,
+            )? {
+                SelectedTypeSite::Missing => SelectedTypeSite::Reference,
+                selected => selected,
+            },
+        )
+    }
+
+    fn selected_declaration_value_site_for_definition(
+        &self,
+        locator: &SelectedSemanticLocator,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<SelectedTypeSite> {
+        let Some(mount) = self
+            .mount_table()
+            .mount_for_path(locator.storage_language(), locator.relative_path())?
+        else {
+            return Ok(SelectedTypeSite::Missing);
+        };
+        if cancellation.is_cancelled() {
+            return Ok(SelectedTypeSite::Cancelled);
+        }
+        if definition.ordinal() != Some(mount.ordinal().get()) {
+            return Err(StoreError::corrupt(format!(
+                "declaration definition {definition:?} does not belong to selected mount {:?}",
+                mount.ordinal()
+            )));
+        }
+        let site = definition.local_key().ok_or_else(|| {
+            StoreError::corrupt("declaration definition has no local source site")
+        })?;
+        let mut rows = Vec::new();
+        let read = self.ready.typed_source().visit_declaration_type_pages_for_definitions(
+            TypedFactRequest::new(&[definition]), cancellation,
+            &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<LoweredDeclarationTypeProperty>]| {
+                for property in page {
+                    if !session.scope_step() { return Ok(false); }
+                    let property = property.row();
+                    if property.definition() != definition {
+                        return Err(StoreError::corrupt(format!(
+                            "declaration type row {:?} answers a different definition than {definition:?}", property.definition()
+                        )));
+                    }
+                    if property.slot().ordinal() != definition.ordinal() {
+                        return Err(StoreError::corrupt(format!(
+                            "declaration type slot {:?} has a different mount from definition {definition:?}", property.slot()
+                        )));
+                    }
+                    if matches!(property.role(), DeclarationTypeRole::Value | DeclarationTypeRole::Parameter) {
+                        let slot = property.slot().local_key().ok_or_else(|| StoreError::corrupt(
+                            "declaration type slot has no local key",
+                        ))?;
+                        rows.push((site, slot));
+                    }
+                }
+                Ok(true)
+            }),
+        )?;
+        if read.is_cancelled() || cancellation.is_cancelled() {
+            return Ok(SelectedTypeSite::Cancelled);
+        }
+        self.declaration_value_site_from_rows(locator, mount.ordinal(), &rows, cancellation)
+    }
+
+    fn declaration_value_site_from_rows(
+        &self,
+        locator: &SelectedSemanticLocator,
+        ordinal: SelectedResolutionMountOrdinal,
+        rows: &[(u32, u32)],
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedTypeSite> {
+        match rows {
+            [] => Ok(SelectedTypeSite::Missing),
+            [(site, slot)] => Ok(SelectedTypeSite::Declaration((
                 SelectedSemanticLocator::new(
                     locator.storage_language(),
                     locator.relative_path(),
                     brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(*site),
                     crate::analyzer::resolution::LoweredSemanticRole::Definition,
                 ),
-                SemanticId::local(mount.ordinal().get(), *slot),
+                SemanticId::local(ordinal.get(), *slot),
             ))),
-            _ => Err(StoreError::new(format!(
-                "selected type site has multiple declaration value anchors: {locator:?}, {rows:?}"
-            ))),
+            _ => {
+                // Several case-local binders can share one source name range.
+                // A range does not select one of their distinct static slots,
+                // so the answer carries one named reason instead of choosing.
+                // Only dense site/slot coordinates are in hand here. Their
+                // numbering changes with unrelated producer edits; a count is
+                // the exception to full-collection diagnostics until stable
+                // per-candidate source evidence is available without new reads.
+                let evidence = format!(
+                    "declaration range names several case-local bindings; no single value anchor is selected: {locator:?}, {} candidate bindings",
+                    rows.len()
+                );
+                let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                    b"bifrost-ambiguous-declaration-bindings:v1",
+                );
+                hash.field("evidence", evidence.as_bytes());
+                let reason = self.ready.context_identities.named_semantic(
+                    hash.finish(),
+                    "ambiguous_declaration_bindings",
+                    &evidence,
+                );
+                let completion = ResolutionCompletion::incomplete([
+                    crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(
+                        reason,
+                    ),
+                ]);
+                let answer =
+                    crate::analyzer::resolution::fact_resolution::incomplete_fact_resolution_answer(
+                        None,
+                        completion,
+                        cancellation,
+                    );
+                Ok(SelectedTypeSite::Incomplete(Box::new(
+                    SelectedNativeReferenceTypes {
+                        answer,
+                        value_types: SelectedNativeTypes::Ready {
+                            nominal: Vec::new(),
+                            intrinsic: Box::new([]),
+                            external_owners: Vec::new(),
+                        },
+                        query_result_slot: None,
+                        direct_target: None,
+                        named_reasons: vec![("ambiguous_declaration_bindings", evidence)],
+                        diagnostic_identities: Vec::new(),
+                    },
+                )))
+            }
         }
+    }
+
+    fn point_query_result_slot_at(
+        &self,
+        locator: &SelectedSemanticLocator,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SemanticId>> {
+        Ok(
+            match (locator.reference_range(), locator.call_argument_ordinal()) {
+                (Some((start, end)), Some(ordinal)) => self.point_call_argument_slot_at(
+                    locator.storage_language(),
+                    locator.relative_path(),
+                    start,
+                    end,
+                    ordinal,
+                    cancellation,
+                )?,
+                (Some((start, end)), None) if locator.storage_language() == "java" => self
+                    .point_expression_value_slot_at(
+                        locator.storage_language(),
+                        locator.relative_path(),
+                        start,
+                        end,
+                        cancellation,
+                    )?,
+                _ => None,
+            },
+        )
     }
 
     pub(crate) fn resolve_native_reference_types_bounded(
@@ -521,25 +765,7 @@ impl SelectedResolutionOperation<'_, '_> {
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
     ) -> Result<BoundedResolution<NativeReferenceTypesOutcome>> {
-        let query_result_slot = match (locator.reference_range(), locator.call_argument_ordinal()) {
-            (Some((start, end)), Some(ordinal)) => self.point_call_argument_slot_at(
-                locator.storage_language(),
-                locator.relative_path(),
-                start,
-                end,
-                ordinal,
-                cancellation,
-            )?,
-            (Some((start, end)), None) if locator.storage_language() == "java" => self
-                .point_expression_value_slot_at(
-                    locator.storage_language(),
-                    locator.relative_path(),
-                    start,
-                    end,
-                    cancellation,
-                )?,
-            _ => None,
-        };
+        let query_result_slot = self.point_query_result_slot_at(locator, cancellation)?;
         if locator.call_argument_ordinal().is_some() && query_result_slot.is_none() {
             return Ok(if cancellation.is_cancelled() {
                 BoundedResolution::Cancelled {
@@ -607,6 +833,7 @@ impl SelectedResolutionOperation<'_, '_> {
         query_result_slot: Option<SemanticId>,
         go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
         locator: &SelectedSemanticLocator,
+        definition: Option<SemanticId>,
         budget: ReceiverAnalysisBudget,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
@@ -614,6 +841,55 @@ impl SelectedResolutionOperation<'_, '_> {
         point_metrics: &mut crate::analyzer::resolution::ResolutionBatchMetrics,
     ) -> Result<BoundedResolution<NativeReferenceTypesOutcome>> {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
+        let selected = match definition {
+            Some(definition) => self.selected_declaration_value_site_for_definition(
+                locator,
+                definition,
+                cancellation,
+                &session,
+            )?,
+            None => {
+                self.declaration_value_site_for_missing_reference(locator, cancellation, &session)?
+            }
+        };
+        let declaration = match selected {
+            SelectedTypeSite::Reference => None,
+            SelectedTypeSite::Missing => {
+                return Ok(session.finish(SelectedResolutionOperationOutcome::Native(
+                    SelectedResolutionLocated::Missing,
+                )));
+            }
+            SelectedTypeSite::Declaration(site) => Some(site),
+            SelectedTypeSite::Incomplete(answer) => {
+                let completion = answer.answer.completion().clone();
+                let outcome = self.finish_native(
+                    SelectedResolutionLocated::Found(*answer),
+                    &completion,
+                    cancellation,
+                )?;
+                return Ok(session.finish(outcome));
+            }
+            SelectedTypeSite::Cancelled => {
+                return Ok(
+                    session.finish(SelectedResolutionOperationOutcome::Cancelled(
+                        cancelled_completion(),
+                    )),
+                );
+            }
+        };
+        let (locator, query_result_slot) = match &declaration {
+            Some((selected, slot)) => (selected, Some(*slot)),
+            None => (locator, query_result_slot),
+        };
+        let query_result_slot = match query_result_slot {
+            Some(slot) => Some(slot),
+            None => self.point_query_result_slot_at(locator, cancellation)?,
+        };
+        if locator.call_argument_ordinal().is_some() && query_result_slot.is_none() {
+            return Ok(session.finish(SelectedResolutionOperationOutcome::Native(
+                SelectedResolutionLocated::Missing,
+            )));
+        }
         self.resolve_native_type_query_bounded(super::NativeReferenceQuery {
             context: prepared.context,
             locator,
@@ -822,6 +1098,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             rusqlite::params![owner.provider_id.as_ref(),owner.owner_fqn.as_ref(),ordinal],
                             |row| Ok((row.get(0)?,row.get(1)?)))? };
                         external_members.push(ProjectedNativeExternalMember {
+                            coordinate: crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(ordinal),
                             identity: crate::analyzer::resolution::ExternalMemberIdentity { owner, ordinal },
                             member_name, is_static,
                         });
@@ -1192,8 +1469,9 @@ struct FragmentDefinitionRows {
 }
 
 /// Read the parser units and lexical declarations of every coordinate in one
-/// batch. `None` when cancelled. The reads page by coordinate, so a batch
-/// costs one temp write per page, not one per definition.
+/// batch. `None` when cancelled. Each read binds a page of coordinates as one
+/// JSON array, so a batch costs one statement execution per page, not one
+/// per definition.
 fn read_fragment_definition_rows(
     ready: &ReadySelectedResolution<'_, '_>,
     coordinates: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
@@ -1256,23 +1534,25 @@ fn project_fragment_definition(
     rows: &mut FragmentDefinitionRows,
 ) -> Result<Option<SelectedNativeDefinition>> {
     let mount = SelectedMountTable::new(&ready.inventory).mount_by_ordinal(coordinate.0)?;
-    assert!(
-        matches!(
-            mount.semantic_language(),
-            Language::Java | Language::Go | Language::Scala | Language::Kotlin
-        ),
-        "native Java/Go/Scala/Kotlin projection requires an admitted frontend"
-    );
     let file = ProjectFile::new(ready.project.root(), mount.persisted_relative_path());
     let Some(unit_rows) = rows.units.remove(&coordinate) else {
-        let Some(super::super::selected_definition::SelectedDeclarationDefinition::Lexical(
-            mut row,
-        )) = rows.lexical.remove(&coordinate)
-        else {
-            return Ok(None);
+        use super::super::selected_definition::SelectedDeclarationDefinition;
+        return match rows.lexical.remove(&coordinate) {
+            Some(SelectedDeclarationDefinition::Lexical(mut row)) => {
+                row.source_file = Some(file);
+                Ok(Some(SelectedNativeDefinition::Lexical(row)))
+            }
+            Some(SelectedDeclarationDefinition::Module(_)) => {
+                let anchor = ready.definition_module_anchor(coordinate.0, &file)?;
+                Ok(
+                    super::super::linked_store_language_support(mount.semantic_language())
+                        .expect("selected language has store support")
+                        .selected_module_definition(ready.project, &file, anchor.as_ref())?
+                        .map(SelectedNativeDefinition::Unit),
+                )
+            }
+            Some(SelectedDeclarationDefinition::WithoutUnit(_)) | None => Ok(None),
         };
-        row.source_file = Some(file);
-        return Ok(Some(SelectedNativeDefinition::Lexical(row)));
     };
     let mut selected_unit = None;
     for row in unit_rows {
@@ -1280,35 +1560,17 @@ fn project_fragment_definition(
             .fq
             .as_ref()
             .ok_or_else(|| StoreError::corrupt("source declaration lacks structured identity"))?;
-        let prefix = match (mount.semantic_language(), persisted.anchor) {
-            (Language::Java, None)
-            | (Language::Go, None)
-            | (Language::Scala, None)
-            | (Language::Kotlin, None) => None,
-            (Language::Go, Some(PackageAnchor::OwnModule { pop: 0 })) => {
-                let record = ready.inventory.mount_record_by_ordinal(coordinate.0)?;
-                let Some(version) = super::go_context::go_placement_file_version(
-                    ready.inventory.connection(),
-                    &record,
-                )?
-                else {
-                    // An unsaved replacement whose membership inputs changed
-                    // has no selected placement; its predecessor is not proof.
+        let prefix = match persisted.anchor {
+            None => None,
+            Some(PackageAnchor::OwnModule { pop: 0 }) => {
+                let Some(prefix) = ready.definition_module_anchor(coordinate.0, &file)? else {
                     return Ok(None);
                 };
-                let package: Option<String> = ready
-                    .inventory
-                    .connection()
-                    .query_row(GO_DEFINITION_PACKAGE_ANCHOR, [version], |row| row.get(0))
-                    .optional()?;
-                let Some(package) = package else {
-                    return Ok(None);
-                };
-                Some(brokk_bifrost_go::declarations::go_package_fq(&package))
+                Some(prefix)
             }
             _ => {
                 return Err(StoreError::corrupt(
-                    "Java/Go source declaration has an unsupported package anchor",
+                    "source declaration has an unsupported package anchor",
                 ));
             }
         };
@@ -1346,6 +1608,79 @@ fn project_fragment_definition(
         selected_unit = Some(unit);
     }
     Ok(selected_unit.map(SelectedNativeDefinition::Unit))
+}
+
+impl ReadySelectedResolution<'_, '_> {
+    pub(crate) fn definition_module_anchor(
+        &self,
+        ordinal: SelectedResolutionMountOrdinal,
+        file: &ProjectFile,
+    ) -> Result<Option<crate::analyzer::fq_name::FqName>> {
+        if let Some(anchor) = self.definition_module_anchors.borrow().get(&ordinal) {
+            return Ok(anchor.clone());
+        }
+        let mount = SelectedMountTable::new(&self.inventory).mount_by_ordinal(ordinal)?;
+        let anchor = super::super::linked_store_language_support(mount.semantic_language())
+            .expect("selected language has store support")
+            .selected_definition_module_anchor(&self.inventory, ordinal, self.project, file)?;
+        self.definition_module_anchors
+            .borrow_mut()
+            .insert(ordinal, anchor.clone());
+        Ok(anchor)
+    }
+}
+
+/// Canonical Python declaration placement from the selected file publication.
+pub fn python_definition_module_anchor(
+    selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
+    ordinal: SelectedResolutionMountOrdinal,
+    file: &ProjectFile,
+) -> Result<Option<crate::analyzer::fq_name::FqName>> {
+    let name: Option<String> = selection
+        .connection()
+        .query_row(
+            "SELECT anchors.package_name FROM temp.selected_resolution_mounts mounts
+         JOIN main.workspace_file_anchor_rows anchors USING(file_version_id)
+         WHERE mounts.mount_ordinal=?1 AND anchors.anchor_kind='own_module'
+           AND anchors.anchor_pop=0",
+            [ordinal.get()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    name.map(|name| {
+        let components =
+            brokk_bifrost_python::declarations::python_module_components_from_name(file, &name)
+                .ok_or_else(|| {
+                    StoreError::corrupt(
+                        "published Python module is not a suffix of its mounted path",
+                    )
+                })?;
+        Ok(crate::analyzer::fq_name::FqName::from_package_components(
+            &components,
+        ))
+    })
+    .transpose()
+}
+
+/// Go package placement authority for a selected definition's OwnModule anchor.
+#[doc(hidden)]
+pub fn go_definition_module_anchor(
+    selection: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
+    ordinal: SelectedResolutionMountOrdinal,
+) -> Result<Option<crate::analyzer::fq_name::FqName>> {
+    let record = selection.mount_record_by_ordinal(ordinal)?;
+    let Some(version) =
+        super::go_context::go_placement_file_version(selection.connection(), &record)?
+    else {
+        // An unsaved replacement whose membership inputs changed has no selected
+        // placement; its predecessor is not proof.
+        return Ok(None);
+    };
+    let package: Option<String> = selection
+        .connection()
+        .query_row(GO_DEFINITION_PACKAGE_ANCHOR, [version], |row| row.get(0))
+        .optional()?;
+    Ok(package.map(|package| brokk_bifrost_go::declarations::go_package_fq(&package)))
 }
 
 /// Project an intrinsic semantic identity without inventing a source declaration.
@@ -2517,12 +2852,8 @@ fn project_native_import_binder(
     };
     let ordinal = provenance.mount().ordinal();
     let record = ready.inventory.mount_record_by_ordinal(ordinal)?;
-    let Some(import) = super::jvm_context::selected_import_route(
-        &ready.inventory,
-        record.blob_id(),
-        ordinal,
-        token,
-    )?
+    let Some(import) =
+        super::imports::selected_import_route(&ready.inventory, record.blob_id(), ordinal, token)?
     else {
         return Ok(None);
     };
@@ -2551,20 +2882,22 @@ fn project_native_import_binder(
         return Ok(None);
     };
     let wildcard = matches!(
-        import.kind.as_str(),
-        "type_on_demand" | "static_on_demand" | "star"
+        import.kind,
+        SelectedImportRouteKind::TypeOnDemand
+            | SelectedImportRouteKind::StaticOnDemand
+            | SelectedImportRouteKind::Star
     );
     let name = if wildcard {
         WILDCARD_ROUTE_NAME.to_owned()
     } else {
-        let selector = super::jvm_context::selected_jvm_import_selector(
+        let selector = super::imports::selected_import_selector(
             ready.inventory.connection(),
             record.blob_id(),
             token,
         )?;
         // JVM named selectors may rename the source member. Without their
         // structured selector row the bound demand is not its target name.
-        if import.kind == "named" && selector.is_none() {
+        if import.kind == SelectedImportRouteKind::Named && selector.is_none() {
             return Ok(None);
         }
         let source_name = selector

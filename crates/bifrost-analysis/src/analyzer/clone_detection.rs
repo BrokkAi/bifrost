@@ -3,6 +3,7 @@ use crate::analyzer::tree_walk::push_children_reversed;
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeUnit, IAnalyzer, Language, ProjectFile, parser_language_for,
 };
+use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 use brokk_bifrost_core::clones::{
     CloneNormalizationRules, normalize_clone_ast_label, normalize_clone_leaf_token,
 };
@@ -205,14 +206,18 @@ impl LongShingles {
 pub(crate) fn compute_ast_refinement_similarity_percent(
     left_ast_signature: &str,
     right_ast_signature: &str,
+    kind_table: &[(&str, NormalizedKind)],
 ) -> i32 {
     let broad_similarity =
         compute_ast_label_multiset_similarity_percent(left_ast_signature, right_ast_signature);
     if broad_similarity == 0 {
         return 0;
     }
-    let control_similarity =
-        compute_ast_control_flow_similarity_percent(left_ast_signature, right_ast_signature);
+    let control_similarity = compute_ast_control_flow_similarity_percent(
+        left_ast_signature,
+        right_ast_signature,
+        kind_table,
+    );
     if control_similarity < 0 {
         return broad_similarity;
     }
@@ -293,8 +298,14 @@ pub(crate) fn refine_clone_similarity_with_ast(
     if left.ast_signature.is_empty() || right.ast_signature.is_empty() {
         return token_similarity;
     }
-    let ast_similarity =
-        compute_ast_refinement_similarity_percent(&left.ast_signature, &right.ast_signature);
+    let spec = crate::analyzer::structural_spec_for(language_for_file(left.unit.source()))
+        .expect("clone candidates require registered structural syntax");
+    let kind_table = spec.kind_table();
+    let ast_similarity = compute_ast_refinement_similarity_percent(
+        &left.ast_signature,
+        &right.ast_signature,
+        kind_table,
+    );
     if ast_similarity == 0 {
         return token_similarity;
     }
@@ -556,9 +567,7 @@ fn compute_ast_label_multiset_similarity_percent(left: &str, right: &str) -> i32
         intersection += left_count.min(right_count);
         union += left_count.max(right_count);
     }
-    if union == 0 {
-        return 0;
-    }
+    debug_assert!(union > 0, "nonempty label bags have a nonempty union");
     ((intersection as f64 * 100.0) / union as f64).round() as i32
 }
 
@@ -574,31 +583,52 @@ fn ast_label_counts(ast_signature: &str) -> HashMap<String, usize> {
     counts
 }
 
-fn compute_ast_control_flow_similarity_percent(left: &str, right: &str) -> i32 {
-    let left_control = extract_control_flow_signature(left);
-    let right_control = extract_control_flow_signature(right);
+fn compute_ast_control_flow_similarity_percent(
+    left: &str,
+    right: &str,
+    kind_table: &[(&str, NormalizedKind)],
+) -> i32 {
+    let left_control = extract_control_flow_signature(left, kind_table);
+    let right_control = extract_control_flow_signature(right, kind_table);
     if left_control.is_empty() || right_control.is_empty() {
         return -1;
     }
     compute_ast_label_multiset_similarity_percent(&left_control, &right_control)
 }
 
-fn extract_control_flow_signature(ast_signature: &str) -> String {
+fn extract_control_flow_signature(
+    ast_signature: &str,
+    kind_table: &[(&str, NormalizedKind)],
+) -> String {
     ast_signature
         .split('|')
         .map(str::trim)
-        .filter(|label| label.starts_with("N:") && is_control_flow_label(label))
+        .filter(|label| label.starts_with("N:") && is_control_flow_label(label, kind_table))
         .collect::<Vec<_>>()
         .join("|")
 }
 
-fn is_control_flow_label(label: &str) -> bool {
-    [
-        "if", "else", "while", "for", "switch", "case", "try", "catch", "finally", "return",
-        "throw", "break", "continue",
-    ]
-    .iter()
-    .any(|needle| label.contains(needle))
+fn is_control_flow_label(label: &str, kind_table: &[(&str, NormalizedKind)]) -> bool {
+    let Some(node_kind) = label.strip_prefix("N:") else {
+        return false;
+    };
+    // Grammar spelling belongs to each language's structural adapter. In
+    // particular, formal_parameters and modifiers are not loops or branches.
+    kind_table.iter().any(|(name, kind)| {
+        *name == node_kind
+            && (kind.satisfies(NormalizedKind::Loop)
+                || matches!(
+                    kind,
+                    NormalizedKind::If
+                        | NormalizedKind::Switch
+                        | NormalizedKind::Case
+                        | NormalizedKind::Catch
+                        | NormalizedKind::Return
+                        | NormalizedKind::Throw
+                        | NormalizedKind::Break
+                        | NormalizedKind::Continue
+                ))
+    })
 }
 
 fn hash_shingle(tokens: &[String], start: usize, length: usize) -> u64 {
@@ -652,6 +682,219 @@ mod tests {
     };
     use crate::analyzer::{CloneSmellWeights, CodeUnit, CodeUnitType, ProjectFile};
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: formal parameters and modifiers polluted clone control signatures"
+    )]
+    fn declaration_control_signatures_exclude_parameters_and_modifiers() {
+        let java = brokk_bifrost_jvm::java::clones::prepare_java_clone(
+            "class Example { public int f(int x) { return x; } }",
+            0,
+        )
+        .unwrap()
+        .ast_signature;
+        let csharp = brokk_bifrost_csharp::clones::build_csharp_clone_ast_signature(
+            "class Example { public int F(int x) { return x; } }",
+        );
+        for (language, signature, table, declaration_kind) in [
+            (
+                "java",
+                java,
+                brokk_bifrost_jvm::java::structural::JAVA_KIND_TABLE,
+                "N:formal_parameters",
+            ),
+            (
+                "csharp",
+                csharp,
+                brokk_bifrost_csharp::structural::CSHARP_KIND_TABLE,
+                "N:modifier",
+            ),
+        ] {
+            assert!(
+                signature.split('|').any(|label| label == declaration_kind),
+                "{language}: {signature}"
+            );
+            assert_eq!(
+                super::extract_control_flow_signature(&signature, table),
+                "N:return_statement",
+                "{language}",
+            );
+        }
+    }
+
+    #[test]
+    fn ast_multiset_similarity_known_answers() {
+        let table = brokk_bifrost_jvm::java::structural::JAVA_KIND_TABLE;
+        // Independent bag arithmetic: broad intersection/union, control
+        // intersection/union, then round((2 * broad + control) / 3).
+        for (left, right, broad, control, refined) in [
+            (
+                "N:block|N:if_statement",
+                "N:block|N:while_statement",
+                33,
+                0,
+                22,
+            ),
+            (
+                "N:block|N:if_statement",
+                "N:block|N:if_statement|N:while_statement",
+                67,
+                50,
+                61,
+            ),
+            (
+                "N:block|N:if_statement|N:if_statement",
+                "N:block|N:if_statement",
+                67,
+                50,
+                61,
+            ),
+            ("N:block|N:if_statement", "N:block", 50, -1, 50),
+            ("N:block|ID", "N:block|NUM", 33, -1, 33),
+            ("N:block|ID|ID", "N:block|ID", 67, -1, 67),
+        ] {
+            assert_eq!(
+                super::compute_ast_label_multiset_similarity_percent(left, right),
+                broad
+            );
+            assert_eq!(
+                super::compute_ast_control_flow_similarity_percent(left, right, table),
+                control
+            );
+            assert_eq!(
+                super::compute_ast_refinement_similarity_percent(left, right, table),
+                refined
+            );
+            for threshold in [refined, refined + 1] {
+                let weights = weights(1, threshold, 1, 1, threshold);
+                let mut first = candidate("same.java", "alpha", &["A"], weights);
+                let mut second = candidate("same.java", "beta", &["A"], weights);
+                first.data.ast_signature = left.to_string();
+                second.data.ast_signature = right.to_string();
+                let file = first.data.unit.source().clone();
+                let findings = super::detect_structural_clone_smells(
+                    &[file],
+                    vec![second, first],
+                    weights,
+                    super::refine_clone_similarity_with_ast,
+                );
+                let scores: Vec<_> = findings.iter().map(|finding| finding.score).collect();
+                assert_eq!(
+                    scores,
+                    if threshold == refined {
+                        vec![refined]
+                    } else {
+                        vec![]
+                    }
+                );
+                if let Some(finding) = findings.first() {
+                    assert_eq!(finding.enclosing_fq_name.as_str(), "alpha");
+                    assert_eq!(finding.peer_enclosing_fq_name.as_str(), "beta");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shingle_detector_agrees_with_token_tuple_sets() {
+        use std::collections::HashSet;
+        // Enumerate all streams of length <= 3, plus final-window and
+        // repetition cases. The oracle stores token tuples, never hashes.
+        let mut streams = vec![Vec::new()];
+        for length in 1..=3 {
+            for mut number in 0..3usize.pow(length) {
+                streams.push(
+                    (0..length)
+                        .map(|_| {
+                            let token = ["A", "B", "C"][number % 3];
+                            number /= 3;
+                            token
+                        })
+                        .collect(),
+                );
+            }
+        }
+        streams.extend([
+            vec!["A", "A", "A", "A"],
+            vec!["A", "B", "B", "C"],
+            vec!["C", "A", "B", "C"],
+        ]);
+        for width in 1..=3 {
+            for left in &streams {
+                for right in &streams {
+                    let tuples = |tokens: &[&str]| -> HashSet<Vec<String>> {
+                        tokens
+                            .windows(width)
+                            .map(|window| window.iter().map(|s| s.to_string()).collect())
+                            .collect()
+                    };
+                    let left_set = tuples(left);
+                    let right_set = tuples(right);
+                    let overlap = left_set.intersection(&right_set).count();
+                    let union = left_set.union(&right_set).count();
+                    let score = if union == 0 {
+                        0
+                    } else {
+                        (100.0 * overlap as f64 / union as f64).round() as i32
+                    };
+                    for minimum in [0, 1, overlap, overlap + 1] {
+                        for threshold in [0, 33, 100] {
+                            let weights = weights(0, threshold, width as i32, minimum as i32, 0);
+                            let first = candidate("same.cpp", "alpha", left, weights);
+                            let second = candidate("same.cpp", "beta", right, weights);
+                            let file = first.data.unit.source().clone();
+                            let findings = super::detect_structural_clone_smells(
+                                &[file],
+                                vec![second, first],
+                                weights,
+                                super::refine_clone_similarity_with_ast,
+                            );
+                            let expected = union != 0 && overlap >= minimum && score >= threshold;
+                            assert_eq!(
+                                findings.len(),
+                                usize::from(expected),
+                                "left={left:?}, right={right:?}, width={width}, minShared={minimum}, threshold={threshold}"
+                            );
+                            if let Some(finding) = findings.first() {
+                                assert_eq!(finding.score, score);
+                                assert_eq!(finding.enclosing_fq_name.as_str(), "alpha");
+                                assert_eq!(finding.peer_enclosing_fq_name.as_str(), "beta");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_token_minimum_is_inclusive() {
+        let unit = candidate("same.cpp", "alpha", &["A", "B"], weights(0, 100, 1, 1, 0))
+            .data
+            .unit;
+        for minimum in [1, 2, 3] {
+            let weights = weights(minimum, 100, 1, 1, 0);
+            let data = super::build_clone_candidate_data(
+                Some("nonempty source".to_string()),
+                &unit,
+                weights,
+                |_, _| Some((vec!["A".into(), "B".into()], String::new())),
+            );
+            assert_eq!(data.is_some(), minimum <= 2);
+            if let Some(data) = data {
+                let second = candidate("same.cpp", "beta", &["A", "B"], weights);
+                let findings = super::detect_structural_clone_smells(
+                    std::slice::from_ref(unit.source()),
+                    vec![CloneCandidateProfile::create(data, weights), second],
+                    weights,
+                    super::refine_clone_similarity_with_ast,
+                );
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].normalized_token_count, 2);
+            }
+        }
+    }
 
     #[test]
     fn rounded_similarity_threshold_is_preserved_by_candidate_prefilter() {

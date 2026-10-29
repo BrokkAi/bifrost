@@ -366,6 +366,16 @@ pub fn validate_prepared_syntax_source_for_procedure(
         && workspace
             .analyzer()
             .indexed_source_matches(file, prepared.source());
+    if !exact {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=snapshot",
+                file!(),
+                line!()
+            )
+        });
+        workspace.analyzer().mark_execution_dependent();
+    }
     exact
         .then_some(prepared)
         .ok_or(UnknownReason::UncertainFlow)

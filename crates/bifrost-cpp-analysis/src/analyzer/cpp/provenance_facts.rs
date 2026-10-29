@@ -5,6 +5,7 @@
 //! not retain a translation-unit-sized index.  Every result is a bounded
 //! query product for one source anchor.
 
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
@@ -135,10 +136,10 @@ pub fn cpp_provenance_for_anchor_with_model_key(
         procedure.artifact().key().language(),
         LanguageDialect::CppC | LanguageDialect::Standard(Language::Cpp)
     ) {
-        return unavailable("not_cpp");
+        return unavailable(derivation_reason::NOT_CPP);
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return unavailable("cancelled");
+        return unavailable(derivation_reason::CANCELLED);
     }
 
     let file = ProjectFile::new(
@@ -152,16 +153,18 @@ pub fn cpp_provenance_for_anchor_with_model_key(
         .find(|provider| provider.structural_language() == Language::Cpp)
         .map(|provider| provider.structural_syntax_limited(&file, MAX_SOURCE_BYTES, cancellation))
     else {
-        return unavailable("prepared_syntax_unavailable");
+        return unavailable(derivation_reason::PREPARED_SYNTAX_UNAVAILABLE);
     };
     let syntax = match syntax {
         StructuralSyntaxLimitedOutcome::Available(syntax) => syntax,
         StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
-            return unavailable("source_budget_exhausted");
+            return unavailable(derivation_reason::SOURCE_BUDGET_EXHAUSTED);
         }
-        StructuralSyntaxLimitedOutcome::Cancelled => return unavailable("cancelled"),
+        StructuralSyntaxLimitedOutcome::Cancelled => {
+            return unavailable(derivation_reason::CANCELLED);
+        }
         StructuralSyntaxLimitedOutcome::Unavailable => {
-            return unavailable("prepared_syntax_unavailable");
+            return unavailable(derivation_reason::PREPARED_SYNTAX_UNAVAILABLE);
         }
     };
     let Ok(syntax) = validate_prepared_syntax_source_for_procedure(
@@ -170,28 +173,28 @@ pub fn cpp_provenance_for_anchor_with_model_key(
         &file,
         syntax.into_inner(),
     ) else {
-        return unavailable("source_identity_mismatch");
+        return unavailable(derivation_reason::SOURCE_IDENTITY_MISMATCH);
     };
 
     let semantics = procedure.semantics();
     let Some(procedure_mapping) = semantics.source_mapping(semantics.source()) else {
-        return unavailable("procedure_mapping_missing");
+        return unavailable(derivation_reason::PROCEDURE_MAPPING_MISSING);
     };
     if procedure_mapping.kind != SourceMappingKind::Exact {
-        return unavailable("procedure_mapping_inexact");
+        return unavailable(derivation_reason::PROCEDURE_MAPPING_INEXACT);
     }
     let procedure_span = procedure_mapping.locator.anchor().span();
     let Some(procedure_node) = syntax.tree().root_node().named_descendant_for_byte_range(
         procedure_span.start_byte() as usize,
         procedure_span.end_byte() as usize,
     ) else {
-        return unavailable("procedure_syntax_missing");
+        return unavailable(derivation_reason::PROCEDURE_SYNTAX_MISSING);
     };
     if procedure_node.start_byte() != procedure_span.start_byte() as usize
         || procedure_node.end_byte() != procedure_span.end_byte() as usize
         || procedure_node.has_error()
     {
-        return unavailable("procedure_syntax_inexact");
+        return unavailable(derivation_reason::PROCEDURE_SYNTAX_INEXACT);
     }
     let Some(anchor_node) = syntax
         .tree()
@@ -204,7 +207,7 @@ pub fn cpp_provenance_for_anchor_with_model_key(
                 && node.end_byte() <= procedure_node.end_byte()
         })
     else {
-        return unavailable("anchor_syntax_missing");
+        return unavailable(derivation_reason::ANCHOR_SYNTAX_MISSING);
     };
 
     let source = syntax.source();
@@ -422,7 +425,7 @@ fn pointer_scaling_fact(
     let mut stack = vec![anchor];
     while let Some(node) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err("cancelled");
+            return Err(derivation_reason::CANCELLED);
         }
         if node.kind() == "binary_expression"
             && binary_operator(node).is_some_and(|operator| matches!(operator, "+" | "-"))
@@ -615,13 +618,13 @@ fn return_stack_fact(
         return Ok(None);
     }
     if !has_semantic_return(procedure, anchor) {
-        return Err("return_semantics_missing");
+        return Err(derivation_reason::RETURN_SEMANTICS_MISSING);
     }
     let Some(value) = anchor.named_child(0) else {
         return Ok(None);
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err("cancelled");
+        return Err(derivation_reason::CANCELLED);
     }
     let (binding, is_address) = address_or_binding(source, value, bindings);
     let Some(binding) = binding else {
@@ -682,7 +685,7 @@ fn stack_escape_fact(
         return Ok(None);
     }
     if !has_semantic_assignment(procedure, anchor) {
-        return Err("assignment_semantics_missing");
+        return Err(derivation_reason::ASSIGNMENT_SEMANTICS_MISSING);
     }
     let Some(left) = anchor.child_by_field_name("left") else {
         return Ok(None);
@@ -706,7 +709,7 @@ fn stack_escape_fact(
         return Ok(None);
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err("cancelled");
+        return Err(derivation_reason::CANCELLED);
     }
     Ok(Some(CppProvenanceFact {
         rule: CppProvenanceRule::StackAddressEscape,
@@ -737,27 +740,27 @@ fn null_termination_fact(
             || key.parameter_count != 1
             || key.owner.is_empty()
         {
-            return Err("resolved_call_identity_unavailable");
+            return Err(derivation_reason::RESOLVED_CALL_IDENTITY_UNAVAILABLE);
         }
         let Some(function) = anchor.child_by_field_name("function") else {
-            return Err("call_function_missing");
+            return Err(derivation_reason::CALL_FUNCTION_MISSING);
         };
         let Some(spelled_name) = crate::analyzer::cpp::range_facts::terminal_name(function, source)
         else {
-            return Err("resolved_call_name_missing");
+            return Err(derivation_reason::RESOLVED_CALL_NAME_MISSING);
         };
         if spelled_name != key.member {
-            return Err("resolved_call_identity_mismatch");
+            return Err(derivation_reason::RESOLVED_CALL_IDENTITY_MISMATCH);
         }
         key.member.as_str()
     } else {
         let Some(call) = call_site_for_node(procedure, anchor) else {
-            return Err("call_semantics_missing");
+            return Err(derivation_reason::CALL_SEMANTICS_MISSING);
         };
         let CallableTargetResolution::Proven(CallableTarget::External(locator)) =
             &call.declared_targets
         else {
-            return Err("resolved_call_identity_unavailable");
+            return Err(derivation_reason::RESOLVED_CALL_IDENTITY_UNAVAILABLE);
         };
         if locator
             .path()
@@ -765,36 +768,36 @@ fn null_termination_fact(
             .extension()
             .is_none_or(|extension| !matches!(extension.to_str(), Some("h" | "hh" | "hpp" | "hxx")))
         {
-            return Err("resolved_call_header_owner_missing");
+            return Err(derivation_reason::RESOLVED_CALL_HEADER_OWNER_MISSING);
         }
         locator
             .declaration()
             .segments()
             .last()
             .and_then(|segment| segment.name())
-            .ok_or("resolved_call_name_missing")?
+            .ok_or(derivation_reason::RESOLVED_CALL_NAME_MISSING)?
     };
     if !matches!(name, "strdup" | "strcpy" | "strcat") {
         return Ok(None);
     }
     let Some(arguments) = anchor.child_by_field_name("arguments") else {
-        return Err("call_arguments_missing");
+        return Err(derivation_reason::CALL_ARGUMENTS_MISSING);
     };
     let Some(argument) = arguments.named_child(0) else {
-        return Err("call_argument_missing");
+        return Err(derivation_reason::CALL_ARGUMENT_MISSING);
     };
     let argument = strip_parentheses(argument);
     let Some(argument_name) = source.get(argument.byte_range()) else {
-        return Err("call_argument_unreadable");
+        return Err(derivation_reason::CALL_ARGUMENT_UNREADABLE);
     };
     let Some(binding) = resolve_binding(bindings, argument_name, argument.start_byte()) else {
-        return Err("call_argument_alias_unknown");
+        return Err(derivation_reason::CALL_ARGUMENT_ALIAS_UNKNOWN);
     };
     if binding.storage != CppProvenanceStorage::Stack || !binding.ty.array {
         return Ok(None);
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err("cancelled");
+        return Err(derivation_reason::CANCELLED);
     }
     if buffer_is_terminated(source, procedure_node, binding, anchor) {
         return Ok(None);

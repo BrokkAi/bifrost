@@ -451,7 +451,7 @@ fn query_batched_path_units<A: StoreLanguageAdapter>(
             let (request_index, rel_path) = row?;
             assert!(request_index < units.len());
             let file = ProjectFile::new(project_root.to_path_buf(), rel_path);
-            if let Some(unit) = adapter.path_synthetic_module_unit(&file) {
+            if let Some(unit) = adapter.hydrate_path_synthetic_module_unit(&file)? {
                 units[request_index].push(unit);
             }
         }
@@ -928,10 +928,15 @@ fn path_units<A: StoreLanguageAdapter>(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut units = paths
         .into_iter()
-        .filter_map(|rel_path| {
-            adapter
-                .path_synthetic_module_unit(&ProjectFile::new(project_root.to_path_buf(), rel_path))
+        .map(|rel_path| {
+            adapter.hydrate_path_synthetic_module_unit(&ProjectFile::new(
+                project_root.to_path_buf(),
+                rel_path,
+            ))
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     sort_units(&mut units);
     units.dedup();

@@ -186,6 +186,17 @@ pub struct FqName {
 }
 
 impl FqName {
+    /// Heap storage for the name's segment IDs; interned segment text is shared.
+    pub fn retained_heap_bytes(&self) -> usize {
+        if self.segments.spilled() {
+            self.segments
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SegmentId>())
+        } else {
+            0
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

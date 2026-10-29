@@ -816,7 +816,7 @@ SELECT NOT EXISTS(
         )
     });
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[doc(hidden)]
 pub struct GoReverseCandidate {
     #[doc(hidden)]
@@ -839,7 +839,7 @@ struct GoReverseTargetSurface {
     namespace: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct GoReverseSummaryContext {
     context_id: i64,
     workspace_id: String,
@@ -860,6 +860,95 @@ pub struct GoReverseCandidateSet {
     summary_context: GoReverseSummaryContext,
     pub(crate) candidates: Vec<GoReverseCandidate>,
     candidate_inventory_complete: bool,
+}
+
+/// Physical confirmation results for one independent usage batch. Never retained
+/// by an analyzer: inventory, content, generation and publication identities are
+/// part of the scope, and every entry is dropped when the batch returns.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct GoReverseConfirmationMemo {
+    scopes: HashMap<GoReverseMemoScope, GoReversePhysicalMemo>,
+    confirmation_hits: usize,
+}
+
+impl GoReverseConfirmationMemo {
+    /// Number of cached receiver-anchor or forward-group confirmations reused.
+    #[doc(hidden)]
+    pub fn confirmation_hits(&self) -> usize {
+        self.confirmation_hits
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GoReverseMemoScope {
+    inventory: [u8; 32],
+    generation: u64,
+    context_id: i64,
+    base_profile: Option<[u8; 32]>,
+    source_scope: [u8; 32],
+    stage_epochs: (u64, u64),
+    summary: GoReverseSummaryContext,
+    publications: Vec<super::super::GoContextIdentity>,
+}
+
+#[derive(Default)]
+struct GoReversePhysicalMemo {
+    lexical: HashMap<SemanticId, crate::analyzer::resolution::batch::ReferenceLocalPathEvidence>,
+    caller_summaries: HashMap<[u8; 32], Option<i64>>,
+    named_imports: HashMap<i64, bool>,
+    qualified_imports:
+        HashMap<(GoReverseCandidate, Option<i64>, String), Option<GoReverseImportBinding>>,
+    members: HashMap<
+        GoReverseMemberMemoKey,
+        GoReverseMemoValue<std::rc::Rc<BoundedResolution<GoReverseMemberConfirmation>>>,
+    >,
+    forward: HashMap<GoReverseForwardMemoKey, GoReverseMemoValue<GoReverseForwardAnswers>>,
+}
+
+type GoReverseMemberMemoKey = (
+    GoReverseCandidate,
+    FactReferenceSiteMetadata,
+    Vec<super::super::GoContextIdentity>,
+);
+type GoReverseForwardMemoKey = (
+    Vec<GoReverseCandidate>,
+    GoReverseForwardMode,
+    Vec<super::super::GoContextIdentity>,
+);
+type GoReverseForwardAnswers = (
+    Vec<(GoReverseCandidate, FactResolutionAnswer)>,
+    ResolutionCompletion,
+);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GoReverseForwardMode {
+    FollowDemandedMounts,
+    CallerContextOnly,
+}
+
+struct GoReverseMemoValue<T> {
+    value: T,
+    publications: Vec<super::super::GoContextIdentity>,
+}
+
+fn go_reverse_publications(
+    operation: &SelectedResolutionOperation<'_, '_>,
+) -> Vec<super::super::GoContextIdentity> {
+    let mut publications = operation.bound_go_context_publications();
+    publications.sort_by_key(|publication| publication.context_id);
+    publications
+}
+
+impl<T> GoReverseMemoValue<T> {
+    fn rebind(&self, operation: &SelectedResolutionOperation<'_, '_>) {
+        // The key includes every publication already bound before computation.
+        // Replay additional dependencies so finish/projection still validates
+        // exactly the publications the singleton computation consulted.
+        for publication in &self.publications {
+            operation.bind_go_context_publication(publication.clone());
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -913,7 +1002,7 @@ struct GoReverseDotExport {
     export: GoReverseSummaryExport,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GoReverseImportBinding {
     import_id: Option<i64>,
     kind: Option<String>,
@@ -922,7 +1011,7 @@ struct GoReverseImportBinding {
     provider: GoReverseImportProvider,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct GoReverseImportProvider {
     boundary: Option<String>,
     has_selected_sources: bool,
@@ -1789,6 +1878,8 @@ pub enum GoReverseBindingTarget {
 
 #[doc(hidden)]
 pub struct GoReverseConfirmed {
+    /// Concrete members checked against the queried interface contract.
+    pub implementations: Vec<SemanticId>,
     #[doc(hidden)]
     pub family: GoMethodFamily,
     #[doc(hidden)]
@@ -2473,9 +2564,37 @@ impl SelectedResolutionOperation<'_, '_> {
     pub fn confirm_go_reverse_candidates<F>(
         &mut self,
         context_id: i64,
+        candidates: GoReverseCandidateSet,
+        cancellation: &CancellationToken,
+        context_metrics: &mut SelectedResolutionContextMetrics,
+        confirm_member_access: F,
+    ) -> Result<SelectedResolutionOperationOutcome<GoReverseConfirmed>>
+    where
+        F: FnMut(
+            &Self,
+            &GoReverseCandidate,
+            FactReferenceSiteMetadata,
+        ) -> Result<BoundedResolution<GoReverseMemberConfirmation>>,
+    {
+        self.confirm_go_reverse_candidates_with_memo(
+            context_id,
+            candidates,
+            cancellation,
+            context_metrics,
+            &mut GoReverseConfirmationMemo::default(),
+            confirm_member_access,
+        )
+    }
+
+    /// Share only target-independent physical work with other independent queries.
+    #[doc(hidden)]
+    pub fn confirm_go_reverse_candidates_with_memo<F>(
+        &mut self,
+        context_id: i64,
         mut candidates: GoReverseCandidateSet,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
+        memo: &mut GoReverseConfirmationMemo,
         mut confirm_member_access: F,
     ) -> Result<SelectedResolutionOperationOutcome<GoReverseConfirmed>>
     where
@@ -2490,12 +2609,28 @@ impl SelectedResolutionOperation<'_, '_> {
         let candidate_inventory_complete = candidates.candidate_inventory_complete;
         let target_semantic = candidates.target;
         let summary_context = candidates.summary_context.clone();
+        let GoReverseConfirmationMemo {
+            scopes,
+            confirmation_hits,
+        } = memo;
+        let memo = scopes
+            .entry(GoReverseMemoScope {
+                inventory: self.ready.inventory.fingerprint(),
+                generation: self.ready.project.analysis_generation(),
+                context_id,
+                base_profile: self.ready.go_base_profile.get(),
+                source_scope: self.ready.inventory.scope_identity(),
+                stage_epochs: self.ready.inventory.staged_read_epoch(),
+                summary: summary_context.clone(),
+                publications: go_reverse_publications(self),
+            })
+            .or_default();
         let connection = self.ready.inventory.connection();
         let lexical = self.ready.lexical_source();
         let demands_json = go_reverse_demand_json(&candidates.target_surfaces);
         let declarations_json =
             go_reverse_target_declarations_json(&candidates.target_declarations);
-        let mut caller_summaries = HashMap::<[u8; 32], Option<i64>>::default();
+        let caller_summaries = &mut memo.caller_summaries;
         let mut forward_groups = HashMap::<(String, String), Vec<GoReverseCandidate>>::default();
         let mut typed_forward_groups = HashSet::default();
         // Go rejects duplicate package-level declarations, so a package's test
@@ -2503,7 +2638,7 @@ impl SelectedResolutionOperation<'_, '_> {
         // Confirm each physical member site once and fan its answer out below.
         let mut member_confirmations = HashMap::<
             SelectedSemanticLocator,
-            BoundedResolution<GoReverseMemberConfirmation>,
+            std::rc::Rc<BoundedResolution<GoReverseMemberConfirmation>>,
         >::default();
         let mut confirmed_answers = Vec::with_capacity(candidates.candidates.len());
         let mut name_candidate_count = 0;
@@ -2523,8 +2658,15 @@ impl SelectedResolutionOperation<'_, '_> {
                     .expect("Go reverse candidate has a source-site locator")
                     .get(),
             );
-            let Some(evidence) = lexical.reference_local_path_evidence(reference, cancellation)?
-            else {
+            let evidence = match memo.lexical.entry(reference) {
+                std::collections::hash_map::Entry::Occupied(entry) => Some(entry.into_mut()),
+                // A missing read may mean cancellation. Never cache it across
+                // independent queries, which can carry different tokens.
+                std::collections::hash_map::Entry::Vacant(entry) => lexical
+                    .reference_local_path_evidence(reference, cancellation)?
+                    .map(|evidence| entry.insert(evidence)),
+            };
+            let Some(evidence) = evidence else {
                 if cancellation.is_cancelled() {
                     return Ok(SelectedResolutionOperationOutcome::Cancelled(
                         cancelled_completion(),
@@ -2574,12 +2716,19 @@ impl SelectedResolutionOperation<'_, '_> {
             // context. File-local paths alone cannot prove that they refer to
             // a package declaration; confirm their binding before using exports.
             if metadata.go_package_qualifier() && targets.is_empty() {
-                let has_import_binding: bool = connection
-                    .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM main.resolution_go_package_imports
+                let has_import_binding =
+                    if let Some(found) = memo.named_imports.get(&candidate.blob_id) {
+                        *found
+                    } else {
+                        let found: bool = connection
+                            .prepare_cached(
+                                "SELECT EXISTS(SELECT 1 FROM main.resolution_go_package_imports
                          WHERE blob_id=?1 AND kind='named')",
-                    )?
-                    .query_row([candidate.blob_id], |row| row.get(0))?;
+                            )?
+                            .query_row([candidate.blob_id], |row| row.get(0))?;
+                        memo.named_imports.insert(candidate.blob_id, found);
+                        found
+                    };
                 if has_import_binding {
                     record_go_reverse_fallback(GoReverseFallbackCause::QualifiedImportMissing);
                     forward_candidate_count += 1;
@@ -2617,13 +2766,24 @@ impl SelectedResolutionOperation<'_, '_> {
                 {
                     let scope_spellings_json =
                         go_reverse_scope_spellings_json(evidence.prefix_scope_spellings());
-                    qualified_import = read_go_reverse_qualified_import(
-                        connection,
-                        context_id,
+                    let key = (
+                        candidate.clone(),
                         caller_summary_id,
-                        &candidate,
-                        &scope_spellings_json,
-                    )?;
+                        scope_spellings_json.clone(),
+                    );
+                    qualified_import = if let Some(binding) = memo.qualified_imports.get(&key) {
+                        binding.clone()
+                    } else {
+                        let binding = read_go_reverse_qualified_import(
+                            connection,
+                            context_id,
+                            caller_summary_id,
+                            &candidate,
+                            &scope_spellings_json,
+                        )?;
+                        memo.qualified_imports.insert(key, binding.clone());
+                        binding
+                    };
                 }
             }
             let reaches_summary = reaches_root_or_package_scope
@@ -2636,17 +2796,39 @@ impl SelectedResolutionOperation<'_, '_> {
                 let confirmation = match member_confirmations.entry(candidate.locator.clone()) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        crate::analyzer::resolution::seam_profile::record_go_reverse_member_access(
-                        );
-                        entry.insert(confirm_member_access(self, &candidate, metadata)?)
+                        let key = (candidate.clone(), metadata, go_reverse_publications(self));
+                        let answer = if let Some(cached) = memo.members.get(&key) {
+                            *confirmation_hits += 1;
+                            cached.rebind(self);
+                            std::rc::Rc::clone(&cached.value)
+                        } else {
+                            crate::analyzer::resolution::seam_profile::record_go_reverse_member_access();
+                            let answer = std::rc::Rc::new(confirm_member_access(
+                                self, &candidate, metadata,
+                            )?);
+                            if !matches!(answer.as_ref(), BoundedResolution::Cancelled { .. }) {
+                                memo.members.insert(
+                                    key,
+                                    GoReverseMemoValue {
+                                        value: std::rc::Rc::clone(&answer),
+                                        publications: go_reverse_publications(self),
+                                    },
+                                );
+                            }
+                            answer
+                        };
+                        entry.insert(answer)
                     }
                 };
-                match &*confirmation {
+                match confirmation.as_ref() {
                     BoundedResolution::Complete {
                         value: GoReverseMemberConfirmation::ReceiverAnchor(member),
                         ..
                     } => {
-                        if *member != target_semantic && candidates.family.contains(*member) {
+                        if *member != target_semantic
+                            && (candidates.family.contains(*member)
+                                || candidates.family.contains(target_semantic))
+                        {
                             // The anchor proves a declaration. Following its
                             // implementations also needs the native call-family
                             // boundary, which a name-only summary cannot prove.
@@ -2778,6 +2960,21 @@ impl SelectedResolutionOperation<'_, '_> {
                 ));
             }
             candidates.sort_by(|left, right| left.locator.cmp(&right.locator));
+            let mode = if typed_forward_groups.contains(&(path.clone(), source_role.clone())) {
+                GoReverseForwardMode::FollowDemandedMounts
+            } else {
+                GoReverseForwardMode::CallerContextOnly
+            };
+            // Exact ordered seeds preserve singleton chunking, per-root work,
+            // role and completion. Different groups still prepare independently.
+            let forward_key = (candidates.clone(), mode, go_reverse_publications(self));
+            if let Some(cached) = memo.forward.get(&forward_key) {
+                *confirmation_hits += 1;
+                cached.rebind(self);
+                completion = completion.combine(&cached.value.1);
+                confirmed_answers.extend(cached.value.0.iter().cloned());
+                continue;
+            }
             let _context_key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(1);
             let prepared = match self.go_file_import_context_with_role(
                 context_id,
@@ -2957,11 +3154,22 @@ impl SelectedResolutionOperation<'_, '_> {
             // Receivers and literal owners need the point path's admission of foreign
             // declaration contexts inside the same shared demand batch.
             let (answers, forward_completion) =
-                if typed_forward_groups.contains(&(path.clone(), source_role.clone())) {
+                if mode == GoReverseForwardMode::FollowDemandedMounts {
                     self.with_go_forward_operation(operation_context, None, confirm)?
                 } else {
                     self.with_go_reverse_confirmation_operation(operation_context, confirm)?
                 };
+            if !cancellation.is_cancelled()
+                && !forward_completion.contains_reason(ResolutionIncompleteReason::Cancelled)
+            {
+                memo.forward.insert(
+                    forward_key,
+                    GoReverseMemoValue {
+                        value: (answers.clone(), forward_completion.clone()),
+                        publications: go_reverse_publications(self),
+                    },
+                );
+            }
             completion = completion.combine(&forward_completion);
             confirmed_answers.extend(answers);
         }
@@ -3071,6 +3279,50 @@ impl SelectedResolutionOperation<'_, '_> {
             }
         }
         drop(lexical_location);
+        // For an interface query, confirm only concrete methods reached by
+        // the candidate sites. Reuse the same method-set/signature checker as
+        // concrete-to-interface queries; a matching spelling is not evidence.
+        let mut implementations = Vec::new();
+        if candidates.family.contains(target_semantic) {
+            let target_identity = self.go_method_identity(context_id, target_semantic)?;
+            let queried_interfaces = candidates
+                .family
+                .interfaces
+                .iter()
+                .filter(|interface| interface.methods.contains(&target_semantic))
+                .map(|interface| interface.owner)
+                .collect::<Vec<_>>();
+            for &semantic in &definition_semantics {
+                if semantic == target_semantic || candidates.family.contains(semantic) {
+                    continue;
+                }
+                let Some(Some(unit)) = owner_units.get(&semantic) else {
+                    continue;
+                };
+                if !unit.is_function()
+                    || Some(unit.identifier())
+                        != target_identity.as_ref().map(|identity| identity.0.as_str())
+                {
+                    continue;
+                }
+                let family = self.go_method_family(context_id, unit, semantic, cancellation)?;
+                if family.contains(target_semantic) {
+                    implementations.push(semantic);
+                }
+                // Unknown satisfaction cannot nominate an implementation, but
+                // must invalidate absence claims for this exact interface.
+                candidates
+                    .family
+                    .interfaces
+                    .extend(family.interfaces.into_iter().filter(|interface| {
+                        queried_interfaces.contains(&interface.owner)
+                            && matches!(
+                                interface.outcome,
+                                crate::analyzer::resolution::GoMethodSatisfaction::Inconclusive(_)
+                            )
+                    }));
+            }
+        }
         for (candidate, answer) in confirmed_answers {
             let owner = answer
                 .reference_owner()
@@ -3102,6 +3354,7 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         self.ready.finish(
             GoReverseConfirmed {
+                implementations,
                 target: candidates.target,
                 family: candidates.family,
                 references,

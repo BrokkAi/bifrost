@@ -2097,9 +2097,30 @@ pub struct PolicyPackActivationReview {
     complete: bool,
     decisions: Vec<PolicyPackDecision>,
     decisions_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    catalogs: Vec<PolicyCatalogIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PolicyCatalogIdentity {
+    name: String,
+    version: u32,
+    sha256: String,
 }
 
 impl PolicyPackActivationReview {
+    pub(crate) fn set_catalogs(&mut self, catalogs: Vec<ResolvedCatalogIdentity>) {
+        self.catalogs = catalogs
+            .into_iter()
+            .map(|catalog| PolicyCatalogIdentity {
+                name: catalog.name.to_string(),
+                version: catalog.version,
+                sha256: catalog.semantic_hash.to_string(),
+            })
+            .collect();
+        super::finding::tighten_vec(&mut self.catalogs);
+    }
+
     pub(crate) fn new_with_mode(
         document_path: String,
         dependency_mode: PolicyDependencyPackActivationMode,
@@ -2119,6 +2140,7 @@ impl PolicyPackActivationReview {
             complete,
             decisions,
             decisions_truncated,
+            catalogs: Vec::new(),
         }
     }
 
@@ -2160,6 +2182,13 @@ impl RetainedSize for PolicyPackActivationReview {
                     .fold(0_usize, usize::saturating_add),
             )
             .saturating_add(retained_extra(&self.decisions))
+            .saturating_add(self.catalogs.capacity() * size_of::<PolicyCatalogIdentity>())
+            .saturating_add(
+                self.catalogs
+                    .iter()
+                    .map(|catalog| catalog.name.capacity() + catalog.sha256.capacity())
+                    .sum::<usize>(),
+            )
     }
 }
 

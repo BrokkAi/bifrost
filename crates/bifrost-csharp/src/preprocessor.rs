@@ -38,6 +38,90 @@ pub struct PreprocessorScan {
     /// True when at least one conditional branch was excluded, which means the
     /// extraction for this file is partial by construction.
     pub has_inactive_regions: bool,
+    /// Conditional directives and their branch spans, including skipped text.
+    pub branches: Vec<ConditionalBranch>,
+}
+
+/// One branch of a conditional chain. Offsets refer to the original source.
+#[derive(Debug, Clone)]
+pub struct ConditionalBranch {
+    pub chain: usize,
+    pub directive_start: usize,
+    pub directive_end: usize,
+    pub end_byte: usize,
+    pub condition: String,
+    /// The directive keyword is retained even for an unconditional else branch.
+    pub directive: String,
+    /// The closing endif range on the chain's final branch, when present.
+    pub closing_directive: Option<(usize, usize)>,
+    pub kept: bool,
+}
+
+impl ConditionalBranch {
+    fn condition_value(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionValue {
+        use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionValue;
+        match (self.directive.as_str(), self.condition.as_str()) {
+            ("else", _) | (_, "true") => ConditionValue::Decided(true),
+            (_, "false") => ConditionValue::Decided(false),
+            _ => ConditionValue::Unknown,
+        }
+    }
+}
+
+impl PreprocessorScan {
+    /// One shared certainty decision per chain, independent of nesting/selection.
+    pub fn chain_activations(
+        &self,
+    ) -> Vec<brokk_bifrost_core::analyzer::structural::conditional_regions::ChainActivation> {
+        use brokk_bifrost_core::analyzer::structural::conditional_regions::{
+            ConditionValue, chain_activation,
+        };
+        let mut chains = Vec::<Vec<ConditionValue>>::new();
+        for branch in &self.branches {
+            if chains.len() <= branch.chain {
+                chains.resize_with(branch.chain + 1, Vec::new);
+            }
+            chains[branch.chain].push(branch.condition_value());
+        }
+        chains.into_iter().map(chain_activation).collect()
+    }
+
+    pub fn conditional_regions(
+        &self,
+        source: &str,
+    ) -> brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions {
+        use brokk_bifrost_core::analyzer::structural::conditional_regions::{
+            Activation, ConditionalRegion, ConditionalRegions,
+        };
+        let chains = self.chain_activations();
+        let mut indices = vec![0; chains.len()];
+        let mut regions = Vec::new();
+        for branch in &self.branches {
+            let index = &mut indices[branch.chain];
+            let activation = chains[branch.chain].branch(*index, branch.condition_value());
+            *index += 1;
+            regions.push(ConditionalRegion {
+                range: branch.directive_end..branch.end_byte,
+                activation,
+                omitted: !branch.kept,
+            });
+            regions.push(ConditionalRegion {
+                range: branch.directive_start..branch.directive_end,
+                activation: Activation::DecidedInactive,
+                omitted: false,
+            });
+            if let Some((start, end)) = branch.closing_directive {
+                regions.push(ConditionalRegion {
+                    range: start..end,
+                    activation: Activation::DecidedInactive,
+                    omitted: false,
+                });
+            }
+        }
+        ConditionalRegions::new(regions, source)
+    }
 }
 
 /// Lexical mode carried across lines while scanning for directive lines.
@@ -70,6 +154,9 @@ pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
     let bytes = source.as_bytes();
     let mut mode = LexMode::Normal;
     let mut stack: Vec<ChainState> = Vec::new();
+    let mut branches: Vec<ConditionalBranch> = Vec::new();
+    let mut branch_stack: Vec<usize> = Vec::new();
+    let mut next_chain = 0;
     let mut any_directive = false;
     let mut has_inactive_regions = false;
     // Byte spans that stay in the parse, accumulated as [start, end) pairs.
@@ -94,7 +181,43 @@ pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
         let is_directive = mode == LexMode::Normal && line.trim_start().starts_with('#');
         if is_directive {
             any_directive = true;
-            apply_directive(line.trim().trim_start_matches('#').trim_start(), &mut stack);
+            let body = line.trim().trim_start_matches('#').trim_start();
+            let (keyword, condition) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+            if matches!(keyword, "elif" | "else" | "endif")
+                && let Some(previous) = branch_stack.pop()
+            {
+                branches[previous].end_byte = line_start;
+                if keyword == "endif" {
+                    branches[previous].closing_directive = Some((line_start, line_end));
+                }
+                if keyword != "endif" {
+                    branch_stack.push(previous);
+                }
+            }
+            apply_directive(body, &mut stack);
+            if matches!(keyword, "if" | "elif" | "else") {
+                let chain = if keyword == "if" {
+                    let chain = next_chain;
+                    next_chain += 1;
+                    chain
+                } else if let Some(previous) = branch_stack.pop() {
+                    branches[previous].chain
+                } else {
+                    next_chain += 1;
+                    next_chain - 1
+                };
+                branch_stack.push(branches.len());
+                branches.push(ConditionalBranch {
+                    chain,
+                    directive_start: line_start,
+                    directive_end: line_end,
+                    end_byte: source.len(),
+                    condition: condition.trim().to_owned(),
+                    directive: keyword.to_owned(),
+                    closing_directive: None,
+                    kept: stack.last().is_some_and(|state| state.branch_active),
+                });
+            }
         } else if region_active {
             kept.push((line_start, line_end));
             // Only active text is lexed, exactly as a C# compiler skips the
@@ -114,12 +237,14 @@ pub fn scan_preprocessor(source: &str) -> PreprocessorScan {
         return PreprocessorScan {
             included_ranges: None,
             has_inactive_regions: false,
+            branches,
         };
     }
 
     PreprocessorScan {
         included_ranges: Some(build_ranges(bytes, &kept)),
         has_inactive_regions,
+        branches,
     }
 }
 
@@ -620,6 +745,63 @@ mod tests {
         assert!(
             scan.included_ranges.is_none(),
             "no line here is a directive line"
+        );
+        let controlled =
+            format!("{source}#if false\nclass Hidden {{}}\n#else\nclass Kept {{}}\n#endif\n");
+        assert_eq!(kept_text(&controlled), format!("{source}class Kept {{}}\n"));
+    }
+
+    #[test]
+    fn lexical_boundaries_preserve_active_declarations() {
+        let source = r####"class C {
+/* comment */
+#if false
+int HiddenBlock;
+#else
+int KeptBlock;
+#endif
+string Escaped = "\"/*";
+#if false
+int HiddenEscape;
+#else
+int KeptEscape;
+#endif
+string Ordinary = "text"; /* real comment
+#if false
+*/
+int KeptComment;
+#if false
+int HiddenOrdinary;
+#else
+int KeptOrdinary;
+#endif
+}"####;
+        let tree = parse_csharp(source).expect("active C# tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let file =
+            brokk_bifrost_core::analyzer::ProjectFile::new(std::env::temp_dir(), "Active.cs");
+        let parsed = crate::declarations::parse_csharp_file(&file, source, &tree);
+        let mut names: Vec<_> = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.identifier())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "C",
+                "Escaped",
+                "KeptBlock",
+                "KeptComment",
+                "KeptEscape",
+                "KeptOrdinary",
+                "Ordinary"
+            ]
         );
     }
 

@@ -1,5 +1,6 @@
 //! PHP structural spec for `query_code`.
 
+use crate::graph_support::php_is_constructor_name;
 use brokk_bifrost_core::analyzer::common::try_node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     CalleeSpineStep, attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent,
@@ -139,10 +140,6 @@ impl PhpCallResultUseIndex {
         end_byte: usize,
     ) -> Result<&CallResultUseSite, CallResultUseOpenReason> {
         self.inner.at_span(start_byte, end_byte)
-    }
-
-    pub fn sites(&self) -> &[CallResultUseSite] {
-        self.inner.sites()
     }
 }
 
@@ -390,7 +387,7 @@ fn is_inside_signed_numeric_wrapper(node: Node<'_>) -> bool {
 fn object_creation_callee(node: Node<'_>) -> Option<Node<'_>> {
     for index in 0..node.named_child_count() {
         let child = node.named_child(index)?;
-        if child.kind() == "arguments" {
+        if child.kind() == "arguments" || child.is_extra() {
             continue;
         }
         return Some(child);
@@ -558,7 +555,7 @@ fn php_is_foreach_binder(foreach: Node<'_>, subject: Node<'_>) -> bool {
     let body = foreach.child_by_field_name("body");
     let mut header = (0..foreach.named_child_count())
         .filter_map(|index| foreach.named_child(index))
-        .filter(|child| body.is_none_or(|body| child.id() != body.id()));
+        .filter(|child| !child.is_extra() && body.is_none_or(|body| child.id() != body.id()));
     // The first header child is the iterated collection; every later one is a
     // binder the loop introduces.
     header.next().is_some_and(|collection| {
@@ -861,7 +858,7 @@ impl StructuralSpec for PhpStructuralSpec {
             && node
                 .child_by_field_name("name")
                 .and_then(|name| name.utf8_text(source.as_bytes()).ok())
-                .is_some_and(|name| name == "__construct")
+                .is_some_and(php_is_constructor_name)
         {
             NormalizedKind::Constructor
         } else {
@@ -1159,6 +1156,135 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "847cee536608: quicksilver round 9 on brokk-bifrost-php: comments are not foreach operands or constructor callees"
+    )]
+    fn comments_do_not_change_header_roles_or_constructor_callees() {
+        for header in [
+            "$rows as $value",
+            "/*lead*/ $rows as $value",
+            "$rows as /*gap*/ $value",
+            "/*lead*/ $rows as /*gap*/ $key => $value",
+            "$rows as [$key, $value]",
+        ] {
+            let source = format!("<?php foreach ({header}) {{}} new /*note*/ Target();");
+            let roles = identifier_roles(&source);
+            assert_eq!(
+                roles.iter().find(|(name, _)| name == "rows").unwrap().1,
+                Some(OccurrenceRole::ValueReference),
+                "{header}"
+            );
+            for (name, role) in &roles {
+                if matches!(name.as_str(), "key" | "value") {
+                    assert_eq!(*role, Some(OccurrenceRole::Binder), "{header}: {name}");
+                }
+            }
+            let tree = parse(&source);
+            let mut pending = vec![tree.root_node()];
+            let mut calls = 0;
+            while let Some(node) = pending.pop() {
+                if node.kind() == "object_creation_expression" {
+                    calls += 1;
+                    let callee = super::object_creation_callee(node).unwrap();
+                    assert_eq!(callee.kind(), "name");
+                    assert_eq!(callee.utf8_text(source.as_bytes()).unwrap(), "Target");
+                }
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(
+                    node,
+                    &mut pending,
+                );
+            }
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn grammar_import_ancestry_and_class_namespace_are_distinct() {
+        use brokk_bifrost_core::analyzer::structural::{
+            kinds::NormalizedKind,
+            occurrences::Namespace,
+            routes::{CuratedExportSurface, RouteHopKind},
+        };
+        let source = "<?php namespace App; use Vendor\\Target as Alias; class Direct {} function f() { new Direct(); new Alias(); }";
+        let tree = parse(source);
+        let mut pending = vec![tree.root_node()];
+        let mut imports = Vec::new();
+        let mut direct = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "name" {
+                let text = node.utf8_text(source.as_bytes()).unwrap();
+                let hop = PHP_STRUCTURAL_SPEC.indirection_relation(
+                    node,
+                    source,
+                    &CuratedExportSurface::Absent,
+                );
+                if matches!(text, "Vendor" | "Target") {
+                    imports.push(hop);
+                }
+                if text == "Direct" {
+                    direct.push(hop);
+                }
+                if text == "Direct" && node.parent().unwrap().kind() == "class_declaration" {
+                    let role = php_occurrence_role(node).unwrap();
+                    assert_eq!(role, OccurrenceRole::DeclarationName);
+                    assert_eq!(
+                        PHP_STRUCTURAL_SPEC.occurrence_namespace(role, Some(NormalizedKind::Class)),
+                        Some(Namespace::Type)
+                    );
+                }
+            }
+            brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(
+                node,
+                &mut pending,
+            );
+        }
+        assert_eq!(
+            imports,
+            [Some(RouteHopKind::Import), Some(RouteHopKind::Import)]
+        );
+        assert_eq!(direct, [None, None]);
+    }
+
+    #[test]
+    fn grammar_numeric_wrappers_and_property_defaults() {
+        use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+        let source = "<?php -1.25; +2.5; - /*gap*/ 3.75; + /*gap*/ 2; -3; 4.5; class C { public int $unset; public int $set = 3; }";
+        let tree = parse(source);
+        let mut pending = vec![tree.root_node()];
+        let mut numbers = Vec::new();
+        let mut assignments = Vec::new();
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "unary_op_expression" | "integer" | "float")
+                && PHP_STRUCTURAL_SPEC.should_extract(node, NormalizedKind::NumericLiteral)
+            {
+                numbers.push(node.utf8_text(source.as_bytes()).unwrap());
+            }
+            if node.kind() == "property_element"
+                && PHP_STRUCTURAL_SPEC.should_extract(node, NormalizedKind::Assignment)
+            {
+                assignments.push(node.utf8_text(source.as_bytes()).unwrap());
+            }
+            brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(
+                node,
+                &mut pending,
+            );
+        }
+        assert_eq!(
+            numbers,
+            [
+                "-1.25",
+                "+2.5",
+                "- /*gap*/ 3.75",
+                "+ /*gap*/ 2",
+                "-3",
+                "4.5",
+                "3"
+            ]
+        );
+        assert_eq!(assignments, ["$set = 3"]);
+    }
+
+    #[test]
     fn member_positions_follow_php_member_fields_only() {
         let source = r#"<?php
             class Service {
@@ -1304,5 +1430,242 @@ mod tests {
             spelled(OccurrenceRole::MemberPosition).contains(&"field"),
             "`$this->field` is a member position"
         );
+    }
+    #[test]
+    fn recovery_grammar_keeps_call_result_use_open_at_exact_byte_spans() {
+        use super::PhpCallResultUseIndex;
+        use brokk_bifrost_core::analyzer::structural::result_use::{
+            CallResultUse, CallResultUseOpenReason,
+        };
+        let source = "<?php /* \u{03c0} */ @((discard())); $x = consume(); return result(); wrapper(argument()); broken($x +); missing(,); trailing() +";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        assert!(root.has_error());
+        let index = PhpCallResultUseIndex::new(root);
+        let mut pending = vec![root];
+        let mut calls = Vec::new();
+        while let Some(node) = pending.pop() {
+            pending.extend(
+                (0..node.named_child_count())
+                    .rev()
+                    .map(|i| node.named_child(i).unwrap()),
+            );
+            if node.kind() == "function_call_expression" {
+                calls.push(node);
+            }
+        }
+        assert_eq!(calls.len(), 8, "{}", root.to_sexp());
+        for (call, (spelling, expected)) in calls.into_iter().zip([
+            ("discard()", CallResultUse::Discarded),
+            ("consume()", CallResultUse::Consumed),
+            ("result()", CallResultUse::Consumed),
+            ("wrapper(argument())", CallResultUse::Discarded),
+            ("argument()", CallResultUse::Consumed),
+            (
+                "broken($x +)",
+                CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax),
+            ),
+            (
+                "missing(,)",
+                CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax),
+            ),
+            (
+                "trailing()",
+                CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax),
+            ),
+        ]) {
+            assert_eq!(call.utf8_text(source.as_bytes()).unwrap(), spelling);
+            let start = source.find(spelling).unwrap();
+            assert_eq!(call.byte_range(), start..start + spelling.len());
+            match spelling {
+                "broken($x +)" => {
+                    let args = call.child_by_field_name("arguments").unwrap();
+                    assert_eq!(args.named_child(1).unwrap().kind(), "ERROR");
+                }
+                "missing(,)" => {
+                    let args = call.child_by_field_name("arguments").unwrap();
+                    let argument = args.named_child(0).unwrap();
+                    assert_eq!(argument.kind(), "argument");
+                    let missing = argument.named_child(0).unwrap();
+                    assert_eq!(missing.kind(), "name");
+                    assert!(missing.is_missing());
+                }
+                "trailing()" => assert!(call.parent().unwrap().is_error()),
+                _ => assert!(!call.has_error()),
+            }
+            let site = index.at_span(start, start + spelling.len()).unwrap();
+            assert_eq!(
+                (site.start_byte, site.end_byte),
+                (start, start + spelling.len())
+            );
+            assert_eq!(site.default_use(), expected, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn recovery_grammar_retains_only_structured_membership_names() {
+        use crate::graph::resolver::is_recovered_membership_reference;
+        for (expression, kind, names) in [
+            ("$x->field", "member_access_expression", vec!["field"]),
+            (
+                "$x?->safe",
+                "nullsafe_member_access_expression",
+                vec!["safe"],
+            ),
+            ("$x->call()", "member_call_expression", vec!["call"]),
+            (
+                "$x?->invoke()",
+                "nullsafe_member_call_expression",
+                vec!["invoke"],
+            ),
+            ("A\\B::go()", "scoped_call_expression", vec!["A", "B"]),
+            ("$x->$dynamic", "member_access_expression", vec![]),
+            ("garbage", "name", vec![]),
+            ("function ($binder) {}", "anonymous_function", vec![]),
+        ] {
+            let source = format!("<?php ( {expression}");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let root = tree.root_node();
+            let error = root.named_child(1).unwrap();
+            assert!(error.is_error(), "{}", root.to_sexp());
+            let recovered = error.named_child(0).unwrap();
+            assert_eq!(recovered.kind(), kind);
+            if kind.starts_with("member_") || kind.starts_with("nullsafe_") {
+                let name = recovered.child_by_field_name("name").unwrap();
+                assert_eq!(
+                    name.kind(),
+                    if names.is_empty() {
+                        "variable_name"
+                    } else {
+                        "name"
+                    }
+                );
+            }
+            if kind == "scoped_call_expression" {
+                assert_eq!(
+                    recovered.child_by_field_name("scope").unwrap().kind(),
+                    "qualified_name"
+                );
+            }
+            let mut pending = vec![recovered];
+            let mut actual = Vec::new();
+            let mut visited_names = 0;
+            while let Some(node) = pending.pop() {
+                pending.extend(
+                    (0..node.named_child_count())
+                        .rev()
+                        .map(|i| node.named_child(i).unwrap()),
+                );
+                if node.kind() == "name" {
+                    visited_names += 1;
+                    let mut ancestor = node.parent();
+                    while ancestor.is_some_and(|n| !n.is_error()) {
+                        ancestor = ancestor.unwrap().parent();
+                    }
+                    assert_eq!(ancestor, Some(error));
+                    if is_recovered_membership_reference(node) {
+                        let text = node.utf8_text(source.as_bytes()).unwrap();
+                        let start = source.find(text).unwrap();
+                        assert_eq!(node.byte_range(), start..start + text.len());
+                        actual.push(text);
+                    }
+                }
+            }
+            assert!(visited_names > 0);
+            assert_eq!(actual, names, "{source}");
+        }
+    }
+
+    #[test]
+    fn literal_grammar_preserves_php_single_quote_values_and_leaves_other_forms_unknown() {
+        let source = concat!(
+            r#"<?php
+'plain';
+'quote\' slash\\';
+'literal\n\t\xE9\101\u{41}';
+'caf"#,
+            "\u{00e9}",
+            r#"';
+'dollar $x';
+"plain";
+"\n\t\x41\101\u{41}";
+"\xE9\351";
+"unknown\q";
+"interpolated $x";
+<<<TXT
+line\n\t\x41\101\u{41}
+TXT;
+<<<'RAW'
+line\n $x
+RAW;
+"#
+        );
+        let tree = parse(source);
+        let root = tree.root_node();
+        let expected = [
+            ("string", Some("plain")),
+            ("string", Some("quote' slash\\")),
+            ("string", Some(r"literal\n\t\xE9\101\u{41}")),
+            ("string", Some("caf\u{00e9}")),
+            ("string", Some("dollar $x")),
+            ("encapsed_string", None),
+            ("encapsed_string", None),
+            ("encapsed_string", None),
+            ("encapsed_string", None),
+            ("encapsed_string", None),
+            ("heredoc", None),
+            ("nowdoc", None),
+        ];
+        assert_eq!(root.named_child_count(), expected.len() + 1);
+        for (i, (kind, value)) in expected.into_iter().enumerate() {
+            let statement = root.named_child(i + 1).unwrap();
+            assert_eq!(statement.kind(), "expression_statement");
+            let literal = statement.named_child(0).unwrap();
+            assert_eq!(literal.kind(), kind);
+            if i == 1 {
+                assert_eq!(literal.named_child(1).unwrap().kind(), "escape_sequence");
+                assert_eq!(literal.named_child(3).unwrap().kind(), "escape_sequence");
+            }
+            if i == 6 {
+                assert!(
+                    (0..literal.named_child_count()).all(|j| literal
+                        .named_child(j)
+                        .unwrap()
+                        .kind()
+                        == "escape_sequence")
+                );
+            }
+            if i == 9 {
+                assert_eq!(literal.named_child(1).unwrap().kind(), "variable_name");
+            }
+            if kind == "heredoc" || kind == "nowdoc" {
+                assert_eq!(
+                    literal.child_by_field_name("value").unwrap().kind(),
+                    if kind == "heredoc" {
+                        "heredoc_body"
+                    } else {
+                        "nowdoc_body"
+                    }
+                );
+            }
+            // PHP only unescapes backslash and quote in single quotes. Other
+            // grammar kinds have no supported scalar extractor yet; in particular,
+            // byte escapes above ASCII must not invent UTF-8 scalar values.
+            assert_eq!(
+                PHP_STRUCTURAL_SPEC
+                    .string_literal_value(literal, source)
+                    .as_deref(),
+                value
+            );
+            assert!(!PHP_STRUCTURAL_SPEC.string_literal_value_may_be_absent(literal, source));
+        }
     }
 }

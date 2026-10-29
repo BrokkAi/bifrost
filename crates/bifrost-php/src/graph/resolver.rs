@@ -2,7 +2,7 @@ use crate::aliases::{PhpFileContext, resolve_php_type};
 use crate::graph::PhpGraphSource;
 use crate::graph::syntax::static_member_parts;
 use crate::graph_support::PhpSource;
-use crate::graph_support::php_is_interface;
+use crate::graph_support::{php_is_constructor, php_is_interface};
 use crate::structural::php_namespace_name_declares;
 use brokk_bifrost_core::analyzer::model::Range;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
@@ -32,6 +32,15 @@ pub struct TargetSpec {
 }
 
 impl TargetSpec {
+    pub(crate) fn matches_member_name(&self, name: Option<&str>) -> bool {
+        name.is_some_and(|name| match self.kind {
+            TargetKind::Method | TargetKind::Constructor | TargetKind::Function => {
+                name.eq_ignore_ascii_case(&self.member_name)
+            }
+            _ => name == self.member_name,
+        })
+    }
+
     pub fn from_target(php: &dyn PhpSource, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self {
@@ -46,7 +55,10 @@ impl TargetSpec {
 
         let parent = php.parent_of(target);
         let kind = if target.is_function() {
-            if parent.is_some() && target.identifier() == "__construct" {
+            if parent
+                .as_ref()
+                .is_some_and(|owner| php_is_constructor(target, owner, target.package_name()))
+            {
                 TargetKind::Constructor
             } else if parent.is_some() {
                 TargetKind::Method
@@ -136,7 +148,9 @@ impl PhpHierarchyIndex {
             .filter(|unit| unit.is_class())
             .filter(|unit| self.is_subtype(php, &unit.fq_name(), owner_fq_name))
             .flat_map(|owner| php.direct_children(&owner))
-            .filter(|child| child.is_function() && child.identifier() == spec.member_name)
+            .filter(|child| {
+                child.is_function() && child.identifier().eq_ignore_ascii_case(&spec.member_name)
+            })
             .collect()
     }
 }
@@ -150,7 +164,7 @@ fn class_is_subtype_of_owner(
     let mut visited = HashSet::default();
     while let Some(candidate) = stack.pop() {
         let candidate_fq_name = candidate.fq_name();
-        if candidate_fq_name == owner_fq_name {
+        if candidate_fq_name.eq_ignore_ascii_case(owner_fq_name) {
             return true;
         }
         if visited.insert(candidate_fq_name) {
@@ -166,7 +180,7 @@ pub fn receiver_type_matches(
     owner: &str,
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
-    if receiver_fq_name == owner {
+    if receiver_fq_name.eq_ignore_ascii_case(owner) {
         return true;
     }
     hierarchy.is_subtype(php, receiver_fq_name, owner)
@@ -186,18 +200,24 @@ pub fn static_receiver_matches(
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
     match receiver {
-        "self" | "static" => receiver_is_enclosing_subtype(
-            php,
-            analyzer,
-            file,
-            start,
-            end,
-            line_starts,
-            owner,
-            hierarchy,
-        ),
-        "parent" => enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
-            .is_some_and(|enclosing_owner| hierarchy.is_subtype(php, &enclosing_owner, owner)),
+        receiver
+            if receiver.eq_ignore_ascii_case("self") || receiver.eq_ignore_ascii_case("static") =>
+        {
+            receiver_is_enclosing_subtype(
+                php,
+                analyzer,
+                file,
+                start,
+                end,
+                line_starts,
+                owner,
+                hierarchy,
+            )
+        }
+        receiver if receiver.eq_ignore_ascii_case("parent") => {
+            enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
+                .is_some_and(|enclosing_owner| hierarchy.is_subtype(php, &enclosing_owner, owner))
+        }
         _ => resolve_php_type(receiver, ctx)
             .is_some_and(|fq| receiver_type_matches(php, &fq, owner, hierarchy)),
     }
@@ -272,6 +292,9 @@ pub fn is_bare_constant_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    if parent.kind() == "argument" && parent.child_by_field_name("name") == Some(node) {
+        return false;
+    }
     !matches!(
         parent.kind(),
         "function_call_expression"
@@ -391,15 +414,6 @@ pub fn is_recovered_membership_reference(node: Node<'_>) -> bool {
     false
 }
 
-pub fn is_function_declaration_name(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "function_definition" | "method_declaration" | "anonymous_function_creation"
-        )
-    })
-}
-
 fn semantic_parent(node: Node<'_>) -> Option<Node<'_>> {
     let mut candidate = node;
     while let Some(parent) = candidate.parent() {
@@ -410,4 +424,102 @@ fn semantic_parent(node: Node<'_>) -> Option<Node<'_>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod grammar_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn qualified_name_leaves_retain_the_grammar_envelope_and_role() {
+        for (expression, wrapper, role) in [
+            (
+                "new \\Vendor\\Package\\Widget()",
+                "object_creation_expression",
+                "type",
+            ),
+            (
+                "\\Vendor\\Package\\make()",
+                "function_call_expression",
+                "function",
+            ),
+            (
+                "\\Vendor\\Package\\Factory::make()",
+                "scoped_call_expression",
+                "member",
+            ),
+            (
+                "\\Vendor\\Package\\Box::VALUE",
+                "class_constant_access_expression",
+                "member",
+            ),
+        ] {
+            let source = format!("<?php {expression};");
+            let tree = crate::aliases::parse_php_tree(&source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mut stack = vec![tree.root_node()];
+            let mut leaves = 0;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "qualified_name" {
+                    assert_eq!(node.parent().unwrap().kind(), wrapper);
+                    let mut names = vec![node];
+                    while let Some(leaf) = names.pop() {
+                        if leaf.kind() == "name" {
+                            leaves += 1;
+                            assert_eq!(qualified_candidate_node(leaf, || true), Some(node));
+                            assert_eq!(semantic_parent(leaf), node.parent());
+                            assert_eq!(is_object_creation_type_name(leaf), role == "type");
+                            assert_eq!(is_function_call_name(leaf), role == "function");
+                            assert_eq!(is_member_or_scoped_access_name(leaf), role == "member");
+                        }
+                        for i in 0..leaf.named_child_count() {
+                            names.push(leaf.named_child(i).unwrap());
+                        }
+                    }
+                    continue;
+                }
+                for i in 0..node.named_child_count() {
+                    stack.push(node.named_child(i).unwrap());
+                }
+            }
+            assert!(
+                leaves >= 3,
+                "qualified grammar path must be exercised: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_separates_callable_and_constant_name_roles() {
+        let source = "<?php go(); echo go; Box::VALUE; Box::go(); $obj->go();";
+        let tree = crate::aliases::parse_php_tree(source).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut roles = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "name" {
+                roles.push((
+                    node_text(node, source),
+                    node.parent().unwrap().kind(),
+                    is_bare_constant_reference(node),
+                    is_member_or_scoped_access_name(node),
+                ));
+            }
+            for i in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(i).unwrap());
+            }
+        }
+        assert_eq!(
+            roles,
+            vec![
+                ("go", "function_call_expression", false, false),
+                ("go", "echo_statement", true, false),
+                ("Box", "class_constant_access_expression", false, true),
+                ("VALUE", "class_constant_access_expression", false, true),
+                ("Box", "scoped_call_expression", false, true),
+                ("go", "scoped_call_expression", false, true),
+                ("obj", "variable_name", true, false),
+                ("go", "member_call_expression", false, true),
+            ]
+        );
+    }
 }

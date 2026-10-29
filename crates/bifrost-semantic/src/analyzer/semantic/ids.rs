@@ -191,6 +191,8 @@ impl WorkspaceMountId {
 pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic-ir";
 
 /// Current language-neutral semantic IR schema revision.
+/// Revision 46 adds deferred member selection on a receiver place/value,
+/// preserving static pointer depth until query-time method/field lookup.
 /// Revision 45 adds call receiver type facts: the written receiver type of a
 /// method call as the file alone proves it, so a query can apply model
 /// contracts at the call port instead of the lowerer applying them during
@@ -250,7 +252,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// that anything else changed. A checked-in golden expectation that embeds one
 /// of those ids must be re-blessed with `BIFROST_BLESS=1` in the same change;
 /// the code-query tutorial pages elide them (#5016).
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 45;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 46;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that

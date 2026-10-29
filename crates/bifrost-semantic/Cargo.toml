@@ -25,16 +25,16 @@ randomized-hash = ["brokk-bifrost-core/randomized-hash"]
 test-support = ["brokk-bifrost-core/test-support"]
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2" }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.2" }
-brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.14.2" }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.2" }
-brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.2" }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.2" }
-brokk-bifrost-php = { path = "../bifrost-php", version = "=0.14.2" }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.2" }
-brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.14.2" }
-brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.2" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3" }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.3" }
+brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.14.3" }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.3" }
+brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.3" }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.3" }
+brokk-bifrost-php = { path = "../bifrost-php", version = "=0.14.3" }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.3" }
+brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.14.3" }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.3" }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 git2 = { version = "0.20.2", default-features = false }
 moka = { version = "0.12.11", features = ["sync"] }
@@ -58,13 +58,14 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 tree-sitter = "0.25.10"
 jsonschema = { version = "0.48.0", default-features = false }
 serde_json_canonicalizer = "0.3.2"
+workspace-hack.workspace = true
 
 [dev-dependencies]
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2", features = ["test-support"] }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.2", features = ["test-support"] }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.2", features = ["test-support"] }
-brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.2", features = ["test-support"] }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.2", features = ["test-support"] }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.2", features = ["test-support"] }
-brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.3", features = ["test-support"] }

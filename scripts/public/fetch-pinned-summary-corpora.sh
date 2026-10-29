@@ -78,6 +78,6 @@ if [[ -n "${jvm_sources}" && ! -d "${jvm_sources}" ]]; then
   exit 1
 fi
 
-cargo run --locked --release --features release-tooling \
+cargo run --locked --profile measure --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- summary-corpus-join \
   "${pins_path}" "${codeql_models}" "${joern_source}" "${report_path}" ${jvm_sources:+"${jvm_sources}"}

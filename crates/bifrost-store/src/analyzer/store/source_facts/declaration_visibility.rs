@@ -54,21 +54,25 @@ pub(super) fn insert_source_declaration_metadata_bridges_tx(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     validate_metadata_links(facts, metadata_links);
-    let mut metadata_bridge_rows = tx.prepare_cached(
-        "INSERT INTO source_declaration_metadata_bridges(
-           blob_id, declaration_id, unit_key, metadata_ordinal
-         ) VALUES(?1, ?2, ?3, ?4)",
-    )?;
+    let mut metadata_bridge_rows = Vec::new();
     for &(declaration, unit_key, metadata_ordinal) in metadata_links {
         check_cancelled(cancellation)?;
-        metadata_bridge_rows.execute(params![
+        metadata_bridge_rows.push((
             blob_id,
             i64::from(declaration.get()),
             unit_key,
             metadata_ordinal,
-        ])?;
+        ));
     }
-    drop(metadata_bridge_rows);
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_declaration_metadata_bridges(
+           blob_id, declaration_id, unit_key, metadata_ordinal
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &metadata_bridge_rows,
+        cancellation,
+    )?;
     Ok(())
 }
 
@@ -89,20 +93,24 @@ pub(super) fn insert_source_declaration_visibility_facts_tx(
     validate_inputs(facts, visibilities);
     check_cancelled(cancellation)?;
 
-    let mut visibility_rows = tx.prepare_cached(
-        "INSERT INTO source_declaration_visibilities(
-           blob_id, declaration_id, visibility
-         ) VALUES(?1, ?2, ?3)",
-    )?;
+    let mut visibility_rows = Vec::new();
     for fact in visibilities {
         check_cancelled(cancellation)?;
-        visibility_rows.execute(params![
+        visibility_rows.push((
             blob_id,
             i64::from(fact.declaration.get()),
             fact.visibility.label(),
-        ])?;
+        ));
     }
-    drop(visibility_rows);
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_declaration_visibilities(
+           blob_id, declaration_id, visibility
+         ) VALUES",
+        "(?, ?, ?)",
+        &visibility_rows,
+        cancellation,
+    )?;
 
     check_cancelled(cancellation)?;
     tx.execute(
@@ -130,19 +138,24 @@ pub(super) fn insert_source_native_declaration_bridges_tx(
 ) -> Result<()> {
     validate_native_declaration_bridges(facts);
     check_cancelled(cancellation)?;
-    let mut rows = tx.prepare_cached(
-        "INSERT INTO source_native_declaration_bridges(
-           blob_id, source_site, declaration_id
-         ) VALUES(?1, ?2, ?3)",
-    )?;
+    let mut rows = Vec::new();
     for &(source_site, declaration) in &facts.native_declaration_sources {
         check_cancelled(cancellation)?;
-        rows.execute(params![
+        rows.push((
             blob_id,
             i64::from(source_site.get()),
             i64::from(declaration.get()),
-        ])?;
+        ));
     }
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_native_declaration_bridges(
+           blob_id, source_site, declaration_id
+         ) VALUES",
+        "(?, ?, ?)",
+        &rows,
+        cancellation,
+    )?;
     Ok(())
 }
 

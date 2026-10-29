@@ -45,6 +45,15 @@ pub const MAX_RETAINED_POLICY_EVALUATIONS: usize = 64;
 /// per file revision forever.
 pub const POLICY_ROW_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
 
+/// How many snapshots one unit keeps attestations for.
+///
+/// Each check that reuses a unit attests it on that check's head, so a unit
+/// that survives a long chain of checks would collect one row per commit. A
+/// later check asks about its own base and head, which are almost always the
+/// most recent snapshots any run verified, so the oldest attestations are the
+/// ones dropped.
+pub const MAX_UNIT_SNAPSHOTS: usize = 8;
+
 /// Which partition of a workspace one persisted unit covers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PolicyUnitPartitionRow {
@@ -195,15 +204,32 @@ pub struct PolicyUnitRow {
     pub product: String,
     pub read_set_digest: [u8; 32],
     pub reads: Vec<ReadKey>,
-    /// The content identity of the workspace snapshot whose name-index answers
-    /// this unit read.
+    /// The content identities of the workspace snapshots this unit's
+    /// name-index answers are known to hold on.
     ///
     /// A unit's name-index reads are proved against the names that moved
     /// between two snapshots, which holds only for index answers of the first
-    /// of them. The reader compares this with the snapshots its own comparison
-    /// is between and recomputes a unit whose index answers came from anywhere
-    /// else.
-    pub content_identity: [u8; 32],
+    /// of them. The reader looks for one of the snapshots its own comparison is
+    /// between here and recomputes a unit whose index answers are attested on
+    /// neither. A publication names at least one; a load returns the most
+    /// recent [`MAX_UNIT_SNAPSHOTS`].
+    pub snapshots: Vec<[u8; 32]>,
+}
+
+/// A loaded unit that a later run verified on one more snapshot.
+///
+/// Verification proves that the unit's name-index answers on `verified_on`
+/// are its answers on each of `snapshots` too. The row it applies to is found
+/// by its key and read-set digest, and only a row already attested on
+/// `verified_on` gains the new snapshots: a row another run published under
+/// the same key since this run loaded it holds answers of some other snapshot,
+/// which this verification says nothing about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyUnitAttestation {
+    pub key: PolicyUnitRowKey,
+    pub read_set_digest: [u8; 32],
+    pub verified_on: [u8; 32],
+    pub snapshots: Vec<[u8; 32]>,
 }
 
 /// The shared key of one base-evaluation context.
@@ -313,8 +339,7 @@ pub struct LoadedPolicyEvaluationPolicy {
 const UNIT_COLUMNS: &str = "units.unit_id, units.policy_semantic_hash, units.family, \
      units.partition_kind, units.seed_rel_path, units.seed_blob_oid, units.partition_digest, \
      units.lang, units.configuration_fingerprint, units.active_model_set_hash, \
-     units.engine_epoch, units.product_kind, json(units.product), units.read_set_digest, \
-     units.content_identity";
+     units.engine_epoch, units.product_kind, json(units.product), units.read_set_digest";
 
 impl AnalyzerStore {
     /// Publish `units`, replacing any row already published under the same key.
@@ -344,6 +369,46 @@ impl AnalyzerStore {
             }
             tx.commit()?;
             Ok(written)
+        })
+    }
+
+    /// Record that loaded units were verified on more snapshots.
+    ///
+    /// An attestation whose row was replaced or retired since it was loaded
+    /// applies to nothing and is dropped: the row now under its key was
+    /// computed by another run, on answers this verification did not check.
+    /// Returns how many units gained attestations.
+    pub fn attest_policy_units(&self, attestations: Vec<PolicyUnitAttestation>) -> Result<usize> {
+        if attestations.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut attested = 0;
+            for attestation in &attestations {
+                let Some(unit_id) = unit_id_for_key(&tx, &attestation.key)? else {
+                    continue;
+                };
+                let verified = tx
+                    .prepare_cached(
+                        "SELECT 1 FROM policy_units AS units
+                         JOIN policy_unit_snapshots AS snapshots
+                           ON snapshots.unit_id = units.unit_id
+                         WHERE units.unit_id = ?1 AND units.read_set_digest = ?2
+                           AND snapshots.content_identity = ?3",
+                    )?
+                    .exists(params![
+                        unit_id,
+                        attestation.read_set_digest.as_slice(),
+                        attestation.verified_on.as_slice(),
+                    ])?;
+                if verified {
+                    insert_unit_snapshots(&tx, unit_id, &attestation.snapshots)?;
+                    attested += 1;
+                }
+            }
+            tx.commit()?;
+            Ok(attested)
         })
     }
 
@@ -404,16 +469,36 @@ impl AnalyzerStore {
         let sql = policy_unit_batch_sql(&values);
         let mut statement = conn.prepare_cached(&sql)?;
         let mut rows = statement.query(params_from_iter(parameters.iter()))?;
+        let mut keys_by_id: HashMap<i64, PolicyUnitRowKey> = HashMap::new();
         while let Some(row) = rows.next()? {
-            let (unit_id, unit) = decode_unit_row(row)?;
-            let reads = load_unit_reads(&conn, unit_id)?;
-            found.insert(
-                unit.key.clone(),
-                PolicyUnitRow {
-                    reads,
-                    ..unit.clone()
-                },
-            );
+            let (unit_id, mut unit) = decode_unit_row(row)?;
+            unit.reads = load_unit_reads(&conn, unit_id)?;
+            keys_by_id.insert(unit_id, unit.key.clone());
+            found.insert(unit.key.clone(), unit);
+        }
+        if !keys_by_id.is_empty() {
+            // One statement for the whole batch's snapshots, newest first, so
+            // each unit keeps its most recent attestations.
+            let ids = serde_json::to_string(&keys_by_id.keys().collect::<Vec<_>>())
+                .expect("unit ids serialize");
+            let mut statement = conn.prepare_cached(POLICY_UNIT_SNAPSHOTS_SQL)?;
+            let mut rows = statement.query(params![ids])?;
+            while let Some(row) = rows.next()? {
+                let unit_id = row.get::<_, i64>(0)?;
+                let snapshot = row.get::<_, Vec<u8>>(1)?;
+                let snapshot = <[u8; 32]>::try_from(snapshot.as_slice()).map_err(|_| {
+                    StoreError::new(format!(
+                        "policy unit {unit_id} is attested on a content identity of {} bytes",
+                        snapshot.len()
+                    ))
+                })?;
+                let unit = found
+                    .get_mut(&keys_by_id[&unit_id])
+                    .expect("every loaded unit id names a loaded unit");
+                if unit.snapshots.len() < MAX_UNIT_SNAPSHOTS {
+                    unit.snapshots.push(snapshot);
+                }
+            }
         }
         Ok(keys.iter().map(|key| found.remove(key)).collect())
     }
@@ -659,6 +744,15 @@ pub(crate) fn policy_unit_batch_sql(values: &str) -> String {
     )
 }
 
+/// The snapshots every unit of one lookup batch is attested on, newest first.
+///
+/// `?1` is a JSON array of unit ids; each id is one seek on the leading column
+/// of the snapshot table's primary key.
+pub(crate) const POLICY_UNIT_SNAPSHOTS_SQL: &str = "SELECT unit_id, content_identity
+     FROM policy_unit_snapshots
+     WHERE unit_id IN (SELECT value FROM json_each(?1))
+     ORDER BY unit_id, attestation DESC";
+
 /// The evaluation lookup, shared with its query-plan pin.
 pub(crate) const POLICY_EVALUATION_LOOKUP_SQL: &str = "SELECT evaluation_id, resolved_commit,
             policy_set_digest, unreliable_detail, aggregate_unreliable, base_content_identity
@@ -768,10 +862,10 @@ fn write_unit(
            seed_blob_oid, partition_digest, seed_blob_id, lang,
            configuration_fingerprint, active_model_set_hash, engine_epoch,
            completion, budget_mode, product_kind, product, read_set_digest,
-           published_at, content_identity
+           published_at
          ) VALUES(
            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'complete',
-           'exhaustive', ?12, jsonb(?13), ?14, ?15, ?16
+           'exhaustive', ?12, jsonb(?13), ?14, ?15
          )",
         params![
             key.policy_semantic_hash,
@@ -789,15 +883,19 @@ fn write_unit(
             unit.product,
             unit.read_set_digest.as_slice(),
             published_at,
-            unit.content_identity.as_slice(),
         ],
     )?;
     let unit_id = conn.last_insert_rowid();
+    assert!(
+        !unit.snapshots.is_empty(),
+        "a published unit's index answers hold on the snapshot that computed it"
+    );
+    insert_unit_snapshots(conn, unit_id, &unit.snapshots)?;
     let mut intern = conn.prepare_cached(
         "INSERT INTO policy_read_keys(
            key_digest, kind, family, languages, rel_path, name, index_key,
-           blob_oid, subject, start_byte, end_byte, digest, site_ordinal
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(key_digest) DO NOTHING",
     )?;
     let mut find =
@@ -822,12 +920,45 @@ fn write_unit(
             columns.end_byte,
             columns.digest,
             columns.site_ordinal,
+            columns.decl_kind,
+            columns.decl_signature,
         ])?;
         let read_id = find.query_row(params![columns.key_digest.as_slice()], |row| {
             row.get::<_, i64>(0)
         })?;
         member.execute(params![unit_id, read_id])?;
     }
+    Ok(())
+}
+
+/// Attest `unit_id` on `snapshots`, then keep only its most recent
+/// [`MAX_UNIT_SNAPSHOTS`] attestations.
+///
+/// Each snapshot takes the unit's next attestation number, including one the
+/// unit already held, so the numbers order attestations by recency without a
+/// clock that would tie within one run.
+fn insert_unit_snapshots(
+    conn: &rusqlite::Connection,
+    unit_id: i64,
+    snapshots: &[[u8; 32]],
+) -> rusqlite::Result<()> {
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO policy_unit_snapshots(unit_id, content_identity, attestation)
+         VALUES(?1, ?2, (SELECT coalesce(max(attestation), 0) + 1
+                         FROM policy_unit_snapshots WHERE unit_id = ?1))
+         ON CONFLICT(unit_id, content_identity) DO UPDATE SET attestation = excluded.attestation",
+    )?;
+    for snapshot in snapshots {
+        insert.execute(params![unit_id, snapshot.as_slice()])?;
+    }
+    conn.prepare_cached(
+        "DELETE FROM policy_unit_snapshots
+         WHERE unit_id = ?1 AND attestation < (
+           SELECT attestation FROM policy_unit_snapshots WHERE unit_id = ?1
+           ORDER BY attestation DESC LIMIT 1 OFFSET ?2
+         )",
+    )?
+    .execute(params![unit_id, MAX_UNIT_SNAPSHOTS as i64 - 1])?;
     Ok(())
 }
 
@@ -885,7 +1016,6 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
     let product_kind = row.get::<_, String>(11)?;
     let product = row.get::<_, String>(12)?;
     let read_set_digest = row.get::<_, Vec<u8>>(13)?;
-    let content_identity = row.get::<_, Vec<u8>>(14)?;
     let partition = match partition_kind.as_str() {
         "seed" | "binding" | "assert_file" | "root" | "selector" => {
             let blob = Oid::from_str(&seed_blob_oid).map_err(|error| {
@@ -945,12 +1075,6 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
             read_set_digest.len()
         ))
     })?;
-    let content_identity = <[u8; 32]>::try_from(content_identity.as_slice()).map_err(|_| {
-        StoreError::new(format!(
-            "policy unit {unit_id} has a content identity of {} bytes",
-            content_identity.len()
-        ))
-    })?;
     Ok((
         unit_id,
         PolicyUnitRow {
@@ -966,7 +1090,7 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
             product,
             read_set_digest,
             reads: Vec::new(),
-            content_identity,
+            snapshots: Vec::new(),
         },
     ))
 }
@@ -987,7 +1111,7 @@ fn load_unit_reads(conn: &rusqlite::Connection, unit_id: i64) -> Result<Vec<Read
     let mut statement = conn.prepare_cached(
         "SELECT keys.key_digest, keys.kind, keys.family, keys.languages, keys.rel_path,
                 keys.name, keys.index_key, keys.blob_oid, keys.subject,
-                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal
+                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature
          FROM policy_unit_reads AS membership
          JOIN policy_read_keys AS keys ON keys.read_id = membership.read_id
          WHERE membership.unit_id = ?1",
@@ -1138,6 +1262,8 @@ mod tests {
                 LookupQuestion::Declaration {
                     rel_path: Box::from("src/Main.java"),
                     fq_name: Box::from("com.example.Main#run"),
+                    kind: brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+                    signature: None,
                 },
                 digest,
             ),
@@ -1146,6 +1272,8 @@ mod tests {
                 LookupQuestion::Declaration {
                     rel_path: Box::from("src/Main.java"),
                     fq_name: Box::from("com.example.Main#run"),
+                    kind: brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+                    signature: Some("run(int)".to_owned()),
                 },
                 digest,
             ),
@@ -1154,6 +1282,8 @@ mod tests {
                 LookupQuestion::Declaration {
                     rel_path: Box::from("src/Main.java"),
                     fq_name: Box::from("com.example.Main#run"),
+                    kind: brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+                    signature: None,
                 },
                 digest,
             ),
@@ -1231,7 +1361,7 @@ mod tests {
             product: "{\"rows\":[]}".to_string(),
             read_set_digest: *read_set_digest(&reads).digest().as_bytes(),
             reads,
-            content_identity: SNAPSHOT,
+            snapshots: vec![SNAPSHOT],
         }
     }
 
@@ -1251,7 +1381,7 @@ mod tests {
             product: "{\"findings\":[]}".to_string(),
             read_set_digest: *read_set_digest(&reads).digest().as_bytes(),
             reads,
-            content_identity: SNAPSHOT,
+            snapshots: vec![SNAPSHOT],
         };
 
         let written = store
@@ -1267,6 +1397,66 @@ mod tests {
         };
         assert_eq!(loaded.product_kind, "assert_file");
         assert_eq!(loaded.key, assert_file_key("src/Main.java"));
+    }
+
+    /// An attestation adds snapshots only to the row it verified: the same
+    /// key and read set, already attested on the snapshot it was verified
+    /// from. A unit keeps its most recent attestations, and republishing a key
+    /// starts its row over with only the snapshots the publication names.
+    #[test]
+    fn an_attestation_extends_only_the_row_it_verified_and_keeps_the_newest() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let reads = vec![ReadKey::Epoch(StableDigest::sha256(b"epoch"))];
+        let unit = unit_row("src/Main.java", reads.clone());
+        store.publish_policy_units(vec![unit.clone()]).unwrap();
+        let attestation = |verified_on: [u8; 32], snapshots: Vec<[u8; 32]>| PolicyUnitAttestation {
+            key: seed_key("src/Main.java"),
+            read_set_digest: unit.read_set_digest,
+            verified_on,
+            snapshots,
+        };
+        let loaded_snapshots = || {
+            let [loaded] = store
+                .policy_units_for_keys(&[seed_key("src/Main.java")])
+                .unwrap()
+                .try_into()
+                .expect("one key, one answer");
+            let mut snapshots = loaded.expect("the unit is published").snapshots;
+            snapshots.sort();
+            snapshots
+        };
+
+        let attested = store
+            .attest_policy_units(vec![
+                attestation(SNAPSHOT, vec![[8; 32]]),
+                attestation([9; 32], vec![[10; 32]]),
+                PolicyUnitAttestation {
+                    read_set_digest: [0; 32],
+                    ..attestation(SNAPSHOT, vec![[11; 32]])
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            attested, 1,
+            "only the attestation verified on a held snapshot applies"
+        );
+        assert_eq!(loaded_snapshots(), vec![SNAPSHOT, [8; 32]]);
+
+        let many = (20..20 + MAX_UNIT_SNAPSHOTS as u8)
+            .map(|byte| [byte; 32])
+            .collect::<Vec<_>>();
+        store
+            .attest_policy_units(vec![attestation([8; 32], many.clone())])
+            .unwrap();
+        let kept = loaded_snapshots();
+        assert_eq!(kept.len(), MAX_UNIT_SNAPSHOTS, "{kept:?}");
+        assert!(
+            many.iter().all(|snapshot| kept.contains(snapshot)),
+            "the newest attestations are kept: {kept:?}"
+        );
+
+        store.publish_policy_units(vec![unit]).unwrap();
+        assert_eq!(loaded_snapshots(), vec![SNAPSHOT]);
     }
 
     #[test]
@@ -1575,7 +1765,7 @@ mod tests {
             product: "{\"rows\":[]}".to_string(),
             read_set_digest: *read_set_digest(&reads).digest().as_bytes(),
             reads,
-            content_identity: SNAPSHOT,
+            snapshots: vec![SNAPSHOT],
         };
 
         store

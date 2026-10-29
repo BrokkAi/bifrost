@@ -17,8 +17,13 @@ use std::sync::Arc;
 
 impl RubyAnalyzer {
     pub(crate) fn types_by_identifier(&self) -> &HashMap<String, Vec<CodeUnit>> {
-        self.types_by_identifier
-            .get_or_init(|| build_ruby_types_by_identifier(self))
+        self.types_by_identifier.get_or_init(|| {
+            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+                self,
+                "ruby.types_by_identifier",
+                || build_ruby_types_by_identifier(self),
+            )
+        })
     }
 }
 
@@ -31,10 +36,19 @@ impl TypeHierarchyProvider for RubyAnalyzer {
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
+        let persistent_fill_guard =
+            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+                self,
+                "crates/bifrost-ruby-analysis/src/analyzer/ruby/hierarchy.rs",
+            );
 
         let ancestors = ruby_direct_ancestors(self, code_unit);
-        self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        {
+            let cache_key = code_unit.clone();
+            let cache_value = Arc::new(ancestors.clone());
+            persistent_fill_guard.installed("direct_ancestors");
+            self.direct_ancestors.insert(cache_key, cache_value);
+        };
         ancestors
     }
 
@@ -52,7 +66,11 @@ impl TypeHierarchyProvider for RubyAnalyzer {
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
         descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
-            build_direct_descendant_index(self, self, scope)
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                build_direct_descendant_index(self, self, scope)
+            })
+            .ok()
+            .flatten()
         })
     }
 }

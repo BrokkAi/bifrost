@@ -1,0 +1,207 @@
+App: assembly=Some("Product.Assembly")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace System.Numerics alias=None origin=item
+    static System.Math alias=None origin=item
+    alias System.Environment alias=Some("Env") origin=item
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: ["Friend.Assembly"]
+Default: assembly=Some("Default")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Framework: assembly=Some("Framework")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Mixed: assembly=Some("Mixed")
+  usings complete=false
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Web: assembly=Some("Web")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace System.Net.Http.Json alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Builder alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Hosting alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Http alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Routing alias=None origin=implicit
+    namespace Microsoft.Extensions.Configuration alias=None origin=implicit
+    namespace Microsoft.Extensions.DependencyInjection alias=None origin=implicit
+    namespace Microsoft.Extensions.Hosting alias=None origin=implicit
+    namespace Microsoft.Extensions.Logging alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Browser: assembly=Some("Browser")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Microsoft.Extensions.Configuration alias=None origin=implicit
+    namespace Microsoft.Extensions.DependencyInjection alias=None origin=implicit
+    namespace Microsoft.Extensions.Logging alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+MixedWeb: assembly=Some("MixedWeb")
+  usings complete=false
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Worker: assembly=Some("Worker")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Microsoft.Extensions.Configuration alias=None origin=implicit
+    namespace Microsoft.Extensions.DependencyInjection alias=None origin=implicit
+    namespace Microsoft.Extensions.Hosting alias=None origin=implicit
+    namespace Microsoft.Extensions.Logging alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Razor: assembly=Some("Razor")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Razor10: assembly=Some("Razor10")
+  usings complete=false
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Razor10Disabled: assembly=Some("Razor10Disabled")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Blazor: assembly=Some("Blazor")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.IO alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Net.Http alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace Microsoft.Extensions.Configuration alias=None origin=implicit
+    namespace Microsoft.Extensions.DependencyInjection alias=None origin=implicit
+    namespace Microsoft.Extensions.Logging alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Desktop: assembly=Some("Desktop")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace System alias=None origin=implicit
+    namespace System.Collections.Generic alias=None origin=implicit
+    namespace System.Linq alias=None origin=implicit
+    namespace System.Threading alias=None origin=implicit
+    namespace System.Threading.Tasks alias=None origin=implicit
+    namespace System.Drawing alias=None origin=implicit
+    namespace System.Windows.Forms alias=None origin=implicit
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Unknown: assembly=None
+  usings complete=false
+    namespace Shared.Configuration alias=None origin=item
+    namespace Shared.Targets alias=None origin=item
+  friends complete=false: []
+Conditional: assembly=None
+  usings complete=false
+    namespace Shared.Configuration alias=None origin=item
+    namespace Shared.Targets alias=None origin=item
+  friends complete=false: []
+gaps:
+  unsupported_project_items Blazor/Blazor.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Blazor/Blazor.csproj a non-SDK project's transitive reference flow is not modeled
+  unsupported_project_items Browser/Browser.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Browser/Browser.csproj a non-SDK project's transitive reference flow is not modeled
+  unresolved_assembly_name Conditional/Conditional.csproj AssemblyName has a dynamic value or condition
+  unresolved_global_usings Conditional/Conditional.csproj ImplicitUsings has a dynamic value or condition
+  unresolved_global_usings Conditional/Conditional.csproj unsupported using item: [("Include", "Conditional.Namespace")]
+  unresolved_internals_visible_to Conditional/Conditional.csproj unsupported internalsvisibleto item: [("Include", "Conditional.Friend")]
+  unsupported_project_items Desktop/Desktop.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Desktop/Desktop.csproj a non-SDK project's transitive reference flow is not modeled
+  unresolved_global_usings Mixed/Mixed.csproj TargetFrameworkIdentifier does not establish the System.Net.Http condition
+  unsupported_project_items MixedWeb/MixedWeb.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow MixedWeb/MixedWeb.csproj a non-SDK project's transitive reference flow is not modeled
+  unresolved_global_usings MixedWeb/MixedWeb.csproj TargetFramework does not establish the Web SDK browser condition
+  unsupported_project_items Razor/Razor.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Razor/Razor.csproj a non-SDK project's transitive reference flow is not modeled
+  unsupported_project_items Razor10/Razor10.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Razor10/Razor10.csproj a non-SDK project's transitive reference flow is not modeled
+  unresolved_global_usings Razor10/Razor10.csproj .NET 10 Razor _AddEmbeddedValidationAttribute can add Microsoft.Extensions.Validation.Embedded based on unevaluated Razor inputs
+  unsupported_project_items Razor10Disabled/Razor10Disabled.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Razor10Disabled/Razor10Disabled.csproj a non-SDK project's transitive reference flow is not modeled
+  unsupported_project_items Unknown/Unknown.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Unknown/Unknown.csproj a non-SDK project's transitive reference flow is not modeled
+  unknown_implicit_usings_sdk Unknown/Unknown.csproj unmodeled SDK Unknown.Sdk
+  unsupported_project_items Web/Web.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Web/Web.csproj a non-SDK project's transitive reference flow is not modeled
+  unsupported_project_items Worker/Worker.csproj an Import, a condition, a Target, a dynamic item, an unmodeled SDK or an unsupported default-item property
+  unproven_transitive_reference_flow Worker/Worker.csproj a non-SDK project's transitive reference flow is not modeled

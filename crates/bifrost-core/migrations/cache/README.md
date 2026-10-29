@@ -41,6 +41,12 @@ the base each evaluation analyzed. A unit's name-index reads are verified only
 against what moved since that snapshot, so older units, which cannot prove
 their snapshot, are discarded with the evaluations that name them.
 
+Migration `0218-policy-unit-snapshots.sql` replaces that single identity with
+`policy_unit_snapshots`, one row per snapshot a unit's name-index answers are
+attested on. A check that verifies a unit adds its head (and its base, when no
+probe names a moved name), so a chain of checks, each based on the previous
+head, keeps verifying the unit instead of recomputing it.
+
 Migration `0147-resolved-file-import-edges.sql` adds the durable, indexed
 workspace file-import graph and its provenance and route-dependency rows.
 Migration `0148-incremental-file-import-edges.sql` adds source identities and
@@ -266,3 +272,15 @@ three tables that persist procedure-dispatch read keys. It names one call among
 the procedure's call rows at the same relative interval, which lowering can
 produce several of (a Python `finally` body per exit path). Units, summaries
 and surfaces that recorded the previous key are discarded and recomputed.
+
+Migration `0213-drop-redundant-reverse-gap-site-index.sql` removes the redundant Rust
+reverse-gap site index. The WITHOUT ROWID primary key already serves its
+`(blob_id, site)` lookups with the same covering columns.
+
+Migration `0215-sample-seal-validation.sql` samples per-blob publication
+consistency checks through the writer's deterministic `bifrost_seal_validates`
+SQL function. Tests and `test-support` builds validate every blob; production
+validates blob IDs divisible by 64, or every blob when
+`BIFROST_SEAL_VALIDATION=all` is set before the first decision. Immutability and
+publication state-order guards remain unconditional. Every writable store
+connection must register the function; a missing registration fails the seal.

@@ -6,9 +6,9 @@ use crate::graph::PhpGraphSource;
 use crate::graph::hits::{push_hit, push_hit_range, push_import_hit, push_self_receiver_hit_range};
 use crate::graph::resolver::{
     PhpHierarchyIndex, TargetKind, TargetSpec, enclosing_owner_fq_name_at,
-    is_const_declaration_name, is_function_call_name, is_function_declaration_name,
-    is_member_or_scoped_access_name, is_object_creation_type_name, node_text,
-    qualified_candidate_text, receiver_type_matches, static_receiver_matches,
+    is_const_declaration_name, is_function_call_name, is_member_or_scoped_access_name,
+    is_object_creation_type_name, node_text, qualified_candidate_text, receiver_type_matches,
+    static_receiver_matches,
 };
 use crate::graph::syntax::{
     assignment_parts, assignment_value_type_fq_name, captured_local_scope_bindings,
@@ -107,59 +107,51 @@ fn scan_node(
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    if node.kind() == "namespace_use_declaration" {
-        record_namespace_use_import_hit(node, analyzer, file, source, line_starts, spec, hits);
-        return;
-    }
-    if node.kind() == "comment" {
-        return;
-    }
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "namespace_use_declaration" {
+            record_namespace_use_import_hit(node, analyzer, file, source, line_starts, spec, hits);
+            continue;
+        }
+        if node.kind() == "comment" {
+            continue;
+        }
 
-    if matches!(
-        node.kind(),
-        "namespace_name" | "qualified_name" | "relative_scope"
-    ) {
-        handle_candidate(
-            php,
-            node,
-            analyzer,
-            file,
-            source,
-            line_starts,
-            contexts,
-            spec,
-            hits,
-        );
-        return;
-    }
+        if matches!(
+            node.kind(),
+            "namespace_name" | "qualified_name" | "relative_scope"
+        ) {
+            handle_candidate(
+                php,
+                node,
+                analyzer,
+                file,
+                source,
+                line_starts,
+                contexts,
+                spec,
+                hits,
+            );
+            continue;
+        }
 
-    if matches!(node.kind(), "name" | "variable_name") {
-        handle_candidate(
-            php,
-            node,
-            analyzer,
-            file,
-            source,
-            line_starts,
-            contexts,
-            spec,
-            hits,
-        );
-    }
+        if matches!(node.kind(), "name" | "variable_name") {
+            handle_candidate(
+                php,
+                node,
+                analyzer,
+                file,
+                source,
+                line_starts,
+                contexts,
+                spec,
+                hits,
+            );
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_node(
-            php,
-            child,
-            analyzer,
-            file,
-            source,
-            line_starts,
-            contexts,
-            spec,
-            hits,
-        );
+        for i in (0..node.named_child_count()).rev() {
+            stack.push(node.named_child(i).expect("valid named child"));
+        }
     }
 }
 
@@ -381,9 +373,6 @@ fn is_function_reference(
     if !is_function_call_name(node) {
         return false;
     }
-    if is_member_or_scoped_access_name(node) || is_function_declaration_name(node) {
-        return false;
-    }
     resolve_php_function(&raw, ctx)
         .is_some_and(|candidates| bound_callable(&candidates, analyzer) == spec.target_fq_name)
 }
@@ -576,16 +565,15 @@ fn contains_member_reference_candidate(root: Node<'_>, source: &str, spec: &Targ
         "member_access_expression"
         | "nullsafe_member_access_expression"
         | "member_call_expression"
-        | "nullsafe_member_call_expression" => {
+        | "nullsafe_member_call_expression" => spec.matches_member_name(
             node.child_by_field_name("name")
-                .and_then(|member| literal_member_identifier(member, source))
-                == Some(spec.member_name.as_str())
-        }
+                .and_then(|member| literal_member_identifier(member, source)),
+        ),
         "class_constant_access_expression"
         | "scoped_call_expression"
         | "scoped_property_access_expression" => {
             static_member_parts(node).is_some_and(|(_, member)| {
-                static_member_identifier(node, member, source) == Some(spec.member_name.as_str())
+                spec.matches_member_name(static_member_identifier(node, member, source))
             })
         }
         _ => false,
@@ -671,7 +659,7 @@ fn record_member_hit(
             ) else {
                 return;
             };
-            if literal_member_identifier(member_node, source) != Some(spec.member_name.as_str()) {
+            if !spec.matches_member_name(literal_member_identifier(member_node, source)) {
                 return;
             }
             if receiver_expression_type(
@@ -715,9 +703,7 @@ fn record_member_hit(
             let Some((receiver_node, member_node)) = static_member_parts(node) else {
                 return;
             };
-            if static_member_identifier(node, member_node, source)
-                != Some(spec.member_name.as_str())
-            {
+            if !spec.matches_member_name(static_member_identifier(node, member_node, source)) {
                 return;
             }
             let receiver_text = node_text(receiver_node, source);
@@ -737,7 +723,8 @@ fn record_member_hit(
             }
             // `self::m()` / `static::m()` are same-owner own-type static calls;
             // `parent::m()` and an explicit class name are external.
-            let same_owner = matches!(receiver_text, "self" | "static");
+            let same_owner = receiver_text.eq_ignore_ascii_case("self")
+                || receiver_text.eq_ignore_ascii_case("static");
             push_member_hit(
                 member_node,
                 analyzer,

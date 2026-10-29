@@ -706,7 +706,19 @@ How each language binds its modeled API:
   two-argument requests carry the effect. Construction with one or two
   arguments has a reviewed effect-free summary. Reassigning the local to an
   unknown value keeps a later request unresolved. A workspace class also
-  spelled `Net::HTTP` resolves inside the workspace.
+  spelled `Net::HTTP` resolves inside the workspace. A helper reached through
+  a workspace member call concludes only when the receiver is exact and its
+  method table is closed. The receiver must be a constant path, a
+  `Const.new(...)` expression, or a local that only ever holds
+  `Const.new(...)` of one class. The class and every ancestor must be declared
+  once in the workspace, and every superclass and mixin must resolve. No
+  ancestor may define `method_missing`, another dispatch hook, `new`, or
+  `allocate`. The caller's file and the files that declare those classes must
+  not rewrite methods: no `define_method` of the called name, `alias_method`,
+  `class_eval`, `send`, refinement, or dynamic `require`. A call on `self`,
+  a parameter, or an instance variable stays open, because a subclass can
+  answer it. So does `Const.new` on a class that declares no `initialize`.
+  Rewrites spelled in other files are outside the proof's scope.
 - **C#.** Awaited calls of `SendAsync` propagate the effect. Unexpanded
   deferred callbacks and other arities keep the absence claim open. Parameter
   and explicitly typed local receivers bind; field and property receivers do
@@ -1234,9 +1246,10 @@ set-oriented run identity.
 
 A taint policy can declare a sanitizer directly under `:sanitizers`. This is
 different from a `sanitize` effect in a semantic-pack procedure summary: the
-policy-local form selects the sanitizer call, binds its declared input and
+transfer form selects the sanitizer call, binds its declared input and
 output ports, and removes only the labels listed in `:removes` from that
-declared value flow.
+declared value flow. A conditional form instead removes those labels from a
+call operand on an accepting branch.
 
 The selector is part of the sanitizer's identity. When a policy means one
 specific declaration, select that declaration and lift it to its proven call
@@ -1267,6 +1280,54 @@ non-reaching sanitizer call, or a different argument does not receive the
 removal. If the selected sanitizer is unresolved or ambiguous, the policy
 run must remain non-conclusive (or retain the finding); an empty finding set
 alone is never evidence that an uncertain sanitizer made the value safe.
+
+For a conditional sanitizer, replace `:input` and `:output` with
+`:when (result true|false|nil|non-nil [:index k])` and
+`:sanitizes receiver` or `:sanitizes (argument :index k)`. The optional result
+index is zero-based and belongs inside the `result` record. Supply it for a
+multi-result call. The two forms cannot be mixed.
+
+This short test contract illustrates the conditional form with a
+policy-defined label. Choose the intended declaration's proven call sites
+when a policy needs to distinguish same-named predicates.
+
+```lisp
+:sanitizers
+  (endpoint-set :entries [
+    (sanitizer :id prefix
+      :selector (rql :schema-version 1
+        (language go (call :callee (name "HasPrefix"))))
+      :when (result true)
+      :sanitizes (argument :index 0)
+      :requires [(argument :index 1 :constant true)]
+      :removes [example.checked])])
+```
+
+The contract removes only `example.checked` from argument zero on the
+accepting branch; any other labels remain. `:requires` is optional. When
+present, it must be non-empty, without duplicate records, and all its items
+must hold. Each item is `(receiver ATTR)` or `(argument :index k ATTR)`, with
+exactly one of these attributes:
+
+- `:constant true` requires a compile-time constant.
+- `:equals LIT` compares its decoded value with a string, number, or Boolean
+  literal. The language must decode string literal payloads; if it cannot,
+  the guard declines.
+- `:result-of SELECTOR` requires a result of a call matched by the selector,
+  using the same inline `rql` or deferred `rql-file` forms as `:selector`.
+
+When a requirement follows a local, that local must have a unique single
+writer that dominates the tested call. The condition itself must test the
+call result directly: storing it in `ok` and testing `ok` later declines.
+The sanitized carrier must have a unique binding origin and a resolved type
+whose referent is immutable. The guard declines when the language cannot
+report the carrier's type, or when the type is unknown or its referent is
+mutable. Indices must be within the call's arity where it is known.
+
+A decline leaves the flow unsanitized. If a finding is still reported for
+that flow, its related-location evidence explains
+`sanitizer prefix declined: REASON`. This note is advisory: it is never a
+finding of its own and does not itself make the result incomplete.
 
 ### Policy-local transforms: carry a value across an exact seam
 
@@ -3997,12 +4058,16 @@ The `incremental` section reports what the run reused. `base` is `reused` when
 the run served the base findings from a stored base evaluation, and `evaluated`
 when the run evaluated the base itself. `policies` holds one entry per policy
 that ran, with the policy's `mode` (`sliced` when it ran unit by unit, `full`
-when it was evaluated whole) and four counts for the working tree:
-`units_total`, `units_reused`, `units_recomputed`, and `units_unbounded`. Two
-more counts, `base_units_reused` and `base_units_recomputed`, describe the base
-evaluation of the same policy in the same run, and `base_widen_reason` says why
-that evaluation ran in full when it did. They are zero when the run evaluated no
-base.
+when it was evaluated whole) and five counts for the working tree:
+`units_total`, `units_reused`, `units_recomputed`, `units_unbounded`, and
+`lookups_replayed`. `lookups_replayed` is the number of distinct lookup
+questions (callers, dispatch, declaration facts and the like) the run asked the
+working tree again to check that a stored unit still holds. The run widens with
+`verification_budget_exceeded` when that number would pass the policy's file
+budget. Three more counts, `base_units_reused`, `base_units_recomputed`, and
+`base_lookups_replayed`, describe the base evaluation of the same policy in the
+same run, and `base_widen_reason` says why that evaluation ran in full when it
+did. They are zero when the run evaluated no base.
 
 A policy evaluated in full also carries `widen_reason`, one of these typed
 reasons:
@@ -4015,12 +4080,17 @@ reasons:
   `absent-member`, which needs a workspace field index. The policy runs whole
   before any file units are attempted, avoiding repeated index preparation.
   These bindings forgo per-file reuse; recorded base findings can still be reused.
-- `unit_unbounded`: a unit read something the run could not name, so its
-  inputs cannot be verified later.
+- `unit_unbounded`: a unit read something the run could not name, or its
+  result depended on the state of the run rather than on the code alone: it
+  was cancelled, it ran out of a budget shared with other work, the source
+  changed while it ran, or a provider or the store failed. A later run could
+  not verify its inputs, or could get a different answer from the same code.
 - `unit_not_exhaustive`: a unit ran under a bounded budget or was truncated,
   so its result is not a complete answer for its own part.
-- `unit_diagnostics`: a unit reported a query diagnostic, and a diagnostic does
-  not combine across units.
+- `unit_diagnostics`: a unit reported a diagnostic whose code can depend on the
+  state of the run, such as cancellation, an exhausted budget or a provider
+  failure. Diagnostics about the code itself, such as an unsupported
+  construct, combine across units and do not widen the policy.
 - `merged_limit_reached`: the merged result reached a cap that a whole
   evaluation applies globally, so the whole evaluation might have truncated
   somewhere else.
@@ -4138,8 +4208,16 @@ small part of a repository:
 bifrost --root . --policy-file policies/security.rqlp --sources src/auth
 ```
 
+`--policy-cost-hints <path>` reads a JSON object mapping non-empty policy IDs
+to non-negative integer milliseconds. Parallel batches start unknown policies
+first, then hinted policies from longest to shortest; hints never change the report.
+
 `--policy-timings` adds each policy's elapsed evaluation time to its report
-work metrics. `bifrost scan [PATH]` runs the selected external catalog's default
+work metrics as `evaluation.elapsed_ms`. A policy that ran unit by unit also
+gets four disjoint parts of that time: `units.prefetch_ms` (loading stored
+units), `units.verify_ms` (checking their reads, without lookup replay),
+`units.lookup_replay_ms` (asking lookups again), and `units.recompute_ms`
+(evaluating units that could not be reused). `bifrost scan [PATH]` runs the selected external catalog's default
 policies and prints the activated pack versions and catalog hash on
 stderr before the report. [Scan a Codebase](/scan-a-codebase/) walks through a
 first scan and explains why it can exit 2.

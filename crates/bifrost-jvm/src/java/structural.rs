@@ -3,6 +3,7 @@
 //! This maps tree-sitter-java node types to Bifrost's normalized structural
 //! vocabulary and extracts role edges from AST fields.
 
+use super::string_literal::decoded_string_literal_value;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_decorators_under, attach_positional_argument_roles, attach_role_with_derived_name,
     attach_terminal_callee, field_name_in_parent, first_named_child, nearest_ancestor, node_range,
@@ -33,8 +34,11 @@ use brokk_bifrost_core::analyzer::structural::result_use::{
 use brokk_bifrost_core::analyzer::structural::routes::{
     CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
-use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::structural::spec::{
+    ImplicitScopeBinder, RoleSink, StructuralSpec,
+};
 use brokk_bifrost_core::analyzer::tree_walk::last_named_child;
+use brokk_bifrost_core::analyzer::tree_walk::named_children_iter;
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -278,6 +282,20 @@ pub fn java_parent_statement_body(parent: Node<'_>, node: Node<'_>) -> bool {
 }
 
 pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
+    ("binary_expression", NormalizedKind::BinaryExpression),
+    ("ternary_expression", NormalizedKind::If),
+    ("switch_expression", NormalizedKind::Switch),
+    ("switch_label", NormalizedKind::Case),
+    ("switch_rule", NormalizedKind::Case),
+    ("labeled_statement", NormalizedKind::Label),
+    ("break_statement", NormalizedKind::Break),
+    ("continue_statement", NormalizedKind::Continue),
+    ("cast_expression", NormalizedKind::Cast),
+    ("instanceof_expression", NormalizedKind::InstanceOf),
+    ("array_access", NormalizedKind::Subscript),
+    ("array_creation_expression", NormalizedKind::ArrayCreation),
+    ("unary_expression", NormalizedKind::UnaryExpression),
+    ("synchronized_statement", NormalizedKind::Lock),
     ("line_comment", NormalizedKind::Comment),
     ("block_comment", NormalizedKind::Comment),
     ("method_invocation", NormalizedKind::Call),
@@ -514,7 +532,7 @@ fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
 /// - An enhanced-for variable is in effect over the statement in its `body`
 ///   field. The iterable expression is outside that interval, so it cannot
 ///   resolve to the variable being declared.
-fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+pub(super) fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
     let form = nearest_ancestor(binder, |kind| {
         matches!(
             kind,
@@ -530,6 +548,12 @@ fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
                 | "type_pattern"
         )
     })?;
+    // A varargs name sits inside a variable_declarator, but it introduces a
+    // parameter just like a name directly inside a formal_parameter.
+    let form = form
+        .parent()
+        .filter(|parent| parent.kind() == "spread_parameter")
+        .unwrap_or(form);
     match form.kind() {
         "formal_parameter"
         | "spread_parameter"
@@ -613,14 +637,146 @@ impl StructuralSpec for JavaStructuralSpec {
         true
     }
 
+    fn supports_string_literal_value(&self) -> bool {
+        true
+    }
+
+    fn string_literal_value_may_be_absent(&self, node: Node<'_>, source: &str) -> bool {
+        // The shared decoder also abstains on unsupported escapes and UTF-16
+        // surrogate values that cannot be represented as a Rust string.
+        node.kind() == "string_literal" && decoded_string_literal_value(node, source).is_none()
+    }
+
+    fn string_literal_value(&self, node: Node<'_>, source: &str) -> Option<String> {
+        decoded_string_literal_value(node, source)
+    }
+
+    fn declaration_attributes(
+        &self,
+        node: Node<'_>,
+        _source: &str,
+    ) -> Option<brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes> {
+        let type_kind = match node.kind() {
+            "class_declaration" => Some("class"),
+            "interface_declaration" => Some("interface"),
+            "enum_declaration" => Some("enum"),
+            "record_declaration" => Some("record"),
+            "annotation_type_declaration" => Some("annotation"),
+            _ => None,
+        };
+        let owner = match node.kind() {
+            "variable_declarator" => node.parent()?,
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "formal_parameter"
+            | "spread_parameter" => node,
+            _ if type_kind.is_some() => node,
+            _ => return None,
+        };
+        Some(
+            brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes {
+                modifiers: super::declarations::java_modifier_keywords(owner)
+                    .map(str::to_owned)
+                    .collect(),
+                type_kind: type_kind.map(str::to_owned),
+            },
+        )
+    }
+
+    fn refine_kind(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        _enclosing: Option<NormalizedKind>,
+        _source: &str,
+        _context: &brokk_bifrost_core::analyzer::structural::callable::CallSiteContext,
+    ) -> NormalizedKind {
+        if node.kind() == "variable_declarator" && node.child_by_field_name("value").is_none() {
+            return NormalizedKind::Declaration;
+        }
+        if kind == NormalizedKind::BinaryExpression
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| {
+                    matches!(operator.kind(), "==" | "!=" | "<" | ">" | "<=" | ">=")
+                })
+        {
+            NormalizedKind::Comparison
+        } else {
+            kind
+        }
+    }
+
+    fn statement_fact_syntax(
+        &self,
+    ) -> Option<&dyn brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax>
+    {
+        Some(self)
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         JAVA_KIND_TABLE
     }
 
-    fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
-        kind != NormalizedKind::Assignment
-            || node.kind() != "variable_declarator"
-            || node.child_by_field_name("value").is_some()
+    fn supports_kind(&self, kind: NormalizedKind) -> bool {
+        brokk_bifrost_core::analyzer::structural::spec::supports_kind_from_table(
+            kind,
+            &[
+                NormalizedKind::SyntaxError,
+                NormalizedKind::Comparison,
+                NormalizedKind::Declaration,
+                NormalizedKind::RegexPattern,
+                NormalizedKind::RegexSequence,
+                NormalizedKind::RegexGroup,
+                NormalizedKind::RegexAlternation,
+                NormalizedKind::RegexCharacterClass,
+                NormalizedKind::RegexCharacterRange,
+                NormalizedKind::RegexQuantifier,
+                NormalizedKind::RegexAnchor,
+                NormalizedKind::RegexEscape,
+                NormalizedKind::RegexLiteral,
+                NormalizedKind::RegexWildcard,
+                NormalizedKind::RegexRiskHostname,
+                NormalizedKind::RegexRiskRange,
+                NormalizedKind::RegexRiskBadTag,
+                NormalizedKind::RegexRiskExponential,
+                NormalizedKind::RegexIncomplete,
+                NormalizedKind::RegexRiskBackspaceEscape,
+                NormalizedKind::RegexRiskDuplicateClassCharacter,
+                NormalizedKind::RegexRiskUnmatchableCaret,
+                NormalizedKind::RegexRiskUnmatchableDollar,
+                NormalizedKind::RegexRiskIncompleteSpecialGroup,
+                NormalizedKind::RegexRiskPolynomial,
+            ],
+            self.kind_table(),
+        )
+    }
+
+    fn embedded_leaf_facts(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        source: &str,
+        _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Vec<brokk_bifrost_core::analyzer::structural::spec::EmbeddedLeafFact> {
+        // An enclosing top-level type contains every lexical constant source
+        // used by its calls, including constants outside the call expression.
+        if kind == NormalizedKind::Class && node.parent().is_some_and(|p| p.kind() == "program") {
+            super::regex::file_facts(node, source)
+        } else {
+            Vec::new()
+        }
+    }
+
+    // A valueless variable_declarator is not filtered here: should_extract
+    // sees the table kind (Assignment) before refine_kind runs, and
+    // refine_kind records that declarator as a Declaration.
+    fn should_extract(&self, node: Node<'_>, _kind: NormalizedKind) -> bool {
+        node.kind() != "switch_label"
+            || !node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "switch_rule")
     }
 
     fn generator_construct(
@@ -685,6 +841,32 @@ impl StructuralSpec for JavaStructuralSpec {
         &SUPPORT
     }
 
+    fn implicit_scope_binders<'tree>(
+        &self,
+        scope_node: Node<'tree>,
+    ) -> Option<Vec<ImplicitScopeBinder<'tree>>> {
+        if scope_node.kind() != "compact_constructor_declaration" {
+            return Some(Vec::new());
+        }
+        // JLS 8.10.4.2: the compact constructor inherits the record header's
+        // component parameters.
+        let record = scope_node.parent()?.parent()?;
+        if record.kind() != "record_declaration" {
+            return None;
+        }
+        let components =
+            super::declarations::java_record_components(record.child_by_field_name("parameters")?)
+                .ok()?;
+        Some(
+            components
+                .into_iter()
+                .map(|component| ImplicitScopeBinder {
+                    name: component.name,
+                })
+                .collect(),
+        )
+    }
+
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         java_binding_activation(binder, scope)
     }
@@ -713,6 +895,77 @@ impl StructuralSpec for JavaStructuralSpec {
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         if let Some(role) = java_occurrence_role(node) {
             sink.occurrence_role(node, role);
+        }
+        use brokk_bifrost_core::analyzer::structural::adapter_helpers::attach_field_roles;
+        let fields: &[(Role, &str)] = match kind {
+            NormalizedKind::BinaryExpression | NormalizedKind::Comparison => &[
+                (Role::Left, "left"),
+                (Role::Right, "right"),
+                (Role::Operator, "operator"),
+            ],
+            NormalizedKind::Assignment => &[(Role::Operator, "operator")],
+            NormalizedKind::If => &[
+                (Role::Test, "condition"),
+                (Role::Consequence, "consequence"),
+                (Role::Alternative, "alternative"),
+            ],
+            NormalizedKind::Switch => &[(Role::Test, "condition"), (Role::Body, "body")],
+            NormalizedKind::Cast => &[(Role::Type, "type"), (Role::Value, "value")],
+            NormalizedKind::InstanceOf => &[
+                (Role::Operand, "left"),
+                (Role::Type, "right"),
+                (Role::Binding, "name"),
+                (Role::Binding, "pattern"),
+            ],
+            NormalizedKind::Subscript => &[(Role::Object, "array"), (Role::Indices, "index")],
+            NormalizedKind::ArrayCreation => &[
+                (Role::Type, "type"),
+                (Role::Dimensions, "dimensions"),
+                (Role::Value, "value"),
+            ],
+            NormalizedKind::UnaryExpression => {
+                &[(Role::Operator, "operator"), (Role::Operand, "operand")]
+            }
+            NormalizedKind::Lock => &[(Role::Body, "body")],
+            _ => &[],
+        };
+        attach_field_roles(sink, node, fields, expression_name_node);
+        match kind {
+            NormalizedKind::Lock => {
+                if let Some(value) = named_children_iter(node)
+                    .find(|child| child.kind() == "parenthesized_expression")
+                {
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Value,
+                        brokk_bifrost_core::analyzer::tree_walk::expression_target_node(value),
+                        expression_name_node,
+                    );
+                }
+            }
+            NormalizedKind::Label | NormalizedKind::Break | NormalizedKind::Continue => {
+                for child in named_children_iter(node) {
+                    if child.kind() == "identifier" {
+                        sink.role_named(Role::Label, child, child);
+                    } else if !child.is_extra() {
+                        sink.role(Role::Body, child);
+                    }
+                }
+            }
+            NormalizedKind::Case => {
+                for child in named_children_iter(node).filter(|child| !child.is_extra()) {
+                    if node.kind() == "switch_rule" && child.kind() == "switch_label" {
+                        for test in named_children_iter(child).filter(|test| !test.is_extra()) {
+                            sink.role(Role::Test, test);
+                        }
+                    } else if node.kind() == "switch_rule" {
+                        sink.role(Role::Body, child);
+                    } else {
+                        sink.role(Role::Test, child);
+                    }
+                }
+            }
+            _ => {}
         }
         match kind {
             NormalizedKind::Call => {
@@ -773,7 +1026,10 @@ impl StructuralSpec for JavaStructuralSpec {
                     attach_role_with_derived_name(sink, Role::Object, object, expression_name_node);
                 }
             }
-            NormalizedKind::Method | NormalizedKind::Constructor | NormalizedKind::Class => {
+            NormalizedKind::Declaration
+            | NormalizedKind::Method
+            | NormalizedKind::Constructor
+            | NormalizedKind::Class => {
                 if let Some(name) = node.child_by_field_name("name") {
                     sink.set_name(name);
                 }
@@ -894,6 +1150,244 @@ pub fn java_pattern_binding_name(node: Node<'_>) -> Option<Node<'_>> {
         }
         _ => None,
     }
+}
+
+/// Reverse the existing pattern inventory hook for lexical identity lookup.
+pub fn java_pattern_binding_declaration(name: Node<'_>) -> Option<Node<'_>> {
+    let pattern = name.parent()?;
+    (java_pattern_binding_name(pattern) == Some(name)).then_some(pattern)
+}
+
+/// A switch arm is a separate declaration space; conditions in a loop cannot
+/// leak bindings to another iteration or beyond that loop without a flow proof.
+pub fn java_pattern_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "variable_declarator"
+            | "switch_rule"
+            | "switch_block_statement_group"
+            | "lambda_expression"
+            | "while_statement"
+            | "do_statement"
+            | "for_statement"
+    )
+}
+
+/// Initializers and loop conditions can require a visibility proof beyond
+/// their own syntax node; switch arms and lambdas confine their bindings.
+pub fn java_pattern_bindings_may_escape_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "variable_declarator" | "while_statement" | "do_statement" | "for_statement"
+    )
+}
+
+fn java_contains(outer: Node<'_>, inner: Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+/// The instanceof test owning a binding, including record components whose
+/// lexical identities exist even though extraction can remain unsupported.
+pub fn java_pattern_instanceof(mut pattern: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match pattern.kind() {
+            "instanceof_expression" => return Some(pattern),
+            "record_pattern_component"
+            | "record_pattern_body"
+            | "record_pattern"
+            | "pattern"
+            | "type_pattern" => pattern = pattern.parent()?,
+            _ => return None,
+        }
+    }
+}
+
+/// A deliberately bounded Java abrupt-completion proof. Finally, break,
+/// continue and loop reasoning require more than a syntactic last statement.
+fn java_pattern_guard_is_abrupt(statement: Node<'_>) -> Option<bool> {
+    let mut pending = vec![statement];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "return_statement" | "throw_statement" => {}
+            "block" => {
+                let mut cursor = node.walk();
+                let Some(last) = node
+                    .named_children(&mut cursor)
+                    .filter(|child| !child.is_extra())
+                    .last()
+                else {
+                    return Some(false);
+                };
+                pending.push(last);
+            }
+            "if_statement" => {
+                let (Some(yes), Some(no)) = (
+                    node.child_by_field_name("consequence"),
+                    node.child_by_field_name("alternative"),
+                ) else {
+                    return None;
+                };
+                pending.extend([yes, no]);
+            }
+            "expression_statement" | "local_variable_declaration" | "empty_statement" => {
+                return Some(false);
+            }
+            _ => return None,
+        }
+    }
+    Some(true)
+}
+
+/// Java's definitely-matched visibility rules (JLS 6.3), using structured
+/// control syntax. Unproved alternatives never acquire a binding by byte order.
+pub fn java_pattern_binding_visible(pattern: Node<'_>, focus: Node<'_>) -> Option<bool> {
+    if pattern.has_error() || focus.start_byte() < pattern.end_byte() {
+        return Some(false);
+    }
+    let test = java_pattern_instanceof(pattern);
+    if test.is_none() {
+        // Switch patterns bind only in their selected arm, including its guard.
+        let mut owner = pattern.parent();
+        while let Some(node) = owner {
+            if matches!(node.kind(), "switch_rule" | "switch_block_statement_group") {
+                return Some(java_contains(node, focus));
+            }
+            if matches!(
+                node.kind(),
+                "block" | "lambda_expression" | "method_declaration"
+            ) {
+                return Some(false);
+            }
+            owner = node.parent();
+        }
+        return Some(false);
+    }
+    let test = test.expect("instanceof case");
+    let proves = |condition, outcome| {
+        if !java_contains(condition, test) {
+            return false;
+        }
+        let mut node = test;
+        let mut required = true;
+        while node != condition {
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            match parent.kind() {
+                "parenthesized_expression" => {}
+                "unary_expression"
+                    if parent
+                        .child_by_field_name("operator")
+                        .is_some_and(|op| op.kind() == "!") =>
+                {
+                    required = !required
+                }
+                "binary_expression" => {
+                    match parent.child_by_field_name("operator").map(|op| op.kind()) {
+                        Some("&&") if required => {}
+                        Some("||") if !required => {}
+                        _ => return false,
+                    }
+                }
+                _ => return false,
+            }
+            node = parent;
+        }
+        required == outcome
+    };
+    let mut ancestor = focus.parent();
+    while let Some(node) = ancestor {
+        if let Some(left) = node.child_by_field_name("left")
+            && node.kind() == "binary_expression"
+            && node
+                .child_by_field_name("right")
+                .is_some_and(|right| java_contains(right, focus))
+        {
+            match node.child_by_field_name("operator").map(|op| op.kind()) {
+                Some("&&") if proves(left, true) => return Some(true),
+                Some("||") if proves(left, false) => return Some(true),
+                _ => {}
+            }
+        }
+        if let Some(condition) = node.child_by_field_name("condition") {
+            for (field, outcome) in [
+                ("consequence", true),
+                ("alternative", false),
+                ("body", true),
+                ("update", true),
+            ] {
+                if matches!(
+                    node.kind(),
+                    "if_statement" | "ternary_expression" | "while_statement" | "for_statement"
+                ) && node
+                    .child_by_field_name(field)
+                    .is_some_and(|arm| java_contains(arm, focus))
+                    && proves(condition, outcome)
+                {
+                    return Some(true);
+                }
+            }
+        }
+        ancestor = node.parent();
+    }
+    // A negated loop condition may bind a pattern after normal loop exit,
+    // but break/label/finally paths require a flow proof we do not have here.
+    let mut owner = test.parent();
+    while let Some(node) = owner {
+        if matches!(
+            node.kind(),
+            "while_statement" | "do_statement" | "for_statement"
+        ) && node.end_byte() <= focus.start_byte()
+            && node
+                .parent()
+                .is_some_and(|block| block.kind() == "block" && java_contains(block, focus))
+            && node
+                .child_by_field_name("condition")
+                .is_some_and(|condition| proves(condition, false))
+        {
+            return None;
+        }
+        if matches!(
+            node.kind(),
+            "block" | "lambda_expression" | "method_declaration"
+        ) {
+            break;
+        }
+        owner = node.parent();
+    }
+    // An abrupt opposite arm admits the matched binding after the if, in the
+    // same enclosing block. This also covers references inside later lambdas.
+    let mut unproven = false;
+    let mut ancestor = test.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "if_statement"
+            && node.end_byte() <= focus.start_byte()
+            && node
+                .parent()
+                .is_some_and(|block| block.kind() == "block" && java_contains(block, focus))
+            && let Some(condition) = node.child_by_field_name("condition")
+        {
+            for (field, remaining) in [("consequence", false), ("alternative", true)] {
+                if proves(condition, remaining)
+                    && let Some(arm) = node.child_by_field_name(field)
+                {
+                    match java_pattern_guard_is_abrupt(arm) {
+                        Some(true) => return Some(true),
+                        None => unproven = true,
+                        Some(false) => {}
+                    }
+                }
+            }
+        }
+        if matches!(
+            node.kind(),
+            "block" | "lambda_expression" | "method_declaration"
+        ) {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    if unproven { None } else { Some(false) }
 }
 
 /// The text one plain Java string literal denotes.
@@ -1241,5 +1735,129 @@ mod result_use_tests {
         let index = JavaCallResultUseIndex::new(tree.root_node());
         assert_eq!(index.sites.len(), 2);
         assert!(index.sites.iter().all(|site| site.result_use.is_none()));
+    }
+}
+
+impl brokk_bifrost_core::analyzer::statement_facts::producer::StatementFactSyntax
+    for JavaStructuralSpec
+{
+    fn roles<'tree>(&self, node: Node<'tree>, role: Role) -> Vec<Node<'tree>> {
+        let field = match role {
+            Role::Test if matches!(node.kind(), "switch_label" | "switch_rule") => {
+                let label = if node.kind() == "switch_label" {
+                    Some(node)
+                } else {
+                    named_children_iter(node).find(|child| child.kind() == "switch_label")
+                };
+                let Some(label) = label else {
+                    return Vec::new();
+                };
+                // A combined `case null, default` covers every enum constant.
+                // Default arms contribute no finite set of enum tests.
+                if label
+                    .children(&mut label.walk())
+                    .any(|child| child.kind() == "default")
+                {
+                    return Vec::new();
+                }
+                return named_children_iter(label)
+                    .filter(|child| !child.is_extra())
+                    .collect();
+            }
+            Role::Test => "condition",
+            Role::Consequence => "consequence",
+            Role::Alternative => "alternative",
+            Role::Body => "body",
+            Role::Operator => "operator",
+            Role::Left => "left",
+            Role::Right => "right",
+            Role::Label if node.kind() == "labeled_statement" => {
+                return named_children_iter(node)
+                    .find(|child| child.kind() == "identifier")
+                    .into_iter()
+                    .collect();
+            }
+            _ => return Vec::new(),
+        };
+        node.child_by_field_name(field).into_iter().collect()
+    }
+
+    fn loop_variable(&self, node: Node<'_>, source: &str) -> Option<String> {
+        let name = if node.kind() == "enhanced_for_statement" {
+            node.child_by_field_name("name")?
+        } else if node.kind() == "for_statement" {
+            let init = node.child_by_field_name("init")?;
+            match init.kind() {
+                "local_variable_declaration" => named_children_iter(init)
+                    .find(|child| child.kind() == "variable_declarator")?
+                    .child_by_field_name("name")?,
+                "assignment_expression" => init.child_by_field_name("left")?,
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        (name.kind() == "identifier")
+            .then(|| name.utf8_text(source.as_bytes()).ok().map(str::to_owned))
+            .flatten()
+    }
+
+    fn is_counted_loop(&self, node: Node<'_>) -> bool {
+        node.kind() == "for_statement"
+    }
+    fn loop_initializers<'tree>(&self, node: Node<'tree>) -> Vec<Node<'tree>> {
+        let mut cursor = node.walk();
+        node.children_by_field_name("init", &mut cursor)
+            .filter(|child| child.is_named() && !child.is_extra())
+            .collect()
+    }
+
+    // Java's enum operand is resolved by the analyzer's shared lexical binding
+    // engine. A grammar-only spec cannot invent that binding proof.
+    fn switch_enum<'tree>(&self, _node: Node<'tree>, _source: &str) -> Option<Node<'tree>> {
+        None
+    }
+
+    fn enumeration(
+        &self,
+        node: Node<'_>,
+        source: &str,
+    ) -> Option<(
+        brokk_bifrost_core::analyzer::statement_facts::EnumFact,
+        Vec<brokk_bifrost_core::analyzer::statement_facts::EnumeratorFact>,
+    )> {
+        use brokk_bifrost_core::analyzer::statement_facts::{EnumFact, EnumeratorFact};
+        if node.kind() != "enum_declaration" {
+            return None;
+        }
+        let range = node_range(node);
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+            .map(str::to_owned);
+        let enumerators = node
+            .child_by_field_name("body")
+            .map(|body| {
+                named_children_iter(body)
+                    .filter(|child| child.kind() == "enum_constant")
+                    .filter_map(|constant| {
+                        let name = constant
+                            .child_by_field_name("name")?
+                            .utf8_text(source.as_bytes())
+                            .ok()?
+                            .to_owned();
+                        Some(EnumeratorFact {
+                            range: node_range(constant),
+                            enum_range: range,
+                            name,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((EnumFact { range, name }, enumerators))
+    }
+    fn name<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        expression_name_node(node)
     }
 }

@@ -3,6 +3,47 @@
 impl crate::analyzer::store::resolution_operation::SelectedModelAuthority
     for crate::analyzer::semantic_model::SemanticModelOverlay
 {
+    fn model_selected_groups(
+        &self,
+        language: &str,
+        reference: &super::TypeRef,
+        selection: &super::ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<Vec<super::SemanticModelSymbol>>, super::SemanticModelOverlayBuildError> {
+        self.model_selected_groups(language, reference, selection, cancellation)
+    }
+
+    fn model_type_owner(
+        &self,
+        language: &str,
+        nominal: &super::TypeRef,
+        selection: &super::ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<
+        super::ModelTypeOwnerAnswer<super::SemanticModelSymbol>,
+        super::SemanticModelOverlayBuildError,
+    > {
+        self.model_type_owner(language, nominal, selection, cancellation)
+    }
+
+    fn model_member_declarations(
+        &self,
+        owner: &super::ModelSymbolRef,
+        selection: &super::ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Option<super::ModelOwnerAnswer>, super::SemanticModelOverlayBuildError> {
+        self.model_member_declarations(owner, selection, cancellation)
+    }
+
+    fn model_callable_results(
+        &self,
+        callable: &super::ModelSymbolRef,
+        selection: &super::ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Option<Vec<Option<super::TypeRef>>>, super::SemanticModelOverlayBuildError> {
+        self.model_callable_results(callable, selection, cancellation)
+    }
+
     fn modeled_external_package_identity(
         &self,
         language: crate::analyzer::Language,
@@ -60,24 +101,22 @@ pub fn model_declared_external_owner(
     overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
     fqn: &str,
 ) -> Option<crate::analyzer::resolution::ExternalOwnerIdentity> {
+    // The unselected view folds same-id owners across providers; moving the JVM
+    // onto the selected composition is #7605's change, with its own identity.
     let symbols = qualified_model_symbols(overlay, fqn);
-    let mut types = symbols
-        .into_iter()
-        .filter(|symbol| pack_type_kind(symbol.kind).is_some());
-    let first = types.next()?;
-    if first.provenance.ambiguous
-        || types.any(|symbol| {
-            symbol.provenance.ambiguous
-                || symbol.provenance.pack_digest != first.provenance.pack_digest
-                || symbol.qualified_name != first.qualified_name
-        })
-    {
-        return None;
+    match super::classify_model_type_owner(symbols.iter().map(|symbol| &**symbol), |kind| {
+        pack_type_kind(kind).is_some()
+    }) {
+        super::ModelTypeOwnerAnswer::Unique { declaration, .. } => {
+            Some(crate::analyzer::resolution::ExternalOwnerIdentity {
+                provider_id: declaration.provenance.pack_digest.as_str().into(),
+                owner_fqn: declaration.qualified_name.as_str().into(),
+            })
+        }
+        super::ModelTypeOwnerAnswer::Ambiguous(_) | super::ModelTypeOwnerAnswer::Unknown { .. } => {
+            None
+        }
     }
-    Some(crate::analyzer::resolution::ExternalOwnerIdentity {
-        provider_id: first.provenance.pack_digest.as_str().into(),
-        owner_fqn: first.qualified_name.as_str().into(),
-    })
 }
 
 #[doc(hidden)]

@@ -25,7 +25,9 @@ use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
 #[cfg(any(test, feature = "test-support"))]
-use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
+use brokk_bifrost_analysis::analyzer::resolution::model::{
+    ExactCompletionAccumulator, ResolutionCompletion,
+};
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 #[cfg(any(test, feature = "test-support"))]
@@ -266,12 +268,14 @@ pub fn selected_rust_definition_shadow_result_with_after_open(
             SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
                 answers,
             )) => {
-                let completion =
+                let Some(completion) = ResolutionCompletion::combine_all_with_poll(
                     answers
                         .iter()
-                        .fold(ResolutionCompletion::Complete, |completion, answer| {
-                            completion.combine(answer.resolution.binding().completion())
-                        });
+                        .map(|answer| answer.resolution.binding().completion()),
+                    &mut || cancellation.is_cancelled(),
+                ) else {
+                    return RustDefinitionShadowResult::Cancelled { work };
+                };
                 let definitions = answers
                     .into_iter()
                     .flat_map(|answer| answer.definitions)
@@ -716,7 +720,7 @@ pub fn selected_rust_workspace_binding_world(
         );
     };
     let mut sites = Vec::new();
-    let mut completion = ResolutionCompletion::Complete;
+    let mut completion = ExactCompletionAccumulator::default();
     for unit in definition_units.values() {
         let (masks, content_mounts) = match rust
             .inner
@@ -747,7 +751,12 @@ pub fn selected_rust_workspace_binding_world(
         ) {
             RustBindingWorldOutcome::Ready(world) => {
                 sites.extend_from_slice(world.sites());
-                completion = completion.combine(world.completion());
+                if completion
+                    .include(world.completion(), &mut || cancellation.is_cancelled())
+                    .is_none()
+                {
+                    return RustWorkspaceBindingWorldResult::Cancelled;
+                }
             }
             RustBindingWorldOutcome::Unavailable(detail) => {
                 return RustWorkspaceBindingWorldResult::Unavailable(detail);
@@ -763,6 +772,9 @@ pub fn selected_rust_workspace_binding_world(
             }
         }
     }
+    let Some(completion) = completion.finish(&mut || cancellation.is_cancelled()) else {
+        return RustWorkspaceBindingWorldResult::Cancelled;
+    };
     let world =
         match operation.finish_rust_row_binding_world(anchor, sites, completion, cancellation) {
             Ok(SelectedResolutionOperationOutcome::Native(world)) => world,
@@ -894,13 +906,24 @@ fn native_rust_graph_shadow_for_units(
     let mut unproven: BTreeMap<CodeUnit, BTreeSet<(ProjectFile, usize)>> = BTreeMap::new();
     let mut line_starts = BTreeMap::new();
     let mut projection_complete = true;
-    let mut completion = world.completion().clone();
+    let mut completion = ExactCompletionAccumulator::default();
+    if completion
+        .include(world.completion(), &mut || cancellation.is_cancelled())
+        .is_none()
+    {
+        return RustWorkspaceGraphShadowResult::Cancelled;
+    }
 
     for site in world.sites() {
         if cancellation.is_cancelled() {
             return RustWorkspaceGraphShadowResult::Cancelled;
         }
-        completion = completion.combine(site.completion());
+        if completion
+            .include(site.completion(), &mut || cancellation.is_cancelled())
+            .is_none()
+        {
+            return RustWorkspaceGraphShadowResult::Cancelled;
+        }
         let Some(metadata) = site.metadata() else {
             projection_complete = false;
             continue;
@@ -1025,6 +1048,9 @@ fn native_rust_graph_shadow_for_units(
         edges,
         truncated,
         unproven_inbound,
+    };
+    let Some(completion) = completion.finish(&mut || cancellation.is_cancelled()) else {
+        return RustWorkspaceGraphShadowResult::Cancelled;
     };
     if projection_complete && completion == ResolutionCompletion::Complete {
         RustWorkspaceGraphShadowResult::Complete(graph)

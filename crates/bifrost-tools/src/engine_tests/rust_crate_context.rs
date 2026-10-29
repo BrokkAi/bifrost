@@ -1,9 +1,7 @@
 #[cfg(test)]
 mod tests {
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::CLOSURE_SCOPE_MOUNTS_HEAD;
-
-    use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::CLOSURE_SCOPE_MOUNTS_TAIL;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::CLOSURE_SCOPE_MOUNTS;
 
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::DETACHED_SCOPE_CRATES;
 
@@ -951,7 +949,7 @@ mod tests {
     /// subject, so the lowering writes no `resolution_trait_implementations`
     /// row, and derivation writes neither a `rust_crate_trait_impls` row nor a
     /// `rust_crate_unresolved_trait_impls` row for it. A derive, a `Deref`
-    /// target and a default method of a trait from an unindexed crate are the
+    /// target in an unindexed crate and an unindexed trait default are the
     /// same shape. The producer declares the member surface open for every
     /// qualified reference, and the answer is the boundary that declaration
     /// permits, as for `Host::ITEM`.
@@ -981,8 +979,18 @@ mod tests {
                 "service.clone",
             ),
             (
-                "deref target",
-                "struct Inner;\nimpl Inner {\n    fn run(&self) {}\n}\nstruct Service {\n    inner: Inner,\n}\nimpl std::ops::Deref for Service {\n    type Target = Inner;\n    fn deref(&self) -> &Inner {\n        &self.inner\n    }\n}\n\nfn caller(service: Service) {\n    service.run();\n}\n",
+                "type-qualified deref",
+                "struct Item;\nimpl Item { fn run(&self) {} }\nstruct Wrapper(Item);\nimpl std::ops::Deref for Wrapper { type Target = Item; fn deref(&self) -> &Item { &self.0 } }\nfn caller(w: Wrapper) { Wrapper::run(&w); }\n",
+                "Wrapper::run",
+            ),
+            (
+                "raw pointer deref",
+                "struct Item;\nimpl Item { fn run(&self) {} }\nstruct Wrapper(Item);\nimpl std::ops::Deref for Wrapper { type Target = Item; fn deref(&self) -> &Item { &self.0 } }\nfn caller(w: *const Wrapper) { w.run(); }\n",
+                "w.run",
+            ),
+            (
+                "unindexed deref target",
+                "struct Inner;\nimpl Inner {\n    fn run(&self) {}\n}\nstruct Service {\n    inner: Inner,\n}\nimpl std::ops::Deref for Service {\n    type Target = external::Item;\n    fn deref(&self) -> &external::Item {\n        unimplemented!()\n    }\n}\n\nfn caller(service: Service) {\n    service.run();\n}\n",
                 "service.run",
             ),
             (
@@ -996,7 +1004,10 @@ mod tests {
             assert_eq!(
                 (outcome.status, outcome.definitions.len()),
                 (
-                    if label == "derive" {
+                    if matches!(
+                        label,
+                        "derive" | "unindexed deref target" | "raw pointer deref"
+                    ) {
                         DefinitionLookupStatus::Incomplete
                     } else {
                         DefinitionLookupStatus::UnresolvableImportBoundary
@@ -1006,6 +1017,27 @@ mod tests {
                 "{label}: {outcome:?}"
             );
         }
+        let outcome = qualified_member_outcome(
+            &[(
+                "t.rs",
+                "struct Item;\nimpl Item { fn run(&self) {} }\nstruct Wrapper(Item);\nimpl std::ops::Deref for Wrapper { type Target = Item; fn deref(&self) -> &Item { &self.0 } }\nfn caller(w: Wrapper) { w.run(); }\n",
+            )],
+            "t.rs",
+            "w.run",
+        );
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome
+                .definitions
+                .iter()
+                .map(|definition| definition.fq_name())
+                .collect::<Vec<_>>(),
+            vec!["Item.run"]
+        );
     }
 
     /// The reverse half: the impl item and the other trait's default each see
@@ -1475,6 +1507,7 @@ mod tests {
     fn rust_crate_point_queries_have_populated_plan_pins() {
         let project = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='point'\nversion='0.1.0'\nedition='2021'\n")
+            .file("src/main.rs", "fn main() {}")
             .file("src/lib.rs", "mod inner; use inner::Thing as Alias; use inner::*; pub fn make() -> Alias { Alias }")
             .file("src/inner.rs", "pub struct Thing; pub struct Other;")
             .file("src/edited.rs", "mod inner; use inner::Other as Renamed; use inner::*; pub fn make() -> Renamed { Renamed }")
@@ -1524,6 +1557,23 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
+        let scope_keys: Vec<[u8; 32]> = conn
+            .prepare("SELECT unit_key FROM selected_rust_unit_summaries ORDER BY unit_key")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(scope_keys.len() > 1);
+        let scope_keys_json = serde_json::to_string(
+            &scope_keys
+                .iter()
+                .map(|key| {
+                    brokk_bifrost_analysis::analyzer::store::resolution_lexical::hex_digest(*key)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let int = Value::Integer;
         let text = |value: &str| Value::Text(value.to_owned());
         for state in PlannerStatisticsState::BOTH {
@@ -1531,13 +1581,13 @@ mod tests {
             let scope_pins = [
                 brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::PinnedQuery {
                     name: "rust_scope_detached_summary".to_owned(),
-                    sql: format!("{DETACHED_SCOPE_CRATES}(?1)"),
-                    params: vec![Value::Blob(key.clone())],
+                    sql: DETACHED_SCOPE_CRATES.to_owned(),
+                    params: vec![text(&scope_keys_json)],
                 },
                 brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::PinnedQuery {
                     name: "rust_scope_dependency_closure".to_owned(),
-                    sql: format!("{CLOSURE_SCOPE_MOUNTS_HEAD}(?1){CLOSURE_SCOPE_MOUNTS_TAIL}"),
-                    params: vec![Value::Blob(key.clone())],
+                    sql: CLOSURE_SCOPE_MOUNTS.to_owned(),
+                    params: vec![text(&scope_keys_json)],
                 },
             ];
             for pin in &scope_pins {

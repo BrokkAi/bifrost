@@ -104,6 +104,50 @@ use super::resolution_selection::SelectedResolutionReadStamp;
 use super::Result as StoreResult;
 use super::StoreError;
 
+/// Indexed impl Target read shared by execution and planner pins.
+pub(in crate::analyzer::store) const RUST_RECEIVER_IMPL_TARGETS_SQL: &str = "SELECT DISTINCT target_mount.mount_ordinal, target.semantic_key
+FROM temp.selected_resolution_mounts AS owner_mount
+CROSS JOIN resolution_rust_declaration_authorities AS owner
+ ON owner.blob_id=owner_mount.blob_id AND owner.semantic_key=?2
+CROSS JOIN resolution_unit_summary_members AS owner_member
+ INDEXED BY resolution_unit_summary_members_blob
+ ON owner_member.blob_id=owner.blob_id
+AND owner_member.rel_path=owner_mount.persisted_relative_path
+CROSS JOIN selected_rust_unit_summaries AS owner_unit
+ ON owner_unit.summary_id=owner_member.summary_id
+CROSS JOIN rust_resolution_unit_summary_exports AS export
+ INDEXED BY rust_resolution_unit_summary_exports_declaration
+ ON export.summary_id=owner_unit.summary_id
+AND export.declaration_member_ordinal=owner_member.member_ordinal
+AND export.declaration_site=owner.source_site
+AND export.namespace='type' AND export.origin='declaration'
+CROSS JOIN rust_resolution_unit_summary_trait_endpoints AS subject
+ INDEXED BY rust_resolution_unit_summary_trait_endpoints_target
+ ON subject.target_unit_key=owner_unit.unit_key
+AND subject.target_module_path=export.module_path
+AND subject.target_identity_id=export.identity_id
+AND subject.endpoint_role='subject' AND subject.endpoint_state='resolved'
+CROSS JOIN selected_rust_unit_summaries AS impl_unit
+ ON impl_unit.summary_id=subject.summary_id
+CROSS JOIN rust_resolution_unit_summary_trait_endpoints AS trait
+ ON trait.summary_id=subject.summary_id AND trait.member_ordinal=subject.member_ordinal
+AND trait.owner_module_path=subject.owner_module_path
+AND trait.source_relation_key=subject.source_relation_key AND trait.endpoint_role='trait'
+CROSS JOIN resolution_unit_summary_members AS impl_member
+ ON impl_member.summary_id=subject.summary_id AND impl_member.member_ordinal=subject.member_ordinal
+CROSS JOIN temp.selected_resolution_mounts AS target_mount
+ ON target_mount.blob_id=impl_member.blob_id
+AND target_mount.persisted_relative_path=impl_member.rel_path
+AND target_mount.storage_language='rust'
+CROSS JOIN source_rust_item_body_children AS child
+ ON child.blob_id=impl_member.blob_id AND child.owner_declaration_id=subject.impl_declaration_id
+CROSS JOIN resolution_rust_declaration_authorities AS target
+ ON target.blob_id=child.blob_id AND target.declaration=child.declaration_id
+CROSS JOIN resolution_deferred_member_owners AS member
+ ON member.blob_id=target.blob_id AND member.definition=target.semantic_key
+CROSS JOIN resolution_identities AS lookup ON lookup.id=member.lookup AND lookup.spelling='Target'
+WHERE owner_mount.mount_ordinal=?1 AND child.syntax_kind='type_item' AND trait.endpoint_state='unresolved'";
+
 pub(in crate::analyzer::store) const INVOCATION_ROLES_FOR_REFERENCES_SQL: &str = "SELECT role.site, role.role FROM json_each(?2) request \
      CROSS JOIN main.resolution_semantic_sites site ON site.blob_id=?1 \
          AND site.semantic_role='reference' AND site.semantic_key=request.value \
@@ -166,6 +210,8 @@ pub const FRONTIER_SOURCE_READY_SQL: &str =
     "SELECT 1 FROM main.source_fact_readiness WHERE blob_id=?1 AND available=1";
 
 pub(super) trait GoDefinitionContextBinder {
+    fn active_package(&self) -> Option<(i64, Option<&'static str>)>;
+
     fn bind_context(
         &self,
         ordinal: SelectedResolutionMountOrdinal,
@@ -690,6 +736,12 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                     | TypedFactRelation::GapReasonProvenanceReason
                     | TypedFactRelation::DefinitionPropertyGapReason
             ) {
+                // Completion reasons can name shared semantics (for example,
+                // an unproven external member binding). They have no persisted
+                // gap provenance or obligations in any of these relations.
+                if identity.shared_name_id().is_some() {
+                    continue;
+                }
                 // A gap reason has no catalog row, so no digest can classify
                 // it: its key range does. An ordinary reason needs its blob
                 // key here; a stage reason keeps its full runtime id and is
@@ -1198,6 +1250,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             .read_statement(cancellation, |connection| {
                 Ok(Some(
                     super::resolution_operation::selected_jvm_declaration_owner(
+                        super::resolution_operation::nominal_rules::jvm_external_owner_relations(),
                         connection,
                         self.model_authority.as_deref(),
                         &self.external_providers,
@@ -1260,30 +1313,19 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         else {
             return Ok(None);
         };
-        let ids = json_array([i64::from(name.get())]);
-        let result = self.read_statement(cancellation, |conn| {
-            let mut statement = conn.prepare_cached(
-                super::resolution_prepare::resolution_rows::RESOLUTION_IDENTITY_RECIPES_SQL,
-            )?;
-            let mut rows = statement.query([ids])?;
-            let namespace = if let Some(row) = rows.next()? {
-                if let Some(language) = row.get::<_, Option<i64>>(1)? {
-                    Some(
-                        super::resolution_prepare::resolution_rows::decode_stored_lookup_recipe(
-                            language,
-                            row.get(2)?,
-                            &row.get::<_, String>(3)?,
-                            row.get(4)?,
-                        )
-                        .namespace(),
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            Ok(Some(namespace))
+        let result = self.read_statement(cancellation, |_conn| {
+            Ok(
+                super::resolution_prepare::resolution_rows::read_stored_lookup_recipes(
+                    self.selection,
+                    &[i64::from(name.get())],
+                    cancellation,
+                )?
+                .map(|recipes| {
+                    recipes
+                        .get(&i64::from(name.get()))
+                        .map(|recipe| recipe.namespace())
+                }),
+            )
         })?;
         Ok(result.flatten())
     }
@@ -1400,6 +1442,47 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             reference,
             definition,
         )
+    }
+
+    /// Only an ordinary selected declaration can name persisted impl rows.
+    /// Resolved trait endpoints name workspace declarations, so they cannot
+    /// establish the standard-library Deref identity and are excluded here.
+    fn rust_receiver_impl_targets(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<SemanticId>> {
+        let (ordinal, key) = match rust_fragment_coordinate(&self.authority, owner, cancellation)? {
+            RustFragmentCoordinate::FragmentLocal(coordinate) => coordinate,
+            RustFragmentCoordinate::Cancelled | RustFragmentCoordinate::Unplaced => {
+                return Ok(Vec::new());
+            }
+        };
+        // One indexed statement for the common empty case. The target lookup is
+        // an identifier value selected through the impl's structured children.
+
+        let coordinates = self
+            .selection
+            .connection()
+            .prepare_cached(RUST_RECEIVER_IMPL_TARGETS_SQL)?
+            .query_map(rusqlite::params![ordinal.get(), key], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut result = Vec::with_capacity(coordinates.len());
+        for (ordinal, key) in coordinates {
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            let mount = self
+                .selection
+                .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+            result.push(crate::analyzer::resolution::mounted_site_semantic(
+                mount.fragment_id(),
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(key),
+            ));
+        }
+        Ok(result)
     }
 
     /// Asked of the tier-1 crate rows, like the two access decisions above,
@@ -4263,7 +4346,8 @@ fn decode_supertype(
             row.get(2)?,
             row.get(3)?,
             row.get(4)?,
-        ),
+        )
+        .into(),
     ))
 }
 

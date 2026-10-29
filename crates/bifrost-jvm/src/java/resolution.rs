@@ -66,6 +66,69 @@ use brokk_bifrost_core::analyzer::java_facts::{
     JavaSourceFacts, JavaSourceTypeId, JavaTypeSyntaxShape,
 };
 
+// tree-sitter-java 0.23.5: fields that evaluate expressions during ordinary
+// statement traversal. None means unnamed expression children, never bodies.
+// Return, resource and enhanced-for lowering also publish transfers or binders;
+// those keep their ordering-sensitive expression scheduling in their own arms.
+const STATEMENT_EXPRESSION_FIELDS: &[(&str, Option<&str>)] = &[
+    ("assert_statement", None),
+    ("do_statement", Some("condition")),
+    ("expression_statement", None),
+    ("for_statement", Some("init")),
+    ("for_statement", Some("condition")),
+    ("for_statement", Some("update")),
+    ("guard", None),
+    ("if_statement", Some("condition")),
+    ("switch_expression", Some("condition")),
+    ("synchronized_statement", None),
+    ("throw_statement", None),
+    ("while_statement", Some("condition")),
+    ("yield_statement", None),
+];
+
+// The expression supertype closure in node-types.json, including its hidden
+// supertypes. The grammar-boundary test below checks this set against the pinned
+// grammar so unnamed statement children cannot silently stop being expressions.
+fn is_java_expression_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "expression"
+            | "primary_expression"
+            | "_literal"
+            | "array_access"
+            | "array_creation_expression"
+            | "assignment_expression"
+            | "binary_expression"
+            | "binary_integer_literal"
+            | "cast_expression"
+            | "character_literal"
+            | "class_literal"
+            | "decimal_floating_point_literal"
+            | "decimal_integer_literal"
+            | "false"
+            | "field_access"
+            | "hex_floating_point_literal"
+            | "hex_integer_literal"
+            | "identifier"
+            | "instanceof_expression"
+            | "lambda_expression"
+            | "method_invocation"
+            | "method_reference"
+            | "null_literal"
+            | "object_creation_expression"
+            | "octal_integer_literal"
+            | "parenthesized_expression"
+            | "string_literal"
+            | "switch_expression"
+            | "template_expression"
+            | "ternary_expression"
+            | "this"
+            | "true"
+            | "unary_expression"
+            | "update_expression"
+    )
+}
+
 pub(super) struct JavaResolutionExtraction {
     pub facts: FileResolutionFacts,
     pub type_identifiers: HashSet<String>,
@@ -872,13 +935,25 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
 
         if let Some(parent) = node.parent()
-            && parent.kind() == "for_statement"
-            && node.kind() != "local_variable_declaration"
-            && ["init", "condition", "update"].iter().any(|field| {
+            && node.is_named()
+            && is_java_expression_kind(node.kind())
+            && !node.is_extra()
+            && STATEMENT_EXPRESSION_FIELDS.iter().any(|(kind, field)| {
+                if parent.kind() != *kind {
+                    return false;
+                }
                 let mut cursor = parent.walk();
-                parent
-                    .children_by_field_name(field, &mut cursor)
-                    .any(|child| child == node)
+                match field {
+                    Some(field) => parent
+                        .children_by_field_name(field, &mut cursor)
+                        .any(|child| child == node),
+                    None => parent
+                        .children(&mut cursor)
+                        .enumerate()
+                        .any(|(index, child)| {
+                            child == node && parent.field_name_for_child(index as u32).is_none()
+                        }),
+                }
             })
         {
             self.lower_expression(node);
@@ -907,21 +982,8 @@ impl<'source> JavaResolutionBuilder<'source> {
             return TreeWalkAction::Descend;
         }
 
-        if node.kind() == "switch_expression" {
-            self.lower_switch_selector(node);
-        } else if node.kind() == "guard" {
-            if let Some(condition) = named_children(node)
-                .into_iter()
-                .find(|child| !child.is_extra())
-            {
-                self.lower_expression(condition);
-            }
-        } else if node.kind() == "switch_label" {
+        if node.kind() == "switch_label" {
             self.lower_switch_label(node);
-        } else if node.kind() == "synchronized_statement"
-            && let Some(lock) = first_named_child_of_kind(node, "parenthesized_expression")
-        {
-            self.lower_expression(lock);
         }
 
         if node.kind() == "formal_parameters"
@@ -1032,11 +1094,6 @@ impl<'source> JavaResolutionBuilder<'source> {
             }
             "enum_constant" => self.lower_enum_constant(node),
             "return_statement" => self.lower_return(node),
-            "expression_statement" => {
-                if let Some(value) = first_named_child(node) {
-                    self.lower_expression(value);
-                }
-            }
             "superclass" | "super_interfaces" | "extends_interfaces" => {
                 self.lower_inheritance_clause(node)
             }
@@ -2415,6 +2472,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionTypeTransferKind::TypeAlias => {
                 unreachable!("Java has no type alias qualifier transfer")
             }
+            ResolutionTypeTransferKind::ConditionalPayload => {
+                unreachable!("Java has no conditional wrapper payload transfer")
+            }
         };
         self.add_transfer_with_transform(input, output, kind, value_transform);
     }
@@ -2932,12 +2992,6 @@ impl<'source> JavaResolutionBuilder<'source> {
             access: ResolutionMemberAccess::Type,
             qualifier_compatibility: ResolutionMemberQualifierCompatibility::RuntimeOrType,
         });
-    }
-
-    fn lower_switch_selector(&mut self, node: Node<'_>) {
-        if let Some(selector) = node.child_by_field_name("condition") {
-            self.lower_expression(selector);
-        }
     }
 
     fn lower_record_pattern_type(&mut self, pattern: Node<'_>) {
@@ -4934,22 +4988,12 @@ impl<'source> JavaResolutionBuilder<'source> {
                     stack.push((value, false));
                 }
                 "unary_expression" => {
-                    let Some(operator) = node.child_by_field_name("operator") else {
-                        self.lower_unsupported_expression(node);
-                        continue;
-                    };
                     let Some(operand) = node.child_by_field_name("operand") else {
                         self.lower_unsupported_expression(node);
                         continue;
                     };
-                    if matches!(node_text(operator, self.source), "+" | "-")
-                        && is_java_integer_literal(operand)
-                    {
-                        stack.push((node, true));
-                        stack.push((operand, false));
-                    } else {
-                        self.lower_unsupported_expression(node);
-                    }
+                    stack.push((node, true));
+                    stack.push((operand, false));
                 }
                 "lambda_expression" => self.lower_unsupported_expression_preserving_children(node),
                 "method_reference" => {
@@ -4972,7 +5016,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                             receiver,
                             ResolutionNamespace::TypeOrValue,
                         );
-                    } else if receiver.kind() != "this" {
+                    } else if !matches!(receiver.kind(), "this" | "super") {
                         stack.push((receiver, false));
                     }
                 }
@@ -5084,7 +5128,8 @@ impl<'source> JavaResolutionBuilder<'source> {
             "switch_expression" => self.lower_unsupported_expression_preserving_children(node),
             "class_literal" => self.finish_class_literal_expression(node),
             "cast_expression" => self.finish_cast_expression(node),
-            "parenthesized_expression" | "unary_expression" => {
+            "unary_expression" => self.finish_unary_expression(node),
+            "parenthesized_expression" => {
                 let Some(inner) = first_named_child(node) else {
                     self.lower_unsupported_expression(node);
                     return;
@@ -5111,33 +5156,78 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
     }
 
-    fn finish_cast_expression(&mut self, node: Node<'_>) {
-        let (Some(type_node), Some(_value)) = (
-            node.child_by_field_name("type"),
-            node.child_by_field_name("value"),
+    fn finish_unary_expression(&mut self, node: Node<'_>) {
+        let (Some(operator), Some(operand)) = (
+            node.child_by_field_name("operator"),
+            node.child_by_field_name("operand"),
         ) else {
             self.lower_unsupported_expression(node);
             return;
         };
+        match node_text(operator, self.source) {
+            "!" => self.lower_literal(node, "boolean", IntrinsicTypeKind::Primitive),
+            "+" | "-" if is_java_integer_literal(operand) => {
+                // Keep the literal constant fold, including MIN_VALUE's direct
+                // unary-minus exception, rather than discarding its value.
+                self.expression_slots_by_node
+                    .insert(node.id(), self.expression_slot(operand));
+            }
+            "+" | "-" | "~" => {
+                let site = self.add_site(node, ResolutionSiteKind::UnaryExpression);
+                let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+                // JLS 5.6.1: promotion(T, T) is unary numeric promotion.
+                // byte/short/char become int; long/float/double keep their width.
+                self.add_transfer(
+                    self.expression_slot(operand),
+                    output,
+                    ResolutionTypeTransferKind::NumericPromotion,
+                );
+                self.expression_slots_by_node.insert(node.id(), output);
+            }
+            _ => self.lower_unsupported_expression(node),
+        }
+    }
+
+    fn finish_cast_expression(&mut self, node: Node<'_>) {
+        let mut type_cursor = node.walk();
+        let mut type_nodes = node.children_by_field_name("type", &mut type_cursor);
+        let Some(type_node) = type_nodes.next() else {
+            self.lower_unsupported_expression(node);
+            return;
+        };
+        // An intersection cast `(A & B) x` has several `type` children; its
+        // type is never approximated by the first one.
+        if type_nodes.next().is_some() || node.child_by_field_name("value").is_none() {
+            self.lower_unsupported_expression(node);
+            return;
+        }
         let type_slot = self.lower_type(type_node);
-        let Some(type_seed) = self
+        let type_seed = self
             .facts
             .intrinsic_type_seeds
             .iter()
             .find(|seed| seed.output == type_slot)
             .copied()
-            .filter(|seed| seed.kind == IntrinsicTypeKind::Primitive && seed.indirection == 0)
-        else {
+            .filter(|seed| seed.kind == IntrinsicTypeKind::Primitive && seed.indirection == 0);
+        if let Some(type_seed) = type_seed {
+            let site = self.add_site(node, ResolutionSiteKind::UnaryExpression);
+            let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+                output,
+                ..type_seed
+            });
+            self.expression_slots_by_node.insert(node.id(), output);
+        } else if self.is_type_syntax(type_node.kind()) {
+            // Lowering stays syntactic: an unresolved reference target still
+            // publishes its type slot, and query-time applicability reports
+            // it as unknown.
+            let site = self.add_site(node, ResolutionSiteKind::UnaryExpression);
+            let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            crate::call_arguments::publish_jvm_expression_type(&mut self.facts, type_slot, output);
+            self.expression_slots_by_node.insert(node.id(), output);
+        } else {
             self.lower_unsupported_expression(node);
-            return;
-        };
-        let site = self.add_site(node, ResolutionSiteKind::UnaryExpression);
-        let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
-        self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
-            output,
-            ..type_seed
-        });
-        self.expression_slots_by_node.insert(node.id(), output);
+        }
     }
 
     fn finish_assignment_expression(&mut self, node: Node<'_>) {
@@ -5367,7 +5457,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             }
         }
         let constructor = terminal.kind() == "new";
-        let qualifier = if receiver.kind() == "this" {
+        let qualifier = if matches!(receiver.kind(), "this" | "super") {
             None
         } else if self.is_type_syntax(receiver.kind()) {
             Some(self.lower_type(receiver))
@@ -5384,24 +5474,28 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionSiteKind::MemberReference
             },
         );
-        let qualifier = qualifier.map(|input| {
-            if constructor {
-                input
-            } else {
-                // A type-qualified method reference can bind an instance method:
-                // its eventual functional argument supplies the receiver. Java
-                // static members also admit runtime qualifiers, so this searches
-                // both families without inventing an invocation or its arity.
-                let output = self.add_slot(reference, ResolutionTypeSlotRole::Receiver);
-                self.add_transfer_with_transform(
-                    input,
-                    output,
-                    ResolutionTypeTransferKind::Receiver,
-                    ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
-                );
-                output
-            }
-        });
+        let qualifier = if receiver.kind() == "super" {
+            Some(self.lower_super_receiver(reference))
+        } else {
+            qualifier.map(|input| {
+                if constructor {
+                    input
+                } else {
+                    // A type-qualified method reference can bind an instance method:
+                    // its eventual functional argument supplies the receiver. Java
+                    // static members also admit runtime qualifiers, so this searches
+                    // both families without inventing an invocation or its arity.
+                    let output = self.add_slot(reference, ResolutionTypeSlotRole::Receiver);
+                    self.add_transfer_with_transform(
+                        input,
+                        output,
+                        ResolutionTypeTransferKind::Receiver,
+                        ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+                    );
+                    output
+                }
+            })
+        };
         self.add_identifier_to_site(
             reference,
             terminal,
@@ -5456,6 +5550,16 @@ impl<'source> JavaResolutionBuilder<'source> {
         self.expression_slots_by_node.insert(node.id(), output);
     }
 
+    fn lower_super_receiver(&mut self, site: ResolutionSiteId) -> ResolutionTypeSlotId {
+        let output = self.add_slot(site, ResolutionTypeSlotRole::Receiver);
+        if let Some(context) = self.type_contexts.last() {
+            self.super_receivers.push((context.declaration, output));
+        } else {
+            self.add_gap(site, ResolutionGapKind::MalformedSyntax);
+        }
+        output
+    }
+
     fn finish_method_invocation(&mut self, node: Node<'_>) {
         let Some(name) = node.child_by_field_name("name") else {
             self.lower_unsupported_expression(node);
@@ -5470,18 +5574,14 @@ impl<'source> JavaResolutionBuilder<'source> {
         let receiver = object
             .filter(|object| object.kind() != "this")
             .map(|object| {
-                let output = self.add_slot(call, ResolutionTypeSlotRole::Receiver);
                 if object.kind() == "super" {
-                    if let Some(context) = self.type_contexts.last() {
-                        self.super_receivers.push((context.declaration, output));
-                    } else {
-                        self.add_gap(call, ResolutionGapKind::MalformedSyntax);
-                    }
+                    self.lower_super_receiver(call)
                 } else {
+                    let output = self.add_slot(call, ResolutionTypeSlotRole::Receiver);
                     let input = self.expression_slot(object);
                     self.add_transfer(input, output, ResolutionTypeTransferKind::Receiver);
+                    output
                 }
-                output
             });
         let callee = self.add_identifier_site(
             name,
@@ -6298,6 +6398,72 @@ mod tests {
         let facts = parse_once(source);
         assert_eq!(facts, parse_once(source), "fact rows must be deterministic");
         facts
+    }
+
+    #[test]
+    fn statement_expression_fields_match_java_grammar() {
+        let nodes: Vec<serde_json::Value> =
+            serde_json::from_str(tree_sitter_java::NODE_TYPES).unwrap();
+        let mut expressions = HashSet::default();
+        let mut pending = vec!["expression"];
+        while let Some(kind) = pending.pop() {
+            if !expressions.insert(kind) {
+                continue;
+            }
+            let node = nodes
+                .iter()
+                .find(|node| node["type"] == kind && node["named"] == true)
+                .unwrap();
+            if let Some(subtypes) = node["subtypes"].as_array() {
+                pending.extend(
+                    subtypes
+                        .iter()
+                        .map(|subtype| subtype["type"].as_str().unwrap()),
+                );
+            }
+        }
+        for node in &nodes {
+            let kind = node["type"].as_str().unwrap();
+            assert_eq!(
+                is_java_expression_kind(kind),
+                expressions.contains(kind),
+                "expression kind {kind}"
+            );
+        }
+        for &(kind, field) in STATEMENT_EXPRESSION_FIELDS {
+            let node = nodes
+                .iter()
+                .find(|node| node["type"] == kind && node["named"] == true)
+                .unwrap();
+            let shape = match field {
+                Some(field) => &node["fields"][field],
+                None => {
+                    // An unnamed selector must be migrated deliberately when
+                    // the grammar introduces a field for its expression. This
+                    // also prevents field and unnamed selection overlapping.
+                    for (field, shape) in node["fields"].as_object().unwrap() {
+                        assert!(
+                            shape["types"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|ty| { !expressions.contains(ty["type"].as_str().unwrap()) }),
+                            "{kind}.{field} now names an expression: use Some(field) instead of None"
+                        );
+                    }
+                    &node["children"]
+                }
+            };
+            let types = shape["types"]
+                .as_array()
+                .unwrap_or_else(|| panic!("missing {kind}.{field:?}"));
+            assert!(
+                types
+                    .iter()
+                    .any(|ty| expressions.contains(ty["type"].as_str().unwrap())),
+                "{kind}.{field:?} no longer declares expression children: {shape}"
+            );
+        }
     }
 
     #[test]
@@ -9793,11 +9959,15 @@ mod tests {
     java.util.List<String> values;
     void f() {
         if (probe()) {}
+        Object item = omittedArray[omittedIndex];
         Runnable task = () -> hidden();
     }
 }"#;
         let facts = parse(source);
-        let expected = [("probe", ResolutionGapKind::UnsupportedExpression)];
+        let expected = [(
+            "omittedArray[omittedIndex]",
+            ResolutionGapKind::UnsupportedExpression,
+        )];
 
         assert_eq!(facts.reference_enumeration_gaps.len(), expected.len());
         for (snippet, kind) in expected {
@@ -9823,11 +9993,13 @@ mod tests {
                     .any(|point| point.site == gap.site && point.kind == kind)
             );
         }
-        assert!(facts.identifiers.iter().any(|identifier| {
-            identifier.role == ResolutionIdentifierRole::Reference
-                && identifier.namespace == ResolutionNamespace::Callable
-                && name(&facts, identifier.name) == "hidden"
-        }));
+        for callable in ["probe", "hidden"] {
+            assert!(facts.identifiers.iter().any(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && identifier.namespace == ResolutionNamespace::Callable
+                    && name(&facts, identifier.name) == callable
+            }));
+        }
         let [argument] = facts.declared_type_arguments.as_slice() else {
             panic!("List<String> must retain its positional declared type argument");
         };

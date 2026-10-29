@@ -550,15 +550,19 @@ impl JsTsDiagnosticCollector<'_> {
         }
 
         declare_declaration_name_in_current_scope(node, self.source, scopes);
-        let introduces_scope = introduces_js_ts_scope(kind);
+        let introduces_scope =
+            introduces_js_ts_scope(kind) || kind == "generator_function_declaration";
         if introduces_scope {
             scopes.enter();
+            if crate::syntax::js_ts_is_var_scope_kind(kind) && kind != "arrow_function" {
+                scopes.declare("arguments".to_string());
+            }
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 declare_parameter_bindings(parameters, self.source, scopes);
             }
             declare_declaration_name_in_current_scope(node, self.source, scopes);
             declare_function_scoped_bindings(node, self.source, scopes);
-            if kind == "catch_clause"
+            if matches!(kind, "catch_clause" | "arrow_function")
                 && let Some(parameter) = node.child_by_field_name("parameter")
             {
                 declare_binding_pattern(parameter, self.source, scopes);
@@ -589,10 +593,7 @@ impl JsTsDiagnosticCollector<'_> {
 
     fn handle_identifier(&mut self, node: Node<'_>, scopes: &ScopeStack) {
         let text = slice(node, self.source);
-        if text.is_empty()
-            || is_known_js_ts_global(text)
-            || is_unsafe_reference_context(node, self.source)
-        {
+        if text.is_empty() || is_known_js_ts_global(text) || is_unsafe_reference_context(node) {
             // Not a checked lookup: the name is a language global, or it sits
             // where JS/TS gives an identifier a meaning the lexical surface
             // does not decide (a member name off an unknown receiver, a
@@ -664,7 +665,10 @@ fn declare_declaration_name_in_current_scope(
 ) {
     if !matches!(
         node.kind(),
-        "function_declaration" | "class_declaration" | "abstract_class_declaration"
+        "function_declaration"
+            | "generator_function_declaration"
+            | "class_declaration"
+            | "abstract_class_declaration"
     ) {
         return;
     }
@@ -673,39 +677,82 @@ fn declare_declaration_name_in_current_scope(
     }
 }
 
-fn declare_function_scoped_bindings(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
-    let root_id = node.id();
-    let mut stack = vec![node];
+fn declare_function_scoped_bindings(root: Node<'_>, source: &str, scopes: &mut ScopeStack) {
+    let strict = diagnostic_scope_is_strict(root, source);
+    let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        match node.kind() {
-            "function_declaration" if node.id() != root_id => {
-                if let Some(name) = node.child_by_field_name("name") {
+        if node.id() != root.id() {
+            if matches!(
+                node.kind(),
+                "function_declaration" | "generator_function_declaration"
+            ) {
+                // Strict block declarations belong to the block, not an enclosing
+                // function or program. Each block runs this same prepass.
+                if (node.parent() == Some(root) || !strict)
+                    && let Some(name) = node.child_by_field_name("name")
+                {
                     scopes.declare(slice(name, source).to_string());
                 }
                 continue;
             }
-            "function_expression"
-            | "arrow_function"
-            | "generator_function"
-            | "class_declaration"
-            | "abstract_class_declaration"
-                if node.id() != root_id =>
+            if crate::syntax::js_ts_is_var_scope_kind(node.kind())
+                || crate::syntax::js_ts_is_class_scope_kind(node.kind())
             {
                 continue;
             }
-            "variable_declarator" if is_var_declarator(node) => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    declare_binding_pattern(name, source, scopes);
-                }
-                continue;
+        }
+        if node.kind() == "variable_declarator" && is_var_declarator(node) {
+            if let Some(name) = node.child_by_field_name("name") {
+                declare_binding_pattern(name, source, scopes);
             }
-            _ => {}
+            continue;
         }
         for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
+            stack.push(node.named_child(index).expect("named child exists"));
+        }
+    }
+}
+
+/// Modules, class bodies and directive prologues select strict block-function
+/// semantics. Sloppy scripts retain the existing Annex B hoisting behavior.
+fn diagnostic_scope_is_strict(mut node: Node<'_>, source: &str) -> bool {
+    loop {
+        if crate::syntax::js_ts_is_class_scope_kind(node.kind())
+            || (node.kind() == "program"
+                && node.named_children(&mut node.walk()).any(|statement| {
+                    matches!(statement.kind(), "import_statement" | "export_statement")
+                }))
+        {
+            return true;
+        }
+        let body = if node.kind() == "program" {
+            Some(node)
+        } else if crate::syntax::js_ts_is_var_scope_kind(node.kind()) {
+            node.child_by_field_name("body")
+                .filter(|body| body.kind() == "statement_block")
+        } else {
+            None
+        };
+        if let Some(body) = body {
+            for index in 0..body.named_child_count() {
+                let statement = body.named_child(index).expect("named child exists");
+                if statement.kind() == "comment" {
+                    continue;
+                }
+                let Some(value) = statement.named_child(0).filter(|value| {
+                    statement.kind() == "expression_statement" && value.kind() == "string"
+                }) else {
+                    break;
+                };
+                if matches!(slice(value, source), "\"use strict\"" | "'use strict'") {
+                    return true;
+                }
             }
         }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
     }
 }
 
@@ -791,7 +838,7 @@ fn is_suppressed_subtree(kind: &str) -> bool {
     )
 }
 
-fn is_unsafe_reference_context(node: Node<'_>, source: &str) -> bool {
+fn is_unsafe_reference_context(node: Node<'_>) -> bool {
     if is_declaration_identifier(node)
         || is_property_key_in_member(node)
         || is_object_in_member_expression(node)
@@ -829,9 +876,249 @@ fn is_unsafe_reference_context(node: Node<'_>, source: &str) -> bool {
         // run time. Neither is a lexical-scope question, so neither is one
         // this walk can answer.
         "member_expression" | "subscript_expression" => true,
-        _ => {
-            let text = slice(node, source);
-            text.starts_with('_') || text == "arguments"
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod scope_regression_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    struct NoExternalEvidence;
+    impl JsTsExternalSurfaceEvidence for NoExternalEvidence {
+        fn classify_exported_name(&self, _: &str, _: &str) -> JsTsExportedNameEvidence {
+            unimplemented!()
         }
+        fn classify_module(&self, _: &str) -> JsTsModuleEvidence {
+            unimplemented!()
+        }
+    }
+
+    fn lexical_report(source: &str) -> SemanticDiagnosticReport {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let lines = compute_line_starts(source);
+        let mut collector = JsTsDiagnosticCollector {
+            source,
+            diagnostic_source: TYPESCRIPT_SEMANTIC_DIAGNOSTIC_SOURCE,
+            file_rel_path: Path::new("scope.ts"),
+            line_starts: &lines,
+            known_imports: HashSet::default(),
+            same_file_declarations: HashSet::default(),
+            evidence: &NoExternalEvidence,
+            report: SemanticDiagnosticReport::new(),
+            errors: 0,
+        };
+        collector.scan_tree(tree.root_node());
+        collector.report
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: underscore references were suppressed without binding lookup"
+    )]
+    #[hardwon("#7218: review: single arrow parameter was diagnosed as unknown")]
+    fn underscore_references_require_a_binding() {
+        let report = lexical_report(
+            "export const identity = _x => _x; function _present() {} _present(); _missing(); arguments; function ordinary(){ arguments; (()=>arguments)(); } (()=>arguments)();",
+        );
+        let messages: Vec<_> = report
+            .diagnostics()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "Unrecognized JS/TS symbol `_missing`",
+                "Unrecognized JS/TS symbol `arguments`",
+                "Unrecognized JS/TS symbol `arguments`"
+            ]
+        );
+        assert!(!report.outcomes().is_empty());
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: method vars and block functions leaked into outer scopes"
+    )]
+    fn callable_and_block_bindings_do_not_leak() {
+        let report = lexical_report(
+            "export {}; const obj = {method(){var leaked=1; return leaked;}}; const C = class {method(){var hidden=1; return hidden;}}; { function nested() {} nested(); } leaked(); hidden(); nested();",
+        );
+        let messages: Vec<_> = report
+            .diagnostics()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "Unrecognized JS/TS symbol `leaked`",
+                "Unrecognized JS/TS symbol `hidden`",
+                "Unrecognized JS/TS symbol `nested`"
+            ]
+        );
+    }
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: strict block functions leaked while sloppy Annex B differs"
+    )]
+    fn block_function_hoisting_respects_strict_and_sloppy_contexts() {
+        for (prefix, absent) in [
+            ("", false),
+            ("export {};", true),
+            ("'use strict';", true),
+            ("const dependency = require('external');", false),
+        ] {
+            let report =
+                lexical_report(&format!("{prefix} {{ function hidden() {{}} }} hidden();"));
+            assert_eq!(
+                report.diagnostics().len(),
+                usize::from(absent),
+                "{prefix}: {report:?}"
+            );
+            assert!(!report.outcomes().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod report_boundary_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::model::SemanticDiagnosticOutcome;
+    use brokk_bifrost_core::analyzer::project::{Project, TestProject};
+    use brokk_bifrost_core::analyzer::{CodeUnit, Range};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    struct LocalIndex(TestProject);
+    impl CodeUnitIndex for LocalIndex {
+        fn project(&self) -> &dyn Project {
+            &self.0
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            unimplemented!()
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            unimplemented!()
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+    struct Surface;
+    impl JsTsExternalSurfaceEvidence for Surface {
+        fn classify_exported_name(&self, specifier: &str, name: &str) -> JsTsExportedNameEvidence {
+            assert_eq!(specifier, "known");
+            match name {
+                "x" => JsTsExportedNameEvidence::Indexed,
+                "q" => JsTsExportedNameEvidence::AbsentFromCompleteSurface,
+                _ => panic!("unexpected export {name}"),
+            }
+        }
+        fn classify_module(&self, specifier: &str) -> JsTsModuleEvidence {
+            match specifier {
+                "known" => JsTsModuleEvidence::Indexed,
+                "unknown" => JsTsModuleEvidence::Undecided(vec![
+                    SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                        detail: "no retained surface".to_string(),
+                    },
+                ]),
+                _ => panic!("unexpected module {specifier}"),
+            }
+        }
+    }
+
+    #[test]
+    fn full_diagnostic_report_keeps_binding_ranges_and_scope_outcomes() {
+        let source = concat!(
+            "import 'unknown';\n",
+            "import {x} from 'known';\n",
+            "export * from 'unknown';\n",
+            "export {q} from 'known';\n",
+            "const {run:local}=require('unknown');\n",
+            "const all=require('known');\n",
+            "import api = require('known');\n",
+            "function outer(optional?:string, {run}={run:()=>1}){\n",
+            "  inner(); function inner() {}\n",
+            "  abstract class Local {}\n",
+            "  let value: Local; optional; run(); return value;\n",
+            "}\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let project = TestProject::new(dir.path(), Language::TypeScript);
+        let aliases = AliasResolver::new(Arc::new(project.clone()));
+        let index = LocalIndex(project);
+        let file = ProjectFile::new(dir.path().to_path_buf(), "report.ts");
+        let report = collect_js_ts_semantic_diagnostics(
+            &index,
+            &Surface,
+            &file,
+            source,
+            Language::TypeScript,
+            TYPESCRIPT_SEMANTIC_DIAGNOSTIC_SOURCE,
+            &aliases,
+        );
+        let mut rendered = format!("{:?}\n", report.status());
+        for outcome in report.outcomes() {
+            let (range, status) = match outcome {
+                SemanticDiagnosticOutcome::Resolved { range, boundary } => {
+                    (*range, format!("resolved {boundary:?}"))
+                }
+                SemanticDiagnosticOutcome::Absent(proof) => {
+                    (proof.range, format!("absent {:?}", proof.domain))
+                }
+                SemanticDiagnosticOutcome::Incomplete {
+                    range: Some(range),
+                    reasons,
+                } => (*range, format!("incomplete {reasons:?}")),
+                other => panic!("unexpected outcome {other:?}"),
+            };
+            rendered.push_str(&format!(
+                "{}:{}-{} {} {}\n",
+                range.start_line,
+                range.start_byte,
+                range.end_byte,
+                &source[range.start_byte..range.end_byte],
+                status
+            ));
+        }
+        for diagnostic in report.diagnostics() {
+            rendered.push_str(&format!("{}\n", diagnostic.message));
+        }
+        assert_eq!(
+            rendered,
+            "Incomplete\n1:7-16 'unknown' incomplete [RuntimeUnavailable { detail: \"no retained surface\" }]\n2:26-27 x resolved ExternalIndexed\n3:57-66 'unknown' incomplete [RuntimeUnavailable { detail: \"no retained surface\" }]\n4:76-77 q absent Module { name: \"known\" }\n5:99-110 {run:local} incomplete [RuntimeUnavailable { detail: \"no retained surface\" }]\n6:137-140 all resolved ExternalIndexed\n9:245-250 inner resolved WorkspaceLocal\n10:291-296 Local resolved WorkspaceLocal\n11:320-328 optional resolved WorkspaceLocal\n11:330-333 run resolved WorkspaceLocal\n11:344-349 value resolved WorkspaceLocal\nModule `known` has no exported member `q`\n"
+        );
     }
 }

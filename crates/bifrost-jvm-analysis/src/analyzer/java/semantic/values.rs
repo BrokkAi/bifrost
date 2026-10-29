@@ -1,3 +1,5 @@
+use brokk_bifrost_analysis::analyzer::java_integral_parameter::JavaScalarType;
+
 use crate::analyzer::java::semantic::syntax::*;
 
 use crate::analyzer::java::semantic::*;
@@ -23,28 +25,39 @@ fn java_binding_declares_array(node: Node<'_>) -> bool {
 /// always implicitly `static final`). The `is_static` flag is what
 /// [`LoweringContext::implicit_instance_field_locator`] (#2573) uses to
 /// refuse a `static` field: a bare identifier naming one is not `this`-scoped
-/// (it names one shared, class-wide slot, not a per-instance one), a
-/// different, unaddressed question this fix does not touch.
+/// (it names one shared, class-wide slot, not a per-instance one).
+/// Static accesses use `static_field_locator` instead.
 #[derive(Clone, Copy)]
-pub(in crate::analyzer::java::semantic) struct FieldDeclarationAnchor {
+pub(in crate::analyzer::java::semantic) struct FieldDeclarationAnchor<'tree> {
     pub(in crate::analyzer::java::semantic) anchor: SourceAnchor,
+    pub(in crate::analyzer::java::semantic) declaration: Node<'tree>,
     pub(in crate::analyzer::java::semantic) is_static: bool,
     pub(in crate::analyzer::java::semantic) is_array: bool,
 }
 
-pub(in crate::analyzer::java::semantic) struct JavaDeclarationInventory {
+pub(in crate::analyzer::java::semantic) struct JavaDeclarationInventory<'tree> {
     pub(in crate::analyzer::java::semantic) field_anchors:
-        HashMap<(Box<str>, Box<str>), Option<FieldDeclarationAnchor>>,
+        HashMap<(usize, Box<str>), Option<FieldDeclarationAnchor<'tree>>>,
+    pub(in crate::analyzer::java::semantic) type_nodes:
+        HashMap<(usize, Box<str>), Option<Node<'tree>>>,
     pub(in crate::analyzer::java::semantic) type_roots: HashSet<Box<str>>,
+    pub(in crate::analyzer::java::semantic) pattern_names: HashSet<Box<str>>,
 }
 
-pub(in crate::analyzer::java::semantic) fn java_declaration_inventory(
-    prepared: &PreparedSyntaxTree,
-) -> JavaDeclarationInventory {
+pub(in crate::analyzer::java::semantic) fn java_declaration_inventory<'tree>(
+    prepared: &'tree PreparedSyntaxTree,
+) -> JavaDeclarationInventory<'tree> {
     let mut field_anchors = HashMap::default();
+    let mut pattern_names = HashSet::default();
     let mut type_roots = HashSet::default();
+    let mut type_nodes = HashMap::<(usize, Box<str>), Option<Node<'tree>>>::default();
     let mut stack = vec![prepared.tree().root_node()];
     while let Some(node) = stack.pop() {
+        if let Some(name) = brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node)
+            .and_then(|name| node_text(prepared.source(), name))
+        {
+            pattern_names.insert(name.into());
+        }
         if matches!(
             node.kind(),
             "class_declaration"
@@ -57,6 +70,14 @@ pub(in crate::analyzer::java::semantic) fn java_declaration_inventory(
             .and_then(|name| node_text(prepared.source(), name))
         {
             type_roots.insert(name.into());
+            let mut scope = node.parent().expect("named type has a declaration scope");
+            if scope.kind() == "enum_body_declarations" {
+                scope = scope.parent().expect("enum members have an enum body");
+            }
+            type_nodes
+                .entry((scope.id(), name.into()))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(node));
         }
         if node.kind() == "import_declaration"
             && let Some(raw) = prepared.source().get(node.byte_range())
@@ -89,13 +110,14 @@ pub(in crate::analyzer::java::semantic) fn java_declaration_inventory(
                 let Ok(anchor) = source_anchor(name, 0) else {
                     continue;
                 };
-                let Some(owner) = enclosing_type_name(prepared.source(), node) else {
+                let Some(owner) = enclosing_type_node(node) else {
                     continue;
                 };
-                match field_anchors.entry((owner, text.into())) {
+                match field_anchors.entry((owner.id(), text.into())) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(Some(FieldDeclarationAnchor {
                             anchor,
+                            declaration: declarator,
                             is_static,
                             is_array,
                         }));
@@ -111,28 +133,32 @@ pub(in crate::analyzer::java::semantic) fn java_declaration_inventory(
     }
     JavaDeclarationInventory {
         field_anchors,
+        type_nodes,
         type_roots,
+        pattern_names,
     }
 }
 
-fn enclosing_type_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
-    let candidate = brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(
-        node,
-        |kind| {
-            matches!(
-                kind,
-                "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "annotation_type_declaration"
-            )
-        },
-    )?;
-    candidate
-        .child_by_field_name("name")
-        .and_then(|name| node_text(source, name))
-        .map(Into::into)
+fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |parent| {
+        declaration_container_kind(parent).is_some()
+    })
+}
+
+// An absent source member differs from an inherited or ambiguous member:
+// only the former lets lookup continue into an enclosing type.
+enum SourceFieldLookup<'tree> {
+    Found {
+        owner: Node<'tree>,
+        field: FieldDeclarationAnchor<'tree>,
+    },
+    Missing,
+    Open,
+}
+
+struct SourceQualifier<'tree> {
+    owner: Node<'tree>,
+    is_value: bool,
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -279,6 +305,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 return Ok(WalkControl::SkipChildren);
             }
             if let Some(binding) = java_local_binding(node)
+                && (brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node).is_none()
+                    || java_pattern_has_value(node))
                 && let Some(text) = node_text(self.prepared.source(), binding.name)
             {
                 let JavaLocalBindingSyntax {
@@ -318,8 +346,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         value,
                     });
             }
-            // A pattern variable has no lowered binding. Its name is kept so
-            // that a reference to it can say so.
+            // Keep pattern names as a cheap query-local filter. Visibility is
+            // resolved per reference; record extraction remains explicitly open.
             if let Some(binder) =
                 brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node)
                 && let Some(text) = node_text(self.prepared.source(), binder)
@@ -335,6 +363,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         name: &str,
         byte: usize,
     ) -> Option<ValueId> {
+        if self.pattern_variable_names.contains(name) {
+            use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+                LexicalBindingResolution, resolve_lexical_binding,
+            };
+            let resolution = resolve_lexical_binding(
+                Language::Java,
+                self.prepared.tree().root_node(),
+                self.prepared.source(),
+                byte,
+                byte + name.len(),
+                name,
+            )?;
+            let definition = match resolution {
+                LexicalBindingResolution::Parameter(definition)
+                | LexicalBindingResolution::OtherLocal(definition) => definition,
+            };
+            return self
+                .locals
+                .get(name)?
+                .iter()
+                .find(|binding| binding.declaration_start == definition.name_range.start_byte)
+                .map(|binding| binding.value);
+        }
         self.locals
             .get(name)?
             .iter()
@@ -448,6 +499,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some(value) = self.expression_values.get(&node.id()) {
             return Ok(*value);
         }
+        let kind = if kind == SemanticValueKind::Constant {
+            brokk_bifrost_jvm::java::decoded_string_literal_value(node, self.prepared.source())
+                .map(|value| SemanticValueKind::ConstantString(value.into_boxed_str()))
+                .unwrap_or(kind)
+        } else {
+            kind
+        };
         let metadata = self.value_mapping(builder, node)?;
         let value = self.session.insert_cached_value_with_metadata(
             builder,
@@ -544,6 +602,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// that may have mutated the object it names (`emit_receiver_write_back`,
     /// #2571). Keeping one resolver means the two directions can never drift
     /// apart on which node names which slot.
+    pub(super) fn pattern_visibility_unproven(&self, node: Node<'tree>) -> bool {
+        use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus_with_visibility;
+        node.kind() == "identifier"
+            && node_text(self.prepared.source(), node).is_some_and(|name| {
+                self.pattern_variable_names.contains(name)
+                    && resolve_lexical_binding_from_focus_with_visibility(
+                        Language::Java,
+                        node,
+                        self.prepared.source(),
+                        node.start_byte(),
+                        name,
+                    )
+                    .is_err()
+            })
+    }
+
+    pub(super) fn pattern_definition_at(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalDefinition> {
+        use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+            LexicalBindingResolution, resolve_lexical_binding_from_focus,
+        };
+        let name = node_text(self.prepared.source(), node)?;
+        if node.kind() != "identifier" || !self.pattern_variable_names.contains(name) {
+            return None;
+        }
+        let definition = match resolve_lexical_binding_from_focus(
+            Language::Java,
+            node,
+            self.prepared.source(),
+            node.start_byte(),
+            name,
+        )? {
+            LexicalBindingResolution::Parameter(definition)
+            | LexicalBindingResolution::OtherLocal(definition) => definition,
+        };
+        (definition.kind == brokk_bifrost_core::analyzer::model::DeclarationKind::PatternVariable)
+            .then_some(definition)
+    }
+
     pub(in crate::analyzer::java::semantic) fn lexical_reference_binding(
         &self,
         node: Node<'tree>,
@@ -593,6 +692,282 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    /// Resolve a source-declared type in the lexical type scopes of this use.
+    /// Scope and owner identities keep same-named nested types distinct.
+    /// An unknown external type stays unresolved.
+    fn source_type_named(&self, name: &str, focus: Node<'tree>) -> Option<Node<'tree>> {
+        let source = self.prepared.source();
+        let mut scope = Some(focus);
+        while let Some(node) = scope {
+            if brokk_bifrost_jvm::java::graph_support::java_declared_type_parameters(node)
+                .into_iter()
+                .any(|parameter| {
+                    brokk_bifrost_jvm::java::graph_support::java_type_parameter_name(
+                        parameter, source,
+                    ) == Some(name)
+                })
+            {
+                return None;
+            }
+            if declaration_container_kind(node).is_some()
+                && node
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(source, n))
+                    == Some(name)
+            {
+                return Some(node);
+            }
+            let body = node.child_by_field_name("body").unwrap_or(node);
+            if let Some(candidate) = self.source_type_nodes.get(&(body.id(), name.into())) {
+                let candidate = (*candidate)?;
+                if !candidate.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "block"
+                            | "constructor_body"
+                            | "switch_block_statement_group"
+                            | "switch_rule"
+                    )
+                }) || candidate.start_byte() <= focus.start_byte()
+                {
+                    return Some(candidate);
+                }
+            }
+            scope = node.parent();
+        }
+        None
+    }
+
+    fn source_member(&self, owner: Node<'tree>, name: &str) -> SourceFieldLookup<'tree> {
+        match self
+            .field_declaration_anchors
+            .get(&(owner.id(), name.into()))
+        {
+            Some(Some(field)) => {
+                return SourceFieldLookup::Found {
+                    owner,
+                    field: *field,
+                };
+            }
+            Some(None) => return SourceFieldLookup::Open,
+            None => {}
+        }
+        if owner.child_by_field_name("superclass").is_some()
+            || owner.child_by_field_name("interfaces").is_some()
+            || has_child_kind(owner, "extends_interfaces")
+            || owner.kind() == "class_body"
+        {
+            return SourceFieldLookup::Open;
+        }
+        SourceFieldLookup::Missing
+    }
+
+    fn source_unqualified_field(&self, name: &str, focus: Node<'tree>) -> SourceFieldLookup<'tree> {
+        if self.pattern_definition_at(focus).is_some() || self.pattern_visibility_unproven(focus) {
+            return SourceFieldLookup::Open;
+        }
+        let mut ancestor = Some(focus);
+        while let Some(node) = ancestor {
+            if declaration_container_kind(node).is_some() {
+                match self.source_member(node, name) {
+                    SourceFieldLookup::Missing => {}
+                    selected => return selected,
+                }
+            }
+            ancestor = node.parent();
+        }
+        SourceFieldLookup::Missing
+    }
+
+    /// Follow the AST selector chain once, distinguishing type qualifiers
+    /// from evaluated values. A field value hides a same-named nested type.
+    fn source_qualifier(&self, expression: Node<'tree>) -> Option<SourceQualifier<'tree>> {
+        let source = self.prepared.source();
+        let mut root = expression;
+        while root.kind() == "field_access" {
+            root = root.child_by_field_name("object")?;
+        }
+        let mut selected = if root.kind() == "this" {
+            let mut parent = root.parent();
+            let owner = loop {
+                let node = parent?;
+                if declaration_container_kind(node).is_some() {
+                    break node;
+                }
+                parent = node.parent();
+            };
+            SourceQualifier {
+                owner,
+                is_value: true,
+            }
+        } else if root.kind() == "identifier" {
+            let name = node_text(source, root)?;
+            if let Some((value, _)) = self.lexical_reference_binding(root) {
+                let ty = *self.local_type_nodes.get(&value)?;
+                if ty.kind() != "type_identifier" {
+                    return None;
+                }
+                SourceQualifier {
+                    owner: self.source_type_named(node_text(source, ty)?, ty)?,
+                    is_value: true,
+                }
+            } else {
+                match self.source_unqualified_field(name, root) {
+                    SourceFieldLookup::Found { field, .. } => {
+                        let ty = java_binding_type(field.declaration)?;
+                        if ty.kind() != "type_identifier" {
+                            return None;
+                        }
+                        SourceQualifier {
+                            owner: self.source_type_named(node_text(source, ty)?, ty)?,
+                            is_value: true,
+                        }
+                    }
+                    SourceFieldLookup::Open => return None,
+                    SourceFieldLookup::Missing => SourceQualifier {
+                        owner: self.source_type_named(name, root)?,
+                        is_value: false,
+                    },
+                }
+            }
+        } else {
+            return None;
+        };
+        for name in java_field_access_segments(expression, source)
+            .into_iter()
+            .skip(1)
+        {
+            match self.source_member(selected.owner, name) {
+                SourceFieldLookup::Found { field, .. } => {
+                    let ty = java_binding_type(field.declaration)?;
+                    if ty.kind() != "type_identifier" {
+                        return None;
+                    }
+                    selected = SourceQualifier {
+                        owner: self.source_type_named(node_text(source, ty)?, ty)?,
+                        is_value: true,
+                    };
+                }
+                SourceFieldLookup::Missing if !selected.is_value => {
+                    let body = selected
+                        .owner
+                        .child_by_field_name("body")
+                        .unwrap_or(selected.owner);
+                    selected.owner = (*self.source_type_nodes.get(&(body.id(), name.into()))?)?;
+                }
+                SourceFieldLookup::Missing | SourceFieldLookup::Open => return None,
+            }
+        }
+        Some(selected)
+    }
+
+    /// A nearer instance declaration is a hiding barrier for outer statics.
+    pub(super) fn source_field_declaration(
+        &self,
+        access: Node<'tree>,
+    ) -> Option<(Node<'tree>, FieldDeclarationAnchor<'tree>)> {
+        let source = self.prepared.source();
+        let selected = if access.kind() == "identifier" {
+            if self.lexical_reference_binding(access).is_some() {
+                return None;
+            }
+            self.source_unqualified_field(node_text(source, access)?, access)
+        } else if access.kind() == "field_access" {
+            let object = access.child_by_field_name("object")?;
+            let field = access.child_by_field_name("field")?;
+            let qualifier = self.source_qualifier(object)?;
+            self.source_member(qualifier.owner, node_text(source, field)?)
+        } else {
+            return None;
+        };
+        match selected {
+            SourceFieldLookup::Found { owner, field } => Some((owner, field)),
+            SourceFieldLookup::Missing | SourceFieldLookup::Open => None,
+        }
+    }
+
+    /// A static member is anchored in its declaring type, independent of the
+    /// method performing the access. Existing Static IR needs no receiver.
+    pub(super) fn static_field_locator(
+        &self,
+        access: Node<'tree>,
+    ) -> Option<(SemanticLocator, Option<JavaScalarType>)> {
+        let (owner, field) = self.source_field_declaration(access)?;
+        if !field.is_static {
+            return None;
+        }
+        let primitive = java_binding_type(field.declaration).and_then(JavaScalarType::from_type);
+        let procedure = self.session.locator();
+        let mut ancestors = Vec::new();
+        let mut parent = Some(owner);
+        while let Some(node) = parent {
+            if let Some(kind) = declaration_container_kind(node) {
+                let anchor = source_anchor(node, 0).expect("source-backed type anchor");
+                let segment = match declaration_container_name(self.prepared.source(), node) {
+                    Some(name) => DeclarationSegment::named(kind, name.as_ref(), anchor, 0)
+                        .expect("source-backed type name is nonempty"),
+                    None => DeclarationSegment::anonymous(kind, anchor, 0),
+                };
+                ancestors.push(segment);
+            }
+            parent = node.parent();
+        }
+        let mut segments = vec![procedure.declaration().segments()[0].clone()];
+        segments.extend(ancestors.into_iter().rev());
+        Some((
+            SemanticLocator::new(
+                procedure.mount(),
+                procedure.path().clone(),
+                procedure.language(),
+                DeclarationLocator::new(segments).expect("file and declaring type path"),
+                SemanticRole::MemoryLocation,
+                field.anchor,
+            ),
+            primitive,
+        ))
+    }
+
+    /// A method's own declaring class is already active when it executes.
+    /// Access to a different declaring class can initialize that class before
+    /// the load or store, independently of the operand's primitive type.
+    pub(super) fn static_field_may_initialize(&self, access: Node<'tree>) -> bool {
+        self.source_field_declaration(access)
+            .is_some_and(|(owner, field)| {
+                field.is_static
+                    && enclosing_type_node(access).is_none_or(|current| current != owner)
+            })
+    }
+
+    /// All qualified field reads and writes use the same storage decision.
+    pub(super) fn field_memory_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+        base: ValueId,
+    ) -> Result<(MemoryLocationId, MemoryAccessKind), JavaLoweringError> {
+        if let Some((member, _)) = self.static_field_locator(access) {
+            let location = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Static { member },
+            )?;
+            return Ok((location, MemoryAccessKind::Static));
+        }
+        let object = required_field(access, "object")?;
+        let field = required_field(access, "field")?;
+        let (member, resolved) = self.memory_member_locator(field, object)?;
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        if !resolved {
+            self.add_field_identity_gap(builder, point, location)?;
+        }
+        Ok((location, MemoryAccessKind::Field))
+    }
+
     /// The [`MemoryLocationKind::Field`] a *bare* (unqualified) identifier
     /// names, when it unambiguously names a non-`static` instance field
     /// declared directly on the procedure's own enclosing type (#2573).
@@ -627,9 +1002,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// `None`, the same ambiguity rule `memory_member_locator` already
     /// trusts), or when the matched declaration is `static` (a shared,
     /// class-wide slot is not `this`-scoped at all -- a bare identifier
-    /// naming one is real Java, common even, and is left exactly as
-    /// unmodeled as it was before this fix, not silently misidentified as an
-    /// instance field). A local or parameter of the same name is never
+    /// naming one uses `static_field_locator` instead of being
+    /// misidentified as an instance field). A local or parameter of the same name is never
     /// reached here in the first place: every caller checks
     /// `lexical_reference_binding` first, and Java's own shadowing rule
     /// means a local or parameter always wins.
@@ -655,7 +1029,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // unqualified identifier. Explicit `this.field` accesses do not use
         // this path and remain fields even when a lexical binding shares the
         // name.
-        if self.lexical_reference_binding(node).is_some() {
+        if self.lexical_reference_binding(node).is_some()
+            || self.pattern_definition_at(node).is_some()
+            || self.pattern_visibility_unproven(node)
+        {
             return None;
         }
         // An implicit field access needs `this` to exist at all: a `static`
@@ -779,6 +1156,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         result: ValueId,
     ) -> Result<(), JavaLoweringError> {
+        if let Some((member, _)) = self.static_field_locator(node) {
+            let location = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Static { member },
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Static,
+                    location,
+                    result,
+                },
+            )?;
+            return Ok(());
+        }
         let Some((member, name)) = self.implicit_instance_field_locator(node) else {
             return Ok(());
         };
@@ -838,18 +1232,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         value: ValueId,
     ) -> Result<bool, JavaLoweringError> {
-        let Some((member, name)) = self.implicit_instance_field_locator(node) else {
+        if let Some((member, _)) = self.static_field_locator(node) {
+            let location = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Static { member },
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Static,
+                    location,
+                    value,
+                },
+            )?;
+            return Ok(true);
+        }
+        let Some((location, carrier)) =
+            self.implicit_instance_field_storage(builder, node, point)?
+        else {
             return Ok(false);
         };
-        let base = self
-            .receiver
-            .expect("implicit_instance_field_locator only resolves when a receiver exists");
-        let field_anchor = member.anchor();
-        let location = self.session.add_memory_location(
-            builder,
-            point,
-            MemoryLocationKind::Field { base, member },
-        )?;
         self.append_effect(
             builder,
             point,
@@ -859,31 +1263,51 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 value,
             },
         )?;
-        // #2573: a genuine assignment unconditionally kills the procedure's
-        // own per-field virtual carrier -- see `implicit_field_carrier`'s
-        // own doc comment. Mirrors `assignment_expression`'s own local-target
-        // branch exactly (an `Assignment` effect plus a `ValueFlowKind::Local`
-        // edge), which is what gives a reassignment its required, later,
-        // unconditional-kill property over any write-back edge before it.
-        let carrier = self.implicit_field_carrier(builder, &name, field_anchor)?;
-        self.append_effect(
+        self.assign_implicit_field_carrier(builder, point, carrier, value)?;
+        Ok(true)
+    }
+
+    pub(super) fn implicit_instance_field_storage(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+    ) -> Result<Option<(MemoryLocationId, ValueId)>, JavaLoweringError> {
+        let Some((member, name)) = self.implicit_instance_field_locator(node) else {
+            return Ok(None);
+        };
+        let base = self
+            .receiver
+            .expect("implicit instance field has a receiver");
+        let anchor = member.anchor();
+        let location = self.session.add_memory_location(
             builder,
             point,
-            SemanticEffect::Assignment {
-                target: carrier,
-                value,
-            },
+            MemoryLocationKind::Field { base, member },
         )?;
+        let carrier = self.implicit_field_carrier(builder, &name, anchor)?;
+        Ok(Some((location, carrier)))
+    }
+
+    pub(super) fn assign_implicit_field_carrier(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        target: ValueId,
+        value: ValueId,
+    ) -> Result<(), JavaLoweringError> {
+        // A genuine write kills the prior virtual-local value; a receiver
+        // mutation still uses the existing additive write-back path (#2573).
+        self.append_effect(builder, point, SemanticEffect::Assignment { target, value })?;
         self.append_effect(
             builder,
             point,
             SemanticEffect::ValueFlow {
                 kind: ValueFlowKind::Local,
                 source: value,
-                target: carrier,
+                target,
             },
-        )?;
-        Ok(true)
+        )
     }
 
     /// After a call whose receiver is an implicit `this.field` access,
@@ -1109,6 +1533,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         &self,
         node: Node<'tree>,
     ) -> bool {
+        if self
+            .source_qualifier(node)
+            .is_some_and(|qualifier| qualifier.is_value)
+        {
+            return false;
+        }
         java_field_access_is_type_qualifier(
             node,
             self.prepared.source(),
@@ -1178,13 +1608,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// exact identifier. This fact is useful both for implicit-field memory
     /// identity and for array-type proof; callers apply lexical-shadowing,
     /// static, or receiver restrictions appropriate to their syntax shape.
-    fn enclosing_field_declaration(&self, node: Node<'tree>) -> Option<FieldDeclarationAnchor> {
+    fn enclosing_field_declaration(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<FieldDeclarationAnchor<'tree>> {
         if node.kind() != "identifier" {
             return None;
         }
         let name = node_text(self.prepared.source(), node)?;
-        let owner = enclosing_type_name(self.prepared.source(), node)?;
-        *self.field_declaration_anchors.get(&(owner, name.into()))?
+        let owner = enclosing_type_node(node)?;
+        *self
+            .field_declaration_anchors
+            .get(&(owner.id(), name.into()))?
     }
 
     fn root_identifier_is_value(&self, name: &str, access: Node<'tree>) -> bool {
@@ -1192,11 +1627,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return true;
         }
-        let Some(owner) = enclosing_type_name(self.prepared.source(), access) else {
+        let Some(owner) = enclosing_type_node(access) else {
             return false;
         };
         self.field_declaration_anchors
-            .contains_key(&(owner, name.into()))
+            .contains_key(&(owner.id(), name.into()))
     }
 
     pub(in crate::analyzer::java::semantic) fn memory_member_locator(
@@ -1209,15 +1644,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let declaration_anchor = node_text(self.prepared.source(), object)
             .and_then(|name| self.local_at(name, object.start_byte()))
             .and_then(|base| {
-                self.local_types
-                    .get(&base)
-                    .zip(node_text(self.prepared.source(), node))
-            })
-            .and_then(|(owner, name)| {
+                let ty = *self.local_type_nodes.get(&base)?;
+                let owner_name = self.local_types.get(&base)?;
+                let owner = self.source_type_named(owner_name, ty)?;
+                let name = node_text(self.prepared.source(), node)?;
                 self.field_declaration_anchors
-                    .get(&(owner.clone(), name.into()))
+                    .get(&(owner.id(), name.into()))
+                    .copied()
+                    .flatten()
             })
-            .and_then(|entry| *entry)
             .map(|field| field.anchor)
             .or_else(|| {
                 (object.kind() == "this")
@@ -1268,8 +1703,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let element_type = array_type.child_by_field_name("element")?;
         let owner = node_text(self.prepared.source(), element_type)?;
         let field_name = node_text(self.prepared.source(), field)?;
+        let owner = self.source_type_named(owner, element_type)?;
         self.field_declaration_anchors
-            .get(&(owner.into(), field_name.into()))
+            .get(&(owner.id(), field_name.into()))
             .and_then(|entry| *entry)
             .map(|field| field.anchor)
     }

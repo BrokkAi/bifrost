@@ -1,4 +1,4 @@
-//! On-demand projection of catalog-backed composition groups.
+//! Group-local composition over catalog rows and selected decoded inputs.
 
 use super::*;
 use crate::analyzer::store::cache_budget::StoreCacheBudget;
@@ -7,13 +7,15 @@ use crate::analyzer::store::semantic_composition::{
     ComposedGroupCacheKey, CompositionDiscoveryCacheKey, CompositionLookup, SearchCandidate,
     SearchCandidateStream, SearchGroup, SemanticOverlayBuildIdentity,
 };
-use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements as questions;
+use brokk_bifrost_semantic::analyzer::semantic_model::catalog::{
+    CatalogError, statements as questions,
+};
 use composition::{CompositionGroupKey, RowCompositionReads};
 use rusqlite::named_params;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct RowOverlay {
-    active: Arc<ResolvedActiveSemanticModels>,
+    pub(super) active: Arc<ResolvedActiveSemanticModels>,
     pub(super) cache: Option<StoreCacheBudget>,
     build_identity: SemanticOverlayBuildIdentity,
     anchors: locations::SourceAnchors,
@@ -22,12 +24,44 @@ pub(super) struct RowOverlay {
 }
 
 impl RowOverlay {
+    /// These are activation-lifetime originals, not evictable cache entries.
+    /// Estimate each fact exactly as the eager overlay does, and include spare
+    /// vector capacity and the anchor map's owned keys and values.
+    pub(super) fn retained_owned_input_bytes(&self) -> [usize; 3] {
+        [
+            self.anchors.retained_bytes_lower_bound(),
+            std::mem::size_of_val(&self.generated)
+                .saturating_add(
+                    (self.generated.capacity() - self.generated.len())
+                        .saturating_mul(std::mem::size_of::<SemanticModelSymbol>()),
+                )
+                .saturating_add(
+                    self.generated
+                        .iter()
+                        .map(symbol_retained_bytes)
+                        .fold(0usize, usize::saturating_add),
+                ),
+            std::mem::size_of_val(&self.generated_relations)
+                .saturating_add(
+                    (self.generated_relations.capacity() - self.generated_relations.len())
+                        .saturating_mul(std::mem::size_of::<SemanticModelRelation>()),
+                )
+                .saturating_add(
+                    self.generated_relations
+                        .iter()
+                        .map(relation_retained_bytes)
+                        .fold(0usize, usize::saturating_add),
+                ),
+        ]
+    }
+
     pub(super) fn new(
         analyzer: &dyn IAnalyzer,
         active: &Arc<ResolvedActiveSemanticModels>,
         generated: Vec<SemanticModelSymbol>,
         generated_relations: Vec<SemanticModelRelation>,
         cache: Option<StoreCacheBudget>,
+        eager_symbols: &[SemanticModelSymbol],
     ) -> Self {
         let mut result = Self {
             active: Arc::clone(active),
@@ -37,11 +71,26 @@ impl RowOverlay {
             generated,
             generated_relations,
         };
-        result.anchors = semantic_catalog_question(
-            "SOURCE_TYPES/SOURCE_MEMBERS",
-            active.active_model_set_hash(),
-            result.reads().source_anchors(analyzer),
-        );
+        if active.shards.iter().any(|shard| shard.decoded.is_none()) {
+            result.anchors = semantic_catalog_question(
+                "SOURCE_TYPES/SOURCE_MEMBERS",
+                active.active_model_set_hash(),
+                result.reads().source_anchors(analyzer),
+            );
+        }
+        for symbol in eager_symbols
+            .iter()
+            .filter(|s| matches!(s.location, SemanticModelLocation::Authored(_)))
+        {
+            result.anchors.insert_symbol(
+                if symbol.owner_id.is_none() {
+                    "type"
+                } else {
+                    "member"
+                },
+                symbol.clone(),
+            );
+        }
         let mut digest =
             crate::analyzer::semantic::LengthDelimitedDigest::new(b"semantic-overlay-build-v1");
         digest.push(active.active_model_set_hash().as_bytes());
@@ -85,6 +134,7 @@ impl RowOverlay {
     fn composed_group(&self, key: &CompositionGroupKey) -> composition::ComposedGroup {
         let cache_key = ComposedGroupCacheKey {
             build: self.build_identity,
+            selection_digest: None,
             group: key.clone(),
         };
         if let Some(value) = self
@@ -107,10 +157,358 @@ impl RowOverlay {
         Arc::unwrap_or_clone(group)
     }
 
+    fn selected_reads<'a>(
+        &'a self,
+        language: &'a str,
+        selection: &'a ModelProviderSelection,
+        defining_owner: Option<&'a SemanticModelProvenance>,
+        cancellation: &'a crate::CancellationToken,
+    ) -> Box<dyn composition::GroupInput + 'a> {
+        if crate::analyzer::Language::from_config_label(language)
+            .and_then(brokk_bifrost_semantic::analyzer::semantic::languages::language_knowledge)
+            .is_some_and(|knowledge| knowledge.models_compose_from_catalog_rows())
+        {
+            let mut reads = self.reads();
+            reads.cancellation = Some(cancellation);
+            reads.selection = Some(selection);
+            reads.defining_owner = defining_owner;
+            Box::new(reads.for_language(language))
+        } else {
+            Box::new(composition::SelectedDecodedReads {
+                language,
+                active: &self.active,
+                selection,
+                defining_owner,
+                generated: &self.generated,
+                generated_relations: &self.generated_relations,
+                cancellation,
+            })
+        }
+    }
+
+    pub(super) fn selected_symbols(
+        &self,
+        symbol: &ModelSymbolRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<SemanticModelSymbol>, SemanticModelOverlayBuildError> {
+        let Some(shard) = self.active.shards.iter().find(|shard| {
+            shard.manifest.pack_id == symbol.provider.pack_id
+                && shard.manifest.version == symbol.provider.pack_version
+                && shard.manifest.semantic_sha256 == symbol.provider.pack_digest
+        }) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .selected_groups(
+                &shard.manifest.language,
+                &TypeRef::Declared {
+                    id: symbol.symbol_id.clone(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+                selection,
+                cancellation,
+            )?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// One selected alias group is the cache unit, including its defining facets.
+    pub(super) fn selected_groups(
+        &self,
+        language: &str,
+        reference: &TypeRef,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<Vec<SemanticModelSymbol>>, SemanticModelOverlayBuildError> {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        let input = self.selected_reads(language, selection, None, cancellation);
+        let reads = composition::GroupProjection::new(input.as_ref());
+        let selected_lookup = match reference {
+            TypeRef::Declared { id, .. } => CompositionLookup::SelectedId {
+                language: language.to_owned(),
+                id: id.clone(),
+            },
+            TypeRef::Named { name, .. } => CompositionLookup::SelectedName {
+                language: language.to_owned(),
+                name: name.clone(),
+            },
+            _ => return Ok(Vec::new()),
+        };
+        let lookup = CompositionDiscoveryCacheKey {
+            build: self.build_identity,
+            selection_digest: Some(selection.digest()),
+            lookup: selected_lookup,
+        };
+        let keys = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.composition_discovery(&lookup));
+        let keys = match keys {
+            Some(keys) => keys,
+            None => {
+                let symbols = match reference {
+                    TypeRef::Declared { id, .. } => selected_question(
+                        "TYPES_BY_ID/MEMBERS_BY_ID",
+                        reference,
+                        reads.symbols_with_id(&self.anchors, id),
+                    )?,
+                    TypeRef::Named { name, .. } => {
+                        let records = selected_question(
+                            "TYPES_BY_NAME",
+                            reference,
+                            input.all_types_named(name),
+                        )?;
+                        let mut symbols = Vec::new();
+                        for record in records {
+                            check_selected_cancellation(cancellation)?;
+                            symbols.extend(selected_question(
+                                "TYPES_BY_ID",
+                                &record.record.id,
+                                reads.owner_symbols(&self.anchors, &record.record.id),
+                            )?);
+                        }
+                        symbols
+                    }
+                    _ => unreachable!("selected group references are names or declaration IDs"),
+                };
+                let mut keys = Vec::new();
+                for symbol in symbols.into_iter().filter(|s| s.language == language) {
+                    check_selected_cancellation(cancellation)?;
+                    let owners = if let Some(owner) = symbol.owner_id {
+                        selected_question(
+                            "TYPES_BY_ID",
+                            &owner,
+                            reads.owner_symbols(&self.anchors, &owner),
+                        )?
+                    } else {
+                        vec![symbol]
+                    };
+                    for owner in owners {
+                        check_selected_cancellation(cancellation)?;
+                        let seed = CompositionGroupKey {
+                            language: owner.language,
+                            module_namespace: owner.kind == SemanticModelSymbolKind::Module,
+                            identity: owner.qualified_name,
+                        };
+                        let owners = selected_question(
+                            "GROUP_OWNERS",
+                            &seed,
+                            reads.group_owners(&self.anchors, &seed),
+                        )?;
+                        keys.push(composition::group_key(&owners.iter().collect::<Vec<_>>()));
+                    }
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                let keys = Arc::new(keys);
+                if cancellation.is_cancelled() {
+                    return Err(SemanticModelOverlayBuildError::Cancelled);
+                }
+                if let Some(cache) = &self.cache {
+                    cache.insert_composition_discovery(lookup, Arc::clone(&keys));
+                }
+                keys
+            }
+        };
+        let mut symbols = Vec::new();
+        for key in keys.iter() {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            let cache_key = ComposedGroupCacheKey {
+                build: self.build_identity,
+                selection_digest: Some(selection.digest()),
+                group: key.clone(),
+            };
+            let cached = self
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.composed_group(&cache_key));
+            let group = match cached {
+                Some(group) => group,
+                None => {
+                    let owners = selected_question(
+                        "GROUP_OWNERS",
+                        key,
+                        reads.group_owners(&self.anchors, key),
+                    )?;
+                    let mut facets = HashSet::default();
+                    let mut groups = Vec::new();
+                    // Partition before the shared kernel: both representative and
+                    // endpoint reads see at most one extracted defining provider.
+                    // Selected curated contributors remain available to every facet.
+                    let has_extracted = owners.iter().any(|s| s.provenance.extraction.is_some());
+                    for owner in owners
+                        .iter()
+                        .filter(|s| !has_extracted || s.provenance.extraction.is_some())
+                    {
+                        let provider = ModelProvider::from(&owner.provenance);
+                        let input = self.selected_reads(
+                            language,
+                            selection,
+                            Some(&owner.provenance),
+                            cancellation,
+                        );
+                        let facet_reads = composition::GroupProjection::new(input.as_ref());
+                        let seed = CompositionGroupKey {
+                            language: owner.language.clone(),
+                            module_namespace: owner.kind == SemanticModelSymbolKind::Module,
+                            identity: owner.qualified_name.clone(),
+                        };
+                        let facet_owners = selected_question(
+                            "GROUP_OWNERS",
+                            &seed,
+                            facet_reads.group_owners(&self.anchors, &seed),
+                        )?;
+                        let facet_key =
+                            composition::group_key(&facet_owners.iter().collect::<Vec<_>>());
+                        if facets.insert((provider.clone(), facet_key.clone())) {
+                            groups.push(selected_question(
+                                "SELECTED_GROUP",
+                                &facet_key,
+                                facet_reads.compose_group(&self.anchors, &facet_key),
+                            )?);
+                        }
+                    }
+                    let mut groups = groups.into_iter();
+                    let mut group = groups.next().expect("discovered group has an owner");
+                    for other in groups {
+                        check_selected_cancellation(cancellation)?;
+                        let offset = group.symbols.len();
+                        group
+                            .source_indices
+                            .extend(other.source_indices.into_iter().map(|i| i + offset));
+                        group.symbols.extend(other.symbols);
+                        group.relations.extend(other.relations);
+                        group.diagnostics.extend(other.diagnostics);
+                    }
+                    self.augment_selected_group(
+                        &key.language,
+                        &mut group.symbols,
+                        selection,
+                        cancellation,
+                    )?;
+                    check_selected_cancellation(cancellation)?;
+                    let group = Arc::new(group);
+                    if let Some(cache) = &self.cache {
+                        cache.insert_composed_group(cache_key, Arc::clone(&group));
+                    }
+                    group
+                }
+            };
+            symbols.push(group.symbols.clone());
+        }
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        Ok(symbols)
+    }
+
+    fn augment_selected_group(
+        &self,
+        language: &str,
+        symbols: &mut Vec<SemanticModelSymbol>,
+        selection: &ModelProviderSelection,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<(), SemanticModelOverlayBuildError> {
+        let hook =
+            brokk_bifrost_semantic::analyzer::semantic_model::overlay::model_composition_language(
+                language,
+            );
+        let original = symbols.len();
+        let input = self.selected_reads(language, selection, None, cancellation);
+        let reads = composition::GroupProjection::new(input.as_ref());
+        let mut seen = symbols
+            .iter()
+            .map(|s| (ModelProvider::from(&s.provenance), s.id.clone()))
+            .collect::<HashSet<_>>();
+        let mut cursor = 0;
+        // Materialize only the structured embedding inputs of this request.
+        // The shared Go algorithm below owns provider-first resolution, shadowing,
+        // DeclaringSite matching, promotion marks and members_state.
+        while cursor < symbols.len() {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            let dependencies = hook
+                .group_dependencies(&symbols[cursor])
+                .cloned()
+                .collect::<Vec<_>>();
+            cursor += 1;
+            for dependency in dependencies {
+                if cancellation.is_cancelled() {
+                    return Err(SemanticModelOverlayBuildError::Cancelled);
+                }
+                let mut reference = &dependency;
+                while let TypeRef::Pointer { element } = reference {
+                    reference = element;
+                }
+                let targets = match reference {
+                    TypeRef::Declared { id, .. } => selected_question(
+                        "GO_EMBEDDED_OWNER_ID",
+                        id,
+                        reads.owner_symbols(&self.anchors, id),
+                    )?,
+                    TypeRef::Named { name, .. } => {
+                        let records = selected_question(
+                            "GO_EMBEDDED_OWNER_NAME",
+                            name,
+                            input.all_types_named(name),
+                        )?;
+                        let mut targets = Vec::new();
+                        for record in records {
+                            check_selected_cancellation(cancellation)?;
+                            targets.extend(selected_question(
+                                "GO_EMBEDDED_OWNER_ID",
+                                &record.record.id,
+                                reads.owner_symbols(&self.anchors, &record.record.id),
+                            )?);
+                        }
+                        targets
+                    }
+                    _ => Vec::new(),
+                };
+                for target in targets {
+                    let key = CompositionGroupKey {
+                        language: target.language.clone(),
+                        module_namespace: target.kind == SemanticModelSymbolKind::Module,
+                        identity: target.qualified_name.clone(),
+                    };
+                    let group = selected_question(
+                        "GO_EMBEDDED_GROUP",
+                        &key,
+                        reads.group_symbols(&self.anchors, &key),
+                    )?;
+                    for symbol in group {
+                        if seen.insert((ModelProvider::from(&symbol.provenance), symbol.id.clone()))
+                        {
+                            symbols.push(symbol);
+                        }
+                    }
+                }
+            }
+        }
+        hook.augment_group(symbols, &mut Vec::new(), cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        // The embedded closure dies here; only the requested alias group is cached.
+        symbols.truncate(original);
+        // Do not retain the embedding closure's allocation in a group cache entry.
+        symbols.shrink_to_fit();
+        Ok(())
+    }
+
     fn discovered(&self, lookup: &CompositionLookup) -> Option<Arc<Vec<CompositionGroupKey>>> {
         self.cache.as_ref().and_then(|cache| {
             cache.composition_discovery(&CompositionDiscoveryCacheKey {
                 build: self.build_identity,
+                selection_digest: None,
                 lookup: lookup.clone(),
             })
         })
@@ -122,6 +520,7 @@ impl RowOverlay {
             cache.insert_composition_discovery(
                 CompositionDiscoveryCacheKey {
                     build: self.build_identity,
+                    selection_digest: None,
                     lookup,
                 },
                 Arc::new(groups),
@@ -144,15 +543,14 @@ impl RowOverlay {
     }
 
     fn reads(&self) -> RowCompositionReads<'_> {
-        RowCompositionReads {
-            active: &self.active,
-            reader: self
-                .active
+        RowCompositionReads::new(
+            &self.active,
+            self.active
                 .source_reader()
                 .expect("row-backed active set has its reader"),
-            generated: &self.generated,
-            generated_relations: &self.generated_relations,
-        }
+            &self.generated,
+            &self.generated_relations,
+        )
     }
 
     pub(super) fn row_language(&self, language: &str) -> bool {
@@ -1566,5 +1964,25 @@ impl RowOverlay {
             .into_iter()
             .map(|(_, exposure, provenance)| (exposure, provenance))
             .collect()
+    }
+}
+
+fn check_selected_cancellation(
+    cancellation: &crate::CancellationToken,
+) -> Result<(), SemanticModelOverlayBuildError> {
+    if cancellation.is_cancelled() {
+        return Err(SemanticModelOverlayBuildError::Cancelled);
+    }
+    Ok(())
+}
+
+fn selected_question<T>(
+    question: &'static str,
+    key: impl std::fmt::Debug,
+    result: Result<T, CatalogError>,
+) -> Result<T, SemanticModelOverlayBuildError> {
+    match result {
+        Err(CatalogError::Cancelled) => Err(SemanticModelOverlayBuildError::Cancelled),
+        result => Ok(semantic_catalog_question(question, key, result)),
     }
 }

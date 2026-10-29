@@ -83,7 +83,7 @@ impl ProjectedSummaryWitness {
             retention_truncated: witness.retention_truncated(),
         }
     }
-    pub(super) fn steps(&self) -> &[super::CodeQueryFlowWitnessStep] {
+    pub(super) fn steps(&self) -> &Vec<super::CodeQueryFlowWitnessStep> {
         &self.steps
     }
     fn quality(&self) -> PathQuality {

@@ -1,5 +1,5 @@
 use crate::call_match::{CppArgType, normalize_cpp_type_name};
-use crate::compile_context::CppCompileContext;
+use crate::compile_context::{CompiledLanguage, CppCompileContext};
 use crate::declarations::cpp_displaced_preprocessor_branch;
 #[cfg(test)]
 use crate::declarations::cpp_displaced_preprocessor_terminator;
@@ -169,6 +169,26 @@ pub enum LexicalTypeResolution {
     },
     Ambiguous,
     Missing,
+}
+
+/// What a reference's guard and build evidence selects from the conditional
+/// alias arms on its alias chain.
+pub enum GuardedAliasSelection {
+    /// Evidence implies one arm at every conditional hop and the chain names
+    /// exactly `unit`. `candidates` are the selected top-level declarations.
+    Proven {
+        unit: CodeUnit,
+        candidates: Vec<CodeUnit>,
+    },
+    /// Undecided or unresolvable arms remain. Each type is a candidate only.
+    Alternatives(Vec<CodeUnit>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AliasArmEvidence {
+    Implied,
+    Compatible,
+    Contradicted,
 }
 
 #[derive(Clone, Copy)]
@@ -2069,6 +2089,9 @@ impl<'a> VisibilityIndex<'a> {
             self.cpp.include_target_index(),
             &facts,
             before_byte,
+            &|guards: Option<&HashSet<PreprocessorGuard>>| {
+                self.effective_reference_guards(file, guards)
+            },
         )
     }
 
@@ -4580,8 +4603,13 @@ impl<'a> VisibilityIndex<'a> {
         }
         let mut arities = Vec::with_capacity(differing_candidates.len());
         // The activation ranges here describe the whole file rather than one
-        // reference, so there is no reference guard environment to consult.
+        // reference, so only file-level language and build facts are known.
+        let effective_guards = |guards: Option<&HashSet<PreprocessorGuard>>| {
+            self.effective_reference_guards(file, guards)
+        };
         let reference = CallableReferenceContext {
+            effective_guards: &effective_guards,
+            file_guards: OnceCell::new(),
             file,
             position: None,
         };
@@ -4705,10 +4733,14 @@ impl<'a> VisibilityIndex<'a> {
         #[cfg(any(test, feature = "test-support"))]
         self.include_activation_build_count
             .fetch_add(1, Ordering::Relaxed);
-        let language_guard_stable = OnceCell::new();
+        let effective = OnceCell::new();
         let activation =
             find_include_activation(cpp, self.token, file, prepared, donor_source, &|| {
-                *language_guard_stable.get_or_init(|| self.include_language_guard_is_stable(file))
+                effective
+                    .get_or_init(|| {
+                        self.effective_reference_guards(file, Some(&HashSet::default()))
+                    })
+                    .as_ref()
             });
         let mut cells = self
             .include_activation_cells
@@ -4735,15 +4767,18 @@ impl<'a> VisibilityIndex<'a> {
             #[cfg(any(test, feature = "test-support"))]
             self.conditional_include_projection_index_build_count
                 .fetch_add(1, Ordering::Relaxed);
-            let language_guard_stable = OnceCell::new();
+            let effective = OnceCell::new();
             find_conditional_include_projection_index(
                 self.cpp,
                 self.token,
                 file,
                 prepared,
                 &|| {
-                    *language_guard_stable
-                        .get_or_init(|| self.include_language_guard_is_stable(file))
+                    effective
+                        .get_or_init(|| {
+                            self.effective_reference_guards(file, Some(&HashSet::default()))
+                        })
+                        .as_ref()
                 },
                 &|| {
                     #[cfg(any(test, feature = "test-support"))]
@@ -4932,6 +4967,7 @@ impl<'a> VisibilityIndex<'a> {
             return false;
         };
         let reference_guards = preprocessor_guard_environment(reference, prepared.source());
+        let reference_guards = self.effective_reference_guards(file, reference_guards.as_ref());
         declaration_guard_requirements(analyzer, self.cpp, declaration)
             .iter()
             .any(|(_, required)| {
@@ -4977,7 +5013,12 @@ impl<'a> VisibilityIndex<'a> {
             let reference_function =
                 real_function_definition_ancestor(reference, prepared.source());
             let guards = OnceCell::new();
+            let effective_guards = |guards: Option<&HashSet<PreprocessorGuard>>| {
+                self.effective_reference_guards(file, guards)
+            };
             let field_reference = CallableReferenceContext {
+                effective_guards: &effective_guards,
+                file_guards: OnceCell::new(),
                 file,
                 position: Some(CallableReferencePosition {
                     prepared: prepared.as_ref(),
@@ -5095,7 +5136,12 @@ impl<'a> VisibilityIndex<'a> {
         let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
+        let effective_guards = |guards: Option<&HashSet<PreprocessorGuard>>| {
+            self.effective_reference_guards(file, guards)
+        };
         let reference = CallableReferenceContext {
+            effective_guards: &effective_guards,
+            file_guards: OnceCell::new(),
             file,
             position: Some(CallableReferencePosition {
                 prepared: prepared.as_ref(),
@@ -5153,15 +5199,7 @@ impl<'a> VisibilityIndex<'a> {
         reference: &CallableReferenceContext<'_>,
     ) -> bool {
         let build_decides = !self.compile_context_is_absent(reference.file);
-        let proven = self.compile_proven_guards(reference.file);
-        let augmented;
-        let active = match reference.guards() {
-            Some(active) if !proven.is_empty() => {
-                augmented = active.union(&proven).cloned().collect();
-                Some(&augmented)
-            }
-            other => other,
-        };
+        let active = reference.guards();
         analyzer
             .declaration_source_occurrences(declaration)
             .into_iter()
@@ -5170,7 +5208,7 @@ impl<'a> VisibilityIndex<'a> {
                 if occurrence.fact.callable_activation.is_none() {
                     return false;
                 }
-                let Some(mut required) = occurrence
+                let Some(required) = occurrence
                     .fact
                     .callable_guards
                     .as_ref()
@@ -5178,25 +5216,11 @@ impl<'a> VisibilityIndex<'a> {
                 else {
                     return false;
                 };
-                if required.iter().any(|guard| match guard {
-                    PreprocessorGuard::Defined(name) if name == "__cplusplus" => reference.is_c(),
-                    PreprocessorGuard::Undefined(name) if name == "__cplusplus" => {
-                        !reference.is_c()
-                    }
-                    _ => false,
-                }) {
-                    return false;
-                }
-                required.retain(|guard| {
-                    !matches!(guard,
-                    PreprocessorGuard::Defined(name) | PreprocessorGuard::Undefined(name)
-                        if name == "__cplusplus")
-                });
                 required.is_empty()
                     || if build_decides {
                         guard_requirements_hold_at_reference(&required, active)
                     } else {
-                        guards_compatible_at_reference(&required, reference.guards())
+                        guards_compatible_at_reference(&required, active)
                     }
             })
     }
@@ -5271,39 +5295,7 @@ impl<'a> VisibilityIndex<'a> {
         {
             return Arc::clone(cached);
         }
-        let names = match context_fact_names(self.cpp.compile_contexts_for(file)) {
-            Some(names) => names,
-            None => {
-                let mut translation_units = self.cpp.reaching_translation_units(file).into_iter();
-                let seed = translation_units.next().and_then(|translation_unit| {
-                    context_fact_names(self.cpp.compile_contexts_for(&translation_unit))
-                });
-                match seed {
-                    None => HashSet::default(),
-                    Some(mut names) => {
-                        for translation_unit in translation_units {
-                            let Some(reached) = context_fact_names(
-                                self.cpp.compile_contexts_for(&translation_unit),
-                            ) else {
-                                names.clear();
-                                break;
-                            };
-                            names.retain(|name| reached.contains(name));
-                            if names.is_empty() {
-                                break;
-                            }
-                        }
-                        names
-                    }
-                }
-            }
-        };
-        let proven = Arc::new(
-            names
-                .into_iter()
-                .map(PreprocessorGuard::Defined)
-                .collect::<HashSet<_>>(),
-        );
+        let proven = Arc::new(compile_proven_guard_facts(self.cpp, file));
         self.compile_proven_guard_cells
             .lock()
             .expect("C++ compile-proven guard cache poisoned")
@@ -5412,27 +5404,19 @@ impl<'a> VisibilityIndex<'a> {
         })
     }
 
-    /// The guards that hold at a reference in `file`: its own source guards,
-    /// the defines the build proves (#2011), and the translation unit's stable
-    /// `__cplusplus` state. A reference whose own environment is unknown stays
-    /// unknown -- the facts extend an environment, they never invent one. Every
-    /// proof and contradiction check against a reference uses this set, so a C
-    /// translation unit never takes an `#ifdef __cplusplus` arm (#7072).
+    /// Supply this query's cached build facts to the shared guard constructor.
     fn effective_reference_guards(
         &self,
         file: &ProjectFile,
         reference_guards: Option<&HashSet<PreprocessorGuard>>,
     ) -> Option<HashSet<PreprocessorGuard>> {
-        let mut effective = reference_guards.cloned()?;
-        effective.extend(self.compile_proven_guards(file).iter().cloned());
-        if self.include_language_guard_is_stable(file) {
-            effective.insert(if reference_uses_c_semantics(self.cpp, file) {
-                PreprocessorGuard::Undefined("__cplusplus".to_string())
-            } else {
-                PreprocessorGuard::Defined("__cplusplus".to_string())
-            });
-        }
-        Some(effective)
+        effective_reference_guards(
+            self.cpp,
+            file,
+            reference_guards,
+            &self.compile_proven_guards(file),
+            &|| self.include_language_guard_is_stable(file),
+        )
     }
 
     /// Decide whether a declaration that lives in another file reaches a
@@ -5523,7 +5507,7 @@ impl<'a> VisibilityIndex<'a> {
         {
             return true;
         }
-        let language_guard_stable = OnceCell::new();
+        let effective = OnceCell::new();
         let reachable = find_conditional_include_projection_for_source(
             self.cpp,
             self.token,
@@ -5533,7 +5517,13 @@ impl<'a> VisibilityIndex<'a> {
             self.include_path_admission(file),
             reference_guards,
             reference_byte,
-            &|| *language_guard_stable.get_or_init(|| self.include_language_guard_is_stable(file)),
+            &|| {
+                effective
+                    .get_or_init(|| {
+                        self.effective_reference_guards(file, Some(&HashSet::default()))
+                    })
+                    .as_ref()
+            },
             &|| {
                 #[cfg(any(test, feature = "test-support"))]
                 self.conditional_include_target_state_count
@@ -5672,10 +5662,15 @@ impl<'a> VisibilityIndex<'a> {
                     || (site.completed_family_before_reference
                         && guards_compatible_at_reference(&site.guards, guards))
             };
-            if !active(raw_reference_guards) {
+            let effective_guards = |guards: Option<&HashSet<PreprocessorGuard>>| {
+                self.effective_reference_guards(file, guards)
+            };
+            let raw_reference_guards = effective_guards(raw_reference_guards);
+            if !active(raw_reference_guards.as_ref()) {
                 return false;
             }
-            return active(reference_guards_at_site())
+            let reference_guards_at_site = effective_guards(reference_guards_at_site());
+            return active(reference_guards_at_site.as_ref())
                 && self.preprocessor_guards_stable_between(
                     file,
                     site.byte,
@@ -6051,8 +6046,8 @@ impl<'a> VisibilityIndex<'a> {
         let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
-        let Some(reference_guards) = preprocessor_guard_environment(reference, prepared.source())
-        else {
+        let raw = preprocessor_guard_environment(reference, prepared.source());
+        let Some(reference_guards) = self.effective_reference_guards(file, raw.as_ref()) else {
             return false;
         };
         // An external header selects its declaration branch before the
@@ -6151,7 +6146,12 @@ impl<'a> VisibilityIndex<'a> {
             return false;
         };
         let guards = OnceCell::new();
+        let effective_guards = |guards: Option<&HashSet<PreprocessorGuard>>| {
+            self.effective_reference_guards(file, guards)
+        };
         let context = CallableReferenceContext {
+            effective_guards: &effective_guards,
+            file_guards: OnceCell::new(),
             file,
             position: Some(CallableReferencePosition {
                 prepared: prepared.as_ref(),
@@ -6310,6 +6310,15 @@ impl<'a> VisibilityIndex<'a> {
         source: &str,
     ) -> Option<CodeUnit> {
         let components = cpp_type_name_components(node, source)?;
+        if !is_globally_qualified_cpp_name(node)
+            && let Some(resolution) =
+                function_local_type_resolution(&self.cpp_source(), file, node, &components, source)
+        {
+            return match resolution {
+                LexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+                LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+            };
+        }
         self.resolve_type(file, &components.join("::"))
     }
 
@@ -7405,6 +7414,192 @@ impl<'a> VisibilityIndex<'a> {
             .ok()
     }
 
+    /// Canonicalize an alias chain at `reference` after its guards select
+    /// conditional alias arms (#6902).
+    ///
+    /// `#if X using T = A; #else using T = B; #endif` indexes one alias
+    /// declaration per arm. Canonicalizing the arms together reports `A` and
+    /// `B` as an ambiguity everywhere, and following the first arm of a nested
+    /// family attributes every use to `A`. Each arm, at every hop of the chain,
+    /// therefore faces the reference's own guards plus the defines the build
+    /// proves before its target is followed. An arm whose guards the evidence
+    /// implies is proven when it is also visible at the reference; an arm
+    /// whose guards are only compatible stays a candidate; a contradicted arm
+    /// is dropped. Compatibility never establishes proof.
+    ///
+    /// Returns `None` when no hop of the chain is a family of alias arms with
+    /// different targets; ordinary canonicalization owns that case.
+    pub fn guarded_alias_selection_at_reference(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        reference: Node<'_>,
+        candidates: &[CodeUnit],
+    ) -> Option<GuardedAliasSelection> {
+        const MAX_GUARDED_ALIAS_STEPS: usize = 64;
+        let mut conditional = false;
+        let mut complete = true;
+        let mut selected = Vec::new();
+        let mut terminals: Vec<(CodeUnit, bool)> = Vec::new();
+        let mut visited = HashSet::default();
+        // Each pending entry is a unit, whether every hop before it was
+        // proven, its hop depth, and whether it is a top-level candidate.
+        let mut pending = candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), true, 0, true))
+            .collect::<Vec<_>>();
+        let mut steps = 0;
+        while let Some((unit, proven, depth, top_level)) = pending.pop() {
+            if !visited.insert((unit.clone(), proven)) {
+                continue;
+            }
+            steps += 1;
+            if steps > MAX_GUARDED_ALIAS_STEPS || depth > MAX_COMPARABLE_ALIAS_HOPS {
+                return None;
+            }
+            let arms = match self.conditional_alias_arms(analyzer, file, &unit) {
+                Some(arms) => {
+                    conditional = true;
+                    let evidence = arms
+                        .into_iter()
+                        .map(|arm| {
+                            let evidence = self.alias_arm_evidence(analyzer, file, &arm, reference);
+                            (arm, evidence)
+                        })
+                        .collect::<Vec<_>>();
+                    // A translation unit declares at most one arm of an alias
+                    // with conflicting targets, so an implied arm excludes
+                    // every merely compatible one.
+                    let implied = evidence
+                        .iter()
+                        .any(|(_, evidence)| *evidence == AliasArmEvidence::Implied);
+                    for (arm, _) in &evidence {
+                        visited.insert((arm.clone(), proven));
+                    }
+                    evidence
+                        .into_iter()
+                        .filter_map(|(arm, evidence)| match evidence {
+                            AliasArmEvidence::Implied => Some((arm, proven)),
+                            AliasArmEvidence::Compatible if !implied => Some((arm, false)),
+                            AliasArmEvidence::Compatible | AliasArmEvidence::Contradicted => None,
+                        })
+                        .collect::<Vec<_>>()
+                }
+                None => vec![(unit, proven)],
+            };
+            for (arm, proven) in arms {
+                if top_level {
+                    selected.push(arm.clone());
+                }
+                match self.structured_alias_target(analyzer, &arm) {
+                    None | Some(StructuredAliasTarget::Builtin) if arm.is_class() => {
+                        terminals.push((arm, proven));
+                    }
+                    None | Some(StructuredAliasTarget::Builtin) => complete = false,
+                    Some(target) => {
+                        match self.structured_alias_target_resolution(file, &arm, &target) {
+                            Ok(next) => pending.push((next, proven, depth + 1, false)),
+                            Err(_) => complete = false,
+                        }
+                    }
+                }
+            }
+        }
+        if !conditional {
+            return None;
+        }
+        let mut targets: Vec<CodeUnit> = Vec::new();
+        for (terminal, _) in &terminals {
+            if !targets
+                .iter()
+                .any(|existing| same_visible_symbol(existing, terminal))
+            {
+                targets.push(terminal.clone());
+            }
+        }
+        if complete
+            && let [unit] = targets.as_slice()
+            && terminals.iter().all(|(_, proven)| *proven)
+        {
+            return Some(GuardedAliasSelection::Proven {
+                unit: unit.clone(),
+                candidates: selected,
+            });
+        }
+        Some(GuardedAliasSelection::Alternatives(targets))
+    }
+
+    /// Every visible arm of `unit`'s alias family when the arms disagree about
+    /// their target. Template aliases keep their own argument machinery.
+    fn conditional_alias_arms(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        unit: &CodeUnit,
+    ) -> Option<Vec<CodeUnit>> {
+        if !declared_type_alias(analyzer, unit) || self.cpp_template_metadata.contains_key(unit) {
+            return None;
+        }
+        let mut arms = Vec::new();
+        for candidate in self
+            .visible_identifier_candidates(file, unit.identifier())
+            .filter(|candidate| {
+                candidate.kind() == unit.kind()
+                    && candidate.fq_name() == unit.fq_name()
+                    && declared_type_alias(analyzer, candidate)
+            })
+        {
+            if self.cpp_template_metadata.contains_key(candidate) {
+                return None;
+            }
+            if !arms.contains(candidate) {
+                arms.push(candidate.clone());
+            }
+        }
+        let refs = arms.iter().collect::<Vec<_>>();
+        (arms.len() > 1
+            && select_alias_spelling_with_agreed_targets(&refs, |candidate| {
+                self.structured_alias_target(analyzer, candidate)
+            })
+            .is_none())
+        .then_some(arms)
+    }
+
+    /// Item 8's proof boundary for one alias arm: implication by the
+    /// reference's effective guards proves the arm,
+    /// compatibility only keeps it a candidate (#6902).
+    fn alias_arm_evidence(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        arm: &CodeUnit,
+        reference: Node<'_>,
+    ) -> AliasArmEvidence {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return AliasArmEvidence::Compatible;
+        };
+        let effective = self.effective_reference_guards(
+            file,
+            preprocessor_guard_environment(reference, prepared.source()).as_ref(),
+        );
+        let requirements = declaration_guard_requirements(analyzer, self.cpp, arm);
+        if requirements
+            .iter()
+            .any(|(_, required)| guard_requirements_hold_at_reference(required, effective.as_ref()))
+            && self.external_type_candidate_visible_in_context(analyzer, file, arm, reference)
+        {
+            AliasArmEvidence::Implied
+        } else if requirements.is_empty()
+            || requirements
+                .iter()
+                .any(|(_, required)| guards_compatible_at_reference(required, effective.as_ref()))
+        {
+            AliasArmEvidence::Compatible
+        } else {
+            AliasArmEvidence::Contradicted
+        }
+    }
+
     /// Follow `unit`'s alias chain to the class it names, or report why the
     /// chain does not end at one indexed class.
     ///
@@ -8309,9 +8504,12 @@ impl<'a> VisibilityIndex<'a> {
         candidate: &CodeUnit,
         target: &CodeUnit,
     ) -> bool {
-        let mut current = candidate.clone();
+        // A hop that lands on a conditional alias family follows every arm:
+        // this is a may-reach gate, and the reference's guards choose the arm
+        // later (#6902).
+        let mut pending = vec![candidate.clone()];
         let mut seen = HashSet::default();
-        loop {
+        while let Some(current) = pending.pop() {
             if same_visible_symbol(&current, target)
                 || self.compatible_primary_template_redeclarations(&current, target)
             {
@@ -8321,7 +8519,7 @@ impl<'a> VisibilityIndex<'a> {
                 return true;
             }
             let Some(alias_target) = self.structured_alias_target(analyzer, &current) else {
-                return false;
+                continue;
             };
             let StructuredAliasTarget::Named {
                 components,
@@ -8329,7 +8527,7 @@ impl<'a> VisibilityIndex<'a> {
                 arguments,
             } = alias_target
             else {
-                return false;
+                continue;
             };
             if arguments.is_some() || !seen.insert(current.clone()) {
                 return true;
@@ -8343,8 +8541,12 @@ impl<'a> VisibilityIndex<'a> {
             let Some(next) = next else {
                 return true;
             };
-            current = next;
+            match self.conditional_alias_arms(analyzer, visible_from, &next) {
+                Some(arms) => pending.extend(arms),
+                None => pending.push(next),
+            }
         }
+        false
     }
 
     fn alias_candidate_structurally_reaches_target(
@@ -8354,9 +8556,11 @@ impl<'a> VisibilityIndex<'a> {
         candidate: &CodeUnit,
         target: &CodeUnit,
     ) -> bool {
-        let mut current = candidate.clone();
+        // Every arm of a conditional alias family on the chain may reach the
+        // target; the reference's guards choose among them later (#6902).
+        let mut pending = vec![candidate.clone()];
         let mut seen = HashSet::default();
-        loop {
+        while let Some(current) = pending.pop() {
             if same_visible_symbol(&current, target)
                 || self.compatible_primary_template_redeclarations(&current, target)
                 || self
@@ -8370,10 +8574,10 @@ impl<'a> VisibilityIndex<'a> {
                 return true;
             }
             if !seen.insert(current.clone()) {
-                return false;
+                continue;
             }
             let Some(alias_target) = self.structured_alias_target(analyzer, &current) else {
-                return false;
+                continue;
             };
             if let StructuredAliasTarget::Named { components, .. } = &alias_target
                 && components[..components.len().saturating_sub(1)]
@@ -8391,15 +8595,19 @@ impl<'a> VisibilityIndex<'a> {
                 return true;
             }
             if matches!(alias_target, StructuredAliasTarget::Builtin) {
-                return false;
+                continue;
             }
             let Some(primary) =
                 self.resolve_structured_alias_primary(visible_from, &current, &alias_target)
             else {
-                return false;
+                continue;
             };
-            current = primary;
+            match self.conditional_alias_arms(analyzer, visible_from, &primary) {
+                Some(arms) => pending.extend(arms),
+                None => pending.push(primary),
+            }
         }
+        false
     }
 
     /// Whether one indexed alias component in a qualified type reference has
@@ -9768,12 +9976,18 @@ impl<'a> VisibilityIndex<'a> {
         file: &ProjectFile,
         normalized: &str,
     ) -> Vec<&'b CodeUnit> {
+        // A bare name reaches a function-local class only through block-scope
+        // lookup at a reference inside its function
+        // (`function_local_type_resolution`), never through the visible-name
+        // table. Its canonical qualified spelling still matches below.
+        let qualified = normalized.contains("::");
         let mut candidates = self
             .candidate_units(file, normalized, TargetKind::Type)
             .into_iter()
             .filter(|unit| {
                 unit.kind() == CodeUnitType::Class || declared_type_alias(&self.cpp_source(), unit)
             })
+            .filter(|unit| qualified || !is_function_local_unit(unit))
             .collect::<Vec<_>>();
         dedup_unit_refs(&mut candidates);
         candidates
@@ -11195,32 +11409,24 @@ fn collect_macro_events(
     events
 }
 
-fn find_include_activation(
+fn find_include_activation<'guards>(
     cpp: &dyn CppSource,
     token: QueryToken<'_>,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     donor_source: &ProjectFile,
-    language_guard_is_stable: &dyn Fn() -> bool,
+    effective_guards: &dyn Fn() -> Option<&'guards HashSet<PreprocessorGuard>>,
 ) -> Option<usize> {
     let include_targets = cpp.include_target_index();
-    let reference_is_c = file
-        .rel_path()
-        .extension()
-        .and_then(|extension| extension.to_str())
-        == Some("c");
     let mut direct_includes = Vec::new();
     let mut nodes = vec![prepared.tree().root_node()];
     // An include activates for the whole file, so only an unconditional
     // directive counts here.
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            let Some(required_guards) = include_directive_guard_requirements(
-                node,
-                prepared.source(),
-                reference_is_c,
-                language_guard_is_stable,
-            ) else {
+            let Some(required_guards) =
+                include_directive_guard_requirements(node, prepared.source(), effective_guards)
+            else {
                 continue;
             };
             if required_guards.all.is_empty() && required_guards.partial.is_empty() {
@@ -11250,21 +11456,20 @@ fn find_include_activation(
                 donor_source,
                 file,
                 &mut known_missing,
-                language_guard_is_stable,
+                effective_guards,
             )
         })
         .map(|(activation, _)| activation)
 }
 
-fn find_conditional_include_projection_index(
+fn find_conditional_include_projection_index<'guards>(
     cpp: &dyn CppSource,
     token: QueryToken<'_>,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
-    language_guard_is_stable: &dyn Fn() -> bool,
+    effective_guards: &dyn Fn() -> Option<&'guards HashSet<PreprocessorGuard>>,
     on_state: &dyn Fn(),
 ) -> ConditionalIncludeProjectionIndex {
-    let reference_is_c = reference_uses_c_semantics(cpp, file);
     let include_targets = cpp.include_target_index();
     let mut projections_by_source: HashMap<ProjectFile, Vec<ConditionalIncludeProjection>> =
         HashMap::default();
@@ -11272,12 +11477,9 @@ fn find_conditional_include_projection_index(
     let mut nodes = vec![prepared.tree().root_node()];
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            let Some(required_guards) = include_directive_guard_requirements(
-                node,
-                prepared.source(),
-                reference_is_c,
-                language_guard_is_stable,
-            ) else {
+            let Some(required_guards) =
+                include_directive_guard_requirements(node, prepared.source(), effective_guards)
+            else {
                 continue;
             };
             for (include, _) in include_path_from_node(node, prepared.source()).into_iter() {
@@ -11347,8 +11549,7 @@ fn find_conditional_include_projection_index(
                 let Some(include_guards) = include_directive_guard_requirements(
                     node,
                     current_prepared.source(),
-                    reference_is_c,
-                    language_guard_is_stable,
+                    effective_guards,
                 ) else {
                     continue;
                 };
@@ -11388,7 +11589,7 @@ fn find_conditional_include_projection_index(
 /// only ever add requirements -- so discard it before expanding the next
 /// header.
 #[allow(clippy::too_many_arguments)]
-fn find_conditional_include_projection_for_source(
+fn find_conditional_include_projection_for_source<'guards>(
     cpp: &dyn CppSource,
     token: QueryToken<'_>,
     file: &ProjectFile,
@@ -11397,24 +11598,20 @@ fn find_conditional_include_projection_for_source(
     admission: IncludePathAdmission,
     reference_guards: Option<&HashSet<PreprocessorGuard>>,
     reference_byte: usize,
-    language_guard_is_stable: &dyn Fn() -> bool,
+    effective_guards: &dyn Fn() -> Option<&'guards HashSet<PreprocessorGuard>>,
     on_state: &dyn Fn(),
 ) -> bool {
     let Some(reference_guards) = reference_guards else {
         return false;
     };
-    let reference_is_c = reference_uses_c_semantics(cpp, file);
     let include_targets = cpp.include_target_index();
     let mut pending = Vec::new();
     let mut nodes = vec![prepared.tree().root_node()];
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            let Some(required_guards) = include_directive_guard_requirements(
-                node,
-                prepared.source(),
-                reference_is_c,
-                language_guard_is_stable,
-            ) else {
+            let Some(required_guards) =
+                include_directive_guard_requirements(node, prepared.source(), effective_guards)
+            else {
                 continue;
             };
             if node.end_byte() > reference_byte
@@ -11462,8 +11659,7 @@ fn find_conditional_include_projection_for_source(
                 let Some(include_guards) = include_directive_guard_requirements(
                     node,
                     current_prepared.source(),
-                    reference_is_c,
-                    language_guard_is_stable,
+                    effective_guards,
                 ) else {
                     continue;
                 };
@@ -11515,6 +11711,8 @@ pub fn cpp_include_closure_reaches(
     header: &ProjectFile,
 ) -> bool {
     let language_guard_stable = OnceCell::new();
+    let effective = OnceCell::new();
+    let proven = compile_proven_guard_facts(cpp, translation_unit);
     unconditional_include_reaches(
         cpp,
         token,
@@ -11523,31 +11721,43 @@ pub fn cpp_include_closure_reaches(
         translation_unit,
         &mut HashSet::default(),
         &|| {
-            *language_guard_stable.get_or_init(|| {
-                let mut macro_events =
-                    |file: &ProjectFile| collect_macro_events(cpp, token, file).into_boxed_slice();
-                include_language_guard_is_stable_with(
-                    cpp,
-                    token,
-                    translation_unit,
-                    &mut macro_events,
-                    &mut |_: &ProjectFile, prepared: &PreparedSyntaxTree| {
-                        collect_structured_include_facts(prepared)
-                    },
-                )
-            })
+            effective
+                .get_or_init(|| {
+                    effective_reference_guards(
+                        cpp,
+                        translation_unit,
+                        Some(&HashSet::default()),
+                        &proven,
+                        &|| {
+                            *language_guard_stable.get_or_init(|| {
+                                include_language_guard_is_stable_with(
+                                    cpp,
+                                    token,
+                                    translation_unit,
+                                    &mut |file: &ProjectFile| {
+                                        collect_macro_events(cpp, token, file).into_boxed_slice()
+                                    },
+                                    &mut |_: &ProjectFile, prepared: &PreparedSyntaxTree| {
+                                        collect_structured_include_facts(prepared)
+                                    },
+                                )
+                            })
+                        },
+                    )
+                })
+                .as_ref()
         },
     )
 }
 
-fn unconditional_include_reaches(
+fn unconditional_include_reaches<'guards>(
     cpp: &dyn CppSource,
     token: QueryToken<'_>,
     first: &ProjectFile,
     donor_source: &ProjectFile,
     reference_file: &ProjectFile,
     known_missing: &mut HashSet<ProjectFile>,
-    language_guard_is_stable: &dyn Fn() -> bool,
+    effective_guards: &dyn Fn() -> Option<&'guards HashSet<PreprocessorGuard>>,
 ) -> bool {
     if first == donor_source {
         return true;
@@ -11555,11 +11765,6 @@ fn unconditional_include_reaches(
     if known_missing.contains(first) {
         return false;
     }
-    let reference_is_c = reference_file
-        .rel_path()
-        .extension()
-        .and_then(|extension| extension.to_str())
-        == Some("c");
     if let Some(reaches) =
         cpp.cached_unconditional_include_reachability(first, donor_source, reference_file)
     {
@@ -11584,12 +11789,9 @@ fn unconditional_include_reaches(
         let mut nodes = vec![prepared.tree().root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() == "preproc_include" {
-                let Some(required_guards) = include_directive_guard_requirements(
-                    node,
-                    prepared.source(),
-                    reference_is_c,
-                    language_guard_is_stable,
-                ) else {
+                let Some(required_guards) =
+                    include_directive_guard_requirements(node, prepared.source(), effective_guards)
+                else {
                     continue;
                 };
                 if required_guards.all.is_empty() && required_guards.partial.is_empty() {
@@ -11612,6 +11814,31 @@ fn unconditional_include_reaches(
     known_missing.extend(visited);
     cpp.cache_unconditional_include_reachability(first, donor_source, reference_file, false);
     false
+}
+
+/// The guards that hold at a reference in `file`: its own source guards,
+/// the defines the build proves (#2011), and the translation unit's stable
+/// `__cplusplus` state. A reference whose own environment is unknown stays
+/// unknown -- the facts extend an environment, they never invent one. Every
+/// proof and contradiction check against a reference uses this set, so a C
+/// translation unit never takes an `#ifdef __cplusplus` arm (#7072).
+fn effective_reference_guards(
+    cpp: &dyn CppSource,
+    file: &ProjectFile,
+    reference_guards: Option<&HashSet<PreprocessorGuard>>,
+    proven: &HashSet<PreprocessorGuard>,
+    language_guard_is_stable: &dyn Fn() -> bool,
+) -> Option<HashSet<PreprocessorGuard>> {
+    let mut effective = reference_guards.cloned()?;
+    effective.extend(proven.iter().cloned());
+    if language_guard_is_stable() {
+        effective.insert(if reference_uses_c_semantics(cpp, file) {
+            PreprocessorGuard::Undefined("__cplusplus".to_string())
+        } else {
+            PreprocessorGuard::Defined("__cplusplus".to_string())
+        });
+    }
+    Some(effective)
 }
 
 fn include_language_guard_is_stable_with<MacroEvents, IncludeFacts>(
@@ -11813,24 +12040,74 @@ fn first_declaration_byte(analyzer: &CppGraphSource<'_>, candidate: &CodeUnit) -
         .min()
 }
 
-/// The macro names every configuration in `contexts` defines -- the fact set
-/// one file's compile-database coverage proves (#2011). `None` when the
-/// database has no entry for the file, which is different from an empty
-/// intersection: no entry means no coverage, while an empty intersection is
-/// covered-and-proves-nothing.
-fn context_fact_names(contexts: &[CppCompileContext]) -> Option<HashSet<String>> {
+/// Build facts shared by visibility queries and standalone include identity.
+fn compile_proven_guard_facts(
+    cpp: &dyn CppSource,
+    file: &ProjectFile,
+) -> HashSet<PreprocessorGuard> {
+    if let Some(facts) = context_guard_facts(cpp.compile_contexts_for(file), file) {
+        return facts;
+    }
+    let mut translation_units = cpp.reaching_translation_units(file).into_iter();
+    let Some(mut facts) = translation_units.next().and_then(|translation_unit| {
+        context_guard_facts(
+            cpp.compile_contexts_for(&translation_unit),
+            &translation_unit,
+        )
+    }) else {
+        return HashSet::default();
+    };
+    for translation_unit in translation_units {
+        let Some(reached) = context_guard_facts(
+            cpp.compile_contexts_for(&translation_unit),
+            &translation_unit,
+        ) else {
+            facts.clear();
+            break;
+        };
+        facts.retain(|fact| reached.contains(fact));
+        if facts.is_empty() {
+            break;
+        }
+    }
+    facts
+}
+
+/// Facts every compiler configuration proves. No entry differs from coverage
+/// with an empty intersection (#2011). The compiler's language selection is
+/// authoritative, including when it overrides the source extension.
+fn context_guard_facts(
+    contexts: &[CppCompileContext],
+    file: &ProjectFile,
+) -> Option<HashSet<PreprocessorGuard>> {
     let (first, rest) = contexts.split_first()?;
-    Some(
-        first
-            .defined_macros
+    let mut facts = first
+        .defined_macros
+        .iter()
+        .filter(|name| {
+            rest.iter()
+                .all(|context| context.defined_macros.contains(*name))
+        })
+        .cloned()
+        .map(PreprocessorGuard::Defined)
+        .collect::<HashSet<_>>();
+    let language = first.tu_language(file.rel_path());
+    // An explicit -D/-U may override the builtin independently of the dialect.
+    // Surviving defines above still prove their names; an -U alone proves no
+    // source-level absence, matching the other command-line macro facts.
+    if contexts
+        .iter()
+        .all(|context| !context.cplusplus_macro_configured)
+        && rest
             .iter()
-            .filter(|name| {
-                rest.iter()
-                    .all(|context| context.defined_macros.contains(*name))
-            })
-            .cloned()
-            .collect(),
-    )
+            .all(|context| context.tu_language(file.rel_path()) == language)
+    {
+        facts.insert(match language {
+            CompiledLanguage::C => PreprocessorGuard::Undefined("__cplusplus".to_string()),
+            CompiledLanguage::Cpp => PreprocessorGuard::Defined("__cplusplus".to_string()),
+        });
+    }
+    Some(facts)
 }
 
 pub fn guard_requirements_hold_at_reference(
@@ -11944,40 +12221,25 @@ fn preprocessor_conditional_family_has_terminal_else(
 /// never implies `defined(__cplusplus)`, but it never contradicts it either,
 /// so without this a `.c` file would reach the C++ arm of every
 /// `#ifdef __cplusplus` / `#else` include pair.
-fn include_directive_guard_requirements(
+fn include_directive_guard_requirements<'guards>(
     node: Node<'_>,
     source: &str,
-    reference_is_c: bool,
-    language_guard_is_stable: &dyn Fn() -> bool,
+    effective_guards: &dyn Fn() -> Option<&'guards HashSet<PreprocessorGuard>>,
 ) -> Option<PreprocessorGuardEnvironment> {
     let mut required = preprocessor_guard_environment_by_family(node, source)?;
-    let excluded_by_language = required
-        .all
-        .iter()
-        .any(|guard| preprocessor_guard_excludes_language(guard, reference_is_c));
-    if excluded_by_language {
-        return None;
-    }
-    let is_language_guard = |guard: &PreprocessorGuard| {
-        matches!(guard, PreprocessorGuard::Defined(name) | PreprocessorGuard::Undefined(name)
-            if name == "__cplusplus")
-    };
-    // The dialect decides this guard only when the admitted source closure
-    // cannot mutate the builtin. Unknown include sources keep it undecided.
-    if required.all.iter().any(is_language_guard) && language_guard_is_stable() {
+    if !required.all.is_empty() {
+        let effective = effective_guards();
+        if !guards_compatible_at_reference(&required.all, effective) {
+            return None;
+        }
         for guards in [&mut required.all, &mut required.partial] {
-            guards.retain(|guard| !is_language_guard(guard));
+            guards.retain(|guard| {
+                !effective
+                    .is_some_and(|active| preprocessor_guard_holds_at_reference(guard, active))
+            });
         }
     }
     Some(required)
-}
-
-fn preprocessor_guard_excludes_language(guard: &PreprocessorGuard, reference_is_c: bool) -> bool {
-    match guard {
-        PreprocessorGuard::Defined(name) => reference_is_c && name == "__cplusplus",
-        PreprocessorGuard::Undefined(name) => !reference_is_c && name == "__cplusplus",
-        _ => false,
-    }
 }
 
 pub fn preprocessor_guard_environment(
@@ -12550,44 +12812,29 @@ fn callable_guard_requirements_are_visible(
     completion_byte: Option<usize>,
     reference: &CallableReferenceContext<'_>,
 ) -> bool {
-    if required.iter().all(|guard| match guard {
-        PreprocessorGuard::Defined(name) if name == "__cplusplus" => !reference.is_c(),
-        PreprocessorGuard::Undefined(name) if name == "__cplusplus" => reference.is_c(),
-        guard => reference
-            .guards()
-            .is_some_and(|active| preprocessor_guard_holds_at_reference(guard, active)),
-    }) {
+    if required.is_empty() || guard_requirements_hold_at_reference(required, reference.guards()) {
         return true;
     }
-    if required.iter().any(|guard| match guard {
-        PreprocessorGuard::Defined(name) if name == "__cplusplus" => reference.is_c(),
-        PreprocessorGuard::Undefined(name) if name == "__cplusplus" => !reference.is_c(),
-        _ => false,
-    }) {
-        return false;
-    }
-    let undecided: HashSet<_> = required
-        .iter()
-        .filter(|guard| {
-            !matches!(guard, PreprocessorGuard::Defined(name) | PreprocessorGuard::Undefined(name)
-            if name == "__cplusplus")
-        })
-        .cloned()
-        .collect();
     reference.position.as_ref().is_some_and(|position| {
         completion_byte.is_some_and(|end| end > 0 && end <= position.byte)
-            && guards_compatible_at_reference(&undecided, reference.guards())
+            && guards_compatible_at_reference(required, reference.guards())
     })
 }
 
+type ReferenceGuardAugmenter<'a> =
+    dyn Fn(Option<&HashSet<PreprocessorGuard>>) -> Option<HashSet<PreprocessorGuard>> + 'a;
+
 /// The reference side of a callable visibility question.
 ///
-/// An include-graph walk and a whole-file arity activation ask the question
-/// without one reference position, so they carry no `position` and therefore no
-/// guard environment.
+/// Whole-file arity activation has no exact reference position and therefore
+/// no source guard environment, but retains file-level language and build facts.
+/// Position-based questions augment their source environment with the same
+/// effective context as declaration and include proofs.
 struct CallableReferenceContext<'a> {
+    effective_guards: &'a ReferenceGuardAugmenter<'a>,
     file: &'a ProjectFile,
     position: Option<CallableReferencePosition<'a>>,
+    file_guards: OnceCell<Option<HashSet<PreprocessorGuard>>>,
 }
 
 /// One reference position plus its preprocessor guard environment. The
@@ -12600,27 +12847,25 @@ struct CallableReferencePosition<'a> {
 }
 
 impl CallableReferenceContext<'_> {
-    fn is_c(&self) -> bool {
-        self.file
-            .rel_path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            == Some("c")
-    }
-
     fn guards(&self) -> Option<&HashSet<PreprocessorGuard>> {
-        let position = self.position.as_ref()?;
+        let Some(position) = self.position.as_ref() else {
+            return self
+                .file_guards
+                .get_or_init(|| (self.effective_guards)(Some(&HashSet::default())))
+                .as_ref();
+        };
         position
             .guards
             .get_or_init(|| {
-                position
+                let raw = position
                     .prepared
                     .tree()
                     .root_node()
                     .descendant_for_byte_range(position.byte, position.byte.saturating_add(1))
                     .and_then(|node| {
                         preprocessor_guard_environment(node, position.prepared.source())
-                    })
+                    });
+                (self.effective_guards)(raw.as_ref())
             })
             .as_ref()
     }
@@ -12642,21 +12887,17 @@ fn callable_declaration_guard_requirements(
     source: &str,
     reference: &CallableReferenceContext<'_>,
 ) -> Option<HashSet<PreprocessorGuard>> {
-    let reference_is_c = reference.is_c();
     let mut required = HashSet::default();
     for guard in callable_preprocessor_ancestor_guards(node, source)? {
         match guard {
             PreprocessorGuard::Constant(true) => {}
             PreprocessorGuard::Constant(false) => return None,
-            guard if preprocessor_guard_excludes_language(&guard, reference_is_c) => {
-                return None;
-            }
             guard => {
                 required.insert(guard);
             }
         }
     }
-    Some(required)
+    guards_compatible_at_reference(&required, reference.guards()).then_some(required)
 }
 
 /// Whether a declaration in the reference's own file is co-active with the
@@ -13744,6 +13985,224 @@ pub fn anonymous_aggregate_owner(
     }
 }
 
+/// Resolve an unqualified-head type reference through C++ block scope.
+///
+/// Unqualified lookup searches the enclosing blocks and local class bodies of
+/// a function before any namespace or member scope of the function itself, so
+/// a local class hides every same-spelled outer type from the point where it
+/// is declared. `None` means no enclosing block or local class declares the
+/// head and ordinary lookup proceeds. A head that a block does declare is
+/// never answered by an outer type: it resolves to the local class extraction
+/// minted for that block, or stays `Missing` when no such class exists (a
+/// local class declared but never defined, or one written where extraction
+/// mints no identity). C block scope is a separate capability and keeps
+/// ordinary lookup.
+pub fn function_local_type_resolution(
+    analyzer: &CppGraphSource<'_>,
+    file: &ProjectFile,
+    node: Node<'_>,
+    components: &[String],
+    source: &str,
+) -> Option<LexicalTypeResolution> {
+    let (head, rest) = components.split_first()?;
+    if is_c_source_file(file) {
+        return None;
+    }
+    let declaration = function_local_class_declaration(node, head, source)?;
+    let Some(mut unit) = function_local_class_unit(analyzer, file, declaration, head, source)
+    else {
+        return Some(LexicalTypeResolution::Missing);
+    };
+    for component in rest {
+        let mut nested = analyzer
+            .declarations(file)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.identifier() == component
+                    && brokk_bifrost_core::analyzer::default_parent_fq_name(candidate)
+                        .is_some_and(|parent| parent == unit.fq_name())
+            })
+            .collect::<Vec<_>>();
+        nested.dedup();
+        match nested.as_slice() {
+            [child] => unit = child.clone(),
+            [] => return Some(LexicalTypeResolution::Missing),
+            _ => return Some(LexicalTypeResolution::Ambiguous),
+        }
+    }
+    Some(LexicalTypeResolution::Resolved {
+        components: canonical_cpp_scope_components(&unit),
+        candidates: vec![unit.clone()],
+        unit,
+    })
+}
+
+/// Whether `unit` is a function-local class or a member of one. Extraction
+/// scopes those through their callable, so a callable segment sits inside the
+/// identity rather than at its end; no namespace-scope spelling names them.
+pub fn is_function_local_unit(unit: &CodeUnit) -> bool {
+    let interner = segment_interner();
+    unit.fq().segments().split_last().is_some_and(|(_, scope)| {
+        scope
+            .iter()
+            .any(|&segment| interner.resolve(segment).1 == SegmentKind::Member)
+    })
+}
+
+/// The class-like specifier that block-scope lookup of `name` reaches from
+/// `node`, innermost scope first, stopping at the outermost function body.
+///
+/// A block declares a class at its specifier, so only a declaration that ends
+/// before the reference is visible there. A local class body sees its own
+/// injected name and its nested classes: all of them from a member function
+/// body (the complete-class context), only earlier ones elsewhere in the body.
+fn function_local_class_declaration<'tree>(
+    node: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    // A recovery envelope that tree-sitter parsed as a function body (a
+    // namespace sentinel, an export-macro class) is declaration scope, not a
+    // block: the walk ends there, as it does at the translation unit.
+    let mut path = Vec::new();
+    let mut child = node;
+    while let Some(ancestor) = child.parent() {
+        if ancestor.kind() == "compound_statement"
+            && ancestor.parent().is_some_and(|function| {
+                function.kind() == "function_definition"
+                    && (is_recovered_declaration_scope_container(function, source)
+                        || crate::graph::extractor::is_malformed_wrapper_function_definition(
+                            function,
+                        ))
+            })
+        {
+            break;
+        }
+        path.push((ancestor, child));
+        child = ancestor;
+    }
+    let outermost_block = path
+        .iter()
+        .rposition(|(ancestor, _)| ancestor.kind() == "compound_statement")?;
+    let mut in_member_body = false;
+    for &(ancestor, _) in &path[..=outermost_block] {
+        match ancestor.kind() {
+            "compound_statement" => {
+                if let Some(found) =
+                    scope_local_class_declaration(ancestor, name, source, Some(node.start_byte()))
+                {
+                    return Some(found);
+                }
+            }
+            "function_definition" | "lambda_expression" => in_member_body = true,
+            "field_declaration_list" => {
+                let class = ancestor.parent()?;
+                if local_class_name_is(class, name, source) {
+                    return Some(class);
+                }
+                let before = (!in_member_body).then_some(node.start_byte());
+                if let Some(found) = scope_local_class_declaration(ancestor, name, source, before) {
+                    return Some(found);
+                }
+                in_member_body = false;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The last class named `name` that one block or class body declares, among
+/// those ending before `before` when it is given. A specifier counts as a
+/// declaration when it has a body or stands alone (`struct W;`); one inside a
+/// declaration with declarators and no body (`struct W *p;`) is a reference.
+fn scope_local_class_declaration<'tree>(
+    scope: Node<'tree>,
+    name: &str,
+    source: &str,
+    before: Option<usize>,
+) -> Option<Node<'tree>> {
+    named_children_iter(scope)
+        .filter_map(scope_level_class_specifier)
+        .filter(|specifier| before.is_none_or(|before| specifier.end_byte() <= before))
+        .filter(|specifier| local_class_name_is(*specifier, name, source))
+        .last()
+}
+
+fn scope_level_class_specifier(statement: Node<'_>) -> Option<Node<'_>> {
+    let is_class_like = |node: &Node<'_>| {
+        matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        )
+    };
+    if is_class_like(&statement) {
+        return Some(statement);
+    }
+    if !matches!(
+        statement.kind(),
+        "declaration" | "field_declaration" | "type_definition"
+    ) {
+        return None;
+    }
+    let specifier = statement
+        .child_by_field_name("type")
+        .filter(is_class_like)?;
+    (specifier.child_by_field_name("body").is_some()
+        || statement.child_by_field_name("declarator").is_none())
+    .then_some(specifier)
+}
+
+fn local_class_name_is(specifier: Node<'_>, name: &str, source: &str) -> bool {
+    specifier
+        .child_by_field_name("name")
+        .is_some_and(|name_node| {
+            name_node.kind() == "type_identifier" && node_text(name_node, source) == name
+        })
+}
+
+/// The unit extraction minted for the local class `declaration` names. A
+/// forward declaration names the class its own scope defines.
+fn function_local_class_unit(
+    analyzer: &CppGraphSource<'_>,
+    file: &ProjectFile,
+    declaration: Node<'_>,
+    name: &str,
+    source: &str,
+) -> Option<CodeUnit> {
+    let definition = if declaration.child_by_field_name("body").is_some() {
+        declaration
+    } else {
+        let mut scope = declaration.parent()?;
+        if scope.kind() != "compound_statement" && scope.kind() != "field_declaration_list" {
+            scope = scope.parent()?;
+        }
+        named_children_iter(scope)
+            .filter_map(scope_level_class_specifier)
+            .filter(|specifier| specifier.child_by_field_name("body").is_some())
+            .find(|specifier| local_class_name_is(*specifier, name, source))?
+    };
+    let mut candidates = analyzer
+        .declarations(file)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.identifier() == name
+                && is_function_local_unit(candidate)
+                && analyzer.ranges(candidate).into_iter().any(|range| {
+                    range.start_byte == definition.start_byte()
+                        && range.end_byte == definition.end_byte()
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [candidate] => Some(candidate.clone()),
+        _ => None,
+    }
+}
+
 /// The one logical type the candidates name, or why they do not name one.
 fn logical_type_candidate(candidates: Vec<&CodeUnit>) -> Result<CodeUnit, TypeCandidateFailure> {
     let Some(first) = candidates.first() else {
@@ -14388,9 +14847,12 @@ fn has_unresolved_include_visible_before_in_prepared(
     include_targets: &IncludeTargetIndex,
     facts: &[StructuredIncludeFact],
     before_byte: usize,
+    effective_guards: &ReferenceGuardAugmenter<'_>,
 ) -> bool {
     let guards = OnceCell::new();
     let reference = CallableReferenceContext {
+        effective_guards,
+        file_guards: OnceCell::new(),
         file,
         position: Some(CallableReferencePosition {
             prepared,
@@ -16036,6 +16498,16 @@ fn resolve_designated_owner_type(
 ) -> Option<CodeUnit> {
     if let Some(owner) = anonymous_aggregate_owner(analyzer, file, type_node) {
         return Some(owner);
+    }
+    if !is_globally_qualified_cpp_name(type_node)
+        && let Some(components) = cpp_type_name_components(type_node, source)
+        && let Some(resolution) =
+            function_local_type_resolution(analyzer, file, type_node, &components, source)
+    {
+        return match resolution {
+            LexicalTypeResolution::Resolved { unit, .. } => Some(unit).filter(CodeUnit::is_class),
+            LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+        };
     }
     let type_name = normalize_type_text(node_text(type_node, source));
     visibility
@@ -18176,21 +18648,25 @@ fn canonical_cpp_name_matches(unit: &CodeUnit, expected: &str) -> bool {
 /// through `parse_symbol_path` would mistake those dots for component
 /// separators.  Cache-loaded/legacy units may still have an empty structured
 /// name, so retain the parser only as that explicit fallback.
+///
+/// Only a terminal member is not a scope. A callable that encloses a
+/// function-local class (`run$block@3:12$Local`) is one of that class's scope
+/// components, exactly as its canonical name spells it.
 pub fn canonical_cpp_scope_components(unit: &CodeUnit) -> Vec<String> {
     let fq = unit.fq();
     if !fq.is_empty() {
         let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
-        let scope = fq
-            .segments()
+        let segments = fq.segments();
+        let scope = segments
             .iter()
-            .filter_map(|&segment| {
+            .enumerate()
+            .filter_map(|(index, &segment)| {
                 let (text, kind) = interner.resolve(segment);
-                matches!(
-                    kind,
-                    brokk_bifrost_core::analyzer::fq_name::SegmentKind::Package
-                        | brokk_bifrost_core::analyzer::fq_name::SegmentKind::Type
-                        | brokk_bifrost_core::analyzer::fq_name::SegmentKind::Nested
-                )
+                match kind {
+                    SegmentKind::Package | SegmentKind::Type | SegmentKind::Nested => true,
+                    SegmentKind::Member => index + 1 < segments.len(),
+                    SegmentKind::Path | SegmentKind::Companion | SegmentKind::Unknown => false,
+                }
                 .then(|| text.to_string())
             })
             .collect();
@@ -19682,6 +20158,7 @@ mod tests {
             &include_targets,
             &facts,
             source.find(reference).expect("reference fixture"),
+            &|guards| guards.cloned(),
         )
     }
 

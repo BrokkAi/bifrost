@@ -941,7 +941,8 @@ fn decode_supertype(row: &Row<'_>) -> Result<LoweredSupertypeProperty> {
         row_semantic(row, "frontier")?,
         row.get("kind")?,
         row.get("parent_ordinal")?,
-    ))
+    )
+    .into())
 }
 fn decode_property_gap(row: &Row<'_>) -> Result<LoweredDefinitionPropertyGap> {
     Ok(typed_rows::decode_definition_property_gap_fields(

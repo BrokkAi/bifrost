@@ -32,6 +32,10 @@ pub(crate) struct JavaMemoCaches {
         ),
         Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
     >,
+    pub(crate) statement_facts: Cache<
+        (git2::Oid, ProjectFile),
+        Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>,
+    >,
     pub(crate) package_names: Cache<ProjectFile, Arc<str>>,
     pub(crate) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(crate) relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
@@ -62,6 +66,18 @@ impl JavaMemoCaches {
                     u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
                 },
             ),
+            statement_facts:
+                build_weighted_cache(
+                    budget_bytes / 16,
+                    |key: &(git2::Oid, ProjectFile),
+                     rows: &Arc<
+                        brokk_bifrost_core::analyzer::statement_facts::StatementFactRows,
+                    >| {
+                        weight_bytes(
+                            estimate_project_file(&key.1) + rows.estimated_retained_bytes() as u64,
+                        )
+                    },
+                ),
             package_names: build_weighted_cache(budget_bytes / 16, weight_package_name),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 8, weight_string_set),

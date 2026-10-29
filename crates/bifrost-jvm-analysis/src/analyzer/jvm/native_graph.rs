@@ -12,9 +12,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResol
 use brokk_bifrost_analysis::analyzer::store_bridge::jvm_graph::JvmGraphStageExt;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
-use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::{
-    NativeWorkspaceGraphBuilder, SelectedWorkspaceUsageGraphProjectionOutcome as Outcome,
-};
+use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome as Outcome;
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::analyzer::model::{Language, ProjectFile};
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -130,11 +128,10 @@ fn build<A: LanguageAdapter>(
         }
     };
     let admitted = HashSet::from_iter(files.iter().cloned());
-    let Some(mut builder) = NativeWorkspaceGraphBuilder::new(analyzer, &admitted, cancellation)
-    else {
-        return Ok(Outcome::Cancelled);
-    };
-    let staged = operation.stage_jvm_graph_units(
+    let projection = brokk_bifrost_analysis::analyzer::store_bridge::native_graph::project_native_workspace_graph(
+        analyzer, &mut operation, &admitted, UsageEcosystem::Jvm, cancellation,
+        |operation, builder| {
+    operation.stage_jvm_graph_units(
         analyzer,
         files,
         brokk_bifrost_analysis::analyzer::resolution::batch::MAX_REFERENCE_SEEDS_PER_BATCH,
@@ -153,22 +150,8 @@ fn build<A: LanguageAdapter>(
             }
             Ok(())
         },
-    )?;
-    let staged = match staged {
-        SelectedResolutionOperationOutcome::Native(staged) => staged,
-        SelectedResolutionOperationOutcome::Cancelled(_) => return Ok(Outcome::Cancelled),
-        SelectedResolutionOperationOutcome::Stale(_) => return Ok(Outcome::Stale),
-        SelectedResolutionOperationOutcome::Unavailable(reason) => {
-            return Ok(Outcome::Unavailable(format!("{reason:?}")));
-        }
-    };
-    let projection = builder.finish(
-        &mut operation,
-        staged.summary,
-        staged.skipped,
-        admitted,
-        UsageEcosystem::Jvm,
-        cancellation,
+    )
+        },
     )?;
     if cancellation.is_cancelled() {
         return Ok(Outcome::Cancelled);

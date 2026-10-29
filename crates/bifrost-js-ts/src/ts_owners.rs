@@ -113,6 +113,12 @@ pub fn jsts_member_candidates(
     }
 }
 
+fn ts_return_expression(node: Node<'_>) -> Option<Node<'_>> {
+    debug_assert_eq!(node.kind(), "return_statement");
+    node.named_children(&mut node.walk())
+        .find(|child| !child.is_extra())
+}
+
 pub fn ts_direct_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
     crate::syntax::js_ts_object_literal_value(node)
 }
@@ -199,22 +205,33 @@ fn ts_receiver_owner_candidates_at_byte_with_resolution(
         return Vec::new();
     };
 
-    // Keep an annotated parameter's owner in the same candidate set as every
-    // visible write. If a write names a different owner, the combined set is
-    // ambiguous rather than silently replacing the declared evidence with a
-    // latest-write answer (#2495).
-    let mut candidates = ts_receiver_owners_from_parameters(
+    // Parameter and callback annotations seed the same conservative history
+    // as visible writes. Unknown or conflicting writes must invalidate that
+    // evidence instead of disappearing when candidate vectors are joined
+    // (#2495). A conditional write may leave the initial value in use.
+    let mut initial_owners = ts_receiver_owners_from_parameters(
         host, support, file, source, imports, aliases, scope, receiver,
     );
-    if candidates.is_empty() {
-        candidates.extend(ts_receiver_owners_from_contextual_callback(
+    if initial_owners.is_empty() {
+        initial_owners.extend(ts_receiver_owners_from_contextual_callback(
             host, support, file, source, root, imports, aliases, scope, receiver, resolution,
         ));
     }
-    candidates.extend(ts_receiver_owners_from_local_bindings(
-        host, support, file, source, root, imports, aliases, scope, receiver, byte, depth,
+    let mut candidates = ts_receiver_owners_from_local_bindings(
+        host,
+        support,
+        file,
+        source,
+        root,
+        imports,
+        aliases,
+        scope,
+        receiver,
+        byte,
+        depth,
+        initial_owners,
         resolution,
-    ));
+    );
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
@@ -308,8 +325,7 @@ fn ts_receiver_owners_from_parameters(
         let Some(type_node) = parameter.child_by_field_name("type") else {
             continue;
         };
-        if parameter
-            .child_by_field_name("name")
+        if ts_parameter_name_node(parameter)
             .is_some_and(|name| node_text_matches(name, source, receiver))
         {
             owners.extend(
@@ -331,9 +347,9 @@ fn ts_receiver_owners_from_parameters(
             );
             continue;
         }
-        if parameter
+        if let Some(property) = parameter
             .child_by_field_name("pattern")
-            .is_some_and(|pattern| ts_object_pattern_binds(pattern, source, receiver))
+            .and_then(|pattern| ts_object_pattern_property(pattern, source, receiver))
         {
             let container_owners = ts_resolve_type_node_to_property_owner_outcome(
                 host,
@@ -349,7 +365,7 @@ fn ts_receiver_owners_from_parameters(
             .values()
             .map(|values| values.to_vec())
             .unwrap_or_default();
-            let fields = jsts_member_candidates(host, support, container_owners, receiver, true);
+            let fields = jsts_member_candidates(host, support, container_owners, &property, true);
             for field in fields {
                 owners.extend(ts_field_signature_type_owners(host, support, &field, 0));
             }
@@ -507,12 +523,16 @@ fn ts_receiver_owners_from_local_bindings(
     receiver: &str,
     before_byte: usize,
     depth: usize,
+    initial_owners: Vec<CodeUnit>,
     resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if depth > 8 {
         return Vec::new();
     }
     let mut owners = ReceiverOwnerWrites::Unseen;
+    if !initial_owners.is_empty() {
+        owners.record(initial_owners);
+    }
     ts_collect_receiver_owners_from_bindings(
         host,
         support,
@@ -882,7 +902,7 @@ pub fn ts_call_expression_callees(
         };
         let Some(property) = function
             .child_by_field_name("property")
-            .and_then(|property| ts_call_reference_name(property, source))
+            .and_then(|property| ts_simple_call_reference_name(property, source))
         else {
             return Vec::new();
         };
@@ -926,7 +946,7 @@ pub fn ts_call_expression_callees(
         return Vec::new();
     }
 
-    ts_call_reference_name(function, source)
+    ts_simple_call_reference_name(function, source)
         .map(|name| {
             ts_identifier_candidates(host, support, file, source, imports, aliases, &name, true)
         })
@@ -950,7 +970,7 @@ fn ts_expression_receiver_owners(
         return Vec::new();
     }
     match expression.kind() {
-        "identifier" | "property_identifier" | "this" => {
+        "identifier" | "this" => {
             let Some(receiver) = source
                 .get(expression.start_byte()..expression.end_byte())
                 .map(str::trim)
@@ -1660,10 +1680,7 @@ fn jsts_function_returns_direct_object_literal(
                 continue;
             }
             if node.kind() == "return_statement" {
-                let mut cursor = node.walk();
-                if node
-                    .named_children(&mut cursor)
-                    .next()
+                if ts_return_expression(node)
                     .and_then(ts_direct_object_literal_value)
                     .is_some()
                 {
@@ -1834,8 +1851,7 @@ fn ts_collect_return_property_owners(
             continue;
         }
         if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            if let Some(expression) = node.named_children(&mut cursor).next() {
+            if let Some(expression) = ts_return_expression(node) {
                 out.extend(ts_expression_property_owners(
                     host,
                     support,
@@ -1882,49 +1898,30 @@ fn ts_field_signature_type_owners(
         .collect()
 }
 
-fn ts_object_pattern_binds(pattern: Node<'_>, source: &str, receiver: &str) -> bool {
+fn ts_object_pattern_property(pattern: Node<'_>, source: &str, receiver: &str) -> Option<String> {
     if pattern.kind() != "object_pattern" {
-        return false;
+        return None;
     }
-    let mut cursor = pattern.walk();
-    pattern
-        .named_children(&mut cursor)
-        .any(|child| match child.kind() {
-            "shorthand_property_identifier_pattern" => node_text_matches(child, source, receiver),
-            "pair_pattern" => child
-                .child_by_field_name("value")
-                .is_some_and(|value| ts_pattern_binds_name(value, source, receiver)),
-            _ => false,
+    crate::syntax::object_pattern_entries(pattern)
+        .into_iter()
+        .find(|entry| {
+            entry
+                .binder
+                .is_some_and(|binder| node_text_matches(binder, source, receiver))
         })
-}
-
-fn ts_pattern_binds_name(pattern: Node<'_>, source: &str, receiver: &str) -> bool {
-    let mut current = Some(pattern);
-    while let Some(pattern) = current {
-        match pattern.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => {
-                return node_text_matches(pattern, source, receiver);
+        .and_then(|entry| {
+            if entry.key.kind() == "shorthand_property_identifier_pattern" {
+                Some(slice(entry.key, source).to_string())
+            } else {
+                crate::syntax::static_property_name(entry.key, source).map(|(_, name)| name)
             }
-            "assignment_pattern" => current = pattern.child_by_field_name("left"),
-            _ => return false,
-        }
-    }
-    false
+        })
 }
 
 pub fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
     source
         .get(node.start_byte()..node.end_byte())
         .is_some_and(|text| text.trim() == expected)
-}
-
-fn ts_call_reference_name(node: Node<'_>, source: &str) -> Option<String> {
-    ts_simple_call_reference_name(node, source).or_else(|| match node.kind() {
-        "member_expression" => node
-            .child_by_field_name("property")
-            .and_then(|property| ts_call_reference_name(property, source)),
-        _ => None,
-    })
 }
 
 pub fn ts_simple_call_reference_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -1950,12 +1947,7 @@ pub fn ts_contextual_object_literal_type_node<'tree>(object: Node<'tree>) -> Opt
     let return_statement = object
         .parent()
         .filter(|parent| parent.kind() == "return_statement")?;
-    let mut cursor = return_statement.walk();
-    if return_statement
-        .named_children(&mut cursor)
-        .next()
-        .is_none_or(|value| value.id() != object.id())
-    {
+    if ts_return_expression(return_statement).is_none_or(|value| value.id() != object.id()) {
         return None;
     }
     crate::graph::common::enclosing_function_scope(object)?.child_by_field_name("return_type")
@@ -1967,7 +1959,7 @@ mod tests {
     use brokk_bifrost_core::analyzer::capabilities::{
         ImportAnalysisProvider, TypeHierarchyProvider,
     };
-    use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo, Range};
+    use brokk_bifrost_core::analyzer::model::{ImportInfo, Range};
     use brokk_bifrost_core::analyzer::project::{Project, TestProject};
     use brokk_bifrost_core::analyzer::query_token::QueryToken;
     use brokk_bifrost_core::hash::HashMap;
@@ -2024,45 +2016,13 @@ export function caller(items: string[]): Wrapped<string> | string {
             let project = Arc::new(TestProject::new(root, Language::TypeScript));
             let aliases = Arc::new(AliasResolver::new(project.clone() as Arc<dyn Project>));
 
-            // Index the two top-level functions by their declaration ranges,
-            // exactly what `ts_nodes_for_code_unit` reads back.
             let tree = parse_js_ts_tree(&file, source, Language::TypeScript).expect("parse");
-            let mut declarations = Vec::new();
-            let root_node = tree.root_node();
-            let mut stack = vec![root_node];
-            while let Some(node) = stack.pop() {
-                if node.kind() == "function_declaration"
-                    && let Some(name) = node.child_by_field_name("name")
-                {
-                    let identifier = &source[name.start_byte()..name.end_byte()];
-                    declarations.push((
-                        CodeUnit::new(
-                            file.clone(),
-                            CodeUnitType::Function,
-                            "",
-                            identifier.to_string(),
-                        ),
-                        Range {
-                            start_byte: node.start_byte(),
-                            end_byte: node.end_byte(),
-                            start_line: node.start_position().row,
-                            end_line: node.end_position().row,
-                        },
-                    ));
-                }
-                let mut cursor = node.walk();
-                let children: Vec<_> = node.named_children(&mut cursor).collect();
-                stack.extend(children);
-            }
-
             let parsed = crate::typescript::parse_typescript_file(&file, source, &tree);
-            declarations.extend(
-                parsed
-                    .ranges
-                    .iter()
-                    .filter(|(unit, _)| !unit.is_function())
-                    .flat_map(|(unit, ranges)| ranges.iter().map(|range| (unit.clone(), *range))),
-            );
+            let declarations = parsed
+                .ranges
+                .iter()
+                .flat_map(|(unit, ranges)| ranges.iter().map(|range| (unit.clone(), *range)))
+                .collect();
             let mut declaration_units: HashMap<_, Vec<_>> = HashMap::default();
             for (declaration, unit) in parsed.source_declaration_units {
                 declaration_units.entry(declaration).or_default().push(unit);
@@ -2102,6 +2062,21 @@ export function caller(items: string[]): Wrapped<string> | string {
             } else {
                 Vec::new()
             }
+        }
+
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+            self.declarations
+                .iter()
+                .filter(|(unit, _)| unit.source() == file)
+                .map(|(unit, _)| unit.clone())
+                .collect()
+        }
+
+        fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+            self.declarations(file)
+                .into_iter()
+                .filter(|unit| unit.package_name().is_empty())
+                .collect()
         }
 
         fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -2244,7 +2219,13 @@ export function caller(items: string[]): Wrapped<string> | string {
             &self,
             _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> Option<Arc<crate::graph::resolver::JsTsUsageIndex>> {
-            None
+            crate::graph::resolver::build_jsts_usage_index(
+                self,
+                &self.aliases,
+                Language::TypeScript,
+                false,
+            )
+            .map(Arc::new)
         }
     }
 
@@ -2328,6 +2309,556 @@ export function caller(items: string[]): Wrapped<string> | string {
         // The budgets bound the walk; the answer itself is whatever the bounded
         // walk reaches, so only termination is pinned here.
         assert!(owners.len() < 64, "unexpected owner explosion: {owners:?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: comments hid returned expressions"
+    )]
+    fn commented_factory_returns_keep_owners() {
+        let source = "class A {} function plain() { return new A(); } function leading() { return /* why */ new A(); } function trailing() { return new A() /* why */; } function both() { return /* before */ new A() /* after */; } function object() { return /* before */ { work() {} } /* after */; }";
+        let root = tempfile::tempdir().unwrap();
+        let host = FakeJsTsSource::new(root.path(), source);
+        let tree = parse_js_ts_tree(&host.file, source, Language::TypeScript).unwrap();
+        let imports = compute_jsts_import_binder(source, &tree);
+        let resolution = TsReceiverResolution::default();
+        for name in ["plain", "leading", "trailing", "both"] {
+            let unit = host.file_identifier(&host.file, name).pop().unwrap();
+            let node = ts_nodes_for_code_unit(&host, &unit, tree.root_node())[0];
+            let mut owners = Vec::new();
+            ts_collect_return_property_owners(
+                &host,
+                &host,
+                &host.file,
+                source,
+                tree.root_node(),
+                &imports,
+                &host.aliases,
+                node,
+                node.id(),
+                0,
+                &resolution,
+                &mut owners,
+            );
+            assert_eq!(
+                owners.iter().map(CodeUnit::identifier).collect::<Vec<_>>(),
+                ["A"],
+                "{name}"
+            );
+        }
+        let object = host.file_identifier(&host.file, "object").pop().unwrap();
+        assert!(jsts_function_returns_direct_object_literal(&host, &object));
+        let object_node = ts_nodes_for_code_unit(&host, &object, tree.root_node())[0];
+        let mut stack = vec![object_node];
+        let mut saw_return = false;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "return_statement" {
+                let children = node.named_children(&mut node.walk()).collect::<Vec<_>>();
+                assert!(children.first().unwrap().is_extra());
+                assert!(children.last().unwrap().is_extra());
+                assert_eq!(ts_return_expression(node).unwrap().kind(), "object");
+                saw_return = true;
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        assert!(saw_return);
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: destructured receiver lookup used the binder instead of its property"
+    )]
+    fn destructured_receiver_renaming_preserves_property_owner() {
+        for (pattern, receiver) in [
+            ("original", "original"),
+            ("original: renamed", "renamed"),
+            ("original: renamed = fallback", "renamed"),
+            ("original = fallback", "original"),
+        ] {
+            let source = format!(
+                "class A {{ work() {{}} }} interface Container {{ left: unknown; original: A }} declare const fallback: A; function use({{ left, {pattern} }}: Container) {{ {receiver}.work(); }}"
+            );
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeJsTsSource::new(root.path(), &source);
+            let tree = parse_js_ts_tree(&host.file, &source, Language::TypeScript).unwrap();
+            let imports = compute_jsts_import_binder(&source, &tree);
+            let byte = source.rfind(&format!("{receiver}.work")).unwrap();
+            let owners = ts_receiver_owner_candidates_at_byte(
+                &host,
+                &host,
+                &host.file,
+                &source,
+                tree.root_node(),
+                &imports,
+                &host.aliases,
+                receiver,
+                byte,
+            );
+            assert_eq!(
+                owners.iter().map(CodeUnit::identifier).collect::<Vec<_>>(),
+                ["A"],
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: local namespace heritage lost its qualified declaration"
+    )]
+    fn local_namespace_heritage_resolves_qualified_base() {
+        for (source, raw, expected) in [
+            (
+                "namespace N { export class Base {} } class Child extends N.Base {}",
+                "N.Base",
+                "N.Base",
+            ),
+            (
+                "import * as ns from './unroll'; export class Base {} class Child extends ns.Base {}",
+                "ns.Base",
+                "Base",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeJsTsSource::new(root.path(), source);
+            let index = crate::graph::resolver::build_jsts_usage_index(
+                &host,
+                &host.aliases,
+                Language::TypeScript,
+                false,
+            )
+            .unwrap();
+            let child = host.file_identifier(&host.file, "Child").pop().unwrap();
+            let ancestors = crate::hierarchy::resolve_direct_ancestors(
+                &host,
+                &index,
+                Language::TypeScript,
+                &host.aliases,
+                &child,
+                &[raw.to_string()],
+            );
+            assert_eq!(
+                ancestors
+                    .iter()
+                    .map(CodeUnit::fq_name_str)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+        }
+    }
+
+    // Each transformation preserves the receiver's declared structural owner.
+    // Conflicting nominal writes intentionally withhold a vector-only answer;
+    // they must never be narrowed to whichever write the walk sees first.
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: annotated parameter binders live in the pattern field"
+    )]
+    fn receiver_owner_equivalences_preserve_binding_and_return_evidence() {
+        for (body, receiver, expected) in [
+            ("function use(r: A) { r.work(); }", "r", vec!["A"]),
+            (
+                "function use(r: A, cond: boolean) { if (cond) { r = new B(); } r.work(); }",
+                "r",
+                vec![],
+            ),
+            ("function use(r: A) { r = new B(); r.work(); }", "r", vec![]),
+            (
+                "declare function dynamic(): unknown; function use(r: A) { r = dynamic(); r.work(); }",
+                "r",
+                vec![],
+            ),
+            (
+                "function use(r: A) { r = new B(); r = new A(); r.work(); }",
+                "r",
+                vec![],
+            ),
+            (
+                "function use(r: A) { function inner() { r = new B(); } r.work(); }",
+                "r",
+                vec!["A"],
+            ),
+            ("function use(r?: A) { r?.work(); }", "r", vec!["A"]),
+            (
+                "function use() { let r; r = new A(); r.work(); }",
+                "r",
+                vec!["A"],
+            ),
+            (
+                "function use() { let r = new A(); r = new A(); r.work(); }",
+                "r",
+                vec!["A"],
+            ),
+            (
+                "function use() { let r = new A(); r = new B(); r.work(); }",
+                "r",
+                vec![],
+            ),
+            (
+                "function use() { let r = new A(); function inner() { r = new B(); } r.work(); }",
+                "r",
+                vec!["A"],
+            ),
+            ("class C { use(r: A) { r.work(); } }", "r", vec!["A"]),
+            (
+                "class C { use(r: A) { this.work(); } work() {} }",
+                "this",
+                vec!["C"],
+            ),
+            (
+                "function make() { return new A(); } function use() { let r = make(); r.work(); }",
+                "r",
+                vec!["A"],
+            ),
+        ] {
+            let source = format!("class A {{ work() {{}} }} class B {{ work() {{}} }} {body}");
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeJsTsSource::new(root.path(), &source);
+            let tree = parse_js_ts_tree(&host.file, &source, Language::TypeScript).unwrap();
+            let imports = compute_jsts_import_binder(&source, &tree);
+            let byte = source
+                .rfind(&format!("{receiver}."))
+                .or_else(|| source.rfind(&format!("{receiver}?.")))
+                .unwrap();
+            let owners = ts_receiver_owner_candidates_at_byte(
+                &host,
+                &host,
+                &host.file,
+                &source,
+                tree.root_node(),
+                &imports,
+                &host.aliases,
+                receiver,
+                byte,
+            );
+            assert_eq!(
+                owners.iter().map(CodeUnit::identifier).collect::<Vec<_>>(),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_type_and_ast_resolution_agree_at_budget_and_union_boundaries() {
+        for (ty, depth, expected) in [
+            ("A", 0, "precise"),
+            ("A", 7, "precise"),
+            ("A", 8, "unknown"),
+            ("A", 9, "budget"),
+            ("(A)", 6, "precise"),
+            ("(A)", 7, "unknown"),
+            ("(A)", 8, "budget"),
+            ("A | never", 0, "precise"),
+            ("A | null", 0, "precise"),
+            ("A | undefined", 0, "precise"),
+            ("A & A", 0, "precise"),
+        ] {
+            let source = format!("class A {{ work() {{}} }} type Shape = {ty};");
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeJsTsSource::new(root.path(), &source);
+            let tree = parse_js_ts_tree(&host.file, &source, Language::TypeScript).unwrap();
+            let imports = compute_jsts_import_binder(&source, &tree);
+            let alias = tree.root_node().named_child(1).unwrap();
+            let value = alias.child_by_field_name("value").unwrap();
+            let unit = host.file_identifier(&host.file, "Shape").pop().unwrap();
+            let type_id = source_declarations_for_unit(&host.source_facts, &unit)
+                .find_map(|declaration| declaration.alias_type)
+                .unwrap();
+            match value.kind() {
+                "union_type" => assert!(matches!(
+                    host.source_facts.facts.types[type_id.index()].shape,
+                    JsTsTypeShape::Union(_)
+                )),
+                "intersection_type" => assert!(matches!(
+                    host.source_facts.facts.types[type_id.index()].shape,
+                    JsTsTypeShape::Intersection(_)
+                )),
+                _ => {}
+            }
+            let budget = ReceiverAnalysisBudget::default();
+            let ast = ts_resolve_type_node_to_property_owner_outcome(
+                &host,
+                &host,
+                &host.file,
+                &source,
+                &imports,
+                &host.aliases,
+                value,
+                depth,
+                budget,
+            );
+            let captured = ts_resolve_source_type_to_property_owner_outcome(
+                &host,
+                &host,
+                &host.file,
+                &host.source_facts,
+                type_id,
+                depth,
+                budget,
+            );
+            for outcome in [ast, captured] {
+                match expected {
+                    "precise" => assert!(
+                        matches!(outcome, ReceiverAnalysisOutcome::Precise(ref units) if units.iter().map(CodeUnit::identifier).collect::<Vec<_>>() == ["A"]),
+                        "{ty}@{depth}: {outcome:?}"
+                    ),
+                    "unknown" => assert!(
+                        matches!(outcome, ReceiverAnalysisOutcome::Unknown),
+                        "{ty}@{depth}: {outcome:?}"
+                    ),
+                    "budget" => assert!(
+                        matches!(outcome, ReceiverAnalysisOutcome::ExceededBudget { .. }),
+                        "{ty}@{depth}: {outcome:?}"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            if depth == 0 {
+                let text_owners = ts_resolve_type_text_to_property_owners(
+                    &host,
+                    &host,
+                    &host.file,
+                    &source,
+                    &imports,
+                    &host.aliases,
+                    ty,
+                    depth,
+                );
+                assert_eq!(
+                    text_owners
+                        .iter()
+                        .map(CodeUnit::identifier)
+                        .collect::<Vec<_>>(),
+                    ["A"],
+                    "text {ty}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_space_selection_matches_grammar_binders() {
+        let source = "interface A { work(): void } function A() {} namespace N { export interface B { work(): void } export function B() {} }";
+        let root = tempfile::tempdir().unwrap();
+        let host = FakeJsTsSource::new(root.path(), source);
+        let tree = parse_js_ts_tree(&host.file, source, Language::TypeScript).unwrap();
+        let imports = compute_jsts_import_binder(source, &tree);
+        for value_position in [false, true] {
+            let check = |units: Vec<CodeUnit>| {
+                assert_eq!(units.len(), 1, "{units:?}");
+                assert_eq!(units[0].is_function(), value_position, "{units:?}");
+            };
+            check(jsts_identifier_candidates(
+                &host,
+                &host,
+                Language::TypeScript,
+                &host.file,
+                source,
+                &imports,
+                &host.aliases,
+                "A",
+                value_position,
+            ));
+            check(ts_identifier_candidates(
+                &host,
+                &host,
+                &host.file,
+                source,
+                &imports,
+                &host.aliases,
+                "A",
+                value_position,
+            ));
+            check(jsts_member_candidates(
+                &host,
+                &host,
+                host.file_identifier(&host.file, "N"),
+                "B",
+                value_position,
+            ));
+        }
+    }
+
+    #[test]
+    fn contextual_callback_budget_is_nested_and_balanced_across_siblings() {
+        for count in [62, 63, 64, 65] {
+            let mut source = String::from(
+                "class A { step(callback: (value: A) => void) {} work() {} } function use(root: A) {",
+            );
+            for index in 0..count {
+                let previous = if index == 0 {
+                    "root".to_string()
+                } else {
+                    format!("r{}", index - 1)
+                };
+                source.push_str(&format!("{previous}.step(r{index} => {{"));
+            }
+            let receiver = format!("r{}", count - 1);
+            let byte = source.len();
+            source.push_str(&format!("{receiver}.work();"));
+            for _ in 0..count {
+                source.push_str("});");
+            }
+            let shallow_byte = source.len();
+            source.push_str("root.work(); }");
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeJsTsSource::new(root.path(), &source);
+            let tree = parse_js_ts_tree(&host.file, &source, Language::TypeScript).unwrap();
+            assert!(!tree.root_node().has_error());
+            let imports = compute_jsts_import_binder(&source, &tree);
+            let resolution = TsReceiverResolution::default();
+            let owners = ts_receiver_owner_candidates_at_byte_with_resolution(
+                &host,
+                &host,
+                &host.file,
+                &source,
+                tree.root_node(),
+                &imports,
+                &host.aliases,
+                &receiver,
+                byte,
+                0,
+                &resolution,
+            );
+            assert_eq!(
+                owners.iter().map(CodeUnit::identifier).collect::<Vec<_>>(),
+                if count < 64 { vec!["A"] } else { vec![] },
+                "callback count {count}"
+            );
+            // Repeat siblings against the same live resolution, which must
+            // count simultaneous contexts rather than completed contexts.
+            for _ in 0..80 {
+                let owners = ts_receiver_owner_candidates_at_byte_with_resolution(
+                    &host,
+                    &host,
+                    &host.file,
+                    &source,
+                    tree.root_node(),
+                    &imports,
+                    &host.aliases,
+                    "root",
+                    shallow_byte,
+                    0,
+                    &resolution,
+                );
+                assert_eq!(
+                    owners.iter().map(CodeUnit::identifier).collect::<Vec<_>>(),
+                    ["A"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owner_budget_preserves_terminal_constructors_and_factory_returns() {
+        for (factory, expression, terminal, last_depth) in [
+            ("", "new A()", "A", 7),
+            (
+                "function make() { return { work() {} }; }",
+                "make()",
+                "make",
+                6,
+            ),
+            ("const make = () => ({ work() {} });", "make()", "make", 6),
+            ("", "input.build()", "build", 5),
+        ] {
+            for depth in 0..=9 {
+                let source = format!(
+                    "class A {{ work() {{}} build() {{ return {{ work() {{}} }}; }} }} {factory} async function use(input: A) {{ let r = {}{expression}; r.work(); }}",
+                    "await ".repeat(depth)
+                );
+                let root = tempfile::tempdir().unwrap();
+                let host = FakeJsTsSource::new(root.path(), &source);
+                let tree = parse_js_ts_tree(&host.file, &source, Language::TypeScript).unwrap();
+                assert!(!tree.root_node().has_error());
+                let imports = compute_jsts_import_binder(&source, &tree);
+                let byte = source.rfind("r.work").unwrap();
+                let owners = ts_receiver_owner_candidates_at_byte(
+                    &host,
+                    &host,
+                    &host.file,
+                    &source,
+                    tree.root_node(),
+                    &imports,
+                    &host.aliases,
+                    "r",
+                    byte,
+                );
+                assert_eq!(
+                    owners.iter().map(CodeUnit::identifier).collect::<Vec<_>>(),
+                    if depth <= last_depth {
+                        vec![terminal]
+                    } else {
+                        vec![]
+                    },
+                    "{expression} at await depth {depth}"
+                );
+            }
+        }
+        for depth in 0..=9 {
+            let source = format!(
+                "class A {{ work() {{}} }} interface Container {{ left: unknown; original: {}A{} }} function use({{left, original}}: Container) {{ original.work(); }}",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeJsTsSource::new(root.path(), &source);
+            let tree = parse_js_ts_tree(&host.file, &source, Language::TypeScript).unwrap();
+            let imports = compute_jsts_import_binder(&source, &tree);
+            let byte = source.rfind("original.work").unwrap();
+            let owners = ts_receiver_owner_candidates_at_byte(
+                &host,
+                &host,
+                &host.file,
+                &source,
+                tree.root_node(),
+                &imports,
+                &host.aliases,
+                "original",
+                byte,
+            );
+            assert_eq!(
+                owners.iter().map(CodeUnit::identifier).collect::<Vec<_>>(),
+                if depth <= 5 { vec!["A"] } else { vec![] },
+                "destructured field wrapper depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "4ed755aac3c5: quicksilver round 7 on brokk-bifrost-js-ts: competing namespace import projection chooses one recovery owner"
+    )]
+    fn competing_namespace_import_recovery_is_permutation_invariant() {
+        for imports in [
+            "import * as ns from './unroll'; import { missing as ns } from './unroll';",
+            "import { missing as ns } from './unroll'; import * as ns from './unroll';",
+        ] {
+            let source = format!(
+                "{imports} export function make() {{ return {{ work() {{}} }}; }} function use() {{ let r = ns.make(); r.work(); }}"
+            );
+            let root = tempfile::tempdir().unwrap();
+            let host = FakeJsTsSource::new(root.path(), &source);
+            let tree = parse_js_ts_tree(&host.file, &source, Language::TypeScript).unwrap();
+            let binder = compute_jsts_import_binder(&source, &tree);
+            assert!(binder.has_competing_static_imports("ns"));
+            let owners = ts_receiver_owner_candidates_at_byte(
+                &host,
+                &host,
+                &host.file,
+                &source,
+                tree.root_node(),
+                &binder,
+                &host.aliases,
+                "r",
+                source.rfind("r.work").unwrap(),
+            );
+            assert!(
+                owners.is_empty(),
+                "competing imports must not select one owner: {owners:?}; {imports}"
+            );
+        }
     }
 
     #[test]
@@ -2428,7 +2959,7 @@ export function caller(items: string[]): Wrapped<string> | string {
 
 #[cfg(test)]
 mod pattern_binding_tests {
-    use super::{ts_object_pattern_binds, ts_pattern_binds_name};
+    use super::ts_object_pattern_property;
     use tree_sitter::Parser;
 
     #[test]
@@ -2475,7 +3006,10 @@ mod pattern_binding_tests {
             .into_iter()
             .collect()
         );
-        assert!(ts_object_pattern_binds(pattern, source, "receiver"));
+        assert_eq!(
+            ts_object_pattern_property(pattern, source, "receiver").as_deref(),
+            Some("direct")
+        );
 
         let mut assignments = Vec::new();
         let mut stack = vec![tree.root_node()];
@@ -2492,7 +3026,56 @@ mod pattern_binding_tests {
             }
         }
         assert_eq!(assignments.len(), 1);
-        assert!(ts_pattern_binds_name(assignments[0], source, "receiver"));
-        assert!(!ts_pattern_binds_name(assignments[0], source, "shadow"));
+        assert!(crate::syntax::direct_pattern_binding(assignments[0]).is_some());
+        assert_eq!(ts_object_pattern_property(pattern, source, "shadow"), None);
+    }
+}
+
+#[cfg(test)]
+mod parameter_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn optional_and_default_parameter_fields_preserve_callback_positions() {
+        for (source, expected) in [
+            (
+                "function use(first: A, receiver?: B) {}",
+                vec!["first", "receiver"],
+            ),
+            (
+                "function use(first = fallback, receiver?: B) {}",
+                vec!["first", "receiver"],
+            ),
+            (
+                "const use = (first: A, receiver?: B) => {};",
+                vec!["first", "receiver"],
+            ),
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mut stack = vec![tree.root_node()];
+            let mut found = false;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "formal_parameters" {
+                    let names = node
+                        .named_children(&mut node.walk())
+                        .filter_map(ts_parameter_name_node)
+                        .map(|name| slice(name, source))
+                        .collect::<Vec<_>>();
+                    assert_eq!(names, expected, "{source}");
+                    assert_eq!(
+                        ts_callback_parameter_index(node.parent().unwrap(), source, "receiver"),
+                        Some(1)
+                    );
+                    found = true;
+                }
+                stack.extend(node.named_children(&mut node.walk()));
+            }
+            assert!(found);
+        }
     }
 }

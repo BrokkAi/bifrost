@@ -27,7 +27,7 @@ use crate::scala::{scala_nested_type_candidates, scala_short_name_terminal_segme
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, external_usage_hit_count, usage_hit,
+    SNIPPET_CONTEXT_LINES, classify_recursive_hit, external_usage_hit_count, usage_hit,
 };
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{ClassRangeIndex, UsageReferenceKind};
 use brokk_bifrost_core::analyzer::usages::model::{UsageHit, UsageHitKind};
@@ -748,6 +748,7 @@ impl ScalaFileEligibility {
 }
 
 pub struct ScalaQueryHitSink<'a> {
+    pub tree: &'a tree_sitter::Tree,
     pub analyzer: &'a dyn ScalaWorkspaceSource,
     pub scala: &'a dyn ScalaSource,
     pub file: &'a ProjectFile,
@@ -1005,8 +1006,8 @@ impl ScalaQueryHitSink<'_> {
             // which the editor surface lists and the external usage surface
             // omits, and it stays out of `observed_hits` so the callsite budget
             // still counts only references from elsewhere. Inside any other
-            // target's own declaration the site is the declaration itself, not
-            // a use of it, and stays dropped.
+            // target's own declaration the shared classifier keeps initializer
+            // value reads and excludes declaration names.
             let inside_own_declaration = enclosing == *query_target
                 && self
                     .analyzer
@@ -1014,13 +1015,18 @@ impl ScalaQueryHitSink<'_> {
                     .iter()
                     .any(|range| range.start_byte <= start && end <= range.end_byte);
             let recursive = inside_own_declaration && query_target.is_function();
-            if inside_own_declaration && !recursive {
-                continue;
-            }
-            let target_hit = if recursive {
-                hit.clone().into_self_receiver()
+            let target_hit = if inside_own_declaration {
+                classify_recursive_hit(
+                    hit.clone(),
+                    query_target,
+                    self.tree.root_node().descendant_for_byte_range(start, end),
+                    &crate::ScalaKnowledge,
+                )
             } else {
-                hit.clone()
+                Some(hit.clone())
+            };
+            let Some(target_hit) = target_hit else {
+                continue;
             };
             if self.hits[target_id].insert(target_hit.clone()) && !recursive {
                 self.observed_hits.insert(target_hit);

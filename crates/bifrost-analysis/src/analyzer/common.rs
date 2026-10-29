@@ -72,13 +72,165 @@ pub struct CandidateState<T> {
     pub reason: Option<&'static str>,
 }
 
+/// Values without retained failure evidence cannot replay an incomplete read
+/// on a warm hit. Refuse those fills, including deterministic content gaps,
+/// without mistaking a content gap for execution dependence.
+#[doc(hidden)]
+pub fn complete_query_cache_fill<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> T,
+) -> Result<T, T> {
+    let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+    replayable_query_cache_fill(analyzer, build).and_then(|value| {
+        if scope.captured_read_incompleteness().is_empty() {
+            Ok(value)
+        } else {
+            Err(value)
+        }
+    })
+}
+
+/// For cache values that retain every deterministic incomplete-read reason
+/// and replay it into each reader's scope. Execution failures are never stored;
+/// Err carries only this invocation's best-effort value.
+#[doc(hidden)]
+pub fn replayable_query_cache_fill<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> T,
+) -> Result<T, T> {
+    let generation_before = analyzer.project().analysis_generation();
+    let ((value, incompleteness), reads) =
+        crate::analyzer::i_analyzer::capture_query_reads(analyzer, || {
+            let scope =
+                crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+            let value = build();
+            (value, scope.captured_read_incompleteness())
+        });
+    let mut incomplete = false;
+    for reason in incompleteness {
+        incomplete |= reason.is_execution_dependent();
+        analyzer.record_query_incomplete(reason);
+    }
+    let snapshot_changed = analyzer.project().analysis_generation() != generation_before;
+    if incomplete
+        || snapshot_changed
+        || reads.execution_dependences() > 0
+        || analyzer
+            .active_query_cancellation()
+            .is_some_and(|token| token.is_cancelled())
+    {
+        crate::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=cache_fill snapshot={snapshot_changed}",
+                file!(),
+                line!()
+            )
+        });
+        analyzer.mark_execution_dependent();
+        Err(value)
+    } else {
+        Ok(value)
+    }
+}
+
+/// Temporary #7311 guard: remove once persistent accessors are fallible and
+/// owned, so a failed build is never installed. This scope observes actual
+/// fills, including marks from worker threads. Its capture/replay preserves the
+/// enclosing resolver's read narrowing.
+#[doc(hidden)]
+pub struct PersistentCacheFill<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    cache: &'static str,
+    generation_before: u64,
+    scope: Option<crate::analyzer::AnalyzerQueryScope<'a>>,
+    enclosing: Option<Arc<crate::analyzer::ReadLedger>>,
+    reads: Arc<crate::analyzer::ReadLedger>,
+}
+
+impl<'a> PersistentCacheFill<'a> {
+    pub fn new(analyzer: &'a dyn IAnalyzer, cache: &'static str) -> Self {
+        let reads = Arc::new(crate::analyzer::ReadLedger::new());
+        let enclosing = analyzer.current_thread_read_ledger();
+        let scope = match &enclosing {
+            Some(enclosing) => crate::analyzer::AnalyzerQueryScope::with_nested_read_ledger(
+                analyzer,
+                Arc::clone(&reads),
+                Arc::clone(enclosing),
+            ),
+            None => {
+                crate::analyzer::AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&reads))
+            }
+        };
+        Self {
+            analyzer,
+            cache,
+            generation_before: analyzer.project().analysis_generation(),
+            scope: Some(scope),
+            enclosing,
+            reads,
+        }
+    }
+
+    #[track_caller]
+    pub fn installed(&self, cache: &str) {
+        let completion = self
+            .scope
+            .as_ref()
+            .expect("fill scope stays open until drop")
+            .read_completion();
+        // Observe an actual failed/cut computation. Merely polling an already
+        // cancelled token after a pure completed fill would poison clean data.
+        let snapshot_changed =
+            self.analyzer.project().analysis_generation() != self.generation_before;
+        // A persistent fill that cannot replay its reason degrades on any
+        // completion error, including deterministic content incompleteness.
+        if completion.is_err() || snapshot_changed || self.reads.execution_dependences() > 0 {
+            self.analyzer.record_degraded_persistent_fill(
+                &format!("{}::{cache}", self.cache),
+                &format!(
+                    "completion={completion:?} marks={} snapshot={snapshot_changed}",
+                    self.reads.execution_dependences()
+                ),
+            );
+        }
+    }
+}
+
+impl Drop for PersistentCacheFill<'_> {
+    fn drop(&mut self) {
+        drop(self.scope.take());
+        if let Some(enclosing) = &self.enclosing {
+            crate::analyzer::i_analyzer::forward_captured_query_reads(enclosing, &self.reads);
+        }
+    }
+}
+
+#[doc(hidden)]
+#[track_caller]
+pub fn persistent_cache_fill<T>(
+    analyzer: &dyn IAnalyzer,
+    cache: &'static str,
+    build: impl FnOnce() -> T,
+) -> T {
+    let guard = PersistentCacheFill::new(analyzer, cache);
+    let value = build();
+    guard.installed(cache);
+    value
+}
+
 #[doc(hidden)]
 pub fn import_target_files_from_cache(
+    analyzer: &dyn IAnalyzer,
     cache: &moka::sync::Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     file: &ProjectFile,
     resolve: impl FnOnce() -> HashSet<ProjectFile>,
 ) -> Arc<HashSet<ProjectFile>> {
-    cache.get_with(file.clone(), || Arc::new(resolve()))
+    match cache.try_get_with(file.clone(), || {
+        complete_query_cache_fill(analyzer, || Arc::new(resolve()))
+    }) {
+        Ok(value) => value,
+        Err(value) => Arc::clone(value.as_ref()),
+    }
 }
 
 impl<T> CandidateState<T> {
@@ -760,13 +912,6 @@ pub fn declaration_header(source: &str) -> &str {
     source.split('{').next().unwrap_or(source)
 }
 
-#[doc(hidden)]
-pub fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
-    source
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .any(|token| token == modifier)
-}
-
 pub use crate::analyzer::resolution::file_paths::{
     is_java_module_descriptor_file, rebase_project_file_to_root,
 };
@@ -779,6 +924,151 @@ mod tests {
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::{CodeUnit, CodeUnitType, Language, ProjectFile};
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn scala_companion_segments_match_object_declarations() {
+        use crate::analyzer::usages::get_definition::parse_tree_for_language;
+        let dir = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(dir.path(), "Companion.scala");
+        let source = "class A {}\nobject A { class B {}\n object B {} }\n";
+        let tree = parse_tree_for_language(&file, Language::Scala, source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let parsed = brokk_bifrost_jvm::scala::declarations::parse_scala_file(&file, source, &tree);
+        let units = parsed.declarations();
+        let mut stack = vec![tree.root_node()];
+        let mut objects = 0;
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "class_definition" | "object_definition") {
+                let name = node.child_by_field_name("name").unwrap();
+                let name_text = &source[name.byte_range()];
+                let is_object = node.kind() == "object_definition";
+                let unit = units
+                    .iter()
+                    .find(|unit| {
+                        unit.is_class()
+                            && unit.identifier().trim_end_matches('$') == name_text
+                            && unit.short_name().ends_with('$') == is_object
+                    })
+                    .unwrap();
+                assert_eq!(
+                    super::is_scala_object_like(unit),
+                    is_object || name_text == "B"
+                );
+                objects += usize::from(is_object);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(objects, 2);
+    }
+
+    #[test]
+    fn bounded_sources_obey_the_filesystem_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = crate::analyzer::project::TestProject::new(dir.path(), Language::Java);
+        for source in ["", "abcd", "\u{e9}\u{65e5}"] {
+            let file = ProjectFile::new(dir.path(), "Input.java");
+            std::fs::write(file.abs_path(), source).unwrap();
+            for cap in [
+                0,
+                source.len().saturating_sub(1),
+                source.len(),
+                source.len() + 1,
+                usize::MAX,
+            ] {
+                assert_eq!(
+                    super::read_bounded_source(&project, &file, cap),
+                    (source.len() <= cap).then(|| source.to_string()),
+                    "source={source:?}, cap={cap}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_batches_account_for_actual_iterator_visits() {
+        use std::cell::Cell;
+        for len in 0..6 {
+            for cap in 0..8 {
+                let visits = Cell::new(0);
+                let source = (0..len).inspect(|_| visits.set(visits.get() + 1));
+                let batch = super::limited_known_rows(len, source, cap);
+                assert_eq!(batch.inspected, visits.get());
+                assert_eq!(batch.rows, (0..len).take(cap).collect::<Vec<_>>());
+                assert_eq!(batch.complete, cap != 0 && len <= cap);
+            }
+        }
+    }
+
+    #[test]
+    fn access_modifier_nodes_exclude_comment_words() {
+        use crate::analyzer::semantic_model::Visibility;
+        use tree_sitter::Parser;
+        let source = "class C { public /* private */ a() {} protected /* public */ b() {} private /* protected */ c() {} }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut modifiers = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "accessibility_modifier" {
+                modifiers.push((
+                    node.start_byte(),
+                    super::visibility_from_modifier_text(&source[node.byte_range()]),
+                ));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        modifiers.sort_by_key(|(start, _)| *start);
+        assert_eq!(
+            modifiers
+                .into_iter()
+                .map(|(_, visibility)| visibility)
+                .collect::<Vec<_>>(),
+            vec![
+                Visibility::Public,
+                Visibility::Protected,
+                Visibility::Private
+            ]
+        );
+    }
+
+    #[test]
+    fn lexical_binding_selection_matches_half_open_grammar_scopes() {
+        use crate::analyzer::usages::get_definition::parse_tree_for_language;
+        let dir = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(dir.path(), "Scope.java");
+        let source = "class C { void f() { int x = 0; { int x = 1; }x++; } }";
+        let tree = parse_tree_for_language(&file, Language::Java, source).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut blocks = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "block" {
+                blocks.push((node.start_byte(), node.end_byte()));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(blocks.len(), 2);
+        for byte in 0..=source.len() {
+            // Enumerate the grammar's byte ranges, independently of the lookup's predicates.
+            let expected = blocks
+                .iter()
+                .filter(|(start, end)| (*start..*end).contains(&byte))
+                .min_by_key(|(start, end)| end - start);
+            let actual = super::visible_local_binding(
+                &blocks,
+                byte,
+                |&(start, end)| (start, start, end),
+                |_, (_, start, end)| end - start,
+            );
+            assert_eq!(actual, expected, "byte={byte}");
+        }
+    }
 
     /// `$` inside segment text is ordinary identifier text. Parent boundaries
     /// come from the structured FqName segments, including Scala companion

@@ -323,6 +323,51 @@ impl TypeFlowSummaryProfile {
     }
 }
 
+/// Bounded LRU of type-flow products built under the same engine-owned root allotment.
+///
+/// The key is the solver and semantic allotment inherited by query continuations.
+/// The table retains at most eight partitions,
+/// each capped by `DEFAULT_SUMMARY_REPOSITORY_ENTRIES` and
+/// `DEFAULT_SUMMARY_REPOSITORY_BYTES` (semantic summaries),
+/// `MAX_CLASS_SET_SUMMARIES` and `MAX_CLASS_SET_ENTRY_SELECTOR_PROBES`
+/// (class-set summaries and selector probes) and `FIELD_SLOT_CACHE_BYTES`
+/// (ready field-slot values), so eight times those caps in total. Queries pin
+/// their selected state, so eviction does not invalidate active consumers: an
+/// evicted partition stays alive while an in-flight query holds it, and live
+/// memory can exceed the table's bound by those partitions for the length of
+/// the request.
+#[derive(Debug, Clone, Default)]
+pub struct TypeFlowSummaryPartitions {
+    entries: Arc<Mutex<Vec<TypeFlowSummaryPartition>>>,
+}
+
+#[derive(Debug)]
+struct TypeFlowSummaryPartition {
+    limits: (SolverWork, SemanticWork),
+    state: TypeFlowSummaryState,
+}
+
+impl TypeFlowSummaryPartitions {
+    pub fn select(&self, solver: SolverWork, semantic: SemanticWork) -> TypeFlowSummaryState {
+        const CAPACITY: usize = 8;
+        let key = (solver, semantic);
+        let mut entries = self.entries.lock().expect("type-flow partitions poisoned");
+        let state = if let Some(index) = entries.iter().position(|entry| entry.limits == key) {
+            entries.remove(index).state
+        } else {
+            if entries.len() == CAPACITY {
+                entries.remove(0);
+            }
+            TypeFlowSummaryState::default()
+        };
+        entries.push(TypeFlowSummaryPartition {
+            limits: key,
+            state: state.clone(),
+        });
+        state
+    }
+}
+
 /// Workspace-owned in-memory state for the class-set summary dimension.
 #[derive(Debug, Clone)]
 pub struct TypeFlowSummaryState {

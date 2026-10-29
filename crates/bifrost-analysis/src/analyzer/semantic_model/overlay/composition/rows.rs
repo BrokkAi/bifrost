@@ -1,29 +1,170 @@
 //! Query-local catalog reads for one composition group. No decoded payloads.
 
 use super::*;
-use crate::analyzer::semantic::oracle::dispatch::authored_procedure_target_identity;
-use crate::analyzer::store::active_models::{resolve_procedure_records, resolve_records};
+use crate::analyzer::store::active_models::resolve_records;
 use crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements as questions;
-use brokk_bifrost_semantic::analyzer::semantic_model::runtime::{
-    ProcedureSummaryAcceptance, procedure_claims_agree, procedure_summary_minimum_actual_count,
-};
-use rusqlite::named_params;
+use rusqlite::{ToSql, named_params};
 
 /// Connection-only outside reads; generated symbols belong to this overlay
 /// build, and are included by the group loader and keyed identity checks.
 pub struct RowCompositionReads<'a> {
+    pub selection: Option<&'a ModelProviderSelection>,
+    pub defining_owner: Option<&'a SemanticModelProvenance>,
     pub active: &'a ResolvedActiveSemanticModels,
     pub reader: &'a CatalogRuntimeSourceReader,
     pub generated: &'a [SemanticModelSymbol],
     pub generated_relations: &'a [SemanticModelRelation],
+    scope: Option<LanguageScope<'a>>,
+    pub(in crate::analyzer::semantic_model::overlay) cancellation:
+        Option<&'a crate::CancellationToken>,
 }
 
-impl RowCompositionReads<'_> {
+struct LanguageScope<'a> {
+    language: &'a str,
+    shard_keys: String,
+}
+
+impl<'a> RowCompositionReads<'a> {
+    fn admits_provenance(&self, provenance: &SemanticModelProvenance) -> bool {
+        let provider = ModelProvider::from(provenance);
+        self.selection
+            .is_none_or(|selection| selection.contains(&provider))
+            && self.defining_owner.is_none_or(|defining| {
+                (defining.extraction.is_some() && provenance.extraction.is_none())
+                    || ModelProvider::from(defining) == provider
+            })
+    }
+
+    pub fn new(
+        active: &'a ResolvedActiveSemanticModels,
+        reader: &'a CatalogRuntimeSourceReader,
+        generated: &'a [SemanticModelSymbol],
+        generated_relations: &'a [SemanticModelRelation],
+    ) -> Self {
+        Self {
+            selection: None,
+            defining_owner: None,
+            active,
+            reader,
+            generated,
+            generated_relations,
+            scope: None,
+            cancellation: None,
+        }
+    }
+
+    /// Scope every outside read before decoding. The reader's full metadata
+    /// slice still matches its immutable active views; SQL selects only this
+    /// language's physical shard identities, as established by their manifests.
+    pub(in crate::analyzer::semantic_model::overlay) fn for_language<'b>(
+        &self,
+        language: &'b str,
+    ) -> RowCompositionReads<'b>
+    where
+        'a: 'b,
+    {
+        use crate::analyzer::store::active_models::CatalogShardDatabase;
+        let shards = self
+            .active
+            .shards
+            .iter()
+            .filter(|shard| {
+                let provider = ModelProvider {
+                    pack_id: shard.manifest.pack_id.clone(),
+                    pack_version: shard.manifest.version.clone(),
+                    pack_digest: shard.manifest.semantic_sha256.clone(),
+                };
+                shard.manifest.language == language
+                    && self
+                        .selection
+                        .is_none_or(|selection| selection.contains(&provider))
+                    && self.defining_owner.is_none_or(|defining| {
+                        (defining.extraction.is_some() && shard.manifest.extraction.is_none())
+                            || ModelProvider::from(defining) == provider
+                    })
+            })
+            .map(|shard| {
+                shard
+                    .row_store
+                    .expect("catalog group shard has row identity")
+            })
+            .map(|identity| {
+                (
+                    match identity.database {
+                        CatalogShardDatabase::Durable => "durable",
+                        CatalogShardDatabase::Session => "session",
+                    },
+                    identity.shard_key,
+                )
+            })
+            .collect::<Vec<_>>();
+        RowCompositionReads {
+            selection: self.selection,
+            defining_owner: self.defining_owner,
+            active: self.active,
+            reader: self.reader,
+            generated: self.generated,
+            generated_relations: self.generated_relations,
+            cancellation: self.cancellation,
+            scope: Some(LanguageScope {
+                language,
+                shard_keys: serde_json::to_string(&shards).expect("shard identities serialize"),
+            }),
+        }
+    }
+
+    fn generated_symbols(&self) -> impl Iterator<Item = &SemanticModelSymbol> {
+        self.generated.iter().filter(|symbol| {
+            self.admits_provenance(&symbol.provenance)
+                && self
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| symbol.language == scope.language)
+        })
+    }
+
+    fn generated_edges(&self) -> impl Iterator<Item = &SemanticModelRelation> {
+        self.generated_relations.iter().filter(|relation| {
+            self.admits_provenance(&relation.provenance)
+                && self.scope.as_ref().is_none_or(|scope| {
+                    self.active.shards.iter().any(|shard| {
+                        shard.manifest.language == scope.language
+                            && shard.manifest.semantic_sha256 == relation.provenance.pack_digest
+                    })
+                })
+        })
+    }
+
+    fn raw_rows<T>(
+        &self,
+        statement: &str,
+        params: &[(&str, &dyn ToSql)],
+        decode: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> ReadResult<Vec<crate::analyzer::store::model_catalog::CatalogRawRecord<T>>> {
+        check_composition_cancellation(self.cancellation)?;
+        let Some(scope) = &self.scope else {
+            return self
+                .reader
+                .raw_rows(statement, params, &self.active.shards, decode);
+        };
+        let statement = format!(
+            "SELECT composition_row.* FROM ({}) AS composition_row
+             JOIN json_each(:composition_shards) AS selected_shard
+             ON composition_row.source_db=json_extract(selected_shard.value,'$[0]')
+             AND composition_row.shard_key=json_extract(selected_shard.value,'$[1]')",
+            statement.trim_end().trim_end_matches(';')
+        );
+        let mut params = params.to_vec();
+        params.push((":composition_shards", &scope.shard_keys));
+        self.reader
+            .raw_rows(&statement, params.as_slice(), &self.active.shards, decode)
+    }
+
     fn records<T: serde::de::DeserializeOwned>(
         &self,
         statement: &str,
-        params: impl rusqlite::Params,
+        params: &[(&str, &dyn ToSql)],
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<T>>> {
         self.ordered_records(statement, params, |row| {
             let json: String = row.get("record_json")?;
@@ -42,12 +183,11 @@ impl RowCompositionReads<'_> {
     fn ordered_records<T>(
         &self,
         statement: &str,
-        params: impl rusqlite::Params,
+        params: &[(&str, &dyn ToSql)],
         decode: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<T>>> {
         let mut rows = self
-            .reader
-            .raw_rows(statement, params, &self.active.shards, |row| {
+            .raw_rows(statement, params, |row| {
                 Ok((row.get::<_, i64>("record_key")?, Arc::new(decode(row)?)))
             })?
             .into_iter()
@@ -76,7 +216,7 @@ impl RowCompositionReads<'_> {
     fn types(
         &self,
         statement: &str,
-        params: impl rusqlite::Params,
+        params: &[(&str, &dyn ToSql)],
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
         Ok(self
             .records::<TypeFact>(statement, params)?
@@ -88,7 +228,7 @@ impl RowCompositionReads<'_> {
     fn members(
         &self,
         statement: &str,
-        params: impl rusqlite::Params,
+        params: &[(&str, &dyn ToSql)],
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
         Ok(self
             .records::<MemberFact>(statement, params)?
@@ -103,7 +243,7 @@ impl RowCompositionReads<'_> {
     ) -> ReadResult<locations::SourceAnchors> {
         let mut anchors = locations::SourceAnchors::default();
         let owners = self
-            .types(questions::SOURCE_TYPES, [])?
+            .types(questions::SOURCE_TYPES, &[])?
             .into_iter()
             .filter(|r| r.shard.decoded.is_none())
             .map(|r| r.record.id.clone())
@@ -114,7 +254,7 @@ impl RowCompositionReads<'_> {
             }
         }
         let members = self
-            .members(questions::SOURCE_MEMBERS, [])?
+            .members(questions::SOURCE_MEMBERS, &[])?
             .into_iter()
             .filter(|r| r.shard.decoded.is_none())
             .map(|r| r.record.id.clone())
@@ -127,7 +267,7 @@ impl RowCompositionReads<'_> {
         Ok(anchors)
     }
 
-    fn projection(&self) -> GroupProjection<'_, '_> {
+    fn projection(&self) -> GroupProjection<'_> {
         GroupProjection::new(self)
     }
     pub(crate) fn owner_symbols(
@@ -205,14 +345,18 @@ impl RowCompositionReads<'_> {
         analyzer: &(impl SemanticModelLocations + ?Sized),
         key: &CompositionGroupKey,
     ) -> ReadResult<Vec<SemanticModelSymbol>> {
-        self.projection().group_owners(analyzer, key)
+        self.for_language(&key.language)
+            .projection()
+            .group_owners(analyzer, key)
     }
     pub fn group_symbols(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
         key: &CompositionGroupKey,
     ) -> ReadResult<Vec<SemanticModelSymbol>> {
-        self.projection().group_symbols(analyzer, key)
+        self.for_language(&key.language)
+            .projection()
+            .group_symbols(analyzer, key)
     }
     pub(in crate::analyzer::semantic_model::overlay) fn endpoint_representatives(
         &self,
@@ -226,7 +370,12 @@ impl RowCompositionReads<'_> {
         analyzer: &(impl SemanticModelLocations + ?Sized),
         symbols: &[SemanticModelSymbol],
     ) -> ReadResult<Vec<SemanticModelRelation>> {
-        self.projection().group_relations(analyzer, symbols)
+        let Some(symbol) = symbols.first() else {
+            return Ok(Vec::new());
+        };
+        self.for_language(&symbol.language)
+            .projection()
+            .group_relations(analyzer, symbols)
     }
     pub(crate) fn relations_for_origins(
         &self,
@@ -240,7 +389,9 @@ impl RowCompositionReads<'_> {
         analyzer: &(impl SemanticModelLocations + ?Sized),
         key: &CompositionGroupKey,
     ) -> ReadResult<ComposedGroup> {
-        self.projection().compose_group(analyzer, key)
+        self.for_language(&key.language)
+            .projection()
+            .compose_group(analyzer, key)
     }
 }
 
@@ -278,62 +429,9 @@ impl CompositionReads for RowCompositionReads<'_> {
         key: ProcedureSummaryMemberKey<'_>,
     ) -> ReadResult<Vec<Arc<CompiledProcedureSummary>>> {
         let realm = brokk_bifrost_core::analyzer::model::semantic_pack_realm(key.language);
-        let mut owners = HashSet::default();
-        for declaration in self.types(
-            questions::TYPES_BY_IDENTITY_NAME,
-            named_params! { ":name": key.owner },
-        )? {
-            if declaration.shard.manifest.extraction.is_some()
-                && brokk_bifrost_core::analyzer::model::semantic_pack_realm(
-                    &declaration.shard.manifest.language,
-                ) == realm
-            {
-                owners.insert(declaration.record.name.clone());
-                owners.extend(declaration.record.aliases.iter().cloned());
-            }
-        }
-        owners.remove(key.owner);
-        let mut owners = owners.into_iter().collect::<Vec<_>>();
-        owners.sort_unstable();
-        owners.push(key.owner.to_owned());
+        let owners = procedure_owner_names(self.all_types_named(key.owner)?, key);
         let records = self.records::<CompiledProcedureSummary>(questions::SUMMARY_MEMBER, named_params! { ":realm": realm, ":owners": serde_json::to_string(&owners).expect("owner IDs serialize"), ":member": key.member, ":receiver": key.has_receiver })?;
-        let mut candidates = Vec::new();
-        for (index, record) in records.iter().enumerate() {
-            let target = &record.record.target;
-            let (owner, _) = authored_procedure_target_identity(&target.path, &target.symbol)
-                .expect("member question has target identity");
-            let owner = owners
-                .iter()
-                .position(|name| name == &owner)
-                .expect("question restricts owners");
-            if !target.variadic && target.parameter_count == key.parameter_count {
-                candidates.push(((0, 0, 0, owner, index), record.clone()));
-            }
-            let minimum = procedure_summary_minimum_actual_count(target);
-            if target.variadic && minimum <= key.parameter_count {
-                candidates.push(((1, minimum, 0, owner, index), record.clone()));
-            }
-            if !target.formals.is_empty() && target.formals.iter().any(|f| f.optional) {
-                let minimum = u32::try_from(target.formals.iter().filter(|f| !f.optional).count())
-                    .expect("validated formal count");
-                if minimum <= key.parameter_count && target.parameter_count >= key.parameter_count {
-                    candidates.push((
-                        (2, minimum, target.parameter_count, owner, index),
-                        record.clone(),
-                    ));
-                }
-            }
-        }
-        candidates.sort_by_key(|(order, _)| *order);
-        Ok(resolve_procedure_records(
-            candidates.into_iter().map(|(_, r)| r),
-            procedure_claims_agree,
-            |_, _| ProcedureSummaryAcceptance::Accept(None),
-        )
-        .records
-        .into_iter()
-        .map(|r| r.record)
-        .collect())
+        select_procedure_summaries(records, &owners, key)
     }
 }
 
@@ -341,11 +439,133 @@ type TypeRecords = Vec<ActivatedSemanticModelRecord<TypeFact>>;
 type MemberRecords = Vec<ActivatedSemanticModelRecord<MemberFact>>;
 type SummaryQuestion = (String, String, String, bool, u32);
 
+/// The shared group driver asks structured questions of either input backing.
+pub(in crate::analyzer::semantic_model::overlay) trait GroupInput:
+    CompositionReads
+{
+    fn for_language<'a>(&'a self, language: &'a str) -> Box<dyn GroupInput + 'a>;
+    fn cancellation(&self) -> Option<&crate::CancellationToken>;
+    fn provider_selection(&self) -> Option<&ModelProviderSelection>;
+    fn defining_owner(&self) -> Option<&SemanticModelProvenance>;
+
+    fn active(&self) -> &ResolvedActiveSemanticModels;
+    fn all_types_named(&self, name: &str) -> ReadResult<TypeRecords>;
+    fn owner_ids_named(&self, key: &CompositionGroupKey, name: &str) -> ReadResult<Vec<String>>;
+    fn member_ids_by_owners(&self, owners: &[&String]) -> ReadResult<Vec<String>>;
+    fn relation_records_from(
+        &self,
+        ids: &HashSet<String>,
+    ) -> ReadResult<Vec<ActivatedSemanticModelRecord<RelationFact>>>;
+    fn generated_symbols(&self) -> Box<dyn Iterator<Item = &SemanticModelSymbol> + '_>;
+    fn generated_relations(&self) -> Box<dyn Iterator<Item = &SemanticModelRelation> + '_>;
+}
+
+impl GroupInput for RowCompositionReads<'_> {
+    fn cancellation(&self) -> Option<&crate::CancellationToken> {
+        self.cancellation
+    }
+    fn for_language<'a>(&'a self, language: &'a str) -> Box<dyn GroupInput + 'a> {
+        Box::new(RowCompositionReads::for_language(self, language))
+    }
+    fn provider_selection(&self) -> Option<&ModelProviderSelection> {
+        self.selection
+    }
+    fn defining_owner(&self) -> Option<&SemanticModelProvenance> {
+        self.defining_owner
+    }
+    fn active(&self) -> &ResolvedActiveSemanticModels {
+        self.active
+    }
+    fn all_types_named(&self, name: &str) -> ReadResult<TypeRecords> {
+        self.types(
+            questions::TYPES_BY_IDENTITY_NAME,
+            named_params! { ":name": name },
+        )
+    }
+    fn owner_ids_named(&self, key: &CompositionGroupKey, name: &str) -> ReadResult<Vec<String>> {
+        Ok(self
+            .raw_rows(
+                questions::GROUP_OWNER_IDS,
+                named_params! { ":name":name, ":language":key.language,
+                ":namespace": if key.module_namespace { "module" } else { "type" } },
+                |row| row.get::<_, String>("record_id"),
+            )?
+            .into_iter()
+            .map(|row| Arc::unwrap_or_clone(row.record))
+            .collect())
+    }
+    fn member_ids_by_owners(&self, owners: &[&String]) -> ReadResult<Vec<String>> {
+        Ok(self.raw_rows(questions::MEMBER_IDS_BY_OWNERS,
+            named_params! { ":owner_ids": serde_json::to_string(owners).expect("owner IDs serialize") },
+            |row| row.get::<_, String>("record_id"))?
+            .into_iter().map(|row| Arc::unwrap_or_clone(row.record)).collect())
+    }
+    fn relation_records_from(
+        &self,
+        ids: &HashSet<String>,
+    ) -> ReadResult<Vec<ActivatedSemanticModelRecord<RelationFact>>> {
+        let mut relation_ids = HashSet::default();
+        for id in ids {
+            check_composition_cancellation(self.cancellation)?;
+            for record in self.raw_rows(
+                questions::RELATIONS_FROM,
+                named_params! { ":id": id },
+                |row| {
+                    Ok((
+                        row.get::<_, String>("origin")?,
+                        row.get::<_, String>("record_id")?,
+                    ))
+                },
+            )? {
+                if record.record.0 == "relation_fact" {
+                    relation_ids.insert(record.record.1.clone());
+                }
+            }
+        }
+        let mut relation_ids = relation_ids.into_iter().collect::<Vec<_>>();
+        relation_ids.sort_unstable();
+        let mut result = Vec::new();
+        for id in relation_ids {
+            check_composition_cancellation(self.cancellation)?;
+            result.extend(self.ordered_records(
+                questions::RELATIONS_BY_ID,
+                named_params! { ":id": id },
+                |row| {
+                    let kind: String = row.get("relation_kind")?;
+                    let relation_kind = serde_json::from_value(serde_json::Value::String(kind))
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                row.as_ref()
+                                    .column_index("relation_kind")
+                                    .expect("relation kind column"),
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    Ok(RelationFact {
+                        id: row.get("record_id")?,
+                        from: row.get("from_id")?,
+                        to: row.get("to_id")?,
+                        relation_kind,
+                    })
+                },
+            )?);
+        }
+        Ok(result)
+    }
+    fn generated_symbols(&self) -> Box<dyn Iterator<Item = &SemanticModelSymbol> + '_> {
+        Box::new(RowCompositionReads::generated_symbols(self))
+    }
+    fn generated_relations(&self) -> Box<dyn Iterator<Item = &SemanticModelRelation> + '_> {
+        Box::new(self.generated_edges())
+    }
+}
+
 /// Results reused only while answering this projection. A composed group
 /// creates one of these on its stack and drops it before returning. No raw
 /// records or qualifications are shared with another group or request.
-struct GroupProjection<'query, 'models> {
-    reads: &'query RowCompositionReads<'models>,
+pub(in crate::analyzer::semantic_model::overlay) struct GroupProjection<'query> {
+    reads: &'query dyn GroupInput,
     types_by_id: std::cell::RefCell<HashMap<String, TypeRecords>>,
     types_by_name: std::cell::RefCell<HashMap<String, TypeRecords>>,
     members_by_id: std::cell::RefCell<HashMap<String, MemberRecords>>,
@@ -354,15 +574,12 @@ struct GroupProjection<'query, 'models> {
     summaries: std::cell::RefCell<HashMap<SummaryQuestion, Vec<Arc<CompiledProcedureSummary>>>>,
 }
 
-impl<'query, 'models> std::ops::Deref for GroupProjection<'query, 'models> {
-    type Target = RowCompositionReads<'models>;
-    fn deref(&self) -> &Self::Target {
-        self.reads
+impl<'query> GroupProjection<'query> {
+    fn poll(&self) -> ReadResult<()> {
+        check_composition_cancellation(self.reads.cancellation())
     }
-}
 
-impl<'query, 'models> GroupProjection<'query, 'models> {
-    fn new(reads: &'query RowCompositionReads<'models>) -> Self {
+    pub(in crate::analyzer::semantic_model::overlay) fn new(reads: &'query dyn GroupInput) -> Self {
         Self {
             reads,
             types_by_id: Default::default(),
@@ -396,27 +613,13 @@ impl<'query, 'models> GroupProjection<'query, 'models> {
         if let Some(ids) = self.group_names.borrow().get(&question) {
             return Ok(ids.clone());
         }
-        let namespace = if key.module_namespace {
-            "module"
-        } else {
-            "type"
-        };
-        let rows = self.reader.raw_rows(
-            questions::GROUP_OWNER_IDS,
-            named_params! { ":name":name,":language":key.language,":namespace":namespace },
-            &self.active.shards,
-            |row| row.get::<_, String>("record_id"),
-        )?;
-        let ids = rows
-            .into_iter()
-            .map(|row| Arc::unwrap_or_clone(row.record))
-            .collect::<Vec<_>>();
+        let ids = self.reads.owner_ids_named(key, name)?;
         self.group_names.borrow_mut().insert(question, ids.clone());
         Ok(ids)
     }
 }
 
-impl CompositionReads for GroupProjection<'_, '_> {
+impl CompositionReads for GroupProjection<'_> {
     fn all_type_records_with_id(&self, id: &str) -> ReadResult<TypeRecords> {
         if let Some(records) = self.types_by_id.borrow().get(id) {
             return Ok(records.clone());
@@ -434,10 +637,7 @@ impl CompositionReads for GroupProjection<'_, '_> {
         if let Some(records) = self.types_by_name.borrow().get(name) {
             return Ok(resolve_records(records.clone()).records);
         }
-        let records = self.reads.types(
-            questions::TYPES_BY_IDENTITY_NAME,
-            named_params! { ":name":name },
-        )?;
+        let records = self.reads.all_types_named(name)?;
         self.types_by_name
             .borrow_mut()
             .insert(name.to_owned(), records.clone());
@@ -478,31 +678,69 @@ impl CompositionReads for GroupProjection<'_, '_> {
     }
 }
 
-impl GroupProjection<'_, '_> {
-    fn owner_symbols(
+impl GroupProjection<'_> {
+    fn declaration_families<T: Eq + Clone>(
+        &self,
+        records: Vec<ActivatedSemanticModelRecord<T>>,
+    ) -> Vec<SemanticModelMatch<T>> {
+        // Discovery must not lose a defining provider through evidence ranking
+        // or equal-value deduplication. Actual facets already have their owner
+        // scope: extracted facets keep curated contribution ranking; authored
+        // facets see only their own defining provider.
+        if self.reads.provider_selection().is_none() || self.reads.defining_owner().is_some() {
+            return vec![with_artifact_declarations(
+                resolve_records(records.clone()),
+                records.into_iter(),
+            )];
+        }
+        let mut positions = HashMap::default();
+        let mut families: Vec<Vec<ActivatedSemanticModelRecord<T>>> = Vec::new();
+        for record in records {
+            let provider = ModelProvider {
+                pack_id: record.shard.manifest.pack_id.clone(),
+                pack_version: record.shard.manifest.version.clone(),
+                pack_digest: record.shard.manifest.semantic_sha256.clone(),
+            };
+            let index = positions.entry(provider).or_insert_with(|| {
+                families.push(Vec::new());
+                families.len() - 1
+            });
+            families[*index].push(record);
+        }
+        families
+            .into_iter()
+            .map(|records| {
+                with_artifact_declarations(resolve_records(records.clone()), records.into_iter())
+            })
+            .collect()
+    }
+
+    pub(in crate::analyzer::semantic_model::overlay) fn owner_symbols(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
         id: &str,
     ) -> ReadResult<Vec<SemanticModelSymbol>> {
         let records = self.all_type_records_with_id(id)?;
-        let matched =
-            with_artifact_declarations(resolve_records(records.clone()), records.into_iter());
-        let ambiguous = type_declaration_records_conflict(&matched);
         let mut result = Vec::new();
-        for (index, activated) in matched.records.iter().enumerate() {
-            if matched.records[..index].iter().any(|earlier| {
-                earlier.record.runtime_bases != activated.record.runtime_bases
-                    && type_declarations_equivalent(&earlier.record, &activated.record)
-            }) {
-                continue;
+        for matched in self.declaration_families(records) {
+            self.poll()?;
+            let ambiguous = type_declaration_records_conflict(&matched);
+            for (index, activated) in matched.records.iter().enumerate() {
+                self.poll()?;
+                if matched.records[..index].iter().any(|earlier| {
+                    earlier.record.runtime_bases != activated.record.runtime_bases
+                        && type_declarations_equivalent(&earlier.record, &activated.record)
+                }) {
+                    continue;
+                }
+                result.push(type_symbol(
+                    analyzer,
+                    self.reads.active(),
+                    &activated.shard,
+                    &activated.record,
+                    ambiguous,
+                ));
             }
-            result.push(type_symbol(
-                analyzer,
-                self.active,
-                &activated.shard,
-                &activated.record,
-                ambiguous,
-            ));
         }
         Ok(result)
     }
@@ -513,38 +751,45 @@ impl GroupProjection<'_, '_> {
         id: &str,
     ) -> ReadResult<Vec<SemanticModelSymbol>> {
         let records = self.all_member_records_with_id(id)?;
-        let matched =
-            with_artifact_declarations(resolve_records(records.clone()), records.into_iter());
-        let ambiguous = declaration_records_conflict(&matched);
         let mut result = Vec::new();
-        for activated in matched.records {
-            let owner = self.owner_qualification(&activated.record.owner)?;
-            result.push(member_symbol(
-                analyzer,
-                self.active,
-                &activated.shard,
-                &activated.record,
-                owner.as_deref(),
-                ambiguous,
-            ));
+        for matched in self.declaration_families(records) {
+            self.poll()?;
+            let ambiguous = declaration_records_conflict(&matched);
+            for activated in matched.records {
+                self.poll()?;
+                let owner = self.owner_qualification(&activated.record.owner)?;
+                result.push(member_symbol(
+                    analyzer,
+                    self.reads.active(),
+                    &activated.shard,
+                    &activated.record,
+                    owner.as_deref(),
+                    ambiguous,
+                ));
+            }
         }
         Ok(result)
     }
 
-    fn symbols_with_id(
+    pub(in crate::analyzer::semantic_model::overlay) fn symbols_with_id(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
         id: &str,
     ) -> ReadResult<Vec<SemanticModelSymbol>> {
         let mut symbols = self.owner_symbols(analyzer, id)?;
         symbols.extend(self.member_symbols(analyzer, id)?);
-        symbols.extend(self.generated.iter().filter(|s| s.id == id).cloned());
+        symbols.extend(
+            self.reads
+                .generated_symbols()
+                .filter(|s| s.id == id)
+                .cloned(),
+        );
         Ok(symbols)
     }
 
     /// Close canonical/alias spellings iteratively, including generated owners
     /// from this build. Terminal simple names are deliberately not group edges.
-    fn group_owners(
+    pub(in crate::analyzer::semantic_model::overlay) fn group_owners(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
         key: &CompositionGroupKey,
@@ -554,17 +799,19 @@ impl GroupProjection<'_, '_> {
         let mut owners = Vec::new();
         let mut seen = HashSet::default();
         while let Some(name) = pending.pop() {
+            self.poll()?;
             if !visited.insert(name.clone()) {
                 continue;
             }
             let ids = self.owner_ids_named(key, &name)?;
             let mut candidates = Vec::new();
             for id in ids {
+                self.poll()?;
                 candidates.extend(self.owner_symbols(analyzer, &id)?);
             }
             candidates.extend(
-                self.generated
-                    .iter()
+                self.reads
+                    .generated_symbols()
                     .filter(|s| {
                         s.owner_id.is_none()
                             && s.language == key.language
@@ -574,6 +821,7 @@ impl GroupProjection<'_, '_> {
                     .cloned(),
             );
             for symbol in candidates {
+                self.poll()?;
                 if symbol.language != key.language
                     || (symbol.qualified_name != name && !symbol.aliases.contains(&name))
                     || (symbol.kind == SemanticModelSymbolKind::Module) != key.module_namespace
@@ -597,7 +845,7 @@ impl GroupProjection<'_, '_> {
         Ok(owners)
     }
 
-    fn group_symbols(
+    pub(in crate::analyzer::semantic_model::overlay) fn group_symbols(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
         key: &CompositionGroupKey,
@@ -606,24 +854,21 @@ impl GroupProjection<'_, '_> {
         let owner_ids = owners.iter().map(|s| s.id.clone()).collect::<HashSet<_>>();
         let mut ordered_owner_ids = owner_ids.iter().collect::<Vec<_>>();
         ordered_owner_ids.sort_unstable();
-        let members=self.reader.raw_rows(questions::MEMBER_IDS_BY_OWNERS,named_params! { ":owner_ids":serde_json::to_string(&ordered_owner_ids).expect("owner IDs serialize") },&self.active.shards,|row|row.get::<_,String>("record_id"))?;
-        let mut member_ids = members
-            .iter()
-            .map(|r| r.record.as_str())
-            .collect::<Vec<_>>();
+        let mut member_ids = self.reads.member_ids_by_owners(&ordered_owner_ids)?;
         member_ids.sort_unstable();
         member_ids.dedup();
         let mut symbols = owners;
         for id in member_ids {
+            self.poll()?;
             symbols.extend(
-                self.member_symbols(analyzer, id)?
+                self.member_symbols(analyzer, &id)?
                     .into_iter()
                     .filter(|s| s.owner_id.as_ref().is_some_and(|id| owner_ids.contains(id))),
             );
         }
         symbols.extend(
-            self.generated
-                .iter()
+            self.reads
+                .generated_symbols()
                 .filter(|s| s.owner_id.as_ref().is_some_and(|id| owner_ids.contains(id)))
                 .cloned(),
         );
@@ -632,6 +877,7 @@ impl GroupProjection<'_, '_> {
         ids.sort_unstable();
         ids.dedup();
         for id in ids {
+            self.poll()?;
             let mut all = self.symbols_with_id(analyzer, &id)?;
             let matching = symbols
                 .iter()
@@ -645,6 +891,7 @@ impl GroupProjection<'_, '_> {
                 .collect::<Vec<_>>();
             mark_symbol_identity_conflicts(&mut all);
             for (index, other) in matching {
+                self.poll()?;
                 symbols[index].provenance.ambiguous = all[other].provenance.ambiguous;
             }
         }
@@ -652,7 +899,7 @@ impl GroupProjection<'_, '_> {
     }
 }
 
-impl GroupProjection<'_, '_> {
+impl GroupProjection<'_> {
     /// Resolve only owner identity at a relation endpoint. No other group's
     /// members are composed, so cross-group edges cannot recurse composition.
     fn endpoint_representatives(
@@ -664,18 +911,20 @@ impl GroupProjection<'_, '_> {
         let mut groups = Vec::new();
         let mut owners = self.owner_symbols(analyzer, id)?;
         owners.extend(
-            self.generated
-                .iter()
+            self.reads
+                .generated_symbols()
                 .filter(|s| s.id == id && s.owner_id.is_none())
                 .cloned(),
         );
         for owner in owners {
+            self.poll()?;
             let key = CompositionGroupKey {
                 language: owner.language,
                 module_namespace: owner.kind == SemanticModelSymbolKind::Module,
                 identity: owner.qualified_name,
             };
-            let owners = self.group_owners(analyzer, &key)?;
+            let reads = self.reads.for_language(&key.language);
+            let owners = GroupProjection::new(reads.as_ref()).group_owners(analyzer, &key)?;
             let key = group_key(&owners.iter().collect::<Vec<_>>());
             if keys.insert(key) {
                 groups.push(owners);
@@ -690,7 +939,10 @@ impl GroupProjection<'_, '_> {
         };
         let mut origins = OriginRewrites::default();
         for owners in groups {
-            let representative = representative_identity(&owners.iter().collect::<Vec<_>>(), self)?;
+            self.poll()?;
+            let reads = self.reads.for_language(&owners[0].language);
+            let representative =
+                representative_identity(&owners.iter().collect::<Vec<_>>(), reads.as_ref())?;
             record_origin_identities(
                 &mut origins,
                 &owners.iter().collect::<Vec<_>>(),
@@ -726,6 +978,7 @@ impl GroupProjection<'_, '_> {
     ) -> ReadResult<Vec<SemanticModelRelation>> {
         let mut relations = Vec::new();
         for id in ids {
+            self.poll()?;
             for owner in self.owner_symbols(analyzer, id)? {
                 let ambiguous = owner.provenance.ambiguous;
                 for record in self
@@ -735,7 +988,7 @@ impl GroupProjection<'_, '_> {
                 {
                     relations.extend(record.record.hierarchy.iter().map(|hierarchy| {
                         hierarchy_relation(
-                            self.active,
+                            self.reads.active(),
                             &record.shard,
                             &owner.id,
                             hierarchy,
@@ -745,50 +998,17 @@ impl GroupProjection<'_, '_> {
                 }
             }
         }
-        let mut relation_ids = HashSet::default();
-        for id in ids {
-            for record in self.reader.raw_rows(
-                questions::RELATIONS_FROM,
-                named_params! { ":id": id },
-                &self.active.shards,
-                |row| {
-                    Ok((
-                        row.get::<_, String>("origin")?,
-                        row.get::<_, String>("record_id")?,
-                    ))
-                },
-            )? {
-                if record.record.0 == "relation_fact" {
-                    relation_ids.insert(record.record.1.clone());
-                }
-            }
+        let records = self.reads.relation_records_from(ids)?;
+        let mut by_id: HashMap<String, Vec<_>> = HashMap::default();
+        for record in records {
+            self.poll()?;
+            by_id
+                .entry(record.record.id.clone())
+                .or_default()
+                .push(record);
         }
-        let mut relation_ids = relation_ids.into_iter().collect::<Vec<_>>();
-        relation_ids.sort_unstable();
-        for id in relation_ids {
-            let records = self.ordered_records::<RelationFact>(
-                questions::RELATIONS_BY_ID,
-                named_params! { ":id": id },
-                |row| {
-                    let kind: String = row.get("relation_kind")?;
-                    let relation_kind = serde_json::from_value(serde_json::Value::String(kind))
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                row.as_ref()
-                                    .column_index("relation_kind")
-                                    .expect("relation kind column"),
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                    Ok(RelationFact {
-                        id: row.get("record_id")?,
-                        from: row.get("from_id")?,
-                        to: row.get("to_id")?,
-                        relation_kind,
-                    })
-                },
-            )?;
+        for records in by_id.into_values() {
+            self.poll()?;
             let matched = resolve_records(records);
             let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
             relations.extend(
@@ -796,12 +1016,12 @@ impl GroupProjection<'_, '_> {
                     .records
                     .iter()
                     .filter(|r| ids.contains(&r.record.from))
-                    .map(|r| relation(self.active, &r.shard, &r.record, ambiguous)),
+                    .map(|r| relation(self.reads.active(), &r.shard, &r.record, ambiguous)),
             );
         }
         relations.extend(
-            self.generated_relations
-                .iter()
+            self.reads
+                .generated_relations()
                 .filter(|r| ids.contains(&r.from))
                 .cloned(),
         );
@@ -811,14 +1031,14 @@ impl GroupProjection<'_, '_> {
 
     /// The row driver asks only for this group and the identity of endpoints.
     /// It never composes a neighboring group to rewrite an edge.
-    fn compose_group(
+    pub(in crate::analyzer::semantic_model::overlay) fn compose_group(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
         key: &CompositionGroupKey,
     ) -> ReadResult<ComposedGroup> {
         let mut symbols = self.group_symbols(analyzer, key)?;
         freeze_symbol_order(&mut symbols);
-        debug_assert_group_backing(&symbols, self.active);
+        debug_assert_group_backing(&symbols, self.reads.active());
         let mut relations = self.group_relations(analyzer, &symbols)?;
         let origins = symbols
             .iter()
@@ -842,8 +1062,10 @@ impl GroupProjection<'_, '_> {
                 .flat_map(|r| [r.from.clone(), r.to.clone()]),
         );
         for id in endpoints {
+            self.poll()?;
             let (representative, origins) = self.endpoint_representatives(analyzer, &id)?;
             for (pack, ids) in origins {
+                self.poll()?;
                 origin_identities.entry(pack).or_default().extend(ids);
             }
             if representative.composed {

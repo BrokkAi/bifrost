@@ -2,7 +2,7 @@
 
 use super::super::branch_relations::{
     self, BranchOpenReason, BranchReferenceKind, BranchReferenceProofs, BranchReferenceSite,
-    BranchRelationVerdict,
+    BranchRelationVerdict, BranchStorageField,
 };
 use super::super::provider::StructuralSyntaxLimitedOutcome;
 use super::results::{
@@ -20,7 +20,9 @@ use crate::analyzer::usages::get_definition::{
     DefinitionLookupOutcome, DefinitionLookupRequest, DefinitionLookupStatus,
     resolve_definition_batch_with_source_and_cancellation,
 };
+use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
 use brokk_bifrost_rql::{BranchRelationFilter, BranchRelationKind};
 use tree_sitter::Node;
 
@@ -29,6 +31,7 @@ const MAX_BRANCH_SOURCE_BYTES: usize = 1024 * 1024;
 #[derive(Default)]
 pub(super) struct BranchRelationTraversalCache {
     syntax: HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
+    regions: HashMap<ProjectFile, ConditionalRegions>,
     reference_proofs: HashMap<ProjectFile, BranchReferenceProofs>,
     scalar: HashMap<ProcedureHandle, Result<ScalarConditionDerivation, ScalarConditionGap>>,
     reported: HashSet<(ProjectFile, &'static str, &'static str)>,
@@ -146,6 +149,7 @@ fn make_value(
 }
 
 fn report(
+    analyzer: &dyn IAnalyzer,
     cache: &mut BranchRelationTraversalCache,
     seed: &SeedMatch,
     relation: &'static str,
@@ -153,19 +157,37 @@ fn report(
     message: String,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    if cache.reported.insert((seed.file.clone(), relation, cause)) {
-        diagnostics.push(CodeQueryDiagnostic {
-            related: Vec::new(),
-            source: None,
-            code: CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: seed.language.config_label(),
-            message,
-            exhausted_roots: Vec::new(),
-            // A branch relation row is a row of its seed's file.
-            withheld_rows_path: Some(rel_path_string(&seed.file)),
+    if DerivationExecutionCause::from_reason(cause).is_some() {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=derivation detail={cause}",
+                file!(),
+                line!()
+            )
         });
+        analyzer.mark_execution_dependent();
+    }
+    if cache.reported.insert((seed.file.clone(), relation, cause)) {
+        diagnostics.push(super::QueryExecutionState::diagnostic(
+            analyzer,
+            CodeQueryDiagnostic {
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: seed.language.config_label(),
+                message,
+                exhausted_roots: Vec::new(),
+                // A branch relation row is a row of its seed's file.
+                withheld_rows_path: Some(rel_path_string(&seed.file)),
+            },
+            CodeQueryDiagnosticCode::from_execution_reason(
+                CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
+                cause,
+            )
+            .1,
+        ));
     }
 }
 
@@ -190,10 +212,11 @@ pub(super) fn branch_relation_expansions(
         .partition(|relation| !supports_relation(seed.language, *relation));
     for relation in &unsupported {
         report(
+            analyzer,
             cache,
             seed,
             relation.label(),
-            "unsupported_language",
+            derivation_reason::UNSUPPORTED_LANGUAGE,
             format!(
                 "{} {} branch relations are not implemented for {}",
                 seed.language.config_label(),
@@ -217,10 +240,11 @@ pub(super) fn branch_relation_expansions(
         )
     }) {
         report(
+            analyzer,
             cache,
             seed,
             relation.label(),
-            "unsupported_relation",
+            derivation_reason::UNSUPPORTED_RELATION,
             format!(
                 "{} has no complete {} branch-relation producer for {}",
                 seed.language.config_label(),
@@ -248,7 +272,15 @@ pub(super) fn branch_relation_expansions(
     }
     let owner = seed.facts.node(seed.fact_match.node).range;
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return open_selected(cache, seed, &supported, "cancelled", owner, diagnostics);
+        return open_selected(
+            analyzer,
+            cache,
+            seed,
+            &supported,
+            derivation_reason::CANCELLED,
+            owner,
+            diagnostics,
+        );
     }
 
     if !cache.syntax.contains_key(&seed.file) {
@@ -273,17 +305,56 @@ pub(super) fn branch_relation_expansions(
             if actual == seed.facts.source_identity() {
                 (Some(syntax.clone_prepared()), None)
             } else {
-                (None, Some("snapshot_mismatch"))
+                (None, Some(derivation_reason::SNAPSHOT_MISMATCH))
             }
         }
-        StructuralSyntaxLimitedOutcome::Exceeded { .. } => (None, Some("source_limit")),
-        StructuralSyntaxLimitedOutcome::Cancelled => (None, Some("cancelled")),
-        StructuralSyntaxLimitedOutcome::Unavailable => (None, Some("syntax_unavailable")),
+        StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
+            (None, Some(derivation_reason::SOURCE_LIMIT))
+        }
+        StructuralSyntaxLimitedOutcome::Cancelled => (None, Some(derivation_reason::CANCELLED)),
+        StructuralSyntaxLimitedOutcome::Unavailable => {
+            (None, Some(derivation_reason::SYNTAX_UNAVAILABLE))
+        }
     };
     let Some(syntax) = syntax else {
         let reason = failure.expect("syntax failure has a reason");
-        return open_selected(cache, seed, &supported, reason, owner, diagnostics);
+        return open_selected(
+            analyzer,
+            cache,
+            seed,
+            &supported,
+            reason,
+            owner,
+            diagnostics,
+        );
     };
+    // Temporary until #7581 decides the cross-language rule: C# expression
+    // owners that map to If (a conditional expression) produce no branch
+    // relations. Only known, mapped expression owners are excluded; a failed
+    // syntax lookup or an unknown recovered owner keeps its diagnostic.
+    if seed.language == Language::CSharp {
+        let body_syntax =
+            brokk_bifrost_core::analyzer::structural::body_relations::syntax_for(seed.language)
+                .expect("C# statement body syntax");
+        let spec = brokk_bifrost_analysis::analyzer::structural_spec_for(seed.language)
+            .expect("C# structural spec");
+        if syntax
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(owner.start_byte, owner.end_byte)
+            .is_some_and(|node| {
+                node.start_byte() == owner.start_byte
+                    && node.end_byte() == owner.end_byte
+                    && !body_syntax.if_kinds.contains(&node.kind())
+                    && spec
+                        .kind_table()
+                        .iter()
+                        .any(|(name, kind)| *name == node.kind() && *kind == NormalizedKind::If)
+            })
+        {
+            return Vec::new();
+        }
+    }
     let mut rows = if supported.iter().any(|relation| {
         matches!(
             relation,
@@ -294,16 +365,32 @@ pub(super) fn branch_relation_expansions(
         )
     }) {
         let env = environment_cache.environment_for(analyzer, &seed.file);
-        if matches!(seed.language, Language::Java | Language::Rust)
-            && supported.contains(&BranchRelationKind::IdenticalBodies)
-            && !cache.reference_proofs.contains_key(&seed.file)
+        if supported.iter().any(|relation| {
+            matches!(
+                relation,
+                BranchRelationKind::IdenticalBodies | BranchRelationKind::RepeatedCondition
+            )
+        }) && !cache.reference_proofs.contains_key(&seed.file)
         {
-            let proofs = resolve_branch_references(analyzer, seed, &syntax, &env, cancellation);
+            let proofs = resolve_branch_references(
+                analyzer,
+                seed,
+                &syntax,
+                &env,
+                &mut cache.syntax,
+                cancellation,
+            );
             cache.reference_proofs.insert(seed.file.clone(), proofs);
         }
         let empty = BranchReferenceProofs::default();
         let members = cache.reference_proofs.get(&seed.file).unwrap_or(&empty);
-        branch_relations::relations_for_if(&syntax, seed.language, owner, &env, members)
+        let regions = cache.regions.entry(seed.file.clone()).or_insert_with(|| {
+            brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
+                .expect("branch language is registered")
+                .structural_spec()
+                .conditional_regions(syntax.tree().root_node(), syntax.source())
+        });
+        branch_relations::relations_for_if(&syntax, seed.language, owner, &env, members, regions)
     } else {
         Vec::new()
     };
@@ -324,11 +411,17 @@ pub(super) fn branch_relation_expansions(
         .filter(|row| filter.accepts(row.kind.label()))
         .map(|row| {
             let reason = match row.verdict {
-                BranchRelationVerdict::Open(reason) => Some(reason.label()),
+                BranchRelationVerdict::Open(reason) => {
+                    if reason.execution_cause().is_some() {
+                        analyzer.mark_execution_dependent();
+                    }
+                    Some(reason.label())
+                }
                 _ => None,
             };
             if let Some(reason) = reason {
                 report(
+                    analyzer,
                     cache,
                     seed,
                     row.kind.label(),
@@ -401,6 +494,7 @@ fn qualify_php_repeated_conditions(
     let uncancelled = CancellationToken::new();
     let outcomes = scalar_outcomes_for_procedure(
         workspace,
+        semantic,
         cache,
         &seed.file,
         procedure,
@@ -440,6 +534,7 @@ fn open_php_repeated_rows(rows: &mut [branch_relations::BranchRelationRow]) {
 
 fn scalar_outcomes_for_procedure(
     workspace: &WorkspaceAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
     cache: &mut BranchRelationTraversalCache,
     file: &ProjectFile,
     procedure: &SemanticProcedureValue,
@@ -449,12 +544,14 @@ fn scalar_outcomes_for_procedure(
     if let Some(outcomes) = cache.scalar.get(&procedure.handle) {
         return outcomes.clone();
     }
+    let reference_calls = semantic.reference_receiver_calls(file, &procedure.handle);
     let outcomes = scalar_condition_outcomes(
         workspace,
         file,
         &procedure.handle,
         Arc::clone(syntax),
         cancellation,
+        &reference_calls,
     );
     cache
         .scalar
@@ -603,6 +700,7 @@ fn resolve_branch_references(
     seed: &SeedMatch,
     syntax: &PreparedSyntaxTree,
     env: &super::super::lexical_environment::EnvironmentFileResult,
+    syntax_cache: &mut HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
     cancellation: Option<&CancellationToken>,
 ) -> BranchReferenceProofs {
     let mut proofs = BranchReferenceProofs::default();
@@ -639,12 +737,101 @@ fn resolve_branch_references(
         outcomes.len(),
         "definition batch must answer every requested branch reference site"
     );
+    let support = crate::analyzer::languages::language_support_for_hook(
+        seed.language,
+        "branch_current_object_fields",
+    );
+    let field_spec = support
+        .and_then(|support| support.branch_current_object_fields())
+        .filter(|spec| {
+            // Most files never use a base receiver. Avoid declaration reads
+            // unless receiver normalization can matter in this file.
+            sites.iter().any(|site| {
+                syntax
+                    .tree()
+                    .root_node()
+                    .named_descendant_for_byte_range(site.range.0, site.range.1)
+                    .and_then(|name| name.parent())
+                    .filter(|access| spec.member(*access).is_some())
+                    .and_then(|access| access.child_by_field_name(spec.receiver_field))
+                    .is_some_and(|receiver| receiver.kind() == spec.parent_kind)
+            })
+        });
+    // At most the bounded reference-site set, retained only during this file's
+    // lookup. Repeated reads of one field do not repeat declaration queries.
+    let mut declarations = HashMap::default();
     for (site, outcome) in sites.into_iter().zip(outcomes) {
-        proofs
-            .sites
-            .insert(site.range, admit_reference_proof(site, &outcome));
+        let proof = admit_reference_proof(site, &outcome);
+        if let (Ok(target), Some(spec), Some(support)) = (&proof, field_spec.as_ref(), support)
+            && let Some(name) = syntax
+                .tree()
+                .root_node()
+                .named_descendant_for_byte_range(site.range.0, site.range.1)
+            && let Some(access) = name.parent()
+            && spec
+                .member(access)
+                .is_some_and(|member| (member.start_byte(), member.end_byte()) == site.range)
+            && let Some(declaration) = declarations.entry(target.clone()).or_insert_with(|| {
+                branch_storage_field(analyzer, support, spec, target, syntax_cache, cancellation)
+            })
+        {
+            proofs
+                .storage_fields
+                .insert(site.range, declaration.clone());
+        }
+        proofs.sites.insert(site.range, proof);
     }
     proofs
+}
+
+/// Equality needs a singleton physical storage declaration, not just the
+/// presentation CodeUnit used by the distinct-only reference proofs.
+fn branch_storage_field(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn crate::analyzer::languages::LanguageSupport,
+    spec: &branch_relations::BranchCurrentObjectFields,
+    target: &CodeUnit,
+    syntax_cache: &mut HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
+    cancellation: Option<&CancellationToken>,
+) -> Option<BranchStorageField> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return None;
+    }
+    let ranges = support.declaration_ranges_limited(analyzer, target, 2)?;
+    if !ranges.complete || ranges.rows.len() != 1 {
+        return None;
+    }
+    let file = target.source();
+    let syntax = syntax_cache.entry(file.clone()).or_insert_with(|| {
+        analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == support.knowledge().language())
+            .map_or(StructuralSyntaxLimitedOutcome::Unavailable, |provider| {
+                provider.structural_syntax_limited(file, MAX_BRANCH_SOURCE_BYTES, cancellation)
+            })
+    });
+    let StructuralSyntaxLimitedOutcome::Available(syntax) = syntax else {
+        return None;
+    };
+    let syntax = syntax.prepared();
+    let range = crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range(
+        syntax.source(),
+        syntax.tree().root_node(),
+        target,
+        ranges.rows[0],
+    )?;
+    let name = syntax
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    if !spec.is_storage_declaration(name) {
+        return None;
+    }
+    Some(BranchStorageField {
+        file: file.clone(),
+        range,
+    })
 }
 
 fn admit_reference_proof(
@@ -681,6 +868,7 @@ fn scalar_condition_expansions(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
+    let analyzer = workspace.analyzer();
     const RELATION: &str = "contradictory_condition";
     let owner = seed.facts.node(seed.fact_match.node).range;
     let Some(node) = syntax
@@ -702,30 +890,33 @@ fn scalar_condition_expansions(
         })
     else {
         return open_selected(
+            analyzer,
             cache,
             seed,
             &[BranchRelationKind::ContradictoryCondition],
-            "syntax_recovery",
+            derivation_reason::SYNTAX_RECOVERY,
             owner,
             diagnostics,
         );
     };
     let Some(condition) = node.child_by_field_name("condition") else {
         return open_selected(
+            analyzer,
             cache,
             seed,
             &[BranchRelationKind::ContradictoryCondition],
-            "missing_branch_field",
+            derivation_reason::MISSING_BRANCH_FIELD,
             owner,
             diagnostics,
         );
     };
     if node.has_error() || condition.has_error() {
         return open_selected(
+            analyzer,
             cache,
             seed,
             &[BranchRelationKind::ContradictoryCondition],
-            "syntax_recovery",
+            derivation_reason::SYNTAX_RECOVERY,
             owner,
             diagnostics,
         );
@@ -738,10 +929,11 @@ fn scalar_condition_expansions(
                 "elif_clause" => {
                     let Some(condition) = alternative.child_by_field_name("condition") else {
                         return open_selected(
+                            analyzer,
                             cache,
                             seed,
                             &[BranchRelationKind::ContradictoryCondition],
-                            "missing_branch_field",
+                            derivation_reason::MISSING_BRANCH_FIELD,
                             owner,
                             diagnostics,
                         );
@@ -751,10 +943,11 @@ fn scalar_condition_expansions(
                 "else_clause" => {}
                 _ => {
                     return open_selected(
+                        analyzer,
                         cache,
                         seed,
                         &[BranchRelationKind::ContradictoryCondition],
-                        "missing_branch_field",
+                        derivation_reason::MISSING_BRANCH_FIELD,
                         owner,
                         diagnostics,
                     );
@@ -762,10 +955,11 @@ fn scalar_condition_expansions(
             }
             if conditions.len() > 16 {
                 return open_selected(
+                    analyzer,
                     cache,
                     seed,
                     &[BranchRelationKind::ContradictoryCondition],
-                    "comparison_budget",
+                    derivation_reason::COMPARISON_BUDGET,
                     owner,
                     diagnostics,
                 );
@@ -776,11 +970,12 @@ fn scalar_condition_expansions(
     let procedures = semantic.cfg().procedure_of_match(seed);
     let [procedure] = procedures.as_slice() else {
         let reason = if procedures.is_empty() {
-            "no_enclosing_procedure"
+            derivation_reason::NO_ENCLOSING_PROCEDURE
         } else {
-            "ambiguous_procedure"
+            derivation_reason::AMBIGUOUS_PROCEDURE
         };
         return open_selected(
+            analyzer,
             cache,
             seed,
             &[BranchRelationKind::ContradictoryCondition],
@@ -790,6 +985,7 @@ fn scalar_condition_expansions(
         );
     };
     let uncancelled = CancellationToken::new();
+    let reference_calls = semantic.reference_receiver_calls(&seed.file, &procedure.handle);
     let outcome = cache
         .scalar
         .entry(procedure.handle.clone())
@@ -800,6 +996,7 @@ fn scalar_condition_expansions(
                 &procedure.handle,
                 Arc::clone(syntax),
                 cancellation.unwrap_or(&uncancelled),
+                &reference_calls,
             )
         });
     let verdicts = conditions
@@ -912,8 +1109,8 @@ fn scalar_condition_expansions(
                     );
                     diagnostic.source = source;
                     diagnostic.related = match (reason, related) {
-                        ("partial_procedure", Some((gaps, _)))
-                        | ("partial_producer", Some((_, gaps))) => gaps.clone(),
+                        (derivation_reason::PARTIAL_PROCEDURE, Some((gaps, _)))
+                        | (derivation_reason::PARTIAL_PRODUCER, Some((_, gaps))) => gaps.clone(),
                         _ => Vec::new(),
                     };
                     diagnostic.withheld_rows_path = Some(rel_path_string(&seed.file));
@@ -936,6 +1133,7 @@ fn scalar_condition_expansions(
 }
 
 fn open_selected(
+    analyzer: &dyn IAnalyzer,
     cache: &mut BranchRelationTraversalCache,
     seed: &SeedMatch,
     relations: &[BranchRelationKind],
@@ -948,6 +1146,7 @@ fn open_selected(
         .copied()
         .map(|relation| {
             report(
+                analyzer,
                 cache,
                 seed,
                 relation.label(),

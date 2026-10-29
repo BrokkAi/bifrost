@@ -63,6 +63,39 @@ pub fn walk_tree_preorder<'tree>(
     }
 }
 
+/// Whether `node` is a literal whose whole subtree is data: its kind is one of
+/// `literal_kinds`, and no node under it is an error, a missing node, or one
+/// of `interpolation_kinds`, which hold executable expressions. The language
+/// supplies the kinds; `should_stop` breaks the walk for cancellation or a
+/// deadline.
+pub fn is_uninterpolated_literal(
+    node: Node<'_>,
+    literal_kinds: &[&str],
+    interpolation_kinds: &[&str],
+    should_stop: &mut dyn FnMut() -> bool,
+) -> std::ops::ControlFlow<(), bool> {
+    use std::ops::ControlFlow;
+    if !literal_kinds.contains(&node.kind()) {
+        return ControlFlow::Continue(false);
+    }
+    let mut result = ControlFlow::Continue(true);
+    walk_tree_preorder(node, true, |current| {
+        if should_stop() {
+            result = ControlFlow::Break(());
+            WalkControl::Break
+        } else if current.is_error()
+            || current.is_missing()
+            || interpolation_kinds.contains(&current.kind())
+        {
+            result = ControlFlow::Continue(false);
+            WalkControl::Break
+        } else {
+            WalkControl::Continue
+        }
+    });
+    result
+}
+
 fn try_walk_tree_preorder<'tree, Error>(
     root: Node<'tree>,
     include_root: bool,

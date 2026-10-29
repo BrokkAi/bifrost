@@ -10,7 +10,9 @@ use brokk_bifrost_analysis::analyzer::usages::inverted_edges::EdgeNodeDomain;
 
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildOutput;
 
-use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    DeclarationKinds, UsageEdges, terminal_index,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::build_edge_output;
 
@@ -147,13 +149,26 @@ impl<'a> PhpEdgeResolver<'a> {
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
+        kinds: &DeclarationKinds,
         keep_file: F,
     ) -> Output
     where
         Output: UsageEdgeBuildOutput<String>,
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        self.build_php_edges(analyzer, EdgeNodeDomain::Closed(nodes), keep_file)
+        // The caller already read indexed declarations to select these nodes.
+        // Retain their kinds instead of resolving every rendered name again.
+        let catalog = terminal_index(&brokk_bifrost_php::PhpKnowledge, nodes, |key| {
+            kinds
+                .get(key)
+                .expect("graph node has indexed declaration kinds")
+                .clone()
+        });
+        self.build_php_edges(
+            analyzer,
+            EdgeNodeDomain::ClosedWithCatalog(nodes, &catalog),
+            keep_file,
+        )
     }
 
     pub(crate) fn build_rooted_edges<F>(

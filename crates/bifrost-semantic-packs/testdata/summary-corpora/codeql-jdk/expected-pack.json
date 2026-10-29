@@ -1,0 +1,464 @@
+{
+  "schema_version": 20,
+  "pack_id": "codeql.jdk21.summaries",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost-codeql-jdk",
+    "version": "0.11.0"
+  },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "toolchains": [
+      {
+        "name": "jdk",
+        "requirement": ">=21.0.0, <22.0.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "https://github.com/github/codeql (MIT license)",
+    "revision": "c9142680f5b6409dbe0944350321c54e8c801e61"
+  },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "codeql.jdk21.procedure-summaries",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "jdk",
+            "version": ">=21.0.0, <22.0.0"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "codeql.java.base-java-lang-abstractstringbuilder.java-java.lang.abstractstringbuilder.init-java.lang.string.d41a9662276c",
+            "target": {
+              "path": "java.base/java/lang/AbstractStringBuilder.java",
+              "symbol": "java.lang.AbstractStringBuilder.<init>(java.lang.String)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-iterable.java-java.lang.iterable.iterator.f9aac7a90602",
+            "target": {
+              "path": "java.base/java/lang/Iterable.java",
+              "symbol": "java.lang.Iterable.iterator()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-processbuilder.java-java.lang.processbuilder.init-java.lang.string.b6b987e4544b",
+            "target": {
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "java.lang.ProcessBuilder.<init>(java.lang.String[])",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-string.java-java.lang.string.concat-java.lang.string.1e67e38b2da1",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.concat(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-string.java-java.lang.string.format-java.lang.string-java.lang.object.be1fab5a8750",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.format(java.lang.String,java.lang.Object[])",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-string.java-java.lang.string.join-java.lang.charsequence-java.lang.charsequence.aaf96f10602a",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.join(java.lang.CharSequence,java.lang.CharSequence[])",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-string.java-java.lang.string.join-java.lang.charsequence-java.lang.iterable.81e70914d0fe",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.join(java.lang.CharSequence,java.lang.Iterable)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-string.java-java.lang.string.length.d184a3916fb1",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.length()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-stringbuilder.java-java.lang.stringbuilder.reverse.3628a6b7b848",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.reverse()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                },
+                "value_transfer": {
+                  "kind": {
+                    "kind": "conversion",
+                    "preservation": "identity"
+                  },
+                  "operation": {
+                    "kind": "none"
+                  }
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-stringbuilder.java-java.lang.stringbuilder.substring-int.8ed5f32c7151",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.substring(int)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-lang-stringbuilder.java-java.lang.stringbuilder.tostring.6b8f424c8291",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.toString()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-util-arraylist.java-java.util.arraylist.iterator.2f21db8e212d",
+            "target": {
+              "path": "java.base/java/util/ArrayList.java",
+              "symbol": "java.util.ArrayList.iterator()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-util-map.java-java.util.map.computeifabsent-java.lang.object-java.util.function.function.0185081218c6",
+            "target": {
+              "path": "java.base/java/util/Map.java",
+              "symbol": "java.util.Map.computeIfAbsent(java.lang.Object,java.util.function.Function)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.java.base-java-util-map.java-java.util.map.copyof-java.util.map.92ed89eef7b4",
+            "target": {
+              "path": "java.base/java/util/Map.java",
+              "symbol": "java.util.Map.copyOf(java.util.Map)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.test-basector.java-test.basector.init-java.lang.string.45f901404702",
+            "target": {
+              "path": "test/BaseCtor.java",
+              "symbol": "test.BaseCtor.<init>(java.lang.String)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codeql.test-ctor.java-test.ctor.init-java.lang.string.1f1152c5c74e",
+            "target": {
+              "path": "test/Ctor.java",
+              "symbol": "test.Ctor.<init>(java.lang.String)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

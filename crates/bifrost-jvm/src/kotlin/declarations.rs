@@ -22,7 +22,7 @@
 
 use crate::kotlin::structural::{KOTLIN_KIND_TABLE, KOTLIN_STRUCTURAL_SPEC};
 use crate::kotlin::syntax::{
-    kotlin_binding_type_components, kotlin_binding_type_text,
+    kotlin_binding_type_components, kotlin_binding_type_node, kotlin_binding_type_text,
     kotlin_declared_return_type_components, kotlin_declared_return_type_text,
     kotlin_declared_type_parameter_names, kotlin_extension_receiver_components,
     kotlin_extension_receiver_text,
@@ -370,17 +370,33 @@ impl<'a> KotlinVisitor<'a> {
         name_node: Option<Node<'_>>,
         parent: Option<&CodeUnit>,
     ) -> CodeUnit {
+        self.declare_with_signature(kind, segment_kind, name, None, node, name_node, parent)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn declare_with_signature(
+        &mut self,
+        kind: CodeUnitType,
+        segment_kind: SegmentKind,
+        name: &str,
+        signature: Option<String>,
+        node: Node<'_>,
+        name_node: Option<Node<'_>>,
+        parent: Option<&CodeUnit>,
+    ) -> CodeUnit {
         let short_name = match parent {
             Some(parent) => format!("{}.{name}", parent.short_name()),
             None => name.to_string(),
         };
         let fq = child_fq_base(parent, || kotlin_package_fq(self.package_name))
             .with_pushed(segment_interner().intern(name, segment_kind));
-        let code_unit = CodeUnit::new_fq(
+        let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             kind,
             self.package_name.to_string(),
             short_name,
+            signature,
+            false,
             fq,
         );
         self.parsed
@@ -510,10 +526,20 @@ impl<'a> KotlinVisitor<'a> {
             return;
         }
 
-        let code_unit = self.declare(
+        let facts = first_named_child(node, "function_value_parameters")
+            .map(|list| kotlin_function_parameter_facts(list, self.source))
+            .unwrap_or_else(KotlinParameterFacts::empty);
+        let signature_key = kotlin_signature_key(
+            first_named_child(node, "type_parameters"),
+            node.child_by_field_name("receiver"),
+            &facts,
+            self.source,
+        );
+        let code_unit = self.declare_with_signature(
             CodeUnitType::Function,
             SegmentKind::Member,
             name,
+            Some(signature_key),
             node,
             Some(name_node),
             parent,
@@ -526,7 +552,7 @@ impl<'a> KotlinVisitor<'a> {
         // lets a consumer decide the declared receiver contract instead of
         // reporting "nobody looked" (#3453); the same gate is why JavaScript,
         // TypeScript (#2597), PHP, Ruby (#2912) and Python (#3451) record it.
-        let metadata = kotlin_callable_signature_metadata(signature, node, self.source)
+        let metadata = kotlin_callable_signature_metadata(signature, facts, node, self.source)
             .with_callable_modifiers(
                 parent.is_some_and(|owner| self.singleton_owners.contains(owner)),
                 false,
@@ -541,18 +567,15 @@ impl<'a> KotlinVisitor<'a> {
             .filter(|child| child.kind() == "class_parameter")
             .collect();
         if !parameters.is_empty() {
-            let constructor = self.declare_constructor(primary, class_name, owner);
+            let facts = kotlin_class_parameter_facts(&parameters, self.source);
+            let constructor = self.declare_constructor(primary, class_name, owner, &facts);
             let params_text = collapse_whitespace(node_text(primary, self.source));
             let signature = if params_text.starts_with('(') {
                 format!("{class_name}{params_text}")
             } else {
                 format!("{class_name} {params_text}")
             };
-            self.add_constructor_metadata(
-                constructor,
-                signature,
-                kotlin_class_parameter_facts(&parameters, self.source),
-            );
+            self.add_constructor_metadata(constructor, signature, facts);
         }
 
         // `val`/`var` class parameters declare real properties.
@@ -595,16 +618,18 @@ impl<'a> KotlinVisitor<'a> {
 
     fn visit_secondary_constructor(&mut self, node: Node<'_>, parent: Option<&CodeUnit>) {
         // A secondary constructor is only meaningful inside a class body. All
-        // of a class's constructors share one source callable identity
-        // named after the class (`Owner.Owner`, the Scala precedent): each
-        // constructor declaration accumulates its own range and signature on
-        // that unit, exactly like ordinary overloads sharing a spelling.
+        // of a class's constructors are named after the class (`Owner.Owner`,
+        // the Scala precedent) and, like ordinary overloads sharing a
+        // spelling, are told apart by their signature key.
         let Some(owner) = parent else {
             return;
         };
         let class_name = owner.identifier().to_string();
-        let code_unit = self.declare_constructor(node, &class_name, owner);
         let parameter_list = first_named_child(node, "function_value_parameters");
+        let facts = parameter_list
+            .map(|list| kotlin_function_parameter_facts(list, self.source))
+            .unwrap_or_else(KotlinParameterFacts::empty);
+        let code_unit = self.declare_constructor(node, &class_name, owner, &facts);
         let header_end = parameter_list
             .map(|parameters| parameters.end_byte())
             .unwrap_or(node.end_byte());
@@ -613,9 +638,6 @@ impl<'a> KotlinVisitor<'a> {
                 .get(node.start_byte()..header_end)
                 .unwrap_or_default(),
         );
-        let facts = parameter_list
-            .map(|list| kotlin_function_parameter_facts(list, self.source))
-            .unwrap_or_else(|| kotlin_parameter_facts_from(Vec::new(), 0, false));
         self.add_constructor_metadata(code_unit, signature, facts);
     }
 
@@ -624,12 +646,15 @@ impl<'a> KotlinVisitor<'a> {
         node: Node<'_>,
         class_name: &str,
         owner: &CodeUnit,
+        facts: &KotlinParameterFacts,
     ) -> CodeUnit {
-        let constructor = CodeUnit::new_fq(
+        let constructor = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
             self.package_name.to_string(),
             format!("{}.{class_name}", owner.short_name()),
+            Some(kotlin_signature_key(None, None, facts, self.source)),
+            false,
             owner
                 .fq()
                 .clone()
@@ -1022,8 +1047,61 @@ fn kotlin_callable_header(node: Node<'_>, source: &str) -> String {
 
 struct KotlinParameterFacts {
     metadata: Vec<ParameterMetadata>,
+    /// The written type of each parameter, `vararg`-prefixed where declared:
+    /// what tells same-named overloads apart (see `kotlin_signature_key`).
+    key_types: Vec<String>,
     required: usize,
     repeated: bool,
+}
+
+impl KotlinParameterFacts {
+    fn empty() -> Self {
+        kotlin_parameter_facts_from(Vec::new(), Vec::new(), 0, false)
+    }
+}
+
+/// Overload-discriminating key stored on Kotlin callable `CodeUnit`s (the
+/// `scala_method_signature_key` shape): extension receiver, generic arity and
+/// the written type of every value parameter, e.g. `extension (Int)[1](T, String?)`.
+/// Same-named overloads must be distinct `CodeUnit`s, or every per-overload
+/// fact (range, signature, the definition a resolved call projects to)
+/// collapses onto the first overload.
+fn kotlin_signature_key(
+    type_parameters: Option<Node<'_>>,
+    receiver: Option<Node<'_>>,
+    facts: &KotlinParameterFacts,
+    source: &str,
+) -> String {
+    let mut key = String::new();
+    if let Some(receiver) = receiver {
+        key.push_str("extension (");
+        key.push_str(&collapse_whitespace(node_text(receiver, source)));
+        key.push(')');
+    }
+    let generic_arity = type_parameters.map_or(0, |parameters| {
+        named_children_of(parameters)
+            .into_iter()
+            .filter(|child| child.kind() == "type_parameter")
+            .count()
+    });
+    if generic_arity > 0 {
+        key.push_str(&format!("[{generic_arity}]"));
+    }
+    key.push('(');
+    key.push_str(&facts.key_types.join(", "));
+    key.push(')');
+    key
+}
+
+fn kotlin_parameter_key_type(parameter: Node<'_>, vararg: bool, source: &str) -> String {
+    let type_text = kotlin_binding_type_node(parameter)
+        .map(|type_node| collapse_whitespace(node_text(type_node, source)))
+        .unwrap_or_else(|| collapse_whitespace(node_text(parameter, source)));
+    if vararg {
+        format!("vararg {type_text}")
+    } else {
+        type_text
+    }
 }
 
 /// Whether a parameter's modifier list marks it `vararg`.
@@ -1048,12 +1126,14 @@ fn kotlin_parameter_metadata(parameter: Node<'_>, source: &str) -> ParameterMeta
 
 fn kotlin_parameter_facts_from(
     metadata: Vec<ParameterMetadata>,
+    key_types: Vec<String>,
     optional: usize,
     repeated: bool,
 ) -> KotlinParameterFacts {
     KotlinParameterFacts {
         required: metadata.len().saturating_sub(optional),
         metadata,
+        key_types,
         repeated,
     }
 }
@@ -1068,6 +1148,7 @@ fn kotlin_parameter_facts_from(
 /// parameter that follows it.
 fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParameterFacts {
     let mut metadata = Vec::new();
+    let mut key_types = Vec::new();
     let mut optional = 0usize;
     let mut repeated = false;
     let mut pending_vararg = false;
@@ -1082,13 +1163,14 @@ fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParame
                 // required.
                 optional += 1;
             }
+            key_types.push(kotlin_parameter_key_type(child, pending_vararg, source));
             pending_vararg = false;
             metadata.push(kotlin_parameter_metadata(child, source));
         } else if !child.is_named() && child.kind() == "=" {
             optional += 1;
         }
     }
-    kotlin_parameter_facts_from(metadata, optional, repeated)
+    kotlin_parameter_facts_from(metadata, key_types, optional, repeated)
 }
 
 /// Parameter facts for a `primary_constructor`'s `class_parameter` list.
@@ -1101,6 +1183,7 @@ fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParame
 /// defaulted constructor parameter as required.
 fn kotlin_class_parameter_facts(parameters: &[Node<'_>], source: &str) -> KotlinParameterFacts {
     let mut metadata = Vec::new();
+    let mut key_types = Vec::new();
     let mut optional = 0usize;
     let mut repeated = false;
     for parameter in parameters {
@@ -1112,9 +1195,10 @@ fn kotlin_class_parameter_facts(parameters: &[Node<'_>], source: &str) -> Kotlin
             optional += 1;
             repeated |= vararg;
         }
+        key_types.push(kotlin_parameter_key_type(*parameter, vararg, source));
         metadata.push(kotlin_parameter_metadata(*parameter, source));
     }
-    kotlin_parameter_facts_from(metadata, optional, repeated)
+    kotlin_parameter_facts_from(metadata, key_types, optional, repeated)
 }
 
 fn kotlin_signature_metadata(signature: String, facts: KotlinParameterFacts) -> SignatureMetadata {
@@ -1151,12 +1235,10 @@ pub fn kotlin_callable_metadata_accepts_arity(
 
 fn kotlin_callable_signature_metadata(
     signature: String,
+    facts: KotlinParameterFacts,
     node: Node<'_>,
     source: &str,
 ) -> SignatureMetadata {
-    let facts = first_named_child(node, "function_value_parameters")
-        .map(|list| kotlin_function_parameter_facts(list, source))
-        .unwrap_or_else(|| kotlin_parameter_facts_from(Vec::new(), 0, false));
     // Publishing the written return type and extension receiver here is what
     // keeps a consumer from having to re-read and re-parse the declaring file to
     // learn them (issue #1345). Both are recorded as *spelled*: resolution
@@ -1322,21 +1404,64 @@ class Widget(val value: Int) {
 }
 "#;
         let (_, parsed) = parse(source);
-        let constructor = parsed
+        let mut constructors: Vec<_> = parsed
             .declarations()
             .iter()
-            .find(|unit| unit.fq_name() == "constructors.Widget.Widget")
-            .expect("primary and secondary constructors share one declaration");
-        let metadata = parsed
-            .signature_metadata
-            .get(constructor)
-            .expect("constructors publish signature metadata");
-
-        assert_eq!(metadata.len(), 2);
-        assert!(
-            metadata
+            .filter(|unit| unit.fq_name() == "constructors.Widget.Widget")
+            .collect();
+        constructors.sort_by_key(|unit| unit.signature());
+        assert_eq!(
+            constructors
                 .iter()
-                .all(SignatureMetadata::callable_is_constructor)
+                .map(|unit| unit.signature())
+                .collect::<Vec<_>>(),
+            [Some("()"), Some("(Int)")],
+            "primary and secondary constructors are distinct overloads"
+        );
+        for constructor in constructors {
+            let metadata = parsed
+                .signature_metadata
+                .get(constructor)
+                .expect("constructors publish signature metadata");
+            assert_eq!(metadata.len(), 1);
+            assert!(metadata[0].callable_is_constructor());
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#7097: Kotlin overloads collapsed into one CodeUnit, so definitions showed the first overload"
+    )]
+    fn overloads_are_distinct_units_keyed_by_written_signature() {
+        let source = r#"package sample
+object Sinks {
+    fun sink(value: Int) {}
+    fun sink(value: String?) {}
+    fun sink(vararg values: Int) {}
+    fun <T> sink(value: T, other: List<T>) {}
+    fun Int.sink() {}
+}
+"#;
+        let (_, parsed) = parse(source);
+        let mut keys: Vec<_> = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.fq_name() == "sample.Sinks.sink")
+            .map(|unit| {
+                unit.signature()
+                    .expect("Kotlin callables carry a signature key")
+            })
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "(Int)",
+                "(String?)",
+                "(vararg Int)",
+                "[1](T, List<T>)",
+                "extension (Int)()"
+            ]
         );
     }
 
@@ -1408,7 +1533,7 @@ val (first, second) = pair()
             .collect();
         assert_eq!(overloads.len(), 2);
         assert_ne!(overloads[0].declaration, overloads[1].declaration);
-        assert_ne!(overloads[0].metadata_ordinal, overloads[1].metadata_ordinal);
+        assert_ne!(overloads[0].unit, overloads[1].unit);
     }
 
     #[test]

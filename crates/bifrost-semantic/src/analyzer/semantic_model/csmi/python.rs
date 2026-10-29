@@ -2161,7 +2161,9 @@ pub(in crate::analyzer::semantic_model::csmi) fn export_document(
                 types: values,
                 members: callables,
                 relations,
-            } if relations.is_empty() => {
+                assembly_identity: None,
+                type_forwards,
+            } if relations.is_empty() && type_forwards.is_empty() => {
                 types.extend(values);
                 members.extend(callables);
             }

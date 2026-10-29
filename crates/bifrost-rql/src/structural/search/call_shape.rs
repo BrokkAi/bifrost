@@ -33,6 +33,7 @@ use brokk_bifrost_core::analyzer::structural::callable::{CallKind, CallShapeCove
 #[allow(clippy::too_many_arguments)]
 pub(super) fn call_shape_expansions_for_input(
     analyzer: &dyn IAnalyzer,
+    semantic: Option<&mut SemanticQueryContext<'_>>,
     traces: &[PipelineTrace],
     file: &ProjectFile,
     range: Range,
@@ -81,6 +82,20 @@ pub(super) fn call_shape_expansions_for_input(
     else {
         return Vec::new();
     };
+    // Go's sole written call argument may supply several producer-proven
+    // results. Reuse its ordinary persisted actuals, without consulting an
+    // imported declaration or manufacturing result ports at query time.
+    if crate::analyzer::common::language_for_file(file) == Language::Go
+        && let [argument] = report.arguments.as_slice()
+        && !argument.spread
+        && argument.name.is_none()
+        && innermost_call_for_range(&facts, argument.range).is_some_and(|inner| inner != call_id)
+        && let Some(count) = semantic
+            .and_then(|semantic| semantic.call_argument_count_at_source(file, report.outcome.range))
+        && count > 1
+    {
+        report.expand_sole_argument(count);
+    }
     // A recognized Rust token-tree grammar supplies only a candidate runtime
     // layout. Publish its synthetic ports only after macro dispatch proves
     // the standard identity; a shadowed or unresolved macro stays opaque.
@@ -144,7 +159,6 @@ pub(super) fn call_shape_expansions_for_input(
     let value = CallShapeValue {
         report: Arc::new(report),
         seed: traces.first().map(|trace| Arc::clone(&trace.seed)),
-        source: Some(Arc::from(facts.source())),
         facts: Some(facts),
         resolved_external_callee: None,
     };

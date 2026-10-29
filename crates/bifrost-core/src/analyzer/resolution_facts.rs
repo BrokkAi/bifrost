@@ -623,6 +623,10 @@ labelled_enum! {
         /// Require conversion to the output's Element component under the
         /// language rule. Adds completion and validity, never operand values.
         ElementOperand => "element_operand",
+        /// Project argument zero only when selected nominal identity proves a
+        /// language wrapper; otherwise preserve the written head. Kinds are
+        /// append-only because their ordinals are persisted vocabulary codes.
+        ConditionalPayload => "conditional_payload",
     }
 }
 
@@ -924,7 +928,7 @@ pub struct ResolutionCallExpectedResultFact {
 }
 
 labelled_enum! {
-    /// The source-syntax route that supplied a callable reference's receiver.
+    /// The source-syntax route that supplied a callable or field reference's receiver.
     ///
     /// This intentionally stops before classifying an explicit expression as a
     /// type qualifier or a runtime value. That classification depends on selected
@@ -940,6 +944,28 @@ labelled_enum! {
 }
 
 impl ResolutionCallableReceiverOrigin {
+    /// Receiver identity belongs to a terminal callable or field reference.
+    /// Value namespaces may carry it only on a member reference, never on a
+    /// standalone value, declaration, type, or import reference.
+    pub const fn is_reference_valid(
+        self,
+        namespace: ResolutionNamespace,
+        kind: ResolutionSiteKind,
+        unqualified: bool,
+    ) -> bool {
+        let terminal = match namespace {
+            ResolutionNamespace::Callable => matches!(
+                kind,
+                ResolutionSiteKind::CallableReference | ResolutionSiteKind::MemberReference
+            ),
+            ResolutionNamespace::Value | ResolutionNamespace::TypeOrValue => {
+                matches!(kind, ResolutionSiteKind::MemberReference)
+            }
+            _ => false,
+        };
+        terminal && self.is_reference_qualification_valid(unqualified)
+    }
+
     /// Whether a source reference's qualification agrees with its receiver
     /// origin. Producers represent a current-instance receiver in either a
     /// separate receiver slot or a qualifier slot.
@@ -952,7 +978,8 @@ impl ResolutionCallableReceiverOrigin {
     }
 }
 
-/// One receiver-origin row for a positioned callable reference.
+/// One receiver-origin row for a positioned callable or value member reference.
+/// Value namespaces carry this evidence only on MemberReference sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionCallableReceiverOriginFact {
     pub reference: ResolutionSiteId,

@@ -60,6 +60,7 @@ fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
         analyzer: &analyzer,
         workspace: None,
         flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        root_memo: None,
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
@@ -186,6 +187,7 @@ fn raw_taint_projection(
                 primary: crate::test_support::policy_test_location("app.ts", 0, 1, 1),
                 scenario_id,
                 evidence_refs: vec![evidence_ref.clone()],
+                certainty: crate::FindingCertainty::Definite,
             })
             .collect()
     };
@@ -315,6 +317,7 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                root_memo: None,
                 cancellation: None,
                 cvss_overlays: &[],
                 organizational_risk: &[],
@@ -385,6 +388,7 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
             analyzer: &analyzer,
             workspace: None,
             flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            root_memo: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -420,6 +424,7 @@ fn taint_assembly_keeps_cvss_scenario_display_joined_after_byte_truncation() {
         analyzer: &analyzer,
         workspace: None,
         flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        root_memo: None,
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
@@ -507,6 +512,7 @@ fn terminal_adapter_completion_survives_secondary_overlay_budget() {
             analyzer: &analyzer,
             workspace: None,
             flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            root_memo: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &overlays,
@@ -1038,6 +1044,7 @@ fn cancellation_after_query_rows_retains_partial_match_candidates() {
             let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
             let evaluated = evaluate_match_query_candidates(
                 &policy_id,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
                 &analyzer,
                 None,
                 &query,
@@ -1120,6 +1127,7 @@ export function invoke(service: Service) { service.run(); }
         let query = CodeQuery::from_json(&query).expect("query");
         let evaluated = evaluate_match_query_candidates(
             &policy_id,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             &analyzer,
             None,
             &query,
@@ -1158,6 +1166,7 @@ export function invoke(service: Service) { service.run(); }
     .expect("query");
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &analyzer,
         None,
         &receiver,
@@ -1526,6 +1535,7 @@ fn generation_site_candidate_keeps_typed_identity_and_source_location() {
 
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &analyzer,
         None,
         &query,
@@ -1590,6 +1600,7 @@ const view = <div dangerouslySetInnerHTML={{ __html: value }} />;
 
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &analyzer,
         None,
         &query,
@@ -1783,6 +1794,7 @@ fn cross_file_provenance_keeps_target_caller_and_callee_identities_distinct() {
         .expect("query");
         evaluate_match_query_candidates(
             &policy_id,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             &analyzer,
             None,
             &query,
@@ -2113,6 +2125,7 @@ fn configuration_fact_near_miss_axes_stay_clean_zeroes() {
         let query = CodeQuery::from_json(&filter).expect("near-miss query");
         let evaluated = evaluate_match_query_candidates(
             &policy_id,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
             &analyzer,
             None,
             &query,

@@ -35,6 +35,7 @@
 
 use crate::declarations::{
     cpp_template_parameter_kind, cpp_template_parameter_name, cpp_template_term, node_text,
+    normalize_cpp_whitespace,
 };
 use crate::graph::resolver::{
     cpp_name_component_nodes, cpp_substitute_template_term, cpp_template_terms_equal,
@@ -123,6 +124,27 @@ pub struct CppTemplateLevel {
 impl CppTemplateLevel {
     fn is_bare(&self) -> bool {
         self.head.is_none() && self.arguments.is_none()
+    }
+
+    /// Whether the written arguments select a specialization rather than the
+    /// primary template: they are not the injected arguments of the head that
+    /// introduces this level's parameters. `Box<T*>` under `template <class
+    /// T>` and `Box<int>` with no head of its own both do; `Box<U>` under
+    /// `template <class U>` names the primary.
+    pub fn selects_specialization(&self) -> bool {
+        let Some(arguments) = &self.arguments else {
+            return false;
+        };
+        let Some(head) = &self.head else {
+            return true;
+        };
+        arguments.len() != head.parameters.len()
+            || !arguments
+                .iter()
+                .zip(&head.parameters)
+                .all(|(argument, parameter)| {
+                    cpp_template_terms_equal(argument, &parameter.injected_argument())
+                })
     }
 
     fn effective_arguments(&self) -> Option<Vec<CppTemplateTerm>> {
@@ -412,6 +434,42 @@ pub fn cpp_declaration_template_context(
         builder.levels.last_mut()?.arguments = Some(arguments);
     }
     Some(builder.finish())
+}
+
+/// The owner each qualifier component of the out-of-line declaration `node`
+/// names, outermost first, terminal member excluded.
+///
+/// A component whose written arguments select a specialization
+/// ([`CppTemplateLevel::selects_specialization`]) names that specialization by
+/// its written template-id, `Box<T*>` or `Box<int>`, which is how the class
+/// body publishes the specialization's own members. Every other component,
+/// the primary template's `Box<T>` included, names its bare class or
+/// namespace. `None` when the template levels cannot be read.
+pub fn cpp_out_of_line_owner_names(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let context = cpp_declaration_template_context(node, source)?;
+    let mut components =
+        cpp_name_component_nodes(declaration_qualifier(declaration_statement(node)?)?)?;
+    components.pop()?;
+    // One level per qualifier component plus the member's own.
+    debug_assert_eq!(context.levels.len(), components.len() + 1);
+    let names = components
+        .into_iter()
+        .zip(&context.levels)
+        .map(|(component, level)| {
+            debug_assert_eq!(level.name, node_text(component, source));
+            match component.parent() {
+                Some(template)
+                    if level.selects_specialization()
+                        && template.kind() == "template_type"
+                        && template.child_by_field_name("name") == Some(component) =>
+                {
+                    normalize_cpp_whitespace(node_text(template, source))
+                }
+                _ => node_text(component, source).to_owned(),
+            }
+        })
+        .collect();
+    Some(names)
 }
 
 struct ContextBuilder<'a, 'tree> {

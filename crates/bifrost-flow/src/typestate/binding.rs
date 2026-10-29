@@ -319,6 +319,7 @@ impl TypestateBindingContext {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn try_new(runtime: OracleCallContext) -> Result<Self, TypestateBindingPlanError> {
         if runtime.calls().len() > MAX_TYPESTATE_CONTEXT_DEPTH {
             return Err(TypestateBindingPlanError::TooManyEntries {
@@ -859,16 +860,11 @@ pub struct TypestateBindingPlan {
     terminal_bindings: Box<[BoundTypestateTerminal]>,
     subject_by_object:
         HashMap<TypestateSubjectClassKey, HashMap<AbstractObject, TypestateSubjectId>>,
-    events_by_point: HashMap<ProgramPointHandle, HashMap<OracleCallContext, Box<[usize]>>>,
     events_by_call: HashMap<
         crate::analyzer::semantic::CallSiteHandle,
         HashMap<OracleCallContext, Box<[usize]>>,
     >,
     terminals_by_point: HashMap<ProgramPointHandle, HashMap<OracleCallContext, Box<[usize]>>>,
-    terminals_by_call: HashMap<
-        crate::analyzer::semantic::CallSiteHandle,
-        HashMap<OracleCallContext, Box<[usize]>>,
-    >,
     initial_seeds_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     events_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     events_by_call_all_contexts: HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
@@ -1178,10 +1174,8 @@ impl TypestateBindingPlan {
             call_noninterference_bindings: compiled_call_noninterference.into_boxed_slice(),
             terminal_bindings: compiled_terminals.into_boxed_slice(),
             subject_by_object,
-            events_by_point: event_indexes.points,
             events_by_call: event_indexes.calls,
             terminals_by_point: terminal_indexes.points,
-            terminals_by_call: terminal_indexes.calls,
             initial_seeds_by_point_all_contexts: initial_seed_indexes,
             events_by_point_all_contexts: event_indexes.all_points,
             events_by_call_all_contexts: event_indexes.all_calls,
@@ -1328,17 +1322,6 @@ impl TypestateBindingPlan {
         self.terminal_bindings.get(id.index())
     }
 
-    pub fn event_bindings_at_program_point(
-        &self,
-        point: &ProgramPointHandle,
-        context: &OracleCallContext,
-    ) -> impl Iterator<Item = &BoundTypestateEvent> {
-        indexed_bindings(
-            site_indexes(&self.events_by_point, point, context),
-            &self.event_bindings,
-        )
-    }
-
     pub fn event_bindings_at_call_site(
         &self,
         call: &crate::analyzer::semantic::CallSiteHandle,
@@ -1389,15 +1372,6 @@ impl TypestateBindingPlan {
             site_indexes(&self.terminals_by_point, point, context),
             &self.terminal_bindings,
         )
-    }
-
-    pub fn terminal_bindings_at_call_site(
-        &self,
-        call: &crate::analyzer::semantic::CallSiteHandle,
-        context: &OracleCallContext,
-    ) -> impl Iterator<Item = &BoundTypestateTerminal> {
-        site_indexes(&self.terminals_by_call, call, context)
-            .map(|index| &self.terminal_bindings[index])
     }
 
     pub fn terminal_bindings_at_program_point_all_contexts(
@@ -1866,6 +1840,7 @@ fn typestate_context_key(context: DurableCallContext) -> TypestateContextKey {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn typestate_runtime_context_key(context: &OracleCallContext) -> TypestateContextKey {
     typestate_context_key(
         DurableCallContext::of(context).expect("call contexts retain validated call sites"),

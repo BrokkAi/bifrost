@@ -36,6 +36,15 @@ def _check_decorated_parameter_contract(decorated_raw: dict, decorated: object) 
         or decorated.annotation_type.kind != "annotation_type_declaration"
     ):
         raise AssertionError("the Java annotation declaration identity changed during decoding")
+    if (
+        decorated.annotation_fq_name != "fixture.annotations.TraceMarker"
+        or decorated.annotation_route != "source_declaration"
+    ):
+        raise AssertionError("the Java annotation route did not survive Python decoding")
+
+    invalid_route = dict(decorated_raw)
+    invalid_route["annotation_route"] = "guessed"
+    _assert_result_item_rejected(invalid_route, "route enum value")
 
     without_annotation_fields = dict(decorated_raw)
     without_annotation_fields.pop("annotation_type")

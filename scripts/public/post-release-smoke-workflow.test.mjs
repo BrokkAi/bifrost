@@ -229,3 +229,27 @@ test("invokes published Codex and Claude MCP list_policies smoke checks", () => 
   assert.ok(workflow.includes('name: "list_policies"'));
   assert.match(workflow, /Claude MCP list_policies passed/u);
 });
+
+test("checks the published Linux binary reports authored configuration-fact ranges", () => {
+  const start = workflow.indexOf("\n  configuration-coordinates:\n");
+  const end = workflow.indexOf("\n  install-smoke:\n", start);
+  assert.ok(start >= 0 && end > start, "configuration-coordinates job must be present");
+  const job = workflow.slice(start, end);
+  assert.equal((job.match(/^    needs: resolve$/gmu) ?? []).length, 1);
+  assert.ok(
+    job.includes(
+      "https://github.com/BrokkAi/bifrost/releases/download/${RELEASE_TAG}/${name}",
+    ),
+  );
+  assert.ok(job.includes('archive="bifrost-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"'));
+  assert.ok(job.includes('sha256sum -c "$archive.sha256"'), "the downloaded archive must be verified");
+  assert.ok(job.includes('"$BIFROST_BIN" --query-file query.rql'));
+  assert.ok(job.includes("(configuration-facts :format properties :node-kind member)"));
+  assert.ok(job.includes("$rows[0].start_byte == 36"));
+  assert.ok(job.includes("$rows[0].end_byte == 67"));
+  assert.ok(
+    job.includes(
+      '$rows[0].range == {"start_line": 2, "start_column": 1, "end_line": 2, "end_column": 32}',
+    ),
+  );
+});

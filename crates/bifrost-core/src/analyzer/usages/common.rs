@@ -7,6 +7,7 @@
 //! `language_for_target` -- names `IAnalyzer` or `Language` and stays in
 //! `brokk-bifrost-analysis`, which re-exports these at their original paths.
 
+use crate::analyzer::language_knowledge::LanguageKnowledge;
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use crate::analyzer::{CodeUnit, ProjectFile, Range};
 use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
@@ -81,15 +82,35 @@ pub fn reclassify_self_receiver_hit_at(
 /// it, so dead-code evidence and the callsite budget still count only calls
 /// from elsewhere.
 ///
-/// For any other target -- a class, a field, a module -- "enclosing is the
-/// target" is not recursion. It is the declaration's own name, or something
-/// written inside the declaration that names it, and neither is a use of it, so
-/// it stays dropped as before.
-pub fn classify_recursive_hit(hit: UsageHit, target: &CodeUnit) -> Option<UsageHit> {
+/// A field initializer declares its target but reads its value, even when
+/// that value names the field itself (#7289). The language supplies the target
+/// and value nodes; shared code distinguishes the two by containment. Other
+/// non-callable self sites remain excluded. Missing syntax cannot prove a read.
+pub fn classify_recursive_hit(
+    hit: UsageHit,
+    target: &CodeUnit,
+    site: Option<Node<'_>>,
+    knowledge: &dyn LanguageKnowledge,
+) -> Option<UsageHit> {
     if hit.enclosing != *target {
         return Some(hit);
     }
-    target.is_function().then(|| hit.into_self_receiver())
+    if target.is_function() {
+        return Some(hit.into_self_receiver());
+    }
+    if target.is_field() {
+        let mut ancestor = site;
+        while let Some(node) = ancestor {
+            if let Some((binding, value)) = knowledge.field_initializer(node) {
+                let contains_hit = |part: Node<'_>| {
+                    part.start_byte() <= hit.start_offset && hit.end_offset <= part.end_byte()
+                };
+                return (contains_hit(value) && !contains_hit(binding)).then_some(hit);
+            }
+            ancestor = node.parent();
+        }
+    }
+    None
 }
 
 fn reclassify_hit_at(

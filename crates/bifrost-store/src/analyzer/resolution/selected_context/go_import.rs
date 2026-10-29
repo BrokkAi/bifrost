@@ -13,9 +13,9 @@ pub struct SelectedGoImportBindingDescriptor {
     definition_node: BindingNodeId,
     lookup: SemanticId,
     completion: ResolutionCompletion,
-    /// Present only for an unresolved provider's conventional default binder.
-    /// This does not verify the provider's package clause.
-    presumed_provider: Option<UnindexedExternalFrontier>,
+    /// The selected package has no source declarations for its members.
+    /// Package name and identity authority remain independent of this frontier.
+    unindexed_provider: Option<UnindexedExternalFrontier>,
 }
 
 impl SelectedGoImportBindingDescriptor {
@@ -40,16 +40,16 @@ impl SelectedGoImportBindingDescriptor {
             definition_node,
             lookup,
             completion,
-            presumed_provider: None,
+            unindexed_provider: None,
         }
     }
 
-    pub(crate) fn with_presumed_provider(
+    pub(crate) fn with_unindexed_provider(
         mut self,
         path: Arc<str>,
         provider_package_id: Option<i64>,
     ) -> Self {
-        self.presumed_provider = Some(UnindexedExternalFrontier {
+        self.unindexed_provider = Some(UnindexedExternalFrontier {
             provider_path: path,
             provider_package_id,
             member: None,
@@ -103,14 +103,14 @@ impl SelectedGoImportBindingDescriptor {
             CanonicalIdentityPart::identity(self.import.spelling_choice),
         )?;
         hash.field("lookup", CanonicalIdentityPart::identity(self.lookup))?;
-        if let Some(provider) = &self.presumed_provider {
+        if let Some(provider) = &self.unindexed_provider {
             hash.field(
-                "presumed_provider",
+                "unindexed_provider",
                 CanonicalIdentityPart::Label(&provider.provider_path),
             )?;
             if let Some(package) = provider.provider_package_id {
                 hash.field(
-                    "presumed_provider_package",
+                    "unindexed_provider_package",
                     CanonicalIdentityPart::Content(&package.to_le_bytes()),
                 )?;
             }
@@ -143,8 +143,8 @@ impl SelectedGoImportBindingDescriptor {
         if cancellation.is_cancelled() || !session.scope_step() {
             return Ok(None);
         }
-        if let Some(provider) = &self.presumed_provider {
-            identities.record_presumed_go_import(self.import.definition, provider.clone());
+        if let Some(provider) = &self.unindexed_provider {
+            identities.record_unindexed_go_import(self.import.definition, provider.clone());
         }
         Ok(Some((
             CandidatePathIdentity::new(
@@ -180,7 +180,7 @@ impl SelectedGoImportBindingDescriptor {
         heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
     ) {
         self.completion.charge_retained(heap);
-        if let Some(provider) = &self.presumed_provider {
+        if let Some(provider) = &self.unindexed_provider {
             provider.charge_retained(heap);
         }
     }
