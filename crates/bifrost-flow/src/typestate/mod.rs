@@ -83,3 +83,5 @@ pub use summary::{
     ProtocolSummarySolveResult, ProtocolTerminalBindingKey, ProtocolUncertaintyKey,
     solve_typestate_with_reusable_summaries,
 };
+
+pub(crate) use production::ProductionTypestateSummaryStorage;

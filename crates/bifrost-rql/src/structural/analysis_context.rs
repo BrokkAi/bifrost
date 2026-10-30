@@ -7,11 +7,13 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, SemanticArtifact, SemanticArtifactKey,
 };
+use crate::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_analysis::analyzer::read_attribution_records_reads as read_ledger_attached;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_flow::taint::ProductionTaintAnalysisResult;
 use brokk_bifrost_flow::typestate::{
     CompiledProtocol, ProductionTypestateSummaryRepository, TypestateBindingPlan,
@@ -237,6 +239,15 @@ impl Default for ProtocolRegistrationLimits {
 }
 
 /// A bounded, cheaply clonable source for immutable execution snapshots.
+// Host registrations must be resolved before attaching a query's read capture.
+// QueryAnalysisContext owns the imported execution handles thereafter.
+fn assert_registration_outside_capture() {
+    debug_assert!(
+        !read_ledger_attached(|| false),
+        "host registrations must be accessed outside read captures"
+    );
+}
+
 #[derive(Debug, Clone)]
 pub struct ProtocolRegistrationSet {
     by_ref: HashMap<ProtocolRef, Arc<ProtocolRegistration>>,
@@ -270,6 +281,7 @@ impl ProtocolRegistrationSet {
         protocol_ref: ProtocolRef,
         registration: ProtocolRegistration,
     ) -> Result<ProtocolRegistrationOutcome, ProtocolRegistrationSetError> {
+        assert_registration_outside_capture();
         let identity = registration.identity();
         if let Some(existing) = self.by_ref.get(&protocol_ref) {
             return if existing.identity() == identity {
@@ -338,12 +350,14 @@ impl ProtocolRegistrationSet {
     }
 
     pub fn get(&self, protocol_ref: &ProtocolRef) -> Option<&Arc<ProtocolRegistration>> {
+        assert_registration_outside_capture();
         self.by_ref.get(protocol_ref)
     }
 
     /// Remove one authored alias and release its unique retained registration
     /// once the final alias is gone.
     pub fn unregister(&mut self, protocol_ref: &ProtocolRef) -> bool {
+        assert_registration_outside_capture();
         let Some(registration) = self.by_ref.remove(protocol_ref) else {
             return false;
         };
@@ -376,6 +390,7 @@ impl ProtocolRegistrationSet {
     }
 
     pub fn clear(&mut self) {
+        assert_registration_outside_capture();
         self.by_ref.clear();
         self.by_identity.clear();
         self.retained_protocol_bytes = 0;
@@ -384,10 +399,12 @@ impl ProtocolRegistrationSet {
     }
 
     pub fn reference_count(&self) -> usize {
+        assert_registration_outside_capture();
         self.by_ref.len()
     }
 
     pub fn registration_count(&self) -> usize {
+        assert_registration_outside_capture();
         self.by_identity.len()
     }
 
@@ -647,6 +664,7 @@ impl ValueFlowPlanRegistrationSet {
         plan_ref: ValueFlowPlanRef,
         registration: ValueFlowPlanRegistration,
     ) -> Result<ValueFlowPlanRegistrationOutcome, ValueFlowPlanRegistrationSetError> {
+        assert_registration_outside_capture();
         let identity = registration.identity().clone();
         if let Some(existing) = self.by_ref.get(&plan_ref) {
             return if existing.identity() == &identity {
@@ -700,10 +718,12 @@ impl ValueFlowPlanRegistrationSet {
     }
 
     pub fn get(&self, plan_ref: &ValueFlowPlanRef) -> Option<&Arc<ValueFlowPlanRegistration>> {
+        assert_registration_outside_capture();
         self.by_ref.get(plan_ref)
     }
 
     pub fn unregister(&mut self, plan_ref: &ValueFlowPlanRef) -> bool {
+        assert_registration_outside_capture();
         let Some(registration) = self.by_ref.remove(plan_ref) else {
             return false;
         };
@@ -730,6 +750,7 @@ impl ValueFlowPlanRegistrationSet {
     }
 
     pub fn clear(&mut self) {
+        assert_registration_outside_capture();
         self.by_ref.clear();
         self.by_identity.clear();
         self.retained_plan_bytes = 0;
@@ -737,10 +758,12 @@ impl ValueFlowPlanRegistrationSet {
     }
 
     pub fn reference_count(&self) -> usize {
+        assert_registration_outside_capture();
         self.by_ref.len()
     }
 
     pub fn registration_count(&self) -> usize {
+        assert_registration_outside_capture();
         self.by_identity.len()
     }
 
@@ -1040,6 +1063,7 @@ impl TaintResultRegistrationSet {
         taint_ref: TaintResultRef,
         registration: TaintResultRegistration,
     ) -> Result<TaintResultRegistrationOutcome, TaintResultRegistrationSetError> {
+        assert_registration_outside_capture();
         let identity = registration.identity().clone();
         if let Some(existing) = self.by_ref.get(&taint_ref) {
             return if existing.identity() == &identity {
@@ -1090,10 +1114,12 @@ impl TaintResultRegistrationSet {
     }
 
     pub fn get(&self, taint_ref: &TaintResultRef) -> Option<&Arc<TaintResultRegistration>> {
+        assert_registration_outside_capture();
         self.by_ref.get(taint_ref)
     }
 
     pub fn unregister(&mut self, taint_ref: &TaintResultRef) -> bool {
+        assert_registration_outside_capture();
         let Some(registration) = self.by_ref.remove(taint_ref) else {
             return false;
         };
@@ -1124,6 +1150,7 @@ impl TaintResultRegistrationSet {
     }
 
     pub fn clear(&mut self) {
+        assert_registration_outside_capture();
         self.by_ref.clear();
         self.by_identity.clear();
         self.retained_plan_bytes = 0;
@@ -1132,10 +1159,12 @@ impl TaintResultRegistrationSet {
     }
 
     pub fn reference_count(&self) -> usize {
+        assert_registration_outside_capture();
         self.by_ref.len()
     }
 
     pub fn registration_count(&self) -> usize {
+        assert_registration_outside_capture();
         self.by_identity.len()
     }
 
@@ -1234,11 +1263,11 @@ pub struct ProtocolHandle {
 pub struct QueryAnalysisContext {
     generation: NonZeroU64,
     workspace_generation: u64,
-    by_ref: HashMap<ProtocolRef, ProtocolHandle>,
+    by_ref: CaptureScopedMemo<HashMap<ProtocolRef, ProtocolHandle>>,
     registrations: Box<[Arc<ProtocolRegistration>]>,
-    value_flow_by_ref: HashMap<ValueFlowPlanRef, ValueFlowPlanHandle>,
+    value_flow_by_ref: CaptureScopedMemo<HashMap<ValueFlowPlanRef, ValueFlowPlanHandle>>,
     value_flow_registrations: Box<[Arc<ValueFlowPlanRegistration>]>,
-    taint_by_ref: HashMap<TaintResultRef, TaintResultHandle>,
+    taint_by_ref: CaptureScopedMemo<HashMap<TaintResultRef, TaintResultHandle>>,
     taint_registrations: Box<[Arc<TaintResultRegistration>]>,
     summaries: Arc<ProductionTypestateSummaryRepository>,
 }
@@ -1351,7 +1380,7 @@ impl QueryAnalysisContext {
         validation_limits: QueryAnalysisValidationLimits,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Self, QueryAnalysisContextError> {
-        let summaries = flow_state.typestate_summaries();
+        let summaries = flow_state.typestate_summaries(workspace);
         Self::new_with_validation_and_summaries(
             workspace,
             workspace_generation,
@@ -1546,18 +1575,24 @@ impl QueryAnalysisContext {
         Ok(Self {
             generation,
             workspace_generation,
-            by_ref,
+            by_ref: CaptureScopedMemo::new(by_ref),
             registrations: imported.into_boxed_slice(),
-            value_flow_by_ref,
+            value_flow_by_ref: CaptureScopedMemo::new(value_flow_by_ref),
             value_flow_registrations: imported_value_flows.into_boxed_slice(),
-            taint_by_ref,
+            taint_by_ref: CaptureScopedMemo::new(taint_by_ref),
             taint_registrations: imported_taint_results.into_boxed_slice(),
             summaries,
         })
     }
 
-    pub fn handle(&self, protocol_ref: &ProtocolRef) -> Option<ProtocolHandle> {
-        self.by_ref.get(protocol_ref).copied()
+    pub fn handle(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        protocol_ref: &ProtocolRef,
+    ) -> Option<ProtocolHandle> {
+        self.by_ref.read(&memo_attribution(analyzer), |references| {
+            references.get(protocol_ref).copied()
+        })
     }
 
     /// The workspace's shared typestate summary repository, which this context
@@ -1597,8 +1632,15 @@ impl QueryAnalysisContext {
         Ok(registration)
     }
 
-    pub fn value_flow_handle(&self, plan_ref: &ValueFlowPlanRef) -> Option<ValueFlowPlanHandle> {
-        self.value_flow_by_ref.get(plan_ref).copied()
+    pub fn value_flow_handle(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        plan_ref: &ValueFlowPlanRef,
+    ) -> Option<ValueFlowPlanHandle> {
+        self.value_flow_by_ref
+            .read(&memo_attribution(analyzer), |references| {
+                references.get(plan_ref).copied()
+            })
     }
 
     pub fn resolve_value_flow<'a>(
@@ -1626,8 +1668,15 @@ impl QueryAnalysisContext {
         Ok(registration)
     }
 
-    pub fn taint_result_handle(&self, taint_ref: &TaintResultRef) -> Option<TaintResultHandle> {
-        self.taint_by_ref.get(taint_ref).copied()
+    pub fn taint_result_handle(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        taint_ref: &TaintResultRef,
+    ) -> Option<TaintResultHandle> {
+        self.taint_by_ref
+            .read(&memo_attribution(analyzer), |references| {
+                references.get(taint_ref).copied()
+            })
     }
 
     pub fn resolve_taint_result(

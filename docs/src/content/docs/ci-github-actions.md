@@ -31,7 +31,7 @@ jobs:
 
 The default configuration installs the pinned Bifrost release, selects `bifrost.code-smells` from the host catalog, writes `bifrost-policy.sarif`, uploads it, and gates on the exit code. The [v0.13 external-content follow-up](#versioned-external-content-v013-follow-up) replaces the earlier embedded-pack assumption; acquisition failure is a failed gate, not a clean scan.
 
-On most real code, this default gate exits `2` today, because some policies in the pack cannot complete. For example, the Python absent-member policies need the Python standard-library pack, and `contradictory-condition` ends inconclusive when it cannot decide a condition. Read the report diagnostics before you choose a selection. [Scan a Codebase](/scan-a-codebase/) explains these cases and shows how to gate on selected policies.
+On most real code, some policies in the pack end `inconclusive`: `contradictory-condition`, for example, when it cannot decide a condition, and the Python absent-member policies when the Python standard-library pack is not active. The gate lists each inconclusive policy as a warning annotation and in the job summary, and it passes when no finding crosses `fail-on`. An inconclusive policy that reports nothing proves nothing, so read the warnings before you rely on that policy. A policy that fails, or a pack that fails to load, still fails the gate with exit `2`. [Scan a Codebase](/scan-a-codebase/) explains these cases and shows how to gate on selected policies.
 
 ## Versioning
 
@@ -43,9 +43,13 @@ The `security-events: write` permission is required for the SARIF upload. Code s
 
 The gate distinguishes three results:
 
-- `0` - clean. The job passes.
-- `1` - findings at or above the `fail-on` threshold, or an orphaned suppression record: an accepted suppression whose file the run analyzed but whose finding no longer exists. An orphaned record gives `1` even with `fail-on: never`. The job fails and the findings appear as code-scanning alerts.
-- `2` - unreliable. The run could not prove its own completeness, for example after a budget or capability limit, or a `proven_subset` run found nothing to gate. The job fails with a distinct message. Do not treat an unreliable run as clean, and do not lower `fail-on` to hide it. Read the report diagnostics instead.
+- `0` - clean. No finding crossed `fail-on`, and every policy gave a verdict. An `inconclusive` verdict counts: the run could not prove there is nothing more to find, which is common in static analysis. The job passes, and each inconclusive policy appears as a warning annotation and in the job summary.
+- `1` - findings at or above the `fail-on` threshold, or an orphaned suppression record: an accepted suppression whose file the run analyzed but whose finding no longer exists. An orphaned record gives `1` even with `fail-on: never`. A finding from an inconclusive run gates too. The job fails and the findings appear as code-scanning alerts.
+- `2` - unreliable. Part of the scan gave no verdict: the run stopped at its deadline, a report diagnostic is an error, report diagnostics were truncated, a policy run failed or was unsupported, an explicitly requested policy could not run, or a `proven_subset` run found nothing to gate. The job fails with a distinct message. Do not treat an unreliable run as clean, and do not lower `fail-on` to hide it. Read the report diagnostics instead.
+
+These are the statuses [SlopCop](https://slopcop.com) gives the same report: `0` is its `clean`, with inconclusive policies listed but not counted as incomplete; `1` is its findings status; and `2` is its `incomplete`, a check that timed out, failed, or was unreliable.
+
+Set `on-inconclusive: unreliable` to fail the job with exit `2` on any inconclusive run that gated no finding, as Bifrost before v0.14.4 did. The input passes `--on-inconclusive unreliable` to the CLI. A policy that declares `(on-unknown :verdict warn-unreliable)` or `(on-unknown :verdict fail-closed)` keeps its own handling under either value.
 
 The [policy reference](/reference/policies/#exit-status) gives the complete exit-status rules.
 
@@ -55,7 +59,10 @@ CLI-generated SARIF records the policy status in
 `runs[].invocations[].exitCode`, with an `exitCodeDescription`. Status `1`
 means the finding gate fired; it does not by itself mean the analyzer failed.
 Unreliable analysis keeps `executionSuccessful: false`, including when an
-explicit policy setting changes how an unknown verdict gates CI.
+explicit policy setting changes how an unknown verdict gates CI. An
+`inconclusive` run is a verdict, so it keeps `executionSuccessful: true` and
+is reported as a `warning` notification, unless `--on-inconclusive
+unreliable` made the exit status 2.
 
 Detailed diagnostic identifiers live in
 `runs[].invocations[].toolExecutionNotifications[].descriptor.id`. Use these
@@ -75,7 +82,7 @@ kinds:
 | --- | --- | --- |
 | `proven_subset` | `BIFROST_POLICY_PROVEN_SUBSET` | Every retained finding is proven, but the run searched only part of the program. Reliable, not exhaustive. With no gated finding, the run exits `2`. |
 | `proven_by_summary` | `BIFROST_POLICY_PROVEN_BY_SUMMARY` | The result rests on authored external procedure summaries. Reliable, not exhaustive. Exits `0` or `1`. |
-| `inconclusive` | `BIFROST_POLICY_INCONCLUSIVE` | The run could not finish its analysis. Exits `2` unless the policy's `on-unknown` verdict says otherwise. |
+| `inconclusive` | `BIFROST_POLICY_INCONCLUSIVE` | The run could not prove there is nothing more to find. Advisory: exits `0` or `1` on its findings. Exits `2` under `on-inconclusive: unreliable` unless the policy's `on-unknown` verdict says otherwise. |
 | `not_run` | `BIFROST_POLICY_NOT_RUN` | A required capability was unavailable. Implicit pack/category/default selections do not affect the exit status; an explicit policy ID exits `2`. |
 | `unsupported` | `BIFROST_POLICY_UNSUPPORTED` | The policy needs a capability that this analyzer lacks. Exits `2`. |
 | `failed` | `BIFROST_POLICY_FAILED` | Evaluation failed. Exits `2`. |
@@ -235,7 +242,7 @@ jobs:
           diff-base: ${{ github.event.pull_request.base.sha }}
 ```
 
-The checkout must contain the base revision: `fetch-depth: 0` is the simple form, or fetch the base SHA explicitly. If the base revision does not resolve, the run exits `2` (unreliable) rather than silently gating on everything. If the base revision resolves but its evaluation cannot prove its own completeness, the run degrades to full gating, reports a `diff-base-unreliable` diagnostic, and exits `2`, so a broken base can never hide new findings.
+The checkout must contain the base revision: `fetch-depth: 0` is the simple form, or fetch the base SHA explicitly. If the base revision does not resolve, the run exits `2` (unreliable) rather than silently gating on everything. If the base revision resolves but its evaluation reaches no verdict, the run degrades to full gating, reports a `diff-base-unreliable` diagnostic, and exits `2`, so a broken base can never hide new findings. A policy whose base run was only `inconclusive` gates every one of its head findings, including those that already existed, and reports a `diff-base-policy-unqualified` warning; it does not by itself make the run exit `2`.
 
 With `cache` on, which is the default, the run stores what each policy concluded over the base revision and what every part of that evaluation read. A later run against the same base restores that cache, skips the base export and build, and recomputes only the parts of the pull request's tree whose inputs changed, so a pull-request run pays for its own change rather than for the whole base. `cache: 'false'` keeps nothing between runs, so every run evaluates both revisions in full. The report is the same either way: findings, identities, `baselineState` values, diagnostics, and the exit code do not depend on what the cache holds. Only the report's `incremental` section, which records what the run reused, and the run's own work counters differ.
 
@@ -265,8 +272,8 @@ The core engine has no default product rules. The updated action acquires rules
 from a host-selected source and their exact semantic release dependency before
 resolving `policy-packs`, `policy-ids` or `policy-categories` against that catalog.
 A successful download or verified cache hit is not a clean scan or proof of
-behavioral coverage. Incomplete policy results retain the engine's exit `2`
-contract and SARIF diagnostics.
+behavioral coverage. Policy results without a verdict retain the engine's exit
+`2` contract and SARIF diagnostics.
 Each invocation clears its SARIF and diagnostic output paths before binary or
 content acquisition, so a failed acquisition cannot retain an earlier report.
 

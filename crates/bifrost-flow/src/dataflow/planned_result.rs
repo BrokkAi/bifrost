@@ -141,10 +141,6 @@ impl<Finding, Evidence> PlannedDataflowResult<Finding, Evidence> {
     pub const fn is_complete(&self) -> bool {
         self.completion.is_complete()
     }
-
-    pub fn into_evidence(self) -> Evidence {
-        self.evidence
-    }
 }
 
 #[test]

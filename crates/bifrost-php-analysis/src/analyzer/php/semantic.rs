@@ -225,6 +225,8 @@ fn enumerate_procedures<'tree>(
             Ok(ProcedureWalkStep::Continue {
                 value,
                 scopes: ProcedureWalkScopes {
+                    child_lexical_parent: frame.lexical_parent,
+                    child_declaration_path: frame.declaration_path,
                     container_body,
                     callable_body,
                 },

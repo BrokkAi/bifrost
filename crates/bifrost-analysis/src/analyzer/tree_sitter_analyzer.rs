@@ -34,6 +34,7 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::common::{
     IdentifierSeek, decorated_identifier_seeks, identifier_addresses_target,
 };
+use crate::analyzer::without_project_reads;
 
 use crate::analyzer::fq_name::absent_segment_separators;
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, install_on_dedicated_build_pool};
@@ -132,6 +133,12 @@ pub use crate::delegate_inner_methods;
 #[macro_export]
 macro_rules! delegate_inner_procedure_fact_methods {
     () => {
+        fn relational_frontier_read_recorder(
+            &self,
+        ) -> $crate::analyzer::relational_frontier::FrontierReadRecorder {
+            $crate::analyzer::IAnalyzer::relational_frontier_read_recorder(&self.inner)
+        }
+
         $crate::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
             fn loop_candidates_for(
                 &self,
@@ -1316,6 +1323,14 @@ pub fn store_context_from_shared_store(
 pub trait LanguageAdapter:
     crate::analyzer::store::StoreLanguageAdapter + Send + Sync + 'static
 {
+    /// Non-source inputs used when hydrating this file's declaration identities.
+    /// Called on every recorded file read, including retained file-state hits.
+    fn record_file_identity_inputs(&self, _analyzer: &TreeSitterAnalyzer<Self>, _file: &ProjectFile)
+    where
+        Self: Sized,
+    {
+    }
+
     /// Language-owned, resolved members declared outside the owner's file.
     /// None keeps the ordinary file-only child path for this owner kind.
     fn cross_file_children(
@@ -3194,13 +3209,13 @@ impl QueryFileStateCache {
 
 type FileStateCache = SegmentedFileStateCache;
 type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
-/// Request-local absence is a legal answer; only failed reads replay provenance.
-/// Nested readers can outlive the scope that observed a failure.
+/// Request-local absence is a legal answer. Incomplete attempts retain their
+/// value and provenance for this invocation, but must never enter a shared memo.
 #[derive(Clone)]
 enum RequestRead<T> {
     Present(T),
     Absent,
-    Failed(Box<[QueryReadIncomplete]>),
+    Incomplete(Option<T>, Box<[QueryReadIncomplete]>),
 }
 
 impl<T: Clone> RequestRead<T> {
@@ -3213,24 +3228,23 @@ impl<T: Clone> RequestRead<T> {
     }
 
     fn from_scope(value: Option<T>, scope: &crate::analyzer::AnalyzerQueryScope<'_>) -> Self {
-        match value {
-            Some(value) => Self::Present(value),
-            None => {
-                let reasons = scope.captured_read_incompleteness();
-                if reasons.is_empty() {
-                    Self::Absent
-                } else {
-                    Self::Failed(reasons.into_boxed_slice())
-                }
-            }
+        let reasons = scope.captured_read_incompleteness();
+        if !reasons.is_empty() {
+            Self::Incomplete(value, reasons.into_boxed_slice())
+        } else {
+            value.map_or(Self::Absent, Self::Present)
         }
+    }
+
+    fn can_publish(&self) -> bool {
+        !matches!(self, Self::Incomplete(..))
     }
 
     fn replay<A: LanguageAdapter>(&self, analyzer: &TreeSitterAnalyzer<A>) -> Option<T> {
         match self {
             Self::Present(value) => Some(value.clone()),
             Self::Absent => None,
-            Self::Failed(reasons) => {
+            Self::Incomplete(value, reasons) => {
                 assert!(
                     !reasons.is_empty(),
                     "a failed request read needs provenance"
@@ -3243,21 +3257,24 @@ impl<T: Clone> RequestRead<T> {
                         reason => analyzer.record_query_incomplete(reason.clone()),
                     }
                 }
-                None
+                value.clone()
             }
         }
     }
 }
 
-type PreparedSyntaxRequestCache =
-    HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<RequestRead<Arc<PreparedSyntaxTree>>>>>;
+type PreparedSyntaxRequestCache = HashMap<
+    PreparedSyntaxCacheKey,
+    Arc<crate::analyzer::common::QueryCacheCell<RequestRead<Arc<PreparedSyntaxTree>>>>,
+>;
 // Snapshot file states belong to one immutable analyzer generation. Unlike the
 // transient cache, this index is seeded once when the generation is built and
 // never receives an insert or eviction. Keep its bounded seed as a plain map so
 // read-only analyzer calls do not pay for recency metadata that can never affect
 // the index.
 type SourceSnapshotFileStateIndex = HashMap<FileStateCacheKey, Arc<FileState>>;
-type TopLevelClassUnitsByPackageCell = Arc<OnceLock<Arc<HashMap<String, Vec<CodeUnit>>>>>;
+type TopLevelClassUnitsByPackageCell =
+    Arc<crate::analyzer::common::QueryCacheCell<Arc<HashMap<String, Vec<CodeUnit>>>>>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct IdentifierCandidateLookupKey {
@@ -3313,12 +3330,10 @@ pub struct QueryReadCache {
     /// C# import-graph candidate discovery does — re-hydrates every declaration
     /// in the workspace thousands of times per query (#1194).
     ///
-    /// `Arc<OnceLock<..>>`, not a plain `Option`: candidate discovery can hydrate this from many
-    /// threads at once (parallel import-graph scans), and a check-then-compute-then-store `Option`
-    /// lets every thread that misses the check before the first writer finishes redo the same
-    /// whole-workspace scan. Cloning the `Arc` out from under `query_read_cache`'s coarse lock (see
-    /// `top_level_class_units_by_package_cell`) and calling `get_or_init` on that handle keeps the
-    /// expensive hydration off the coarse lock while still guaranteeing only one thread runs it.
+    /// Cloning the `Arc` out from under `query_read_cache`'s coarse lock keeps
+    /// hydration off that lock. Only complete builds initialize the cell;
+    /// concurrent cold readers may race a build, and the first complete value
+    /// wins. Failed builds remain local to the invocation that observed them.
     top_level_class_units_by_package: TopLevelClassUnitsByPackageCell,
     /// The workspace file listing bucketed by basename, walked at most once per
     /// request (#1334). Same `Arc<OnceLock<..>>` single-flight shape and the
@@ -3366,8 +3381,8 @@ pub struct QueryReadCache {
     #[doc(hidden)]
     pub identifier_candidate_query_executions: Arc<AtomicUsize>,
     /// The workspace's path-synthetic module units, walked at most once per
-    /// request (#1774). See [`TreeSitterAnalyzer::workspace_module_walk`].
-    workspace_module_walk: Arc<RwLock<Option<Arc<WorkspaceModuleWalk>>>>,
+    /// request (#1774). Complete eligibility is memoized before caller filtering.
+    path_synthetic_modules: Arc<RwLock<Option<Arc<PathSyntheticModules>>>>,
     /// Per-file [`ClassRangeIndex`], built at most once per file per request
     /// (#2679). The definition resolvers ask the enclosing-class question once
     /// per reference site, so a bulk scan rebuilt this whole-file index — a
@@ -3389,27 +3404,16 @@ pub struct QueryReadCache {
     request_memos: QueryRequestMemos,
 }
 
-/// One request's materialization of the workspace's path-synthetic module
-/// units, plus the live snapshot it was read from. See
-/// [`TreeSitterAnalyzer::workspace_module_walk`].
-struct WorkspaceModuleWalk {
-    snapshot: Arc<LiveSnapshot>,
-    entries: Vec<(ProjectFile, Oid, CodeUnit)>,
-    /// Live paths visited by the walk, so a memo hit reports the same
-    /// `inspected` budget figure the walk itself would have reported.
+/// Complete path-symbol set retained only by the active query. No declarations
+/// are hydrated while building or verifying this authority.
+#[derive(Debug)]
+struct PathSyntheticModules {
+    candidates: Vec<(String, PathSymbolRow, bool)>,
+    #[cfg(any(test, feature = "test-support"))]
+    hydrations: AtomicUsize,
     inspected: usize,
-}
-
-// `LiveSnapshot` is not `Debug`, and the entry list is workspace-sized, so
-// report the shape rather than the contents.
-impl std::fmt::Debug for WorkspaceModuleWalk {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("WorkspaceModuleWalk")
-            .field("entries", &self.entries.len())
-            .field("inspected", &self.inspected)
-            .finish()
-    }
+    // Dirty inputs are complete for this request, but have no replayable answer.
+    answer: Option<StableDigest>,
 }
 
 impl Default for QueryReadCache {
@@ -3460,14 +3464,16 @@ impl QueryReadCache {
                 file_state_budget_bytes,
             ))),
             prepared_syntax: Arc::new(RwLock::new(HashMap::default())),
-            top_level_class_units_by_package: Arc::new(OnceLock::new()),
+            top_level_class_units_by_package: Arc::new(
+                crate::analyzer::common::QueryCacheCell::new(),
+            ),
             workspace_file_index: Arc::new(OnceLock::new()),
             parent_units: Arc::new(RwLock::new(HashMap::default())),
             definition_units: Arc::new(KeyedPoolSafeMemo::new()),
             identifier_candidate_units: Arc::new(KeyedPoolSafeMemo::new()),
             #[cfg(any(test, feature = "test-support"))]
             identifier_candidate_query_executions: Arc::new(AtomicUsize::new(0)),
-            workspace_module_walk: Arc::new(RwLock::new(None)),
+            path_synthetic_modules: Arc::new(RwLock::new(None)),
             class_ranges: Arc::new(RwLock::new(HashMap::default())),
             definition_lookup: Arc::default(),
             request_memos: QueryRequestMemos::default(),
@@ -3480,9 +3486,11 @@ impl QueryReadCache {
     /// nested scopes make.
     #[doc(hidden)]
     pub fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) -> bool {
+        context.assert_current();
         if self.contexts.is_empty() {
             self.reset_request_caches();
-            self.top_level_class_units_by_package = Arc::new(OnceLock::new());
+            self.top_level_class_units_by_package =
+                Arc::new(crate::analyzer::common::QueryCacheCell::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
         }
         if self
@@ -3492,14 +3500,7 @@ impl QueryReadCache {
         {
             return false;
         }
-        // New nested scopes reuse these request memos. They must inherit the
-        // provenance of any earlier incomplete read, even after its original
-        // cancellation scope has closed.
-        for active in &self.contexts {
-            if let Err(reason) = active.read_completion() {
-                context.record_read_incomplete(reason);
-            }
-        }
+        crate::analyzer::i_analyzer::inherit_query_incompleteness(context, &self.contexts);
         if let Some(owner) = context.identifier_candidate_memo_owner() {
             self.identifier_candidate_memo_owners.insert(owner);
         }
@@ -3525,7 +3526,8 @@ impl QueryReadCache {
         }
         if was_active && self.contexts.is_empty() {
             self.reset_request_caches();
-            self.top_level_class_units_by_package = Arc::new(OnceLock::new());
+            self.top_level_class_units_by_package =
+                Arc::new(crate::analyzer::common::QueryCacheCell::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
         }
         removed
@@ -3554,7 +3556,7 @@ impl QueryReadCache {
         {
             self.identifier_candidate_query_executions = Arc::new(AtomicUsize::new(0));
         }
-        self.workspace_module_walk = Arc::new(RwLock::new(None));
+        self.path_synthetic_modules = Arc::new(RwLock::new(None));
         self.class_ranges = Arc::new(RwLock::new(HashMap::default()));
         self.definition_lookup = Arc::default();
         self.request_memos = QueryRequestMemos::default();
@@ -3577,10 +3579,9 @@ impl QueryReadCache {
     /// an inner scope can only narrow a deadline, never widen one, so the
     /// innermost token that carries one governs.
     fn active_cancellation(&self) -> Option<CancellationToken> {
-        self.contexts
-            .iter()
-            .rev()
-            .find_map(|context| context.cancellation().cloned())
+        crate::analyzer::i_analyzer::current_query_context_value(&self.contexts, |context| {
+            context.cancellation().cloned()
+        })
     }
 
     fn active_semantic_model_overlay(
@@ -3622,9 +3623,10 @@ impl QueryReadCache {
         }
     }
 
-    /// The single-flight cell backing `persisted_top_level_classes_in_package`. Callers clone this
-    /// `Arc` handle out from under the coarse `query_read_cache` lock and call `get_or_init` on
-    /// their own copy, so the (potentially expensive) hydration never runs while that lock is held.
+    /// The completed package-class index shared by active queries. Callers clone
+    /// this handle under the cache lock, then hydrate through its transient
+    /// coordinator. Only completed fills initialize the shared cell; a failed
+    /// wave replays its evidence to its own consumers before it is retired.
     fn top_level_class_units_by_package_cell(&self) -> Option<TopLevelClassUnitsByPackageCell> {
         self.is_active()
             .then(|| Arc::clone(&self.top_level_class_units_by_package))
@@ -3785,6 +3787,21 @@ fn note_additional_projection_totals(language: Language) {
     });
 }
 
+/// One source-admission refusal persisted for a selected workspace revision.
+#[derive(Debug)]
+pub struct SourceAdmissionRefusalRow {
+    pub file: ProjectFile,
+    pub blob: Oid,
+    pub reason: String,
+}
+
+/// Why indexed source cannot serve a selected native usage query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedNativeSourceError {
+    Unavailable,
+    Stale,
+}
+
 pub struct TreeSitterAnalyzer<A> {
     #[doc(hidden)]
     pub project: Arc<dyn Project>,
@@ -3831,7 +3848,6 @@ pub struct TreeSitterAnalyzer<A> {
     /// Parse-safety verdicts for source blobs whose required fact publication
     /// is absent. The explicit entry cap bounds this across requests.
     /// Shared with clones that share persistent products; rebuilds start clean.
-    degraded_persistent_fills: Arc<AtomicUsize>,
     source_parseability:
         moka::sync::Cache<SourceParseabilityCacheKey, Result<(), SourceAdmissionRefusal>>,
     #[doc(hidden)]
@@ -3961,6 +3977,7 @@ pub struct TreeSitterAnalyzer<A> {
 
 impl<A> Clone for TreeSitterAnalyzer<A> {
     fn clone(&self) -> Self {
+        let attached_read_ledgers = Arc::new(AtomicUsize::new(0));
         Self {
             project: Arc::clone(&self.project),
             adapter: Arc::clone(&self.adapter),
@@ -3975,13 +3992,16 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             statement_assessments_by_procedure: self.statement_assessments_by_procedure.clone(),
             semantic_source_digests: self.semantic_source_digests.clone(),
             blob_oids: Arc::clone(&self.blob_oids),
-            degraded_persistent_fills: Arc::clone(&self.degraded_persistent_fills),
             source_parseability: self.source_parseability.clone(),
             store_context: self.store_context.clone(),
             indexed_live_snapshot: Arc::clone(&self.indexed_live_snapshot),
             dependency_evidence_overlay: self.dependency_evidence_overlay.clone(),
             relational_workspace_snapshots: Arc::clone(&self.relational_workspace_snapshots),
-            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            query_read_cache: install_project_read_recorder(
+                &self.project,
+                QueryReadCache::default(),
+                &attached_read_ledgers,
+            ),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::clone(&self.prepared_syntax_store),
@@ -3992,7 +4012,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
             tier_access_counts: Arc::clone(&self.tier_access_counts),
             tier_access_totals: Arc::clone(&self.tier_access_totals),
-            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
+            attached_read_ledgers,
             transient_file_states: Arc::clone(&self.transient_file_states),
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
@@ -4024,15 +4044,31 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
 }
 
 impl<A> TreeSitterAnalyzer<A> {
+    /// An object-safe core source can retain this exact generation's
+    /// recording capability without cloning an analyzer into a fresh registry.
+    pub fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        brokk_bifrost_core::analyzer::project_reads::ReadCapability::new(ProjectReadAttribution {
+            root: self.project.root().to_path_buf(),
+            queries: Arc::downgrade(&self.query_read_cache),
+            attached: Arc::downgrade(&self.attached_read_ledgers),
+        })
+    }
+
     #[doc(hidden)]
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self
     where
         A: LanguageAdapter,
     {
+        let project = super::project_read_facade::with_project_read_slot(project);
         let mut snapshot = self.clone();
         if let Some(adapter) = snapshot.adapter.for_project(Arc::clone(&project)) {
             snapshot.adapter = Arc::new(adapter);
         }
+        snapshot.query_read_cache = install_project_read_recorder(
+            &project,
+            QueryReadCache::default(),
+            &snapshot.attached_read_ledgers,
+        );
         snapshot.project = project;
         snapshot.dependency_evidence_overlay = Self::capture_dependency_overlay(
             snapshot.project.as_ref(),
@@ -4201,66 +4237,68 @@ where
 
     #[doc(hidden)]
     pub fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
-        #[cfg(any(test, feature = "test-support"))]
-        count_full_update_for_test(self.project.root());
-        let adapter = self
-            .adapter
-            .for_project(Arc::clone(&self.project))
-            .map(Arc::new)
-            .unwrap_or_else(|| Arc::clone(&self.adapter));
-        let mut store_context = self.store_context.clone();
-        store_context.live_paths = Arc::new(
-            self.store_context
-                .live_paths
-                .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
-        );
-        store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
-            self.project.as_ref(),
-            store_context.liveness.as_deref(),
-            &[self.adapter.language()],
-        );
-        store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
-        let mut state = Self::build_state(
-            self.project.as_ref(),
-            adapter.as_ref(),
-            &self.config,
-            progress,
-            &store_context,
-        );
-        store_context.workspace_snapshot = None;
-        let (relational_workspace_snapshots, snapshots_complete) =
-            self.capture_relational_workspace_snapshots();
-        if !snapshots_complete {
-            state.mark_workspace_package_inventory_incomplete();
-        }
-        if let Some(snapshot) = relational_workspace_snapshots.get("rust")
-            && self.adapter.language() == Language::Rust
-            && let Err(error) = store_context.store.reconcile_rust_crates(snapshot)
-        {
-            state.mark_workspace_package_inventory_incomplete();
-            eprintln!("Rust crate reconciliation failed after full update: {error}");
-        }
-        if let Err(error) = store_context
-            .store
-            .reconcile_jvm_package_contexts(&relational_workspace_snapshots)
-        {
-            state.record_workspace_package_inventory_error(
-                error.context("JVM context reconciliation after full update"),
+        without_project_reads(|| {
+            #[cfg(any(test, feature = "test-support"))]
+            count_full_update_for_test(self.project.root());
+            let adapter = self
+                .adapter
+                .for_project(Arc::clone(&self.project))
+                .map(Arc::new)
+                .unwrap_or_else(|| Arc::clone(&self.adapter));
+            let mut store_context = self.store_context.clone();
+            store_context.live_paths = Arc::new(
+                self.store_context
+                    .live_paths
+                    .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
             );
-        }
-        Self::from_state(
-            Arc::clone(&self.project),
-            adapter,
-            self.config.clone(),
-            state,
-            Arc::clone(&self.structural_cache),
-            Arc::clone(&self.structural_index_cache),
-            Arc::new(self.snapshot_caches.carry_content_keyed_values_forward()),
-            self.content_identity_base,
-            self.semantic_cache.clone(),
-            store_context,
-            relational_workspace_snapshots,
-        )
+            store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
+                self.project.as_ref(),
+                store_context.liveness.as_deref(),
+                &[self.adapter.language()],
+            );
+            store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
+            let mut state = Self::build_state(
+                self.project.as_ref(),
+                adapter.as_ref(),
+                &self.config,
+                progress,
+                &store_context,
+            );
+            store_context.workspace_snapshot = None;
+            let (relational_workspace_snapshots, snapshots_complete) =
+                self.capture_relational_workspace_snapshots();
+            if !snapshots_complete {
+                state.mark_workspace_package_inventory_incomplete();
+            }
+            if let Some(snapshot) = relational_workspace_snapshots.get("rust")
+                && self.adapter.language() == Language::Rust
+                && let Err(error) = store_context.store.reconcile_rust_crates(snapshot)
+            {
+                state.mark_workspace_package_inventory_incomplete();
+                eprintln!("Rust crate reconciliation failed after full update: {error}");
+            }
+            if let Err(error) = store_context
+                .store
+                .reconcile_jvm_package_contexts(&relational_workspace_snapshots)
+            {
+                state.record_workspace_package_inventory_error(
+                    error.context("JVM context reconciliation after full update"),
+                );
+            }
+            Self::from_state(
+                Arc::clone(&self.project),
+                adapter,
+                self.config.clone(),
+                state,
+                Arc::clone(&self.structural_cache),
+                Arc::clone(&self.structural_index_cache),
+                Arc::new(self.snapshot_caches.carry_content_keyed_values_forward()),
+                self.content_identity_base,
+                self.semantic_cache.clone(),
+                store_context,
+                relational_workspace_snapshots,
+            )
+        })
     }
 
     pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, progress: F) -> Self
@@ -4290,6 +4328,13 @@ where
         progress: Option<BuildProgress>,
         store_context: Option<AnalyzerStoreContext>,
     ) -> std::result::Result<Self, StoreError> {
+        let project = super::project_read_facade::with_project_read_slot(project);
+        let attached_read_ledgers = Arc::new(AtomicUsize::new(0));
+        let query_read_cache = install_project_read_recorder(
+            &project,
+            QueryReadCache::default(),
+            &attached_read_ledgers,
+        );
         let adapter = Arc::new(adapter.for_project(Arc::clone(&project)).unwrap_or(adapter));
         // A supplied store can still belong to a directly constructed analyzer.
         // Only a workspace build snapshot delegates crate publication to the
@@ -4401,7 +4446,8 @@ where
             &store_context,
             &relational_workspace_snapshots,
         );
-        Ok(Self {
+        let project = Arc::clone(&project);
+        Ok(Self::assemble_runtime(
             project,
             adapter,
             config,
@@ -4411,73 +4457,17 @@ where
             snapshot_caches,
             content_identity_base,
             semantic_cache,
-            loop_candidates_by_procedure: crate::analyzer::weighted_cache::build_weighted_cache(
-                procedure_fact_cache_budget,
-                crate::analyzer::weight_loop_candidates,
-            ),
-            statement_assessments_by_procedure:
-                crate::analyzer::weighted_cache::build_weighted_cache(
-                    procedure_fact_cache_budget,
-                    crate::analyzer::semantic::statement_entries::weight_statement_assessments,
-                ),
-            semantic_source_digests:
-                crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
-            blob_oids: Arc::new(SourceBlobOidMemo::default()),
-            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
-            source_parseability: moka::sync::Cache::builder()
-                .max_capacity(SOURCE_PARSEABILITY_MEMO_ENTRIES)
-                .build(),
             store_context,
+            relational_workspace_snapshots,
+            attached_read_ledgers,
+            query_read_cache,
+            source_snapshot_file_states,
+            file_state_cache_budget,
+            query_file_state_cache_budget,
+            procedure_fact_cache_budget,
             indexed_live_snapshot,
             dependency_evidence_overlay,
-            relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
-                relational_workspace_snapshots,
-            )),
-            query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
-                query_file_state_cache_budget,
-            ))),
-            live_source_snapshot: Arc::new(ArcSwapOption::empty()),
-            query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
-            prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
-                PREPARED_SYNTAX_STORE_MAX_BYTES,
-            ))),
-            import_info_store: Arc::new(Mutex::new(ImportInfoStore::new(
-                IMPORT_INFO_STORE_MAX_BYTES,
-            ))),
-            type_alias_store: Arc::new(Mutex::new(TypeAliasStore::new(TYPE_ALIAS_STORE_MAX_BYTES))),
-            enclosing_code_unit_store: Arc::new(Mutex::new(EnclosingCodeUnitStore::new(
-                ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES,
-            ))),
-            #[cfg(any(test, feature = "test-support"))]
-            live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
-            tier_access_counts: Arc::new(Mutex::new(HashMap::default())),
-            tier_access_totals: Arc::new(Default::default()),
-            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
-            transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
-                file_state_cache_budget,
-            ))),
-            source_snapshot_file_states: Arc::new(source_snapshot_file_states),
-            summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
-                SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
-            ))),
-            full_hydration_count: Arc::new(AtomicUsize::new(0)),
-            authoritative_file_state_reads: Arc::new(AtomicUsize::new(0)),
-            bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
-            sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
-            definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
-            definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
-            relational_definition_batch_call_count: Arc::new(AtomicUsize::new(0)),
-            resolve_definition_batch_with_source_call_count: Arc::new(AtomicUsize::new(0)),
-            definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
-            structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
-            enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
-            full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
-            search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
-            package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
-            workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
-            analyzed_file_listing_count: Arc::new(AtomicUsize::new(0)),
-            _state: PhantomData,
-        })
+        ))
     }
 
     /// The structural facts cache takes a slice of the shared memo budget --
@@ -4657,6 +4647,7 @@ where
             .live_paths
             .snapshot()
             .reusable_oid_for_path(file)
+            .inspect(|oid| self.record_file_read(file, *oid))
     }
 
     #[doc(hidden)]
@@ -4671,13 +4662,23 @@ where
         >,
         crate::analyzer::semantic::SemanticProviderError,
     > {
-        crate::analyzer::semantic::service::materialize_with_lowerer(
+        let outcome = crate::analyzer::semantic::service::materialize_with_lowerer(
             self,
             &self.semantic_cache,
             lowerer,
             file,
             request,
-        )
+        )?;
+        #[cfg(debug_assertions)]
+        if let Some(artifact) = outcome.available_value()
+            && let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger()
+        {
+            debug_assert!(
+                keys.contains_read_key(&ReadKey::semantic_artifact(artifact.key())),
+                "semantic cache hits record their public artifact"
+            );
+        }
+        Ok(outcome)
     }
 
     #[doc(hidden)]
@@ -4777,6 +4778,7 @@ where
         file: &ProjectFile,
         oid: Oid,
     ) -> Option<StructuralSnapshotKey> {
+        self.record_file_read(file, oid);
         let lang = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(lang).copied()?;
         Some(StructuralSnapshotKey {
@@ -4883,6 +4885,16 @@ where
 
     pub fn project(&self) -> &dyn Project {
         self.project.as_ref()
+    }
+
+    /// A recording-only view must observe the owner's active consumers on
+    /// helper threads even when no attribution frame was carried there.
+    #[doc(hidden)]
+    pub fn clone_for_read_attribution(&self) -> Self {
+        let mut observer = self.clone();
+        observer.query_read_cache = Arc::clone(&self.query_read_cache);
+        observer.attached_read_ledgers = Arc::clone(&self.attached_read_ledgers);
+        observer
     }
 
     /// The project handle itself, for a collaborator that outlives the borrow.
@@ -5074,16 +5086,17 @@ where
 
     /// Sources of this analyzer's storage languages that source admission
     /// refused at the selected revision, with the recorded reason object as
-    /// JSON text, ordered by path. They are explained exclusions: never
-    /// selected source rows, never parsed. The result lives for one query.
+    /// JSON text and persisted blob identity, ordered by path. They are explained
+    /// exclusions: never selected source rows, never parsed. The result lives
+    /// for one query.
     #[doc(hidden)]
     pub fn selected_source_admission_refusals(
         &self,
-    ) -> Result<Vec<(ProjectFile, String)>, StoreError> {
+    ) -> Result<Vec<SourceAdmissionRefusalRow>, StoreError> {
         let snapshots = self.selected_workspace_snapshots();
         let conn = self.store_context.store.read_conn()?;
         let mut statement = conn.prepare_cached(
-            "SELECT rel_path, json(reason) FROM workspace_source_refusals
+            "SELECT rel_path, blob_oid, json(reason) FROM workspace_source_refusals
              WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
                AND valid_from <= ?4 AND (valid_until IS NULL OR ?4 < valid_until)
              ORDER BY rel_path",
@@ -5100,14 +5113,26 @@ where
                     snapshot.generation.get(),
                     snapshot.revision
                 ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )?;
             for row in rows {
-                let (path, reason) = row?;
-                refusals.push((
-                    ProjectFile::new(self.project.root(), std::path::PathBuf::from(path)),
+                let (path, blob, reason) = row?;
+                let blob = blob.parse::<Oid>().map_err(|error| {
+                    StoreError::corrupt(format!(
+                        "invalid persisted source-admission refusal blob OID {blob:?}: {error}"
+                    ))
+                })?;
+                refusals.push(SourceAdmissionRefusalRow {
+                    file: ProjectFile::new(self.project.root(), std::path::PathBuf::from(path)),
+                    blob,
                     reason,
-                ));
+                });
             }
         }
         Ok(refusals)
@@ -5179,6 +5204,13 @@ where
         store_context: AnalyzerStoreContext,
         relational_workspace_snapshots: Arc<WorkspaceSnapshots>,
     ) -> Self {
+        let project = super::project_read_facade::with_project_read_slot(project);
+        let attached_read_ledgers = Arc::new(AtomicUsize::new(0));
+        let query_read_cache = install_project_read_recorder(
+            &project,
+            QueryReadCache::default(),
+            &attached_read_ledgers,
+        );
         let mut source_snapshot_file_states =
             map_with_capacity(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
@@ -5204,11 +5236,64 @@ where
             &store_context,
             &relational_workspace_snapshots,
         );
+        let project = Arc::clone(&project);
+        Self::assemble_runtime(
+            project,
+            adapter,
+            config,
+            Arc::new(state),
+            structural_cache,
+            structural_index_cache,
+            snapshot_caches,
+            content_identity_base,
+            semantic_cache,
+            store_context,
+            relational_workspace_snapshots,
+            attached_read_ledgers,
+            query_read_cache,
+            source_snapshot_file_states,
+            file_state_cache_budget,
+            query_file_state_cache_budget,
+            procedure_fact_cache_budget,
+            indexed_live_snapshot,
+            dependency_evidence_overlay,
+        )
+    }
+
+    // The callers own construction and inherited-cache choices; this only
+    // assembles the runtime after their snapshots and budgets are ready.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    fn assemble_runtime(
+        project: Arc<dyn Project>,
+        adapter: Arc<A>,
+        config: AnalyzerConfig,
+        state: Arc<AnalyzerRuntimeState>,
+        structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
+        structural_index_cache: Arc<
+            crate::analyzer::structural::provider::StructuralFactSnapshotCache,
+        >,
+        snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
+        content_identity_base: StableDigest,
+        semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
+        store_context: AnalyzerStoreContext,
+        relational_workspace_snapshots: Arc<WorkspaceSnapshots>,
+        attached_read_ledgers: Arc<AtomicUsize>,
+        query_read_cache: Arc<RwLock<QueryReadCache>>,
+        source_snapshot_file_states: SourceSnapshotFileStateIndex,
+        file_state_cache_budget: usize,
+        query_file_state_cache_budget: usize,
+        procedure_fact_cache_budget: u64,
+        indexed_live_snapshot: Arc<LiveSnapshot>,
+        dependency_evidence_overlay: crate::analyzer::store::Result<
+            Option<Arc<crate::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
+        >,
+    ) -> Self {
         Self {
             project,
             adapter,
             config,
-            state: Arc::new(state),
+            state,
             structural_cache,
             structural_index_cache,
             snapshot_caches,
@@ -5226,7 +5311,6 @@ where
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             blob_oids: Arc::new(SourceBlobOidMemo::default()),
-            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
             source_parseability: moka::sync::Cache::builder()
                 .max_capacity(SOURCE_PARSEABILITY_MEMO_ENTRIES)
                 .build(),
@@ -5236,9 +5320,11 @@ where
             relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
                 relational_workspace_snapshots,
             )),
-            query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
-                query_file_state_cache_budget,
-            ))),
+            query_read_cache: {
+                *query_read_cache.write().expect("query read cache poisoned") =
+                    QueryReadCache::new(query_file_state_cache_budget);
+                query_read_cache
+            },
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
@@ -5255,7 +5341,7 @@ where
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             tier_access_counts: Arc::new(Mutex::new(HashMap::default())),
             tier_access_totals: Arc::new(Default::default()),
-            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
+            attached_read_ledgers,
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 file_state_cache_budget,
             ))),
@@ -5588,6 +5674,8 @@ where
         let language = adapter.parser_language();
         let completed = AtomicUsize::new(0);
         let pool = parse_pool(adapter.language(), config.parallelism());
+        // Parsing publishes source facts; maintenance reads belong to no query.
+        // Suppression is thread-local, so install it on every parser worker.
 
         let states = pool.install(|| {
             files
@@ -5595,21 +5683,23 @@ where
                 .map_init(
                     || Self::build_parser(language.clone()),
                     |parser, file| {
-                        store_context
-                            .build_tier_access
-                            .record_tier_access(InformationTier::Syntax);
-                        let state = Self::analyze_file(parser, adapter, project, &file);
-                        if let Some(progress) = progress.as_ref() {
-                            let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                            progress(BuildProgressEvent::new(
-                                adapter.language(),
-                                BuildProgressPhase::Parse,
-                                current,
-                                total,
-                                Some(file.clone()),
-                            ));
-                        }
-                        (file, state)
+                        without_project_reads(|| {
+                            store_context
+                                .build_tier_access
+                                .record_tier_access(InformationTier::Syntax);
+                            let state = Self::analyze_file(parser, adapter, project, &file);
+                            if let Some(progress) = progress.as_ref() {
+                                let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                progress(BuildProgressEvent::new(
+                                    adapter.language(),
+                                    BuildProgressPhase::Parse,
+                                    current,
+                                    total,
+                                    Some(file.clone()),
+                                ));
+                            }
+                            (file, state)
+                        })
                     },
                 )
                 .collect::<Vec<_>>()
@@ -5637,6 +5727,8 @@ where
         let completed = AtomicUsize::new(0);
         let started = AtomicUsize::new(0);
         let pool = parse_pool(adapter.language(), config.parallelism());
+        // Source publication is maintenance, including catch-up inside a query.
+        // Every parser worker suppresses its own project-input recording.
         let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(PREPARED_CHANNEL_CAPACITY);
         let producer_progress = progress.clone();
         let in_flight = Arc::new(Mutex::new(PreparedInFlight::default()));
@@ -5684,7 +5776,7 @@ where
                     pool.install(|| {
                         targets.into_par_iter().for_each_init(
                             || Self::build_parser(language.clone()),
-                            |parser, target| {
+                            |parser, target| without_project_reads(|| {
                                 let PreparedAnalysisTarget {
                                     file,
                                     oid,
@@ -5881,7 +5973,7 @@ where
                                     send_start.elapsed().as_nanos() as usize,
                                     Ordering::Relaxed,
                                 );
-                            },
+                            }),
                         );
                     });
                 }));
@@ -6382,142 +6474,152 @@ where
         store_context: &AnalyzerStoreContext,
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
-        let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
-        type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
+        without_project_reads(|| {
+            let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
+            type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
 
-        let workspace_snapshot = store_context.workspace_snapshot.as_deref();
-        let liveness = store_context.liveness.as_ref();
-        let revision_blobs = store_context.revision_blobs.as_deref();
-        let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
-            let has_overlay = project.has_overlay(file);
-            let revision_oid = revision_blobs.and_then(|blobs| blobs.oid_for(file));
-            // An immutable revision image names every analyzer-visible file of
-            // the revision but writes only the analyzers' configuration inputs
-            // to disk; the rest are served from the repository's object
-            // database. Absence from the filesystem is therefore not absence
-            // from the revision, and dropping such a file here would make the
-            // analyzer's picture of the revision silently partial.
-            if revision_oid.is_none() && !file.exists() && !has_overlay {
-                return Ok(None);
-            }
-            if let Some(snapshot) = workspace_snapshot
-                && let Some(entry) = snapshot.live_entry(project, file)
-            {
-                return Ok(Some((file.clone(), entry.oid(), entry)));
-            }
-            let (oid, entry) = if has_overlay {
-                let source = project.read_source(file).map_err(|err| err.to_string())?;
-                let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                    .map_err(|err| err.to_string())?;
-                (oid, LivePathEntry::overlay(file.clone(), oid))
-            } else if let Some(oid) = revision_oid {
-                // The tree walk that exported this immutable image already
-                // named this file's blob, so there is nothing to hash: the
-                // export directory is written once and never edited, and the
-                // identity is the revision's by definition rather than an
-                // observation of the bytes that happen to be on disk.
-                (oid, LivePathEntry::filesystem_hashed(file.clone(), oid))
-            } else if let Some(liveness) = liveness {
-                // Point resolution hashes the bytes currently on disk, so an
-                // incremental update observes the edit that triggered it.
-                let Some(oid) = liveness.oid_for_path(file)? else {
+            let workspace_snapshot = store_context.workspace_snapshot.as_deref();
+            let liveness = store_context.liveness.as_ref();
+            let revision_blobs = store_context.revision_blobs.as_deref();
+            let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
+                let has_overlay = project.has_overlay(file);
+                let revision_oid = revision_blobs.and_then(|blobs| blobs.oid_for(file));
+                // An immutable revision image names every analyzer-visible file of
+                // the revision but writes only the analyzers' configuration inputs
+                // to disk; the rest are served from the repository's object
+                // database. Absence from the filesystem is therefore not absence
+                // from the revision, and dropping such a file here would make the
+                // analyzer's picture of the revision silently partial.
+                if revision_oid.is_none() && !file.exists() && !has_overlay {
                     return Ok(None);
+                }
+                if let Some(snapshot) = workspace_snapshot
+                    && let Some(entry) = snapshot.live_entry(project, file)
+                {
+                    return Ok(Some((file.clone(), entry.oid(), entry)));
+                }
+                let (oid, entry) = if has_overlay {
+                    let source = project.read_source(file).map_err(|err| err.to_string())?;
+                    let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                        .map_err(|err| err.to_string())?;
+                    (oid, LivePathEntry::overlay(file.clone(), oid))
+                } else if let Some(oid) = revision_oid {
+                    // The tree walk that exported this immutable image already
+                    // named this file's blob, so there is nothing to hash: the
+                    // export directory is written once and never edited, and the
+                    // identity is the revision's by definition rather than an
+                    // observation of the bytes that happen to be on disk.
+                    (oid, LivePathEntry::filesystem_hashed(file.clone(), oid))
+                } else if let Some(liveness) = liveness {
+                    // Point resolution hashes the bytes currently on disk, so an
+                    // incremental update observes the edit that triggered it.
+                    let Some(oid) = liveness.oid_for_path(file)? else {
+                        return Ok(None);
+                    };
+                    (oid, LivePathEntry::filesystem(file.clone(), oid))
+                } else {
+                    // No Git identity source, so the bytes on disk are hashed here.
+                    // Nothing else will notice a later disk edit on this
+                    // analyzer's behalf, so the identity is not checked for
+                    // liveness against the file's stat: the analyzer must keep
+                    // answering from the generation it indexed until it is
+                    // explicitly refreshed. The stat is still captured with the
+                    // hash, so content-derived work can be reused only while the
+                    // file provably still holds these bytes.
+                    let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
+                    let oid = Oid::hash_object(ObjectType::Blob, &bytes)
+                        .map_err(|err| err.to_string())?;
+                    (oid, LivePathEntry::filesystem_hashed(file.clone(), oid))
                 };
-                (oid, LivePathEntry::filesystem(file.clone(), oid))
+                Ok(Some((file.clone(), oid, entry)))
+            };
+            // The hashing burst runs on the process-shared dedicated build pool.
+            // A fresh `rayon::ThreadPool` per call spawned and joined one set of OS
+            // threads per reconcile, which an incremental update pays repeatedly
+            // (#2115); the shared pool is also off the global pool, so the burst
+            // does not park interactive requests behind it.
+            let plan_parallel = |subset: &[ProjectFile]| -> Vec<Result<PlannedLiveOid, String>> {
+                if subset.len() <= 1 {
+                    return subset
+                        .iter()
+                        .map(|file| without_project_reads(|| plan_one(file)))
+                        .collect();
+                }
+                install_on_dedicated_build_pool(|| {
+                    subset
+                        .par_iter()
+                        .map(|file| without_project_reads(|| plan_one(file)))
+                        .collect()
+                })
+            };
+
+            let planned = if replace_live_paths && let Some(liveness) = liveness {
+                // Startup and full-sweep reconciles project every disk file with
+                // one shared Git identity scan instead of hashing each clean file.
+                // Incremental updates stay on point resolution above: they carry
+                // few files and must observe the edit that triggered them without
+                // depending on the startup scan.
+                let (overlay_files, disk_files): (Vec<ProjectFile>, Vec<ProjectFile>) = files
+                    .iter()
+                    .cloned()
+                    .partition(|file| project.has_overlay(file));
+                let mut planned = Vec::with_capacity(files.len());
+                let mut unresolved_overlays = Vec::new();
+                for file in overlay_files {
+                    if let Some(snapshot) = workspace_snapshot
+                        && let Some(entry) = snapshot.live_entry(project, &file)
+                    {
+                        let oid = entry.oid();
+                        planned.push(Ok(Some((file, oid, entry))));
+                    } else {
+                        unresolved_overlays.push(file);
+                    }
+                }
+                planned.extend(plan_parallel(&unresolved_overlays));
+
+                let mut unresolved_disk = Vec::new();
+                for file in disk_files {
+                    if let Some(snapshot) = workspace_snapshot
+                        && let Some(entry) = snapshot.live_entry(project, &file)
+                    {
+                        let oid = entry.oid();
+                        planned.push(Ok(Some((file, oid, entry))));
+                    } else {
+                        unresolved_disk.push(file);
+                    }
+                }
+                if !unresolved_disk.is_empty() {
+                    planned.extend(liveness.oids_for_files(&unresolved_disk)?.into_iter().map(
+                        |(file, oid)| {
+                            let entry = LivePathEntry::filesystem(file.clone(), oid);
+                            Ok(Some((file, oid, entry)))
+                        },
+                    ));
+                }
+                planned
             } else {
-                // No Git identity source, so the bytes on disk are hashed here.
-                // Nothing else will notice a later disk edit on this
-                // analyzer's behalf, so the identity is not checked for
-                // liveness against the file's stat: the analyzer must keep
-                // answering from the generation it indexed until it is
-                // explicitly refreshed. The stat is still captured with the
-                // hash, so content-derived work can be reused only while the
-                // file provably still holds these bytes.
-                let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
-                let oid =
-                    Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
-                (oid, LivePathEntry::filesystem_hashed(file.clone(), oid))
+                plan_parallel(files)
             };
-            Ok(Some((file.clone(), oid, entry)))
-        };
-        // The hashing burst runs on the process-shared dedicated build pool.
-        // A fresh `rayon::ThreadPool` per call spawned and joined one set of OS
-        // threads per reconcile, which an incremental update pays repeatedly
-        // (#2115); the shared pool is also off the global pool, so the burst
-        // does not park interactive requests behind it.
-        let plan_parallel = |subset: &[ProjectFile]| -> Vec<Result<PlannedLiveOid, String>> {
-            if subset.len() <= 1 {
-                return subset.iter().map(&plan_one).collect();
-            }
-            install_on_dedicated_build_pool(|| subset.par_iter().map(&plan_one).collect())
-        };
 
-        let planned = if replace_live_paths && let Some(liveness) = liveness {
-            // Startup and full-sweep reconciles project every disk file with
-            // one shared Git identity scan instead of hashing each clean file.
-            // Incremental updates stay on point resolution above: they carry
-            // few files and must observe the edit that triggered them without
-            // depending on the startup scan.
-            let (overlay_files, disk_files): (Vec<ProjectFile>, Vec<ProjectFile>) = files
-                .iter()
-                .cloned()
-                .partition(|file| project.has_overlay(file));
-            let mut planned = Vec::with_capacity(files.len());
-            let mut unresolved_overlays = Vec::new();
-            for file in overlay_files {
-                if let Some(snapshot) = workspace_snapshot
-                    && let Some(entry) = snapshot.live_entry(project, &file)
-                {
-                    let oid = entry.oid();
-                    planned.push(Ok(Some((file, oid, entry))));
-                } else {
-                    unresolved_overlays.push(file);
-                }
+            let mut out = map_with_capacity(files.len());
+            let mut live_entries = Vec::with_capacity(files.len());
+            for result in planned {
+                let Some((file, oid, entry)) = result? else {
+                    continue;
+                };
+                live_entries.push(entry);
+                out.insert(file, oid);
             }
-            planned.extend(plan_parallel(&unresolved_overlays));
-
-            let mut unresolved_disk = Vec::new();
-            for file in disk_files {
-                if let Some(snapshot) = workspace_snapshot
-                    && let Some(entry) = snapshot.live_entry(project, &file)
-                {
-                    let oid = entry.oid();
-                    planned.push(Ok(Some((file, oid, entry))));
-                } else {
-                    unresolved_disk.push(file);
-                }
+            if let Some(liveness) = store_context.liveness.as_ref() {
+                liveness.refresh_overlay(live_entries.iter().cloned())?;
             }
-            if !unresolved_disk.is_empty() {
-                planned.extend(liveness.oids_for_files(&unresolved_disk)?.into_iter().map(
-                    |(file, oid)| {
-                        let entry = LivePathEntry::filesystem(file.clone(), oid);
-                        Ok(Some((file, oid, entry)))
-                    },
-                ));
+            if replace_live_paths {
+                store_context.live_paths.replace_all(live_entries);
+            } else {
+                store_context.live_paths.refresh(live_entries);
             }
-            planned
-        } else {
-            plan_parallel(files)
-        };
-
-        let mut out = map_with_capacity(files.len());
-        let mut live_entries = Vec::with_capacity(files.len());
-        for result in planned {
-            let Some((file, oid, entry)) = result? else {
-                continue;
-            };
-            live_entries.push(entry);
-            out.insert(file, oid);
-        }
-        if let Some(liveness) = store_context.liveness.as_ref() {
-            liveness.refresh_overlay(live_entries.iter().cloned())?;
-        }
-        if replace_live_paths {
-            store_context.live_paths.replace_all(live_entries);
-        } else {
-            store_context.live_paths.refresh(live_entries);
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     fn build_state(
@@ -7386,12 +7488,16 @@ where
             }
             if !persisted {
                 inventory.mark_incomplete();
-                dirty.extend(
-                    entries
-                        .into_iter()
-                        .filter_map(|(file, _, row)| row.map(|row| (file, (lang.clone(), row)))),
-                );
             }
+            // A path projection may publish before its source blob does. Keep
+            // the producer's row beside the retained dirty source until both
+            // inputs are usable through the ready-only live views.
+            dirty.extend(entries.into_iter().filter_map(|(file, source, row)| {
+                (!persisted || !published.contains(&(source.blob_oid, lang.clone())))
+                    .then_some(row)
+                    .flatten()
+                    .map(|row| (file, (lang.clone(), row)))
+            }));
         }
         (dirty, inventory)
     }
@@ -7621,7 +7727,9 @@ where
                     }
                 }
             }
-            if !persisted && let Some((lang, row)) = replacement {
+            if let Some((lang, row)) = replacement
+                && (!persisted || !published.contains(&(row.blob_oid, lang.to_string())))
+            {
                 dirty.insert(file.clone(), (lang.to_string(), row));
             }
             inventory.require(persisted);
@@ -8032,6 +8140,7 @@ where
     #[doc(hidden)]
     pub fn source_snapshot_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_file_read(file, oid);
         let key = Self::transient_cache_key(oid, file);
         self.source_snapshot_file_states.get(&key).cloned()
     }
@@ -8105,6 +8214,10 @@ where
 
     #[doc(hidden)]
     pub fn query_file_state_snapshot(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        self.record_file_read(
+            &ProjectFile::new(self.project.root(), &key.rel_path),
+            key.oid,
+        );
         self.query_file_state_snapshot
             .load()
             .as_ref()
@@ -8119,6 +8232,7 @@ where
         file: &ProjectFile,
         key: &FileStateCacheKey,
     ) -> Option<Arc<FileState>> {
+        self.record_file_read(file, key.oid);
         if let Some(state) = self
             .state
             .dirty_file_state(key)
@@ -8593,6 +8707,7 @@ where
     #[doc(hidden)]
     pub fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_file_read(file, oid);
         let key = Self::transient_cache_key(oid, file);
         let state = self.fetch_file_state_for_key(file, &key)?;
         if self.project.has_overlay(file) {
@@ -8676,7 +8791,9 @@ where
                 .get(file)
                 .cloned()
         {
-            return source.replay(self);
+            let source = source.replay(self)?;
+            self.record_file_read(file, source.oid);
+            return Some(source);
         }
         let source = RequestRead::capture(self, || {
             let text = self
@@ -8692,13 +8809,17 @@ where
                 oid,
             })
         });
-        if let Some(sources) = sources {
+        if source.can_publish()
+            && let Some(sources) = sources
+        {
             sources
                 .write()
                 .expect("query current-source cache write lock poisoned")
                 .insert(file.clone(), source.clone());
         }
-        source.replay(self)
+        let source = source.replay(self)?;
+        self.record_file_read(file, source.oid);
+        Some(source)
     }
 
     fn structural_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
@@ -8786,6 +8907,7 @@ where
             return Some(state);
         }
 
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
         let source = match exact_source {
             Some(source) => source.to_owned(),
@@ -8807,6 +8929,9 @@ where
         };
         state.source = source;
         let state = Arc::new(state);
+        if !scope.captured_read_incompleteness().is_empty() {
+            return Some(state);
+        }
         self.transient_file_states
             .lock()
             .expect("transient file-state cache mutex poisoned")
@@ -8823,7 +8948,8 @@ where
     fn prepared_syntax_cache_cell(
         &self,
         key: PreparedSyntaxCacheKey,
-    ) -> Option<Arc<OnceLock<RequestRead<Arc<PreparedSyntaxTree>>>>> {
+    ) -> Option<Arc<crate::analyzer::common::QueryCacheCell<RequestRead<Arc<PreparedSyntaxTree>>>>>
+    {
         let prepared_syntax = self.active_query_cache_handle(|cache| &cache.prepared_syntax)?;
         if let Some(cell) = prepared_syntax
             .read()
@@ -8842,7 +8968,7 @@ where
         if prepared_syntax.len() >= QUERY_PREPARED_SYNTAX_CACHE_CAPACITY {
             return None;
         }
-        let cell = Arc::new(OnceLock::new());
+        let cell = Arc::new(crate::analyzer::common::QueryCacheCell::new());
         prepared_syntax.insert(key, Arc::clone(&cell));
         Some(cell)
     }
@@ -8873,7 +8999,12 @@ where
         max_source_bytes: usize,
     ) -> Result<Option<(Oid, ProjectSourceSnapshot)>, PreparedSourceFailure> {
         self.resolve_prepared_source(file, Some(max_source_bytes))
-            .map(|resolved| resolved.map(|resolved| (resolved.oid, resolved.snapshot)))
+            .map(|resolved| {
+                resolved.map(|resolved| {
+                    self.record_file_read(file, resolved.oid);
+                    (resolved.oid, resolved.snapshot)
+                })
+            })
     }
 
     /// Prepare syntax from one atomically captured project source snapshot,
@@ -8954,8 +9085,11 @@ where
         }
         let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
-            if let Some(cell) = &cell {
-                let _ = cell.set(RequestRead::from_scope(Some(Arc::clone(&retained)), &scope));
+            let read = RequestRead::from_scope(Some(Arc::clone(&retained)), &scope);
+            if read.can_publish()
+                && let Some(cell) = &cell
+            {
+                cell.get_or_init(|| read);
             }
             return PreparedSyntaxLimitedOutcome::Available(resolved.oid, retained);
         }
@@ -9006,14 +9140,17 @@ where
         // request won the race, its coherent result is authoritative.
         let prepared = if let Some(cell) = cell {
             let read = RequestRead::from_scope(prepared, &scope);
-            let _ = cell.set(read);
-            cell.get()
-                .expect("prepared syntax cell initialized")
-                .replay(self)
+            if read.can_publish() {
+                cell.get_or_init(|| read).replay(self)
+            } else {
+                read.replay(self)
+            }
         } else {
             prepared
         };
-        self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
+        if scope.captured_read_incompleteness().is_empty() {
+            self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
+        }
         prepared.map_or(PreparedSyntaxLimitedOutcome::Unavailable, |prepared| {
             PreparedSyntaxLimitedOutcome::Available(oid, prepared)
         })
@@ -9094,7 +9231,10 @@ where
                 resolved.snapshot.source(),
             );
         };
-        cell.get_or_init(|| {
+        if let Some(read) = cell.get() {
+            return read.replay(self);
+        }
+        crate::analyzer::common::complete_query_cache_cell(self, &cell, || {
             RequestRead::capture(self, || {
                 self.retained_or_prepared_syntax_for_key(
                     prepared_key,
@@ -9124,9 +9264,12 @@ where
         if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
             return Some(retained);
         }
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         let prepared =
             self.prepare_syntax_for_key(file, key, origin, overlay_revision, exact_source);
-        self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
+        if scope.captured_read_incompleteness().is_empty() {
+            self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
+        }
         prepared
     }
 
@@ -9241,8 +9384,8 @@ where
     /// analyzer-wide total.
     ///
     /// The active contexts are cloned out from under the coarse
-    /// `query_read_cache` read lock before they are touched, exactly as
-    /// `record_store_error` does, so this adds no lock-order edge: the
+    /// `query_read_cache` read lock before they are touched, so this adds no
+    /// lock-order edge: the
     /// per-file map's mutex is never held while the cache lock is.
     fn record_tier_access(&self, tier: InformationTier) -> usize {
         let total = self.tier_access_totals[tier.index()].fetch_add(1, Ordering::Relaxed) + 1;
@@ -9291,6 +9434,13 @@ where
     /// attribution frame. Empty request frames skip recording; broadcast uses
     /// the analyzer's attached-ledger count, as in [`Self::record_reads`].
     pub(crate) fn record_unattributed_read(&self) {
+        self.record_unattributed_reads(1);
+    }
+
+    pub(crate) fn record_unattributed_reads(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
         if !crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
             return;
         }
@@ -9299,7 +9449,70 @@ where
         } else {
             self.query_read_cache_lock().contexts.clone()
         };
-        crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts);
+        crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts, count);
+    }
+
+    /// Hot request memos name the complete source domain before a hit.
+    pub(crate) fn record_workspace_memo_read(
+        &self,
+        family: crate::analyzer::read_ledger::WorkspaceFactFamily,
+    ) {
+        use crate::analyzer::workspace_authority::{
+            AuthorityInputs, record_workspace_authority_read,
+        };
+        record_workspace_authority_read(
+            self,
+            family,
+            AuthorityInputs::SourceOf(&[self.adapter.language()]),
+        );
+        #[cfg(debug_assertions)]
+        if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+            debug_assert!(
+                keys.contains_read_key(&self.scope_read_key()),
+                "workspace memo hits record their source domain"
+            );
+        }
+    }
+
+    fn record_procedure_memo_read(&self, procedure: &crate::analyzer::semantic::ProcedureHandle) {
+        self.record_reads(|sink| {
+            let key = ReadKey::semantic_artifact(procedure.artifact().key());
+            sink.push(key.clone());
+            #[cfg(debug_assertions)]
+            if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+                debug_assert!(
+                    keys.contains_read_key(&key),
+                    "procedure memo hits name their immutable artifact"
+                );
+            }
+        });
+    }
+
+    /// A selected source is an input even when all derived projections hit.
+    pub(crate) fn record_file_read(&self, file: &ProjectFile, oid: Oid) {
+        self.record_reads(|sink| {
+            let key = self.file_read_key(file, oid);
+            sink.push(key.clone());
+            #[cfg(debug_assertions)]
+            if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+                debug_assert!(
+                    keys.contains_read_key(&key),
+                    "file memo hits record their selected input"
+                );
+            }
+        });
+    }
+
+    /// The original non-source content digest that qualified this generation.
+    #[doc(hidden)]
+    pub fn workspace_package_identity_input_content_digest(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<[u8; 32]> {
+        self.state
+            .workspace_package_identity_input_digests
+            .get(file)
+            .map(|input| input.content)
     }
 
     /// The [`ReadKey::File`] naming `file`'s blob as this adapter reads it.
@@ -9309,6 +9522,9 @@ where
         file: &ProjectFile,
         blob: Oid,
     ) -> crate::analyzer::read_ledger::ReadKey {
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+            self.adapter.record_file_identity_inputs(self, file);
+        }
         crate::analyzer::read_ledger::ReadKey::file(
             self.adapter.language(),
             crate::path_utils::rel_path_string(file),
@@ -9500,10 +9716,14 @@ where
         else {
             return;
         };
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         let entries = self.bulk_file_state_entries(
             files.into_iter().take(BULK_FILE_STATE_QUERY_LIMIT),
             source_mode,
         );
+        if !scope.captured_read_incompleteness().is_empty() {
+            return;
+        }
         let mut snapshot = map_with_capacity(entries.len());
         let mut file_states = query_file_states
             .write()
@@ -9936,17 +10156,17 @@ where
             snapshot,
         });
 
-        if let Some(prepared_sources) = prepared_sources.as_ref() {
+        let read = RequestRead::from_scope(resolved.clone(), &scope);
+        if read.can_publish()
+            && let Some(prepared_sources) = prepared_sources.as_ref()
+        {
             let mut prepared_sources = prepared_sources
                 .write()
                 .expect("query prepared-source cache write lock poisoned");
             if prepared_sources.contains_key(file)
                 || prepared_sources.len() < QUERY_PREPARED_SYNTAX_CACHE_CAPACITY
             {
-                prepared_sources.insert(
-                    file.clone(),
-                    RequestRead::from_scope(resolved.clone(), &scope),
-                );
+                prepared_sources.insert(file.clone(), read);
             }
         }
         Ok(resolved)
@@ -10022,7 +10242,9 @@ where
                     .map(|oid| ResolvedLiveSource { oid })
             }
         });
-        if let Some(live_sources) = live_sources.as_ref() {
+        if source.can_publish()
+            && let Some(live_sources) = live_sources.as_ref()
+        {
             live_sources
                 .write()
                 .expect("query live-source cache write lock poisoned")
@@ -10033,8 +10255,18 @@ where
 
     #[doc(hidden)]
     pub fn resolve_live_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
-        self.resolve_live_source_for_file(file)
-            .map(|source| source.oid)
+        match self.resolve_live_source_for_file(file) {
+            Some(source) => Some(source.oid),
+            None => {
+                self.record_reads(|sink| {
+                    sink.push(ReadKey::path_absent(
+                        self.adapter.language(),
+                        crate::path_utils::rel_path_string(file),
+                    ));
+                });
+                None
+            }
+        }
     }
     fn git_index_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
         let repo = gitblob::discover(self.project.root())?;
@@ -10096,6 +10328,7 @@ where
         file: &ProjectFile,
         oid: Oid,
     ) -> bool {
+        self.record_file_read(file, oid);
         if self
             .active_query_cancellation()
             .as_ref()
@@ -10281,92 +10514,97 @@ where
     /// with their real oid anyway.
     #[doc(hidden)]
     pub fn persist_live_blobs(&self, files: &[ProjectFile]) {
-        let mut targets = Vec::with_capacity(files.len());
-        // One target per blob key, not per file: byte-identical files share a
-        // blob, and persisting the same key twice in one batch is a hard error
-        // in the persistence layer. Reconcile picks a representative for the
-        // same reason (`representative_by_blob_key`).
-        let mut claimed = HashSet::default();
-        for file in files {
-            let Some(oid) = self.live_snapshot().oid_for_path(file) else {
-                continue;
-            };
-            let Ok(source) = self.project.read_source(file) else {
-                continue;
-            };
-            if self.content_oid_of(file, &source) != Some(oid) {
-                continue;
-            }
-            let storage_key = self.adapter.storage_language_key_for_file(file);
-            let Some(generation) = self.store_context.generations.get(storage_key).copied() else {
-                continue;
-            };
-            if !claimed.insert((oid, storage_key)) {
-                continue;
-            }
-            targets.push((file.clone(), oid, storage_key.to_string(), generation));
-        }
-        if targets.is_empty() {
-            return;
-        }
-        let independent_primary_keys = targets
-            .iter()
-            .map(|(_, oid, storage_language, _)| (*oid, storage_language.clone()))
-            .collect::<HashSet<_>>();
-        let targets = targets
-            .into_iter()
-            .map(|(file, oid, storage_language, generation)| {
-                let independently_owned_additional_storage_languages = self
-                    .adapter
-                    .possible_additional_storage_language_keys_for_file(&file)
-                    .iter()
-                    .filter(|projection| {
-                        independent_primary_keys.contains(&(oid, (**projection).to_owned()))
-                    })
-                    .map(|projection| (**projection).to_owned())
-                    .collect();
-                PreparedAnalysisTarget {
-                    file,
-                    oid,
-                    storage_language,
-                    generation,
-                    required_existing_additional_storage_languages: Vec::new(),
-                    independently_owned_additional_storage_languages,
+        without_project_reads(|| {
+            let mut targets = Vec::with_capacity(files.len());
+            // One target per blob key, not per file: byte-identical files share a
+            // blob, and persisting the same key twice in one batch is a hard error
+            // in the persistence layer. Reconcile picks a representative for the
+            // same reason (`representative_by_blob_key`).
+            let mut claimed = HashSet::default();
+            for file in files {
+                let Some(oid) = self.live_snapshot().oid_for_path(file) else {
+                    continue;
+                };
+                let Ok(source) = self.project.read_source(file) else {
+                    continue;
+                };
+                if self.content_oid_of(file, &source) != Some(oid) {
+                    continue;
                 }
-            })
-            .collect();
-        Self::analyze_prepare_and_persist_files(
-            self.adapter.as_ref(),
-            self.project.as_ref(),
-            &self.config,
-            targets,
-            None,
-            &self.store_context,
-            |file, outcome| {
-                if let Some((_, _, Some(error))) = outcome {
+                let storage_key = self.adapter.storage_language_key_for_file(file);
+                let Some(generation) = self.store_context.generations.get(storage_key).copied()
+                else {
+                    continue;
+                };
+                if !claimed.insert((oid, storage_key)) {
+                    continue;
+                }
+                targets.push((file.clone(), oid, storage_key.to_string(), generation));
+            }
+            if targets.is_empty() {
+                return;
+            }
+            let independent_primary_keys = targets
+                .iter()
+                .map(|(_, oid, storage_language, _)| (*oid, storage_language.clone()))
+                .collect::<HashSet<_>>();
+            let targets = targets
+                .into_iter()
+                .map(|(file, oid, storage_language, generation)| {
+                    let independently_owned_additional_storage_languages = self
+                        .adapter
+                        .possible_additional_storage_language_keys_for_file(&file)
+                        .iter()
+                        .filter(|projection| {
+                            independent_primary_keys.contains(&(oid, (**projection).to_owned()))
+                        })
+                        .map(|projection| (**projection).to_owned())
+                        .collect();
+                    PreparedAnalysisTarget {
+                        file,
+                        oid,
+                        storage_language,
+                        generation,
+                        required_existing_additional_storage_languages: Vec::new(),
+                        independently_owned_additional_storage_languages,
+                    }
+                })
+                .collect();
+            Self::analyze_prepare_and_persist_files(
+                self.adapter.as_ref(),
+                self.project.as_ref(),
+                &self.config,
+                targets,
+                None,
+                &self.store_context,
+                |file, outcome| {
+                    if let Some((_, _, Some(error))) = outcome {
+                        self.record_store_error(
+                            error.context(format!(
+                                "persisting live blob during catch-up for {file:?}"
+                            )),
+                        );
+                    }
+                },
+            );
+            if self.adapter.language() == Language::Rust {
+                // Re-persisting a blob withdraws every Rust summary version that
+                // lists it (`WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL`). A warm start
+                // runs no other reconcile, and the Rust route readers answer only
+                // from live summary rows, so derive those units again here.
+                let (snapshots, _) = self.capture_relational_workspace_snapshots();
+                if let Some(snapshot) = snapshots.get("rust")
+                    && let Err(error) = self
+                        .store_context
+                        .store
+                        .reconcile_rust_crates_unless_current(snapshot)
+                {
                     self.record_store_error(
-                        error.context(format!("persisting live blob during catch-up for {file:?}")),
+                        error.context("re-deriving Rust summaries after a live blob repair"),
                     );
                 }
-            },
-        );
-        if self.adapter.language() == Language::Rust {
-            // Re-persisting a blob withdraws every Rust summary version that
-            // lists it (`WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL`). A warm start
-            // runs no other reconcile, and the Rust route readers answer only
-            // from live summary rows, so derive those units again here.
-            let (snapshots, _) = self.capture_relational_workspace_snapshots();
-            if let Some(snapshot) = snapshots.get("rust")
-                && let Err(error) = self
-                    .store_context
-                    .store
-                    .reconcile_rust_crates_unless_current(snapshot)
-            {
-                self.record_store_error(
-                    error.context("re-deriving Rust summaries after a live blob repair"),
-                );
             }
-        }
+        })
     }
 
     /// The analyzer store, for a language module that answers a question from
@@ -10461,6 +10699,9 @@ where
     /// behaviour is exactly the unmemoized lookup.
     #[doc(hidden)]
     pub fn definition_parent_unit(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.record_workspace_memo_read(
+            crate::analyzer::read_ledger::WorkspaceFactFamily::DefinitionParents,
+        );
         if !self.workspace_declaration_identities_authoritative() {
             return None;
         }
@@ -10476,8 +10717,11 @@ where
         if let Some(parent) = cached {
             return parent;
         }
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         let parent = CodeUnitIndex::definitions(self, &owner_fq_name).next();
-        if let Some(parent_units) = parent_units.as_ref() {
+        if scope.captured_read_incompleteness().is_empty()
+            && let Some(parent_units) = parent_units.as_ref()
+        {
             parent_units
                 .write()
                 .expect("query parent-unit cache write lock poisoned")
@@ -10504,6 +10748,14 @@ where
         // than the whole language scope can bound. Recorded before the request
         // memo answers, so a second call under the same ledger still names it.
         self.record_reads(|sink| sink.push(self.scope_read_key()));
+        #[cfg(debug_assertions)]
+        if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+            debug_assert!(
+                keys.contains_read_key(&self.scope_read_key()),
+                "listing hits record their language scope"
+            );
+        }
+
         // Capture the two request handles together. `analyzed_live_files` is
         // also the one path that already validates every live filesystem entry;
         // publishing that same snapshot into `live_sources` before publishing
@@ -10533,6 +10785,7 @@ where
         {
             return files;
         }
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         let snapshot = self.live_snapshot();
         let mut files = Vec::new();
         let mut persisted_candidates = Vec::new();
@@ -10628,8 +10881,9 @@ where
         // detached and harmless. Recheck both identities under the outer lock
         // before publishing the generation-wide immutable snapshot so it can
         // never leak into a later request.
-        if let (Some(analyzed_live_files), Some(live_sources)) =
-            (analyzed_live_files.as_ref(), live_sources.as_ref())
+        if scope.captured_read_incompleteness().is_empty()
+            && let (Some(analyzed_live_files), Some(live_sources)) =
+                (analyzed_live_files.as_ref(), live_sources.as_ref())
         {
             live_sources
                 .write()
@@ -10954,17 +11208,39 @@ where
         {
             return None;
         }
-        let unit = self.store_query_or_record(
-            |sink| sink.push(self.scope_read_key()),
-            self.adapter.hydrate_path_synthetic_module_unit(&file),
-            "hydrating live path symbol",
-        )??;
+        let unit = self.hydrated_path_synthetic_module_unit(&file)??;
         (unit.kind() == row.kind
             && unit.package_name() == row.package_name
             && unit.short_name() == row.short_name
             && unit.fq_name() == row.exact_fqn
             && self.adapter.normalize_full_name(&unit.fq_name()) == row.normalized_fqn)
             .then_some(unit)
+    }
+
+    fn hydrated_path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<Option<CodeUnit>> {
+        let result = self.adapter.hydrate_path_synthetic_module_unit(file);
+        let answer = result.as_ref().ok().map(|module| {
+            crate::analyzer::read_ledger::path_synthetic_module_digest(module.as_ref())
+        });
+        self.store_query_or_record(
+            |sink| {
+                if let Some(answer) = answer {
+                    sink.push(ReadKey::lookup(
+                        LookupKind::WorkspaceFact,
+                        LookupQuestion::WorkspaceFact {
+                            family: crate::analyzer::read_ledger::WorkspaceFactFamily::PathSyntheticModules,
+                            language: self.adapter.language(),
+                            subject: crate::analyzer::read_ledger::FactSubject::File {
+                                rel_path: crate::path_utils::rel_path_string(file).into(),
+                            },
+                        },
+                        answer,
+                    ));
+                }
+            },
+            result,
+            "hydrating path-backed module",
+        )
     }
 
     fn rebase_live_file_to_project_root(&self, file: &ProjectFile) -> Option<ProjectFile> {
@@ -10976,9 +11252,47 @@ where
         keep: impl FnMut(&CodeUnit) -> bool,
     ) -> Option<Vec<CodeUnit>> {
         self.store_query_or_record(
-            |sink| sink.push(self.scope_read_key()),
+            |_| {},
             self.try_sql_nonpersisted_workspace_declarations_vec_matching(keep),
             "querying non-persisted workspace declarations",
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn path_synthetic_modules_named_for_test(&self, name: &str) -> Option<Vec<CodeUnit>> {
+        self.sql_nonpersisted_workspace_declarations_vec_matching(|module| {
+            module.short_name() == name
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn path_synthetic_module_hydrations_for_test(&self) -> usize {
+        self.active_query_cache_handle(|cache| &cache.path_synthetic_modules)
+            .and_then(|memo| {
+                memo.read()
+                    .expect("path-module cache read lock poisoned")
+                    .clone()
+            })
+            .map_or(0, |modules| modules.hydrations.load(Ordering::Relaxed))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn path_synthetic_modules_for_test(&self) -> Option<Vec<CodeUnit>> {
+        self.sql_nonpersisted_workspace_declarations_vec_matching(|_| true)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn path_synthetic_modules_cancellable_for_test(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<LimitedQueryRows<CodeUnit>> {
+        self.sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
+            |_| true,
+            cancellation,
         )
     }
 
@@ -10988,7 +11302,7 @@ where
         cancellation: Option<&CancellationToken>,
     ) -> Option<LimitedQueryRows<CodeUnit>> {
         self.store_query_or_record(
-            |sink| sink.push(self.scope_read_key()),
+            |_| {},
             self.try_sql_nonpersisted_workspace_declarations_vec_matching_limited(keep, || {
                 !cancellation.is_some_and(CancellationToken::is_cancelled)
             }),
@@ -11005,187 +11319,276 @@ where
             .rows)
     }
 
-    /// The live-path prefix shared by every non-persisted workspace
-    /// declaration scan: one pass over the snapshot's paths that keeps the
-    /// entries carrying a path-synthetic module unit for this analyzer's
-    /// language, together with the snapshot it was taken from.
-    ///
-    /// Materialized at most once per request (#1774). Every caller of
-    /// `sql_nonpersisted_workspace_declarations_vec_matching` used to pay this
-    /// whole-workspace walk again, and the callers are per-name (short-name
-    /// lookup, package-scoped class listings, identifier lookup), so a single
-    /// query re-walked the workspace once per name it resolved. The narrowing
-    /// `keep` predicate is deliberately *not* part of the memo: it runs after
-    /// the walk, so the expensive tail (stat validation, the structured-import
-    /// blob query, declaration hydration) stays scoped to the matching subset
-    /// exactly as before.
-    ///
-    /// The snapshot travels with the walk so a memo hit and its tail read the
-    /// same live-path state. `Err(inspected)` reports a cancelled walk and
-    /// publishes nothing: a partial walk must never be served to a later
-    /// caller as the workspace.
-    fn workspace_module_walk(
-        &self,
-        continue_query: &mut impl FnMut() -> bool,
-    ) -> std::result::Result<Arc<WorkspaceModuleWalk>, usize> {
-        let memo = self.active_query_cache_handle(|cache| &cache.workspace_module_walk);
-        let cached = memo.as_ref().and_then(|memo| {
-            memo.read()
-                .expect("query workspace-module walk cache read lock poisoned")
-                .clone()
-        });
-        if let Some(walk) = cached {
-            return Ok(walk);
-        }
-
-        self.workspace_path_scan_count
-            .fetch_add(1, Ordering::Relaxed);
-        let snapshot = self.live_snapshot();
-        let mut entries = Vec::new();
-        let mut inspected = 0usize;
-        for file in snapshot.all_paths() {
-            if !continue_query() {
-                return Err(inspected);
-            }
-            inspected = inspected.saturating_add(1);
-            let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
-                continue;
-            };
-            if !self.adapter_owns_file(&project_file, &snapshot) {
-                continue;
-            }
-            let module = self
-                .store_query_or_record(
-                    |sink| sink.push(self.scope_read_key()),
-                    self.adapter
-                        .hydrate_path_synthetic_module_unit(&project_file),
-                    "hydrating workspace module",
-                )
-                .ok_or(inspected)?;
-            let Some(module) = module else {
-                continue;
-            };
-            let Some(oid) = snapshot.oid_for_path(file) else {
-                continue;
-            };
-            entries.push((file.clone(), oid, module));
-        }
-
-        let walk = Arc::new(WorkspaceModuleWalk {
-            snapshot,
-            entries,
-            inspected,
-        });
-        if let Some(memo) = memo.as_ref() {
-            *memo
-                .write()
-                .expect("query workspace-module walk cache write lock poisoned") =
-                Some(Arc::clone(&walk));
-        }
-        Ok(walk)
-    }
-
     fn try_sql_nonpersisted_workspace_declarations_vec_matching_limited(
         &self,
-        mut keep: impl FnMut(&CodeUnit) -> bool,
+        keep: impl FnMut(&CodeUnit) -> bool,
         mut continue_query: impl FnMut() -> bool,
     ) -> std::result::Result<LimitedQueryRows<CodeUnit>, StoreError> {
-        if !self.adapter.has_path_synthetic_module_units() {
-            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
-        }
-        let walk = match self.workspace_module_walk(&mut continue_query) {
-            Ok(walk) => walk,
-            Err(inspected) => return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected)),
+        let Some(modules) = self.path_synthetic_module_set(&mut continue_query)? else {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
         };
-        let snapshot = Arc::clone(&walk.snapshot);
-        let mut candidates = Vec::new();
-        let mut candidate_files = Vec::new();
-        let mut inspected = walk.inspected;
-        for (file, oid, module) in &walk.entries {
+        let mut keep = keep;
+        let mut declarations = Vec::new();
+        let snapshot = self.live_snapshot();
+        for (_, row, _) in &modules.candidates {
             if !continue_query() {
-                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
-            }
-            if !keep(module) {
-                continue;
-            }
-            candidate_files.push(file.clone());
-            candidates.push((file.clone(), *oid, module.clone()));
-        }
-
-        if !continue_query() {
-            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
-        }
-        let stale: HashSet<_> = snapshot
-            .validate(candidate_files.iter())
-            .into_iter()
-            .collect();
-        if !continue_query() {
-            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
-        }
-
-        let import_oids = if self.adapter.path_synthetic_module_requires_imports() {
-            let mut blob_keys = Vec::with_capacity(candidates.len());
-            for (file, oid, _) in &candidates {
-                if !continue_query() {
-                    return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
-                }
-                inspected = inspected.saturating_add(1);
-                let project_file = self
-                    .rebase_live_file_to_project_root(file)
-                    .unwrap_or_else(|| file.clone());
-                blob_keys.push((
-                    *oid,
-                    self.adapter
-                        .storage_language_key_for_file(&project_file)
-                        .to_string(),
+                self.record_unattributed_read();
+                return Ok(LimitedQueryRows::incomplete(
+                    declarations,
+                    modules.inspected,
                 ));
             }
-            blob_keys.sort();
-            blob_keys.dedup();
-            let import_oids = self
-                .store_context
-                .store
-                .blobs_with_structured_imports_by_keys(
-                    &blob_keys,
-                    self.store_context.generations.as_ref(),
-                )?;
-            if !continue_query() {
-                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            let file = ProjectFile::new(self.project.root().to_path_buf(), &row.rel_path);
+            let candidate = self
+                .adapter
+                .path_synthetic_module_from_published_name(&file, &row.exact_fqn)?;
+            let Some(candidate) = candidate else {
+                return Err(StoreError::corrupt(format!(
+                    "published path symbol has no path candidate: {row:?}"
+                )));
+            };
+            if candidate.kind() != row.kind || candidate.fq_name() != row.exact_fqn {
+                return Err(StoreError::corrupt(format!(
+                    "path-symbol identity disagrees with its path: {row:?}"
+                )));
             }
-            Some(import_oids)
-        } else {
-            None
-        };
-
-        let mut declarations = Vec::new();
-        for (file, oid, module) in candidates {
-            if !continue_query() {
-                return Ok(LimitedQueryRows::incomplete(declarations, inspected));
-            }
-            inspected = inspected.saturating_add(1);
-            if stale.contains(&file) || module.is_file_scope() {
+            if !keep(&candidate) {
                 continue;
             }
-            if let Some(import_oids) = &import_oids {
-                let project_file = self
-                    .rebase_live_file_to_project_root(&file)
-                    .unwrap_or_else(|| file.clone());
-                if !self.adapter.include_path_synthetic_module(
-                    import_oids.contains(&(
-                        oid,
-                        self.adapter
-                            .storage_language_key_for_file(&project_file)
-                            .to_string(),
-                    )),
-                ) {
-                    continue;
-                }
+            // Stat validation and hydration stay scoped to the matching subset.
+            if snapshot.validated_oid_for_path(&file) != Some(row.blob_oid) {
+                continue;
             }
-            declarations.push(module);
+            #[cfg(any(test, feature = "test-support"))]
+            modules.hydrations.fetch_add(1, Ordering::Relaxed);
+            let Some(module) = self.hydrated_path_synthetic_module_unit(&file) else {
+                return Ok(LimitedQueryRows::incomplete(
+                    declarations,
+                    modules.inspected,
+                ));
+            };
+            if let Some(module) = module {
+                declarations.push(module);
+            }
         }
         declarations.sort();
         declarations.dedup();
-        Ok(LimitedQueryRows::complete(declarations, inspected))
+        Ok(LimitedQueryRows::complete(declarations, modules.inspected))
+    }
+
+    fn path_synthetic_module_set(
+        &self,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> std::result::Result<Option<Arc<PathSyntheticModules>>, StoreError> {
+        use crate::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
+        use crate::analyzer::workspace_authority::{
+            AuthorityInputs, record_workspace_authority_read,
+        };
+        if !continue_query() {
+            self.record_unattributed_read();
+            return Ok(None);
+        }
+        // Failed builds are sticky only on this request's transported context.
+        // Hold its language slot through construction so concurrent lookups in
+        // the same request also pay for at most one failed build.
+        let failure_cell =
+            crate::analyzer::i_analyzer::path_module_request_failure_cell(self.adapter.language());
+        let mut failure = failure_cell.as_ref().map(|cell| {
+            // The build must not call back into this lookup: it would self-deadlock.
+            cell.lock()
+                .expect("request path-module failure cell poisoned")
+        });
+        if let Some(error) = failure.as_ref().and_then(|slot| slot.as_ref()) {
+            return Err(error.clone());
+        }
+        let memo = self.active_query_cache_handle(|cache| &cache.path_synthetic_modules);
+        let cached = memo.as_ref().and_then(|memo| {
+            memo.read()
+                .expect("query path-module cache read lock poisoned")
+                .clone()
+        });
+        let modules = if let Some(modules) = cached {
+            modules
+        } else {
+            // The complete set answer subsumes projection, inventory and import reads.
+            // Failure channels still reach the caller and forbid a reusable fill.
+            let generation = self.project.analysis_generation();
+            let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
+            let (result, reads) =
+                crate::analyzer::i_analyzer::capture_subsumed_query_read_receipt(self, || {
+                    self.build_workspace_modules_limited(&mut continue_query)
+                });
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(slot) = failure.as_mut() {
+                        **slot = Some(error.clone());
+                    }
+                    return Err(error);
+                }
+            };
+            if !result.complete || !continue_query() {
+                self.record_unattributed_read();
+                return Ok(None);
+            }
+            let modules = Arc::new(PathSyntheticModules {
+                answer: (reads.execution_dependences == 0).then(|| {
+                    crate::analyzer::read_ledger::path_synthetic_modules_digest(
+                        self.adapter.language(),
+                        &result.rows,
+                    )
+                }),
+                candidates: result.rows,
+                #[cfg(any(test, feature = "test-support"))]
+                hydrations: AtomicUsize::new(0),
+                inspected: result.inspected,
+            });
+            if self.project.analysis_generation() != generation {
+                self.mark_execution_dependent();
+                return Ok(None);
+            }
+            if reads.unattributed_reads == 0
+                && reads.execution_dependences == 0
+                && scope.captured_read_incompleteness().is_empty()
+                && let Some(memo) = &memo
+            {
+                *memo
+                    .write()
+                    .expect("query path-module cache write lock poisoned") =
+                    Some(Arc::clone(&modules));
+            }
+            modules
+        };
+        if !continue_query() {
+            self.record_unattributed_read();
+            return Ok(None);
+        }
+        if let Some(answer) = modules.answer {
+            record_workspace_authority_read(
+                self,
+                WorkspaceFactFamily::PathSyntheticModules,
+                AuthorityInputs::Fact {
+                    language: self.adapter.language(),
+                    subject: FactSubject::Whole,
+                    answer,
+                },
+            );
+        }
+        Ok(Some(modules))
+    }
+
+    fn build_workspace_modules_limited(
+        &self,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> std::result::Result<LimitedQueryRows<(String, PathSymbolRow, bool)>, StoreError> {
+        if !self.adapter.has_path_synthetic_module_units() {
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        }
+        self.workspace_path_scan_count
+            .fetch_add(1, Ordering::Relaxed);
+        let snapshot = self.live_snapshot();
+        let dirty_symbols = self.state.dirty_path_symbol_snapshot();
+        let dirty_states = self.state.dirty_snapshot();
+        // Probe only retained dirty candidates. Ordinary requests add no read,
+        // and a published blob still goes through the selected persisted rows.
+        let published_dirty = if dirty_symbols.is_empty() {
+            HashSet::default()
+        } else {
+            let keys = dirty_symbols
+                .values()
+                .map(|(lang, row)| (row.blob_oid, lang.clone()))
+                .collect::<Vec<_>>();
+            self.store_context
+                .store
+                .parsed_blob_keys_at_generations(&keys, self.store_context.generations.as_ref())?
+        };
+        let mut dirty_modules = Vec::new();
+        let mut keys = Vec::new();
+        let mut paths = HashMap::default();
+        let mut inspected = 0usize;
+        for file in snapshot.all_paths() {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            inspected = inspected.saturating_add(1);
+            let Some(file) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if !self.adapter_owns_file(&file, &snapshot) {
+                continue;
+            }
+            let Some(oid) = snapshot.oid_for_path(&file) else {
+                continue;
+            };
+            let lang = self
+                .adapter
+                .storage_language_key_for_file(&file)
+                .to_string();
+            if let Some((dirty_lang, row)) = dirty_symbols.get(&file)
+                && dirty_lang == &lang
+                && row.blob_oid == oid
+                && !published_dirty.contains(&(oid, lang.clone()))
+                && let Some(dirty) = dirty_states.get(&Self::transient_cache_key(oid, &file))
+                && dirty.state.parse_complete
+                && dirty.generations.get(&lang) == self.store_context.generations.get(&lang)
+            {
+                // Retained parsed state and its matching path row are authority
+                // for this request, not a publication usable at another head.
+                dirty_modules.push((lang.clone(), row.clone(), !dirty.state.imports.is_empty()));
+            } else {
+                keys.push((oid, lang.clone()));
+            }
+            paths.insert((lang, crate::path_utils::rel_path_string(&file)), oid);
+        }
+        keys.sort();
+        keys.dedup();
+        let rows = self
+            .store_context
+            .store
+            .path_symbol_rows_for_blob_keys_at_snapshots(
+                self.selected_workspace_snapshots().as_ref(),
+                &keys,
+                self.store_context.generations.as_ref(),
+            )?;
+        if !continue_query() {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        }
+        let imports = if self.adapter.path_synthetic_module_requires_imports() {
+            self.store_context
+                .store
+                .blobs_with_structured_imports_by_keys(
+                    &keys,
+                    self.store_context.generations.as_ref(),
+                )?
+        } else {
+            HashSet::default()
+        };
+        if !dirty_modules.is_empty() {
+            self.mark_execution_dependent();
+        }
+        let rows = rows
+            .into_iter()
+            .map(|(lang, row)| {
+                let has_imports = imports.contains(&(row.blob_oid, lang.clone()));
+                (lang, row, has_imports)
+            })
+            .chain(dirty_modules);
+        let mut candidates = Vec::new();
+        for (lang, row, has_imports) in rows {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            if paths.get(&(lang.clone(), row.rel_path.clone())) != Some(&row.blob_oid)
+                || row.kind == CodeUnitType::FileScope
+            {
+                continue;
+            }
+            if row.requires_imports && !self.adapter.include_path_synthetic_module(has_imports) {
+                continue;
+            }
+            candidates.push((lang, row, has_imports));
+        }
+        Ok(LimitedQueryRows::complete(candidates, inspected))
     }
 
     fn dirty_file_states_for_queries(&self) -> Vec<Arc<FileState>> {
@@ -12179,6 +12582,24 @@ where
     #[doc(hidden)]
     pub fn selected_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
         self.relational_workspace_snapshots.load_full()
+    }
+
+    /// Load selected indexed usage source, preserving caller work between
+    /// source availability and selected-content validation.
+    #[doc(hidden)]
+    pub fn selected_native_usage_source(
+        &self,
+        file: &ProjectFile,
+        source_available: impl FnOnce(),
+    ) -> Result<String, SelectedNativeSourceError> {
+        let source = self
+            .indexed_source(file)
+            .ok_or(SelectedNativeSourceError::Unavailable)?;
+        source_available();
+        if !self.source_matches_selected_native_content(file, &source) {
+            return Err(SelectedNativeSourceError::Stale);
+        }
+        Ok(source)
     }
 
     /// Check supplied point-query text against admitted live content without
@@ -13521,6 +13942,9 @@ where
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
+        self.record_workspace_memo_read(
+            crate::analyzer::read_ledger::WorkspaceFactFamily::BoundedIdentifierCandidates,
+        );
         if !self.workspace_declaration_identities_authoritative() {
             return LimitedQueryRows::complete(Vec::new(), 0);
         }
@@ -13719,6 +14143,40 @@ where
         candidates
     }
 
+    fn persisted_fqn_lookup(
+        &self,
+        fqn: &str,
+        key: crate::analyzer::store::PersistedLookupKey,
+    ) -> (
+        crate::analyzer::store::PersistedLookupKey,
+        String,
+        IndexFamily,
+    ) {
+        use crate::analyzer::store::PersistedLookupKey;
+        let (lookup, family) = match key {
+            PersistedLookupKey::NormalizedFqn => (
+                self.adapter.normalize_full_name(fqn),
+                IndexFamily::DefinitionNormalizedTail,
+            ),
+            PersistedLookupKey::ExactFqn => (fqn.to_string(), IndexFamily::DefinitionExact),
+        };
+        (key, lookup, family)
+    }
+
+    fn persisted_fqn_candidate_matches(
+        &self,
+        unit: &CodeUnit,
+        key: crate::analyzer::store::PersistedLookupKey,
+        lookup: &str,
+    ) -> bool {
+        use crate::analyzer::store::PersistedLookupKey;
+        let candidate = match key {
+            PersistedLookupKey::NormalizedFqn => self.adapter.normalize_full_name(&unit.fq_name()),
+            PersistedLookupKey::ExactFqn => unit.fq_name(),
+        };
+        candidate == lookup
+    }
+
     /// Persisted exact/normalized declaration lookup for a generation cache.
     /// A transient store failure is reported but never returned as an
     /// authoritative empty result, so callers can decline to publish it
@@ -13733,27 +14191,16 @@ where
             return Some(BTreeSet::new());
         }
         use crate::analyzer::store::PersistedLookupKey;
-        let key = if normalized {
-            PersistedLookupKey::NormalizedFqn
-        } else {
-            PersistedLookupKey::ExactFqn
-        };
-        let lookup = if normalized {
-            self.adapter.normalize_full_name(fqn)
-        } else {
-            fqn.to_string()
-        };
-        let rows = self.store_query_or_record(
-            |sink| {
-                sink.push(ReadKey::index(
-                    if normalized {
-                        IndexFamily::DefinitionNormalizedTail
-                    } else {
-                        IndexFamily::DefinitionExact
-                    },
-                    &lookup,
-                ))
+        let (key, lookup, family) = self.persisted_fqn_lookup(
+            fqn,
+            if normalized {
+                PersistedLookupKey::NormalizedFqn
+            } else {
+                PersistedLookupKey::ExactFqn
             },
+        );
+        let rows = self.store_query_or_record(
+            |sink| sink.push(ReadKey::index(family, &lookup)),
             self.store_context
                 .store
                 .declaration_candidate_rows_by_lookup_key_for_langs(
@@ -13766,21 +14213,11 @@ where
         )?;
         let mut matches: BTreeSet<_> = self.resolve_candidate_rows(rows).into_iter().collect();
         matches.extend(self.dirty_units_matching(false, |unit| {
-            let candidate = if normalized {
-                self.adapter.normalize_full_name(&unit.fq_name())
-            } else {
-                unit.fq_name()
-            };
-            candidate == lookup
+            self.persisted_fqn_candidate_matches(unit, key, &lookup)
         }));
         matches.extend(
             self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                let candidate = if normalized {
-                    self.adapter.normalize_full_name(&unit.fq_name())
-                } else {
-                    unit.fq_name()
-                };
-                candidate == lookup
+                self.persisted_fqn_candidate_matches(unit, key, &lookup)
             })?,
         );
         Some(matches)
@@ -13798,28 +14235,17 @@ where
             return LimitedQueryRows::complete(Vec::new(), 0);
         }
         use crate::analyzer::store::PersistedLookupKey;
-        let key = if normalized {
-            PersistedLookupKey::NormalizedFqn
-        } else {
-            PersistedLookupKey::ExactFqn
-        };
-        let lookup = if normalized {
-            self.adapter.normalize_full_name(fqn)
-        } else {
-            fqn.to_string()
-        };
+        let (key, lookup, family) = self.persisted_fqn_lookup(
+            fqn,
+            if normalized {
+                PersistedLookupKey::NormalizedFqn
+            } else {
+                PersistedLookupKey::ExactFqn
+            },
+        );
         let persisted = self
             .store_query_or_record(
-                |sink| {
-                    sink.push(ReadKey::index(
-                        if normalized {
-                            IndexFamily::DefinitionNormalizedTail
-                        } else {
-                            IndexFamily::DefinitionExact
-                        },
-                        &lookup,
-                    ))
-                },
+                |sink| sink.push(ReadKey::index(family, &lookup)),
                 self.store_context
                     .store
                     .declaration_candidate_rows_by_lookup_key_for_langs_limited(
@@ -13837,14 +14263,7 @@ where
             false,
             true,
             limit,
-            |unit| {
-                let candidate = if normalized {
-                    self.adapter.normalize_full_name(&unit.fq_name())
-                } else {
-                    unit.fq_name()
-                };
-                candidate == lookup
-            },
+            |unit| self.persisted_fqn_candidate_matches(unit, key, &lookup),
             continue_query,
         )
     }
@@ -14804,6 +15223,7 @@ where
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return Vec::new();
         };
+        self.record_file_read(file, oid);
         let key = Self::transient_cache_key(oid, file);
         // The dirty overlay holds a parse the store has not accepted yet, and
         // is authoritative over anything retained.
@@ -14878,6 +15298,7 @@ where
             return None;
         }
         let oid = self.resolve_live_oid_for_file(file)?;
+        self.record_file_read(file, oid);
         let key = Self::transient_cache_key(oid, file);
         if let Some(state) = self.state.dirty_file_state(&key) {
             return state.source_facts.as_ref().map(|_| state.imports.clone());
@@ -14977,6 +15398,10 @@ where
     }
 
     fn import_info_store_get(&self, key: &FileStateCacheKey) -> Option<Arc<[ImportInfo]>> {
+        self.record_file_read(
+            &ProjectFile::new(self.project.root(), &key.rel_path),
+            key.oid,
+        );
         self.import_info_store
             .lock()
             .expect("import info store mutex poisoned")
@@ -14989,6 +15414,10 @@ where
         &self,
         key: &FileStateCacheKey,
     ) -> Option<Arc<[ImportInfo]>> {
+        self.record_file_read(
+            &ProjectFile::new(self.project.root(), &key.rel_path),
+            key.oid,
+        );
         self.import_info_store
             .lock()
             .expect("import info store mutex poisoned")
@@ -15035,6 +15464,7 @@ where
         oid: Oid,
         limit: usize,
     ) -> LimitedQueryRows<ImportInfo> {
+        self.record_file_read(file, oid);
         if limit == 0 {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -15350,6 +15780,9 @@ where
     /// Without an active query scope there is nothing to retain the map against,
     /// so the single-package path runs exactly as before.
     fn persisted_top_level_classes_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+        self.record_workspace_memo_read(
+            crate::analyzer::read_ledger::WorkspaceFactFamily::PackageClassDeclarations,
+        );
         let Some(cell) = self
             .query_read_cache_lock()
             .top_level_class_units_by_package_cell()
@@ -15361,10 +15794,7 @@ where
                 .collect();
         };
 
-        // `get_or_init` runs on this thread's own `Arc` handle, not while the coarse
-        // `query_read_cache` lock is held, and guarantees the hydration below runs at most once
-        // even when many threads race here concurrently (#1194).
-        let index = cell.get_or_init(|| {
+        let index = crate::analyzer::common::complete_query_cache_arc_cell(self, &cell, || {
             let units = self.hydrated_persisted_top_level_classes(package_name);
             let mut index: HashMap<String, Vec<CodeUnit>> = HashMap::default();
             for unit in units {
@@ -15373,7 +15803,7 @@ where
                     .or_default()
                     .push(unit);
             }
-            Arc::new(index)
+            index
         });
         index.get(package_name).cloned().unwrap_or_default()
     }
@@ -16016,16 +16446,12 @@ where
 
     #[doc(hidden)]
     pub fn record_store_error(&self, error: StoreError) {
-        let contexts = self.query_read_cache_lock().contexts.clone();
-        for context in contexts {
-            context.record_store_error(error.clone());
-        }
+        crate::analyzer::i_analyzer::record_store_error_on_current_contexts(error);
     }
 
     #[doc(hidden)]
     pub fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
-        let contexts = self.query_read_cache_lock().contexts.clone();
-        crate::analyzer::i_analyzer::record_query_incomplete_on_active_contexts(&contexts, reason);
+        crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(reason);
     }
 
     /// Route one analyzer-side store read through the request boundary: name
@@ -16444,6 +16870,10 @@ where
     /// there is no memo and the behaviour is exactly the unmemoized build,
     /// like `definition_parent_unit`.
     fn class_range_index(&self, file: &ProjectFile) -> Arc<ClassRangeIndex> {
+        if let Some(oid) = self.resolve_live_oid_for_file(file) {
+            self.record_file_read(file, oid);
+        }
+
         let class_ranges = self.active_query_cache_handle(|cache| &cache.class_ranges);
         let cached = class_ranges.as_ref().and_then(|class_ranges| {
             class_ranges
@@ -16455,8 +16885,11 @@ where
         if let Some(index) = cached {
             return index;
         }
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         let index = Arc::new(ClassRangeIndex::build(self, file));
-        if let Some(class_ranges) = class_ranges.as_ref() {
+        if scope.captured_read_incompleteness().is_empty()
+            && let Some(class_ranges) = class_ranges.as_ref()
+        {
             class_ranges
                 .write()
                 .expect("query class-range cache write lock poisoned")
@@ -16856,14 +17289,22 @@ where
                 read()
             };
         if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
-            self.record_read_key(ReadKey::lookup(
+            let key = ReadKey::lookup(
                 LookupKind::Definitions,
                 LookupQuestion::Name {
                     language: Some(self.adapter.language()),
                     name: fq_name.into(),
                 },
                 crate::analyzer::read_ledger::declaration_set_digest(&definitions),
-            ));
+            );
+            self.record_read_key(key.clone());
+            #[cfg(debug_assertions)]
+            if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+                debug_assert!(
+                    keys.contains_read_key(&key),
+                    "definition hits record their complete answer"
+                );
+            }
         }
         Box::new(definitions.into_iter())
     }
@@ -17104,6 +17545,7 @@ where
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&crate::CancellationToken>,
     ) -> Result<Arc<crate::analyzer::LoopCandidates>, crate::analyzer::QueryReadIncomplete> {
+        self.record_procedure_memo_read(procedure);
         enum FailedFill {
             Read(crate::analyzer::QueryReadIncomplete),
             Execution(Arc<crate::analyzer::LoopCandidates>),
@@ -17158,6 +17600,7 @@ where
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&crate::CancellationToken>,
     ) -> Arc<crate::analyzer::semantic::StatementAssessments> {
+        self.record_procedure_memo_read(procedure);
         let generation_before = self.project().analysis_generation();
         let key = (procedure.artifact().materialization_id(), procedure.id());
         match self
@@ -17433,45 +17876,57 @@ where
         TreeSitterAnalyzer::record_read_key(self, key);
     }
 
-    fn record_unattributed_read(&self) {
-        TreeSitterAnalyzer::record_unattributed_read(self);
-    }
-
-    #[track_caller]
-    fn record_degraded_persistent_fill(&self, cache: &str, cause: &str) {
-        let count = self
-            .degraded_persistent_fills
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        let origin = std::panic::Location::caller();
-        profiling::note_with(|| {
-            format!(
-                "policy.units degraded_persistent_fill origin={}:{} cache={cache} cause={cause} count={count}",
-                origin.file(),
-                origin.line()
-            )
-        });
-        self.mark_execution_dependent();
-    }
-
-    fn degraded_persistent_fills(&self) -> usize {
-        self.degraded_persistent_fills.load(Ordering::Relaxed)
-    }
-
-    fn mark_execution_dependent(&self) {
-        if !crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
-            return;
-        }
+    fn record_read_receipt(&self, keys: &Arc<[crate::analyzer::ReadKey]>) {
         let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
             Vec::new()
         } else {
-            self.query_read_cache_lock().contexts.clone()
+            self.read_ledger_contexts()
         };
-        crate::analyzer::i_analyzer::record_execution_dependence_on_active_ledgers(&contexts);
+        crate::analyzer::i_analyzer::record_receipt_on_active_ledgers(&contexts, keys);
+    }
+
+    fn record_read_capture(&self, reads: &crate::analyzer::ReadLedger) {
+        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.read_ledger_contexts()
+        };
+        crate::analyzer::i_analyzer::record_capture_on_active_ledgers(&contexts, reads);
+    }
+
+    fn relational_frontier_read_recorder(
+        &self,
+    ) -> crate::analyzer::relational_frontier::FrontierReadRecorder {
+        // Preserve the live registry for explicit broadcast as well as TLS
+        // captures; an ordinary analyzer clone deliberately starts fresh.
+        let mut recorder = self.clone();
+        recorder.query_read_cache = Arc::clone(&self.query_read_cache);
+        recorder.attached_read_ledgers = Arc::clone(&self.attached_read_ledgers);
+        crate::analyzer::relational_frontier::frontier_read_recorder(Arc::new(recorder))
+    }
+
+    fn record_unattributed_reads(&self, count: usize) {
+        TreeSitterAnalyzer::record_unattributed_reads(self, count);
+    }
+
+    fn mark_execution_dependent_reads(&self, count: usize) {
+        crate::analyzer::i_analyzer::record_execution_dependence(
+            count,
+            || IAnalyzer::read_ledger_attached(self),
+            || self.query_read_cache_lock().contexts.clone(),
+        );
+    }
+
+    fn records_query_reads(&self) -> bool {
+        true
     }
 
     fn read_ledger_attached(&self) -> bool {
         TreeSitterAnalyzer::read_ledger_attached(self)
+    }
+
+    fn read_ledger_contexts(&self) -> Vec<Arc<crate::analyzer::AnalyzerQueryContext>> {
+        self.query_read_cache_lock().contexts.clone()
     }
 
     fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
@@ -17549,261 +18004,265 @@ where
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        if changed_files.is_empty() {
-            return self.clone();
-        }
-        // A changed package-identity input rekeys declarations in files it did
-        // not change, which only a full rebuild reaches. An edit that keeps its
-        // identity digest rekeys nothing; it only moves the byte baseline and,
-        // when the input is also selected configuration, publishes its new
-        // bytes at the next revision. Created, deleted and unreadable inputs
-        // change which files an input governs, so they rebuild too, as does any
-        // other configuration input. Like the build, this reads the disk
-        // generation, not a request overlay.
-        let mut identity_inputs = Vec::new();
-        let mut configuration_inputs = Vec::new();
-        for file in changed_files {
-            let configuration = Self::workspace_configuration_input(self.adapter.as_ref(), file);
-            if !self.adapter.workspace_package_identity_input(file) {
+        without_project_reads(|| {
+            if changed_files.is_empty() {
+                return self.clone();
+            }
+            // A changed package-identity input rekeys declarations in files it did
+            // not change, which only a full rebuild reaches. An edit that keeps its
+            // identity digest rekeys nothing; it only moves the byte baseline and,
+            // when the input is also selected configuration, publishes its new
+            // bytes at the next revision. Created, deleted and unreadable inputs
+            // change which files an input governs, so they rebuild too, as does any
+            // other configuration input. Like the build, this reads the disk
+            // generation, not a request overlay.
+            let mut identity_inputs = Vec::new();
+            let mut configuration_inputs = Vec::new();
+            for file in changed_files {
+                let configuration =
+                    Self::workspace_configuration_input(self.adapter.as_ref(), file);
+                if !self.adapter.workspace_package_identity_input(file) {
+                    if configuration {
+                        return self.update_all();
+                    }
+                    continue;
+                }
+                let Ok(source) = std::fs::read(file.abs_path()) else {
+                    return self.update_all();
+                };
+                let digest = PackageIdentityInputDigest::new(self.adapter.as_ref(), file, &source);
+                let previous = self
+                    .state
+                    .workspace_package_identity_input_digests
+                    .get(file);
+                if digest.identity.is_none()
+                    || previous.is_none_or(|previous| previous.identity != digest.identity)
+                {
+                    return self.update_all();
+                }
+                identity_inputs.push((file.clone(), digest));
                 if configuration {
-                    return self.update_all();
+                    // A generation that failed to capture configuration has no
+                    // baseline row to replace.
+                    if self.state.workspace_configuration_digest.is_none() {
+                        return self.update_all();
+                    }
+                    configuration_inputs.push(WorkspaceConfigurationInput::new(
+                        crate::path_utils::rel_path_string(file),
+                        source.into_boxed_slice(),
+                    ));
                 }
-                continue;
             }
-            let Ok(source) = std::fs::read(file.abs_path()) else {
-                return self.update_all();
-            };
-            let digest = PackageIdentityInputDigest::new(self.adapter.as_ref(), file, &source);
-            let previous = self
-                .state
-                .workspace_package_identity_input_digests
-                .get(file);
-            if digest.identity.is_none()
-                || previous.is_none_or(|previous| previous.identity != digest.identity)
-            {
-                return self.update_all();
-            }
-            identity_inputs.push((file.clone(), digest));
-            if configuration {
-                // A generation that failed to capture configuration has no
-                // baseline row to replace.
-                if self.state.workspace_configuration_digest.is_none() {
-                    return self.update_all();
-                }
-                configuration_inputs.push(WorkspaceConfigurationInput::new(
-                    crate::path_utils::rel_path_string(file),
-                    source.into_boxed_slice(),
-                ));
-            }
-        }
-        let unchanged_meaning = identity_inputs
-            .iter()
-            .map(|(file, _)| file.clone())
-            .collect::<BTreeSet<_>>();
+            let unchanged_meaning = identity_inputs
+                .iter()
+                .map(|(file, _)| file.clone())
+                .collect::<BTreeSet<_>>();
 
-        let mut store_context = self.store_context.clone();
-        store_context.live_paths = Arc::new(
-            self.store_context
-                .live_paths
-                .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
-        );
-        let mut relational_workspace_snapshots =
-            self.selected_workspace_snapshots().as_ref().clone();
-        let mut to_update = Vec::new();
-        let mut claim_roots = Vec::new();
-        let mut new_claimable_file_appeared = false;
-        let mut dirty_file_states = self.state.dirty_snapshot();
-        let mut dirty_path_symbol_rows = self.state.dirty_path_symbol_snapshot();
-        let live = self.live_snapshot();
-
-        for file in changed_files {
-            Self::remove_dirty_for_file(&mut dirty_file_states, file);
-            if !file.exists() && !self.project.has_overlay(file) {
-                store_context
+            let mut store_context = self.store_context.clone();
+            store_context.live_paths = Arc::new(
+                self.store_context
                     .live_paths
-                    .remove(std::iter::once(file.clone()));
-                if let Some(liveness) = store_context.liveness.as_ref() {
-                    liveness.remove_overlay_paths(std::iter::once(file.clone()));
-                }
-                // A deleted file contributes no claim edges. Feeding it to the
-                // inference roots is what retires the ones it used to own.
-                claim_roots.push(file.clone());
-                continue;
-            }
-            // A changed file whose extension names no language reaches this
-            // adapter only once inference has claimed it (#1837); an unclaimed
-            // one must not be parsed as this language.
-            if !self.adapter_owns_file(file, &live) {
-                // A claimable file that did not exist last generation can turn
-                // an `#include` that resolved to nothing into a claim, and the
-                // includer itself did not change. Re-deriving the whole relation
-                // is the only way to find out -- but only for a file some
-                // recorded import directive could actually name (#1865). Every
-                // other creation (a `.md`, a `.txt`, a `.json` in a C++
-                // workspace) is local to itself: the demand record is written
-                // from the same import facts the derivation reads, so a miss is
-                // proof that re-deriving would claim nothing new.
-                new_claimable_file_appeared |= self.adapter.claims_included_files()
-                    && file.has_unclaimed_extension()
-                    && self
-                        .state
-                        .tier_demand
-                        .is_demanded(InformationTier::Imports, file);
-                continue;
-            }
-            to_update.push(file.clone());
-            claim_roots.push(file.clone());
-        }
+                    .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
+            );
+            let mut relational_workspace_snapshots =
+                self.selected_workspace_snapshots().as_ref().clone();
+            let mut to_update = Vec::new();
+            let mut claim_roots = Vec::new();
+            let mut new_claimable_file_appeared = false;
+            let mut dirty_file_states = self.state.dirty_snapshot();
+            let mut dirty_path_symbol_rows = self.state.dirty_path_symbol_snapshot();
+            let live = self.live_snapshot();
 
-        let mut state = Self::reconcile_file_states(
-            self.project.as_ref(),
-            self.adapter.as_ref(),
-            &self.config,
-            &store_context,
-            ReconcileFileStates {
-                files: to_update,
-                replace_live_paths: false,
-                progress: None,
-                dirty_file_states,
-                dirty_path_symbol_rows,
-            },
-        );
-        state
-            .workspace_inventory
-            .meet(self.state.workspace_inventory);
-        state.workspace_package_inventory_error =
-            self.state.workspace_package_inventory_error.clone();
-        state.workspace_package_identity_input_digests =
-            self.state.workspace_package_identity_input_digests.clone();
-        state.workspace_configuration_digest = self.state.workspace_configuration_digest;
-        state
-            .workspace_package_identity_input_digests
-            .extend(identity_inputs);
-        if new_claimable_file_appeared {
-            claim_roots.extend(
-                live.all_paths()
-                    .filter(|file| {
-                        crate::analyzer::common::language_for_file(file) == self.adapter.language()
-                    })
-                    .cloned(),
-            );
-            claim_roots.sort();
-            claim_roots.dedup();
-        }
-        let claim_delta = Self::reconcile_claimed_files(
-            self.project.as_ref(),
-            self.adapter.as_ref(),
-            &self.config,
-            &store_context,
-            &claim_roots,
-            RetainedClaimRelation {
-                edges: self.state.claim_edges.clone(),
-                demand: self.state.tier_demand.clone(),
-            },
-            &mut state,
-        );
-        let mut workspace_paths_to_refresh = changed_files.clone();
-        workspace_paths_to_refresh.extend(claim_delta.added);
-        workspace_paths_to_refresh.extend(claim_delta.dropped);
-        dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
-        Self::refresh_path_symbol_units(
-            self.project.as_ref(),
-            self.adapter.as_ref(),
-            &workspace_paths_to_refresh,
-            &store_context,
-            &mut relational_workspace_snapshots,
-            &mut dirty_path_symbol_rows,
-            &mut state.workspace_inventory,
-        );
-        *state
-            .dirty_path_symbol_rows
-            .lock()
-            .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows;
-        for input in configuration_inputs {
-            let storage_languages = self
-                .adapter
-                .storage_language_keys()
-                .into_iter()
-                .map(|(lang, _)| lang)
-                .collect::<Vec<_>>();
-            let generations = storage_languages
-                .iter()
-                .map(|lang| (lang.clone(), store_context.generations[lang]))
-                .collect::<HashMap<_, _>>();
-            let path = input.relative_path().to_owned();
-            match store_context.store.replace_configuration_input(
-                &store_context.workspace_id,
-                &relational_workspace_snapshots,
-                &storage_languages,
-                &generations,
-                input,
-            ) {
-                Ok((snapshots, digest)) => {
-                    relational_workspace_snapshots.extend(snapshots);
-                    state.workspace_configuration_digest = Some(digest);
+            for file in changed_files {
+                Self::remove_dirty_for_file(&mut dirty_file_states, file);
+                if !file.exists() && !self.project.has_overlay(file) {
+                    store_context
+                        .live_paths
+                        .remove(std::iter::once(file.clone()));
+                    if let Some(liveness) = store_context.liveness.as_ref() {
+                        liveness.remove_overlay_paths(std::iter::once(file.clone()));
+                    }
+                    // A deleted file contributes no claim edges. Feeding it to the
+                    // inference roots is what retires the ones it used to own.
+                    claim_roots.push(file.clone());
+                    continue;
                 }
-                Err(error) => {
-                    state.record_workspace_package_inventory_error(
-                        error.context(format!("configuration input {path:?} after update")),
-                    );
+                // A changed file whose extension names no language reaches this
+                // adapter only once inference has claimed it (#1837); an unclaimed
+                // one must not be parsed as this language.
+                if !self.adapter_owns_file(file, &live) {
+                    // A claimable file that did not exist last generation can turn
+                    // an `#include` that resolved to nothing into a claim, and the
+                    // includer itself did not change. Re-deriving the whole relation
+                    // is the only way to find out -- but only for a file some
+                    // recorded import directive could actually name (#1865). Every
+                    // other creation (a `.md`, a `.txt`, a `.json` in a C++
+                    // workspace) is local to itself: the demand record is written
+                    // from the same import facts the derivation reads, so a miss is
+                    // proof that re-deriving would claim nothing new.
+                    new_claimable_file_appeared |= self.adapter.claims_included_files()
+                        && file.has_unclaimed_extension()
+                        && self
+                            .state
+                            .tier_demand
+                            .is_demanded(InformationTier::Imports, file);
+                    continue;
+                }
+                to_update.push(file.clone());
+                claim_roots.push(file.clone());
+            }
+
+            let mut state = Self::reconcile_file_states(
+                self.project.as_ref(),
+                self.adapter.as_ref(),
+                &self.config,
+                &store_context,
+                ReconcileFileStates {
+                    files: to_update,
+                    replace_live_paths: false,
+                    progress: None,
+                    dirty_file_states,
+                    dirty_path_symbol_rows,
+                },
+            );
+            state
+                .workspace_inventory
+                .meet(self.state.workspace_inventory);
+            state.workspace_package_inventory_error =
+                self.state.workspace_package_inventory_error.clone();
+            state.workspace_package_identity_input_digests =
+                self.state.workspace_package_identity_input_digests.clone();
+            state.workspace_configuration_digest = self.state.workspace_configuration_digest;
+            state
+                .workspace_package_identity_input_digests
+                .extend(identity_inputs);
+            if new_claimable_file_appeared {
+                claim_roots.extend(
+                    live.all_paths()
+                        .filter(|file| {
+                            crate::analyzer::common::language_for_file(file)
+                                == self.adapter.language()
+                        })
+                        .cloned(),
+                );
+                claim_roots.sort();
+                claim_roots.dedup();
+            }
+            let claim_delta = Self::reconcile_claimed_files(
+                self.project.as_ref(),
+                self.adapter.as_ref(),
+                &self.config,
+                &store_context,
+                &claim_roots,
+                RetainedClaimRelation {
+                    edges: self.state.claim_edges.clone(),
+                    demand: self.state.tier_demand.clone(),
+                },
+                &mut state,
+            );
+            let mut workspace_paths_to_refresh = changed_files.clone();
+            workspace_paths_to_refresh.extend(claim_delta.added);
+            workspace_paths_to_refresh.extend(claim_delta.dropped);
+            dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
+            Self::refresh_path_symbol_units(
+                self.project.as_ref(),
+                self.adapter.as_ref(),
+                &workspace_paths_to_refresh,
+                &store_context,
+                &mut relational_workspace_snapshots,
+                &mut dirty_path_symbol_rows,
+                &mut state.workspace_inventory,
+            );
+            *state
+                .dirty_path_symbol_rows
+                .lock()
+                .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows;
+            for input in configuration_inputs {
+                let storage_languages = self
+                    .adapter
+                    .storage_language_keys()
+                    .into_iter()
+                    .map(|(lang, _)| lang)
+                    .collect::<Vec<_>>();
+                let generations = storage_languages
+                    .iter()
+                    .map(|lang| (lang.clone(), store_context.generations[lang]))
+                    .collect::<HashMap<_, _>>();
+                let path = input.relative_path().to_owned();
+                match store_context.store.replace_configuration_input(
+                    &store_context.workspace_id,
+                    &relational_workspace_snapshots,
+                    &storage_languages,
+                    &generations,
+                    input,
+                ) {
+                    Ok((snapshots, digest)) => {
+                        relational_workspace_snapshots.extend(snapshots);
+                        state.workspace_configuration_digest = Some(digest);
+                    }
+                    Err(error) => {
+                        state.record_workspace_package_inventory_error(
+                            error.context(format!("configuration input {path:?} after update")),
+                        );
+                    }
                 }
             }
-        }
-        store_context
-            .gc
-            .schedule(self.project.root(), Arc::clone(&store_context.store));
-        // An incremental update knows which paths moved, and the crate rows
-        // know which crates place them, so this reconcile derives those and
-        // their surface-changed dependents instead of every crate in the
-        // workspace. The full pass still runs when the change can move crate
-        // membership itself.
-        if let Some(snapshot) = relational_workspace_snapshots.get("rust")
-            && self.adapter.language() == Language::Rust
-        {
-            // A manifest whose meaning did not change places no crate
-            // differently, so it does not send the reconcile to every crate.
-            let changed_paths = workspace_paths_to_refresh
-                .iter()
-                .filter(|file| !unchanged_meaning.contains(*file))
-                .map(crate::path_utils::rel_path_string)
-                .collect::<Vec<_>>();
-            let previous = self.selected_workspace_snapshots();
-            let reconciled = match previous.get("rust") {
-                Some(previous) => store_context.store.reconcile_rust_crates_after_changes(
-                    previous,
-                    snapshot,
-                    &changed_paths,
-                ),
-                // No crate rows were reconciled for this workspace before.
-                None => store_context.store.reconcile_rust_crates(snapshot),
-            };
-            if let Err(error) = reconciled {
-                state.mark_workspace_package_inventory_incomplete();
-                eprintln!("Rust crate reconciliation failed after update: {error}");
+            store_context
+                .gc
+                .schedule(self.project.root(), Arc::clone(&store_context.store));
+            // An incremental update knows which paths moved, and the crate rows
+            // know which crates place them, so this reconcile derives those and
+            // their surface-changed dependents instead of every crate in the
+            // workspace. The full pass still runs when the change can move crate
+            // membership itself.
+            if let Some(snapshot) = relational_workspace_snapshots.get("rust")
+                && self.adapter.language() == Language::Rust
+            {
+                // A manifest whose meaning did not change places no crate
+                // differently, so it does not send the reconcile to every crate.
+                let changed_paths = workspace_paths_to_refresh
+                    .iter()
+                    .filter(|file| !unchanged_meaning.contains(*file))
+                    .map(crate::path_utils::rel_path_string)
+                    .collect::<Vec<_>>();
+                let previous = self.selected_workspace_snapshots();
+                let reconciled = match previous.get("rust") {
+                    Some(previous) => store_context.store.reconcile_rust_crates_after_changes(
+                        previous,
+                        snapshot,
+                        &changed_paths,
+                    ),
+                    // No crate rows were reconciled for this workspace before.
+                    None => store_context.store.reconcile_rust_crates(snapshot),
+                };
+                if let Err(error) = reconciled {
+                    state.mark_workspace_package_inventory_incomplete();
+                    eprintln!("Rust crate reconciliation failed after update: {error}");
+                }
             }
-        }
-        if let Err(error) = store_context
-            .store
-            .reconcile_jvm_package_contexts(&relational_workspace_snapshots)
-        {
-            state.record_workspace_package_inventory_error(
-                error.context("JVM context reconciliation after update"),
-            );
-        }
-        let relational_workspace_snapshots = Arc::new(relational_workspace_snapshots);
-        Self::from_state(
-            Arc::clone(&self.project),
-            Arc::clone(&self.adapter),
-            self.config.clone(),
-            state,
-            Arc::clone(&self.structural_cache),
-            Arc::clone(&self.structural_index_cache),
-            Arc::new(self.snapshot_caches.carry_content_keyed_values_forward()),
-            self.content_identity_base,
-            self.semantic_cache.clone(),
-            store_context,
-            relational_workspace_snapshots,
-        )
+            if let Err(error) = store_context
+                .store
+                .reconcile_jvm_package_contexts(&relational_workspace_snapshots)
+            {
+                state.record_workspace_package_inventory_error(
+                    error.context("JVM context reconciliation after update"),
+                );
+            }
+            let relational_workspace_snapshots = Arc::new(relational_workspace_snapshots);
+            Self::from_state(
+                Arc::clone(&self.project),
+                Arc::clone(&self.adapter),
+                self.config.clone(),
+                state,
+                Arc::clone(&self.structural_cache),
+                Arc::clone(&self.structural_index_cache),
+                Arc::new(self.snapshot_caches.carry_content_keyed_values_forward()),
+                self.content_identity_base,
+                self.semantic_cache.clone(),
+                store_context,
+                relational_workspace_snapshots,
+            )
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -18267,6 +18726,27 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
         )
     }
 
+    fn path_synthetic_module_answer_digest(&self, file: &ProjectFile) -> Option<StableDigest> {
+        self.hydrated_path_synthetic_module_unit(file)
+            .map(|module| {
+                crate::analyzer::read_ledger::path_synthetic_module_digest(module.as_ref())
+            })
+    }
+
+    fn path_synthetic_modules_answer_digest(&self) -> Option<StableDigest> {
+        let cancellation = self.active_query_cancellation();
+        self.store_query_or_record(
+            |_| {},
+            self.path_synthetic_module_set(|| {
+                !cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+            }),
+            "querying synthetic module set",
+        )?
+        .and_then(|modules| modules.answer)
+    }
+
     fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)> {
         self.analyzed_live_files()
             .into_iter()
@@ -18275,6 +18755,11 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
                 Some((file, oid))
             })
             .collect()
+    }
+
+    fn refused_source_blobs(&self) -> Result<Vec<(ProjectFile, Oid)>, StoreError> {
+        self.selected_source_admission_refusals()
+            .map(|rows| rows.into_iter().map(|row| (row.file, row.blob)).collect())
     }
 
     fn blob_index_keys(
@@ -18508,6 +18993,277 @@ pub mod js_ts_source_admission_support;
 pub mod tree_sitter_resolution_producer_tests_go_support;
 
 pub use crate::analyzer::store::file_state::{FileState, PreparedSyntaxPreparation};
+
+#[cfg(test)]
+mod memo_input_tests {
+    use super::*;
+    use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+
+    #[test]
+    fn blob_memo_hits_only_project_selected_text() {
+        let memo = SourceBlobOidMemo::default();
+        let file = ProjectFile::new(std::env::temp_dir(), "memo.py");
+        let first = memo.oid_of(&file, "first");
+        assert_ne!(first, memo.oid_of(&file, "second"));
+        let analyzer = MultiAnalyzer::default();
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert_eq!(memo.oid_of(&file, "first"), first);
+            assert_eq!(memo.oid_of(&file, "first"), first);
+        });
+        assert!(reads.keys().is_empty());
+    }
+
+    #[test]
+    fn request_cache_handles_do_not_read_workspace_facts() {
+        let mut cache = QueryReadCache::default();
+        let memo = cache.request_memos.get_or_init::<AtomicUsize>();
+        let definitions = Arc::clone(&cache.definition_lookup);
+        let listing = Arc::clone(&cache.workspace_file_index);
+        let analyzer = MultiAnalyzer::default();
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert!(Arc::ptr_eq(
+                &memo,
+                &cache.request_memos.get_or_init::<AtomicUsize>()
+            ));
+            assert!(Arc::ptr_eq(&definitions, &cache.definition_lookup));
+            assert!(Arc::ptr_eq(&listing, &cache.workspace_file_index));
+        });
+        assert!(reads.keys().is_empty());
+    }
+}
+
+/// A project retains only weak references to analyzer request ownership.
+struct ProjectReadAttribution {
+    root: std::path::PathBuf,
+    queries: std::sync::Weak<RwLock<QueryReadCache>>,
+    attached: std::sync::Weak<AtomicUsize>,
+}
+impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for ProjectReadAttribution {
+    fn is_live(&self) -> bool {
+        self.queries.strong_count() != 0
+    }
+    fn is_capturing(&self) -> bool {
+        crate::analyzer::read_attribution_records_reads(|| {
+            self.attached
+                .upgrade()
+                .is_some_and(|attached| attached.load(Ordering::Relaxed) != 0)
+        })
+    }
+    fn capture_identity(
+        &self,
+    ) -> Option<brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity> {
+        crate::analyzer::i_analyzer::innermost_read_ledger().map(|ledger| ledger.capture_identity())
+    }
+    fn record_unattributed(&self) {
+        crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&self.contexts(), 1);
+    }
+    fn capture(
+        &self,
+        build: &mut dyn FnMut(),
+    ) -> brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
+        let forwarded_to = self.capture_identity();
+        let enclosing = crate::analyzer::i_analyzer::current_thread_read_ledger();
+        let (_, reads) = crate::analyzer::i_analyzer::capture_with_read_registration(
+            enclosing.as_ref(),
+            |context| self.register(context),
+            build,
+        );
+        if let Some(enclosing) = enclosing {
+            crate::analyzer::i_analyzer::forward_captured_query_reads(&enclosing, &reads);
+        }
+        crate::analyzer::workspace_authority::erased_captured_reads(&reads, forwarded_to)
+    }
+    fn capture_authority(
+        &self,
+        build: &mut dyn FnMut(),
+    ) -> brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
+        let enclosing = crate::analyzer::i_analyzer::innermost_read_ledger();
+        let (_, reads) = crate::analyzer::i_analyzer::capture_with_read_registration(
+            enclosing.as_ref(),
+            |context| self.register(context),
+            build,
+        );
+        crate::analyzer::workspace_authority::erased_captured_reads(&reads, None)
+    }
+    fn replay(
+        &self,
+        receipts: &[brokk_bifrost_core::analyzer::project_reads::OpaqueReadReceipt],
+        unattributed_reads: usize,
+        execution_dependences: usize,
+    ) {
+        crate::analyzer::workspace_authority::replay_erased_reads(
+            &self.contexts(),
+            receipts,
+            unattributed_reads,
+            execution_dependences,
+        );
+    }
+    fn record(
+        &self,
+        project: &dyn Project,
+        read: brokk_bifrost_core::analyzer::project_reads::ProjectRead<'_>,
+        receipt: brokk_bifrost_core::analyzer::project_reads::ProjectReadReceipt,
+    ) {
+        let contexts = self.contexts();
+        match crate::analyzer::workspace_authority::project_read_keys(
+            project, &self.root, read, receipt,
+        ) {
+            Ok(keys) => {
+                for key in keys {
+                    crate::analyzer::i_analyzer::record_read_on_active_ledgers(&contexts, key);
+                }
+            }
+            Err(_) => {
+                crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts, 1)
+            }
+        }
+    }
+}
+fn install_project_read_recorder(
+    project: &Arc<dyn Project>,
+    cache: QueryReadCache,
+    attached: &Arc<AtomicUsize>,
+) -> Arc<RwLock<QueryReadCache>> {
+    let queries = Arc::new(RwLock::new(cache));
+    let capability =
+        brokk_bifrost_core::analyzer::project_reads::ReadCapability::new(ProjectReadAttribution {
+            root: project.root().to_path_buf(),
+            queries: Arc::downgrade(&queries),
+            attached: Arc::downgrade(attached),
+        });
+    assert!(
+        project.install_read_recorder(capability),
+        "analysis projects must carry a read capability"
+    );
+    queries
+}
+
+impl ProjectReadAttribution {
+    fn contexts(&self) -> Vec<Arc<crate::analyzer::AnalyzerQueryContext>> {
+        if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            return Vec::new();
+        }
+        self.queries
+            .upgrade()
+            .map(|queries| {
+                queries
+                    .read()
+                    .expect("query read cache poisoned")
+                    .contexts
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
+    fn register(
+        &self,
+        context: Arc<crate::analyzer::AnalyzerQueryContext>,
+    ) -> ProjectReadRegistration {
+        let queries = self.queries.upgrade();
+        let attached = self.attached.upgrade();
+        if let Some(queries) = &queries {
+            let registered = queries
+                .write()
+                .expect("query read cache poisoned")
+                .begin(&context);
+            assert!(registered, "a private memo capture has a fresh context");
+            if let Some(attached) = &attached {
+                attached.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        ProjectReadRegistration {
+            queries,
+            attached,
+            context,
+        }
+    }
+}
+struct ProjectReadRegistration {
+    queries: Option<Arc<RwLock<QueryReadCache>>>,
+    attached: Option<Arc<AtomicUsize>>,
+    context: Arc<crate::analyzer::AnalyzerQueryContext>,
+}
+impl Drop for ProjectReadRegistration {
+    fn drop(&mut self) {
+        if let Some(queries) = &self.queries {
+            let retired = queries
+                .write()
+                .expect("query read cache poisoned")
+                .end(&self.context);
+            assert!(retired, "a private memo capture retires its own context");
+            if let Some(attached) = &self.attached {
+                crate::analyzer::i_analyzer::decrement_attached_read_ledger(
+                    attached,
+                    &self.context,
+                );
+            }
+        }
+    }
+}
+
+/// The same weak Project recorder can serve an empty-language workspace.
+/// Its registry supplies capture/broadcast ownership, with no semantic query API.
+#[derive(Clone)]
+pub(super) struct ProjectReadRegistry {
+    queries: Arc<RwLock<QueryReadCache>>,
+    attached: Arc<AtomicUsize>,
+}
+impl ProjectReadRegistry {
+    pub(super) fn new(project: &Arc<dyn Project>) -> Self {
+        let attached = Arc::new(AtomicUsize::new(0));
+        let queries = install_project_read_recorder(project, QueryReadCache::default(), &attached);
+        Self { queries, attached }
+    }
+    pub(super) fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        if self
+            .queries
+            .write()
+            .expect("query read cache poisoned")
+            .begin(context)
+            && context.read_ledger().is_some()
+        {
+            self.attached.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub(super) fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        if self
+            .queries
+            .write()
+            .expect("query read cache poisoned")
+            .end(context)
+        {
+            crate::analyzer::i_analyzer::decrement_attached_read_ledger(&self.attached, context);
+        }
+    }
+    pub(super) fn read_ledger_attached(&self) -> bool {
+        self.attached.load(Ordering::Relaxed) != 0
+    }
+    pub(super) fn contexts(&self) -> Vec<Arc<crate::analyzer::AnalyzerQueryContext>> {
+        if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.queries
+                .read()
+                .expect("query read cache poisoned")
+                .contexts
+                .clone()
+        }
+    }
+    pub(super) fn record_read(&self, key: crate::analyzer::ReadKey) {
+        if crate::analyzer::i_analyzer::record_read_on_attribution_frame(&key)
+            || !self.read_ledger_attached()
+        {
+            return;
+        }
+        crate::analyzer::i_analyzer::record_read_on_active_ledgers(&self.contexts(), key);
+    }
+    pub(super) fn record_unattributed_reads(&self, count: usize) {
+        crate::analyzer::i_analyzer::record_unattributed_reads(
+            count,
+            || self.read_ledger_attached(),
+            || self.contexts(),
+        );
+    }
+}
 
 #[cfg(test)]
 mod declaration_limit_tests;

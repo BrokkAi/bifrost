@@ -463,10 +463,7 @@ impl CallModel {
         let complete = self.completeness.is_complete();
         match &self.authored {
             None => HopQuality::from_uncertain(!self.proven || !complete),
-            Some(closures) => HopQuality {
-                proven: self.proven && !closures.is_empty(),
-                complete,
-            },
+            Some(closures) => HopQuality::new(self.proven && !closures.is_empty(), complete),
         }
     }
 }

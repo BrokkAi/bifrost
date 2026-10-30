@@ -4,6 +4,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::analyzer::without_project_reads;
 use crate::analyzer::{WorkspaceAnalyzer, spawn_on_dedicated_build_pool};
 use crate::profiling;
 
@@ -37,8 +38,7 @@ struct IndexWarmerState {
 
 fn spawn_index_warm(task: impl FnOnce() + Send + 'static) {
     spawn_on_dedicated_build_pool(move || {
-        let _attribution = crate::analyzer::ReadAttribution::broadcast().install();
-        task();
+        without_project_reads(task);
     });
 }
 
@@ -102,11 +102,9 @@ impl IndexWarmer {
                     // (`BIFROST_PARALLELISM=1`). Joined branches instead run
                     // on the workers there are, concurrently when the pool has
                     // several and one after the other when it has one.
-                    let context =
-                        brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
                     rayon::join(
-                        || context.run(|| current.warm_structural_indexes()),
-                        || context.run(|| current.warm_query_indexes()),
+                        || without_project_reads(|| current.warm_structural_indexes()),
+                        || without_project_reads(|| current.warm_query_indexes()),
                     );
                 }));
                 // Release the snapshot before publishing idle. On Windows,
@@ -194,5 +192,22 @@ mod tests {
                 .all(|name| name.starts_with("bifrost-index-build-")),
             "nested warm parallelism escaped to non-build workers: {worker_names:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+
+    #[test]
+    fn idle_warmer_state_is_coordination_without_source_inputs() {
+        let analyzer = MultiAnalyzer::default();
+        let warmer = IndexWarmer::new();
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            warmer.wait_until_idle();
+            assert!(warmer.state.lock().unwrap().pending.is_none());
+        });
+        assert!(reads.keys().is_empty());
     }
 }

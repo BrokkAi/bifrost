@@ -1170,6 +1170,22 @@ pub struct ResolutionDefinitionUnitFact {
     pub unit: CodeUnit,
 }
 
+/// A producer-selected name for blob candidate membership. Consumers confirm
+/// ownership from the candidate blob's own rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ResolutionNameLookupKind {
+    EmbeddedType,
+    InterfaceMethod,
+    SupertypeName,
+}
+
+/// The positioned identifier carrying a candidate lookup name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionNameLookupFact {
+    pub site: ResolutionSiteId,
+    pub kind: ResolutionNameLookupKind,
+}
+
 /// A member whose owner is a pending type lookup rather than a local type
 /// declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1423,6 +1439,13 @@ pub struct ResolutionRootImportFact {
     /// import takes effect at; lowering starts the import's route at that
     /// position's checkpoint in the scope timeline.
     pub position: Option<usize>,
+}
+
+/// A source import visible in every file of the caller's own compilations.
+/// Presence is the marker; ordinary lexical imports have no row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionCompilationImportFact {
+    pub import_site: ResolutionSiteId,
 }
 
 /// One source-order segment of a root import route.
@@ -2215,6 +2238,7 @@ pub struct FileResolutionFacts {
     pub import_routes: Vec<ResolutionImportRouteFact>,
     pub import_route_segments: Vec<ResolutionImportRouteSegmentFact>,
     pub root_imports: Vec<ResolutionRootImportFact>,
+    pub compilation_imports: Vec<ResolutionCompilationImportFact>,
     pub root_import_segments: Vec<ResolutionRootImportSegmentFact>,
     pub root_import_demands: Vec<ResolutionRootImportDemandFact>,
     pub root_import_kinds: Vec<ResolutionRootImportKindFact>,
@@ -2282,6 +2306,7 @@ pub struct FileResolutionFacts {
     pub callable_receivers: Vec<ResolutionCallableReceiverFact>,
     pub member_owners: Vec<ResolutionMemberOwnerFact>,
     pub deferred_member_owners: Vec<ResolutionDeferredMemberOwnerFact>,
+    pub name_lookups: Vec<ResolutionNameLookupFact>,
     /// Module declarations reached through environment routes rather than a
     /// lexical binder. Python file modules use selected import providers.
     /// Rust module declarations can use a crate-level module walk, not
@@ -2633,6 +2658,7 @@ impl FileResolutionFacts {
             && self.import_routes.is_empty()
             && self.import_route_segments.is_empty()
             && self.root_imports.is_empty()
+            && self.compilation_imports.is_empty()
             && self.root_import_segments.is_empty()
             && self.root_import_demands.is_empty()
             && self.root_import_kinds.is_empty()
@@ -2687,6 +2713,7 @@ impl FileResolutionFacts {
             && self.callable_receivers.is_empty()
             && self.member_owners.is_empty()
             && self.deferred_member_owners.is_empty()
+            && self.name_lookups.is_empty()
             && self.route_owned_module_declarations.is_empty()
             && self.keyword_references.is_empty()
             && self.declared_type_relations.is_empty()
@@ -2895,6 +2922,7 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.import_routes))
             .saturating_add(rows(&self.import_route_segments))
             .saturating_add(rows(&self.root_imports))
+            .saturating_add(rows(&self.compilation_imports))
             .saturating_add(rows(&self.root_import_segments))
             .saturating_add(rows(&self.root_import_demands))
             .saturating_add(rows(&self.root_import_kinds))
@@ -2977,6 +3005,7 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.callable_receivers))
             .saturating_add(rows(&self.member_owners))
             .saturating_add(rows(&self.deferred_member_owners))
+            .saturating_add(rows(&self.name_lookups))
             .saturating_add(rows(&self.declared_type_relations))
             .saturating_add(rows(&self.relation_members))
             .saturating_add(rows(&self.engine_rule_eligibilities))

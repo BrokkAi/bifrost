@@ -639,30 +639,17 @@ mod tests {
         PreparedSourceOrigin, PreparedSyntaxSource,
     };
     use brokk_bifrost_core::analyzer::tree_walk::node_range;
-    use brokk_bifrost_jvm::java::declarations::parse_tree;
     use std::sync::Arc;
 
+    #[track_caller]
     fn catch_shapes(source: &str) -> Vec<HandlerBodyShape> {
-        let tree = parse_tree(source).expect("Java grammar parses source");
-        let catches = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
-            tree.root_node(),
+        shapes_with(
+            source,
+            tree_sitter_java::LANGUAGE.into(),
+            Language::Java,
             "catch_clause",
+            java_catch_body_shape,
         )
-        .into_iter()
-        .map(node_range)
-        .collect::<Vec<_>>();
-        let prepared = PreparedSyntaxTree::new(
-            PreparedSyntaxSource::Exact(Arc::from(source)),
-            tree,
-            vec![0],
-            LanguageDialect::Standard(Language::Java),
-            PreparedSourceOrigin::Disk,
-            None,
-        );
-        catches
-            .into_iter()
-            .map(|catch| java_catch_body_shape(&prepared, catch))
-            .collect()
     }
 
     #[test]
@@ -755,13 +742,13 @@ mod tests {
         }
     }
 
-    fn shapes_with(
+    #[track_caller]
+    fn prepared_shapes(
         source: &str,
         language: tree_sitter::Language,
         dialect: Language,
         handler_kind: &str,
-        classify: fn(&PreparedSyntaxTree, Range) -> HandlerBodyShape,
-    ) -> Vec<HandlerBodyShape> {
+    ) -> (PreparedSyntaxTree, Vec<Range>) {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).expect("grammar loads");
         let tree = parser.parse(source, None).expect("source parses");
@@ -780,6 +767,18 @@ mod tests {
             PreparedSourceOrigin::Disk,
             None,
         );
+        (prepared, handlers)
+    }
+
+    #[track_caller]
+    fn shapes_with(
+        source: &str,
+        language: tree_sitter::Language,
+        dialect: Language,
+        handler_kind: &str,
+        classify: fn(&PreparedSyntaxTree, Range) -> HandlerBodyShape,
+    ) -> Vec<HandlerBodyShape> {
+        let (prepared, handlers) = prepared_shapes(source, language, dialect, handler_kind);
         handlers
             .into_iter()
             .map(|handler| classify(&prepared, handler))
@@ -812,26 +811,13 @@ mod tests {
         .collect()
     }
 
+    #[track_caller]
     fn scala_shapes(source: &str) -> Vec<ScalaCatchBodyShape> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&brokk_bifrost_jvm::scala::language::LANGUAGE.into())
-            .expect("Scala grammar loads");
-        let tree = parser.parse(source, None).expect("Scala source parses");
-        let catches = brokk_bifrost_core::analyzer::exception_handling::collect_nodes_by_kind(
-            tree.root_node(),
+        let (prepared, catches) = prepared_shapes(
+            source,
+            brokk_bifrost_jvm::scala::language::LANGUAGE.into(),
+            Language::Scala,
             "catch_clause",
-        )
-        .into_iter()
-        .map(node_range)
-        .collect::<Vec<_>>();
-        let prepared = PreparedSyntaxTree::new(
-            PreparedSyntaxSource::Exact(Arc::from(source)),
-            tree,
-            vec![0],
-            LanguageDialect::Standard(Language::Scala),
-            PreparedSourceOrigin::Disk,
-            None,
         );
         catches
             .into_iter()

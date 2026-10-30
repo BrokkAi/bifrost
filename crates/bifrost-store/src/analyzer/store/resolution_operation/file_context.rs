@@ -177,8 +177,9 @@ impl SelectedResolutionOperation<'_, '_> {
                 return Ok(Some(members));
             }
         }
-        let super::package_context::SelectedPackageRows::Ready(members) =
-            self.selected_package_members_by_lookup(peer, cancellation)?
+        let super::package_context::SelectedPackageRows::Ready(members) = self
+            .ready
+            .selected_package_members_by_lookup(peer, cancellation)?
         else {
             return Ok(None);
         };

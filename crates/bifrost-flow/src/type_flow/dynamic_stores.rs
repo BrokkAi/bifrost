@@ -373,7 +373,7 @@ fn field_value_write_receiver_bounds(
     let Some((owner, member)) = &prepared[index].receiver_field else {
         return StructuralWriteReceiverBound::NotApplicable;
     };
-    let Some(slot) = slots.slot(owner, member) else {
+    let Some(slot) = slots.slot(workspace, adapter, owner, member) else {
         return StructuralWriteReceiverBound::Unbounded(UnknownReason::FieldSlotIncomplete);
     };
     let hierarchy = adapter.class_hierarchy(workspace, owner);

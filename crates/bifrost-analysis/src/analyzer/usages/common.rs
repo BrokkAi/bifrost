@@ -156,3 +156,127 @@ pub fn with_relational_frontier<R>(
 }
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain;
+
+// These maps belong to one usage operation, which can serve several nested
+// read captures. Each immutable answer carries its own transitive inputs.
+pub(super) type QueryReadMemo<K, V> = crate::analyzer::workspace_authority::ReplayingMemo<
+    std::sync::Mutex<
+        crate::hash::HashMap<
+            K,
+            std::sync::Arc<
+                crate::analyzer::workspace_authority::ReplayingMemoEntry<
+                    V,
+                    crate::analyzer::ReadKey,
+                >,
+            >,
+        >,
+    >,
+>;
+
+pub(super) fn query_read_memo<K, V>() -> QueryReadMemo<K, V> {
+    crate::analyzer::workspace_authority::ReplayingMemo::new(std::sync::Mutex::new(
+        crate::hash::HashMap::default(),
+    ))
+}
+
+pub(super) fn query_memo_value<K: Clone + Eq + std::hash::Hash, V>(
+    memo: &QueryReadMemo<K, V>,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    key: &K,
+    build: impl FnOnce() -> V,
+) -> impl std::ops::Deref<Target = V> {
+    memo.read(
+        &crate::analyzer::workspace_authority::memo_attribution(analyzer),
+        |entries, capture| {
+            let mut entries = entries.lock().expect("usage read memo poisoned");
+            Ok::<_, std::convert::Infallible>(std::sync::Arc::clone(
+                entries
+                    .entry(key.clone())
+                    .or_insert_with(|| std::sync::Arc::new(capture.build(build))),
+            ))
+        },
+    )
+    .expect("usage memo acquisition is infallible")
+}
+
+/// A shared replay wrapper for the inputs of mutable request state. These
+/// requests can be restored by successive captures, so capture scoping alone
+/// cannot certify their hits.
+pub(crate) type QueryMemoReads = crate::analyzer::workspace_authority::ReplayingMemo<
+    Option<
+        std::sync::Arc<
+            crate::analyzer::workspace_authority::ReplayingMemoEntry<(), crate::analyzer::ReadKey>,
+        >,
+    >,
+>;
+
+pub(crate) fn capture_memo_reads<T>(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    build: impl FnOnce() -> T,
+) -> (T, QueryMemoReads) {
+    let mut reads = QueryMemoReads::default();
+    let mut value = None;
+    reads
+        .read_mut(
+            &crate::analyzer::workspace_authority::memo_attribution(analyzer),
+            |slot, capture| {
+                let entry = std::sync::Arc::new(capture.build(|| {
+                    value = Some(build());
+                }));
+                *slot = Some(std::sync::Arc::clone(&entry));
+                Ok::<_, std::convert::Infallible>(entry)
+            },
+        )
+        .expect("request input capture is infallible");
+    (value.expect("request builder ran"), reads)
+}
+
+pub(crate) fn replay_memo_reads(reads: &QueryMemoReads, analyzer: &dyn crate::analyzer::IAnalyzer) {
+    reads
+        .read(
+            &crate::analyzer::workspace_authority::memo_attribution(analyzer),
+            |slot, _| {
+                Ok::<_, std::convert::Infallible>(std::sync::Arc::clone(
+                    slot.as_ref().expect("request inputs initialized"),
+                ))
+            },
+        )
+        .expect("request input replay is infallible");
+}
+
+pub(crate) fn memo_read_bytes(reads: &QueryMemoReads) -> usize {
+    reads.account(|slot| {
+        slot.as_ref().map_or(0, |entry| {
+            entry.retained_bytes(|key| {
+                let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::default();
+                crate::analyzer::store::cache_budget::retained_read_key(&mut heap, key);
+                heap.total()
+            })
+        })
+    })
+}
+
+#[cfg(test)]
+mod memo_read_tests {
+    use super::*;
+    use crate::analyzer::semantic::StableDigest;
+    use crate::analyzer::{IAnalyzer, MultiAnalyzer, ReadKey, capture_query_reads};
+
+    #[test]
+    fn restored_query_state_replays_reads_from_an_uncaptured_build() {
+        let analyzer = MultiAnalyzer::default();
+        let key = ReadKey::Configuration(StableDigest::sha256(b"query state input"));
+        let (value, receipt) = capture_memo_reads(&analyzer, || {
+            analyzer.record_read(key.clone());
+            analyzer.record_unattributed_read();
+            37
+        });
+        assert_eq!(value, 37);
+        for _ in 0..2 {
+            let (_, reads) =
+                capture_query_reads(&analyzer, || replay_memo_reads(&receipt, &analyzer));
+            assert_eq!(reads.keys(), vec![key.clone()]);
+            assert_eq!(reads.unattributed_reads(), 1);
+        }
+    }
+}

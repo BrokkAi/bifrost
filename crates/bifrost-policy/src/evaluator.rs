@@ -2567,7 +2567,7 @@ fn sliced_match_candidates(
         workspace_files: &workspace_files,
         subject_batch,
     };
-    let mut reuse = UnitReuse::new(policy, incremental, budget);
+    let mut reuse = UnitReuse::new(policy, incremental, budget, &context.flow_resources());
     let sliced = sliced_query_units(
         policy,
         &executable,

@@ -1,4 +1,5 @@
 use super::DerivationExecutionCause;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
@@ -342,9 +343,10 @@ pub(super) struct SemanticQueryContext<'a> {
     active_retained_bytes: usize,
     peak_retained_bytes: usize,
     traversal_steps: usize,
-    indexed_source_identities: HashMap<ProjectFile, Option<ContentIdentity>>,
-    source_call_indexes: HashMap<ProjectFile, Option<SemanticSourceCallIndex>>,
-    prepared_source_dispatch: Vec<PreparedSourceDispatchCache<'a>>,
+    indexed_source_identities: CaptureScopedMemo<HashMap<ProjectFile, Option<ContentIdentity>>>,
+    source_call_indexes:
+        CaptureScopedMemo<HashMap<ProjectFile, Option<Arc<SemanticSourceCallIndex>>>>,
+    prepared_source_dispatch: CaptureScopedMemo<Vec<PreparedSourceDispatchCache<'a>>>,
     budget_exhausted: bool,
     typestate: TypestateQueryState,
     value_flow: ValueFlowQueryState,
@@ -487,6 +489,10 @@ fn callback_invoked_formals(
 }
 
 impl<'a> SemanticQueryContext<'a> {
+    pub(super) fn analyzer(&self) -> &'a dyn crate::analyzer::IAnalyzer {
+        self.workspace.analyzer()
+    }
+
     pub(super) fn prefetch_call_bindings(
         &self,
         bindings: &mut crate::analyzer::usages::call_relations::CallBindingCache,
@@ -690,9 +696,9 @@ impl<'a> SemanticQueryContext<'a> {
             active_retained_bytes: 0,
             peak_retained_bytes: artifact_lease_bytes,
             traversal_steps: 0,
-            indexed_source_identities: HashMap::default(),
-            source_call_indexes: HashMap::default(),
-            prepared_source_dispatch: Vec::new(),
+            indexed_source_identities: CaptureScopedMemo::default(),
+            source_call_indexes: CaptureScopedMemo::default(),
+            prepared_source_dispatch: CaptureScopedMemo::default(),
             budget_exhausted: false,
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
@@ -810,9 +816,14 @@ impl<'a> SemanticQueryContext<'a> {
     ) -> Option<PreparedSourceDispatchCache<'a>> {
         let position = self
             .prepared_source_dispatch
-            .iter()
-            .position(|prepared| &prepared.file == file)?;
-        let prepared = self.prepared_source_dispatch.remove(position);
+            .read(&memo_attribution(self.workspace.analyzer()), |prepared| {
+                prepared.iter().position(|prepared| &prepared.file == file)
+            })?;
+        let prepared = self
+            .prepared_source_dispatch
+            .read_mut(&memo_attribution(self.workspace.analyzer()), |prepared| {
+                prepared.remove(position)
+            });
         self.unaccount_prepared_source_dispatch(&prepared);
         Some(prepared)
     }
@@ -836,7 +847,10 @@ impl<'a> SemanticQueryContext<'a> {
     /// Drop every retained file's syntax. Retained syntax is optional, so any
     /// mandatory row, lease, or budget decision may displace all of it.
     fn evict_prepared_source_dispatch(&mut self) {
-        for prepared in std::mem::take(&mut self.prepared_source_dispatch) {
+        for prepared in self
+            .prepared_source_dispatch
+            .read_mut(&memo_attribution(self.workspace.analyzer()), std::mem::take)
+        {
             self.unaccount_prepared_source_dispatch(&prepared);
         }
     }
@@ -868,14 +882,26 @@ impl<'a> SemanticQueryContext<'a> {
             return;
         }
         self.record_active_retained_bytes(retained_bytes);
-        self.prepared_source_dispatch
-            .push(PreparedSourceDispatchCache {
-                file,
-                session,
-                retained_bytes,
-            });
-        if self.prepared_source_dispatch.len() > PREPARED_SOURCE_DISPATCH_FILE_CAP {
-            let evicted = self.prepared_source_dispatch.remove(0);
+        self.prepared_source_dispatch.read_mut(
+            &memo_attribution(self.workspace.analyzer()),
+            |prepared| {
+                prepared.push(PreparedSourceDispatchCache {
+                    file,
+                    session,
+                    retained_bytes,
+                })
+            },
+        );
+        if self
+            .prepared_source_dispatch
+            .read(&memo_attribution(self.workspace.analyzer()), Vec::len)
+            > PREPARED_SOURCE_DISPATCH_FILE_CAP
+        {
+            let evicted = self
+                .prepared_source_dispatch
+                .read_mut(&memo_attribution(self.workspace.analyzer()), |prepared| {
+                    prepared.remove(0)
+                });
             self.unaccount_prepared_source_dispatch(&evicted);
         }
     }
@@ -891,9 +917,12 @@ impl<'a> SemanticQueryContext<'a> {
         crate::analyzer::semantic::SemanticProviderError,
     > {
         assert!(
-            self.prepared_source_dispatch
-                .iter()
-                .all(|cached| !cached.session.has_definition_operation()),
+            self.prepared_source_dispatch.read(
+                &memo_attribution(self.workspace.analyzer()),
+                |prepared| prepared
+                    .iter()
+                    .all(|cached| !cached.session.has_definition_operation())
+            ),
             "release the previous file operation before resolving the next file"
         );
         session.enable_definition_operation_reuse();
@@ -923,9 +952,14 @@ impl<'a> SemanticQueryContext<'a> {
 
     /// Close reader-backed file operations before yielding to another step.
     pub(super) fn release_definition_operations(&mut self) {
-        for cached in &mut self.prepared_source_dispatch {
-            cached.session.release_definition_operation();
-        }
+        self.prepared_source_dispatch.read_mut(
+            &memo_attribution(self.workspace.analyzer()),
+            |prepared| {
+                for cached in prepared {
+                    cached.session.release_definition_operation();
+                }
+            },
+        );
     }
 
     fn prepared_dispatch_at_source(
@@ -1033,11 +1067,16 @@ impl<'a> SemanticQueryContext<'a> {
         use super::dispatch::{DispatchArm, DispatchSiteAnswer};
 
         // Release before materializing the next file: materialization may publish.
-        for cached in &mut self.prepared_source_dispatch {
-            if &cached.file != file {
-                cached.session.release_definition_operation();
-            }
-        }
+        self.prepared_source_dispatch.read_mut(
+            &memo_attribution(self.workspace.analyzer()),
+            |prepared| {
+                for cached in prepared {
+                    if &cached.file != file {
+                        cached.session.release_definition_operation();
+                    }
+                }
+            },
+        );
         if self
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
@@ -1463,9 +1502,18 @@ impl<'a> SemanticQueryContext<'a> {
         &mut self,
         file: &ProjectFile,
         artifact: &Arc<SemanticArtifact>,
-    ) -> Option<&SemanticSourceCallIndex> {
-        if self.source_call_indexes.contains_key(file) {
-            return self.source_call_indexes.get(file).and_then(Option::as_ref);
+    ) -> Option<Arc<SemanticSourceCallIndex>> {
+        if self
+            .source_call_indexes
+            .read(&memo_attribution(self.workspace.analyzer()), |indexes| {
+                indexes.contains_key(file)
+            })
+        {
+            return self
+                .source_call_indexes
+                .read(&memo_attribution(self.workspace.analyzer()), |indexes| {
+                    indexes.get(file).cloned().flatten()
+                });
         }
         if self
             .cancellation
@@ -1588,7 +1636,10 @@ impl<'a> SemanticQueryContext<'a> {
             self.reject_retained_bytes_error(file, error);
             return None;
         }
-        self.source_call_indexes.get(file).and_then(Option::as_ref)
+        self.source_call_indexes
+            .read(&memo_attribution(self.workspace.analyzer()), |indexes| {
+                indexes.get(file).cloned().flatten()
+            })
     }
 
     fn retain_source_call_index_entry(
@@ -1608,8 +1659,9 @@ impl<'a> SemanticQueryContext<'a> {
         );
         assert!(
             self.source_call_indexes
-                .insert(file.clone(), index)
-                .is_none(),
+                .read_mut(&memo_attribution(self.workspace.analyzer()), |indexes| {
+                    indexes.insert(file.clone(), index.map(Arc::new)).is_none()
+                }),
             "one semantic source-call index is retained per file"
         );
         if let Some(reservation) = live_reservation {
@@ -2098,15 +2150,17 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         identity: ContentIdentity,
     ) -> bool {
-        let current = *self
-            .indexed_source_identities
-            .entry(file.clone())
-            .or_insert_with(|| {
-                self.workspace
-                    .analyzer()
-                    .indexed_source(file)
-                    .map(|source| ContentIdentity::hash_bytes(source.as_bytes()))
-            });
+        let current = self.indexed_source_identities.read_mut(
+            &memo_attribution(self.workspace.analyzer()),
+            |identities| {
+                *identities.entry(file.clone()).or_insert_with(|| {
+                    self.workspace
+                        .analyzer()
+                        .indexed_source(file)
+                        .map(|source| ContentIdentity::hash_bytes(source.as_bytes()))
+                })
+            },
+        );
         if current == Some(identity) {
             return true;
         }
@@ -2222,7 +2276,7 @@ impl<'a> SemanticQueryContext<'a> {
     /// prevent the next consuming step from opening its first file window.
     pub(super) fn finish_reference_inventory(&mut self) {
         if self.cache.is_empty() {
-            self.indexed_source_identities.clear();
+            self.indexed_source_identities = CaptureScopedMemo::default();
         }
     }
 
@@ -3916,9 +3970,21 @@ impl<'a> SemanticQueryContext<'a> {
     /// an earlier semantic row family.
     pub(super) fn can_start_artifact_windows(&self) -> bool {
         self.cache.is_empty()
-            && self.indexed_source_identities.is_empty()
-            && self.source_call_indexes.is_empty()
-            && self.prepared_source_dispatch.is_empty()
+            && self
+                .indexed_source_identities
+                .read(&memo_attribution(self.workspace.analyzer()), |memo| {
+                    memo.is_empty()
+                })
+            && self
+                .source_call_indexes
+                .read(&memo_attribution(self.workspace.analyzer()), |memo| {
+                    memo.is_empty()
+                })
+            && self
+                .prepared_source_dispatch
+                .read(&memo_attribution(self.workspace.analyzer()), |memo| {
+                    memo.is_empty()
+                })
             && self.active_retained_bytes == 0
             && self.artifact_window.is_none()
             && self.artifact_window_file.is_none()
@@ -3982,8 +4048,8 @@ impl<'a> SemanticQueryContext<'a> {
         self.cache.clear();
         self.budget
             .release_unleased_artifacts(&self.artifact_leases);
-        self.indexed_source_identities.clear();
-        drop(std::mem::take(&mut self.source_call_indexes));
+        self.indexed_source_identities = CaptureScopedMemo::default();
+        self.source_call_indexes = CaptureScopedMemo::default();
         self.active_retained_bytes = 0;
         self.artifact_window_file = None;
         debug_assert_eq!(
@@ -4010,7 +4076,10 @@ impl<'a> SemanticQueryContext<'a> {
         assert!(
             self.artifact_window.is_none()
                 && self.artifact_window_file.is_none()
-                && self.prepared_source_dispatch.is_empty(),
+                && self
+                    .prepared_source_dispatch
+                    .read(&memo_attribution(self.workspace.analyzer()), |memo| memo
+                        .is_empty()),
             "the pipeline releases its final result-contract file window"
         );
         let artifact_charge = self.artifact_leases.into_charge();
@@ -5133,6 +5202,22 @@ fn procedure_source_mapping(handle: &ProcedureHandle) -> &SourceMapping {
         .expect("validated procedure has a source mapping")
 }
 
+/// The exact callable extent, which may be wider than its declaration anchor.
+pub(super) fn procedure_callable_span(handle: &ProcedureHandle) -> SourceSpan {
+    handle
+        .semantics()
+        .source_mappings()
+        .iter()
+        .find(|mapping| {
+            mapping.kind == SourceMappingKind::Exact
+                && mapping.locator.role() == SemanticRole::SourceMapping
+        })
+        .unwrap_or_else(|| procedure_source_mapping(handle))
+        .locator
+        .anchor()
+        .span()
+}
+
 fn procedure_evidence(handle: &ProcedureHandle) -> &Evidence {
     handle
         .semantics()
@@ -5416,43 +5501,53 @@ mod tests {
         let first = project.file("src/lib.rs");
         let second = project.file("src/other.rs");
         context.dispatch_at_source(&first, range(source, "first()"));
-        assert!(
-            context
-                .prepared_source_dispatch
-                .iter()
-                .any(|cached| cached.file == first && cached.session.has_definition_operation())
-        );
+        assert!(context.prepared_source_dispatch.read(
+            &memo_attribution(context.workspace.analyzer()),
+            |entries| {
+                entries
+                    .iter()
+                    .any(|cached| cached.file == first && cached.session.has_definition_operation())
+            }
+        ));
         context.dispatch_at_source(&second, range(other, "crate::first()"));
-        assert!(
-            context
-                .prepared_source_dispatch
-                .iter()
-                .filter(|cached| cached.file != second)
-                .all(|cached| !cached.session.has_definition_operation())
-        );
+        assert!(context.prepared_source_dispatch.read(
+            &memo_attribution(context.workspace.analyzer()),
+            |entries| {
+                entries
+                    .iter()
+                    .filter(|cached| cached.file != second)
+                    .all(|cached| !cached.session.has_definition_operation())
+            }
+        ));
         context.dispatch_at_source(&first, range(source, "second()"));
-        assert!(
-            context
-                .prepared_source_dispatch
-                .iter()
-                .any(|cached| cached.file == first && cached.session.has_definition_operation())
-        );
+        assert!(context.prepared_source_dispatch.read(
+            &memo_attribution(context.workspace.analyzer()),
+            |entries| {
+                entries
+                    .iter()
+                    .any(|cached| cached.file == first && cached.session.has_definition_operation())
+            }
+        ));
         assert!(overlay.set(second.abs_path(), format!("{other}pub fn added() {{}}\n")));
         context.dispatch_at_source(&first, range(source, "third()"));
         assert!(
-            context
-                .prepared_source_dispatch
-                .iter()
-                .all(|cached| !cached.session.has_definition_operation()),
+            context.prepared_source_dispatch.read(
+                &memo_attribution(context.workspace.analyzer()),
+                |entries| entries
+                    .iter()
+                    .all(|cached| !cached.session.has_definition_operation())
+            ),
             "stale native state is discarded"
         );
         context.release_definition_operations();
-        assert!(
-            context
-                .prepared_source_dispatch
-                .iter()
-                .all(|cached| !cached.session.has_definition_operation())
-        );
+        assert!(context.prepared_source_dispatch.read(
+            &memo_attribution(context.workspace.analyzer()),
+            |entries| {
+                entries
+                    .iter()
+                    .all(|cached| !cached.session.has_definition_operation())
+            }
+        ));
     }
 
     #[test]
@@ -5676,11 +5771,12 @@ mod tests {
             calibration_answer.outcome, "resolved",
             "{calibration_answer:#?}"
         );
-        let prepared_bytes = calibration
-            .prepared_source_dispatch
-            .last()
-            .expect("the default cap retains calibrated dispatch syntax")
-            .retained_bytes;
+        let prepared_bytes = calibration.prepared_source_dispatch.account(|entries| {
+            entries
+                .last()
+                .expect("the default cap retains calibrated dispatch syntax")
+                .retained_bytes
+        });
         let mandatory_bytes = calibration
             .physical_retained_bytes()
             .checked_sub(prepared_bytes)
@@ -5719,12 +5815,14 @@ mod tests {
             .iter()
             .map(|arm| arm.target_id.clone())
             .collect::<Vec<_>>();
-        let prepared = fitting
-            .prepared_source_dispatch
-            .last()
-            .expect("an exactly fitting window retains its parsed dispatch session");
-        assert_eq!(prepared.retained_bytes, prepared_bytes);
-        assert_eq!(prepared.session.retained_bytes(), prepared.retained_bytes);
+        fitting.prepared_source_dispatch.account(|entries| {
+            let prepared = entries
+                .last()
+                .expect("an exactly fitting window retains its parsed dispatch session");
+            assert_eq!(prepared.retained_bytes, prepared_bytes);
+            assert_eq!(prepared.session.retained_bytes(), prepared.retained_bytes);
+            prepared.retained_bytes
+        });
         assert_eq!(
             fitting.physical_retained_bytes(),
             mandatory_bytes + prepared_bytes
@@ -5767,7 +5865,10 @@ mod tests {
             fitting_targets,
             "the optional-retention refusal falls back to the same one-shot answer"
         );
-        assert!(refusing.prepared_source_dispatch.is_empty());
+        assert!(refusing.prepared_source_dispatch.read(
+            &memo_attribution(refusing.workspace.analyzer()),
+            |entries| entries.is_empty()
+        ));
         assert_eq!(
             refusing.physical_retained_bytes(),
             mandatory_bytes,
@@ -5799,7 +5900,13 @@ mod tests {
             },
         );
         assert_eq!(no_call_answer.outcome, "unknown", "{no_call_answer:#?}");
-        assert!(no_call.prepared_source_dispatch.is_empty());
+        assert!(
+            no_call
+                .prepared_source_dispatch
+                .read(&memo_attribution(no_call.workspace.analyzer()), |entries| {
+                    entries.is_empty()
+                })
+        );
         assert_eq!(
             no_call.physical_retained_bytes(),
             mandatory_bytes,
@@ -5845,12 +5952,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!expected_targets.is_empty());
         let expected_unnamed_boundaries = answer.unnamed_boundaries.clone();
-        let prepared = calibration
-            .prepared_source_dispatch
-            .last()
-            .expect("the default cap retains the cross-file caller syntax");
-        let prepared_bytes = prepared.retained_bytes;
-        assert_eq!(prepared.session.retained_bytes(), prepared_bytes);
+        let prepared_bytes = calibration.prepared_source_dispatch.account(|entries| {
+            let prepared = entries
+                .last()
+                .expect("the default cap retains the cross-file caller syntax");
+            let prepared_bytes = prepared.retained_bytes;
+            assert_eq!(prepared.session.retained_bytes(), prepared_bytes);
+            prepared_bytes
+        });
         let mandatory_bytes = calibration
             .physical_retained_bytes()
             .checked_sub(prepared_bytes)
@@ -5910,7 +6019,13 @@ mod tests {
                 .all(|arm| arm.proof == "proven" && arm.completeness == "complete"),
             "the optional-cache refusal leaves the complete target answer unchanged"
         );
-        assert!(fitting.prepared_source_dispatch.is_empty());
+        assert!(
+            fitting
+                .prepared_source_dispatch
+                .read(&memo_attribution(fitting.workspace.analyzer()), |entries| {
+                    entries.is_empty()
+                })
+        );
         assert_eq!(fitting.physical_retained_bytes(), mandatory_bytes);
         assert!(
             fitting
@@ -6034,7 +6149,14 @@ mod tests {
         );
         drop(artifact);
         fitting.release_artifact_window();
-        assert_eq!(fitting.source_call_indexes.capacity(), 0);
+        assert_eq!(
+            fitting
+                .source_call_indexes
+                .read(&memo_attribution(fitting.workspace.analyzer()), |indexes| {
+                    indexes.capacity()
+                }),
+            0
+        );
         assert_eq!(fitting.active_retained_bytes, 0);
 
         let refusing_limit = artifact_and_source_bytes + reservation_bytes - 1;

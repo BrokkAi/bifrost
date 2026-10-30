@@ -43,7 +43,6 @@ use brokk_bifrost_jvm::java::hierarchy::{
     JavaExternalRootHierarchyStatus, build_java_direct_descendant_index,
     build_java_external_root_hierarchy, java_direct_ancestors,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use brokk_bifrost_core::analyzer::capabilities::{
@@ -51,32 +50,19 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_jvm::intrinsics::{implicit_interface_members, overridable_method_inventory};
 use brokk_bifrost_jvm::java::graph_support::{
-    java_type_name_candidate_fqns, resolve_java_forward_type_name, resolve_java_lexical_type_name,
+    java_type_name_candidate_fqns, resolve_java_lexical_type_name,
 };
 
 impl TypeHierarchyProvider for JavaAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-jvm-analysis/src/analyzer/java/hierarchy.rs",
-            );
-
-        let ancestors = java_direct_ancestors(self, token, code_unit);
-        {
-            let cache_key = code_unit.clone();
-            let cache_value = Arc::new(ancestors.clone());
-            persistent_fill_guard.installed("direct_ancestors");
-            self.memo_caches
-                .direct_ancestors
-                .insert(cache_key, cache_value);
-        };
-        ancestors
+        crate::analyzer::jvm::hierarchy::memoized_ancestors(
+            &self.memo_caches.direct_ancestors,
+            self,
+            code_unit,
+            || java_direct_ancestors(self, token, code_unit),
+        )
     }
 
     fn member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
@@ -85,7 +71,7 @@ impl TypeHierarchyProvider for JavaAnalyzer {
         let mut unread = Vec::new();
         for name in self.raw_supertypes_of(owner) {
             if resolve_java_lexical_type_name(self, owner, &name)
-                .or_else(|| resolve_java_forward_type_name(self, token, owner.source(), &name))
+                .or_else(|| self.resolve_imported_type_name(token, owner.source(), &name))
                 .is_none()
             {
                 unread.push(UnreadMemberFamilyAncestor {
@@ -180,6 +166,11 @@ impl TypeHierarchyProvider for JavaAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
+        crate::analyzer::jvm::authority::source_read(
+            self,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JavaDescendantIndex,
+        );
+
         let descendants = descendants_from_variant_index(
             &self.memo_caches.direct_descendant_index,
             scope,
@@ -359,65 +350,15 @@ impl JavaAnalyzer {
             return ExternalMemberFamilyAnswer::stopped(status, hierarchy.visited);
         }
 
-        let mut visited = hierarchy.visited;
-        let mut candidates = Vec::new();
-        for descendant in hierarchy.descendants {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return ExternalMemberFamilyAnswer::stopped(
-                    ExternalMemberFamilyStatus::Cancelled,
-                    visited,
-                );
-            }
-            let children = analyzer.direct_children(&descendant);
-            if children.len() > max_visits.saturating_sub(visited) {
-                return ExternalMemberFamilyAnswer::stopped(
-                    ExternalMemberFamilyStatus::BudgetExhausted,
-                    visited,
-                );
-            }
-            visited += children.len();
-            let mut matching = Vec::new();
-            for candidate in children {
-                if !candidate.is_function() || candidate.identifier() != identity.member() {
-                    continue;
-                }
-                let Some(facts) = MemberFacts::read(analyzer, &candidate) else {
-                    return ExternalMemberFamilyAnswer::incomplete(
-                        ExternalMemberFamilyIncompleteReason::MemberFactsUnavailable,
-                        visited,
-                    );
-                };
-                if facts.universal_exclusion().is_some() || facts.is_static() {
-                    continue;
-                }
-                let Some(arity) = facts.arity() else {
-                    return ExternalMemberFamilyAnswer::incomplete(
-                        ExternalMemberFamilyIncompleteReason::MemberFactsUnavailable,
-                        visited,
-                    );
-                };
-                if arity.accepts(identity.arity()) {
-                    matching.push(candidate);
-                }
-            }
-            match matching.as_slice() {
-                [] => {}
-                [candidate] => candidates.push(candidate.clone()),
-                _ => {
-                    return ExternalMemberFamilyAnswer::incomplete(
-                        ExternalMemberFamilyIncompleteReason::OverloadIdentityUnproven,
-                        visited,
-                    );
-                }
-            }
-        }
-        candidates.sort();
-        candidates.dedup();
-        ExternalMemberFamilyAnswer {
-            status: ExternalMemberFamilyStatus::Complete,
-            candidates,
-            visited,
-        }
+        MemberFacts::external_descendant_family(
+            analyzer,
+            hierarchy.descendants,
+            hierarchy.visited,
+            identity.member(),
+            identity.arity(),
+            max_visits,
+            cancellation,
+        )
     }
 
     pub(crate) fn external_root_hierarchy(

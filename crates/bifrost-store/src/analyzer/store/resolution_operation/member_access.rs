@@ -1208,9 +1208,15 @@ pub(super) fn poll_member_access<Row>(
         if result.evidence.outcome == AccessOutcome::Open
             && result.completion == ResolutionCompletion::Complete
         {
+            // The reduction left this access open without recording why, and
+            // its completion unions `input`, so `input` is Complete too. Name
+            // the open access here: an unavailable root must carry a reason
+            // before a closure settles it.
             return Ok(Read::Unavailable {
                 reason: DemandRootUnavailableReason::IncompletePreparation,
-                completion: input,
+                completion: input.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(site.reference),
+                ])),
             });
         }
         return Ok(Read::ready(MemberAccessProgress::Ready(result)));
@@ -2382,6 +2388,83 @@ mod tests {
         });
     }
     #[test]
+    fn member_access_unprojected_complete_row_settles_with_reference_reason() {
+        #[derive(Debug)]
+        struct DeclaredRules;
+        impl MemberAccessRules<u32> for DeclaredRules {
+            fn classify_row(
+                &self,
+                context: &MemberAccessContext<'_>,
+                _: &u32,
+                target: Option<&SelectedMemberRouteTarget>,
+                _: AccessRowInput<'_>,
+            ) -> Result<AccessRowPoll> {
+                assert!(target.is_none());
+                Ok(AccessRowPoll::Ready(Read::ready(Box::new(
+                    row(
+                        context.provenance,
+                        0,
+                        0,
+                        AccessKey::Fixed(0),
+                        AccessKey::Fixed(0),
+                    )
+                    .facts,
+                ))))
+            }
+        }
+        fixture(|view, mut selection| {
+            selection.owners = vec![id("first")];
+            assert_eq!(selection.completion, ResolutionCompletion::Complete);
+            assert!(view.order_status(selection.order.unwrap()).complete);
+            let session = session();
+            let mut state = MemberAccessState::<u32>::new(&selection);
+            let site = MemberAccessSite {
+                session: &session,
+                selection: &selection,
+                provenance: view,
+                input_completion: &ResolutionCompletion::Complete,
+                reference: id("reference"),
+                lookup: id("lookup"),
+                step: 0,
+                namespace: ResolutionNamespace::Value,
+            };
+            let projections = std::cell::Cell::new(0);
+            let read = poll_member_access(
+                &mut state.rows,
+                &site,
+                &DeclaredRules,
+                &mut ProviderObservationStore::default(),
+                &mut ResolutionCompletion::Complete,
+                &mut ResolutionCompletion::Complete,
+                &CancellationToken::new(),
+                |_| Ok(Read::ready(vec![0])),
+                |_| {
+                    projections.set(projections.get() + 1);
+                    Ok(Read::ready(None))
+                },
+                || Ok(Read::ready(Vec::new())),
+            )
+            .unwrap();
+            assert_eq!(projections.get(), 1);
+            let Read::Unavailable { completion, .. } = read else {
+                panic!("a complete declared row without a target leaves access open");
+            };
+            // The source closer passes unavailable evidence to this checked
+            // constructor. A reasonless open access used to panic here.
+            let root = crate::analyzer::resolution::RootClosure::settled(completion);
+            assert!(matches!(
+                root,
+                crate::analyzer::resolution::RootClosure::Settled(_)
+            ));
+            assert_eq!(
+                root.completion(),
+                &ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(site.reference),
+                ])
+            );
+        });
+    }
+    #[test]
     fn member_access_empty_owner_keeps_its_observation_and_completion() {
         fixture(|view, selection| {
             let providers = ProviderObservationStore::default();
@@ -3007,7 +3090,7 @@ pub(crate) mod bridge_contract {
             &mut self,
             _: &DemandRelationKey,
             _: &[(DemandReferenceKey, &FactResolutionAnswer)],
-        ) -> Result<ResolutionCompletion> {
+        ) -> Result<crate::analyzer::resolution::RootClosure> {
             unreachable!("fixture lexical source is assembled")
         }
     }

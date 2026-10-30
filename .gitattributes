@@ -175,3 +175,9 @@ crates/workspace-hack/Cargo.toml text eol=lf
 
 # Native failure-handler diagnostics retain exact source byte offsets.
 tests/fixtures/golden/rql-control-analysis/failure-handler-identities/branches.* text eol=lf
+
+# Workspace memo classification is a tab-separated text contract.
+tests/suite_cross_language/workspace_authority_classification.tsv text eol=lf
+
+# The planner-statistics seek-plan test parses this source with include_str!.
+crates/bifrost-store/src/analyzer/store/mod.rs text eol=lf

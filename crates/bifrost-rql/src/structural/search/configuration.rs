@@ -22,6 +22,7 @@ use brokk_bifrost_analysis::analyzer::configuration::{
     decoded_properties_scalar_value, decoded_xml_scalar_value, decoded_yaml_scalar_value,
     ingest_configuration_document,
 };
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationCompleteness, ConfigurationDocumentFacts, ConfigurationFact, ConfigurationFactId,
     ConfigurationNodeKind, ConfigurationRouteSelector, ConfigurationValueProvenance,
@@ -211,26 +212,33 @@ pub(super) enum ConfigurationDocumentIngestion {
 /// one gap reports once.
 #[derive(Default)]
 pub(super) struct ConfigurationFactsTraversalCache {
-    documents: HashMap<ProjectFile, ConfigurationDocumentSnapshot>,
+    documents: CaptureScopedMemo<HashMap<ProjectFile, ConfigurationDocumentSnapshot>>,
     reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
 }
 
 impl ConfigurationFactsTraversalCache {
     /// Full immutable facts already ingested by this request, before any row
     /// predicate. Effective resolution must not lose shadowing declarations.
-    pub(super) fn ingested_document(&self, path: &str) -> Option<ConfigurationFactValue> {
-        self.documents.iter().find_map(|(file, snapshot)| {
-            if rel_path_string(file) != path {
-                return None;
-            }
-            let (document, source) = snapshot.document.as_ref()?;
-            Some(ConfigurationFactValue {
-                file: file.clone(),
-                document: Arc::clone(document),
-                source: Arc::clone(source),
-                index: 0,
+    pub(super) fn ingested_document(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        path: &str,
+    ) -> Option<ConfigurationFactValue> {
+        self.documents
+            .read(&memo_attribution(analyzer), |documents| {
+                documents.iter().find_map(|(file, snapshot)| {
+                    if rel_path_string(file) != path {
+                        return None;
+                    }
+                    let (document, source) = snapshot.document.as_ref()?;
+                    Some(ConfigurationFactValue {
+                        file: file.clone(),
+                        document: Arc::clone(document),
+                        source: Arc::clone(source),
+                        index: 0,
+                    })
+                })
             })
-        })
     }
     /// Ingest (or replay) one workspace configuration document. `None` only on
     /// cancellation; a supported-but-failed document yields `Some` with no
@@ -242,8 +250,13 @@ impl ConfigurationFactsTraversalCache {
         cancellation: Option<&CancellationToken>,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) -> Option<ConfigurationDocumentSnapshot> {
-        if let Some(cached) = self.documents.get(file) {
-            return Some(cached.clone());
+        if let Some(cached) = self
+            .documents
+            .read(&memo_attribution(analyzer), |documents| {
+                documents.get(file).cloned()
+            })
+        {
+            return Some(cached);
         }
         let project = analyzer.project();
         let snapshot = project.read_source_snapshot_limited(file, MAX_CONFIGURATION_DOCUMENT_BYTES);
@@ -269,7 +282,10 @@ impl ConfigurationFactsTraversalCache {
                     diagnostics,
                 );
                 let snapshot = ConfigurationDocumentSnapshot { document: None };
-                self.documents.insert(file.clone(), snapshot.clone());
+                self.documents
+                    .read_mut(&memo_attribution(analyzer), |documents| {
+                        documents.insert(file.clone(), snapshot.clone())
+                    });
                 return Some(snapshot);
             }
             Err(error) => {
@@ -295,7 +311,10 @@ impl ConfigurationFactsTraversalCache {
                     diagnostics,
                 );
                 let snapshot = ConfigurationDocumentSnapshot { document: None };
-                self.documents.insert(file.clone(), snapshot.clone());
+                self.documents
+                    .read_mut(&memo_attribution(analyzer), |documents| {
+                        documents.insert(file.clone(), snapshot.clone())
+                    });
                 return Some(snapshot);
             }
         };
@@ -355,27 +374,36 @@ impl ConfigurationFactsTraversalCache {
             }
         };
         let snapshot = ConfigurationDocumentSnapshot { document };
-        self.documents.insert(file.clone(), snapshot.clone());
+        self.documents
+            .read_mut(&memo_attribution(analyzer), |documents| {
+                documents.insert(file.clone(), snapshot.clone())
+            });
         Some(snapshot)
     }
 
     /// How the document at one workspace-relative path fared in this request.
     /// A cross-domain relation reads this to tell a declared document whose
     /// keys are all known from one whose absence would only look clean.
-    pub(super) fn ingestion_of(&self, rel_path: &str) -> ConfigurationDocumentIngestion {
-        let snapshot = self
-            .documents
-            .iter()
-            .find(|(file, _)| rel_path_string(file) == rel_path)
-            .map(|(_, snapshot)| snapshot);
-        match snapshot.map(|snapshot| &snapshot.document) {
-            None => ConfigurationDocumentIngestion::NotIngested,
-            Some(None) => ConfigurationDocumentIngestion::NoFacts,
-            Some(Some((facts, _))) if facts.completeness().is_complete() => {
-                ConfigurationDocumentIngestion::Complete
-            }
-            Some(Some(_)) => ConfigurationDocumentIngestion::Recovered,
-        }
+    pub(super) fn ingestion_of(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        rel_path: &str,
+    ) -> ConfigurationDocumentIngestion {
+        self.documents
+            .read(&memo_attribution(analyzer), |documents| {
+                let snapshot = documents
+                    .iter()
+                    .find(|(file, _)| rel_path_string(file) == rel_path)
+                    .map(|(_, snapshot)| snapshot);
+                match snapshot.map(|snapshot| &snapshot.document) {
+                    None => ConfigurationDocumentIngestion::NotIngested,
+                    Some(None) => ConfigurationDocumentIngestion::NoFacts,
+                    Some(Some((facts, _))) if facts.completeness().is_complete() => {
+                        ConfigurationDocumentIngestion::Complete
+                    }
+                    Some(Some(_)) => ConfigurationDocumentIngestion::Recovered,
+                }
+            })
     }
 
     fn report_file_incomplete(

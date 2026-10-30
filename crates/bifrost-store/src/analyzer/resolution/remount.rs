@@ -903,6 +903,7 @@ fn remount_common(
         additional_definition_namespaces,
         definition_unit_crosswalks,
         deferred_member_owners,
+        name_lookups,
         declared_type_relations,
         relation_members,
         declared_root_routes,
@@ -945,6 +946,14 @@ fn remount_common(
             return None;
         }
         remounted_deferred.push(remount_deferred_member_owner(row, translation));
+    }
+    let mut remounted_name_lookups = Vec::with_capacity(name_lookups.len());
+    for mut row in name_lookups {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        row.lookup = translation.semantic(row.lookup);
+        remounted_name_lookups.push(row);
     }
     let mut remounted_relations = Vec::with_capacity(declared_type_relations.len());
     for row in declared_type_relations {
@@ -1127,6 +1136,7 @@ fn remount_common(
     }
     let shared_language = LoweredSharedLanguageFacts {
         aliases: shared_language.aliases,
+        compilation_imports: shared_language.compilation_imports,
         call_argument_lists: shared_language.call_argument_lists,
         call_arguments: remounted_call_arguments,
         named_argument_labels: shared_language.named_argument_labels,
@@ -1146,6 +1156,7 @@ fn remount_common(
         remounted_additional,
         remounted_crosswalks,
         remounted_deferred,
+        remounted_name_lookups,
         remounted_relations,
         remounted_members,
         remounted_routes,

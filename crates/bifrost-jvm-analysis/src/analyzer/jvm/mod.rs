@@ -6,6 +6,7 @@
 //! Everything in this module is language-neutral by construction; per-language
 //! behaviour belongs in `crate::analyzer::{java, scala, kotlin}`.
 
+pub(crate) mod authority;
 pub(crate) mod dependency_discovery;
 #[doc(hidden)]
 pub mod external;
@@ -19,6 +20,7 @@ pub(crate) mod kotlin_artifact;
 pub mod native_points;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
+pub(crate) mod scala_collection_contracts;
 pub(crate) mod toolchains_document;
 pub(crate) mod topology;
 
@@ -36,6 +38,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::Visibility;
 
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 
+use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType;
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_jvm::proof::{
     JvmActiveSemanticModel, JvmModelDisposition, JvmRetainedExternalIndex,
@@ -43,6 +46,29 @@ use brokk_bifrost_jvm::proof::{
 
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use tree_sitter::{Language, Node, Parser, Tree};
+
+pub(crate) fn intrinsic_call_type_converts(
+    source: IntrinsicCallType,
+    target: IntrinsicCallType,
+) -> bool {
+    use brokk_bifrost_jvm::java::primitives::{JavaPrimitive, primitive_converts};
+
+    if source == IntrinsicCallType::String || target == IntrinsicCallType::String {
+        return source == target;
+    }
+    let primitive = |ty| match ty {
+        IntrinsicCallType::Boolean => JavaPrimitive::Boolean,
+        IntrinsicCallType::Byte => JavaPrimitive::Byte,
+        IntrinsicCallType::Short => JavaPrimitive::Short,
+        IntrinsicCallType::Char => JavaPrimitive::Char,
+        IntrinsicCallType::Int => JavaPrimitive::Int,
+        IntrinsicCallType::Long => JavaPrimitive::Long,
+        IntrinsicCallType::Float => JavaPrimitive::Float,
+        IntrinsicCallType::Double => JavaPrimitive::Double,
+        IntrinsicCallType::String => unreachable!("String handled above"),
+    };
+    primitive_converts(primitive(source), primitive(target))
+}
 
 pub(crate) fn take_artifact_record(remaining: &mut usize, record_limit_hit: &mut bool) -> bool {
     if *remaining == 0 {

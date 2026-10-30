@@ -18,6 +18,8 @@
 //! A declaration whose source root differs from the reference's root is
 //! outside the workspace and passes unchanged, with no doubt.
 
+use brokk_bifrost_core::analyzer::memo_attribution::CaptureScopedMemo;
+
 use brokk_bifrost_core::CancellationToken;
 use brokk_bifrost_core::analyzer::capabilities::{
     AdditionalFileDependencies, DescendantIndexScope, FileDependencyFacts, ImportAnalysisProvider,
@@ -50,41 +52,46 @@ use crate::graph_support::{CSharpCompilationVisibility, CSharpSource, identity_v
 /// visible one passes unchanged.
 pub struct MembershipScopedSource<'a> {
     inner: &'a dyn CSharpSource,
+    read_capability: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
     reference: ProjectFile,
     /// Request-lifetime membership answers by declaring file.
     ///
     /// A `Mutex` rather than the request-local `RefCell` the analysis-side
     /// definition provider uses: this wrapper implements [`CSharpSource`],
     /// whose [`CodeUnitIndex`] supertrait requires `Send + Sync`.
-    answers: Arc<Mutex<HashMap<ProjectFile, Option<CSharpCompilationVisibility>>>>,
+    answers: Arc<CaptureScopedMemo<Mutex<VisibilityAnswers<ProjectFile>>>>,
     /// Request-lifetime visibility of type identities by fully qualified
     /// name: whether any physical part of the type is visible.
-    type_identities: Arc<Mutex<HashMap<String, Option<CSharpCompilationVisibility>>>>,
+    type_identities: Arc<CaptureScopedMemo<Mutex<VisibilityAnswers<String>>>>,
     /// Request-lifetime direct ancestors derived through this view, with
     /// whether the derivation admitted doubt.
-    direct_ancestors: Arc<Mutex<HashMap<CodeUnit, DoubtedAncestors>>>,
+    direct_ancestors: Arc<CaptureScopedMemo<Mutex<HashMap<CodeUnit, DoubtedAncestors>>>>,
     /// Declarations admitted although their membership is unproven. An
     /// `AtomicUsize` for the same `Sync` reason as `answers`.
     doubt: Arc<AtomicUsize>,
-    /// Owned filtered copies for methods that return borrowed slices.
-    static_types: OnceLock<Vec<CodeUnit>>,
-    usage_static_types: OnceLock<Vec<CodeUnit>>,
+    /// Query-owned filtered type lists shared by the source accessors.
+    static_types: CaptureScopedMemo<OnceLock<std::sync::Arc<Vec<CodeUnit>>>>,
+    usage_static_types: CaptureScopedMemo<OnceLock<std::sync::Arc<Vec<CodeUnit>>>>,
 }
 
 /// Direct ancestors and whether deriving them admitted doubt.
 type DoubtedAncestors = (Vec<CodeUnit>, bool);
 
+type VisibilityAnswers<K> = HashMap<K, Option<CSharpCompilationVisibility>>;
+
 impl<'a> MembershipScopedSource<'a> {
     pub fn new(inner: &'a dyn CSharpSource, reference: &ProjectFile) -> Self {
+        let read_capability = inner.read_capability();
         Self {
             inner,
+            read_capability,
             reference: reference.clone(),
             answers: Arc::default(),
             type_identities: Arc::default(),
             direct_ancestors: Arc::default(),
             doubt: Arc::default(),
-            static_types: OnceLock::new(),
-            usage_static_types: OnceLock::new(),
+            static_types: CaptureScopedMemo::default(),
+            usage_static_types: CaptureScopedMemo::default(),
         }
     }
 
@@ -123,28 +130,30 @@ impl<'a> MembershipScopedSource<'a> {
     /// The membership of `unit`'s file for the reference, `None` for a
     /// declaration outside the workspace (its own provenance applies).
     fn visibility(&self, unit: &CodeUnit) -> Option<Option<CSharpCompilationVisibility>> {
-        if unit.source().root() != self.reference.root() {
-            return None;
-        }
-        let cached = self
-            .answers
-            .lock()
-            .expect("membership answer cache poisoned")
-            .get(unit.source())
-            .copied();
-        Some(match cached {
-            Some(answer) => answer,
-            None => {
-                let answer = self
-                    .inner
-                    .compilation_visibility(&self.reference, unit.source());
-                self.answers
+        self.answers
+            .read(&self.read_capability.memo_attribution(), |answers_memo| {
+                if unit.source().root() != self.reference.root() {
+                    return None;
+                }
+                let cached = answers_memo
                     .lock()
                     .expect("membership answer cache poisoned")
-                    .insert(unit.source().clone(), answer);
-                answer
-            }
-        })
+                    .get(unit.source())
+                    .copied();
+                Some(match cached {
+                    Some(answer) => answer,
+                    None => {
+                        let answer = self
+                            .inner
+                            .compilation_visibility(&self.reference, unit.source());
+                        answers_memo
+                            .lock()
+                            .expect("membership answer cache poisoned")
+                            .insert(unit.source().clone(), answer);
+                        answer
+                    }
+                })
+            })
     }
 
     /// Admit one declaration on its own. A type is a physical part: an
@@ -171,33 +180,37 @@ impl<'a> MembershipScopedSource<'a> {
     /// Doubt for an unproven type part unless its type identity has a
     /// visible (or external) physical part.
     fn admit_unproven_part(&self, part: &CodeUnit) {
-        let fqn = part.fq_name();
-        let cached = self
-            .type_identities
-            .lock()
-            .expect("type identity cache poisoned")
-            .get(&fqn)
-            .copied();
-        let answer = match cached {
-            Some(answer) => answer,
-            None => {
-                let answer = identity_visibility(
-                    self.inner,
-                    &self.reference,
-                    &fqn,
-                    Some(part),
-                    CodeUnit::is_class,
-                );
-                self.type_identities
+        self.type_identities.read(
+            &self.read_capability.memo_attribution(),
+            |type_identities_memo| {
+                let fqn = part.fq_name();
+                let cached = type_identities_memo
                     .lock()
                     .expect("type identity cache poisoned")
-                    .insert(fqn, answer);
-                answer
-            }
-        };
-        if answer != Some(CSharpCompilationVisibility::Visible) {
-            self.add_doubt();
-        }
+                    .get(&fqn)
+                    .copied();
+                let answer = match cached {
+                    Some(answer) => answer,
+                    None => {
+                        let answer = identity_visibility(
+                            self.inner,
+                            &self.reference,
+                            &fqn,
+                            Some(part),
+                            CodeUnit::is_class,
+                        );
+                        type_identities_memo
+                            .lock()
+                            .expect("type identity cache poisoned")
+                            .insert(fqn, answer);
+                        answer
+                    }
+                };
+                if answer != Some(CSharpCompilationVisibility::Visible) {
+                    self.add_doubt();
+                }
+            },
+        )
     }
 
     /// Admit a candidate set. Types follow [`Self::admit`]. Members are
@@ -832,23 +845,27 @@ impl ImportAnalysisProvider for MembershipScopedSource<'_> {
 /// defaults over these two.
 impl TypeHierarchyProvider for MembershipScopedSource<'_> {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        let cached = self
-            .direct_ancestors
-            .lock()
-            .expect("direct ancestor cache poisoned")
-            .get(code_unit)
-            .cloned();
-        if let Some((ancestors, doubted)) = cached {
-            self.replay(doubted);
-            return ancestors;
-        }
-        let (ancestors, doubted) =
-            self.measured(|| self.inner.direct_ancestors_through(self, code_unit));
-        self.direct_ancestors
-            .lock()
-            .expect("direct ancestor cache poisoned")
-            .insert(code_unit.clone(), (ancestors.clone(), doubted));
-        ancestors
+        self.direct_ancestors.read(
+            &self.read_capability.memo_attribution(),
+            |direct_ancestors_memo| {
+                let cached = direct_ancestors_memo
+                    .lock()
+                    .expect("direct ancestor cache poisoned")
+                    .get(code_unit)
+                    .cloned();
+                if let Some((ancestors, doubted)) = cached {
+                    self.replay(doubted);
+                    return ancestors;
+                }
+                let (ancestors, doubted) =
+                    self.measured(|| self.inner.direct_ancestors_through(self, code_unit));
+                direct_ancestors_memo
+                    .lock()
+                    .expect("direct ancestor cache poisoned")
+                    .insert(code_unit.clone(), (ancestors.clone(), doubted));
+                ancestors
+            },
+        )
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
@@ -891,6 +908,10 @@ impl TypeHierarchyProvider for MembershipScopedSource<'_> {
 }
 
 impl CSharpSource for MembershipScopedSource<'_> {
+    fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        self.read_capability.clone()
+    }
+
     fn persisted_declaration_candidates_by_fqn(
         &self,
         fqn: &str,
@@ -1107,7 +1128,7 @@ impl CSharpSource for MembershipScopedSource<'_> {
             .using_aliases_of_limited(file, limit, continue_query)
     }
 
-    fn global_static_using_type_names(&self) -> &[String] {
+    fn global_static_using_type_names(&self) -> std::sync::Arc<Vec<String>> {
         self.inner.global_static_using_type_names()
     }
 
@@ -1120,18 +1141,37 @@ impl CSharpSource for MembershipScopedSource<'_> {
             .global_static_using_type_names_limited(limit, continue_query)
     }
 
-    fn global_static_using_types(&self) -> &[CodeUnit] {
-        self.static_types
-            .get_or_init(|| self.admit_vec(self.inner.global_static_using_types().iter().cloned()))
+    fn global_static_using_types(&self) -> std::sync::Arc<Vec<CodeUnit>> {
+        self.static_types.read(
+            &self.read_capability.memo_attribution(),
+            |static_types_memo| {
+                static_types_memo
+                    .get_or_init(|| {
+                        std::sync::Arc::new(
+                            self.admit_vec(self.inner.global_static_using_types().iter().cloned()),
+                        )
+                    })
+                    .clone()
+            },
+        )
     }
 
-    fn usage_global_static_using_types(&self) -> &[CodeUnit] {
-        self.usage_static_types.get_or_init(|| {
-            self.admit_vec(self.inner.usage_global_static_using_types().iter().cloned())
-        })
+    fn usage_global_static_using_types(&self) -> std::sync::Arc<Vec<CodeUnit>> {
+        self.usage_static_types.read(
+            &self.read_capability.memo_attribution(),
+            |usage_static_types_memo| {
+                usage_static_types_memo
+                    .get_or_init(|| {
+                        std::sync::Arc::new(self.admit_vec(
+                            self.inner.usage_global_static_using_types().iter().cloned(),
+                        ))
+                    })
+                    .clone()
+            },
+        )
     }
 
-    fn global_using_namespaces(&self) -> &HashSet<String> {
+    fn global_using_namespaces(&self) -> std::sync::Arc<HashSet<String>> {
         self.inner.global_using_namespaces()
     }
 
@@ -1152,7 +1192,7 @@ impl CSharpSource for MembershipScopedSource<'_> {
             .global_using_namespaces_limited(limit, continue_query)
     }
 
-    fn global_using_aliases(&self) -> &HashMap<String, String> {
+    fn global_using_aliases(&self) -> std::sync::Arc<HashMap<String, String>> {
         self.inner.global_using_aliases()
     }
 

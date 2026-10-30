@@ -6,7 +6,7 @@ mod rust_departing_wave2_root_tests {
 
     use brokk_bifrost_test_macros::hardwon;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_operation::tests::native_query_plan_tests::rust_wave2_root_test_support::registry as registry;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::tests::native_query_plan_tests::shared_support::registry as registry;
     fn unindexed_main_tables(
         conn: &rusqlite::Connection,
         sql: &str,

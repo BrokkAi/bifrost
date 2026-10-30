@@ -9,7 +9,7 @@
 use std::fmt;
 use std::mem::{size_of, size_of_val};
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 use crate::analyzer::invalidation::{
@@ -19,8 +19,7 @@ use crate::analyzer::semantic::{
     DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint,
     DispatchBoundaryKind, EvidenceCompleteness, ExecutionTiming, LengthDelimitedDigest,
     ProofStatus, SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest,
-    SynchronizationOperation, WorkspaceMountId, WorkspaceRelativePath,
-    is_unmaterialized_external_artifact_locator,
+    WorkspaceMountId, WorkspaceRelativePath, is_unmaterialized_external_artifact_locator,
 };
 use crate::analyzer::semantic_model::UnmaterializedExternalSummaryCallShapeBinding;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
@@ -203,15 +202,6 @@ impl SummaryProcedureSourceKey {
 }
 
 impl SummaryEventKey {
-    /// Derive the stable key shared by production projection and live replay
-    /// for one source-backed concurrency event.
-    pub fn from_concurrency_source(locator: &SemanticLocator, ordinal: usize) -> Self {
-        let mut digest = LengthDelimitedDigest::new(b"bifrost-production-concurrency-effect-v2");
-        locator.push_stable_identity(&mut digest);
-        digest.push(&ordinal.to_le_bytes());
-        Self::from_digest(digest.finish())
-    }
-
     /// Derive the stable key for one source call occurrence. The ordinal
     /// distinguishes nested or synthetic calls that share a source mapping.
     pub fn from_call_source(locator: &SemanticLocator, ordinal: usize) -> Self {
@@ -226,30 +216,6 @@ define_summary_digest!(
     SummaryLocationKey
 );
 
-impl SummaryLocationKey {
-    pub fn from_locator(locator: &SemanticLocator) -> Self {
-        let mut digest = LengthDelimitedDigest::new(b"bifrost-production-concurrency-location-v2");
-        // A field declaration is shared by accesses from different methods.
-        // The locator's enclosing declaration chain names the use site, so it
-        // must not enter the storage selector. Path, language, semantic role,
-        // and the source anchor identify the declaration-backed location.
-        digest.push(locator.path().as_str().as_bytes());
-        digest.push(locator.language().stable_label().as_bytes());
-        digest.push(locator.role().stable_label().as_bytes());
-        digest.push_anchor(locator.anchor());
-        Self::from_digest(digest.finish())
-    }
-
-    /// Name one allocation occurrence without conflating multiple semantic
-    /// allocations that share a source expression and locator.
-    pub fn from_allocation_source(locator: &SemanticLocator, ordinal: usize) -> Self {
-        let mut digest =
-            LengthDelimitedDigest::new(b"bifrost-production-concurrency-allocation-v1");
-        locator.push_stable_identity(&mut digest);
-        digest.push(&ordinal.to_le_bytes());
-        Self::from_digest(digest.finish())
-    }
-}
 define_summary_digest!(
     /// Content identity of one externally supplied semantic model.
     ExternalSummaryContentHash
@@ -508,29 +474,9 @@ impl ProcedureSummaryIdentity {
         fingerprint_procedure_identity(self)
     }
 
-    /// A checkout-independent fingerprint of this identity, for a read ledger
-    /// or any other record that must compare across two checkouts of the same
-    /// content.
-    ///
-    /// [`Self::fingerprint`] is mount-free only for external origins: the
-    /// workspace case folds `SemanticArtifactKey::fingerprint`, which carries
-    /// the `WorkspaceMountId` -- a hash of the absolute workspace root. A
-    /// `--diff-base` run analyzes the base at a temporary root, so a summary
-    /// named by that fingerprint could never match its head counterpart. This
-    /// takes the artifact's `public_fingerprint` instead and adds the
-    /// declaration locator's stable segments and the schema, semantics,
-    /// context and behavior keys, so it still separates two summaries of the
-    /// same procedure derived under different contracts.
-    pub fn public_fingerprint(&self) -> StableDigest {
-        self.checkout_independent_fingerprint(
-            b"bifrost-procedure-summary-public-identity-v1",
-            self.behavior.as_bytes(),
-        )
-    }
-
     /// The identity a read ledger names this summary by.
     ///
-    /// [`Self::public_fingerprint`] folds the behavior key, and the behavior
+    /// [`Self::fingerprint`] folds the behavior key, and the behavior
     /// key folds the whole workspace's content identity, so a summary named by
     /// it rotates on any edit anywhere -- and a root unit whose read set named
     /// summaries that way could never survive an unrelated edit. This folds the
@@ -1306,17 +1252,6 @@ pub enum SummaryConcurrencySynchronizationOperation {
     Acquire,
     Release,
     AcquireRelease,
-}
-
-impl From<SynchronizationOperation> for SummaryConcurrencySynchronizationOperation {
-    fn from(operation: SynchronizationOperation) -> Self {
-        match operation {
-            SynchronizationOperation::ChannelSend | SynchronizationOperation::ChannelClose => {
-                Self::Release
-            }
-            SynchronizationOperation::ChannelReceive => Self::Acquire,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2449,11 +2384,6 @@ impl SemanticProcedureSummary {
         &self.key
     }
 
-    /// The original procedure key represented by this composition's leftmost stage.
-    pub fn composition_root(&self) -> &ProcedureSummaryKey {
-        &self.composition_root
-    }
-
     pub fn recursive_topology(&self) -> &[SummaryRecursiveEdge] {
         &self.recursive_topology
     }
@@ -2819,14 +2749,6 @@ impl ExternalSummaryTarget {
             SemanticRole::Procedure,
             formal.anchor(),
         ))
-    }
-
-    pub fn matches(&self, locator: &SemanticLocator) -> bool {
-        locator.role() == SemanticRole::Procedure
-            && self.mount == locator.mount()
-            && self.path == *locator.path()
-            && self.language == locator.language()
-            && self.declaration == *locator.declaration()
     }
 
     fn compare_locator(&self, locator: &SemanticLocator) -> std::cmp::Ordering {
@@ -3321,10 +3243,6 @@ impl ExternalSemanticSummarySet {
             })
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// Conservative retained heap estimate for the set's boxed entries and
     /// their owned target and summary metadata.
     pub(crate) fn retained_heap_bytes(&self) -> usize {
@@ -3416,10 +3334,6 @@ impl CuratedCallModel {
         })
     }
 
-    pub fn model(&self) -> &ExternalSummaryModelId {
-        &self.model
-    }
-
     pub const fn content(&self) -> ExternalSummaryContentHash {
         self.content
     }
@@ -3451,7 +3365,7 @@ impl CuratedCallModel {
     }
 
     /// Conservative retained heap estimate for the model identifier and
-    /// transfer evidence owned by this model.
+    /// transfer evidence and effect payloads owned by this model.
     pub(crate) fn retained_heap_bytes(&self) -> usize {
         self.model.as_str().len().saturating_add(
             size_of_val(self.transfers())
@@ -3465,7 +3379,7 @@ impl CuratedCallModel {
                 .saturating_add(
                     self.effects
                         .iter()
-                        .map(|effect| evidence_heap_bytes(effect.evidence()))
+                        .map(effect_heap_bytes)
                         .fold(0_usize, usize::saturating_add),
                 ),
         )
@@ -4148,9 +4062,130 @@ impl DependentVerdict {
     }
 }
 
-/// Complete in-memory summaries with preflighted atomic SCC publication.
+fn record_retained_summary(
+    attribution: &crate::analyzer::workspace_authority::OwnedMemoCapability,
+    key: &ProcedureSummaryKey,
+    summary: Option<&SemanticProcedureSummary>,
+) {
+    SummaryReadRecorder::new(attribution.analyzer()).summary_read(
+        key.identity(),
+        summary.map_or_else(
+            crate::analyzer::read_ledger::absent_summary_digest,
+            SemanticProcedureSummary::public_content_digest,
+        ),
+        summary.map_or(&[], SemanticProcedureSummary::dependencies),
+    );
+}
+
+/// Query-owned reader and publisher of a bounded standalone repository.
 #[derive(Debug)]
 pub struct CompleteSummaryRepository {
+    storage: CompleteSummaryStorage,
+    attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+}
+
+impl CompleteSummaryRepository {
+    pub fn new(attribution: crate::analyzer::workspace_authority::OwnedMemoCapability) -> Self {
+        Self::with_limits(SummaryRepositoryLimits::default(), attribution)
+    }
+    pub fn with_limits(
+        limits: SummaryRepositoryLimits,
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+    ) -> Self {
+        Self {
+            storage: CompleteSummaryStorage::with_limits(limits),
+            attribution,
+        }
+    }
+    pub fn get(&self, key: &ProcedureSummaryKey) -> Option<&SemanticProcedureSummary> {
+        let answer = self.storage.get(key);
+        if answer.is_some() {
+            record_retained_summary(&self.attribution, key, answer);
+        }
+        answer
+    }
+    pub fn get_observed(
+        &self,
+        key: &ProcedureSummaryKey,
+        observer: &dyn SummaryReadObserver,
+    ) -> Option<&SemanticProcedureSummary> {
+        let answer = self.get(key);
+        observer.summary_read(
+            key.identity(),
+            answer.map_or_else(
+                crate::analyzer::read_ledger::absent_summary_digest,
+                SemanticProcedureSummary::public_content_digest,
+            ),
+            answer.map_or(&[], SemanticProcedureSummary::dependencies),
+        );
+        answer
+    }
+    pub fn publish(
+        &mut self,
+        summary: SemanticProcedureSummary,
+    ) -> Result<SummaryPublicationOutcome, SummaryPublicationError> {
+        self.storage.publish(summary)
+    }
+    pub fn publish_scc(
+        &mut self,
+        summaries: Vec<SemanticProcedureSummary>,
+    ) -> Result<SummaryPublicationOutcome, SummaryPublicationError> {
+        self.storage.publish_scc(summaries)
+    }
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+    pub const fn retained_bytes(&self) -> usize {
+        self.storage.retained_bytes()
+    }
+    pub const fn limits(&self) -> SummaryRepositoryLimits {
+        self.storage.limits()
+    }
+    pub fn clear(&mut self) {
+        self.storage.clear();
+    }
+    pub fn reverse_dependencies(&self) -> &SummaryReverseDependencyIndex {
+        self.record_index();
+        self.storage.reverse_dependencies()
+    }
+    pub fn dependents_of(
+        &self,
+        callee: &ProcedureSummaryIdentity,
+    ) -> impl Iterator<Item = &ProcedureSummaryKey> {
+        self.record_index();
+        self.storage.dependents_of(callee)
+    }
+    pub fn dependent_verdicts(
+        &self,
+        before: &SemanticProcedureSummary,
+        after: &SemanticProcedureSummary,
+    ) -> Result<Vec<DependentVerdict>, InvalidationReason> {
+        self.record_index();
+        self.storage.dependent_verdicts(before, after)
+    }
+    pub fn public_content_for_identity(&self, identity: StableDigest) -> Option<StableDigest> {
+        self.record_index();
+        self.storage.public_content_for_identity(identity)
+    }
+    fn record_index(&self) {
+        for summary in self.storage.entries.values() {
+            record_retained_summary(&self.attribution, summary.key(), Some(summary));
+        }
+        // Reverse lookup includes negative membership in this complete index.
+        self.attribution.analyzer().record_read(
+            self.attribution
+                .analyzer()
+                .workspace_scope_read_key(&crate::analyzer::Language::ALL),
+        );
+    }
+}
+
+/// Complete in-memory summaries with preflighted atomic SCC publication.
+#[derive(Debug)]
+struct CompleteSummaryStorage {
     entries: HashMap<ProcedureSummaryKey, SemanticProcedureSummary>,
     reverse_dependencies: SummaryReverseDependencyIndex,
     retained_bytes: usize,
@@ -4165,8 +4200,14 @@ pub struct CompleteSummaryRepository {
 /// the same content-keyed rows without exposing a lock guard or duplicating a
 /// cache per analysis family.
 #[derive(Debug)]
+pub(crate) struct ProductionSemanticSummaryStorage {
+    state: Mutex<CompleteSummaryStorage>,
+}
+
+#[derive(Debug)]
 pub struct ProductionSemanticSummaryRepository {
-    state: Mutex<CompleteSummaryRepository>,
+    storage: Arc<ProductionSemanticSummaryStorage>,
+    attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
 }
 
 /// One exact dependency closure recovered from retained complete summaries.
@@ -4202,10 +4243,6 @@ impl RetainedSemanticSummaryClosure {
             );
         }
     }
-
-    pub fn into_parts(self) -> (Vec<SemanticProcedureSummary>, Vec<Range<usize>>) {
-        (self.summaries, self.components)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4214,27 +4251,57 @@ enum RetainedSummaryComponent {
     Recursive(SummaryRecursiveGroupKey),
 }
 
-impl Default for ProductionSemanticSummaryRepository {
+impl Default for ProductionSemanticSummaryStorage {
     fn default() -> Self {
+        Self::with_limits(SummaryRepositoryLimits::default())
+    }
+}
+
+impl ProductionSemanticSummaryStorage {
+    pub(crate) fn with_limits(limits: SummaryRepositoryLimits) -> Self {
         Self {
-            state: Mutex::new(CompleteSummaryRepository::default()),
+            state: Mutex::new(CompleteSummaryStorage::with_limits(limits)),
+        }
+    }
+
+    pub(crate) fn reader(
+        self: &Arc<Self>,
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+    ) -> ProductionSemanticSummaryRepository {
+        ProductionSemanticSummaryRepository {
+            storage: Arc::clone(self),
+            attribution,
         }
     }
 }
 
 impl ProductionSemanticSummaryRepository {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(attribution: crate::analyzer::workspace_authority::OwnedMemoCapability) -> Self {
+        Self::with_limits(SummaryRepositoryLimits::default(), attribution)
     }
 
-    pub fn with_limits(limits: SummaryRepositoryLimits) -> Self {
-        Self {
-            state: Mutex::new(CompleteSummaryRepository::with_limits(limits)),
-        }
+    pub fn with_limits(
+        limits: SummaryRepositoryLimits,
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+    ) -> Self {
+        Arc::new(ProductionSemanticSummaryStorage::with_limits(limits)).reader(attribution)
+    }
+
+    fn record_summary(
+        &self,
+        key: &ProcedureSummaryKey,
+        summary: Option<&SemanticProcedureSummary>,
+    ) {
+        record_retained_summary(&self.attribution, key, summary);
     }
 
     pub fn get(&self, key: &ProcedureSummaryKey) -> Option<SemanticProcedureSummary> {
-        self.state().get(key).cloned()
+        let state = self.state();
+        let answer = state.get(key);
+        if answer.is_some() {
+            self.record_summary(key, answer);
+        }
+        answer.cloned()
     }
 
     /// [`Self::get`], announced to `observer` through the shared repository.
@@ -4243,7 +4310,10 @@ impl ProductionSemanticSummaryRepository {
         key: &ProcedureSummaryKey,
         observer: &dyn SummaryReadObserver,
     ) -> Option<SemanticProcedureSummary> {
-        self.state().get_observed(key, observer).cloned()
+        let state = self.state();
+        let answer = state.get_observed(key, observer);
+        self.record_summary(key, answer);
+        answer.cloned()
     }
 
     /// Recover the complete retained dependency closure for exact root
@@ -4258,7 +4328,9 @@ impl ProductionSemanticSummaryRepository {
         &self,
         roots: &[ProcedureSummaryIdentity],
     ) -> Option<RetainedSemanticSummaryClosure> {
-        self.state().complete_closure(roots)
+        let closure = self.state().complete_closure(roots)?;
+        closure.observe(&SummaryReadRecorder::new(self.attribution.analyzer()));
+        Some(closure)
     }
 
     /// The public content retained for one recorded summary identity.
@@ -4271,9 +4343,11 @@ impl ProductionSemanticSummaryRepository {
 
     pub fn contains_all(&self, summaries: &[SemanticProcedureSummary]) -> bool {
         let state = self.state();
-        summaries
-            .iter()
-            .all(|summary| state.get(summary.key()) == Some(summary))
+        summaries.iter().all(|summary| {
+            let retained = state.get(summary.key());
+            self.record_summary(summary.key(), retained);
+            retained == Some(summary)
+        })
     }
 
     /// Publish bottom-up summary components, keeping every recursive group
@@ -4329,32 +4403,21 @@ impl ProductionSemanticSummaryRepository {
         self.state().is_empty()
     }
 
-    pub fn retained_bytes(&self) -> usize {
-        self.state().retained_bytes()
-    }
-
-    pub fn limits(&self) -> SummaryRepositoryLimits {
-        self.state().limits()
-    }
-
-    fn state(&self) -> std::sync::MutexGuard<'_, CompleteSummaryRepository> {
-        self.state
+    fn state(&self) -> std::sync::MutexGuard<'_, CompleteSummaryStorage> {
+        self.storage
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
-impl Default for CompleteSummaryRepository {
+impl Default for CompleteSummaryStorage {
     fn default() -> Self {
         Self::with_limits(SummaryRepositoryLimits::default())
     }
 }
 
-impl CompleteSummaryRepository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl CompleteSummaryStorage {
     pub fn with_limits(limits: SummaryRepositoryLimits) -> Self {
         Self {
             entries: HashMap::default(),
@@ -5460,7 +5523,9 @@ fn evidence_heap_bytes(evidence: &SummaryEvidence) -> usize {
 
 fn effect_heap_bytes(effect: &SummaryEffect) -> usize {
     let key_bytes = match effect.key() {
-        SummaryEffectKey::Call { callee, .. } => dependency_heap_bytes(callee),
+        SummaryEffectKey::Call { callee, .. } => {
+            size_of_val(callee.as_ref()).saturating_add(dependency_heap_bytes(callee))
+        }
         SummaryEffectKey::AmbiguousCall { candidates, .. } => size_of_val(candidates.as_ref())
             .saturating_add(
                 candidates
@@ -5485,7 +5550,19 @@ fn effect_heap_bytes(effect: &SummaryEffect) -> usize {
 
 fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
     fn path_bytes(path: &SummaryConcurrencyAccessPath) -> usize {
-        size_of_val(path.selectors())
+        size_of_val(path.selectors()).saturating_add(
+            path.selectors()
+                .iter()
+                .map(|selector| match selector {
+                    SummaryConcurrencyAccessSelector::Property(property) => property.len(),
+                    SummaryConcurrencyAccessSelector::Field(_)
+                    | SummaryConcurrencyAccessSelector::Aggregate
+                    | SummaryConcurrencyAccessSelector::ConstantIndex(_)
+                    | SummaryConcurrencyAccessSelector::Index(_)
+                    | SummaryConcurrencyAccessSelector::AnyIndex => 0,
+                })
+                .fold(0_usize, usize::saturating_add),
+        )
     }
 
     match effect.kind() {
@@ -5830,3 +5907,64 @@ fn validate_publishable(summary: &SemanticProcedureSummary) -> Result<(), Summar
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use crate::analyzer::{ReadKey, capture_query_reads};
+
+    #[test]
+    fn summary_readers_retain_storage_but_follow_the_current_query_owner() {
+        crate::test_support::with_leaf_semantic_summary(|workspace, summary| {
+            let flow = crate::FlowWorkspaceState::default();
+            let reader = flow.semantic_summaries(workspace);
+            let (_, reads) = capture_query_reads(workspace.analyzer(), || {
+                reader
+                    .publish_components(
+                        std::slice::from_ref(&summary),
+                        std::slice::from_ref(&(0..1)),
+                    )
+                    .expect("publish");
+                assert_eq!(reader.get(summary.key()).as_ref(), Some(&summary));
+            });
+            let key = ReadKey::semantic_artifact(summary.key().artifact());
+            assert!(reads.keys().contains(&key));
+            drop(reader);
+            // Ordinary snapshot cloning deliberately creates a different query
+            // registry. The reader must bind to that registry, not the old one.
+            let next = workspace.clone();
+            let reader = flow.semantic_summaries(&next);
+            let (_, reads) = capture_query_reads(next.analyzer(), || {
+                std::thread::scope(|threads| {
+                    threads
+                        .spawn(|| assert_eq!(reader.get(summary.key()).as_ref(), Some(&summary)))
+                        .join()
+                        .expect("summary helper panicked");
+                });
+            });
+            assert!(reads.keys().contains(&key));
+            assert_eq!(
+                reader.len(),
+                1,
+                "backing storage survives the reader change"
+            );
+            let mut standalone = CompleteSummaryRepository::new(
+                crate::analyzer::workspace_authority::workspace_memo_attribution(&next),
+            );
+            standalone
+                .publish(summary.clone())
+                .expect("standalone publication");
+            let (_, reads) = capture_query_reads(next.analyzer(), || {
+                assert_eq!(standalone.get(summary.key()), Some(&summary));
+            });
+            assert!(reads.keys().contains(&key));
+        });
+    }
+}
+
+#[cfg(test)]
+#[path = "summary_input_contracts.rs"]
+mod summary_input_contracts;
+
+#[cfg(test)]
+mod evidence_set_contracts;

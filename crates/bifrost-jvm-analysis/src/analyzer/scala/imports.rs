@@ -463,46 +463,62 @@ impl ScalaAnalyzer {
         )
     }
 
-    fn importable_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
-        self.importable_declarations_by_package.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "scala.importable_declarations_by_package",
-                || {
-                    let mut declarations: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-                    for unit in self.inner.all_declarations() {
-                        if is_scala_importable_top_level(&unit) {
-                            declarations
-                                .entry(unit.package_name().to_string())
-                                .or_default()
-                                .push(unit.clone());
+    fn importable_declarations_by_package(&self) -> Arc<HashMap<String, Arc<Vec<CodeUnit>>>> {
+        self.importable_declarations_by_package.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    memo,
+                    || {
+                        let mut declarations: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+                        for unit in self.inner.all_declarations() {
+                            if is_scala_importable_top_level(&unit) {
+                                declarations
+                                    .entry(unit.package_name().to_string())
+                                    .or_default()
+                                    .push(unit.clone());
+                            }
                         }
-                    }
-                    declarations
-                        .into_iter()
-                        .map(|(package, units)| (package, Arc::new(units)))
-                        .collect()
-                },
-            )
-        })
+                        declarations
+                            .into_iter()
+                            .map(|(package, units)| (package, Arc::new(units)))
+                            .collect()
+                    },
+                )
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Scala,
+                ])
+            },
+        )
     }
 
-    fn package_namespaces(&self) -> &[String] {
-        self.package_namespaces.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "scala.package_namespaces",
-                || {
-                    let mut packages = self
-                        .importable_declarations_by_package()
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    packages.sort_unstable();
-                    packages
-                },
-            )
-        })
+    fn package_namespaces(&self) -> Arc<Vec<String>> {
+        self.package_namespaces.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    memo,
+                    || {
+                        let mut packages = self
+                            .importable_declarations_by_package()
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        packages.sort_unstable();
+                        packages
+                    },
+                )
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Scala,
+                ])
+            },
+        )
     }
 
     fn package_namespace_exists(&self, candidate: &str) -> bool {
@@ -535,20 +551,22 @@ impl ScalaAnalyzer {
     }
 
     fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.same_package_reference_index.get_or_build(
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.same_package_reference_index.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
                     self,
-                    "scala.same_package_reference_index",
+                    memo,
                     || self.compute_same_package_reference_index(true),
-                )
-            },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "scala.same_package_reference_index",
                     || self.compute_same_package_reference_index(false),
                 )
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Java,
+                    Language::Kotlin,
+                    Language::Scala,
+                ])
             },
         )
     }
@@ -603,82 +621,93 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if let Some(cached) = self.imported_code_units.get(file) {
-            return cached;
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-jvm-analysis/src/analyzer/scala/imports.rs",
-            );
-        if file_language(file) != Language::Scala {
-            return Arc::new(HashSet::default());
-        }
-        let imports = self.inner.import_info_of(token, file);
-        let wildcard_environment = self.wildcard_import_environment(file, &imports);
-        let mut imported = HashSet::default();
-        for (import_index, info) in imports.iter().enumerate() {
-            for code_unit in
-                self.resolve_import_info(token, file, import_index, info, &wildcard_environment)
-            {
-                imported.insert(code_unit);
+        crate::analyzer::jvm::hierarchy::derived_read(&self.imported_code_units, self, file, || {
+            if file_language(file) != Language::Scala {
+                return (Arc::new(HashSet::default()), 0);
             }
-        }
-        let imported = Arc::new(imported);
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::clone(&imported);
-            persistent_fill_guard.installed("imported_code_units");
-            self.imported_code_units.insert(cache_key, cache_value);
-        };
-        imported
+            let imported = {
+                let imports = self.inner.import_info_of(token, file);
+                let wildcard_environment = self.wildcard_import_environment(file, &imports);
+                let mut imported = HashSet::default();
+                for (import_index, info) in imports.iter().enumerate() {
+                    for code_unit in self.resolve_import_info(
+                        token,
+                        file,
+                        import_index,
+                        info,
+                        &wildcard_environment,
+                    ) {
+                        imported.insert(code_unit);
+                    }
+                }
+                imported
+            };
+            let imported = Arc::new(imported);
+            let bytes =
+                brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set(file, &imported)
+                    as usize;
+            (imported, bytes)
+        })
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        if let Some(cached) = self.referencing_files.get(file) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-jvm-analysis/src/analyzer/scala/imports.rs",
-            );
-        if file_language(file) != Language::Scala {
-            return HashSet::default();
-        }
-        let reverse_index =
-            brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
-                &self.reverse_import_index,
-                || {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "scala.reverse_file_index",
-                        || self.inner.all_files(),
-                    )
-                },
-                |candidate| {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "scala.reverse_file_index",
-                        || self.imported_code_units_of(candidate),
-                    )
-                },
-            );
-        let mut result = reverse_index
-            .get(file)
-            .map(|files| (**files).clone())
-            .unwrap_or_default();
-        if let Some(files) = self.same_package_reference_index().get(file) {
-            result.extend(files.iter().cloned());
-        }
+        self.referencing_files.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |cache| {
+                if let Some(cached) = cache.get(file) {
+                    return (*cached).clone();
+                }
+                if file_language(file) != Language::Scala {
+                    return HashSet::default();
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let reverse_index = self.reverse_import_index.read(
+                    &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+                    |memo| {
+                        let parallel = || {
+                            brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                                &self.inner.all_files(),
+                                |candidate| self.imported_code_units_of(candidate),
+                                true,
+                            )
+                        };
+                        let serial = || {
+                            brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                                &self.inner.all_files(),
+                                |candidate| self.imported_code_units_of(candidate),
+                                false,
+                            )
+                        };
+                        brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
+                            self, memo, parallel, serial,
+                        )
+                    },
+                    |_| {
+                        brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+                            &[Language::Java, Language::Kotlin, Language::Scala],
+                        )
+                    },
+                );
+                let mut result = reverse_index
+                    .get(file)
+                    .map(|files| (**files).clone())
+                    .unwrap_or_default();
+                if let Some(files) = self.same_package_reference_index().get(file) {
+                    result.extend(files.iter().cloned());
+                }
 
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::new(result.clone());
-            persistent_fill_guard.installed("referencing_files");
-            self.referencing_files.insert(cache_key, cache_value);
-        };
-        result
+                if cache_fill.is_complete() {
+                cache.insert(file.clone(), Arc::new(result.clone()));
+                }
+                result
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+                    &[Language::Java, Language::Kotlin, Language::Scala],
+                )
+            },
+        )
     }
 
     fn import_infos_for_files(
@@ -703,9 +732,15 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
-        self.file_dependency_index
-            .get()
-            .map(|index| index.resolve_imports(file, imports))
+        self.file_dependency_index.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| memo.get().map(|index| index.resolve_imports(file, imports)),
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Scala,
+                ])
+            },
+        )
     }
 
     fn prefetch_file_dependency_targets(
@@ -714,16 +749,27 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) {
-        if self.file_dependency_index.get().is_none()
-            && let Some(index) =
-                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                    ScalaFileDependencyIndex::build(self, files, cancellation)
-                })
-                .ok()
-                .flatten()
-        {
-            let _ = self.file_dependency_index.set(index);
-        }
+        self.file_dependency_index.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                if memo.get().is_none()
+                    && let Some(index) =
+                        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                            self,
+                            || ScalaFileDependencyIndex::build(self, files, cancellation),
+                        )
+                        .ok()
+                        .flatten()
+                {
+                    let _ = memo.set(index);
+                }
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Scala,
+                ])
+            },
+        );
     }
 
     fn additional_direct_file_dependencies(
@@ -731,45 +777,56 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         files: &[ProjectFile],
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> Option<brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies> {
-        let index = self.file_dependency_index.get()?;
-        let selected = files.iter().cloned().collect::<HashSet<_>>();
-        let mut dependencies = HashMap::default();
-        for file in files {
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            let direct = dependencies
-                .entry(file.clone())
-                .or_insert_with(HashSet::default);
-            if let (Some(package), Some(identifiers)) = (
-                index.package_by_file.get(file),
-                index.type_identifiers_by_file.get(file),
-            ) && let Some(targets_by_name) = index.same_package_declarations_by_name.get(package)
-            {
-                for identifier in identifiers {
-                    direct.extend(
-                        targets_by_name
-                            .get(identifier)
-                            .into_iter()
-                            .flatten()
-                            .filter(|target| *target != file && selected.contains(*target))
-                            .cloned(),
-                    );
+        self.file_dependency_index.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                let index = memo.get()?;
+                let selected = files.iter().cloned().collect::<HashSet<_>>();
+                let mut dependencies = HashMap::default();
+                for file in files {
+                    if cancellation.is_cancelled() {
+                        return None;
+                    }
+                    let direct = dependencies
+                        .entry(file.clone())
+                        .or_insert_with(HashSet::default);
+                    if let (Some(package), Some(identifiers)) = (
+                        index.package_by_file.get(file),
+                        index.type_identifiers_by_file.get(file),
+                    ) && let Some(targets_by_name) =
+                        index.same_package_declarations_by_name.get(package)
+                    {
+                        for identifier in identifiers {
+                            direct.extend(
+                                targets_by_name
+                                    .get(identifier)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|target| *target != file && selected.contains(*target))
+                                    .cloned(),
+                            );
+                        }
+                    }
+                    if let Some(exported) = index.export_dependencies.get(file) {
+                        direct.extend(
+                            exported
+                                .iter()
+                                .filter(|target| selected.contains(*target))
+                                .cloned(),
+                        );
+                    }
                 }
-            }
-            if let Some(exported) = index.export_dependencies.get(file) {
-                direct.extend(
-                    exported
-                        .iter()
-                        .filter(|target| selected.contains(*target))
-                        .cloned(),
-                );
-            }
-        }
-        Some(
-            brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::complete(
-                dependencies,
-            ),
+                Some(
+                    brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::complete(
+                        dependencies,
+                    ),
+                )
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+                    &[Language::Scala],
+                )
+            },
         )
     }
 

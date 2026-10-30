@@ -2515,6 +2515,53 @@ impl<'a> ProcedureLoweringSession<'a> {
     }
 
     #[doc(hidden)]
+    pub fn append_assignment_value_flow(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        kind: ValueFlowKind,
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), ProcedureLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind,
+                source,
+                target,
+            },
+        )
+    }
+
+    /// Resolve a throw continuation before allocating its syntax-mapped abort
+    /// point. Callers retain language-specific failure diagnostics and effects.
+    #[doc(hidden)]
+    pub fn prepare_implicit_abort(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'_>,
+        scope: ScopeFrameId,
+    ) -> Result<Option<(CompletionRoute, ProgramPointId)>, ProcedureLoweringError> {
+        let Some(route) = builder.resolve_completion(
+            scope,
+            &crate::analyzer::semantic::cfg::CompletionRequest::new(CompletionKind::Throw, None),
+        ) else {
+            return Ok(None);
+        };
+        let abort = self.add_node_point(builder, node, Vec::new())?;
+        Ok(Some((route, abort)))
+    }
+
+    #[doc(hidden)]
     pub fn append_value_flow_if_distinct(
         &self,
         builder: &mut ProcedureCfgBuilder,

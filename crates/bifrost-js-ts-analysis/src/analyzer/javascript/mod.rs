@@ -352,22 +352,21 @@ impl JavascriptAnalyzer {
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        let inner = self.inner.update_all_with_progress(progress);
-        let alias_resolver = Arc::new(AliasResolver::new(inner.shared_project()));
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-            alias_resolver,
-        }
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let inner = self.inner.update_all_with_progress(progress);
+            let alias_resolver = crate::analyzer::js_ts::providers::alias_resolver(&inner);
+            Self {
+                inner,
+                memo_budget: self.memo_budget,
+                memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+                alias_resolver,
+            }
+        })
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        // The clone keeps this analyzer's `alias_resolver`, whose config memo is
-        // keyed on the root it was built with. Re-projecting is a same-root
-        // operation (the only caller wraps the same project in an overlay), and
-        // the shared resolver every JS/TS resolution path now reads would answer
-        // for the wrong tree if that stopped holding.
+        // Reprojection preserves the root, but the recording callback must
+        // read the clone's selected project rather than the original handle.
         debug_assert_eq!(
             self.inner.project().root(),
             project.root(),
@@ -375,6 +374,7 @@ impl JavascriptAnalyzer {
         );
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.alias_resolver = crate::analyzer::js_ts::providers::alias_resolver(&clone.inner);
         clone
     }
 
@@ -384,9 +384,10 @@ impl JavascriptAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let alias_resolver = Arc::new(AliasResolver::new(Arc::clone(&project)));
+        let inner = TreeSitterAnalyzer::new_with_config(project, JavascriptAdapter, config);
+        let alias_resolver = crate::analyzer::js_ts::providers::alias_resolver(&inner);
         Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, JavascriptAdapter, config),
+            inner,
             memo_budget,
             memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
             alias_resolver,
@@ -399,7 +400,6 @@ impl JavascriptAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, brokk_bifrost_analysis::analyzer::store::StoreError> {
-        let alias_resolver = Arc::new(AliasResolver::new(Arc::clone(&project)));
         TreeSitterAnalyzer::try_wrap_with_config(
             config,
             |config| {
@@ -411,11 +411,14 @@ impl JavascriptAnalyzer {
                     progress,
                 )
             },
-            |inner, memo_budget| Self {
-                inner,
-                memo_budget,
-                memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
-                alias_resolver,
+            |inner, memo_budget| {
+                let alias_resolver = crate::analyzer::js_ts::providers::alias_resolver(&inner);
+                Self {
+                    inner,
+                    memo_budget,
+                    memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
+                    alias_resolver,
+                }
             },
         )
     }
@@ -735,6 +738,7 @@ impl CodeUnitIndex for JavascriptAnalyzer {
 }
 
 impl IAnalyzer for JavascriptAnalyzer {
+    brokk_bifrost_analysis::forward_query_read_ledger!();
     delegate_inner_procedure_fact_methods!();
 
     fn dependency_file_evidence(
@@ -812,15 +816,17 @@ impl IAnalyzer for JavascriptAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let inner = self.inner.update(changed_files);
-        // Rebuild from root so a changed jsconfig/tsconfig drops its stale parse cache.
-        let alias_resolver = Arc::new(AliasResolver::new(inner.shared_project()));
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-            alias_resolver,
-        }
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let inner = self.inner.update(changed_files);
+            // Rebuild from root so a changed jsconfig/tsconfig drops its stale parse cache.
+            let alias_resolver = crate::analyzer::js_ts::providers::alias_resolver(&inner);
+            Self {
+                inner,
+                memo_budget: self.memo_budget,
+                memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+                alias_resolver,
+            }
+        })
     }
 
     fn update_all(&self) -> Self {

@@ -25,6 +25,7 @@
 //! Everything else -- artifacts, scopes, models, policy, configuration, epoch
 //! -- is an identity comparison against what the head publishes.
 
+use crate::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
 use git2::Oid;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -81,8 +82,25 @@ pub trait WorkspaceFactIndex: Send + Sync {
     /// Replay the complete short-name candidate set.
     fn short_name_candidate_answer_digest(&self, name: &str) -> StableDigest;
 
+    /// Hydrate one path-backed module from this snapshot, including absence.
+    /// An index without this authority cannot certify the question.
+    fn path_synthetic_module_answer_digest(&self, _file: &ProjectFile) -> Option<StableDigest> {
+        None
+    }
+
+    /// Complete eligible synthetic module set, before caller filtering.
+    fn path_synthetic_modules_answer_digest(&self) -> Option<StableDigest> {
+        None
+    }
+
     /// Every analyzed path of this language with the blob it resolves to.
     fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)>;
+
+    /// Every source-admission refusal persisted for the selected revision,
+    /// with the blob identity recorded at admission time.
+    fn refused_source_blobs(
+        &self,
+    ) -> Result<Vec<(ProjectFile, Oid)>, crate::analyzer::store::StoreError>;
 
     /// Every `(family, key)` the facts of `file`'s `blob` contribute to the
     /// name-keyed indexes a [`ReadKey::Index`] probes.
@@ -169,6 +187,7 @@ pub struct ChangedFacts {
     head_blobs: HashMap<(Language, Box<str>), Oid>,
     unenumerated: Vec<(Language, Box<str>)>,
     languages_without_index: Vec<Language>,
+    refused_sources_incomplete: bool,
 }
 
 impl ChangedFacts {
@@ -180,6 +199,7 @@ impl ChangedFacts {
             head_blobs: HashMap::default(),
             unenumerated: Vec::new(),
             languages_without_index: Vec::new(),
+            refused_sources_incomplete: false,
         };
         let base_indexes = fact_indexes_by_language(base);
         let head_indexes = fact_indexes_by_language(head);
@@ -269,6 +289,7 @@ impl ChangedFacts {
             head_blobs: HashMap::default(),
             unenumerated: Vec::new(),
             languages_without_index: Vec::new(),
+            refused_sources_incomplete: false,
         };
         let head_indexes = fact_indexes_by_language(head);
         for language in head.analyzer().languages() {
@@ -278,6 +299,7 @@ impl ChangedFacts {
         }
         let mut head_by_language: HashMap<Language, HashMap<Box<str>, (ProjectFile, Oid)>> =
             HashMap::default();
+        let mut refused_by_language: HashMap<Language, HashMap<Box<str>, Oid>> = HashMap::default();
         for (language, index) in &head_indexes {
             let blobs = blob_map(*index);
             for (rel_path, (_, blob)) in &blobs {
@@ -286,6 +308,26 @@ impl ChangedFacts {
                     .insert((*language, rel_path.clone()), *blob);
             }
             head_by_language.insert(*language, blobs);
+            match index.refused_source_blobs() {
+                Ok(refusals) => {
+                    refused_by_language.insert(
+                        *language,
+                        refusals
+                            .into_iter()
+                            .map(|(file, blob)| {
+                                (
+                                    Box::from(crate::path_utils::rel_path_string(&file).as_str()),
+                                    blob,
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+                Err(error) => {
+                    head.analyzer().record_query_failure(error);
+                    facts.refused_sources_incomplete = true;
+                }
+            }
         }
 
         let project = head.analyzer().project();
@@ -315,7 +357,12 @@ impl ChangedFacts {
             let head_blob = head_by_language
                 .get(&language)
                 .and_then(|blobs| blobs.get(rel_path))
-                .map(|(_, blob)| *blob);
+                .map(|(_, blob)| *blob)
+                .or_else(|| {
+                    refused_by_language
+                        .get(&language)
+                        .and_then(|blobs| blobs.get(rel_path).copied())
+                });
             if head_blob == Some(*blob) {
                 continue;
             }
@@ -350,6 +397,20 @@ impl ChangedFacts {
                 );
             }
         }
+        for (language, refusals) in &refused_by_language {
+            let base_paths = base_by_language.get(language);
+            for (rel_path, blob) in refusals {
+                let unchanged = base_blob_by_path.get(rel_path).copied() == Some(*blob)
+                    && base_paths.is_some_and(|paths| paths.contains(rel_path));
+                if !unchanged {
+                    facts
+                        .paths
+                        .entry(*language)
+                        .or_default()
+                        .insert(rel_path.clone());
+                }
+            }
+        }
         facts.languages_without_index.sort();
         facts.languages_without_index.dedup();
         facts
@@ -371,13 +432,16 @@ impl ChangedFacts {
             head_blobs: self.head_blobs.clone(),
             unenumerated: Vec::new(),
             languages_without_index: self.languages_without_index.clone(),
+            refused_sources_incomplete: self.refused_sources_incomplete,
         }
     }
 
     /// Whether every changed blob's facts were enumerated and every language
     /// the two analyzers serve published a fact index.
     pub fn is_complete(&self) -> bool {
-        self.unenumerated.is_empty() && self.languages_without_index.is_empty()
+        self.unenumerated.is_empty()
+            && self.languages_without_index.is_empty()
+            && !self.refused_sources_incomplete
     }
 
     /// The changed blobs whose facts could not be enumerated, and the
@@ -508,6 +572,17 @@ impl Default for LookupReplayLimits {
 /// repository supplies this instead, and answers through the same lookup the
 /// recording was announced from, so both sides fold the same digest.
 pub trait SummaryAnswers {
+    /// The head's workspace authority digest. None means the caller cannot
+    /// answer, so verification must recompute rather than retain the product.
+    fn workspace_fact(
+        &self,
+        _family: WorkspaceFactFamily,
+        _language: Language,
+        _subject: &FactSubject,
+    ) -> Option<StableDigest> {
+        None
+    }
+
     /// The content digest the head retains under `identity`, or the ledger's
     /// absent digest when it retains nothing.
     ///
@@ -541,11 +616,34 @@ impl SummaryAnswers for NoSummaryAnswers {
 pub struct LookupMemo {
     answers: HashMap<(LookupKind, LookupQuestion), Option<StableDigest>>,
     replay_elapsed: Duration,
+    raw_blobs: HashMap<(Language, Box<str>), Result<Option<Oid>, ()>>,
 }
 
 impl LookupMemo {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The head's blob at one recorded path, read at most once per head
+    /// evaluation. Verification must not record its own project reads.
+    fn head_blob(
+        &mut self,
+        head: &WorkspaceAnalyzer,
+        changed: &ChangedFacts,
+        language: Language,
+        rel_path: &str,
+    ) -> Result<Option<Oid>, ()> {
+        if let Some(blob) = changed.head_blob(language, rel_path) {
+            return Ok(Some(blob));
+        }
+        *self
+            .raw_blobs
+            .entry((language, rel_path.into()))
+            .or_insert_with(|| {
+                brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                    head_path_blob(head, language, rel_path).map_err(|_| ())
+                })
+            })
     }
 
     /// How many distinct questions this memo has answered.
@@ -571,10 +669,57 @@ impl LookupMemo {
         limits: LookupReplayLimits,
         summaries: &dyn SummaryAnswers,
     ) -> Option<StableDigest> {
+        let read_ledger_attached = crate::analyzer::read_attribution_records_reads(|| {
+            head.analyzer().read_ledger_attached()
+        });
+        if read_ledger_attached {
+            head.analyzer().record_unattributed_read();
+        }
+        debug_assert!(
+            !read_ledger_attached,
+            "lookup verification is outside product captures"
+        );
         if let Some(answer) = self.answers.get(&(kind, question.clone())) {
             return *answer;
         }
         let started = Instant::now();
+        if kind == LookupKind::WorkspaceFact
+            && let LookupQuestion::WorkspaceFact {
+                family:
+                    WorkspaceFactFamily::WorkspaceFileListing
+                    | WorkspaceFactFamily::WorkspaceFileInventory,
+                language: Language::None,
+                subject: FactSubject::Whole,
+            } = question
+        {
+            let pair =
+                super::workspace_authority::workspace_file_set_answers(head.analyzer().project())
+                    .ok();
+            for (family, answer) in [
+                (
+                    WorkspaceFactFamily::WorkspaceFileListing,
+                    pair.map(|pair| pair.listing),
+                ),
+                (
+                    WorkspaceFactFamily::WorkspaceFileInventory,
+                    pair.map(|pair| pair.inventory),
+                ),
+            ] {
+                self.answers.insert(
+                    (
+                        kind,
+                        LookupQuestion::WorkspaceFact {
+                            family,
+                            language: Language::None,
+                            subject: FactSubject::Whole,
+                        },
+                    ),
+                    answer,
+                );
+            }
+            self.replay_elapsed += started.elapsed();
+            return self.answers[&(kind, question.clone())];
+        }
         let answer = replay_lookup(head, kind, question, limits, summaries);
         self.replay_elapsed += started.elapsed();
         self.answers.insert((kind, question.clone()), answer);
@@ -747,6 +892,17 @@ pub fn replay_lookup(
         // The repository is not this crate's, so the answer comes from the
         // caller that holds the head's, through the same lookup the recording
         // was announced from.
+        LookupKind::WorkspaceFact => {
+            let LookupQuestion::WorkspaceFact {
+                family,
+                language,
+                subject,
+            } = question
+            else {
+                unreachable!("a workspace-fact lookup records a workspace-fact question");
+            };
+            answer_workspace_fact(head, summaries, *family, *language, subject, limits)
+        }
         LookupKind::ProcedureSummary => {
             let LookupQuestion::Summary { identity } = question else {
                 debug_assert!(
@@ -758,6 +914,141 @@ pub fn replay_lookup(
             };
             summaries.summary_content(*identity)
         }
+    }
+}
+
+/// The head's answer to one `WorkspaceFact` question.
+///
+/// Each family is answered by the code that owns its authority. The
+/// field-slot index belongs to the flow crate, which this crate cannot name,
+/// so its families go to the caller-supplied answers. A family whose authority
+/// is computed in this crate gets an arm here. Every other family belongs to
+/// a language adapter and is answered by that language's registered support.
+/// `None` means unanswerable, which invalidates the recorded key.
+fn answer_workspace_fact(
+    head: &WorkspaceAnalyzer,
+    summaries: &dyn SummaryAnswers,
+    family: WorkspaceFactFamily,
+    language: Language,
+    subject: &FactSubject,
+    limits: LookupReplayLimits,
+) -> Option<StableDigest> {
+    let analyzer = head.analyzer();
+    match family {
+        WorkspaceFactFamily::WorkspaceFileListing | WorkspaceFactFamily::WorkspaceFileInventory => {
+            if language != Language::None || !matches!(subject, FactSubject::Whole) {
+                return None;
+            }
+            let answers =
+                super::workspace_authority::workspace_file_set_answers(analyzer.project()).ok()?;
+            Some(if family == WorkspaceFactFamily::WorkspaceFileListing {
+                answers.listing
+            } else {
+                answers.inventory
+            })
+        }
+        WorkspaceFactFamily::WorkspaceAnalyzerLanguages => {
+            if language != Language::None || !matches!(subject, FactSubject::Whole) {
+                return None;
+            }
+            Some(
+                super::workspace_authority::workspace_analyzer_languages_answer(analyzer.project()),
+            )
+        }
+        WorkspaceFactFamily::WorkspaceIgnoreRules => {
+            if language != Language::None || !matches!(subject, FactSubject::Whole) {
+                return None;
+            }
+            super::workspace_authority::workspace_ignore_rules_answer(analyzer.project()).ok()
+        }
+        WorkspaceFactFamily::WorkspacePathKind => {
+            if language != Language::None {
+                return None;
+            }
+            let FactSubject::File { rel_path } = subject else {
+                return None;
+            };
+            Some(super::workspace_authority::workspace_path_kind_answer(
+                analyzer.project(),
+                rel_path,
+            ))
+        }
+        WorkspaceFactFamily::WorkspaceDirectory => {
+            if language != Language::None {
+                return None;
+            }
+            let FactSubject::File { rel_path } = subject else {
+                return None;
+            };
+            Some(super::workspace_authority::workspace_directory_answer(
+                analyzer.project(),
+                rel_path,
+            ))
+        }
+        WorkspaceFactFamily::WorkspaceOverlayMembership => {
+            if language != Language::None {
+                return None;
+            }
+            match subject {
+                FactSubject::Whole => Some(
+                    super::workspace_authority::workspace_overlay_set_answer(analyzer.project()),
+                ),
+                FactSubject::File { rel_path } => Some(
+                    super::workspace_authority::workspace_overlay_membership_answer(
+                        analyzer.project(),
+                        rel_path,
+                    ),
+                ),
+                _ => None,
+            }
+        }
+        WorkspaceFactFamily::PathSyntheticModules => {
+            let index = analyzer
+                .workspace_fact_indexes()
+                .into_iter()
+                .find(|index| index.fact_index_language() == language)?;
+            match subject {
+                FactSubject::Whole => index.path_synthetic_modules_answer_digest(),
+                FactSubject::File { rel_path } => {
+                    let file = analyzed_file(analyzer, rel_path)?;
+                    index.path_synthetic_module_answer_digest(&file)
+                }
+                _ => None,
+            }
+        }
+        WorkspaceFactFamily::FieldSlots => summaries.workspace_fact(family, language, subject),
+        WorkspaceFactFamily::RuntimeRootWriteFootprint => {
+            let FactSubject::File { rel_path } = subject else {
+                return None;
+            };
+            let file = ProjectFile::new(
+                analyzer.project().root().to_path_buf(),
+                Path::new(rel_path.as_ref()),
+            );
+            // This authority scans project source snapshots, not declaration
+            // indexes. The current module must still belong to that source set.
+            if file.language() != language
+                || !analyzer.project().all_files_shared().ok()?.contains(&file)
+            {
+                return None;
+            }
+            crate::analyzer::semantic::workspace_oracle::runtime_values::runtime_footprint_answer(
+                head,
+                &file,
+                limits.semantic,
+            )
+        }
+        WorkspaceFactFamily::JsTsExternalModuleMemberMutation => {
+            if !matches!(language, Language::JavaScript | Language::TypeScript) {
+                return None;
+            }
+            let FactSubject::NamedMember { owner, member } = subject else {
+                return None;
+            };
+            crate::analyzer::semantic::workspace_oracle::dispatch::js_ts_module_member_mutation_answer(analyzer, owner, member)
+        }
+        _ => crate::analyzer::languages::language_support(language)?
+            .workspace_fact_answer(analyzer, family, language, subject),
     }
 }
 
@@ -1276,24 +1567,28 @@ pub fn verify_read_set_for_artifact(
                 language,
                 rel_path,
                 blob,
-            } => (changed.head_blob(*language, rel_path) != Some(*blob)).then(|| {
-                InvalidationReason::InputContentChanged {
-                    artifact,
-                    before: blob_identity(Some(*blob)),
-                    after: blob_identity(changed.head_blob(*language, rel_path)),
+            } => match memo.head_blob(head, changed, *language, rel_path) {
+                Ok(after) => {
+                    (after != Some(*blob)).then(|| InvalidationReason::InputContentChanged {
+                        artifact,
+                        before: blob_identity(Some(*blob)),
+                        after: blob_identity(after),
+                    })
                 }
-            }),
-            // The negative half of the path map, and the exact counterpart of
-            // the `File` arm: the probe found nothing at this path, so the
-            // head still answers the same question only while it finds
-            // nothing there either.
-            ReadKey::PathAbsent { language, rel_path } => changed
-                .head_blob(*language, rel_path)
-                .map(|blob| InvalidationReason::InputContentChanged {
-                    artifact,
-                    before: blob_identity(None),
-                    after: blob_identity(Some(blob)),
-                }),
+                Err(_) => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
+            },
+            // Absence must include non-source inputs, whose paths never enter
+            // the analyzed map (for example package.json and Gemfile).
+            ReadKey::PathAbsent { language, rel_path } => {
+                match memo.head_blob(head, changed, *language, rel_path) {
+                    Ok(after) => after.map(|blob| InvalidationReason::InputContentChanged {
+                        artifact,
+                        before: blob_identity(None),
+                        after: blob_identity(Some(blob)),
+                    }),
+                    Err(_) => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
+                }
+            }
             ReadKey::Index { family, key } => {
                 if !changed.is_complete() {
                     // A changed-key set that could not be completed is smaller
@@ -1467,6 +1762,30 @@ fn verify_artifact(
     }
 }
 
+/// Ask the project for a path the analyzed source map does not cover. Project
+/// snapshots retain raw-byte blob identity and honor selected configuration
+/// revisions and unsaved overlays.
+fn head_path_blob(
+    head: &WorkspaceAnalyzer,
+    language: Language,
+    rel_path: &str,
+) -> std::io::Result<Option<Oid>> {
+    let analyzer = match head {
+        WorkspaceAnalyzer::Multi(multi) => multi
+            .delegates()
+            .get(&language)
+            .map_or_else(|| head.analyzer(), |delegate| delegate.analyzer()),
+        WorkspaceAnalyzer::Empty(_) => head.analyzer(),
+    };
+    let project = analyzer.project();
+    let Some(file) = project.file_by_rel_path(Path::new(rel_path)) else {
+        return Ok(None);
+    };
+    project
+        .read_source_snapshot(&file)
+        .map(|source| Some(source.oid()))
+}
+
 /// A blob identity as a `StableDigest`, so an absent blob and a present one
 /// are different values a reason can print.
 fn blob_identity(blob: Option<Oid>) -> StableDigest {
@@ -1479,6 +1798,16 @@ fn blob_identity(blob: Option<Oid>) -> StableDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::read_ledger::read_set_digest;
+    use crate::analyzer::store::AnalyzerStore;
+    use crate::analyzer::store::policy_units::{
+        PolicyUnitPartitionRow, PolicyUnitRow, PolicyUnitRowKey,
+    };
+    use crate::analyzer::workspace::EmptyAnalyzer;
+    use crate::analyzer::{FilesystemProject, Project};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::Arc;
+
     type IndexKeys = Vec<(IndexFamily, Box<[u8]>)>;
 
     #[derive(Clone)]
@@ -1508,6 +1837,11 @@ mod tests {
         }
         fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)> {
             vec![(self.file.clone(), self.blob)]
+        }
+        fn refused_source_blobs(
+            &self,
+        ) -> Result<Vec<(ProjectFile, Oid)>, crate::analyzer::store::StoreError> {
+            Ok(Vec::new())
         }
         fn blob_index_keys(
             &self,
@@ -1704,5 +2038,164 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[hardwon("#2445: non-source file reads always invalidated and absent paths missed additions")]
+    fn persisted_non_source_reads_verify_content_and_absence_on_another_root() {
+        let base_root = tempfile::tempdir().unwrap();
+        let head_root = tempfile::tempdir().unwrap();
+        let relative = "config/pyproject.toml";
+        for root in [base_root.path(), head_root.path()] {
+            std::fs::create_dir(root.join("config")).unwrap();
+            std::fs::write(root.join(relative), b"[project]\nname='example'\n").unwrap();
+        }
+        let base_project = FilesystemProject::new(base_root.path()).unwrap();
+        let base_file = base_project.file_by_rel_path(Path::new(relative)).unwrap();
+        let blob = base_project.read_source_snapshot(&base_file).unwrap().oid();
+        // The language identifies the authority that read the file, rather
+        // than the configuration file's syntax (TOML).
+        let reads = vec![
+            ReadKey::file(
+                Language::Python,
+                crate::path_utils::rel_path_string(&base_file),
+                blob,
+            ),
+            ReadKey::path_absent(Language::Python, "config/package.json"),
+        ];
+        let digest = StableDigest::sha256(b"non-source read verification");
+        let key = PolicyUnitRowKey {
+            policy_semantic_hash: digest.to_string(),
+            family: "match".into(),
+            partition: PolicyUnitPartitionRow::Whole,
+            configuration_fingerprint: digest.to_string(),
+            active_model_set_hash: digest.to_string(),
+            engine_epoch: digest.to_string(),
+        };
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .publish_policy_units(vec![PolicyUnitRow {
+                key: key.clone(),
+                product_kind: "rows".into(),
+                product: "{\"rows\":[]}".into(),
+                read_set_digest: *read_set_digest(&reads).digest().as_bytes(),
+                reads: reads.clone(),
+                snapshots: vec![[1; 32]],
+            }])
+            .unwrap();
+        let loaded = store
+            .policy_units_for_keys(&[key])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.reads.len(), 2);
+        let head = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(Arc::new(
+            FilesystemProject::new(head_root.path()).unwrap(),
+        )));
+        let base = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(Arc::new(base_project)));
+        let changed = ChangedFacts::between(&base, &head);
+        let inputs = HeadInputs {
+            models: digest,
+            policy_semantic_hash: digest,
+            policy_source: digest,
+            configuration: digest,
+            epoch: digest,
+        };
+        let verify = |key: &ReadKey| {
+            verify_read_set_for_artifact(
+                DerivedArtifactId::semantic_artifact(digest),
+                &head,
+                &changed,
+                &inputs,
+                std::slice::from_ref(key),
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            )
+        };
+        for key in &loaded.reads {
+            assert_eq!(verify(key), ReadVerdict::Unchanged, "{key:?}");
+        }
+        std::fs::write(
+            head_root.path().join(relative),
+            "[project]\nname='changed'\n",
+        )
+        .unwrap();
+        std::fs::write(head_root.path().join("config/package.json"), "{}").unwrap();
+        for key in &loaded.reads {
+            let verdict = verify(key);
+            assert_eq!(verdict.changed().expect("changed input").key, *key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod workspace_fact_test_support {
+    use super::*;
+
+    // These authorities depend on project snapshots and real syntax parsing,
+    // independently of a language analyzer or semantic-pack registration.
+    pub(crate) fn source_workspace(
+        project: &crate::inline_project::BuiltInlineTestProject,
+    ) -> WorkspaceAnalyzer {
+        WorkspaceAnalyzer::Empty(crate::analyzer::workspace::EmptyAnalyzer::new(
+            project.project_dyn(),
+        ))
+    }
+
+    /// Exercise the verifier with field-slot certificates removed, so a broad
+    /// companion certificate cannot mask a missing authority fact.
+    pub(crate) fn verdict_without_field_slots(
+        base: &WorkspaceAnalyzer,
+        head: &WorkspaceAnalyzer,
+        keys: &[ReadKey],
+    ) -> ReadVerdict {
+        let keys: Vec<_> = keys
+            .iter()
+            .filter(|key| {
+                !matches!(
+                    key,
+                    ReadKey::Lookup {
+                        question: LookupQuestion::WorkspaceFact {
+                            family: WorkspaceFactFamily::FieldSlots,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect();
+        assert!(
+            !keys.is_empty(),
+            "family certificate must survive the field-slot filter"
+        );
+        assert!(
+            keys.iter().all(|key| matches!(
+                key,
+                ReadKey::Lookup {
+                    kind: LookupKind::WorkspaceFact,
+                    ..
+                }
+            )),
+            "isolate authority replay: {keys:?}"
+        );
+        let zero = StableDigest::sha256(b"unused verifier inputs");
+        verify_read_set(
+            head,
+            &ChangedFacts::between(base, head),
+            &HeadInputs {
+                models: zero,
+                policy_semantic_hash: zero,
+                policy_source: zero,
+                configuration: zero,
+                epoch: zero,
+            },
+            &keys,
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            &mut LookupMemo::default(),
+        )
     }
 }

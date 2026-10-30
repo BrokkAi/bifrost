@@ -24,6 +24,12 @@
   ; body: (declaration_list) ; contains function_signature_item for methods
   ) @class.definition
 
+;; Nightly trait aliases (`trait Alias = Bound + Other;`)
+(trait_alias
+  (visibility_modifier)? @keyword.modifier
+  name: (type_identifier) @class.name
+  ) @class.definition
+
 ;; Module definitions
 (mod_item
   (visibility_modifier)? @keyword.modifier

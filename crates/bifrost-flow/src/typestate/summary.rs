@@ -144,17 +144,48 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
         )
     }
 
+    /// Diagnostic presence only: never serves rows and never records a read.
+    /// Any path serving rows to a solve must use compatible_repository, which
+    /// retains record_protocol_repository_read and its unattributed refusal.
+    pub(super) fn has_compatible_rows_for_diagnostics(
+        &self,
+        repository: &CompleteProtocolSummaryStorage,
+        protocol: &CompiledProtocol,
+        bindings: &TypestateBindingPlan,
+    ) -> bool {
+        let Some(contracts) = self.compute_binding_contracts(bindings, || false) else {
+            return false;
+        };
+        repository.entries.values().any(|summary| {
+            summary.key().protocol() == protocol.hash()
+                && contracts.get(summary.key().procedure()) == Some(&summary.key().bindings())
+        })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Production rejects row reuse; row-serving paths must retain attribution"
+        )
+    )]
     pub(super) fn compatible_repository(
         &self,
         repository: &CompleteProtocolSummaryRepository,
         protocol: &CompiledProtocol,
         bindings: &TypestateBindingPlan,
     ) -> CompleteProtocolSummaryRepository {
-        let mut compatible = CompleteProtocolSummaryRepository::with_limits(repository.limits());
+        if !repository.storage.entries.is_empty() {
+            repository.record_read();
+        }
+        let mut compatible = CompleteProtocolSummaryRepository::with_limits(
+            repository.limits(),
+            repository.attribution.clone(),
+        );
         let Some(contracts) = self.compute_binding_contracts(bindings, || false) else {
             return compatible;
         };
-        for summary in repository.entries.values() {
+        for summary in repository.storage.entries.values() {
             if summary.key().protocol() == protocol.hash()
                 && contracts.get(summary.key().procedure()) == Some(&summary.key().bindings())
             {
@@ -976,21 +1007,126 @@ impl ProtocolSummaryLookupKey {
     }
 }
 
+/// A query-bound view; shared owners retain only CompleteProtocolSummaryStorage.
 #[derive(Debug, Clone)]
 pub struct CompleteProtocolSummaryRepository {
+    storage: CompleteProtocolSummaryStorage,
+    attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+}
+
+impl CompleteProtocolSummaryRepository {
+    pub fn new(attribution: crate::analyzer::workspace_authority::OwnedMemoCapability) -> Self {
+        Self::with_limits(ProtocolSummaryRepositoryLimits::default(), attribution)
+    }
+    pub fn with_limits(
+        limits: ProtocolSummaryRepositoryLimits,
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+    ) -> Self {
+        Self {
+            storage: CompleteProtocolSummaryStorage::with_limits(limits),
+            attribution,
+        }
+    }
+    fn record_read(&self) {
+        record_protocol_repository_read(&self.attribution);
+    }
+    pub fn get(&self, key: &ProtocolSummaryKey) -> Option<&ProtocolSummary> {
+        let answer = self.storage.get(key);
+        if answer.is_some() {
+            self.record_read();
+        }
+        answer
+    }
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+    pub const fn limits(&self) -> ProtocolSummaryRepositoryLimits {
+        self.storage.limits()
+    }
+    pub const fn retained_bytes(&self) -> usize {
+        self.storage.retained_bytes()
+    }
+    pub fn publish(
+        &mut self,
+        summary: ProtocolSummary,
+    ) -> Result<ProtocolSummaryPublicationOutcome, ProtocolSummaryPublicationError> {
+        self.storage.publish(summary)
+    }
+    pub fn publish_scc(
+        &mut self,
+        summaries: Vec<ProtocolSummary>,
+        semantic: &[&SemanticProcedureSummary],
+    ) -> Result<ProtocolSummaryPublicationOutcome, ProtocolSummaryPublicationError> {
+        self.storage.publish_scc(summaries, semantic)
+    }
+    fn publish_scc_with_manifest(
+        &mut self,
+        summaries: Vec<ProtocolSummary>,
+        group: SummaryRecursiveGroupKey,
+        keys: &[ProcedureSummaryKey],
+    ) -> Result<ProtocolSummaryPublicationOutcome, ProtocolSummaryPublicationError> {
+        self.storage
+            .publish_scc_with_manifest(summaries, group, keys)
+    }
+    fn insert(&mut self, summary: ProtocolSummary) {
+        self.storage.insert(summary);
+    }
+    fn matching_summary_for_entry(
+        &self,
+        procedure: &ProcedureSummaryKey,
+        protocol: TypestateProtocolHash,
+        bindings: TypestateBindingSummaryHash,
+        entry: &ProtocolFactKey,
+    ) -> Option<&ProtocolSummary> {
+        let answer = self
+            .storage
+            .matching_summary_for_entry(procedure, protocol, bindings, entry);
+        if answer.is_some() {
+            self.record_read();
+        }
+        answer
+    }
+    pub(super) fn into_publication_batches(self) -> ProtocolSummaryPublicationBatches {
+        self.storage.into_publication_batches()
+    }
+}
+
+/// Source keys cover the complete index, including negative membership. Until
+/// non-source protocol inputs have a replay receipt, refuse unit reuse too.
+pub(super) fn record_protocol_repository_read(
+    attribution: &crate::analyzer::workspace_authority::OwnedMemoCapability,
+) {
+    let analyzer = attribution.analyzer();
+    crate::analyzer::workspace_authority::record_workspace_authority_read(
+        analyzer,
+        crate::analyzer::WorkspaceFactFamily::ProtocolSummaries,
+        crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+            &crate::analyzer::Language::ALL,
+        ),
+    );
+    if attribution.capability().is_capturing() {
+        attribution.capability().record_unattributed();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompleteProtocolSummaryStorage {
     entries: HashMap<ProtocolSummaryKey, ProtocolSummary>,
     by_entry: HashMap<ProtocolSummaryLookupKey, ProtocolSummaryKey>,
     retained_bytes: usize,
     limits: ProtocolSummaryRepositoryLimits,
 }
 
-impl Default for CompleteProtocolSummaryRepository {
+impl Default for CompleteProtocolSummaryStorage {
     fn default() -> Self {
         Self::with_limits(ProtocolSummaryRepositoryLimits::default())
     }
 }
 
-impl CompleteProtocolSummaryRepository {
+impl CompleteProtocolSummaryStorage {
     pub fn with_limits(limits: ProtocolSummaryRepositoryLimits) -> Self {
         Self {
             entries: HashMap::new(),
@@ -2295,10 +2431,11 @@ fn subject_key_heap_bytes(key: &TypestateSubjectKey) -> usize {
 fn object_key_heap_bytes(key: &TypestateObjectKey) -> usize {
     match key {
         TypestateObjectKey::FieldPath { base, member } => object_key_heap_bytes(base)
+            .saturating_add(size_of::<TypestateObjectKey>())
             .saturating_add(crate::value_flow::semantic_locator_heap_bytes(member)),
-        TypestateObjectKey::CallSubstitution { context, base } => {
-            context_key_heap_bytes(context).saturating_add(object_key_heap_bytes(base))
-        }
+        TypestateObjectKey::CallSubstitution { context, base } => context_key_heap_bytes(context)
+            .saturating_add(size_of::<TypestateObjectKey>())
+            .saturating_add(object_key_heap_bytes(base)),
         TypestateObjectKey::Value(locator)
         | TypestateObjectKey::Allocation(locator)
         | TypestateObjectKey::Static(locator)
@@ -2364,4 +2501,478 @@ fn context_key_heap_bytes(key: &TypestateContextKey) -> usize {
             .map(crate::value_flow::semantic_locator_heap_bytes)
             .fold(0_usize, usize::saturating_add),
     )
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use crate::analyzer::{ReadKey, capture_query_reads};
+
+    fn empty_protocol(state: &str) -> CompiledProtocol {
+        use crate::typestate::{
+            ProtocolAnalysisMode, ProtocolSemantics, ProtocolSpec, ProtocolUncertaintyBehavior,
+            ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior,
+        };
+        let uncertainty = ProtocolUncertaintyBehavior::PreserveUncertainty;
+        ProtocolSpec {
+            schema_version: crate::typestate::PROTOCOL_SCHEMA_VERSION,
+            states: vec![state.into()],
+            initial_state: state.into(),
+            accepting_states: vec![state.into()],
+            error_states: vec![],
+            events: vec![],
+            transitions: vec![],
+            terminal_expectations: vec![],
+            semantics: ProtocolSemantics {
+                analysis_mode: ProtocolAnalysisMode::May,
+                unmatched_event: ProtocolUnmatchedEventBehavior::MarkInconclusive,
+                uncertainty: ProtocolUncertaintySemantics {
+                    ambiguous_dispatch: uncertainty,
+                    unknown_call: uncertainty,
+                    external_call: uncertainty,
+                    escape: uncertainty,
+                    incomplete_analysis: uncertainty,
+                },
+            },
+        }
+        .compile()
+        .expect("valid fixture protocol")
+    }
+
+    fn with_production_result_cache(
+        limits: crate::typestate::TypestateSummaryRepositoryLimits,
+        check: impl FnOnce(
+            &crate::analyzer::WorkspaceAnalyzer,
+            &crate::typestate::ProductionTypestateSummaryRepository,
+            &dyn Fn() -> super::super::TypestateProductionCacheStatus,
+        ),
+    ) {
+        use crate::analyzer::semantic::{CancellationToken, SemanticRequest};
+        use crate::dataflow::{NoSummaryReadObserver, SolverBudget};
+        use crate::typestate::{
+            ProductionTypestateExecutionContext, ProductionTypestateSummaryRepository,
+            solve_typestate_with_production_summaries,
+        };
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::TypeScript,
+        )
+        .file(
+            "leaf.ts",
+            "function leaf() { return 1; }\nexport function root() { return leaf(); }\n",
+        )
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("leaf.ts"),
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|p| {
+                p.locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|s| s.name())
+                    == Some("root")
+            })
+            .and_then(|p| artifact.procedure_handle(p.id()))
+            .unwrap();
+        let protocol = empty_protocol("ready");
+        let bindings =
+            TypestateBindingPlan::try_new(&protocol, vec![], vec![], vec![], vec![]).unwrap();
+        let repository = ProductionTypestateSummaryRepository::with_limits(
+            limits,
+            crate::analyzer::workspace_authority::workspace_memo_attribution(&workspace),
+        );
+        let solve = || {
+            solve_typestate_with_production_summaries(
+                &repository,
+                &NoSummaryReadObserver,
+                &root,
+                &[],
+                &workspace.icfg_provider(),
+                &workspace.icfg_provider(),
+                ProductionTypestateExecutionContext::Workspace,
+                &protocol,
+                &bindings,
+                &mut SemanticBudget::default(),
+                &mut DataflowRequest::new(&mut SolverBudget::default(), &cancellation),
+            )
+            .unwrap()
+            .cache_status()
+        };
+        check(&workspace, &repository, &solve);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: a same-capture result-cache hit refused unit reuse"
+    )]
+    fn same_capture_result_cache_hits_preserve_attributable_reads() {
+        use crate::typestate::TypestateProductionCacheStatus::{Hit, MissPublished};
+        with_production_result_cache(Default::default(), |workspace, _repository, solve| {
+            let (_, reads) = capture_query_reads(workspace.analyzer(), || {
+                assert_eq!(solve(), MissPublished);
+                assert_eq!(solve(), Hit);
+            });
+            assert_eq!(reads.unattributed_reads(), 0);
+            assert!(
+                !reads.keys().is_empty(),
+                "the fill must have recorded inputs"
+            );
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: a same-capture result-cache hit refused unit reuse"
+    )]
+    fn later_capture_result_cache_hits_replay_the_fills_reads() {
+        use crate::typestate::TypestateProductionCacheStatus::{Hit, MissPublished};
+        with_production_result_cache(Default::default(), |workspace, _repository, solve| {
+            let (_, fill) = capture_query_reads(workspace.analyzer(), || {
+                assert_eq!(solve(), MissPublished);
+            });
+            assert_eq!(fill.unattributed_reads(), 0);
+            assert!(!fill.keys().is_empty());
+            let (_, hit) = capture_query_reads(workspace.analyzer(), || {
+                assert_eq!(solve(), Hit);
+            });
+            assert_eq!(hit.keys(), fill.keys());
+            assert_eq!(hit.unattributed_reads(), 0);
+            assert!(hit.is_bounded());
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: a same-capture result-cache hit refused unit reuse"
+    )]
+    fn nested_capture_result_cache_hits_replay_the_fills_reads() {
+        use crate::typestate::TypestateProductionCacheStatus::{Hit, MissPublished};
+        with_production_result_cache(Default::default(), |workspace, _repository, solve| {
+            let (nested, outer) = capture_query_reads(workspace.analyzer(), || {
+                assert_eq!(solve(), MissPublished);
+                let (_, nested) = capture_query_reads(workspace.analyzer(), || {
+                    assert_eq!(solve(), Hit);
+                });
+                assert_eq!(nested.unattributed_reads(), 0);
+                assert!(nested.is_bounded());
+                assert!(!nested.keys().is_empty());
+                assert_eq!(solve(), Hit);
+                nested
+            });
+            assert_eq!(outer.unattributed_reads(), 0);
+            assert_eq!(outer.keys(), nested.keys());
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7884: a typestate production-cache hit recorded no callee-summary reads"
+    )]
+    fn production_cache_hits_replay_callee_summary_reads() {
+        use crate::analyzer::LookupKind;
+        use crate::typestate::TypestateProductionCacheStatus::{Hit, MissPublished};
+        with_production_result_cache(Default::default(), |workspace, _repository, solve| {
+            let (_, fill) = capture_query_reads(workspace.analyzer(), || {
+                assert_eq!(solve(), MissPublished);
+            });
+            let summary_reads = |keys: &[ReadKey]| {
+                keys.iter()
+                    .filter(|key| {
+                        matches!(
+                            key,
+                            ReadKey::Lookup {
+                                kind: LookupKind::ProcedureSummary,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let expected = summary_reads(&fill.keys());
+            assert!(
+                expected.len() >= 2,
+                "root and callee must both be recorded: {fill:?}"
+            );
+            let (_, hit) = capture_query_reads(workspace.analyzer(), || {
+                assert_eq!(solve(), Hit);
+            });
+            assert_eq!(summary_reads(&hit.keys()), expected);
+            assert_eq!(hit.unattributed_reads(), 0);
+            assert!(hit.is_bounded());
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: a same-capture result-cache hit refused unit reuse"
+    )]
+    fn uncaptured_result_cache_fills_replay_into_later_captures() {
+        use crate::typestate::TypestateProductionCacheStatus::{Hit, MissPublished};
+        with_production_result_cache(Default::default(), |workspace, _repository, solve| {
+            assert_eq!(solve(), MissPublished);
+            let (_, hit) = capture_query_reads(workspace.analyzer(), || {
+                assert_eq!(solve(), Hit);
+            });
+            assert_eq!(hit.unattributed_reads(), 0);
+            assert!(hit.is_bounded());
+            assert!(!hit.keys().is_empty());
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: over-budget exact-result receipts must refuse every later capture"
+    )]
+    fn oversized_result_cache_receipts_retain_only_a_bounded_refusal_marker() {
+        use crate::typestate::{
+            TypestateProductionCacheStatus::{Hit, MissPublished},
+            TypestateSummaryRepositoryLimits,
+        };
+        let mut full_bytes = 0;
+        with_production_result_cache(Default::default(), |_workspace, repository, solve| {
+            assert_eq!(solve(), MissPublished);
+            assert_eq!(repository.retained_result_count(), 1);
+            full_bytes = repository.retained_result_bytes();
+            assert!(repository.retained_result_receipt_bytes() > 0);
+        });
+        let limits = TypestateSummaryRepositoryLimits {
+            max_result_bytes: full_bytes - 1,
+            ..Default::default()
+        };
+        with_production_result_cache(limits, |workspace, repository, solve| {
+            assert_eq!(solve(), MissPublished);
+            assert_eq!(repository.retained_result_count(), 1);
+            assert!(repository.retained_result_bytes() < full_bytes - 1);
+            assert_eq!(repository.retained_result_receipt_bytes(), 0);
+            for _ in 0..2 {
+                let (_, hit) = capture_query_reads(workspace.analyzer(), || {
+                    assert_eq!(solve(), Hit);
+                });
+                assert_eq!(
+                    hit.unattributed_reads(),
+                    2,
+                    "both exact-result probes refuse"
+                );
+                assert!(!hit.is_bounded());
+                assert_eq!(
+                    repository.retained_result_receipt_bytes(),
+                    0,
+                    "an oversized receipt retains no keys"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: a diagnostic protocol probe refused typestate unit publication"
+    )]
+    fn diagnostic_protocol_presence_matches_row_filter_without_recording_reads() {
+        crate::test_support::with_leaf_semantic_summary(|workspace, semantic| {
+            let protocol = empty_protocol("ready");
+            let other_protocol = empty_protocol("other");
+            let bindings =
+                TypestateBindingPlan::try_new(&protocol, vec![], vec![], vec![], vec![]).unwrap();
+            let semantic_set = ProtocolSemanticSummarySet::try_new(vec![&semantic]).unwrap();
+            let mut repository = CompleteProtocolSummaryRepository::new(
+                crate::analyzer::workspace_authority::workspace_memo_attribution(workspace),
+            );
+            let check = |repository: &CompleteProtocolSummaryRepository,
+                         protocol: &CompiledProtocol,
+                         expected| {
+                let (present, reads) = capture_query_reads(workspace.analyzer(), || {
+                    semantic_set.has_compatible_rows_for_diagnostics(
+                        &repository.storage,
+                        protocol,
+                        &bindings,
+                    )
+                });
+                assert_eq!(present, expected);
+                assert!(reads.keys().is_empty());
+                assert_eq!(reads.unattributed_reads(), 0);
+                assert_eq!(
+                    present,
+                    !semantic_set
+                        .compatible_repository(repository, protocol, &bindings)
+                        .is_empty()
+                );
+            };
+            check(&repository, &protocol, false);
+            let mut key = ProtocolSummaryKey::try_from_semantic_summary(
+                &semantic,
+                protocol.hash(),
+                bindings.summary_hash_for(semantic.key().artifact(), semantic.key().declaration()),
+                vec![],
+            )
+            .unwrap();
+            repository
+                .publish(ProtocolSummary::try_new(key.clone(), vec![], vec![]).unwrap())
+                .unwrap();
+            check(&repository, &protocol, true);
+            check(&repository, &other_protocol, false);
+            let mut repository = CompleteProtocolSummaryRepository::new(
+                crate::analyzer::workspace_authority::workspace_memo_attribution(workspace),
+            );
+            key.bindings =
+                TypestateBindingSummaryHash::from_canonical_bytes(b"different binding contract");
+            repository
+                .publish(ProtocolSummary::try_new(key, vec![], vec![]).unwrap())
+                .unwrap();
+            check(&repository, &protocol, false);
+        });
+    }
+
+    #[test]
+    fn compatible_protocol_rows_consumed_by_a_standalone_solve_remain_unattributed() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticRequest};
+        use crate::dataflow::SolverBudget;
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::TypeScript,
+        )
+        .file(
+            "calls.ts",
+            "export function leaf() { return 1; }\nexport function root() { return leaf(); }\n",
+        )
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("calls.ts"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|p| {
+                p.locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|s| s.name())
+                    == Some("root")
+            })
+            .and_then(|p| artifact.procedure_handle(p.id()))
+            .unwrap();
+        let summaries = crate::typestate::project_production_semantic_summaries(
+            std::slice::from_ref(&root),
+            &workspace.icfg_provider(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap();
+        let semantic_set = summaries.protocol_summaries().unwrap();
+        let protocol = empty_protocol("ready");
+        let bindings =
+            TypestateBindingPlan::try_new(&protocol, vec![], vec![], vec![], vec![]).unwrap();
+        let mut repository = CompleteProtocolSummaryRepository::new(
+            crate::analyzer::workspace_authority::workspace_memo_attribution(&workspace),
+        );
+        let mut solver_budget = SolverBudget::default();
+        let first = solve_typestate_with_reusable_summaries(
+            &root,
+            &[],
+            &workspace.icfg_provider(),
+            &protocol,
+            &bindings,
+            &semantic_set,
+            &mut repository,
+            &mut SemanticBudget::default(),
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .unwrap();
+        assert!(first.published_summaries() > 0);
+        let (_, reads) = capture_query_reads(workspace.analyzer(), || {
+            let mut compatible =
+                semantic_set.compatible_repository(&repository, &protocol, &bindings);
+            assert!(!compatible.is_empty());
+            let mut solver_budget = SolverBudget::default();
+            let result = solve_typestate_with_reusable_summaries(
+                &root,
+                &[],
+                &workspace.icfg_provider(),
+                &protocol,
+                &bindings,
+                &semantic_set,
+                &mut compatible,
+                &mut SemanticBudget::default(),
+                &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+            )
+            .unwrap();
+            assert!(result.was_reused(), "the solve must consume a retained row");
+        });
+        assert!(reads.unattributed_reads() > 0);
+        assert!(
+            reads
+                .keys()
+                .iter()
+                .any(|key| matches!(key, ReadKey::Scope { .. }))
+        );
+    }
+
+    #[test]
+    fn protocol_direct_and_entry_index_hits_record_inputs_and_refuse_unnamed_reads() {
+        crate::test_support::with_leaf_semantic_summary(|workspace, semantic| {
+            let key = ProtocolSummaryKey {
+                procedure: semantic.key().clone(),
+                protocol: TypestateProtocolHash::from_canonical_bytes(b"protocol memo fixture"),
+                bindings: TypestateBindingSummaryHash::from_canonical_bytes(
+                    b"binding memo fixture",
+                ),
+                schema_version: PROTOCOL_SUMMARY_SCHEMA_VERSION,
+                entry_facts: vec![ProtocolFactKey::Zero].into_boxed_slice(),
+            };
+            let summary = ProtocolSummary::try_new(key.clone(), Vec::new(), Vec::new())
+                .expect("empty complete fixture summary");
+            let mut repository = CompleteProtocolSummaryRepository::new(
+                crate::analyzer::workspace_authority::workspace_memo_attribution(workspace),
+            );
+            repository.publish(summary).expect("publish fixture");
+            let (_, reads) = capture_query_reads(workspace.analyzer(), || {
+                assert!(repository.get(&key).is_some());
+            });
+            assert!(
+                reads
+                    .keys()
+                    .iter()
+                    .any(|key| matches!(key, ReadKey::Scope { .. }))
+            );
+            assert!(reads.unattributed_reads() > 0);
+            let (_, reads) = capture_query_reads(workspace.analyzer(), || {
+                assert!(
+                    repository
+                        .matching_summary_for_entry(
+                            &key.procedure,
+                            key.protocol,
+                            key.bindings,
+                            &ProtocolFactKey::Zero
+                        )
+                        .is_some()
+                );
+            });
+            assert!(
+                reads
+                    .keys()
+                    .iter()
+                    .any(|key| matches!(key, ReadKey::Scope { .. }))
+            );
+            assert!(reads.unattributed_reads() > 0);
+        });
+    }
 }

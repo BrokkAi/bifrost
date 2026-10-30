@@ -57,8 +57,8 @@ pub enum PlanPartitioning {
     Whole(PlanWidenDetail),
 }
 
-/// Why a plan cannot be partitioned by seed, or why typestate rejects its
-/// selector source before applying the ordinary partitioning rules.
+/// Why query-unit slicing widened: plan eligibility, typestate selector
+/// eligibility, or a merged execution limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanWidenDetail {
     Intersect,
@@ -79,6 +79,7 @@ pub enum PlanWidenDetail {
     ClassSetWorkspacePreparation,
     AbsentMemberWorkspacePreparation,
     TypestateSetSource,
+    MergedLimit(crate::structural::search::MergedLimit),
 }
 
 impl PlanWidenDetail {
@@ -102,6 +103,7 @@ impl PlanWidenDetail {
             Self::ClassSetWorkspacePreparation => "class_set_workspace_preparation",
             Self::AbsentMemberWorkspacePreparation => "absent_member_workspace_preparation",
             Self::TypestateSetSource => "typestate_set_source",
+            Self::MergedLimit(limit) => limit.stable_label(),
         }
     }
 }

@@ -6,14 +6,16 @@ use crate::java::source_facts::JavaFileSourceFacts;
 use crate::java::source_types::{is_java_nested_return_scope, java_has_anonymous_class_body};
 use brokk_bifrost_core::analyzer::RelationalDefinitionFrontier;
 use brokk_bifrost_core::analyzer::java_facts::{JavaSourceTypeId, JavaTypeSyntaxShape};
+use brokk_bifrost_core::analyzer::memo_attribution::{ReplayingMemo, ReplayingMemoEntry};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::project_reads::{OpaqueReadReceipt, ReadCapability};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
 };
 use brokk_bifrost_core::hash::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
 
 pub const METHOD_RECEIVER_CHAIN_LIMIT: usize = 64;
@@ -37,10 +39,18 @@ pub struct FileReturnCacheKey {
     pub signature: Option<String>,
 }
 
-pub type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
-pub type MethodAnonymousReturnCache =
-    Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
-pub type FileReturnCache = Mutex<HashMap<ProjectFile, JavaFileReturnFacts>>;
+pub type MethodReturnCache = ReplayingMemo<
+    Mutex<
+        HashMap<
+            MethodReturnCacheKey,
+            Arc<ReplayingMemoEntry<ReceiverAnalysisOutcome<String>, OpaqueReadReceipt>>,
+        >,
+    >,
+>;
+pub type MethodAnonymousReturnCache = MethodReturnCache;
+pub type FileReturnCache = ReplayingMemo<
+    Mutex<HashMap<ProjectFile, Arc<ReplayingMemoEntry<JavaFileReturnFacts, OpaqueReadReceipt>>>>,
+>;
 
 #[derive(Clone, Default)]
 pub struct JavaFileReturnFacts {
@@ -49,6 +59,7 @@ pub struct JavaFileReturnFacts {
 }
 
 pub trait JavaReturnTypeContext {
+    fn read_capability(&self) -> &ReadCapability;
     fn java(&self) -> &dyn JavaSource;
     fn relational_definitions(&self) -> &dyn RelationalDefinitionFrontier;
     fn call_answering_units(&self, owner: &str, name: &str, arity: usize) -> Vec<CodeUnit>;
@@ -124,6 +135,7 @@ where
 {
     cached_method_return_type(
         ctx.method_return_cache(),
+        ctx.read_capability(),
         method,
         "java return type cache poisoned",
         || method_unit_declared_return_type_uncached(method, token, ctx),
@@ -131,7 +143,8 @@ where
 }
 
 fn cached_method_return_type(
-    cache: &Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>,
+    cache: &MethodReturnCache,
+    reads: &ReadCapability,
     method: &CodeUnit,
     poison_message: &str,
     compute: impl FnOnce() -> ReceiverAnalysisOutcome<String>,
@@ -141,15 +154,20 @@ fn cached_method_return_type(
         fq_name: method.fq_name(),
         signature: method.signature().map(str::to_string),
     };
-    if let Some(cached) = cache.lock().expect(poison_message).get(&cache_key).cloned() {
-        return cached;
-    }
-    let outcome = compute();
-    cache
-        .lock()
-        .expect(poison_message)
-        .insert(cache_key, outcome.clone());
-    outcome
+    let outcome = cache
+        .read(&reads.memo_attribution(), |cache, capture| {
+            if let Some(entry) = cache.lock().expect(poison_message).get(&cache_key).cloned() {
+                return Ok::<_, std::convert::Infallible>(entry);
+            }
+            let entry = Arc::new(capture.build(compute));
+            cache
+                .lock()
+                .expect(poison_message)
+                .insert(cache_key, Arc::clone(&entry));
+            Ok(entry)
+        })
+        .expect("return type computation is infallible");
+    (*outcome).clone()
 }
 
 fn method_unit_declared_return_type_uncached<C>(
@@ -224,6 +242,7 @@ where
 {
     cached_method_return_type(
         ctx.method_anonymous_return_cache(),
+        ctx.read_capability(),
         method,
         "java anonymous return cache poisoned",
         || method_unit_anonymous_return_type_uncached(method, token, ctx),
@@ -296,22 +315,30 @@ fn java_file_return_facts<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    if let Some(cached) = ctx
+    let facts = ctx
         .file_return_cache()
-        .lock()
-        .expect("java file return cache poisoned")
-        .get(file)
-        .cloned()
-    {
-        return cached;
-    }
-
-    let index = build_java_file_return_facts(ctx, token, file);
-    ctx.file_return_cache()
-        .lock()
-        .expect("java file return cache poisoned")
-        .insert(file.clone(), index.clone());
-    index
+        .read(
+            &ctx.read_capability().memo_attribution(),
+            |cache, capture| {
+                if let Some(entry) = cache
+                    .lock()
+                    .expect("java file return cache poisoned")
+                    .get(file)
+                    .cloned()
+                {
+                    return Ok::<_, std::convert::Infallible>(entry);
+                }
+                let entry =
+                    Arc::new(capture.build(|| build_java_file_return_facts(ctx, token, file)));
+                cache
+                    .lock()
+                    .expect("java file return cache poisoned")
+                    .insert(file.clone(), Arc::clone(&entry));
+                Ok(entry)
+            },
+        )
+        .expect("file return facts computation is infallible");
+    (*facts).clone()
 }
 
 fn build_java_file_return_facts<C>(

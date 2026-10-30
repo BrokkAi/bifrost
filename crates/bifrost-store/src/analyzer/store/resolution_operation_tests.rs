@@ -388,3 +388,206 @@ impl SelectedResolutionOperation<'_, '_> {
         self.rust_context_for_file(&root, cancellation)
     }
 }
+
+#[cfg(test)]
+mod native_demand_installer_tests {
+    use super::*;
+    use crate::analyzer::resolution::{
+        DemandReferenceKey, DemandRelationKey, DemandRootDiscovery, DemandRootProvider, RootClosure,
+    };
+    use crate::analyzer::store::language_support::{StoreLanguageSupport, neutral_fixture};
+    use std::cell::Cell;
+
+    thread_local! {
+        static BUILDS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static RUNS: Cell<usize> = const { Cell::new(0) };
+        static CANCEL: Cell<bool> = const { Cell::new(false) };
+    }
+    struct FakeInstaller;
+    impl StoreLanguageSupport for FakeInstaller {
+        fn demand_installer(&self) -> Option<NativeDemandInstaller> {
+            Some(NativeDemandInstaller(&FakeInstaller))
+        }
+    }
+    impl DemandInstall for FakeInstaller {
+        fn prepare_caller(
+            &self,
+            _: &SelectedResolutionOperation<'_, '_>,
+            caller: &Path,
+            _: &CancellationToken,
+            _: Option<&ResolutionSession>,
+        ) -> Result<NativeDemandPreparationOutcome> {
+            BUILDS.with(|builds| builds.borrow_mut().push(caller.to_path_buf()));
+            Ok(if CANCEL.get() {
+                NativeDemandPreparationOutcome::Cancelled
+            } else {
+                NativeDemandPreparationOutcome::Ready(Arc::new(()))
+            })
+        }
+        fn run_point(
+            &self,
+            preparation: &dyn std::any::Any,
+            request: NativeDemandPointRequest<'_, '_, '_>,
+            run: &mut NativeDemandCallback<'_>,
+        ) -> Result<()> {
+            assert!(preparation.is::<()>());
+            RUNS.set(RUNS.get() + 1);
+            request.blueprint.with_forward_operation_in_session(
+                request.lexical,
+                request.paths,
+                request.typed,
+                request.cancellation,
+                request.session,
+                |operation| run(operation, &mut FakeInstaller),
+            )
+        }
+    }
+    impl DemandRootProvider for FakeInstaller {
+        fn discover(&mut self, _: &DemandRelationKey) -> Result<DemandRootDiscovery> {
+            Ok(DemandRootDiscovery::AlreadyReady {
+                completion: ResolutionCompletion::Complete,
+            })
+        }
+        fn close(
+            &mut self,
+            _: &DemandRelationKey,
+            _: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        ) -> Result<RootClosure> {
+            Ok(RootClosure::Published(ResolutionCompletion::Complete))
+        }
+    }
+
+    #[test]
+    fn native_demand_installer_runs_generic_points_and_retains_only_one_caller() {
+        let _rules = neutral_fixture::demand_installer_fixture(Language::Go, &FakeInstaller);
+        let (store, workspace, snapshots) =
+            crate::analyzer::store::resolution_selection::tests::qualifier_completion_gap_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::analyzer::project::TestProject::new(root.path(), Language::Go);
+        let cancellation = CancellationToken::new();
+        let languages = [
+            crate::analyzer::store::resolution_selection::SelectedResolutionLanguage::new(
+                "go",
+                Language::Go,
+            ),
+        ];
+        let SelectedResolutionOperationOpenOutcome::Ready(mut operation) = store
+            .open_selected_resolution_operation(
+                SelectedResolutionOperationInput::new(
+                    &project,
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                ),
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("fixture opens");
+        };
+        // One test-only reference over the real selected store; no language parser is registered.
+        operation.ready.inventory.with_owned_temp_write(|connection| {
+            connection.execute("INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(0,zeroblob(32),zeroblob(32))", [])?;
+            let producer = connection.last_insert_rowid();
+            connection.execute("INSERT INTO temp.selected_resolution_stage_nodes(node,kind,kind_semantic_key) VALUES(0,8,0)", [])?;
+            connection.execute("INSERT INTO temp.selected_resolution_stage_node_owners(producer_id,node) VALUES(?1,0)", [producer])?;
+            connection.execute("INSERT INTO temp.selected_resolution_stage_semantics(host_ordinal,producer_id,sequence,semantic_key,node,source_site,role,namespace,start_byte,end_byte,owner_kind) VALUES(0,?1,0,0,0,0,0,0,0,1,0)", [producer])?;
+            Ok(())
+        }).unwrap();
+        let session = ResolutionSession::unbounded();
+        let locator = SelectedSemanticLocator::for_reference_range("go", "fixture.go", 0, 1);
+        let callbacks = Cell::new(0);
+        for _ in 0..2 {
+            let context = operation
+                .empty_contexts(&ResolutionCompletion::Complete)
+                .unwrap();
+            let result = operation
+                .resolve_reference_with_projection(
+                    NativeReferenceQuery {
+                        context,
+                        locator: &locator,
+                        cancellation: &cancellation,
+                        context_metrics: &mut SelectedResolutionContextMetrics,
+                        session: &session,
+                        artifacts: None,
+                        go_demand: None,
+                        selected_import_gap: None,
+                        go_receiver_overlay: None,
+                        query_result_slot: None,
+                        point_metrics: None,
+                    },
+                    |_, _, _, _| {
+                        callbacks.set(callbacks.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                result,
+                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(()))
+            ));
+        }
+        assert_eq!((RUNS.get(), callbacks.get()), (2, 2));
+        let installer = crate::analyzer::store::store_language_support(Language::Go)
+            .unwrap()
+            .demand_installer()
+            .unwrap();
+        for caller in ["other.go", "fixture.go"] {
+            assert!(matches!(
+                operation
+                    .native_demand_preparation(
+                        installer,
+                        Language::Go,
+                        Path::new(caller),
+                        &cancellation,
+                        &session
+                    )
+                    .unwrap(),
+                NativeDemandPreparationOutcome::Ready(_)
+            ));
+        }
+        CANCEL.set(true);
+        for _ in 0..2 {
+            assert!(matches!(
+                operation
+                    .native_demand_preparation(
+                        installer,
+                        Language::Go,
+                        Path::new("cancel.go"),
+                        &cancellation,
+                        &session
+                    )
+                    .unwrap(),
+                NativeDemandPreparationOutcome::Cancelled
+            ));
+        }
+        CANCEL.set(false);
+        assert!(matches!(
+            operation
+                .native_demand_preparation(
+                    installer,
+                    Language::Go,
+                    Path::new("cancel.go"),
+                    &cancellation,
+                    &session
+                )
+                .unwrap(),
+            NativeDemandPreparationOutcome::Ready(_)
+        ));
+        BUILDS.with(|builds| {
+            assert_eq!(
+                *builds.borrow(),
+                [
+                    "fixture.go",
+                    "other.go",
+                    "fixture.go",
+                    "cancel.go",
+                    "cancel.go",
+                    "cancel.go"
+                ]
+                .map(PathBuf::from)
+            )
+        });
+    }
+}

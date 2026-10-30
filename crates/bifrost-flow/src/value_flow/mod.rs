@@ -75,9 +75,9 @@ pub(crate) use plan::{ValueFlowCarrierSummaryIdentity, ValueFlowSourceBehaviorId
 pub use planned::{
     ValueFlowCanonicalMeeting, ValueFlowDirectionPlan, ValueFlowDirectionPlanError,
     ValueFlowPlannedEvidence, ValueFlowPlannedResult, ValueFlowPlannedSolveError,
-    ValueFlowSnapshotObservationBindings, adapt_value_flow_summary_result,
-    plan_value_flow_direction, plan_value_flow_direction_with_requirements,
-    solve_value_flow_planned, solve_value_flow_planned_backward, solve_value_flow_planned_forward,
+    ValueFlowSnapshotObservationBindings, plan_value_flow_direction,
+    plan_value_flow_direction_with_requirements, solve_value_flow_planned,
+    solve_value_flow_planned_backward, solve_value_flow_planned_forward,
 };
 pub use pointer::{
     PointerBounds, PointerInvalidationWitness, PointerProvenanceAccess,

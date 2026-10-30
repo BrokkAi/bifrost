@@ -392,13 +392,31 @@ pub fn assert_deleting_side_table_marks_incomplete<A: LanguageAdapter>(
     );
 }
 #[doc(hidden)]
+#[track_caller]
 pub fn parse_state<A: LanguageAdapter>(adapter: &A, file: &ProjectFile) -> FileState {
     let source = file.read_to_string().unwrap();
+    file_state_from_source_with_grammar(
+        adapter,
+        file,
+        source,
+        adapter.parser_language(),
+        "set parser language",
+        "parse file",
+    )
+}
+
+#[track_caller]
+fn file_state_from_source_with_grammar<A: LanguageAdapter>(
+    adapter: &A,
+    file: &ProjectFile,
+    source: String,
+    language: tree_sitter::Language,
+    configure_message: &str,
+    parse_message: &str,
+) -> FileState {
     let mut parser = Parser::new();
-    parser
-        .set_language(&adapter.parser_language())
-        .expect("set parser language");
-    let tree = parser.parse(source.as_str(), None).expect("parse file");
+    parser.set_language(&language).expect(configure_message);
+    let tree = parser.parse(&source, None).expect(parse_message);
     let mut parsed: ParsedFile = adapter.parse_file(file, &source, &tree);
     parsed.add_file_scope(file, &source);
     let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
@@ -485,4 +503,417 @@ pub fn persisted_short_names<A: LanguageAdapter>(
         "the {lang} fixture must persist declarations for the pin to mean anything"
     );
     names
+}
+
+#[doc(hidden)]
+#[track_caller]
+pub fn file_state_from_source<A: LanguageAdapter>(
+    adapter: &A,
+    file: &ProjectFile,
+    source: &str,
+) -> FileState {
+    file_state_from_source_with_grammar(
+        adapter,
+        file,
+        source.to_owned(),
+        adapter.parser_language_for_file(file),
+        "configure source fixture grammar",
+        "parse source fixture",
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod operation_fixture_support {
+    use crate::CancellationToken;
+    use crate::analyzer::resolution::{BindingFragmentId, SelectedResolutionMountOrdinal};
+    use crate::analyzer::store::resolution_lexical::SelectedResolutionLexicalSource;
+    use brokk_bifrost_core::analyzer::project::AsProject;
+
+    use crate::analyzer::resolution::{
+        LoweredResolutionFactsWithIdentityCatalog, LoweredSemanticRole, SelectedSemanticLocator,
+    };
+
+    use crate::analyzer::store::file_state::FileState;
+    use crate::analyzer::store::resolution_operation::*;
+    use crate::analyzer::store::resolution_selection::{
+        SelectedResolutionContentMountRequest, SelectedResolutionLanguage,
+        SelectedResolutionOverlayMask,
+    };
+    use crate::analyzer::store::{
+        AnalyzerStore, GenerationId, Result, WorkspaceFileRow, WorkspaceId, WorkspaceSnapshotId,
+        WorkspaceSnapshots,
+    };
+    use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
+    use crate::analyzer::{Language, Project, ProjectFile, TestProject};
+    use brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent;
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        FileResolutionFacts, ResolutionIdentifierRole, ResolutionNamespace, ResolutionSiteId,
+    };
+
+    use git2::Oid;
+    use rusqlite::params;
+
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[doc(hidden)]
+    pub fn persist_test_workspace_snapshot(
+        store: &AnalyzerStore,
+        workspace_id: &WorkspaceId,
+        language: &str,
+        generation: GenerationId,
+        file_versions: Vec<(String, String, String)>,
+    ) -> WorkspaceSnapshots {
+        let writer_workspace_id = workspace_id.as_str().to_owned();
+        let writer_language = language.to_owned();
+        let generation_value = generation.get();
+        store.conn.execute(move |conn| {
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+             VALUES(?1, ?2, ?3, 1)",
+                params![writer_workspace_id, writer_language, generation_value],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
+             VALUES(?1, ?2, ?3, 1)",
+                params![writer_workspace_id, writer_language, generation_value],
+            )
+            .unwrap();
+            for (path, blob_oid, projection_digest) in file_versions {
+                tx.execute(
+                    "INSERT INTO workspace_file_versions(
+                   workspace_id, lang, generation, rel_path, blob_oid,
+                   projection_digest, valid_from
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                    params![
+                        writer_workspace_id,
+                        writer_language,
+                        generation_value,
+                        path,
+                        blob_oid,
+                        projection_digest,
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        });
+
+        let mut snapshots = WorkspaceSnapshots::default();
+        snapshots.insert(
+            language.to_owned(),
+            WorkspaceSnapshotId {
+                workspace_id: workspace_id.clone(),
+                lang: language.to_owned(),
+                generation,
+                revision: 1,
+            },
+        );
+        snapshots
+    }
+    #[doc(hidden)]
+    pub fn selected_operation_input<'project, 'selection>(
+        project: &'project dyn Project,
+        workspace_id: &'selection WorkspaceId,
+        snapshots: &'selection WorkspaceSnapshots,
+        languages: &'selection [SelectedResolutionLanguage],
+        overlay_masks: &'selection [SelectedResolutionOverlayMask],
+        content_mounts: Vec<SelectedResolutionContentMountRequest>,
+    ) -> SelectedResolutionOperationInput<'project, 'selection> {
+        SelectedResolutionOperationInput::new(
+            project,
+            workspace_id,
+            snapshots,
+            languages,
+            overlay_masks,
+        )
+        .with_content_mounts(content_mounts)
+    }
+    #[doc(hidden)]
+    pub fn open_ready_operation<'store, 'project, 'selection>(
+        store: &'store AnalyzerStore,
+        input: SelectedResolutionOperationInput<'project, 'selection>,
+        cancellation: &CancellationToken,
+    ) -> SelectedResolutionOperation<'store, 'project> {
+        match store
+            .open_selected_resolution_operation(input, cancellation)
+            .expect("open selected resolution test operation")
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            outcome => panic!("selected resolution test operation must be Ready: {outcome:?}"),
+        }
+    }
+    #[doc(hidden)]
+    pub fn content_mount_request(
+        publication: crate::analyzer::store::resolution_publication::ResolutionContentWitness,
+        path: &str,
+        blob_oid: Oid,
+    ) -> SelectedResolutionContentMountRequest {
+        SelectedResolutionContentMountRequest::new(
+            publication,
+            WorkspaceFileRow {
+                rel_path: path.to_owned(),
+                blob_oid,
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+    #[doc(hidden)]
+    pub fn counterfactual_content_mount(
+        content: SelectedResolutionContentMountRequest,
+        original: &str,
+    ) -> SelectedResolutionContentMountRequest {
+        content.with_counterfactual_base_content_digest(
+            brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(original.as_bytes()),
+        )
+    }
+    #[derive(Clone)]
+    #[doc(hidden)]
+    pub struct MutableGenerationProject {
+        project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
+        delegate: TestProject,
+        generation: Arc<AtomicU64>,
+        overlay_content: Arc<Mutex<Option<Arc<WorkspaceOverlayContent>>>>,
+    }
+    impl MutableGenerationProject {
+        #[doc(hidden)]
+        pub fn new(root: &Path, language: Language) -> Self {
+            Self {
+                delegate: TestProject::new(root, language),
+                project_reads:
+                    brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
+                generation: Arc::new(AtomicU64::new(0)),
+                overlay_content: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        #[doc(hidden)]
+        pub fn generation_handle(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.generation)
+        }
+
+        #[doc(hidden)]
+        pub fn advance(&self) {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+
+        #[doc(hidden)]
+        pub fn set_overlay_content(&self, file: ProjectFile, content: &str) {
+            let digest =
+                brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(content.as_bytes());
+            let overlay = Arc::new(WorkspaceOverlayContent::new([(
+                file,
+                digest,
+                git2::Oid::hash_object(git2::ObjectType::Blob, content.as_bytes())
+                    .expect("hashing installed fixture overlay"),
+            )]));
+            *self
+                .overlay_content
+                .lock()
+                .expect("operation test overlay lock") = Some(overlay);
+        }
+    }
+    impl Project for MutableGenerationProject {
+        fn project_read_slot(
+            &self,
+        ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+            Some(&self.project_reads)
+        }
+        fn install_read_recorder(
+            &self,
+            capability: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
+        ) -> bool {
+            self.delegate.install_read_recorder(capability.clone());
+            self.project_reads.install(capability);
+            true
+        }
+        fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+            let _read = self.project_reads.ignore_rules(self.as_project());
+            self.delegate.ignore_rules_digest()
+        }
+
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.project_reads
+                .languages(self.as_project(), || self.delegate.analyzer_languages())
+        }
+
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            let _project_read = self.project_reads.inventory(self.as_project());
+            self.delegate.all_files()
+        }
+
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            let _project_read = brokk_bifrost_core::analyzer::project_reads::listing_read(self);
+            self.delegate.analyzable_files(language)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            let _project_read = self.project_reads.path(self.as_project(), rel_path);
+            self.delegate.file_by_rel_path(rel_path)
+        }
+
+        fn analysis_generation(&self) -> u64 {
+            self.generation.load(Ordering::SeqCst)
+        }
+
+        fn overlay_content(&self) -> Option<Arc<WorkspaceOverlayContent>> {
+            let _project_read = self.project_reads.overlays(self.as_project());
+            let answer = {
+                self.overlay_content
+                    .lock()
+                    .expect("operation test overlay lock")
+                    .clone()
+            };
+            brokk_bifrost_core::analyzer::project_reads::publish_overlays(&answer);
+            answer
+        }
+    }
+    #[doc(hidden)]
+    pub fn parsed_operation_state<A: LanguageAdapter>(
+        project_root: &Path,
+        relative_path: &str,
+        source: &str,
+        adapter: &A,
+    ) -> (Arc<FileState>, FileResolutionFacts) {
+        let file = ProjectFile::new(project_root.to_path_buf(), relative_path);
+        file.write(source).expect("write operation source");
+        parsed_operation_source_state(project_root, relative_path, source, adapter)
+    }
+    /// Parse unsaved content without replacing the selected disk baseline.
+    #[doc(hidden)]
+    pub fn parsed_operation_source_state<A: LanguageAdapter>(
+        project_root: &Path,
+        relative_path: &str,
+        source: &str,
+        adapter: &A,
+    ) -> (Arc<FileState>, FileResolutionFacts) {
+        let file = ProjectFile::new(project_root.to_path_buf(), relative_path);
+        let state = Arc::new(super::file_state_from_source(adapter, &file, source));
+        let facts = state.resolution_facts.clone();
+        (state, facts)
+    }
+    #[doc(hidden)]
+    pub fn site_for_identifier(
+        facts: &FileResolutionFacts,
+        spelling: &str,
+        role: ResolutionIdentifierRole,
+        namespace: ResolutionNamespace,
+    ) -> ResolutionSiteId {
+        try_site_for_identifier(facts, spelling, role, namespace)
+            .unwrap_or_else(|| panic!("fixture identifier {role:?} {namespace:?} {spelling:?}"))
+    }
+    #[doc(hidden)]
+    pub fn try_site_for_identifier(
+        facts: &FileResolutionFacts,
+        spelling: &str,
+        role: ResolutionIdentifierRole,
+        namespace: ResolutionNamespace,
+    ) -> Option<ResolutionSiteId> {
+        facts
+            .identifiers_named(spelling, role, namespace)
+            .into_iter()
+            .next()
+            .map(|identifier| identifier.site)
+    }
+    #[doc(hidden)]
+    pub fn locator(
+        path: &str,
+        site: ResolutionSiteId,
+        role: LoweredSemanticRole,
+    ) -> SelectedSemanticLocator {
+        SelectedSemanticLocator::new("java", path, site, role)
+    }
+    #[doc(hidden)]
+    pub fn semantic_at(
+        artifact: &LoweredResolutionFactsWithIdentityCatalog,
+        site: ResolutionSiteId,
+        role: LoweredSemanticRole,
+    ) -> crate::analyzer::resolution::SemanticId {
+        crate::analyzer::resolution::test_support::lowered_semantic_at(
+            artifact.lexical().semantics(),
+            site,
+            role,
+        )
+    }
+    /// The mount coverage lookup a test operation's context set is built against.
+    #[doc(hidden)]
+    pub fn mount_lookup(
+        mounts: &[SelectedResolutionOperationMount],
+    ) -> impl Fn(BindingFragmentId) -> Result<Option<(SelectedResolutionMountOrdinal, Language)>> + '_
+    {
+        |fragment| {
+            Ok(mounts
+                .iter()
+                .find(|mount| mount.fragment() == fragment)
+                .map(|mount| (mount.ordinal(), mount.semantic_language())))
+        }
+    }
+    #[doc(hidden)]
+    pub fn assert_store_error_contains<T>(result: Result<T>, needle: &str) {
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected store error containing {needle:?}"),
+        };
+        assert!(
+            error.to_string().contains(needle),
+            "unexpected store error: {error}"
+        );
+    }
+    #[doc(hidden)]
+    pub fn with_operation_lexical<T>(
+        operation: &SelectedResolutionOperation<'_, '_>,
+        inspect: impl FnOnce(
+            &SelectedResolutionLexicalSource<'_, '_>,
+            &SelectedResolutionLexicalSource<'_, '_>,
+        ) -> T,
+    ) -> T {
+        let source = operation.ready.lexical_source();
+        inspect(&source, &source)
+    }
+
+    #[doc(hidden)]
+    pub fn assert_empty_context_metrics(metrics: &SelectedResolutionContextMetrics) {
+        assert_eq!(metrics, &SelectedResolutionContextMetrics);
+    }
+}
+
+#[cfg(test)]
+mod overlay_input_tests {
+    use super::operation_fixture_support::MutableGenerationProject;
+    use crate::analyzer::{Language, MultiAnalyzer, Project, ProjectFile, capture_query_reads};
+
+    #[test]
+    fn overlay_content_only_projects_explicit_fixture_inputs() {
+        let root = std::env::temp_dir();
+        let project = MutableGenerationProject::new(&root, Language::Rust);
+        let file = ProjectFile::new(&root, "input.rs");
+        project.set_overlay_content(file.clone(), "first");
+        let before = project.overlay_content().unwrap();
+        let analyzer = MultiAnalyzer::default();
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert_eq!(
+                project.overlay_content().unwrap().entries(),
+                before.entries()
+            );
+            project.set_overlay_content(file, "second");
+            assert_ne!(
+                project.overlay_content().unwrap().entries(),
+                before.entries()
+            );
+        });
+        assert!(reads.keys().is_empty());
+    }
 }

@@ -105,38 +105,7 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
         source: IntrinsicCallType,
         target: IntrinsicCallType,
     ) -> bool {
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Boolean as Boolean;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Byte as Byte;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Char as Char;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Double as Double;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Float as Float;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Int as Int;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Long as Long;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Short as Short;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::String as String;
-        match (source, target) {
-            (String, String) | (Boolean, Boolean) => true,
-            (String, _) | (_, String) | (Boolean, _) | (_, Boolean) => false,
-            (Byte, Byte | Short | Int | Long | Float | Double)
-            | (Short, Short | Int | Long | Float | Double)
-            | (Char, Char | Int | Long | Float | Double)
-            | (Int, Int | Long | Float | Double)
-            | (Long, Long | Float | Double)
-            | (Float, Float | Double)
-            | (Double, Double) => brokk_bifrost_jvm::java::primitives::primitive_converts(
-                java_primitive(source),
-                java_primitive(target),
-            ),
-            _ => false,
-        }
+        crate::analyzer::jvm::intrinsic_call_type_converts(source, target)
     }
 
     // Java producer slots carry the repeated component type. One actual may
@@ -408,20 +377,5 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
             None
         };
         Ok(Some((answer, implicit_receiver_gap_reason)))
-    }
-}
-
-fn java_primitive(value: IntrinsicCallType) -> brokk_bifrost_jvm::java::primitives::JavaPrimitive {
-    use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
-    match value {
-        IntrinsicCallType::Boolean => JavaPrimitive::Boolean,
-        IntrinsicCallType::Byte => JavaPrimitive::Byte,
-        IntrinsicCallType::Short => JavaPrimitive::Short,
-        IntrinsicCallType::Char => JavaPrimitive::Char,
-        IntrinsicCallType::Int => JavaPrimitive::Int,
-        IntrinsicCallType::Long => JavaPrimitive::Long,
-        IntrinsicCallType::Float => JavaPrimitive::Float,
-        IntrinsicCallType::Double => JavaPrimitive::Double,
-        IntrinsicCallType::String => unreachable!("String is not a Java primitive"),
     }
 }

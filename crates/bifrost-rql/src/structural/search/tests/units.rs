@@ -213,6 +213,47 @@ fn union_merge_widens_when_the_conservative_fair_cap_is_reached() {
     );
 }
 
+/// Isolate output headroom from independently charged work: counts are a
+/// physical-plan certificate, and an exact intermediate boundary is unsafe.
+#[test]
+#[hardwon(
+    "#2445: the merge proof compared intermediate step outputs with the findings cap, so complete policies ran in full"
+)]
+fn intermediate_step_outputs_still_widen_at_the_pipeline_cap() {
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "filter", "where": [{ "field": "fq_name", "op": "eq", "value": { "string": "missing" } }] }
+        ],
+        "limit": 3
+    }))
+    .expect("inventory followed by empty filter");
+    let plan = select_physical_plan(&query, UnionExecutionStrategy::Sequential, 1, 0)
+        .expect("physical query plan");
+    let final_step = plan.node(plan.root()).dependencies()[0];
+    let intermediate = plan.node(final_step).dependencies()[0];
+    let mut merged = merge_unit_rows(&query, []);
+    merged.budgeted_work.step_outputs = vec![0; plan.node_count()];
+    let limits = CodeQueryExecutionLimits {
+        max_pipeline_rows: 20,
+        ..CodeQueryExecutionLimits::default()
+    };
+    for (count, expected) in [
+        (19, None),
+        (20, Some(MergedLimit::StepOutputs)),
+        (21, Some(MergedLimit::StepOutputs)),
+    ] {
+        merged.budgeted_work.step_outputs[intermediate.index()] = count;
+        assert_eq!(
+            merged.reached_limit(&limits, query.limit),
+            expected,
+            "intermediate output count {count}"
+        );
+    }
+}
+
 #[test]
 fn a_row_two_seed_files_reach_keeps_the_first_row_and_folds_both_traces() {
     let project = InlineTestProject::with_language(Language::TypeScript)
@@ -599,6 +640,706 @@ fn a_callers_unit_records_the_whole_workspace_value_it_consumed() {
         )),
         "the callers answer is itself a recorded input: {keys:?}"
     );
+}
+
+// A warm hierarchy memo must retain the cross-file authority of its cold build.
+// Other initially has no edge to Target, so the unit never opens other.go.
+#[test]
+#[hardwon("#7496: warm Go hierarchy reads omit the interface that changes supertypes")]
+fn go_warm_supertypes_unit_rejects_an_unread_interface_edit() {
+    use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+        verify_read_set_for_artifact,
+    };
+
+    let project = InlineTestProject::with_language(Language::Go)
+        .with_git()
+        .file("go.mod", "module example.com/repro\n\ngo 1.23\n")
+        .file(
+            "target.go",
+            "package repro\ntype Target struct {}\nfunc (Target) Ping() {}\n",
+        )
+        .file(
+            "other.go",
+            "package repro\ntype Other interface { Missing() }\n",
+        )
+        .build();
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "class", "name": { "regex": "Target$" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }],
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("supertypes query");
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&query.plan),
+        crate::query::PlanPartitioning::BySeed
+    );
+    let files = seed_files_of(&base);
+    let seed = project.file("target.go");
+    let run = |workspace: &WorkspaceAnalyzer, files: &[ProjectFile]| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(&seed), files),
+        )
+    };
+    // Warm the generation memo before attaching the unit's ledger.
+    let go = brokk_bifrost_analysis::analyzer::resolve_analyzer::<GoAnalyzer>(base.analyzer())
+        .expect("Go analyzer");
+    assert_eq!(go.workspace_indexes_build_count_for_test(), 0);
+    let warm = run(&base, &files);
+    assert_eq!(go.workspace_indexes_build_count_for_test(), 1);
+    assert!(
+        warm.rows.is_empty(),
+        "Target does not initially implement Other: {warm:?}"
+    );
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let before = {
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            base.analyzer(),
+            std::sync::Arc::clone(&ledger),
+        );
+        run(&base, &files)
+    };
+    assert_eq!(
+        go.workspace_indexes_build_count_for_test(),
+        1,
+        "unit used warm memo"
+    );
+    assert_eq!(before.rows, warm.rows);
+    assert!(ledger.is_bounded(), "unit must be publishable");
+    let reads = ledger.keys();
+    assert!(
+        reads.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::Lookup {
+                question: crate::analyzer::LookupQuestion::WorkspaceFact {
+                    family: crate::analyzer::WorkspaceFactFamily::GoWorkspaceIndexes,
+                    language: Language::Go,
+                    subject: crate::analyzer::FactSubject::Named { name },
+                },
+                ..
+            } if name.as_ref() == "example.com/repro.Target"
+        )),
+        "the warm memo must record its replacement certificate: {reads:?}"
+    );
+    assert!(
+        !reads.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "other.go"
+        )),
+        "the edited file must not be directly read: {reads:?}"
+    );
+    project
+        .file("other.go")
+        .write("package repro\ntype Other interface { Ping() }\n")
+        .expect("edit unread interface");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    let changed = ChangedFacts::between(&base, &head);
+    assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+    assert_eq!(changed.changed_path_count(), 1);
+    let artifact = DerivedArtifactId::new(
+        DerivedArtifactKind::PolicyEvaluationUnit,
+        crate::analyzer::read_ledger::read_set_digest(&reads).digest(),
+    );
+    let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+    let verdict = verify_read_set_for_artifact(
+        artifact,
+        &head,
+        &changed,
+        &inputs,
+        &reads,
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    let after = run(&head, &seed_files_of(&head));
+    eprintln!("GO_AUTHORITY reads={reads:?} verdict={verdict:?}");
+    eprintln!(
+        "GO_AUTHORITY before={:?} after={:?}",
+        before.rows, after.rows
+    );
+    assert_ne!(before.rows, after.rows, "mutation must change the answer");
+    assert_ne!(verdict, ReadVerdict::Unchanged, "accepted stale unit");
+}
+
+// The ancestor memo depends on global aliases collected across the workspace.
+// Its warm answer must retain the authority of the global-using scan.
+#[test]
+#[hardwon("#7496: warm C# ancestors omit the global alias that selects the base type")]
+fn csharp_warm_global_alias_unit_rejects_an_unread_using_edit() {
+    use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+        verify_read_set_for_artifact,
+    };
+
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .with_git()
+        .file("Globals.cs", "global using Parent = A.Base;\n")
+        .file(
+            "Parents.cs",
+            "namespace A { public class Base {} }\nnamespace B { public class Base {} }\n",
+        )
+        .file(
+            "Warm.cs",
+            "namespace Warm { public class Target : Parent {} }\n",
+        )
+        .file("Target.cs", "public class Target : Parent {}\n")
+        .build();
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "class", "name": { "regex": "Target$" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }],
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("supertypes query");
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&query.plan),
+        crate::query::PlanPartitioning::BySeed
+    );
+    let files = seed_files_of(&base);
+    let seed = project.file("Target.cs");
+    let run = |workspace: &WorkspaceAnalyzer, seed: &ProjectFile, files: &[ProjectFile]| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), files),
+        )
+    };
+    // Warm the workspace globals through a different seed, leaving Target's
+    // own ancestor cache cold for the next evaluation.
+    let warm = run(&base, &project.file("Warm.cs"), &files);
+    assert_eq!(
+        warm.rows.len(),
+        1,
+        "global alias resolves the warm seed: {warm:?}"
+    );
+    // Warm the captured seed too, so a cold per-type cache cannot contribute
+    // incidental scope reads that disappear on the next unit evaluation.
+    let warm_target = run(&base, &seed, &files);
+    assert_eq!(warm_target.rows.len(), 1);
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let before = {
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            base.analyzer(),
+            std::sync::Arc::clone(&ledger),
+        );
+        run(&base, &seed, &files)
+    };
+    assert_eq!(
+        before.rows.len(),
+        1,
+        "global alias resolves Target: {before:?}"
+    );
+    assert_eq!(before.rows, warm_target.rows);
+    assert!(ledger.is_bounded(), "unit must be publishable");
+    let reads = ledger.keys();
+    assert!(
+        reads.iter().any(|key| matches!(
+            key,
+            crate::analyzer::ReadKey::Lookup {
+                question: crate::analyzer::LookupQuestion::WorkspaceFact {
+                    family: crate::analyzer::WorkspaceFactFamily::CSharpGlobalUsingAliases,
+                    language: Language::CSharp,
+                    subject: crate::analyzer::FactSubject::Whole,
+                },
+                ..
+            }
+        )),
+        "the warm memo must record its replacement certificate: {reads:?}"
+    );
+    assert!(
+        !reads.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "Globals.cs"
+        )),
+        "the edited file must not be directly read: {reads:?}"
+    );
+    project
+        .file("Globals.cs")
+        .write("global using Parent = B.Base;\n")
+        .expect("edit unread global alias");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    let changed = ChangedFacts::between(&base, &head);
+    assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+    assert_eq!(changed.changed_path_count(), 1);
+    let artifact = DerivedArtifactId::new(
+        DerivedArtifactKind::PolicyEvaluationUnit,
+        crate::analyzer::read_ledger::read_set_digest(&reads).digest(),
+    );
+    let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+    let verdict = verify_read_set_for_artifact(
+        artifact,
+        &head,
+        &changed,
+        &inputs,
+        &reads,
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    let after = run(&head, &seed, &seed_files_of(&head));
+    eprintln!("CSHARP_AUTHORITY reads={reads:?} verdict={verdict:?}");
+    eprintln!(
+        "CSHARP_AUTHORITY before={:?} after={:?}",
+        before.rows, after.rows
+    );
+    assert_ne!(before.rows, after.rows, "mutation must change the answer");
+    assert_ne!(verdict, ReadVerdict::Unchanged, "accepted stale unit");
+}
+
+// The warm ancestor memo must retain the reads of its include-visible inputs.
+#[test]
+#[hardwon("#7496: warm C++ ancestors omit the included alias that selects the base type")]
+fn cpp_warm_supertypes_unit_rejects_an_unread_header_edit() {
+    use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+        verify_read_set_for_artifact,
+    };
+
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .with_git()
+        .file(
+            "parents.hpp",
+            "namespace A { class Base {}; }\nnamespace B { class Base {}; }\n",
+        )
+        .file(
+            "alias.hpp",
+            "#include \"parents.hpp\"\nusing Parent = A::Base;\n",
+        )
+        .file(
+            "target.cpp",
+            "#include \"alias.hpp\"\nclass Target : public Parent {};\n",
+        )
+        .build();
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "class", "name": { "regex": "Target$" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }],
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("supertypes query");
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&query.plan),
+        crate::query::PlanPartitioning::BySeed
+    );
+    let files = seed_files_of(&base);
+    let seed = project.file("target.cpp");
+    let run = |workspace: &WorkspaceAnalyzer, seed: &ProjectFile, files: &[ProjectFile]| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), files),
+        )
+    };
+    // Warm the include-visible type table and the per-type ancestor memo.
+    let cpp = brokk_bifrost_analysis::analyzer::resolve_analyzer::<CppAnalyzer>(base.analyzer())
+        .expect("C++ analyzer");
+    assert_eq!(cpp.visible_type_units_build_count_for_test(), 0);
+    let warm_target = run(&base, &seed, &files);
+    assert_eq!(
+        warm_target.rows.len(),
+        1,
+        "included alias resolves a base: {warm_target:?}"
+    );
+    assert_eq!(cpp.visible_type_units_build_count_for_test(), 1);
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let before = {
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            base.analyzer(),
+            std::sync::Arc::clone(&ledger),
+        );
+        run(&base, &seed, &files)
+    };
+    assert_eq!(
+        before.rows.len(),
+        1,
+        "included alias resolves Target: {before:?}"
+    );
+    assert_eq!(before.rows, warm_target.rows);
+    assert_eq!(
+        cpp.visible_type_units_build_count_for_test(),
+        1,
+        "captured unit uses warm memo"
+    );
+    assert!(ledger.is_bounded(), "unit must be publishable");
+    let reads = ledger.keys();
+    assert!(
+        reads.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "alias.hpp"
+        )),
+        "the warm memo must replay the edited header key: {reads:?}"
+    );
+    project
+        .file("alias.hpp")
+        .write("#include \"parents.hpp\"\nusing Parent = B::Base;\n")
+        .expect("edit unread header alias");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    let changed = ChangedFacts::between(&base, &head);
+    assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+    assert_eq!(changed.changed_path_count(), 1);
+    let artifact = DerivedArtifactId::new(
+        DerivedArtifactKind::PolicyEvaluationUnit,
+        crate::analyzer::read_ledger::read_set_digest(&reads).digest(),
+    );
+    let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+    let verdict = verify_read_set_for_artifact(
+        artifact,
+        &head,
+        &changed,
+        &inputs,
+        &reads,
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    let after = run(&head, &seed, &seed_files_of(&head));
+    eprintln!("CPP_AUTHORITY reads={reads:?} verdict={verdict:?}");
+    eprintln!(
+        "CPP_AUTHORITY before={:?} after={:?}",
+        before.rows, after.rows
+    );
+    assert_ne!(before.rows, after.rows, "mutation must change the answer");
+    assert_ne!(verdict, ReadVerdict::Unchanged, "accepted stale unit");
+}
+
+// A warm ancestor vector must retain the reads that resolved its imported base.
+#[test]
+#[hardwon("#7496: warm Java ancestors omit the imported base declaration")]
+fn java_warm_supertypes_unit_rejects_an_unread_base_edit() {
+    use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+        verify_read_set_for_artifact,
+    };
+
+    let project = InlineTestProject::with_language(Language::Java)
+        .with_git()
+        .file("lib/Base.java", "package lib; public class Base {}\n")
+        .file(
+            "app/Target.java",
+            "package app; import lib.Base; public class Target extends Base {}\n",
+        )
+        .build();
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "class", "name": { "regex": "Target$" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }],
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("supertypes query");
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&query.plan),
+        crate::query::PlanPartitioning::BySeed
+    );
+    let files = seed_files_of(&base);
+    let seed = project.file("app/Target.java");
+    let run = |workspace: &WorkspaceAnalyzer, seed: &ProjectFile, files: &[ProjectFile]| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), files),
+        )
+    };
+    // Warm the generation's per-type ancestor memo before attaching a ledger.
+    let warm_target = run(&base, &seed, &files);
+    assert_eq!(
+        warm_target.rows.len(),
+        1,
+        "initial base resolves: {warm_target:?}"
+    );
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let before = {
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            base.analyzer(),
+            std::sync::Arc::clone(&ledger),
+        );
+        run(&base, &seed, &files)
+    };
+    assert_eq!(
+        before.rows.len(),
+        1,
+        "warm base resolves Target: {before:?}"
+    );
+    assert_eq!(before.rows, warm_target.rows);
+    assert!(ledger.is_bounded(), "unit must be publishable");
+    let reads = ledger.keys();
+    assert!(
+        reads.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "lib/Base.java"
+        )),
+        "the shared file-state hit must retain the base input: {reads:?}"
+    );
+    project
+        .file("lib/Base.java")
+        .write("package lib; class Replacement {}\n")
+        .expect("edit unread base input");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    let changed = ChangedFacts::between(&base, &head);
+    assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+    assert_eq!(changed.changed_path_count(), 1);
+    let artifact = DerivedArtifactId::new(
+        DerivedArtifactKind::PolicyEvaluationUnit,
+        crate::analyzer::read_ledger::read_set_digest(&reads).digest(),
+    );
+    let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+    let verdict = verify_read_set_for_artifact(
+        artifact,
+        &head,
+        &changed,
+        &inputs,
+        &reads,
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    let after = run(&head, &seed, &seed_files_of(&head));
+    eprintln!("JAVA_AUTHORITY reads={reads:?} verdict={verdict:?}");
+    eprintln!(
+        "JAVA_AUTHORITY before={:?} after={:?}",
+        before.rows, after.rows
+    );
+    assert_ne!(before.rows, after.rows, "mutation must change the answer");
+    assert_ne!(verdict, ReadVerdict::Unchanged, "accepted stale unit");
+}
+
+// A warm ancestor vector must retain the reads that resolved its imported base.
+#[test]
+#[hardwon("#7496: warm Kotlin ancestors omit the imported base declaration")]
+fn kotlin_warm_supertypes_unit_rejects_an_unread_base_edit() {
+    use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+        verify_read_set_for_artifact,
+    };
+
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .with_git()
+        .file("lib/Base.kt", "package lib\nopen class Base\n")
+        .file(
+            "app/Target.kt",
+            "package app\nimport lib.Base\nclass Target : Base()\n",
+        )
+        .build();
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "class", "name": { "regex": "Target$" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }],
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("supertypes query");
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&query.plan),
+        crate::query::PlanPartitioning::BySeed
+    );
+    let files = seed_files_of(&base);
+    let seed = project.file("app/Target.kt");
+    let run = |workspace: &WorkspaceAnalyzer, seed: &ProjectFile, files: &[ProjectFile]| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), files),
+        )
+    };
+    // Warm the generation's per-type ancestor memo before attaching a ledger.
+    let warm_target = run(&base, &seed, &files);
+    assert_eq!(
+        warm_target.rows.len(),
+        1,
+        "initial base resolves: {warm_target:?}"
+    );
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let before = {
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            base.analyzer(),
+            std::sync::Arc::clone(&ledger),
+        );
+        run(&base, &seed, &files)
+    };
+    assert_eq!(
+        before.rows.len(),
+        1,
+        "warm base resolves Target: {before:?}"
+    );
+    assert_eq!(before.rows, warm_target.rows);
+    assert!(ledger.is_bounded(), "unit must be publishable");
+    let reads = ledger.keys();
+    assert!(
+        reads.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "lib/Base.kt"
+        )),
+        "the warm ancestor hit must replay the base input: {reads:?}"
+    );
+    project
+        .file("lib/Base.kt")
+        .write("package lib\nclass Replacement\n")
+        .expect("edit unread base input");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    let changed = ChangedFacts::between(&base, &head);
+    assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+    assert_eq!(changed.changed_path_count(), 1);
+    let artifact = DerivedArtifactId::new(
+        DerivedArtifactKind::PolicyEvaluationUnit,
+        crate::analyzer::read_ledger::read_set_digest(&reads).digest(),
+    );
+    let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+    let verdict = verify_read_set_for_artifact(
+        artifact,
+        &head,
+        &changed,
+        &inputs,
+        &reads,
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    let after = run(&head, &seed, &seed_files_of(&head));
+    eprintln!("KOTLIN_AUTHORITY reads={reads:?} verdict={verdict:?}");
+    eprintln!(
+        "KOTLIN_AUTHORITY before={:?} after={:?}",
+        before.rows, after.rows
+    );
+    assert_ne!(before.rows, after.rows, "mutation must change the answer");
+    assert_ne!(verdict, ReadVerdict::Unchanged, "accepted stale unit");
+}
+
+// Reexport resolution reads bridge.py on a cold build, beyond the seed file.
+#[test]
+#[hardwon("#7496: warm Python ancestors omit the reexport that selects the base class")]
+fn python_warm_supertypes_unit_rejects_an_unread_reexport_edit() {
+    use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+        verify_read_set_for_artifact,
+    };
+
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("a.py", "class Base:\n    pass\n")
+        .file("b.py", "class Base:\n    pass\n")
+        .file("bridge.py", "from a import Base as Parent\n")
+        .file(
+            "target.py",
+            "from bridge import Parent\nclass Target(Parent):\n    pass\n",
+        )
+        .build();
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "class", "name": { "regex": "Target$" } },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "supertypes" }],
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .expect("supertypes query");
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&query.plan),
+        crate::query::PlanPartitioning::BySeed
+    );
+    let files = seed_files_of(&base);
+    let seed = project.file("target.py");
+    let run = |workspace: &WorkspaceAnalyzer, seed: &ProjectFile, files: &[ProjectFile]| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), files),
+        )
+    };
+    // Warm the generation's per-type ancestor memo before attaching a ledger.
+    let warm_target = run(&base, &seed, &files);
+    assert_eq!(
+        warm_target.rows.len(),
+        1,
+        "initial base resolves: {warm_target:?}"
+    );
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let before = {
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            base.analyzer(),
+            std::sync::Arc::clone(&ledger),
+        );
+        run(&base, &seed, &files)
+    };
+    assert_eq!(
+        before.rows.len(),
+        1,
+        "warm base resolves Target: {before:?}"
+    );
+    assert_eq!(before.rows, warm_target.rows);
+    assert!(ledger.is_bounded(), "unit must be publishable");
+    let reads = ledger.keys();
+    assert!(
+        reads.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "bridge.py"
+        )),
+        "the warm ancestor hit must replay the reexport input: {reads:?}"
+    );
+    project
+        .file("bridge.py")
+        .write("from b import Base as Parent\n")
+        .expect("edit unread base input");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    let changed = ChangedFacts::between(&base, &head);
+    assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+    assert_eq!(changed.changed_path_count(), 1);
+    let artifact = DerivedArtifactId::new(
+        DerivedArtifactKind::PolicyEvaluationUnit,
+        crate::analyzer::read_ledger::read_set_digest(&reads).digest(),
+    );
+    let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+    let verdict = verify_read_set_for_artifact(
+        artifact,
+        &head,
+        &changed,
+        &inputs,
+        &reads,
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    let after = run(&head, &seed, &seed_files_of(&head));
+    eprintln!("PYTHON_AUTHORITY reads={reads:?} verdict={verdict:?}");
+    eprintln!(
+        "PYTHON_AUTHORITY before={:?} after={:?}",
+        before.rows, after.rows
+    );
+    assert_ne!(before.rows, after.rows, "mutation must change the answer");
+    assert_ne!(verdict, ReadVerdict::Unchanged, "accepted stale unit");
 }
 
 fn reference_kind_fixture() -> ReferenceSiteValue {
@@ -1104,6 +1845,70 @@ fn projected_set_collisions_keep_the_first_rows_native_field_mapping() {
             whole.result.results.len(),
             expected_rows,
             "first writer must be chosen before filtering"
+        );
+    }
+}
+
+#[test]
+#[hardwon("#2445: a warm negative posting answer skipped the selected file's read key")]
+fn warm_negative_postings_record_selected_files_without_hydration() {
+    use crate::analyzer::{AnalyzerQueryScope, ReadLedger};
+    use brokk_bifrost_analysis::analyzer::structural::index::StructuralIndexAcquisition;
+    use std::sync::Arc;
+
+    let project = two_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let providers = analyzer.structural_fact_providers();
+    let provider = providers
+        .iter()
+        .find(|provider| provider.structural_language() == Language::TypeScript)
+        .unwrap();
+    let cache = provider.snapshot_structural_index_cache().unwrap().inner();
+    assert!(matches!(
+        cache.acquire(*provider, &CancellationToken::default()),
+        StructuralIndexAcquisition::Ready { .. }
+    ));
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": { "regex": "^absent$" } },
+        "limit": 100,
+        "result_detail": "full"
+    }))
+    .unwrap();
+    let seed = project.file("src/callee.ts");
+    let files = seed_files_of(&workspace);
+    for _ in 0..2 {
+        let ledger = Arc::new(ReadLedger::new());
+        let before = cache.verdicts().totals();
+        let result = {
+            let _scope = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            execute_code_query_unit(
+                analyzer,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                None,
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(&seed), &files),
+            )
+        };
+        assert!(result.rows.is_empty());
+        assert_eq!(result.completion, CodeQueryCompletion::Complete);
+        assert_eq!(
+            result.work.fact_nodes, 0,
+            "the warmed index must avoid fact hydration"
+        );
+        assert!(
+            cache.verdicts().totals().0 > before.0,
+            "the complete cache must actually hit"
+        );
+        assert!(ledger.keys().iter().any(|key| matches!(key, crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "src/callee.ts")), "a negative hit still reads its selected file: {:?}", ledger.keys());
+        assert!(
+            !ledger
+                .keys()
+                .iter()
+                .any(|key| matches!(key, crate::analyzer::ReadKey::Scope { .. }))
         );
     }
 }

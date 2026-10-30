@@ -78,6 +78,7 @@ use crate::structural::analysis_context::{
 use crate::structural::capabilities::QueryFeature;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 #[cfg(test)]
 use brokk_bifrost_analysis::native_resolution_test_support::SelectedReferenceInverseIndex;
 #[cfg(any(test, feature = "test-support"))]
@@ -121,6 +122,7 @@ mod cpp_format;
 mod dependency_evidence;
 mod python_special_method_signature;
 mod statement_facts;
+mod traversal_memo;
 use dependency_evidence::{DependencyEvidenceValue, execute_dependency_evidence_seed};
 mod control_relations;
 mod cpp_range_relations;
@@ -387,22 +389,6 @@ impl std::ops::Deref for SemanticFlowResources {
     }
 }
 
-/// Deterministic work counters for one reusable row-family session.
-///
-/// These counters describe producer construction and reuse, not query budget
-/// charges. Each query keeps its independent scan and row budgets even when a
-/// complete immutable producer result can be replayed.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CodeQueryRowFamilySessionStats {
-    pub occurrence_derivations: usize,
-    pub occurrence_reuses: usize,
-    pub environment_derivations: usize,
-    pub environment_reuses: usize,
-    pub traced_occurrence_derivations: usize,
-    pub traced_occurrence_reuses: usize,
-}
-
 #[derive(Clone)]
 struct SharedRowFamilyStores {
     occurrence: Option<Arc<Mutex<occurrences::OccurrenceTraversalStore>>>,
@@ -508,33 +494,6 @@ impl CodeQueryRowFamilySession {
             active_semantic_model_snapshot,
         }
     }
-
-    #[doc(hidden)]
-    pub fn stats(&self) -> CodeQueryRowFamilySessionStats {
-        let (occurrence_derivations, occurrence_reuses) = self
-            .occurrence
-            .lock()
-            .expect("a row-family occurrence cache lock is not poisoned")
-            .stats();
-        let (
-            environment_derivations,
-            environment_reuses,
-            traced_occurrence_derivations,
-            traced_occurrence_reuses,
-        ) = self
-            .environment
-            .lock()
-            .expect("a row-family environment cache lock is not poisoned")
-            .stats();
-        CodeQueryRowFamilySessionStats {
-            occurrence_derivations,
-            occurrence_reuses,
-            environment_derivations,
-            environment_reuses,
-            traced_occurrence_derivations,
-            traced_occurrence_reuses,
-        }
-    }
 }
 
 // `apply_pipeline_step` below (this engine's own per-step dispatch) reaches
@@ -569,6 +528,7 @@ pub use units::{
     UnitRowKey, UnitRowProvenance, UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowScalar,
     UnitRowUnknownField, execute_code_query_selector_unit, execute_code_query_unit,
     merge_unit_rows, plan_seed_files, seed_file_order, structural_seed_file_order,
+    unit_plan_node_count,
 };
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
@@ -1217,40 +1177,50 @@ struct CallArgumentValue {
 
 #[derive(Default)]
 struct IndexedDeclarations {
-    by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>>,
-    by_unit: HashMap<CodeUnit, Option<DeclarationValue>>,
-    owner_by_member: HashMap<CodeUnit, CodeUnit>,
+    by_file: CaptureScopedMemo<HashMap<ProjectFile, BTreeSet<CodeUnit>>>,
+    by_unit: CaptureScopedMemo<HashMap<CodeUnit, Option<DeclarationValue>>>,
+    owner_by_member: CaptureScopedMemo<HashMap<CodeUnit, CodeUnit>>,
 }
 
 impl IndexedDeclarations {
     fn get(&mut self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DeclarationValue> {
-        if let Some(value) = self.by_unit.get(unit) {
-            return value.clone();
-        }
+        let Self {
+            by_file, by_unit, ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        by_file.read_mut(&attribution, |by_file| {
+            by_unit.read_mut(&attribution, |by_unit| {
+                if let Some(value) = by_unit.get(unit) {
+                    return value.clone();
+                }
 
-        let value = if unit.is_synthetic() || unit.is_file_scope() {
-            None
-        } else {
-            let declarations = self
-                .by_file
-                .entry(unit.source().clone())
-                .or_insert_with(|| analyzer.declarations(unit.source()));
-            declarations.contains(unit).then(|| {
-                analyzer
-                    .ranges_of(unit)
-                    .into_iter()
-                    .min_by_key(primary_range_key)
-                    .map(|range| DeclarationValue::new(unit.clone(), range))
-            })?
-        };
-        self.by_unit.insert(unit.clone(), value.clone());
-        value
+                let value = if unit.is_synthetic() || unit.is_file_scope() {
+                    None
+                } else {
+                    let declarations = by_file
+                        .entry(unit.source().clone())
+                        .or_insert_with(|| analyzer.declarations(unit.source()));
+                    declarations.contains(unit).then(|| {
+                        analyzer
+                            .ranges_of(unit)
+                            .into_iter()
+                            .min_by_key(primary_range_key)
+                            .map(|range| DeclarationValue::new(unit.clone(), range))
+                    })?
+                };
+                by_unit.insert(unit.clone(), value.clone());
+                value
+            })
+        })
     }
 
-    fn record_owner(&mut self, member: &CodeUnit, owner: &CodeUnit) {
+    fn record_owner(&mut self, analyzer: &dyn IAnalyzer, member: &CodeUnit, owner: &CodeUnit) {
         self.owner_by_member
-            .entry(member.clone())
-            .or_insert_with(|| owner.clone());
+            .read_mut(&memo_attribution(analyzer), |owners| {
+                owners
+                    .entry(member.clone())
+                    .or_insert_with(|| owner.clone());
+            });
     }
 
     fn owner_of(
@@ -1260,7 +1230,12 @@ impl IndexedDeclarations {
         work: &mut usize,
         max_work: usize,
     ) -> (Option<DeclarationValue>, bool) {
-        if let Some(owner) = self.owner_by_member.get(member).cloned() {
+        if let Some(owner) = self
+            .owner_by_member
+            .read(&memo_attribution(analyzer), |owners| {
+                owners.get(member).cloned()
+            })
+        {
             if *work >= max_work {
                 return (None, true);
             }
@@ -1268,38 +1243,58 @@ impl IndexedDeclarations {
             return (self.get(analyzer, &owner), false);
         }
 
-        let owner = {
-            let declarations = self
-                .by_file
-                .entry(member.source().clone())
-                .or_insert_with(|| analyzer.declarations(member.source()));
-            let mut found = None;
-            'owners: for candidate in declarations.iter() {
-                if *work >= max_work {
-                    return (None, true);
-                }
-                *work += 1;
-                if !is_type_declaration(analyzer, candidate) {
-                    continue;
-                }
-                for child in analyzer.direct_children(candidate) {
+        let (owner, exhausted) = self
+            .by_file
+            .read_mut(&memo_attribution(analyzer), |by_file| {
+                let declarations = by_file
+                    .entry(member.source().clone())
+                    .or_insert_with(|| analyzer.declarations(member.source()));
+                let mut found = None;
+                'owners: for candidate in declarations.iter() {
                     if *work >= max_work {
                         return (None, true);
                     }
                     *work += 1;
-                    if &child == member {
-                        found = Some(candidate.clone());
-                        break 'owners;
+                    if !is_type_declaration(analyzer, candidate) {
+                        continue;
+                    }
+                    for child in analyzer.direct_children(candidate) {
+                        if *work >= max_work {
+                            return (None, true);
+                        }
+                        *work += 1;
+                        if &child == member {
+                            found = Some(candidate.clone());
+                            break 'owners;
+                        }
                     }
                 }
-            }
-            found
-        };
+                (found, false)
+            });
+        if exhausted {
+            return (None, true);
+        }
+
         if let Some(owner) = owner {
-            self.record_owner(member, &owner);
+            self.record_owner(analyzer, member, &owner);
             return (self.get(analyzer, &owner), false);
         }
         (None, false)
+    }
+}
+
+fn record_render_source_read(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    blob: Option<git2::Oid>,
+) {
+    match blob {
+        Some(blob) => analyzer.record_read(crate::analyzer::ReadKey::file(
+            crate::analyzer::common::language_for_file(file),
+            rel_path_string(file),
+            blob,
+        )),
+        None => analyzer.record_unattributed_read(),
     }
 }
 
@@ -2283,8 +2278,8 @@ enum PipelineVia {
 
 #[derive(Default)]
 struct ReferenceTraversalCache {
-    inbound: HashMap<CodeUnit, Vec<ReferenceHit>>,
-    outbound: HashMap<ProjectFile, Vec<ReferenceHit>>,
+    inbound: CaptureScopedMemo<HashMap<CodeUnit, Vec<ReferenceHit>>>,
+    outbound: CaptureScopedMemo<HashMap<ProjectFile, Vec<ReferenceHit>>>,
     inbound_incomplete: HashSet<CodeUnit>,
     outbound_incomplete: HashSet<ProjectFile>,
     inbound_exhausted: HashSet<CodeUnit>,
@@ -2294,12 +2289,12 @@ struct ReferenceTraversalCache {
 
 #[derive(Default)]
 struct CallTraversalCache {
-    incoming: HashMap<CodeUnit, CallRelationResult>,
-    outgoing: HashMap<CodeUnit, CallRelationResult>,
+    incoming: CaptureScopedMemo<HashMap<CodeUnit, CallRelationResult>>,
+    outgoing: CaptureScopedMemo<HashMap<CodeUnit, CallRelationResult>>,
     reported_incoming: HashSet<CodeUnit>,
     reported_outgoing: HashSet<CodeUnit>,
-    bindings: CallBindingCache,
-    effects: EffectTraversalCache,
+    bindings: CaptureScopedMemo<CallBindingCache>,
+    effects: CaptureScopedMemo<EffectTraversalCache>,
     /// Call sites whose suppressed-shape incompleteness has already been
     /// reported, keyed by `site_ast_id`. One site reached by many pipeline
     /// rows states its gap once (#1949).
@@ -2314,9 +2309,13 @@ impl CallTraversalCache {
         >,
     ) -> Self {
         Self {
-            bindings: CallBindingCache::default()
-                .with_shared_call_target_outcomes(shared_call_target_outcomes),
-            effects: EffectTraversalCache::with_active_semantic_models(active_models),
+            bindings: CaptureScopedMemo::new(
+                CallBindingCache::default()
+                    .with_shared_call_target_outcomes(shared_call_target_outcomes),
+            ),
+            effects: CaptureScopedMemo::new(EffectTraversalCache::with_active_semantic_models(
+                active_models,
+            )),
             ..Self::default()
         }
     }
@@ -2333,17 +2332,20 @@ struct PipelineRow {
 }
 
 struct CachedSourceCoordinates {
+    blob: git2::Oid,
     source: String,
     line_starts: Vec<usize>,
 }
+
+type CachedFileDeclarations = Arc<Vec<(CodeUnit, Vec<Range>)>>;
 
 #[derive(Default)]
 struct PipelineRenderCache {
     sources: HashMap<ProjectFile, Option<CachedSourceCoordinates>>,
     conflicting_sources: HashSet<ProjectFile>,
-    declaration_ranges: HashMap<DeclarationValue, Option<CodeQueryRange>>,
+    declaration_ranges: HashMap<DeclarationValue, (Option<CodeQueryRange>, Option<git2::Oid>)>,
     enclosing_units: HashMap<(ProjectFile, usize, usize), Option<CodeUnit>>,
-    file_declarations: HashMap<ProjectFile, Vec<(CodeUnit, Vec<Range>)>>,
+    file_declarations: traversal_memo::TraversalMemo<ProjectFile, CachedFileDeclarations>,
     source_loads_sealed: bool,
 }
 
@@ -2374,6 +2376,8 @@ impl PipelineRenderCache {
         self.sources.insert(
             file.clone(),
             Some(CachedSourceCoordinates {
+                blob: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                    .expect("hash retained source"),
                 line_starts: compute_line_starts(source),
                 source: source.to_string(),
             }),
@@ -2383,6 +2387,7 @@ impl PipelineRenderCache {
 
     fn coordinates_for<F>(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         load: F,
     ) -> Option<&CachedSourceCoordinates>
@@ -2399,22 +2404,26 @@ impl PipelineRenderCache {
             // probe rendered the fallback coordinates (column 1) instead of
             // its own. The refusal is about this probe, so it stays local to
             // it.
+            // No source was consulted. This probe has no source input to
+            // certify, and must not become a cached failed load.
             return None;
         }
-        self.sources
-            .entry(file.clone())
-            .or_insert_with(|| {
-                load().map(|source| CachedSourceCoordinates {
-                    line_starts: compute_line_starts(&source),
-                    source,
-                })
+        self.sources.entry(file.clone()).or_insert_with(|| {
+            load().map(|source| CachedSourceCoordinates {
+                blob: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                    .expect("hash retained source"),
+                line_starts: compute_line_starts(&source),
+                source,
             })
-            .as_ref()
+        });
+        self.source_coordinates(analyzer, file)
     }
 
     fn retain_loaded_source(&mut self, file: &ProjectFile, source: Option<String>) {
         self.sources.entry(file.clone()).or_insert_with(|| {
             source.map(|source| CachedSourceCoordinates {
+                blob: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                    .expect("hash retained source"),
                 line_starts: compute_line_starts(&source),
                 source,
             })
@@ -2425,10 +2434,23 @@ impl PipelineRenderCache {
         self.source_loads_sealed = true;
     }
 
-    fn source_snapshot(&self, file: &ProjectFile) -> Option<&str> {
-        self.sources
-            .get(file)
-            .and_then(Option::as_ref)
+    /// Every answer names the bytes actually retained, on hits and misses.
+    fn source_coordinates(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> Option<&CachedSourceCoordinates> {
+        let coordinates = self.sources.get(file).and_then(Option::as_ref);
+        record_render_source_read(
+            analyzer,
+            file,
+            coordinates.map(|coordinates| coordinates.blob),
+        );
+        coordinates
+    }
+
+    fn source_snapshot(&self, analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<&str> {
+        self.source_coordinates(analyzer, file)
             .map(|coordinates| coordinates.source.as_str())
     }
 
@@ -2437,23 +2459,27 @@ impl PipelineRenderCache {
         analyzer: &dyn IAnalyzer,
         declaration: &DeclarationValue,
     ) -> Option<CodeQueryRange> {
-        if let Some(range) = self.declaration_ranges.get(declaration) {
+        let file = declaration.unit.source();
+        if let Some((range, blob)) = self.declaration_ranges.get(declaration) {
+            record_render_source_read(analyzer, file, *blob);
             return *range;
         }
-
-        let file = declaration.unit.source();
-        let range = {
-            self.coordinates_for(file, || analyzer.indexed_source(file))
-                .map(|coordinates| {
-                    range_for_offsets(
-                        &coordinates.source,
-                        &coordinates.line_starts,
-                        declaration.range.start_byte,
-                        declaration.range.end_byte,
-                    )
-                })
-        };
-        self.declaration_ranges.insert(declaration.clone(), range);
+        let coordinates = self.coordinates_for(analyzer, file, || analyzer.indexed_source(file));
+        let range = coordinates.map(|coordinates| {
+            range_for_offsets(
+                &coordinates.source,
+                &coordinates.line_starts,
+                declaration.range.start_byte,
+                declaration.range.end_byte,
+            )
+        });
+        let blob = coordinates.map(|coordinates| coordinates.blob);
+        // A sealed probe did not load this file. Leave that result local so
+        // later budgeted retention can supply its actual coordinates.
+        if self.sources.contains_key(file) {
+            self.declaration_ranges
+                .insert(declaration.clone(), (range, blob));
+        }
         range
     }
 
@@ -2465,27 +2491,31 @@ impl PipelineRenderCache {
         end_line: usize,
     ) -> Option<CodeUnit> {
         let cache_key = (file.clone(), start_line, end_line);
+        // An enclosing-unit hit consumes the declaration list's receipt too.
+        let (declarations, _) = traversal_memo::derive(
+            &self.file_declarations,
+            analyzer,
+            file.clone(),
+            || {
+                let blob = analyzer.indexed_blob_oid(file);
+                record_render_source_read(analyzer, file, blob);
+                Ok::<_, std::convert::Infallible>(Arc::new(
+                    analyzer
+                        .declarations(file)
+                        .into_iter()
+                        .map(|unit| {
+                            let ranges = analyzer.ranges(&unit);
+                            (unit, ranges)
+                        })
+                        .collect(),
+                ))
+            },
+            |_| true,
+        )
+        .expect("declaration projection is infallible");
         if let Some(enclosing) = self.enclosing_units.get(&cache_key) {
             return enclosing.clone();
         }
-
-        // A structural query commonly renders many matches from one source
-        // file. Calling `enclosing_code_unit_for_lines` for every match
-        // repeatedly clones and scans the full declaration set. Retain the
-        // declaration ranges once for this render pass instead.
-        let declarations = self
-            .file_declarations
-            .entry(file.clone())
-            .or_insert_with(|| {
-                analyzer
-                    .declarations(file)
-                    .into_iter()
-                    .map(|code_unit| {
-                        let ranges = analyzer.ranges(&code_unit);
-                        (code_unit, ranges)
-                    })
-                    .collect()
-            });
         let enclosing =
             brokk_bifrost_core::analyzer::code_unit_index::narrowest_enclosing_by_lines(
                 declarations
@@ -3055,15 +3085,12 @@ struct QueryExecutionState<'a> {
     /// Languages in this run's seed-file inventory, independent of provider
     /// registration and of any branch's language or path filters.
     scanned_languages: HashSet<Language>,
-    /// Physical node at which an opt-in expansion execution retains its exact
-    /// source rows. `None` preserves all existing execution behavior.
-    source_row_boundary: Option<PhysicalQueryNodeId>,
     /// Rows each plan operator emitted, indexed by its physical plan node.
     /// `max_step_outputs` is enforced per step and has no other counter.
     step_outputs: Vec<u64>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
-    seed_cache: HashMap<String, CachedSeedExecution>,
+    seed_cache: CaptureScopedMemo<HashMap<String, CachedSeedExecution>>,
     /// Per-file charges already admitted in this execution; parallel union
     /// branches use the coordinator's ledger through their lease instead.
     seed_scan_ledger: SeedScanLedger,
@@ -3561,30 +3588,6 @@ pub fn execute_workspace_request_with_cancellation(
     )
 }
 
-pub fn execute_workspace_request_with_registration_cancellation(
-    workspace: &WorkspaceAnalyzer,
-    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
-    workspace_generation: u64,
-    registrations: &ProtocolRegistrationSet,
-    query: &CodeQuery,
-    limits: CodeQueryExecutionLimits,
-    cancellation: &CancellationToken,
-) -> CodeQueryResponse {
-    let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
-    let taint_registrations = TaintResultRegistrationSet::default();
-    execute_workspace_request_with_all_analysis_registrations(
-        workspace,
-        flow_state,
-        workspace_generation,
-        registrations,
-        &value_flow_registrations,
-        &taint_registrations,
-        query,
-        limits,
-        Some(cancellation),
-    )
-}
-
 /// Execute with caller-owned reusable flow state and typestate registrations.
 pub fn execute_workspace_request_with_registrations_and_limits(
     workspace: &WorkspaceAnalyzer,
@@ -3715,7 +3718,7 @@ fn execute_request_internal(
         let requested_taint_results = requested_taint_result_refs(&query.plan);
         let summaries = flow_state
             .expect("workspace query execution requires host-owned flow state")
-            .typestate_summaries();
+            .typestate_summaries(workspace);
         match QueryAnalysisContext::new_with_all_registrations_and_summaries(
             workspace,
             workspace_generation,
@@ -3886,28 +3889,6 @@ pub fn execute_code_query_detailed_eager_index_in_scope(
     )
 }
 
-/// Eager structural execution that reuses complete row-family products across
-/// an explicitly bounded caller batch.
-#[doc(hidden)]
-pub fn execute_code_query_detailed_eager_index_with_row_family_session(
-    analyzer: &dyn IAnalyzer,
-    flow_state: impl Into<SemanticFlowResources> + Clone,
-    query: &CodeQuery,
-    limits: CodeQueryExecutionLimits,
-    cancellation: Option<&CancellationToken>,
-    row_family_session: &mut CodeQueryRowFamilySession,
-) -> DetailedCodeQueryResult {
-    execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
-        analyzer,
-        flow_state,
-        query,
-        limits,
-        cancellation,
-        row_family_session,
-        CodeQueryExecutionScope::whole_workspace(),
-    )
-}
-
 /// Eager structural execution with shared row-family products over an exact
 /// seed-file scope.
 #[doc(hidden)]
@@ -3929,108 +3910,6 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
         token,
         None,
         Some(flow_state.into()),
-        None,
-        0,
-        query,
-        limits,
-        cancellation,
-        None,
-        false,
-        UnionExecutionStrategy::Auto,
-        CODE_QUERY_SCHEDULER_WORKERS,
-        access_mode,
-        OccurrenceDerivationOptions::IDENTITY_ONLY,
-        Some(stores),
-        None,
-        None,
-        execution_scope,
-        None,
-        EdgeTraversalCache::default(),
-    )
-}
-
-/// `execute_code_query_detailed_eager_index` for a caller that reads each
-/// occurrence row's identity, role and position but never its resolved target.
-///
-/// The definition batch is one resolution per reference-class row and is the
-/// dominant cost of deriving a large file's occurrences. A consumer that joins
-/// captures to rows by AST identity -- an assertion policy's row families --
-/// needs none of it, and rows come back carrying
-/// `CodeQueryOccurrenceTarget::NotDerived` so the omission is stated rather
-/// than mistaken for an unresolved reference.
-pub fn execute_code_query_detailed_eager_index_without_targets(
-    analyzer: &dyn IAnalyzer,
-
-    query: &CodeQuery,
-    limits: CodeQueryExecutionLimits,
-    cancellation: Option<&CancellationToken>,
-) -> DetailedCodeQueryResult {
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let token = scope.token();
-    let access_mode = eager_structural_access_mode();
-    execute_internal_with_analysis_strategy(
-        analyzer,
-        token,
-        None,
-        None,
-        None,
-        0,
-        query,
-        limits,
-        cancellation,
-        None,
-        false,
-        UnionExecutionStrategy::Auto,
-        CODE_QUERY_SCHEDULER_WORKERS,
-        access_mode,
-        OccurrenceDerivationOptions::IDENTITY_ONLY,
-        None,
-        None,
-        CodeQueryExecutionScope::whole_workspace(),
-        None,
-    )
-}
-
-/// Identity-only eager structural execution that reuses complete row-family
-/// products across an explicitly bounded caller batch.
-#[doc(hidden)]
-pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_session(
-    analyzer: &dyn IAnalyzer,
-    query: &CodeQuery,
-    limits: CodeQueryExecutionLimits,
-    cancellation: Option<&CancellationToken>,
-    row_family_session: &mut CodeQueryRowFamilySession,
-) -> DetailedCodeQueryResult {
-    execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope(
-        analyzer,
-        query,
-        limits,
-        cancellation,
-        row_family_session,
-        CodeQueryExecutionScope::whole_workspace(),
-    )
-}
-
-/// Identity-only eager structural execution with shared row-family products
-/// over an exact seed-file scope.
-#[doc(hidden)]
-pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope(
-    analyzer: &dyn IAnalyzer,
-    query: &CodeQuery,
-    limits: CodeQueryExecutionLimits,
-    cancellation: Option<&CancellationToken>,
-    row_family_session: &mut CodeQueryRowFamilySession,
-    execution_scope: CodeQueryExecutionScope<'_>,
-) -> DetailedCodeQueryResult {
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let token = scope.token();
-    let access_mode = eager_structural_access_mode();
-    let stores = row_family_session.stores(analyzer, OccurrenceDerivationOptions::IDENTITY_ONLY);
-    execute_internal_with_analysis_strategy_and_row_family_session(
-        analyzer,
-        token,
-        None,
-        None,
         None,
         0,
         query,
@@ -4107,56 +3986,6 @@ pub fn execute_code_query_detailed_eager_index_workspace_in_scope(
         None,
         None,
         execution_scope,
-        None,
-    )
-}
-
-/// Execute a full source query plus an appended expansion suffix against an
-/// exact set of source rows produced by the source query.
-///
-/// This is a query-specific policy seam. The source rows are matched at the
-/// physical source-prefix boundary using structured detailed evidence, then
-/// the suffix continues through the ordinary eager executor. Existing callers
-/// leave this selection unset and retain their whole-workspace behavior.
-#[doc(hidden)]
-pub fn execute_code_query_expansion(
-    analyzer: &dyn IAnalyzer,
-    workspace: Option<&WorkspaceAnalyzer>,
-    query: &CodeQuery,
-    source_steps: usize,
-    source_rows: &[DetailedCodeQueryEvidence],
-    limits: CodeQueryExecutionLimits,
-    cancellation: Option<&CancellationToken>,
-) -> DetailedCodeQueryResult {
-    assert!(
-        source_steps <= query.plan.steps.len(),
-        "source step count must be a prefix of the full query plan"
-    );
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let token = scope.token();
-    let access_mode = eager_structural_access_mode();
-    execute_internal_with_analysis_strategy(
-        analyzer,
-        token,
-        workspace,
-        None,
-        None,
-        0,
-        query,
-        limits,
-        cancellation,
-        None,
-        false,
-        UnionExecutionStrategy::Auto,
-        CODE_QUERY_SCHEDULER_WORKERS,
-        access_mode,
-        OccurrenceDerivationOptions::IDENTITY_ONLY,
-        None,
-        None,
-        CodeQueryExecutionScope::for_source_rows(
-            query.plan.steps.len() - source_steps,
-            source_rows,
-        ),
         None,
     )
 }
@@ -4693,7 +4522,6 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             );
         }
     };
-    let source_row_boundary = source_row_boundary(&physical_plan, &scope);
     let requires_semantic = query_plan_requires_semantic(&query.plan);
     let call_binding_identity_request = query_plan_requires_call_binding_identity(&query.plan);
     let optional_call_site_identity =
@@ -4778,11 +4606,10 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             .iter()
             .map(crate::analyzer::common::language_for_file)
             .collect(),
-        source_row_boundary,
         step_outputs: vec![0; physical_plan.node_count()],
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
-        seed_cache: HashMap::default(),
+        seed_cache: CaptureScopedMemo::default(),
         seed_scan_ledger: SeedScanLedger::default(),
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
@@ -4940,7 +4767,12 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         || execution.truncated
         || state.access_failure.is_some()
         || semantic_work.budget_exhausted
-        || state.call_cache.effects.truncated
+        || state
+            .call_cache
+            .effects
+            .read(&memo_attribution(state.analyzer), |effects| {
+                effects.truncated
+            })
         || state.control_relation_cache.refusal_count() > 0
     {
         brokk_bifrost_core::profiling::note_with(|| {
@@ -4952,7 +4784,11 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 execution.truncated,
                 state.access_failure.is_some(),
                 semantic_work.budget_exhausted,
-                state.call_cache.effects.truncated,
+                state
+                    .call_cache
+                    .effects
+                    .read(&memo_attribution(state.analyzer), |effects| effects
+                        .truncated),
                 state.control_relation_cache.refusal_count() > 0
             )
         });
@@ -5022,15 +4858,15 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         }
         let terminal_source_file = terminal_source_file(&row.value);
         let retained_source =
-            terminal_source_file.and_then(|file| render_cache.source_snapshot(file));
-        let binding_range = pipeline_export_binding_range(&row.value, &render_cache);
+            terminal_source_file.and_then(|file| render_cache.source_snapshot(analyzer, file));
+        let binding_range = pipeline_export_binding_range(analyzer, &row.value, &render_cache);
         let mut row_evidence = detailed_evidence_for_pipeline_value(
             result_index,
             &row.value,
             retained_source,
             binding_range,
         );
-        row_evidence.provenance = detailed_provenance_for_row(&row, &render_cache);
+        row_evidence.provenance = detailed_provenance_for_row(analyzer, &row, &render_cache);
         evidence.push(row_evidence);
         results.push(render_pipeline_item(
             analyzer,
@@ -5196,19 +5032,6 @@ fn select_physical_plan(
     ))
 }
 
-/// Locate the source prefix in the validated plan. The logical builder adds
-/// one unary node per authored suffix step and one root limit; physical
-/// lowering preserves those dependencies. Walking only the outer suffix also
-/// keeps selection above any set branches in the source query.
-fn source_row_boundary(
-    plan: &PhysicalQueryPlan,
-    scope: &CodeQueryExecutionScope<'_>,
-) -> Option<PhysicalQueryNodeId> {
-    scope
-        .source_selection()
-        .map(|selection| plan.suffix_input(selection.suffix_steps()))
-}
-
 fn select_parallel_union(
     logical_plan: &LogicalQueryPlan,
     strategy: UnionExecutionStrategy,
@@ -5325,6 +5148,7 @@ fn state_execution_work_snapshot(state: &QueryExecutionState<'_>) -> QueryOperat
 }
 
 fn detailed_export_binding_range(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     file: &ProjectFile,
     definition: Option<&SourceExportLocalDefinition>,
     cache: &PipelineRenderCache,
@@ -5332,7 +5156,7 @@ fn detailed_export_binding_range(
     let Some(SourceExportLocalDefinition::Defined { binding }) = definition else {
         return None;
     };
-    let coordinates = cache.sources.get(file)?.as_ref()?;
+    let coordinates = cache.source_coordinates(analyzer, file)?;
     Some(render::range_for_offsets(
         &coordinates.source,
         &coordinates.line_starts,
@@ -5342,17 +5166,18 @@ fn detailed_export_binding_range(
 }
 
 fn pipeline_export_binding_range(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &PipelineValue,
     cache: &PipelineRenderCache,
 ) -> Option<CodeQueryRange> {
     match value {
         PipelineValue::Export(value) => {
             let row = value.row();
-            detailed_export_binding_range(&row.file, row.local_definition.as_ref(), cache)
+            detailed_export_binding_range(analyzer, &row.file, row.local_definition.as_ref(), cache)
         }
         PipelineValue::CrossDomain(value) => value
             .code()
-            .and_then(|code| pipeline_export_binding_range(code, cache)),
+            .and_then(|code| pipeline_export_binding_range(analyzer, code, cache)),
         _ => None,
     }
 }
@@ -7550,6 +7375,7 @@ fn retain_budgeted_source_snapshot(
 }
 
 fn detailed_provenance_for_row(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     row: &PipelineRow,
     cache: &PipelineRenderCache,
 ) -> Vec<DetailedCodeQueryProvenanceEvidence> {
@@ -7563,11 +7389,11 @@ fn detailed_provenance_for_row(
                 .iter()
                 .map(|step| DetailedCodeQueryProvenanceStepEvidence {
                     op: step.op.label().to_string(),
-                    result: detailed_trace_provenance_ref(&step.value, cache),
+                    result: detailed_trace_provenance_ref(analyzer, &step.value, cache),
                     via: step
                         .via
                         .as_ref()
-                        .map(|via| detailed_via_provenance_ref(via, cache)),
+                        .map(|via| detailed_via_provenance_ref(analyzer, via, cache)),
                 })
                 .collect(),
         })
@@ -7599,15 +7425,19 @@ fn detailed_seed_provenance_ref(seed: &SeedMatch) -> DetailedCodeQueryProvenance
 }
 
 fn detailed_trace_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &PipelineTraceValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     match value {
         PipelineTraceValue::StructuralMatch(seed) => detailed_seed_provenance_ref(seed),
-        PipelineTraceValue::Declaration(value) => detailed_declaration_provenance_ref(value, cache),
+        PipelineTraceValue::Declaration(value) => {
+            detailed_declaration_provenance_ref(analyzer, value, cache)
+        }
         PipelineTraceValue::Semantic(value) => {
             let projection = value.detailed_projection();
             detailed_semantic_provenance_ref(
+                analyzer,
                 projection.domain,
                 projection.key,
                 projection.file,
@@ -7639,16 +7469,17 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ConfigurationFact(value) => {
             let evidence = value.fact().evidence();
             let byte_span = evidence.start_byte()..evidence.end_byte();
-            let display_range = cache.sources.get(&value.file).and_then(|coordinates| {
-                coordinates.as_ref().map(|coordinates| {
-                    range_for_offsets(
-                        &coordinates.source,
-                        &coordinates.line_starts,
-                        byte_span.start,
-                        byte_span.end,
-                    )
-                })
-            });
+            let display_range =
+                cache
+                    .source_coordinates(analyzer, &value.file)
+                    .map(|coordinates| {
+                        range_for_offsets(
+                            &coordinates.source,
+                            &coordinates.line_starts,
+                            byte_span.start,
+                            byte_span.end,
+                        )
+                    });
             DetailedCodeQueryProvenanceRefEvidence {
                 domain: DetailedCodeQueryDomain::ConfigurationFact,
                 key: DetailedCodeQueryKey::ConfigurationFact {
@@ -7660,6 +7491,7 @@ fn detailed_trace_provenance_ref(
                 display_range,
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 source_slice_sha256: cached_source_slice_sha256(
+                    analyzer,
                     cache,
                     value.file(),
                     &(evidence.start_byte()..evidence.end_byte()),
@@ -7671,11 +7503,13 @@ fn detailed_trace_provenance_ref(
             // a configuration witness; the domain and key name the pair.
             let anchor = match value.code() {
                 Some(code) => detailed_trace_provenance_ref(
+                    analyzer,
                     &pipeline_trace_value(code)
                         .expect("cross-domain code rows have a provenance value"),
                     cache,
                 ),
                 None => detailed_trace_provenance_ref(
+                    analyzer,
                     &PipelineTraceValue::ConfigurationFact(
                         value
                             .configuration()
@@ -7696,33 +7530,36 @@ fn detailed_trace_provenance_ref(
                 ..anchor
             }
         }
-        PipelineTraceValue::ReferenceSite(value) => detailed_reference_provenance_ref(value, cache),
-        PipelineTraceValue::CallSite(value) => detailed_call_provenance_ref(value, cache),
+        PipelineTraceValue::ReferenceSite(value) => {
+            detailed_reference_provenance_ref(analyzer, value, cache)
+        }
+        PipelineTraceValue::CallSite(value) => detailed_call_provenance_ref(analyzer, value, cache),
         PipelineTraceValue::ExpressionSite(value) => {
-            detailed_expression_provenance_ref(value, cache)
+            detailed_expression_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::JsxAttributeValue(value) => {
-            detailed_jsx_attribute_value_provenance_ref(value, cache)
+            detailed_jsx_attribute_value_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::ReceiverAnalysis(value) => {
-            detailed_receiver_provenance_ref(value, cache)
+            detailed_receiver_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::MemberTargetAnalysis(value) => {
-            detailed_member_target_provenance_ref(value, cache)
+            detailed_member_target_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::ReceiverOutcome(value) => {
-            detailed_receiver_outcome_provenance_ref(value, cache)
+            detailed_receiver_outcome_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::ReceiverEvidence(value) => {
-            detailed_receiver_evidence_provenance_ref(value, cache)
+            detailed_receiver_evidence_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::PointsToCandidate(value) => {
-            detailed_points_to_candidate_provenance_ref(value, cache)
+            detailed_points_to_candidate_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::FieldWriteValue(value) => {
-            detailed_field_write_provenance_ref(value, cache)
+            detailed_field_write_provenance_ref(analyzer, value, cache)
         }
         PipelineTraceValue::RuntimeKeyedReadValue(value) => detailed_provenance_ref(
+            analyzer,
             DetailedCodeQueryDomain::RuntimeKeyedReadValue,
             DetailedCodeQueryKey::RuntimeKeyedReadValue { id: value.id() },
             &value.file,
@@ -7731,6 +7568,7 @@ fn detailed_trace_provenance_ref(
             DetailedCodeQueryProvenanceIdentities::None,
         ),
         PipelineTraceValue::CallShape(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::CallShape,
             DetailedCodeQueryKey::CallShape {
                 id: value.report.outcome.id.clone(),
@@ -7743,6 +7581,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::CallArgumentGroup(value) => {
             let group = &value.shape.report.groups[value.group_index];
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::CallArgumentGroup,
                 DetailedCodeQueryKey::CallArgumentGroup {
                     id: group.id.clone(),
@@ -7756,6 +7595,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::CallArgument(value) => {
             let argument = &value.shape.report.arguments[value.argument_index];
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::CallArgument,
                 DetailedCodeQueryKey::CallArgument {
                     id: argument.id.clone(),
@@ -7769,6 +7609,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::CallBinding(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::CallBinding,
                 DetailedCodeQueryKey::CallBinding {
                     id: row.id.clone(),
@@ -7782,6 +7623,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::CallEffect(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::CallEffect,
                 DetailedCodeQueryKey::CallEffect {
                     id: row.id.clone(),
@@ -7793,6 +7635,7 @@ fn detailed_trace_provenance_ref(
             )
         }
         PipelineTraceValue::CallResultContract(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::CallResultContract,
             DetailedCodeQueryKey::CallResultContract {
                 id: value.id.clone(),
@@ -7803,6 +7646,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::CallResultObligation(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::CallResultObligation,
             DetailedCodeQueryKey::CallResultObligation {
                 id: value.id.clone(),
@@ -7824,6 +7668,7 @@ fn detailed_trace_provenance_ref(
             source_slice_sha256: None,
         },
         PipelineTraceValue::ResultContractUse(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::ResultContractUse,
             DetailedCodeQueryKey::ResultContractUse {
                 id: value.id.clone(),
@@ -7834,6 +7679,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::ResultContractFailureUse(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::ResultContractFailureUse,
             DetailedCodeQueryKey::ResultContractFailureUse {
                 id: value.id.clone(),
@@ -7844,6 +7690,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::NilnessOperation(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::NilnessOperation,
             DetailedCodeQueryKey::NilnessOperation {
                 id: value.id.clone(),
@@ -7854,6 +7701,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::SwitchCoverage(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::SwitchCoverage,
             DetailedCodeQueryKey::SwitchCoverage {
                 id: value.id.clone(),
@@ -7864,6 +7712,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::AssignmentRelation(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::AssignmentRelation,
             DetailedCodeQueryKey::AssignmentRelation {
                 id: value.id.clone(),
@@ -7874,6 +7723,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::ClassSetRow(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::ClassSetRow,
             DetailedCodeQueryKey::ClassSetRow {
                 id: value.id.clone(),
@@ -7883,6 +7733,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::AbsentMemberFinding(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::AbsentMemberFinding,
             DetailedCodeQueryKey::AbsentMemberFinding {
                 id: value.id.clone(),
@@ -7892,6 +7743,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::DetachedTaskTransfer(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::DetachedTaskTransfer,
             DetailedCodeQueryKey::DetachedTaskTransfer {
                 id: value.id.clone(),
@@ -7904,6 +7756,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ProcedureEffect(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::ProcedureEffect,
                 DetailedCodeQueryKey::ProcedureEffect {
                     id: row.id.clone(),
@@ -7916,12 +7769,15 @@ fn detailed_trace_provenance_ref(
             )
         }
         PipelineTraceValue::MemberSelection(value) => {
-            detailed_member_selection_provenance_ref(value, cache)
+            detailed_member_selection_provenance_ref(analyzer, value, cache)
         }
-        PipelineTraceValue::Occurrence(value) => detailed_occurrence_provenance_ref(value, cache),
+        PipelineTraceValue::Occurrence(value) => {
+            detailed_occurrence_provenance_ref(analyzer, value, cache)
+        }
         PipelineTraceValue::GenerationSite(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::GenerationSite,
                 DetailedCodeQueryKey::GenerationSite {
                     id: value.id(),
@@ -7936,6 +7792,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::Export(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::Export,
                 DetailedCodeQueryKey::Export {
                     id: value.id(),
@@ -7944,6 +7801,7 @@ fn detailed_trace_provenance_ref(
                     local_definition: detailed_export_local_definition(
                         row.local_definition.as_ref(),
                         detailed_export_binding_range(
+                            analyzer,
                             &row.file,
                             row.local_definition.as_ref(),
                             cache,
@@ -7958,6 +7816,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::DeclarationState(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::DeclarationState,
                 DetailedCodeQueryKey::DeclarationState {
                     id: value.id(),
@@ -7977,6 +7836,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::LexicalScope(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::LexicalScope,
                 DetailedCodeQueryKey::LexicalScope {
                     id: value.id(),
@@ -7991,6 +7851,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::Binding(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::Binding,
                 DetailedCodeQueryKey::Binding {
                     id: value.id(),
@@ -8005,6 +7866,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ResolutionCandidate(value) => {
             let row = &value.occurrence;
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::ResolutionCandidate,
                 DetailedCodeQueryKey::ResolutionCandidate {
                     id: value.id(),
@@ -8017,6 +7879,7 @@ fn detailed_trace_provenance_ref(
             )
         }
         PipelineTraceValue::DispatchOutcome(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::DispatchOutcome,
             DetailedCodeQueryKey::DispatchOutcome {
                 id: value.site_id.clone(),
@@ -8027,6 +7890,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::DispatchTarget(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::DispatchTarget,
             DetailedCodeQueryKey::DispatchTarget {
                 id: value.id(),
@@ -8038,6 +7902,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::CallableSignature(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::CallableSignature,
             DetailedCodeQueryKey::CallableSignature {
                 id: value.report.signature.id.clone(),
@@ -8049,6 +7914,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::LiteralOccurrence(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::LiteralOccurrence,
             DetailedCodeQueryKey::LiteralOccurrence {
                 id: value.row.id.clone(),
@@ -8058,6 +7924,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::SignatureParameter(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::SignatureParameter,
             DetailedCodeQueryKey::SignatureParameter {
                 id: value.row().id.clone(),
@@ -8068,6 +7935,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::DecoratedParameter(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::DecoratedParameter,
             DetailedCodeQueryKey::DecoratedParameter {
                 id: value.row.id.clone(),
@@ -8078,6 +7946,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::CallableMetrics(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::CallableMetrics,
             DetailedCodeQueryKey::CallableMetrics {
                 id: value.declaration.site_id(),
@@ -8089,6 +7958,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::CallableApplicability(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::CallableApplicability,
             DetailedCodeQueryKey::CallableApplicability {
                 id: value.row().id.clone(),
@@ -8099,6 +7969,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::OverloadSelection(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::OverloadSelection,
             DetailedCodeQueryKey::OverloadSelection {
                 id: value.row().id.clone(),
@@ -8109,6 +7980,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::MemberFamily(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::MemberFamily,
             DetailedCodeQueryKey::MemberFamily {
                 id: value.id(),
@@ -8119,6 +7991,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::MemberFamilyEdge(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::MemberFamilyEdge,
             DetailedCodeQueryKey::MemberFamilyEdge {
                 id: value.id(),
@@ -8130,6 +8003,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::PythonHierarchyFact(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::PythonHierarchyFact,
             DetailedCodeQueryKey::PythonHierarchyFact {
                 id: value.id(),
@@ -8151,6 +8025,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::CandidateHop(value) => {
             let row = &value.occurrence;
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::CandidateHop,
                 DetailedCodeQueryKey::CandidateHop {
                     id: value.id(),
@@ -8165,6 +8040,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::StateEvent(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::StateEvent,
                 DetailedCodeQueryKey::StateEvent {
                     id: value.id(),
@@ -8180,6 +8056,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::BindingInitializerCall(value) => {
             let row = &value.row;
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::BindingInitializerCall,
                 DetailedCodeQueryKey::BindingInitializerCall {
                     id: row.id.clone(),
@@ -8199,6 +8076,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::RewritePath(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::RewritePath,
                 DetailedCodeQueryKey::RewritePath {
                     id: value.id(),
@@ -8241,6 +8119,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ControlRelation(value) => {
             let (file, range) = control_relations::anchor(value);
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::ControlRelation,
                 control_relations::detailed_key(value),
                 &file,
@@ -8249,6 +8128,7 @@ fn detailed_trace_provenance_ref(
             )
         }
         PipelineTraceValue::FailureHandlerState(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::FailureHandlerState,
             failure_handler_state::detailed_key(value),
             &value.file,
@@ -8256,6 +8136,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::BranchRelation(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::BranchRelation,
             branch_relations::detailed_key(value),
             &value.file,
@@ -8263,6 +8144,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::LoopRelation(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::LoopRelation,
             loop_relations::detailed_key(value),
             &value.file,
@@ -8270,6 +8152,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::CppExpression(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::CppExpression,
             cpp_expressions::detailed_key(value),
             &value.file,
@@ -8277,6 +8160,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::StatementReachability(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::StatementReachability,
             statement_reachability::detailed_key(value),
             &value.file,
@@ -8284,6 +8168,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::PendingCleanupFlow(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::PendingCleanupFlow,
             pending_cleanup_flow::detailed_key(value),
             &value.file,
@@ -8291,6 +8176,7 @@ fn detailed_trace_provenance_ref(
             cache,
         ),
         PipelineTraceValue::PythonRuleFact(value) => detailed_provenance_ref_no_identity(
+            analyzer,
             DetailedCodeQueryDomain::PythonRuleFact,
             python_rule_facts::detailed_key(value),
             &value.file,
@@ -8300,6 +8186,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::Guard(value) => {
             let (file, range) = guards::anchor(value);
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::Guard,
                 guards::detailed_key(value),
                 &file,
@@ -8310,6 +8197,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::FlowRelation(value) => {
             let target = value.target();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::FlowRelation,
                 DetailedCodeQueryKey::FlowRelation {
                     id: value.id(),
@@ -8325,6 +8213,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ReferenceEdge(value) => {
             let row = &value.row;
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::ReferenceEdge,
                 DetailedCodeQueryKey::ReferenceEdge {
                     id: value.id(),
@@ -8340,6 +8229,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::QualifiedPath(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::QualifiedPath,
                 DetailedCodeQueryKey::QualifiedPath {
                     id: value.id(),
@@ -8353,6 +8243,7 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::PathSegment(value) => {
             let row = value.row();
             detailed_provenance_ref_no_identity(
+                analyzer,
                 DetailedCodeQueryDomain::PathSegment,
                 DetailedCodeQueryKey::PathSegment {
                     id: value.id(),
@@ -8369,6 +8260,7 @@ fn detailed_trace_provenance_ref(
 
 #[allow(clippy::too_many_arguments)]
 fn detailed_semantic_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     domain: DetailedCodeQueryDomain,
     key: DetailedCodeQueryKey,
     file: &ProjectFile,
@@ -8383,7 +8275,7 @@ fn detailed_semantic_provenance_ref(
         domain,
         key,
         file: file.clone(),
-        source_slice_sha256: cached_source_slice_sha256(cache, file, &byte_span),
+        source_slice_sha256: cached_source_slice_sha256(analyzer, cache, file, &byte_span),
         byte_span: Some(byte_span),
         display_range: Some(display_range),
         identities: DetailedCodeQueryProvenanceIdentities::Primary(Some(
@@ -8396,22 +8288,27 @@ fn detailed_semantic_provenance_ref(
 }
 
 fn detailed_via_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &PipelineVia,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     match value {
-        PipelineVia::ReferenceSite(value) => detailed_reference_provenance_ref(value, cache),
-        PipelineVia::CallSite(value) => detailed_call_provenance_ref(value, cache),
+        PipelineVia::ReferenceSite(value) => {
+            detailed_reference_provenance_ref(analyzer, value, cache)
+        }
+        PipelineVia::CallSite(value) => detailed_call_provenance_ref(analyzer, value, cache),
     }
 }
 
 fn detailed_declaration_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     declaration: &DeclarationValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let kind = declaration.kind_label();
     let fq_name = declaration.unit.fq_name();
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::Declaration,
         DetailedCodeQueryKey::Declaration {
             kind: kind.to_string(),
@@ -8428,11 +8325,13 @@ fn detailed_declaration_provenance_ref(
 }
 
 fn detailed_reference_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     site: &ReferenceSiteValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let target_fq_name = site.target.unit.fq_name();
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::ReferenceSite,
         DetailedCodeQueryKey::ReferenceSite {
             target_id: Some(site.target.declaration_id()),
@@ -8448,11 +8347,13 @@ fn detailed_reference_provenance_ref(
 }
 
 fn detailed_call_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     site: &CallSiteValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let file = &site.0.file;
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::CallSite,
         DetailedCodeQueryKey::CallSite {
             site_id: site.4.clone(),
@@ -8470,12 +8371,14 @@ fn detailed_call_provenance_ref(
 }
 
 fn detailed_expression_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     site: &ExpressionSiteValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let file = &site.call_site.0.file;
     let (input_kind, parameter_index, parameter_name) = expression_input_parts(&site.input);
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::ExpressionSite,
         DetailedCodeQueryKey::ExpressionSite {
             input_kind: input_kind.to_string(),
@@ -8491,6 +8394,7 @@ fn detailed_expression_provenance_ref(
 }
 
 fn detailed_jsx_attribute_value_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &JsxAttributeValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
@@ -8498,6 +8402,7 @@ fn detailed_jsx_attribute_value_provenance_ref(
     let range = node.range;
     let ast_id = value.ast_id();
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::JsxAttributeValue,
         DetailedCodeQueryKey::JsxAttributeValue {
             id: value.id(),
@@ -8518,11 +8423,13 @@ fn detailed_jsx_attribute_value_provenance_ref(
 }
 
 fn detailed_receiver_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &ReceiverAnalysisValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let site = &value.report.site;
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::ReceiverAnalysis,
         DetailedCodeQueryKey::ReceiverAnalysis {
             analysis_kind: value.report.operation.as_str().to_string(),
@@ -8537,11 +8444,13 @@ fn detailed_receiver_provenance_ref(
 }
 
 fn detailed_member_target_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &ReceiverAnalysisValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let site = &value.report.site;
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::MemberTargetAnalysis,
         DetailedCodeQueryKey::MemberTargetAnalysis {
             site_id: value.site_id.clone(),
@@ -8554,12 +8463,14 @@ fn detailed_member_target_provenance_ref(
 }
 
 fn detailed_field_write_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &FieldWriteValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let range = value.seed.facts.node(value.rhs_node).range;
     let rhs_ast_id = value.rhs_ast_id();
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::FieldWriteValue,
         DetailedCodeQueryKey::FieldWriteValue {
             id: value.id(),
@@ -8586,11 +8497,13 @@ fn detailed_field_write_provenance_ref(
 }
 
 fn detailed_receiver_outcome_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &ReceiverAnalysisValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let site = &value.report.site;
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::ReceiverOutcome,
         DetailedCodeQueryKey::ReceiverOutcome {
             id: value.site_id.clone(),
@@ -8604,11 +8517,13 @@ fn detailed_receiver_outcome_provenance_ref(
 }
 
 fn detailed_receiver_evidence_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &ReceiverEvidenceValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let site = &value.receiver.report.site;
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::ReceiverEvidence,
         DetailedCodeQueryKey::ReceiverEvidence {
             id: value.id.clone(),
@@ -8622,10 +8537,12 @@ fn detailed_receiver_evidence_provenance_ref(
 }
 
 fn detailed_points_to_candidate_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &PointsToCandidateValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     detailed_provenance_ref_no_identity(
+        analyzer,
         DetailedCodeQueryDomain::PointsToCandidate,
         DetailedCodeQueryKey::PointsToCandidate {
             id: value.id.clone(),
@@ -8638,11 +8555,13 @@ fn detailed_points_to_candidate_provenance_ref(
 }
 
 fn detailed_member_selection_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &MemberSelectionValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let row = &value.occurrence;
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::MemberSelection,
         DetailedCodeQueryKey::MemberSelection {
             id: value.stable_id(),
@@ -8656,11 +8575,13 @@ fn detailed_member_selection_provenance_ref(
 }
 
 fn detailed_occurrence_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &OccurrenceValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let row = &value.row;
     detailed_provenance_ref(
+        analyzer,
         DetailedCodeQueryDomain::Occurrence,
         DetailedCodeQueryKey::Occurrence {
             id: row.id(),
@@ -8676,6 +8597,7 @@ fn detailed_occurrence_provenance_ref(
 
 /// Builds provenance-ref evidence for row families without identity candidates.
 fn detailed_provenance_ref_no_identity(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     domain: DetailedCodeQueryDomain,
     key: DetailedCodeQueryKey,
     file: &ProjectFile,
@@ -8683,6 +8605,7 @@ fn detailed_provenance_ref_no_identity(
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     detailed_provenance_ref(
+        analyzer,
         domain,
         key,
         file,
@@ -8693,6 +8616,7 @@ fn detailed_provenance_ref_no_identity(
 }
 
 fn detailed_provenance_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     domain: DetailedCodeQueryDomain,
     key: DetailedCodeQueryKey,
     file: &ProjectFile,
@@ -8705,29 +8629,31 @@ fn detailed_provenance_ref(
         domain,
         key,
         file: file.clone(),
-        source_slice_sha256: cached_source_slice_sha256(cache, file, &byte_span),
+        source_slice_sha256: cached_source_slice_sha256(analyzer, cache, file, &byte_span),
         byte_span: Some(byte_span),
-        display_range: cached_display_range(cache, file, range),
+        display_range: cached_display_range(analyzer, cache, file, range),
         identities,
     }
 }
 
 fn cached_source_slice_sha256(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     cache: &PipelineRenderCache,
     file: &ProjectFile,
     byte_span: &std::ops::Range<usize>,
 ) -> Option<[u8; 32]> {
     cache
-        .source_snapshot(file)
+        .source_snapshot(analyzer, file)
         .and_then(|source| source_slice_sha256(source, byte_span))
 }
 
 fn cached_display_range(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     cache: &PipelineRenderCache,
     file: &ProjectFile,
     range: Range,
 ) -> Option<CodeQueryRange> {
-    let coordinates = cache.sources.get(file)?.as_ref()?;
+    let coordinates = cache.source_coordinates(analyzer, file)?;
     Some(range_for_offsets(
         &coordinates.source,
         &coordinates.line_starts,

@@ -364,46 +364,59 @@ fn atom_row_order(
         .then_with(|| left.source.kind.cmp(&right.source.kind))
 }
 
+/// Source kinds accepted by the persisted field-slot representation.
+pub const CLASS_SET_FIELD_SLOT_SOURCE_KINDS: &[&str] = &[
+    "constructor_call",
+    "exact_call_result",
+    "exact_access_result",
+    "literal",
+    "container_literal",
+    "declared_parameter",
+    "root_receiver",
+    "unknown",
+];
+
+/// Unknown reasons accepted by the persisted field-slot representation.
+///
+/// A guard's `unmodeled_guard:<class>` reason is deliberately absent. The
+/// field-slot index persists only the unknown atoms it builds itself; any other
+/// unknown reason in a stored value's seed, a guard's included, marks the slot
+/// incomplete and is written as `field_slot_incomplete` instead (`observe_seed`
+/// and `finish` in bifrost-flow's type_flow/field_slots.rs). A guard narrows a
+/// value inside one root's plan and never seeds a slot.
+pub const CLASS_SET_FIELD_SLOT_UNKNOWN_REASONS: &[&str] = &[
+    "root_parameter",
+    "self_receiver",
+    "variadic_parameter",
+    "unresolved_call",
+    "truncated",
+    "unmodeled_load",
+    "await",
+    "capture",
+    "ambiguous_callee",
+    "external_not_modeled",
+    "unresolved_base",
+    "dynamic_attributes",
+    "pack_incomplete",
+    "uncertain_flow",
+    "field_slot_incomplete",
+    "dynamic_field_write",
+    "solver_budget",
+    "semantic_budget",
+    "incomplete_root",
+    "open_type_bound",
+    "scalar_receiver",
+    "class_creation",
+    "class_object",
+    "unmodeled_predicate",
+];
+
 fn valid_source_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "constructor_call"
-            | "literal"
-            | "container_literal"
-            | "declared_parameter"
-            | "root_receiver"
-            | "unknown"
-    )
+    CLASS_SET_FIELD_SLOT_SOURCE_KINDS.contains(&kind)
 }
 
 fn valid_unknown_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "root_parameter"
-            | "self_receiver"
-            | "variadic_parameter"
-            | "unresolved_call"
-            | "truncated"
-            | "unmodeled_load"
-            | "await"
-            | "capture"
-            | "ambiguous_callee"
-            | "external_not_modeled"
-            | "unresolved_base"
-            | "dynamic_attributes"
-            | "pack_incomplete"
-            | "uncertain_flow"
-            | "field_slot_incomplete"
-            | "dynamic_field_write"
-            | "solver_budget"
-            | "semantic_budget"
-            | "incomplete_root"
-            | "open_type_bound"
-            | "scalar_receiver"
-            | "class_creation"
-            | "class_object"
-            | "unmodeled_predicate"
-    )
+    CLASS_SET_FIELD_SLOT_UNKNOWN_REASONS.contains(&reason)
 }
 
 fn validate_class(class: &ClassSetFieldSlotClassRow) -> Result<()> {
@@ -1709,6 +1722,59 @@ mod tests {
             "unknown reasons use the persisted vocabulary"
         );
     }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "b8af11f3b5a1: exact field-slot source kinds failed the schema CHECK"
+    )]
+    fn field_slot_source_vocabulary_agrees_with_fresh_schema() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        for kind in CLASS_SET_FIELD_SLOT_SOURCE_KINDS {
+            let mut candidate = row();
+            for slot in &mut candidate.slots {
+                for atom in &mut slot.atoms {
+                    atom.source.kind = (*kind).into();
+                }
+            }
+            let candidate = reconstruct(candidate).unwrap();
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM class_set_field_slot_indexes", [])
+                .unwrap();
+            assert!(
+                store
+                    .publish_class_set_field_slot_index(candidate, &CancellationToken::new())
+                    .unwrap(),
+                "{kind}"
+            );
+            let stored: String = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT source_kind FROM class_set_field_slot_atoms LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, *kind);
+        }
+        let error = store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE class_set_field_slot_atoms SET source_kind='outside_vocabulary'",
+                [],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+    }
+
     #[test]
     fn persisted_field_slots_bound_headers_digests_and_child_cardinality() {
         let store = AnalyzerStore::open_ephemeral().unwrap();

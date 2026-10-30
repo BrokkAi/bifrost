@@ -35,10 +35,10 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionGapKind, ResolutionGoPackageImportFact, ResolutionGoPackageImportKind,
     ResolutionIdentifierRole, ResolutionLocalWriteFact, ResolutionMemberAccess,
     ResolutionMemberKind, ResolutionMemberOwnerFact, ResolutionMemberQualifierCompatibility,
-    ResolutionNameId, ResolutionNamespace, ResolutionPackageMemberFact,
-    ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
-    ResolutionRootImportFact, ResolutionRootImportKind, ResolutionRootImportKindFact,
-    ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
+    ResolutionNameId, ResolutionNameLookupFact, ResolutionNameLookupKind, ResolutionNamespace,
+    ResolutionPackageMemberFact, ResolutionReferenceOwnerFact, ResolutionRootExportFact,
+    ResolutionRootImportAnchor, ResolutionRootImportFact, ResolutionRootImportKind,
+    ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
     ResolutionRootReferenceSegmentFact, ResolutionRouteGap, ResolutionScopeFact, ResolutionScopeId,
     ResolutionScopeInheritance, ResolutionScopeKind, ResolutionSiteFact, ResolutionSiteId,
     ResolutionSiteKind, ResolutionSupertypeFact, ResolutionSupertypeKind,
@@ -2089,6 +2089,16 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 }
                 continue;
             };
+            if matches!(
+                term.kind(),
+                "type_identifier" | "qualified_type" | "generic_type"
+            ) {
+                let syntax = self.lower_type(*term);
+                self.facts.name_lookups.push(ResolutionNameLookupFact {
+                    site: self.slot(syntax.input).site,
+                    kind: ResolutionNameLookupKind::EmbeddedType,
+                });
+            }
             if is_constraint || !matches!(term.kind(), "type_identifier" | "qualified_type") {
                 self.lower_interface_type_set(owner, [*term]);
                 continue;
@@ -2211,6 +2221,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
 
         if node.kind() == "method_elem" {
+            self.facts.name_lookups.push(ResolutionNameLookupFact {
+                site: declaration,
+                kind: ResolutionNameLookupKind::InterfaceMethod,
+            });
             let owner = self
                 .type_contexts
                 .last()
@@ -2553,6 +2567,12 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             ) else {
                 continue;
             };
+            if embedded {
+                self.facts.name_lookups.push(ResolutionNameLookupFact {
+                    site: declaration,
+                    kind: ResolutionNameLookupKind::EmbeddedType,
+                });
+            }
             self.facts.binders.push(ResolutionBinderFact {
                 declaration,
                 scope: binding_scope,

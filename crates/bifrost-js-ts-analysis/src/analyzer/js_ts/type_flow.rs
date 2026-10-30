@@ -1537,6 +1537,135 @@ impl JsTsMemberSurfaceSummary {
     }
 }
 
+fn member_surface_digest(
+    summary: &JsTsMemberSurfaceSummary,
+    subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+    classes: &[ClassIdentity],
+    member: &str,
+) -> StableDigest {
+    use brokk_bifrost_analysis::analyzer::FactSubject;
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+    let mut hash = CanonicalHasher::new(b"js-ts-member-surface-v1");
+    hash.field(
+        "global-coverage",
+        format!("{:?}", summary.coverage).as_bytes(),
+    );
+    let mut unresolved = summary.unresolved_named.iter().collect::<Vec<_>>();
+    unresolved.sort();
+    hash.sequence("unresolved-named-writes", &unresolved, |hash, name| {
+        hash.value(name.as_bytes())
+    });
+    let selected = match subject {
+        FactSubject::NameGroupMember { names, .. } => summary
+            .by_class
+            .keys()
+            .filter(|class| {
+                names
+                    .iter()
+                    .any(|name| name.as_ref() == class.qualified_name())
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+        FactSubject::ClassMember { .. } => classes.to_vec(),
+        _ => unreachable!("member-surface questions name a receiver and member"),
+    };
+    let mut rows = selected
+        .iter()
+        .map(|class| {
+            let mut identity = CanonicalHasher::new(b"js-ts-member-surface-class-v1");
+            match class {
+                ClassIdentity::Workspace(unit) => {
+                    identity.value(super::workspace_facts::unit_identity(unit).as_bytes())
+                }
+                ClassIdentity::External {
+                    qualified_name,
+                    symbol_id,
+                } => {
+                    identity.field("external-name", qualified_name.as_bytes());
+                    identity.field("symbol", symbol_id.as_bytes());
+                }
+                ClassIdentity::Intrinsic { qualified_name } => {
+                    identity.field("intrinsic", qualified_name.as_bytes())
+                }
+            }
+            let mutations = summary.by_class.get(class);
+            (
+                identity.finish(),
+                mutations.is_some_and(|mutations| mutations.named.contains(member)),
+                mutations.and_then(|mutations| mutations.coverage.as_ref()),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.0);
+    rows.dedup_by_key(|row| row.0);
+    for (class, named, coverage) in rows {
+        hash.value(&class);
+        hash.field("named-write", &[u8::from(named)]);
+        hash.field("coverage", format!("{coverage:?}").as_bytes());
+    }
+    StableDigest::from_array(hash.finish())
+}
+
+pub(super) fn member_surface_fact_answer(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    language: Language,
+    subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+) -> Option<StableDigest> {
+    use brokk_bifrost_analysis::analyzer::FactSubject;
+    use brokk_bifrost_analysis::analyzer::MultiAnalyzer;
+    // Keep the original request's survey memo: cloning a workspace deliberately
+    // starts fresh request caches, while replay questions share one survey.
+    let workspace = WorkspaceAnalyzer::Multi(Box::new(
+        resolve_analyzer::<MultiAnalyzer>(analyzer)?.clone(),
+    ));
+    let _semantic_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        workspace.analyzer(),
+        analyzer.active_semantic_model_snapshot(),
+    );
+    let (classes, member) = match subject {
+        FactSubject::ClassMember { class, member } => {
+            let mut matches = analyzer.all_declarations().filter(|unit| {
+                unit.is_class() && super::workspace_facts::unit_identity(unit) == *class
+            });
+            let unit = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            let closure = workspace_surface_closure(&workspace, language, &unit);
+            let mut classes = closure
+                .owners
+                .into_iter()
+                .map(ClassIdentity::Workspace)
+                .collect::<Vec<_>>();
+            classes.extend(closure.external_bases);
+            (classes, member)
+        }
+        FactSubject::NameGroupMember { member, .. } => (Vec::new(), member),
+        _ => return None,
+    };
+    let summary = with_member_surface_authority(
+        &workspace,
+        language,
+        subject.clone(),
+        &classes,
+        member,
+        || {
+            let request = member_surface_request_for_analyzer(
+                analyzer,
+                language,
+                MAX_JS_TS_MEMBER_SURFACE_NODES,
+            );
+            unrecorded_member_surface_summary(
+                &workspace,
+                language,
+                MAX_JS_TS_MEMBER_SURFACE_NODES,
+                request,
+            )
+        },
+    );
+    Some(member_surface_digest(&summary, subject, &classes, member))
+}
+
 struct WorkspaceSurfaceClosure {
     owners: Vec<CodeUnit>,
     external_bases: Vec<ClassIdentity>,
@@ -2223,15 +2352,23 @@ fn member_surface_request(
     language: Language,
     max_nodes: usize,
 ) -> Option<JsTsMemberSurfaceRequest> {
-    let semantic_snapshot = workspace.analyzer().active_semantic_model_snapshot();
+    member_surface_request_for_analyzer(workspace.analyzer(), language, max_nodes)
+}
+
+fn member_surface_request_for_analyzer(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    language: Language,
+    max_nodes: usize,
+) -> Option<JsTsMemberSurfaceRequest> {
+    let semantic_snapshot = analyzer.active_semantic_model_snapshot();
     let semantic_overlay = semantic_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.semantic_model_overlay())
         .map(|overlay| Box::<str>::from(overlay.active_model_set_hash()));
-    let project_generation = workspace.analyzer().project().analysis_generation();
+    let project_generation = analyzer.project().analysis_generation();
     let (memo, language_content, cancellation) = match language {
         Language::JavaScript => {
-            let analyzer = resolve_analyzer::<JavascriptAnalyzer>(workspace.analyzer())?;
+            let analyzer = resolve_analyzer::<JavascriptAnalyzer>(analyzer)?;
             let inner = analyzer.inner();
             (
                 inner.active_query_request_memo::<JsTsMemberSurfaceRequestMemo>()?,
@@ -2240,7 +2377,7 @@ fn member_surface_request(
             )
         }
         Language::TypeScript => {
-            let analyzer = resolve_analyzer::<TypescriptAnalyzer>(workspace.analyzer())?;
+            let analyzer = resolve_analyzer::<TypescriptAnalyzer>(analyzer)?;
             let inner = analyzer.inner();
             (
                 inner.active_query_request_memo::<JsTsMemberSurfaceRequestMemo>()?,
@@ -2271,12 +2408,13 @@ fn truncated_member_surface_summary() -> Arc<JsTsMemberSurfaceSummary> {
     })
 }
 
-fn member_surface_summary(
+fn unrecorded_member_surface_summary(
     workspace: &WorkspaceAnalyzer,
     language: Language,
     max_nodes: usize,
+    request: Option<JsTsMemberSurfaceRequest>,
 ) -> Arc<JsTsMemberSurfaceSummary> {
-    let Some(request) = member_surface_request(workspace, language, max_nodes) else {
+    let Some(request) = request else {
         return member_surface_survey(workspace, language, max_nodes, None)
             .map(Arc::new)
             .unwrap_or_else(truncated_member_surface_summary);
@@ -2308,6 +2446,46 @@ fn member_surface_summary(
             .record_query_incomplete(QueryReadIncomplete::Cancelled);
         truncated_member_surface_summary()
     })
+}
+
+fn member_surface_summary(
+    workspace: &WorkspaceAnalyzer,
+    language: Language,
+    max_nodes: usize,
+    subject: brokk_bifrost_analysis::analyzer::FactSubject,
+    classes: &[ClassIdentity],
+    member: &str,
+) -> Arc<JsTsMemberSurfaceSummary> {
+    with_member_surface_authority(workspace, language, subject, classes, member, || {
+        let request = member_surface_request(workspace, language, max_nodes);
+        unrecorded_member_surface_summary(workspace, language, max_nodes, request)
+    })
+}
+
+fn with_member_surface_authority(
+    workspace: &WorkspaceAnalyzer,
+    language: Language,
+    subject: brokk_bifrost_analysis::analyzer::FactSubject,
+    classes: &[ClassIdentity],
+    member: &str,
+    build: impl FnOnce() -> Arc<JsTsMemberSurfaceSummary>,
+) -> Arc<JsTsMemberSurfaceSummary> {
+    use brokk_bifrost_analysis::analyzer::{
+        AuthorityInputs, WorkspaceAuthorityMemo, WorkspaceFactFamily,
+    };
+    // The request memo is reused by several receiver questions. Its only
+    // product accessor certifies the requested projection on hits and misses.
+    WorkspaceAuthorityMemo::new(WorkspaceFactFamily::JsTsMemberSurface, ()).read(
+        &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(
+            workspace.analyzer(),
+        ),
+        |_| build(),
+        |summary| AuthorityInputs::Fact {
+            language,
+            answer: member_surface_digest(summary, &subject, classes, member),
+            subject,
+        },
+    )
 }
 
 fn workspace_member_lookup(
@@ -2367,7 +2545,6 @@ fn workspace_member_lookup(
             }
         }
     }
-    let survey = member_surface_summary(workspace, language, max_nodes);
     let mut classes = closure
         .owners
         .iter()
@@ -2375,6 +2552,17 @@ fn workspace_member_lookup(
         .map(ClassIdentity::Workspace)
         .collect::<Vec<_>>();
     classes.extend(closure.external_bases);
+    let survey = member_surface_summary(
+        workspace,
+        language,
+        max_nodes,
+        brokk_bifrost_analysis::analyzer::FactSubject::ClassMember {
+            class: super::workspace_facts::unit_identity(unit),
+            member: member.into(),
+        },
+        &classes,
+        member,
+    );
     if contains_member {
         return MemberLookup::Unknown(UnknownReason::DynamicAttributes);
     }
@@ -2407,7 +2595,17 @@ fn member_lookup_with_surface_limit(
             if matches!(modeled, MemberLookup::Present(_)) {
                 return modeled;
             }
-            let survey = member_surface_summary(workspace, language, max_nodes);
+            let survey = member_surface_summary(
+                workspace,
+                language,
+                max_nodes,
+                brokk_bifrost_analysis::analyzer::FactSubject::NameGroupMember {
+                    names: vec![class.qualified_name().into()],
+                    member: member.into(),
+                },
+                std::slice::from_ref(class),
+                member,
+            );
             if let Some(reason) = survey.reason_for(std::slice::from_ref(class), member) {
                 return MemberLookup::Unknown(reason);
             }
@@ -2417,7 +2615,7 @@ fn member_lookup_with_surface_limit(
     }
 }
 
-fn member_lookup(
+pub(super) fn member_lookup(
     workspace: &WorkspaceAnalyzer,
     language: Language,
     kind: MemberAccessKind,
@@ -2970,5 +3168,81 @@ mod tests {
             panic!("qualified annotation must retain its direct class: {seed:?}")
         };
         assert_eq!(identity.qualified_name(), "Domain.Declared");
+    }
+}
+
+#[cfg(test)]
+mod member_surface_fact_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, FactSubject};
+
+    #[test]
+    fn replayed_receivers_share_the_original_request_survey() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file("a.ts", "export class A {} export class B {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let memo = member_surface_request(
+            &workspace,
+            Language::TypeScript,
+            MAX_JS_TS_MEMBER_SURFACE_NODES,
+        )
+        .unwrap()
+        .memo;
+        let classes = workspace
+            .analyzer()
+            .all_declarations()
+            .filter(CodeUnit::is_class)
+            .collect::<Vec<_>>();
+        assert_eq!(classes.len(), 2);
+        for class in classes {
+            let subject = FactSubject::ClassMember {
+                class: super::super::workspace_facts::unit_identity(&class),
+                member: "missing".into(),
+            };
+            assert!(
+                member_surface_fact_answer(workspace.analyzer(), Language::TypeScript, &subject)
+                    .is_some()
+            );
+        }
+        assert_eq!(memo.survey_count(), 1);
+    }
+
+    #[test]
+    fn name_group_answers_include_symbol_mutations_and_global_unknowns() {
+        let first = ClassIdentity::External {
+            qualified_name: "pkg.C".into(),
+            symbol_id: "first".into(),
+        };
+        let second = ClassIdentity::External {
+            qualified_name: "pkg.C".into(),
+            symbol_id: "second".into(),
+        };
+        let subject = brokk_bifrost_analysis::analyzer::FactSubject::NameGroupMember {
+            names: vec!["pkg.C".into()],
+            member: "value".into(),
+        };
+        let mut left = JsTsMemberSurfaceSummary::default();
+        left.record(
+            JsTsMutationTargets::Exact(vec![first]),
+            Some("value".into()),
+        );
+        let mut right = JsTsMemberSurfaceSummary::default();
+        right.record(
+            JsTsMutationTargets::Exact(vec![second]),
+            Some("value".into()),
+        );
+        let before = member_surface_digest(&left, &subject, &[], "value");
+        assert_ne!(
+            before,
+            member_surface_digest(&right, &subject, &[], "value")
+        );
+        left.record(JsTsMutationTargets::Open, Some("other".into()));
+        assert_ne!(before, member_surface_digest(&left, &subject, &[], "value"));
+        let before = member_surface_digest(&left, &subject, &[], "value");
+        left.record(JsTsMutationTargets::Truncated, None);
+        assert_ne!(before, member_surface_digest(&left, &subject, &[], "value"));
     }
 }

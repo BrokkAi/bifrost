@@ -5,7 +5,7 @@ use super::*;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub mod rust_wave2_root_test_support {
+pub mod shared_support {
     use super::*;
 
     use syn::visit::Visit;
@@ -206,6 +206,18 @@ pub mod rust_wave2_root_test_support {
         };
         use crate::analyzer::store::{go_unit_summaries, rust_unit_summaries, selected_definition};
         for (name, sql) in [
+            (
+                "csharp_namespaces::ORDINARY_CANDIDATES",
+                super::super::csharp_namespaces::ORDINARY_CANDIDATES,
+            ),
+            (
+                "csharp_namespaces::STAGED_CANDIDATES",
+                super::super::csharp_namespaces::STAGED_CANDIDATES,
+            ),
+            (
+                "csharp_namespaces::VERIFY_NAMESPACE",
+                super::super::csharp_namespaces::VERIFY_NAMESPACE,
+            ),
             ("imports::POINT", imports::POINT),
             ("imports::ENUMERATE", imports::ENUMERATE),
             ("imports::AT_SITE", imports::AT_SITE),

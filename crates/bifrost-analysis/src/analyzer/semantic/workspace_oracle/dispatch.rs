@@ -229,13 +229,22 @@ pub struct PreparedWorkspaceDispatchPool<'a> {
     #[doc(hidden)]
     pub sessions: Cache<StableDigest, (u32, Arc<PreparedWorkspaceDispatchPoolEntry>)>,
     expected: Cache<StableDigest, Vec<Range>>,
-    prefetched: Mutex<HashMap<ProjectFile, PrefetchedCallFile>>,
+    prefetched: Mutex<
+        HashMap<
+            ProjectFile,
+            (
+                PrefetchedCallFile,
+                Arc<crate::analyzer::usages::common::QueryMemoReads>,
+            ),
+        >,
+    >,
 }
 
 #[doc(hidden)]
 pub struct PreparedWorkspaceDispatchPoolEntry {
     artifact: crate::analyzer::semantic::service::CachedSemanticArtifact,
     source: Mutex<Option<CallDispatchSession>>,
+    reads: Mutex<Option<Arc<crate::analyzer::usages::common::QueryMemoReads>>>,
 }
 
 impl<'a> PreparedWorkspaceDispatchPool<'a> {
@@ -269,22 +278,33 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
             else {
                 continue;
             };
-            let Some(result) = support.prefetch_reverse_call_targets(
-                self.oracle.workspace,
-                sites,
-                request.cancellation,
-                snapshot.clone(),
-            ) else {
+            let (result, reads) = crate::analyzer::usages::common::capture_memo_reads(
+                self.oracle.workspace.analyzer(),
+                || {
+                    self.oracle.active_semantic_models();
+                    support.prefetch_reverse_call_targets(
+                        self.oracle.workspace,
+                        sites,
+                        request.cancellation,
+                        snapshot.clone(),
+                    )
+                },
+            );
+            let Some(result) = result else {
                 continue;
             };
+            let reads = Arc::new(reads);
             answers.extend(
-                result.map_err(|error| SemanticProviderError::internal(error.to_string()))?,
+                result
+                    .map_err(|error| SemanticProviderError::internal(error.to_string()))?
+                    .into_iter()
+                    .map(|(file, value)| (file, (value, Arc::clone(&reads)))),
             );
         }
         if crate::profiling::enabled() {
             let prefetched = answers
                 .values()
-                .map(|file| file.outcomes.len())
+                .map(|(file, _)| file.outcomes.len())
                 .sum::<usize>();
             crate::profiling::note(format!(
                 "taint.compose.callers.prefetch retained={} prefetched={prefetched}",
@@ -359,27 +379,10 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
-        let before = request.budget.used();
-        if let Some(outcome) =
-            self.oracle
-                .resolve_argument_callable(call, context, request, |entering, request| {
-                    self.resolve_call(entering, request)
-                })?
-        {
-            return Ok(outcome);
-        }
-        let probe = request.budget.used().saturating_sub(before);
-        let mut outcome = self.resolve_call(call, request)?;
-        match &mut outcome {
-            SemanticOutcome::Complete { work, .. }
-            | SemanticOutcome::Ambiguous { work, .. }
-            | SemanticOutcome::Unknown { work, .. }
-            | SemanticOutcome::Unsupported { work, .. }
-            | SemanticOutcome::Unproven { work, .. }
-            | SemanticOutcome::ExceededBudget { work, .. }
-            | SemanticOutcome::Cancelled { work, .. } => *work = probe.conservative_add(*work),
-        }
-        Ok(outcome)
+        self.oracle
+            .resolve_contextual_call(call, context, request, |call, request| {
+                self.resolve_call(call, request)
+            })
     }
 
     /// Resolve one call through the prepared session for its exact artifact
@@ -414,6 +417,7 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
                     call.procedure().artifact(),
                 ),
                 source: Mutex::new(None),
+                reads: Mutex::new(None),
             });
             let (outcome, weight) = self.resolve_with_entry(
                 &entry,
@@ -437,6 +441,7 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
                         call.procedure().artifact(),
                     ),
                     source: Mutex::new(None),
+                    reads: Mutex::new(None),
                 })
             },
             |(_, entry)| entry,
@@ -466,6 +471,42 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
         Result<SemanticOutcome<DispatchResult>, SemanticProviderError>,
         Option<u32>,
     ) {
+        let mut retained = entry.reads.lock().expect("prepared input receipt lock");
+        let (result, reads) = crate::analyzer::usages::common::capture_memo_reads(
+            self.oracle.workspace.analyzer(),
+            || {
+                if let Some(reads) = retained.as_ref() {
+                    crate::analyzer::usages::common::replay_memo_reads(
+                        reads,
+                        self.oracle.workspace.analyzer(),
+                    );
+                }
+                self.oracle.workspace.analyzer().record_read(
+                    crate::analyzer::ReadKey::semantic_artifact(call.procedure().artifact().key()),
+                );
+                self.oracle.active_semantic_models();
+                self.resolve_with_entry_and_inputs(entry, call, expected, request)
+            },
+        );
+        let (outcome, weight) = result;
+        let weight = weight.map(|bytes| {
+            (u64::from(bytes) + crate::analyzer::usages::common::memo_read_bytes(&reads) as u64)
+                .min(u64::from(u32::MAX)) as u32
+        });
+        *retained = Some(Arc::new(reads));
+        (outcome, weight)
+    }
+
+    fn resolve_with_entry_and_inputs(
+        &self,
+        entry: &PreparedWorkspaceDispatchPoolEntry,
+        call: &CallSiteHandle,
+        expected: Vec<Range>,
+        request: &mut SemanticRequest<'_>,
+    ) -> (
+        Result<SemanticOutcome<DispatchResult>, SemanticProviderError>,
+        Option<u32>,
+    ) {
         // Keep the source lock for the call so concurrent users pay once.
         // Native syntax has no semantic handles; bind emitted provenance to
         // the demanding allocation, even after equal-content re-lowering.
@@ -480,11 +521,18 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
             self.oracle.workspace.analyzer().project().root(),
             call.procedure().artifact().key().path().as_path(),
         );
-        session.prefetched = self
+        if let Some((prefetched, reads)) = self
             .prefetched
             .lock()
             .expect("caller prefetch lock")
-            .remove(&file);
+            .remove(&file)
+        {
+            crate::analyzer::usages::common::replay_memo_reads(
+                &reads,
+                self.oracle.workspace.analyzer(),
+            );
+            session.prefetched = Some(prefetched);
+        }
         session.expect_calls(expected);
         let outcome = session.resolve_call(call, request);
         let replayable = outcome.as_ref().is_ok_and(|outcome| {
@@ -590,6 +638,12 @@ impl<'a> PreparedWorkspaceDispatchSession<'a> {
             &mut crate::analyzer::usages::get_definition::ScalarCallTargetSession<'a>,
         >,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        self.oracle
+            .workspace
+            .analyzer()
+            .record_read(crate::analyzer::ReadKey::semantic_artifact(
+                call.procedure().artifact().key(),
+            ));
         if let Some(source) = &self.low_level {
             let (_, bytes) = source.source_admission();
             // This session already retained (and parsed) its source. Moving it
@@ -714,6 +768,14 @@ impl<'a> PreparedWorkspaceDispatchSession<'a> {
             usize::MAX,
             Some(request.cancellation),
             definition_session.as_deref_mut(),
+            call.procedure()
+                .semantics()
+                .call_site(call.id())
+                .ok_or_else(|| {
+                    SemanticProviderError::internal("semantic call-site handle is stale")
+                })?
+                .member_selection
+                .as_deref(),
         );
         // Generic target expansion may check out another store reader. An
         // exclusive reader must leave before that checkout on this thread.
@@ -3248,6 +3310,37 @@ impl<'a> WorkspaceSemanticOracle<'a> {
 }
 
 impl WorkspaceSemanticOracle<'_> {
+    fn resolve_contextual_call(
+        &self,
+        call: &CallSiteHandle,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+        mut resolve_call: impl FnMut(
+            &CallSiteHandle,
+            &mut SemanticRequest<'_>,
+        )
+            -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        let before = request.budget.used();
+        if let Some(outcome) =
+            self.resolve_argument_callable(call, context, request, &mut resolve_call)?
+        {
+            return Ok(outcome);
+        }
+        let probe = request.budget.used().saturating_sub(before);
+        let mut outcome = resolve_call(call, request)?;
+        match &mut outcome {
+            SemanticOutcome::Complete { work, .. }
+            | SemanticOutcome::Ambiguous { work, .. }
+            | SemanticOutcome::Unknown { work, .. }
+            | SemanticOutcome::Unsupported { work, .. }
+            | SemanticOutcome::Unproven { work, .. }
+            | SemanticOutcome::ExceededBudget { work, .. }
+            | SemanticOutcome::Cancelled { work, .. } => *work = probe.conservative_add(*work),
+        }
+        Ok(outcome)
+    }
+
     pub(crate) fn resolve_argument_callable(
         &self,
         call: &CallSiteHandle,
@@ -3616,26 +3709,9 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
-        let before = request.budget.used();
-        if let Some(outcome) =
-            self.resolve_argument_callable(call, context, request, |entering, request| {
-                self.resolve_call(entering, request)
-            })?
-        {
-            return Ok(outcome);
-        }
-        let probe = request.budget.used().saturating_sub(before);
-        let mut outcome = self.resolve_call(call, request)?;
-        match &mut outcome {
-            SemanticOutcome::Complete { work, .. }
-            | SemanticOutcome::Ambiguous { work, .. }
-            | SemanticOutcome::Unknown { work, .. }
-            | SemanticOutcome::Unsupported { work, .. }
-            | SemanticOutcome::Unproven { work, .. }
-            | SemanticOutcome::ExceededBudget { work, .. }
-            | SemanticOutcome::Cancelled { work, .. } => *work = probe.conservative_add(*work),
-        }
-        Ok(outcome)
+        self.resolve_contextual_call(call, context, request, |call, request| {
+            self.resolve_call(call, request)
+        })
     }
 }
 
@@ -5712,34 +5788,145 @@ pub(crate) fn js_ts_module_member_mutation_free(
     target: &UnmaterializedExternalTarget,
     cancellation: &CancellationToken,
 ) -> bool {
-    let Ok(files) = analyzer.project().all_files_shared() else {
-        return false;
+    use crate::analyzer::workspace_authority::{
+        AuthorityInputs, WorkspaceAuthorityMemo, memo_attribution,
     };
+    // This stateless authority still owns a build: its complete answer covers
+    // the scan's named inputs, while unreadable/unattributed crossings survive.
+    WorkspaceAuthorityMemo::new(
+        crate::analyzer::WorkspaceFactFamily::JsTsExternalModuleMemberMutation,
+        (),
+    )
+    .read(
+        &memo_attribution(analyzer),
+        |_| {
+            js_ts_module_member_mutation_verdict(
+                analyzer,
+                target.owner_fqn(),
+                target.member(),
+                cancellation,
+            )
+        },
+        |verdict| AuthorityInputs::Fact {
+            language: Language::JavaScript,
+            subject: crate::analyzer::FactSubject::NamedMember {
+                owner: target.owner_fqn().into(),
+                member: target.member().into(),
+            },
+            answer: verdict.digest(),
+        },
+    )
+    .mutation_free()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleMemberMutationVerdict {
+    Closed,
+    MutationOrEscape,
+    CoverageLimited,
+    IncompleteSyntax { mutation_free: bool },
+}
+
+impl ModuleMemberMutationVerdict {
+    fn mutation_free(self) -> bool {
+        matches!(
+            self,
+            Self::Closed
+                | Self::IncompleteSyntax {
+                    mutation_free: true
+                }
+        )
+    }
+
+    fn digest(self) -> crate::analyzer::semantic::StableDigest {
+        let mut digest = crate::analyzer::semantic::LengthDelimitedDigest::new(
+            b"bifrost.js-ts-module-member-mutation.v1",
+        );
+        digest.push(match self {
+            Self::Closed => b"closed",
+            Self::MutationOrEscape => b"mutation-or-escape",
+            Self::CoverageLimited => b"coverage-limited",
+            Self::IncompleteSyntax {
+                mutation_free: true,
+            } => b"syntax-incomplete-unmutated",
+            Self::IncompleteSyntax {
+                mutation_free: false,
+            } => b"syntax-incomplete-mutated",
+        });
+        digest.finish()
+    }
+}
+
+pub(crate) fn js_ts_module_member_mutation_answer(
+    analyzer: &dyn IAnalyzer,
+    owner: &str,
+    member: &str,
+) -> Option<crate::analyzer::semantic::StableDigest> {
+    let verdict = js_ts_module_member_mutation_verdict(
+        analyzer,
+        owner,
+        member,
+        &CancellationToken::default(),
+    );
+    match verdict {
+        ModuleMemberMutationVerdict::Closed | ModuleMemberMutationVerdict::MutationOrEscape => {
+            Some(verdict.digest())
+        }
+        ModuleMemberMutationVerdict::CoverageLimited
+        | ModuleMemberMutationVerdict::IncompleteSyntax { .. } => None,
+    }
+}
+
+fn js_ts_module_member_mutation_verdict(
+    analyzer: &dyn IAnalyzer,
+    owner: &str,
+    member: &str,
+    cancellation: &CancellationToken,
+) -> ModuleMemberMutationVerdict {
+    let Ok(files) = analyzer.project().all_files_shared() else {
+        return ModuleMemberMutationVerdict::CoverageLimited;
+    };
+    let mut verdict = ModuleMemberMutationVerdict::Closed;
+    let mut coverage_limited = false;
+    let mut incomplete_syntax = false;
     for file in files.iter() {
         if cancellation.is_cancelled() {
-            return false;
+            return ModuleMemberMutationVerdict::CoverageLimited;
         }
         let language = crate::analyzer::common::language_for_file(file);
         if !matches!(language, Language::JavaScript | Language::TypeScript) {
             continue;
         }
         let Ok(source) = file.read_to_string() else {
-            return false;
+            coverage_limited = true;
+            continue;
         };
         let Some(tree) = brokk_bifrost_js_ts::syntax::parse_js_ts_tree(file, &source, language)
         else {
-            return false;
+            coverage_limited = true;
+            continue;
         };
-        if !brokk_bifrost_js_ts::syntax::module_member_is_mutation_free(
-            tree.root_node(),
-            &source,
-            target.owner_fqn(),
-            target.member(),
-        ) {
-            return false;
+        incomplete_syntax |= tree.root_node().has_error();
+        use brokk_bifrost_js_ts::syntax::{JsTsModuleMemberMutation, JsTsModuleMemberWrites};
+        match JsTsModuleMemberWrites::collect(tree.root_node(), &source, owner).mutation(member) {
+            Some(JsTsModuleMemberMutation::Budget) => coverage_limited = true,
+            Some(JsTsModuleMemberMutation::Write(_) | JsTsModuleMemberMutation::Escape(_)) => {
+                verdict = ModuleMemberMutationVerdict::MutationOrEscape;
+            }
+            None => {}
         }
     }
-    true
+    if coverage_limited {
+        ModuleMemberMutationVerdict::CoverageLimited
+    } else if incomplete_syntax {
+        // Preserve the cold scanner's bool result while refusing to certify
+        // reuse from an error-recovered tree.
+        ModuleMemberMutationVerdict::IncompleteSyntax {
+            mutation_free: verdict.mutation_free(),
+        }
+    } else {
+        verdict
+    }
 }
 
 /// The one boundary shape the Python modeled-function discharge answers: the
@@ -6209,6 +6396,20 @@ pub fn python_workspace_module_member_mutation_free(
     max_nodes: usize,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<bool> {
+    crate::analyzer::workspace_authority::record_workspace_authority_read(
+        analyzer,
+        crate::analyzer::WorkspaceFactFamily::PythonExternalModuleMemberMutation,
+        crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[Language::Python]),
+    );
+    if let Some(ledger) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+        debug_assert!(
+            ledger
+                .keys()
+                .contains(&analyzer.workspace_scope_read_key(&[Language::Python])),
+            "every Python module-member mutation scan names its workspace inputs"
+        );
+    }
+
     language_support_for_hook(Language::Python, "workspace_module_member_mutation_free")?
         .workspace_module_member_mutation_free(analyzer, module, member, max_nodes, keep_going)
 }
@@ -7138,4 +7339,166 @@ pub fn prelude(text: &str) {
     let _ = String::from(text);
 }
 "#;
+}
+
+#[cfg(test)]
+mod prepared_pool_input_tests {
+    use super::*;
+    use crate::analyzer::{WorkspaceAnalyzer, capture_query_reads};
+
+    #[test]
+    fn prepared_dispatch_announcements_are_exact_caller_inputs() {
+        let workspace = WorkspaceAnalyzer::Multi(Box::default());
+        let oracle = WorkspaceSemanticOracle::new(&workspace);
+        let pool = oracle.prepare_workspace_dispatch_pool();
+        let first = StableDigest::sha256(b"first exact artifact");
+        let other = StableDigest::sha256(b"other exact artifact");
+        let spans = vec![Range {
+            start_byte: 1,
+            end_byte: 5,
+            start_line: 0,
+            end_line: 0,
+        }];
+        pool.expected.insert(first, spans.clone());
+        for _ in 0..2 {
+            let (selected, reads) =
+                capture_query_reads(workspace.analyzer(), || pool.expected.get(&first));
+            assert_eq!(selected, Some(spans.clone()));
+            assert!(pool.expected.get(&other).is_none());
+            assert!(
+                reads.keys().is_empty(),
+                "announcements contain only caller-supplied ranges"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod js_ts_external_module_member_mutation {
+    use super::*;
+    use crate::analyzer::read_verification::workspace_fact_test_support::{
+        source_workspace, verdict_without_field_slots,
+    };
+    use crate::analyzer::{WorkspaceAnalyzer, capture_query_reads};
+    use crate::inline_project::InlineTestProject;
+
+    fn capture(workspace: &WorkspaceAnalyzer) -> (bool, Arc<crate::analyzer::ReadLedger>) {
+        let target = UnmaterializedExternalTarget::new_modeled(
+            "child_process",
+            "execSync",
+            SemanticLanguage::Standard(Language::JavaScript),
+            1,
+            true,
+        )
+        .unwrap();
+        let (closed, reads) = capture_query_reads(workspace.analyzer(), || {
+            js_ts_module_member_mutation_free(
+                workspace.analyzer(),
+                &target,
+                &CancellationToken::default(),
+            )
+        });
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert_eq!(reads.keys().len(), 1);
+        assert!(
+            matches!(&reads.keys()[0], crate::analyzer::ReadKey::Lookup { question: crate::analyzer::LookupQuestion::WorkspaceFact { family: crate::analyzer::WorkspaceFactFamily::JsTsExternalModuleMemberMutation, subject: crate::analyzer::FactSubject::NamedMember { owner, member }, .. }, .. } if owner.as_ref() == "child_process" && member.as_ref() == "execSync")
+        );
+        (closed, reads)
+    }
+
+    #[test]
+    fn unimported_typescript_member_write_rejects_without_field_slot_keys() {
+        let project = InlineTestProject::new()
+            .file(
+                "app.js",
+                "const cp = require('child_process'); cp.execSync('true');\n",
+            )
+            .file("unimported.ts", "const marker = 0;\n")
+            .build();
+        let base = source_workspace(&project);
+        let (before, reads) = capture(&base);
+        assert!(before);
+        assert!(verdict_without_field_slots(&base, &base, &reads.keys()).is_unchanged());
+        project
+            .file("unimported.ts")
+            .write("import * as cp from 'child_process'; cp.execSync = replacement;\n")
+            .unwrap();
+        let head = source_workspace(&project);
+        let (after, _) = capture(&head);
+        assert!(!after);
+        let verdict = verdict_without_field_slots(&base, &head, &reads.keys());
+        assert!(verdict.changed().is_some(), "{verdict:?}");
+    }
+
+    #[test]
+    fn error_recovered_module_scan_cannot_certify_reuse() {
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file("broken.js", "const = ;\n")
+            .build();
+        let workspace = source_workspace(&project);
+        let source = project.file("broken.js").read_to_string().unwrap();
+        let tree = brokk_bifrost_js_ts::syntax::parse_js_ts_tree(
+            &project.file("broken.js"),
+            &source,
+            Language::JavaScript,
+        )
+        .unwrap();
+        assert!(tree.root_node().has_error());
+        let expected = brokk_bifrost_js_ts::syntax::module_member_is_mutation_free(
+            tree.root_node(),
+            &source,
+            "child_process",
+            "execSync",
+        );
+        let (closed, reads) = capture(&workspace);
+        assert_eq!(
+            closed, expected,
+            "the cold scanner's bool behavior stays unchanged"
+        );
+        assert!(
+            js_ts_module_member_mutation_answer(workspace.analyzer(), "child_process", "execSync")
+                .is_none()
+        );
+        assert!(!verdict_without_field_slots(&workspace, &workspace, &reads.keys()).is_unchanged());
+    }
+
+    #[test]
+    fn repeated_member_mutation_scan_digests_equal() {
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file(
+                "app.js",
+                "const cp = require('child_process'); cp.execSync('true');\n",
+            )
+            .file("unimported.js", "const marker = 0;\n")
+            .build();
+        let workspace = source_workspace(&project);
+        let (first, reads) = capture(&workspace);
+        let (second, again) = capture(&workspace);
+        assert!(first && second);
+        assert_eq!(reads.keys(), again.keys());
+        assert_eq!(reads.digest(), again.digest());
+    }
+
+    #[test]
+    fn comment_before_member_write_preserves_mutation_digest() {
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file(
+                "app.js",
+                "const cp = require('child_process'); cp.execSync('true');\n",
+            )
+            .file(
+                "unimported.js",
+                "const cp = require('child_process'); cp.execSync = replacement;\n",
+            )
+            .build();
+        let base = source_workspace(&project);
+        let (before, reads) = capture(&base);
+        assert!(!before);
+        project.file("unimported.js").write("// comment above the first binding\nconst cp = require('child_process'); cp.execSync = replacement;\n").unwrap();
+        let head = source_workspace(&project);
+        let (after, again) = capture(&head);
+        assert!(!after);
+        assert_eq!(reads.digest(), again.digest());
+        assert!(verdict_without_field_slots(&base, &head, &reads.keys()).is_unchanged());
+    }
 }

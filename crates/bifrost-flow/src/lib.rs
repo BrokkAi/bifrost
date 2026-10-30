@@ -39,16 +39,24 @@ pub use semantic_summary::{
 #[derive(Debug, Clone)]
 pub struct FlowWorkspaceState {
     value_flow: value_flow::ValueFlowCache,
+    semantic_summaries: Arc<dataflow::ProductionSemanticSummaryStorage>,
     type_flow_summaries: type_flow::TypeFlowSummaryPartitions,
-    typestate_summaries: Arc<typestate::ProductionTypestateSummaryRepository>,
+    typestate_summaries: Arc<typestate::ProductionTypestateSummaryStorage>,
 }
 
 impl Default for FlowWorkspaceState {
     fn default() -> Self {
+        let semantic_summaries = Arc::new(dataflow::ProductionSemanticSummaryStorage::default());
         Self {
             value_flow: value_flow::ValueFlowCache::default(),
             type_flow_summaries: type_flow::TypeFlowSummaryPartitions::default(),
-            typestate_summaries: Arc::new(typestate::ProductionTypestateSummaryRepository::new()),
+            typestate_summaries: Arc::new(
+                typestate::ProductionTypestateSummaryStorage::with_shared_semantic_summaries(
+                    typestate::TypestateSummaryRepositoryLimits::default(),
+                    Arc::clone(&semantic_summaries),
+                ),
+            ),
+            semantic_summaries,
         }
     }
 }
@@ -62,11 +70,25 @@ impl FlowWorkspaceState {
         self.value_flow.clone()
     }
 
-    pub fn typestate_summaries(&self) -> Arc<typestate::ProductionTypestateSummaryRepository> {
-        Arc::clone(&self.typestate_summaries)
+    pub fn typestate_summaries(
+        &self,
+        workspace: &analyzer::WorkspaceAnalyzer,
+    ) -> Arc<typestate::ProductionTypestateSummaryRepository> {
+        Arc::new(self.typestate_summaries.reader(
+            analyzer::workspace_authority::workspace_memo_attribution(workspace),
+        ))
     }
 
     pub fn type_flow_summaries(&self) -> type_flow::TypeFlowSummaryPartitions {
         self.type_flow_summaries.clone()
+    }
+
+    pub fn semantic_summaries(
+        &self,
+        workspace: &analyzer::WorkspaceAnalyzer,
+    ) -> Arc<dataflow::ProductionSemanticSummaryRepository> {
+        Arc::new(self.semantic_summaries.reader(
+            analyzer::workspace_authority::workspace_memo_attribution(workspace),
+        ))
     }
 }

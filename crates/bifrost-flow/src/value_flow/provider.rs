@@ -120,6 +120,57 @@ use crate::analyzer::semantic::{
     SemanticRequest, SemanticWork, StableDigest, ValueFlowOracle, ValueFlowRelation,
     ValueFlowSnapshot, WorkspaceIcfgProvider, WorkspaceSemanticOracle, dispatch_read_attribution,
 };
+use crate::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+use crate::analyzer::{ReadKey, capture_query_reads};
+
+/// Inputs retained with a completed derivation, including fail-closed reads.
+#[derive(Debug)]
+struct CapturedValue<T> {
+    value: T,
+    keys: Option<Arc<[ReadKey]>>,
+    unattributed_reads: usize,
+    execution_dependences: usize,
+}
+
+impl<T> CapturedValue<T> {
+    fn capture(workspace: &WorkspaceAnalyzer, build: impl FnOnce() -> T) -> Self {
+        let (value, reads) = capture_query_reads(workspace.analyzer(), build);
+        Self {
+            value,
+            keys: {
+                let keys = reads.unordered_keys();
+                (!keys.is_empty()).then(|| keys.into())
+            },
+            unattributed_reads: reads.unattributed_reads(),
+            execution_dependences: reads.execution_dependences(),
+        }
+    }
+
+    fn read_bytes(&self) -> usize {
+        let mut heap = RetainedHeap::default();
+        if let Some(keys) = &self.keys {
+            heap.arc(keys, |keys, heap| {
+                for key in keys {
+                    retained_read_key(heap, key);
+                }
+            });
+        }
+        heap.total()
+    }
+
+    fn replay(&self, workspace: &WorkspaceAnalyzer) {
+        if let Some(keys) = &self.keys {
+            workspace.analyzer().record_read_receipt(keys);
+        }
+        crate::analyzer::replay_query_read_receipt(
+            workspace.analyzer(),
+            [],
+            self.unattributed_reads,
+            self.execution_dependences,
+        );
+    }
+}
+
 use brokk_bifrost_core::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 
 /// Default bound on the retained bytes of one value-flow sub-cache. This
@@ -302,11 +353,11 @@ impl SnapshotKey {
 /// Retaining the whole [`SemanticOutcome`] rather than a bare snapshot is what
 /// lets a non-complete answer be replayed without losing the typed
 /// incompleteness that makes it honest (#2284).
-type MemoizedSnapshot = SemanticOutcome<ValueFlowSnapshot>;
+type MemoizedSnapshot = CapturedValue<SemanticOutcome<ValueFlowSnapshot>>;
 
 /// The binding verdict this cache retains, on the same terms as
 /// [`MemoizedSnapshot`] (#2289).
-type MemoizedBindings = SemanticOutcome<CallBindings>;
+type MemoizedBindings = CapturedValue<SemanticOutcome<CallBindings>>;
 
 /// The dispatch verdict this cache retains, on the same terms as
 /// [`MemoizedSnapshot`].
@@ -410,15 +461,17 @@ impl BindingsKey {
 /// whose projected rows were filtered out.
 fn weigh_snapshot(_key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
     let relations = outcome
+        .value
         .available_value()
         .map_or(0, |snapshot| snapshot.relations().len())
         .saturating_mul(size_of::<ValueFlowRelation>());
     let mut census = ArtifactRetentionCensus::default();
-    if let Some(snapshot) = outcome.available_value() {
+    if let Some(snapshot) = outcome.value.available_value() {
         snapshot.retained_artifacts(&mut census);
     }
     size_of::<MemoizedSnapshot>()
         .saturating_add(relations)
+        .saturating_add(outcome.read_bytes())
         .saturating_add(census.retained_bytes().min(usize::MAX as u64) as usize)
         .min(u32::MAX as usize) as u32
 }
@@ -426,20 +479,23 @@ fn weigh_snapshot(_key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
 /// Conservative structural byte weight of one retained binding verdict.
 fn weigh_bindings(_key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
     let rows = outcome
+        .value
         .available_value()
         .map_or(0, |bindings| bindings.bindings().len())
         .saturating_mul(size_of::<CallBinding>());
     let excluded_targets = outcome
+        .value
         .available_value()
         .map_or(0, |bindings| bindings.candidate().excluded_targets().len())
         .saturating_mul(size_of::<ProcedureHandle>());
     let mut census = ArtifactRetentionCensus::default();
-    if let Some(bindings) = outcome.available_value() {
+    if let Some(bindings) = outcome.value.available_value() {
         bindings.retained_artifacts(&mut census);
     }
     size_of::<MemoizedBindings>()
         .saturating_add(rows)
         .saturating_add(excluded_targets)
+        .saturating_add(outcome.read_bytes())
         .saturating_add(census.retained_bytes().min(usize::MAX as u64) as usize)
         .min(u32::MAX as usize) as u32
 }
@@ -554,7 +610,7 @@ impl ValueFlowCache {
     pub fn artifact_bytes(&self) -> u64 {
         let mut census = ArtifactRetentionCensus::default();
         self.snapshots.visit_ready(|outcome| {
-            if let Some(value) = outcome.available_value() {
+            if let Some(value) = outcome.value.available_value() {
                 value.retained_artifacts(&mut census);
             }
         });
@@ -564,7 +620,7 @@ impl ValueFlowCache {
             }
         });
         self.bindings.visit_ready(|outcome| {
-            if let Some(value) = outcome.available_value() {
+            if let Some(value) = outcome.value.available_value() {
                 value.retained_artifacts(&mut census);
             }
         });
@@ -687,11 +743,6 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
         }
     }
 
-    /// The shared cache behind this provider.
-    pub fn cache(&self) -> &ValueFlowCache {
-        &self.cache
-    }
-
     /// The workspace semantic oracle this provider delegates to.
     pub const fn oracle(&self) -> &WorkspaceSemanticOracle<'a> {
         &self.oracle
@@ -708,8 +759,13 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
         call: &CallSiteHandle,
         outcome: &SemanticOutcome<DispatchResult>,
     ) {
+        let attribution = dispatch_read_attribution(call, outcome);
+        crate::analyzer::semantic::record_dispatch_read_attribution(
+            self.oracle.workspace(),
+            &attribution,
+        );
         if let Some(collector) = &self.dispatch_reads {
-            collector.record(call, dispatch_read_attribution(call, outcome));
+            collector.record(call, attribution);
         }
     }
 }
@@ -767,25 +823,36 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 // A ready entry charged its semantic work on the flight that
                 // built it, and it already carries the exact verdict that
                 // flight published. Replaying it owns no new semantic work.
-                Ok((*value).clone())
+                value.replay(self.oracle.workspace());
+                Ok(value.value.clone())
             }
             CompleteValueAcquisition::Leader { permit } => {
                 self.cache
                     .stats
                     .snapshot_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let (outcome, retainable) = complete_provider_fill(
-                    self.oracle.workspace().analyzer(),
-                    request,
-                    |request| self.oracle.procedure_relations(procedure, context, request),
-                );
+                let CapturedValue {
+                    value: (outcome, retainable),
+                    keys,
+                    unattributed_reads,
+                    execution_dependences,
+                } = CapturedValue::capture(self.oracle.workspace(), || {
+                    complete_provider_fill(self.oracle.workspace().analyzer(), request, |request| {
+                        self.oracle.procedure_relations(procedure, context, request)
+                    })
+                });
                 let outcome = outcome?;
                 // A finished verdict is retained whether or not it is complete
                 // (#2284). Dropping the permit on a budget-exhausted or
                 // cancelled outcome wakes followers to retry, so a shortfall of
                 // this request never enters the ready cache.
                 if retainable && let Some(memoized) = outcome.completed_replay() {
-                    permit.publish_complete(Arc::new(memoized));
+                    permit.publish_complete(Arc::new(CapturedValue {
+                        value: memoized,
+                        keys,
+                        unattributed_reads,
+                        execution_dependences,
+                    }));
                     self.retained_writes.store(true, Ordering::Release);
                 }
                 Ok(outcome)
@@ -861,6 +928,12 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         let outcome = self
             .dispatch_sessions
             .resolve_call_in_context(call, context, request)?;
+        crate::analyzer::semantic::record_dispatch_read_attribution(
+            self.oracle.workspace(),
+            &DispatchReadAttribution::Unattributed(
+                crate::analyzer::semantic::DispatchReadUnattributedReason::CallContextUnavailable,
+            ),
+        );
         if let Some(collector) = &self.dispatch_reads {
             collector.record(call, DispatchReadAttribution::Unattributed(
                 crate::analyzer::semantic::DispatchReadUnattributedReason::CallContextUnavailable,
@@ -893,23 +966,34 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 // A ready entry charged its semantic work on the flight that
                 // built it, and it already carries the exact verdict that
                 // flight published. Replaying it owns no new semantic work.
-                Ok((*value).clone())
+                value.replay(self.oracle.workspace());
+                Ok(value.value.clone())
             }
             CompleteValueAcquisition::Leader { permit } => {
                 self.cache
                     .stats
                     .binding_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let (outcome, retainable) = complete_provider_fill(
-                    self.oracle.workspace().analyzer(),
-                    request,
-                    |request| self.oracle.call_bindings(call, candidate, context, request),
-                );
+                let CapturedValue {
+                    value: (outcome, retainable),
+                    keys,
+                    unattributed_reads,
+                    execution_dependences,
+                } = CapturedValue::capture(self.oracle.workspace(), || {
+                    complete_provider_fill(self.oracle.workspace().analyzer(), request, |request| {
+                        self.oracle.call_bindings(call, candidate, context, request)
+                    })
+                });
                 let outcome = outcome?;
                 // A finished binding verdict is retained whether or not it is
                 // complete, on the same terms as a snapshot (#2289).
                 if retainable && let Some(memoized) = outcome.completed_replay() {
-                    permit.publish_complete(Arc::new(memoized));
+                    permit.publish_complete(Arc::new(CapturedValue {
+                        value: memoized,
+                        keys,
+                        unattributed_reads,
+                        execution_dependences,
+                    }));
                     self.retained_writes.store(true, Ordering::Release);
                 }
                 Ok(outcome)
@@ -1313,6 +1397,75 @@ mod tests {
     }
 
     #[test]
+    fn semantic_artifact_hits_record_the_consumed_content_identity() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file("input.ts", "export function value() { return 1; }\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut read = || {
+            workspace
+                .materialize_program_semantics(
+                    &project.file("input.ts"),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("materialization")
+                .available_value()
+                .cloned()
+                .expect("artifact")
+        };
+        let (first, first_reads) = capture_query_reads(workspace.analyzer(), &mut read);
+        let (later, later_reads) = capture_query_reads(workspace.analyzer(), &mut read);
+        let key = ReadKey::semantic_artifact(first.key());
+        assert!(first_reads.keys().contains(&key));
+        assert!(later_reads.keys().contains(&key));
+        assert!(
+            Arc::ptr_eq(&first, &later),
+            "the later capture must hit the retained artifact"
+        );
+    }
+
+    #[test]
+    fn captured_verdict_hits_replay_into_later_captures() {
+        with_batch_calls(|workspace, _, _| {
+            // Snapshot and binding verdicts share this capture and replay
+            // protocol. Inject a transitive input at fill time so a fixture
+            // needing no workspace lookup cannot make this test vacuous.
+            let cache =
+                CompleteValueCache::new(1_000_000, |_: &u8, entry: &Arc<CapturedValue<usize>>| {
+                    entry.read_bytes() as u32
+                });
+            let key = ReadKey::Models(StableDigest::sha256(b"verdict input"));
+            let cancellation = CancellationToken::default();
+            let (_, reads) = capture_query_reads(workspace.analyzer(), || {
+                let (acquisition, _) = cache.acquire(&0, &cancellation);
+                let CompleteValueAcquisition::Leader { permit } = acquisition else {
+                    panic!("the first capture must fill the cache");
+                };
+                let captured = CapturedValue::capture(workspace, || {
+                    workspace.analyzer().record_read(key.clone());
+                    workspace.analyzer().record_unattributed_read();
+                    17
+                });
+                permit.publish_complete(Arc::new(captured));
+            });
+            assert_eq!(reads.keys(), vec![key.clone()]);
+            assert_eq!(reads.unattributed_reads(), 1);
+            let (_, reads) = capture_query_reads(workspace.analyzer(), || {
+                let (acquisition, _) = cache.acquire(&0, &cancellation);
+                let CompleteValueAcquisition::Cached { value } = acquisition else {
+                    panic!("the later capture must hit the retained verdict");
+                };
+                value.replay(workspace);
+                assert_eq!(value.value, 17);
+            });
+            assert_eq!(reads.keys(), vec![key]);
+            assert_eq!(reads.unattributed_reads(), 1);
+        });
+    }
+
+    #[test]
     fn cold_and_cached_dispatch_observe_the_same_read() {
         let project = InlineTestProject::with_language(Language::TypeScript)
             .file(
@@ -1362,24 +1515,34 @@ mod tests {
         let cold_reads = DispatchReadCollector::default();
         let cold_provider = provider.observing_dispatch_reads(cold_reads.clone());
         let mut cold_budget = SemanticBudget::default();
-        let cold = cold_provider
-            .resolve_call(
-                &call,
-                &mut SemanticRequest::new(&mut cold_budget, &cancellation),
-            )
-            .expect("cold dispatch");
+        let (cold, cold_ledger) = capture_query_reads(workspace.analyzer(), || {
+            cold_provider
+                .resolve_call(
+                    &call,
+                    &mut SemanticRequest::new(&mut cold_budget, &cancellation),
+                )
+                .expect("cold dispatch")
+        });
         assert!(cold.available_value().is_some());
         assert!(provider.take_retained_writes());
 
         let cached_reads = DispatchReadCollector::default();
         let cached_provider = provider.observing_dispatch_reads(cached_reads.clone());
         let mut cached_budget = SemanticBudget::default();
-        let cached = cached_provider
-            .resolve_call(
-                &call,
-                &mut SemanticRequest::new(&mut cached_budget, &cancellation),
-            )
-            .expect("cached dispatch");
+        let (cached, cached_ledger) = capture_query_reads(workspace.analyzer(), || {
+            cached_provider
+                .resolve_call(
+                    &call,
+                    &mut SemanticRequest::new(&mut cached_budget, &cancellation),
+                )
+                .expect("cached dispatch")
+        });
+        let DispatchReadAttribution::Attributed(key) = dispatch_read_attribution(&call, &cached)
+        else {
+            panic!("the fixture dispatch must have a named read");
+        };
+        assert!(cold_ledger.keys().contains(&key));
+        assert!(cached_ledger.keys().contains(&key));
 
         let hit_only_provider = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
         assert!(!hit_only_provider.take_retained_writes());

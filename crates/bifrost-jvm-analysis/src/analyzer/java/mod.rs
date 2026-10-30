@@ -22,6 +22,7 @@ pub use crate::analyzer::java::annotation::resolve_java_annotation_type;
 mod cache;
 mod call_applicability;
 mod call_conversion;
+mod workspace_facts;
 
 pub use crate::analyzer::java::call_conversion::JavaLocalAssignmentConversionProver;
 
@@ -212,8 +213,6 @@ use crate::analyzer::jvm::external::JvmExternalDeclarations;
 
 use crate::analyzer::jvm::external::jvm_external_qualified_name_exists;
 
-use crate::analyzer::jvm::retained_external_index_state;
-
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
 use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
@@ -238,6 +237,22 @@ use brokk_bifrost_jvm::java::test_detection::detect_test_assertion_smells_java;
 use brokk_bifrost_jvm::proof::JvmRetainedExternalIndex;
 
 use crate::analyzer::java::cache::JavaMemoCaches;
+use brokk_bifrost_analysis::analyzer::{WorkspaceAuthorityMemo, WorkspaceFactFamily};
+
+type JavaImportInventoryMemo = WorkspaceAuthorityMemo<
+    brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
+            brokk_bifrost_analysis::analyzer::semantic::StableDigest,
+        >,
+    >,
+>;
+
+fn fresh_import_inventory() -> Arc<JavaImportInventoryMemo> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::JavaImportInventory,
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+    ))
+}
 
 use crate::analyzer::java::clones::build_clone_candidate_data;
 
@@ -245,20 +260,42 @@ use crate::analyzer::java::clones::build_clone_candidate_data;
 pub struct JavaAnalyzer {
     inner: TreeSitterAnalyzer<JavaAdapter>,
     memo_caches: Arc<JavaMemoCaches>,
+    // The inventory covers both source and external declarations. Its lifetime
+    // must end whenever either input is renewed, including overlay clones.
+    import_inventory: Arc<JavaImportInventoryMemo>,
     java_config: brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig,
-    pub(crate) external_index: Arc<std::sync::OnceLock<Arc<JvmExternalDeclarationIndex>>>,
+    pub(crate) external_index: Arc<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+            brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
+                Arc<JvmExternalDeclarationIndex>,
+            >,
+        >,
+    >,
+    external_inputs: crate::analyzer::jvm::hierarchy::DerivedMemo<(), ()>,
 }
 
 impl_forward_query_provider!(JavaAnalyzer);
 
 impl JavaAnalyzer {
+    pub(crate) fn read_capability(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        self.inner.read_capability()
+    }
+
     pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
-        Self {
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| Self {
             inner: self.inner.update_all_with_progress(progress),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
+            import_inventory: fresh_import_inventory(),
             java_config: self.java_config.clone(),
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+            external_index: Arc::new(
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            ),
+            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(
+                self.memo_caches.budget_bytes() / 8,
+            ),
+        })
     }
 
     pub(crate) fn selected_jdk_home_for_file(
@@ -294,7 +331,11 @@ impl JavaAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
-        clone.external_index = Arc::new(std::sync::OnceLock::new());
+        clone.import_inventory = fresh_import_inventory();
+        clone.external_index =
+            Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new());
+        clone.external_inputs =
+            crate::analyzer::jvm::hierarchy::derived_memo(self.memo_caches.budget_bytes() / 8);
         clone
     }
 
@@ -316,8 +357,12 @@ impl JavaAnalyzer {
             |inner, memo_budget| Self {
                 inner,
                 memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+                import_inventory: fresh_import_inventory(),
                 java_config,
-                external_index: Arc::new(std::sync::OnceLock::new()),
+                external_index: Arc::new(
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                ),
+                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
             },
         )
     }
@@ -351,8 +396,12 @@ impl JavaAnalyzer {
             |inner, memo_budget| Self {
                 inner,
                 memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+                import_inventory: fresh_import_inventory(),
                 java_config,
-                external_index: Arc::new(std::sync::OnceLock::new()),
+                external_index: Arc::new(
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                ),
+                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
             },
         )
     }
@@ -379,8 +428,12 @@ impl JavaAnalyzer {
             |inner, memo_budget| Self {
                 inner,
                 memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+                import_inventory: fresh_import_inventory(),
                 java_config,
-                external_index: Arc::new(std::sync::OnceLock::new()),
+                external_index: Arc::new(
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                ),
+                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
             },
         )
     }
@@ -525,10 +578,15 @@ impl JavaAnalyzer {
         )
     }
 
-    pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
+    pub(crate) fn external_declaration_index(&self) -> Arc<JvmExternalDeclarationIndex> {
         crate::analyzer::jvm::external::get_or_build_external_declaration_index(
             self,
             &self.external_index,
+            (
+                Language::Java,
+                brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JavaExternalDeclarations,
+            ),
+            &self.external_inputs,
             &self.java_config,
             self.inner.project(),
             self.inner.analyzer_store(),
@@ -625,6 +683,25 @@ struct JavaFileClassIndexMemo {
 }
 
 impl JavaSource for JavaAnalyzer {
+    fn resolve_imported_type_name(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        workspace_facts::imported_type_name(self, token, file, raw_name)
+    }
+
+    fn import_inventory_is_complete(&self) -> bool {
+        // Plain lookups need the completeness bit, not its full certificate.
+        if brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self)
+            .is_capturing()
+        {
+            self.import_inventory_answer();
+        }
+        self.has_complete_symbol_lookup_index()
+    }
+
     fn declaration_source_facts(
         &self,
         _token: QueryToken<'_>,
@@ -639,11 +716,10 @@ impl JavaSource for JavaAnalyzer {
     }
 
     fn cached_package_name(&self, file: &ProjectFile) -> Option<Arc<str>> {
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-jvm-analysis/src/analyzer/java/mod.rs",
-            );
+        if let Some(reader) = self.inner.canonical_source_read(file, "java") {
+            reader.record_read_key();
+        }
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         if let Some(package) = self.memo_caches.package_names.get(file) {
             return Some(package);
@@ -652,10 +728,11 @@ impl JavaSource for JavaAnalyzer {
         {
             let cache_key = file.clone();
             let cache_value = Arc::clone(&package);
-            persistent_fill_guard.installed("package_names");
-            self.memo_caches
-                .package_names
-                .insert(cache_key, cache_value);
+            if cache_fill.is_complete() {
+                self.memo_caches
+                    .package_names
+                    .insert(cache_key, cache_value);
+            }
         };
         Some(package)
     }
@@ -667,7 +744,7 @@ impl JavaSource for JavaAnalyzer {
     }
 
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        ForwardQueryProvider::forward_definition_fqn(self, fqn)
+        self.workspace_classes(fqn)
     }
 
     fn with_usage_definitions(
@@ -689,6 +766,11 @@ impl JavaSource for JavaAnalyzer {
         fqn: &str,
         file: &ProjectFile,
     ) -> brokk_bifrost_jvm::java::graph_support::UniqueClassInFile {
+        // This hot file-only index is cheaper to certify directly than to
+        // allocate and replay one receipt for every same-file class question.
+        if let Some(reader) = self.inner.canonical_source_read(file, "java") {
+            reader.record_read_key();
+        }
         let memo = self
             .inner
             .active_query_request_memo::<JavaFileClassIndexMemo>();
@@ -789,10 +871,19 @@ impl JavaSource for JavaAnalyzer {
     }
 
     fn retained_external_index(&self) -> JvmRetainedExternalIndex {
-        retained_external_index_state(self.external_index.get().map(Arc::as_ref))
+        crate::analyzer::jvm::authority::retained_external_index(
+            self,
+            &self.external_index,
+            &self.external_inputs,
+        )
     }
 
     fn retained_external_holds_qualified_name(&self, fqn: &str, access_package: &str) -> bool {
+        crate::analyzer::jvm::authority::external_read(
+            self,
+            &self.external_index,
+            &self.external_inputs,
+        );
         self.external_index.get().is_some_and(|external| {
             jvm_external_qualified_name_exists(external, fqn, access_package)
         })
@@ -1012,11 +1103,16 @@ impl IAnalyzer for JavaAnalyzer {
         let oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
             .expect("source blob hash");
         let key = (oid, file.clone());
-        if let Some(rows) = self.memo_caches.statement_facts.get(&key) {
-            return Some(rows);
-        }
+        let result = self.memo_caches.statement_facts.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |cache, capture| {
+                if let Some(rows) = cache.get(&key) {
+                    return Ok::<_, ()>(rows);
+                }
+                let mut cacheable = false;
+                let entry = Arc::new(capture.try_build_weighted(|| {
         let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
-        let tree = parse_tree(&source)?;
+        let tree = parse_tree(&source).ok_or(())?;
         let root = tree.root_node();
         let mut rows = capture_statement_facts(&JAVA_STRUCTURAL_SPEC, root, &source);
         if !rows.switches.is_empty() {
@@ -1088,14 +1184,19 @@ impl IAnalyzer for JavaAnalyzer {
             }
         }
         let rows = Arc::new(rows);
-        // A transient store/cancellation failure must not turn a partial
-        // enum proof into a source-keyed negative for later requests.
-        if scope.captured_read_incompleteness().is_empty() {
-            self.memo_caches
-                .statement_facts
-                .insert(key, Arc::clone(&rows));
-        }
-        Some(rows)
+                    cacheable = scope.captured_read_incompleteness().is_empty();
+                    let bytes = rows.estimated_retained_bytes()
+                        + brokk_bifrost_analysis::analyzer::cache_weight::estimate_project_file(file) as usize;
+                    Ok::<_, ()>((rows, bytes))
+                })?);
+                // Keep the existing complete-build-only admission rule.
+                if cacheable {
+                    cache.insert(key, Arc::clone(&entry));
+                }
+                Ok(entry)
+            },
+        ).ok()?;
+        Some(Arc::clone(&result))
     }
 
     delegate_inner_procedure_fact_methods!();
@@ -1194,26 +1295,23 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = brokk_bifrost_analysis::analyzer::updated_external_index(
-            &self.external_index,
-            changed_files,
-            is_jvm_dependency_input,
-        );
-        let updated = Self {
-            inner: self.inner.update(changed_files),
-            memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
-            java_config: self.java_config.clone(),
-            external_index,
-        };
-        if Arc::ptr_eq(&self.external_index, &updated.external_index)
-            && self.degraded_persistent_fills() > 0
-        {
-            updated.record_degraded_persistent_fill(
-                "retained_external_index",
-                "inherited_degraded_owner",
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let external_index = brokk_bifrost_analysis::analyzer::updated_external_index(
+                &self.external_index,
+                changed_files,
+                is_jvm_dependency_input,
             );
-        }
-        updated
+            Self {
+                inner: self.inner.update(changed_files),
+                memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
+                import_inventory: fresh_import_inventory(),
+                java_config: self.java_config.clone(),
+                external_index,
+                external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(
+                    self.memo_caches.budget_bytes() / 8,
+                ),
+            }
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -1712,6 +1810,16 @@ fn java_branch_reference_site(
 }
 
 impl LanguageSupport for JavaSupport {
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+        language: Language,
+        subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        workspace_facts::answer(analyzer, family, language, subject)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn observed_value_type(
         &self,
@@ -2290,6 +2398,46 @@ impl LanguageSupport for JavaSupport {
         crate::analyzer::usages::get_definition::java::trial_definition(query)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_point_batch(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+        file: brokk_bifrost_core::analyzer::model::ProjectFile,
+        source: std::sync::Arc<str>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::native_points::NativePointBatch> {
+        std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA")?;
+        let java = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            JavaAnalyzer,
+        >(analyzer)?;
+        match brokk_bifrost_analysis::analyzer::native_points::NativePointBatch::new(
+            &java.inner,
+            analyzer,
+            file,
+            source,
+            cancellation,
+        ) {
+            Ok(batch) => batch,
+            Err(error) => {
+                analyzer.mark_execution_dependent();
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!("native_point.memo batch unavailable: {error}")
+                });
+                None
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn trial_definition_in_batch(
+        &self,
+        query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+        batch: Option<&brokk_bifrost_analysis::analyzer::native_points::NativePointBatch>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution>
+    {
+        crate::analyzer::usages::get_definition::java::trial_definition_in_batch(query, batch)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn resolve_definition_dispatch<'a>(
         &self,
@@ -2353,6 +2501,14 @@ impl LanguageSupport for JavaSupport {
     }
 }
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for JavaSupport {
+    fn precedence_rules(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::resolution::precedence::PrecedenceRules
+    {
+        use brokk_bifrost_analysis::analyzer::resolution::precedence;
+        precedence::JAVA_PRECEDENCE_RULES
+    }
+
     fn supports_direct_type_shapes(&self) -> bool {
         true
     }

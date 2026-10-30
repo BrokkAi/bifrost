@@ -1,11 +1,15 @@
 //! Exact assignment relations over prepared syntax and procedure-local flow.
 
 use super::*;
+use brokk_bifrost_analysis::analyzer::declaration_range::DeclarationNameRangeContext;
 use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
+use brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch_with_source_exact_token_focus;
+use std::cell::OnceCell;
 
 use crate::analyzer::semantic::{
-    BindingOriginIndex, LengthDelimitedDigest, SemanticCapability, SemanticGapKind,
-    SemanticGapSubject, SemanticValueKind, SourceMappingKind,
+    BindingOriginIndex, LengthDelimitedDigest, MemoryAccessKind, MemoryLocationKind,
+    SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticValueKind,
+    SourceMappingKind,
 };
 use crate::analyzer::usages::effects::EffectCoverage;
 use crate::query::{AssignmentRelationFilter, AssignmentRelationKind};
@@ -31,6 +35,14 @@ const OVERWRITTEN_UNREAD_AXES: &[FlowStateAxis] = &[
     FlowStateAxis::BindingEvents,
     FlowStateAxis::ReachingRelation,
 ];
+
+// One procedure's undecided occurrence anchors and their batched answers.
+#[derive(Default)]
+struct NonbindingDefinitions {
+    declaration_names: OnceCell<DeclarationNameRangeContext>,
+    outcomes: HashMap<(usize, usize), Option<DefinitionLookupOutcome>>,
+    deferred: bool,
+}
 
 fn plain_c_candidate(candidate: CAssignmentCandidate) -> PlainAssignmentCandidate {
     PlainAssignmentCandidate {
@@ -392,22 +404,86 @@ fn ordinary_assignment_relation_expansions(
         (candidates.complete && binding_events_complete, reasons)
     };
 
+    let uncancelled = CancellationToken::new();
+    let mut request = FlowStateRequest::new(cancellation.unwrap_or(&uncancelled));
+    let mut definitions = NonbindingDefinitions::default();
+    let mut deferred = Vec::new();
     let mut expansions = if self_selected {
         candidates
             .rows
             .iter()
             .cloned()
-            .map(|candidate| {
-                if cpp_family {
-                    qualify_c_candidate(procedure, derivation, proof_complete, candidate)
+            .enumerate()
+            .map(|(index, candidate)| {
+                definitions.deferred = false;
+                let expansion = if cpp_family {
+                    qualify_c_candidate(
+                        procedure,
+                        derivation,
+                        proof_complete,
+                        candidate,
+                        &mut request,
+                    )
                 } else {
-                    qualify_candidate(procedure, derivation, proof_complete, candidate)
+                    qualify_candidate(
+                        workspace,
+                        &mut definitions,
+                        procedure,
+                        derivation,
+                        proof_complete,
+                        candidate,
+                        &mut request,
+                    )
+                };
+                if definitions.deferred {
+                    deferred.push(index);
                 }
+                expansion
             })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
+    // First qualification leaves undecided static loads open. Resolve all
+    // their distinct occurrence anchors together, then retry only those rows.
+    if !deferred.is_empty() {
+        let anchors = definitions.outcomes.keys().copied().collect::<Vec<_>>();
+        let requests = anchors
+            .iter()
+            .map(|&(start_byte, end_byte)| DefinitionLookupRequest {
+                file: procedure.file().clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(end_byte),
+            })
+            .collect();
+        let outcomes = resolve_definition_batch_with_source_exact_token_focus(
+            workspace.analyzer(),
+            requests,
+            procedure.file().clone(),
+            Arc::from(procedure.source_text()),
+            cancellation,
+        );
+        for (anchor, outcome) in anchors.into_iter().zip(outcomes) {
+            definitions.outcomes.insert(anchor, Some(outcome));
+        }
+        // Cancelled resolution leaves the first pass's open rows intact.
+        for index in deferred {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            expansions[index] = qualify_candidate(
+                workspace,
+                &mut definitions,
+                procedure,
+                derivation,
+                proof_complete,
+                candidates.rows[index].clone(),
+                &mut request,
+            );
+        }
+    }
     for (first, second) in pairs {
         if let Some(pair) = qualify_failed_swap(
             procedure,
@@ -415,6 +491,7 @@ fn ordinary_assignment_relation_expansions(
             proof_complete,
             &candidates.rows[first],
             &candidates.rows[second],
+            &mut request,
         ) {
             expansions.push(pair);
         }
@@ -434,6 +511,7 @@ fn ordinary_assignment_relation_expansions(
                 reasons: proof_reasons.clone(),
             }
         };
+        let diagnostic_start = diagnostics.len();
         flow_state_cache.report_completeness(
             workspace.analyzer(),
             &procedure.wire_id(),
@@ -448,6 +526,11 @@ fn ordinary_assignment_relation_expansions(
             derivation.generation,
             diagnostics,
         );
+        // These diagnostics withhold this procedure's candidate rows, and `row`
+        // builds every assignment row in the procedure's file.
+        for diagnostic in &mut diagnostics[diagnostic_start..] {
+            diagnostic.withheld_rows_path = Some(rel_path_string(procedure.file()));
+        }
     }
     let proof_related = procedure.related_flow_reasons(&proof_reasons);
     for expansion in &mut expansions {
@@ -700,9 +783,11 @@ fn overwritten_unread_expansions(
                 Language::JavaScript | Language::TypeScript
             ) && candidate.source_kind == OverwrittenLocalSourceKind::PlainAssignment
             {
-                match derivation
-                    .binding_initialization_before_establishment(&procedure.handle, write.event)
-                {
+                match derivation.binding_initialization_before_establishment(
+                    &procedure.handle,
+                    write.event,
+                    &mut request,
+                ) {
                     BindingInitializationAnswer::Proven => {}
                     BindingInitializationAnswer::Unreachable => continue,
                     BindingInitializationAnswer::MayBeUninitialized => {
@@ -984,6 +1069,7 @@ fn qualify_c_candidate(
     derivation: &FlowStateDerivation,
     flow_complete: bool,
     candidate: PlainAssignmentCandidate,
+    request: &mut FlowStateRequest<'_>,
 ) -> PipelineExpansion {
     match candidate.verdict {
         PlainAssignmentVerdict::Excluded => {
@@ -1136,7 +1222,7 @@ fn qualify_c_candidate(
     if reaching.iter().all(Vec::is_empty)
         && matches!(procedure.handle.semantics().value(target), Some(value) if matches!(&value.kind, SemanticValueKind::Parameter { .. }))
     {
-        match derivation.binding_initialization_at_read(&procedure.handle, read.event) {
+        match derivation.binding_initialization_at_read(&procedure.handle, read.event, request) {
             BindingInitializationAnswer::Proven => {
                 return row(
                     procedure,
@@ -1186,10 +1272,13 @@ fn qualify_c_candidate(
 /// Only gaps that can reach this evaluation or this binding's initialization
 /// keep the candidate open; a gap elsewhere in the procedure does not.
 fn qualify_candidate(
+    workspace: &WorkspaceAnalyzer,
+    definitions: &mut NonbindingDefinitions,
     procedure: &semantic::SemanticProcedureValue,
     derivation: &FlowStateDerivation,
     flow_complete: bool,
     candidate: PlainAssignmentCandidate,
+    request: &mut FlowStateRequest<'_>,
 ) -> PipelineExpansion {
     match candidate.verdict {
         PlainAssignmentVerdict::Excluded => {
@@ -1294,6 +1383,25 @@ fn qualify_candidate(
             }
         };
         let Some(read) = reads.first() else {
+            if nonbinding_rhs_is_exact(
+                workspace,
+                definitions,
+                procedure,
+                &candidate,
+                &origins,
+                establishment,
+            ) {
+                let rhs = Some(establishment.value);
+                return row(
+                    procedure,
+                    candidate,
+                    rhs,
+                    "different",
+                    "exact",
+                    EffectCoverage::Exhaustive,
+                    Some("different_binding"),
+                );
+            }
             return row(
                 procedure,
                 candidate,
@@ -1331,7 +1439,8 @@ fn qualify_candidate(
             );
         }
         for read in &reads {
-            match derivation.binding_initialization_at_read(&procedure.handle, read.event) {
+            match derivation.binding_initialization_at_read(&procedure.handle, read.event, request)
+            {
                 BindingInitializationAnswer::Proven => proven_read = Some(read.value),
                 BindingInitializationAnswer::Unreachable => {}
                 BindingInitializationAnswer::MayBeUninitialized => {
@@ -1387,6 +1496,7 @@ fn qualify_failed_swap(
     flow_complete: bool,
     first: &PlainAssignmentCandidate,
     second: &PlainAssignmentCandidate,
+    request: &mut FlowStateRequest<'_>,
 ) -> Option<PipelineExpansion> {
     if first.verdict == PlainAssignmentVerdict::Excluded
         || second.verdict == PlainAssignmentVerdict::Excluded
@@ -1508,7 +1618,11 @@ fn qualify_failed_swap(
                 &[],
             );
         }
-        match derivation.binding_initialization_at_read(&procedure.handle, first_read.event) {
+        match derivation.binding_initialization_at_read(
+            &procedure.handle,
+            first_read.event,
+            request,
+        ) {
             BindingInitializationAnswer::Proven => proven_read = Some(second_read.value),
             BindingInitializationAnswer::Unreachable => {}
             BindingInitializationAnswer::MayBeUninitialized => {
@@ -1695,6 +1809,183 @@ fn unique_establishment(
     events.next().is_none().then_some(event)
 }
 
+// Static storage is shared across procedures, so it is not a per-procedure
+// state event: inventing reads without local establishments would change reaching
+// and overwrite answers. Prove this distinct RHS directly from its own IR load.
+fn nonbinding_rhs_is_exact(
+    workspace: &WorkspaceAnalyzer,
+    definitions: &mut NonbindingDefinitions,
+    procedure: &semantic::SemanticProcedureValue,
+    candidate: &PlainAssignmentCandidate,
+    origins: &BindingOriginIndex,
+    establishment: &StateEventRow,
+) -> bool {
+    let semantics = procedure.handle.semantics();
+    let Some(rhs) = candidate
+        .rhs_identifier_range
+        .as_ref()
+        .or(candidate.rhs_range.as_ref())
+    else {
+        return false;
+    };
+    let mut value_id = establishment.value;
+    let mut visited = HashSet::default();
+    loop {
+        if !visited.insert(value_id) {
+            return false;
+        }
+        let value = semantics
+            .value(value_id)
+            .expect("validated assignment value");
+        let mapping = semantics
+            .source_mapping(value.source)
+            .expect("validated value mapping");
+        let span = mapping.locator.anchor().span();
+        let matches = |range: &Range| {
+            span.start_byte() as usize == range.start_byte
+                && span.end_byte() as usize == range.end_byte
+        };
+        if mapping.kind != SourceMappingKind::Exact
+            || !(matches(rhs) || candidate.rhs_range.as_ref().is_some_and(matches))
+            || value.kind.is_binding()
+        {
+            return false;
+        }
+        if value.kind.is_constant() {
+            return true;
+        }
+        let mut loads = semantics
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Static,
+                    location,
+                    result,
+                } if result == value_id => Some(location),
+                _ => None,
+            });
+        if let Some(location) = loads.next() {
+            if loads.next().is_some() {
+                return false;
+            }
+            let Some(target) = candidate.target.and_then(|target| semantics.value(target)) else {
+                return false;
+            };
+            let target_name = match &target.kind {
+                SemanticValueKind::Parameter { name, .. } => name.as_deref(),
+                SemanticValueKind::Local => {
+                    semantics.source_mapping(target.source).and_then(|mapping| {
+                        let span = mapping.locator.anchor().span();
+                        // qualify_local_write already proved this selects the
+                        // local declaration's identifier, not its parent syntax.
+                        procedure
+                            .source_text()
+                            .get(span.start_byte() as usize..span.end_byte() as usize)
+                    })
+                }
+                _ => None,
+            };
+            if target_name.is_none()
+                || target_name == procedure.source_text().get(rhs.start_byte..rhs.end_byte)
+            {
+                // A static load for the local target's own spelling indicates
+                // a lowering binding failure, not distinct bindings. Go's
+                // `x := x` shadowing idiom never reaches here: go_plain_write
+                // admits only assignment statements as candidates.
+                return false;
+            }
+            let Some(MemoryLocationKind::Static { member }) = semantics
+                .memory_location(location)
+                .map(|location| &location.kind)
+            else {
+                return false;
+            };
+            if member.path() != semantics.locator().path() {
+                return false;
+            }
+            let Some(declaration) = super::dispatch::declaration_at_locator(
+                workspace.analyzer(),
+                member,
+                procedure.file(),
+            ) else {
+                return false;
+            };
+            let names = definitions.declaration_names.get_or_init(|| {
+                DeclarationNameRangeContext::new(
+                    procedure.file(),
+                    procedure.source_text().to_owned(),
+                )
+            });
+            let anchor = member.anchor().span();
+            if names
+                .name_ranges(workspace.analyzer(), &declaration)
+                .iter()
+                .any(|range| {
+                    range.start_byte == anchor.start_byte() as usize
+                        && range.end_byte == anchor.end_byte() as usize
+                })
+            {
+                return true;
+            }
+            // Some adapters can only anchor static storage at its occurrence.
+            // Use the same structured definition lookup as the former
+            // concurrency provider, then verify the declaration's own anchor.
+            let outcome = definitions
+                .outcomes
+                .entry((anchor.start_byte() as usize, anchor.end_byte() as usize))
+                .or_default();
+            let Some(outcome) = outcome.as_ref() else {
+                definitions.deferred = true;
+                return false;
+            };
+            if outcome.status != DefinitionLookupStatus::Resolved
+                || !outcome.diagnostics.is_empty()
+                || outcome.lexical_definition.is_some()
+            {
+                return false;
+            }
+            let [resolved] = outcome.definitions.as_slice() else {
+                return false;
+            };
+            // Go var and const both lower to module-scope Field; constants
+            // cannot alias local storage. An unqualified identifier cannot
+            // denote a struct field: that requires a selector.
+            if !resolved.is_field() || resolved.package_name() != declaration.package_name() {
+                return false;
+            }
+            let Some(source) = workspace.analyzer().indexed_source(resolved.source()) else {
+                return false;
+            };
+            let resolved_names =
+                DeclarationNameRangeContext::new(resolved.source(), source.to_string());
+            return resolved_names
+                .name_ranges(workspace.analyzer(), resolved)
+                .iter()
+                .any(|range| {
+                    super::dispatch::declaration_at_byte_range(
+                        workspace.analyzer(),
+                        range.start_byte..range.end_byte,
+                        resolved.source(),
+                    )
+                    .as_ref()
+                        == Some(resolved)
+                });
+        }
+        // Follow only a unique producer chain (for example Go's assignment
+        // conversion). Multiple inputs, cycles and unknown leaves prove nothing.
+        let mut predecessors = origins.value_predecessors(value_id);
+        let Some(predecessor) = predecessors.next() else {
+            return false;
+        };
+        if predecessors.next().is_some() {
+            return false;
+        }
+        value_id = predecessor;
+    }
+}
+
 /// The binding reads spelled by the candidate's RHS that feed this copy of
 /// the assignment. A read that feeds another lowered copy is omitted. An open
 /// same-evaluation account returns its reasons.
@@ -1790,3 +2081,131 @@ use brokk_bifrost_cpp_analysis::analyzer::CAssignmentCandidate;
 use brokk_bifrost_cpp_analysis::analyzer::CAssignmentSyntaxVerdict;
 use brokk_bifrost_cpp_analysis::analyzer::c_assignment_candidates;
 use brokk_bifrost_cpp_analysis::analyzer::cpp_overwritten_local_candidates;
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::inline_project::InlineTestProject;
+    use super::*;
+    use crate::analyzer::AnalyzerConfig;
+
+    #[test]
+    fn static_rhs_with_the_local_targets_spelling_stays_ambiguous() {
+        // Replay a broken lowering: the assignment writes a local END, but
+        // its RHS still loads the class's static END. Correct lowering cannot
+        // produce this combination, so retain a separate local to retarget
+        // the prepared write and its derived establishment in this witness.
+        let source = "class Sample { static final char END = 'z'; char check() { char x = 'a'; x = END; char END = 'b'; return END; } }";
+        let project = InlineTestProject::new().file("Sample.java", source).build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("Sample.java");
+        let mut context = semantic::SemanticQueryContext::new(
+            &workspace,
+            None,
+            CodeQuerySemanticLimits::default(),
+        );
+        let offset = source.find("x = END").unwrap();
+        let mut procedures = context.procedure_of_source_range(
+            &file,
+            Range {
+                start_byte: offset,
+                end_byte: offset + "x = END".len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            ContentIdentity::hash_bytes(source.as_bytes()),
+        );
+        assert_eq!(procedures.len(), 1);
+        let procedure = procedures.pop().unwrap();
+        let outcome = context.materialized_outcome(&file).unwrap();
+        let mut cache = FlowStateTraversalCache::default();
+        let state =
+            cache.for_materialized_procedure(&workspace, &file, outcome, &procedure.handle, None);
+        let derivation = state
+            .procedures
+            .iter()
+            .find(|row| row.procedure == procedure.handle.id())
+            .unwrap();
+        let mut candidate = plain_assignment_candidates(&workspace, &procedure.handle, None)
+            .rows
+            .into_iter()
+            .find(|row| row.range.start_byte == offset)
+            .unwrap();
+        let mut definitions = NonbindingDefinitions::default();
+        let cancellation = CancellationToken::new();
+        let mut request = FlowStateRequest::new(&cancellation);
+        let ordinary = qualify_candidate(
+            &workspace,
+            &mut definitions,
+            &procedure,
+            derivation,
+            true,
+            candidate.clone(),
+            &mut request,
+        );
+        let PipelineValue::AssignmentRelation(ordinary) = ordinary.value else {
+            panic!("relation");
+        };
+        assert_eq!(
+            (ordinary.verdict, ordinary.reason),
+            ("different", Some("different_binding"))
+        );
+        let target = procedure
+            .handle
+            .semantics()
+            .values()
+            .iter()
+            .find(|value| {
+                value.kind == SemanticValueKind::Local && {
+                    let span = procedure
+                        .handle
+                        .semantics()
+                        .source_mapping(value.source)
+                        .unwrap()
+                        .locator
+                        .anchor()
+                        .span();
+                    &source[span.start_byte() as usize..span.end_byte() as usize] == "END"
+                }
+            })
+            .unwrap()
+            .id;
+        let previous = candidate.target.replace(target).unwrap();
+        let mut derivation = derivation.clone();
+        let establishment = derivation
+            .events
+            .iter_mut()
+            .find(|event| {
+                candidate.points.contains(&event.point)
+                    && event.event_class == StateEventClass::Establish
+                    && event.subject == FlowSubject::Binding { value: previous }
+            })
+            .unwrap();
+        establishment.subject = FlowSubject::Binding { value: target };
+        let guarded = qualify_candidate(
+            &workspace,
+            &mut definitions,
+            &procedure,
+            &derivation,
+            true,
+            candidate,
+            &mut request,
+        );
+        let PipelineValue::AssignmentRelation(guarded) = guarded.value else {
+            panic!("relation");
+        };
+        assert_eq!(
+            (
+                guarded.verdict,
+                guarded.reason,
+                guarded.proof,
+                guarded.coverage
+            ),
+            (
+                "unknown",
+                Some("rhs_read_join_ambiguous"),
+                "unknown",
+                EffectCoverage::Open
+            )
+        );
+    }
+}

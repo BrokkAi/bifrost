@@ -76,15 +76,17 @@ pub fn go_identifier_is_exported(name: &str) -> bool {
 /// agree on the language's predeclared type namespace. Callers must still
 /// establish that the written name is not shadowed at its source location.
 pub fn is_predeclared_go_type(name: &str) -> bool {
+    is_predeclared_go_basic_type(name) || matches!(name, "any" | "comparable" | "error")
+}
+
+/// Whether `name` is one of Go's predeclared basic types.
+pub fn is_predeclared_go_basic_type(name: &str) -> bool {
     matches!(
         name,
-        "any"
-            | "bool"
+        "bool"
             | "byte"
-            | "comparable"
             | "complex64"
             | "complex128"
-            | "error"
             | "float32"
             | "float64"
             | "int"

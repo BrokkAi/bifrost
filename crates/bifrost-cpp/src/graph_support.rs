@@ -21,7 +21,6 @@
 //!   the cell and its `test-support` build counter stay analyzer-side, so this
 //!   accessor is the only way the reconciler reaches a warm table.
 
-use crate::compile_context::CppCompileContext;
 use crate::declarations::CppRecoveredExportClassIndex;
 use crate::graph::CppWorkspaceSource;
 use crate::graph::resolver::{
@@ -167,7 +166,7 @@ pub trait CppSource:
 
     /// The workspace-wide `#include` resolution table, built once per analyzer
     /// generation from [`IncludeTargetIndex::build`].
-    fn include_target_index(&self) -> &IncludeTargetIndex;
+    fn include_target_index(&self) -> std::sync::Arc<IncludeTargetIndex>;
 
     /// Every class-like or alias declaration reachable from `file` through its
     /// `#include` closure, memoized per file. See this module's note.
@@ -350,7 +349,10 @@ pub trait CppSource:
     ///
     /// A file the build compiles in several configurations yields several
     /// contexts, because their include closures can disagree about a name.
-    fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext];
+    fn compile_contexts_for(
+        &self,
+        file: &ProjectFile,
+    ) -> crate::compile_context::CppCompileContextView;
 
     /// Every workspace translation unit whose `#include` closure transitively
     /// reaches `file` -- the header-to-TU attribution map from #1970's

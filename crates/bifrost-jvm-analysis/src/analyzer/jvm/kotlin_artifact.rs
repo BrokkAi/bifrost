@@ -28,8 +28,6 @@ use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredShard;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::BoundedProducerDiagnostics;
 
-use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
-
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactKind;
@@ -1654,32 +1652,28 @@ fn finish(
             None,
             "JAR contains no externally visible Kotlin declarations",
         );
-        let (diagnostics, suppressed_diagnostics) = bounded.finish();
-        return ArtifactProduction {
-            artifact_sha256: Some(digest.to_owned()),
-            pack: None,
-            completeness: Completeness::Partial,
-            diagnostics,
-            suppressed_diagnostics,
-        };
     }
     let (diagnostics, suppressed_diagnostics) = bounded.finish();
-    let shard = AuthoredShard {
-        id: "declarations.kotlin.external".to_owned(),
-        activation: request.activation.clone(),
-        payload: AuthoredPayload::DeclarationFacts {
-            assembly_identity: None,
-            type_forwards: Vec::new(),
-            types,
-            members,
-            relations: Vec::new(),
-        },
-        runtime_values: None,
-        runtime_contracts: None,
-        collection_flows: None,
-        deferred_yields: None,
-        conditional_type_refinements: None,
-        callable_values: None,
+    let shards = if types.is_empty() {
+        Vec::new()
+    } else {
+        vec![AuthoredShard {
+            id: "declarations.kotlin.external".to_owned(),
+            activation: request.activation.clone(),
+            payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
+                types,
+                members,
+                relations: Vec::new(),
+            },
+            runtime_values: None,
+            runtime_contracts: None,
+            collection_flows: None,
+            deferred_yields: None,
+            conditional_type_refinements: None,
+            callable_values: None,
+        }]
     };
     brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
         request,
@@ -1688,7 +1682,7 @@ fn finish(
         "kotlin",
         diagnostics,
         suppressed_diagnostics,
-        vec![shard],
+        shards,
     )
 }
 

@@ -95,7 +95,7 @@ pub(super) fn acquire_direct_import_layer(
         state.direct_import_layer = None;
         state.direct_import_layer_content = None;
     }
-    let ready = cache.get_ready(request, workspace_content, cancellation);
+    let ready = cache.get_ready(state.analyzer, request, workspace_content, cancellation);
     let mut fallback_graph = None;
     let remaining_import_files = limits
         .max_scanned_files
@@ -141,6 +141,7 @@ pub(super) fn acquire_direct_import_layer(
             return None;
         }
         None => cache.acquire(
+            state.analyzer,
             request,
             workspace_content,
             cancellation,

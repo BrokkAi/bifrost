@@ -237,3 +237,5 @@ pub use witness::{
     SummaryWitnessStepKind, WitnessLimitError, WitnessReconstructionLimits,
     WitnessReconstructionWork, WitnessRetentionLimits, WitnessTruncationCause,
 };
+
+pub(crate) use reusable_summary::ProductionSemanticSummaryStorage;

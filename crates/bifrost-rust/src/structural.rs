@@ -229,6 +229,7 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("struct_item", NormalizedKind::Class),
     ("enum_item", NormalizedKind::Class),
     ("trait_item", NormalizedKind::Class),
+    ("trait_alias", NormalizedKind::Class),
     // A `type` alias declares a type, so its fact is a type-namespace
     // declaration and its name inherits `Namespace::Type` through
     // `default_occurrence_namespace`. Recorded as a bare `Declaration`, the
@@ -557,11 +558,13 @@ const RUST_DECLARATION_HEADS: &[&str] = &[
     "enum_item",
     "union_item",
     "trait_item",
+    "trait_alias",
     "type_item",
     "const_item",
     "static_item",
     "mod_item",
     "macro_definition",
+    "decl_macro",
     "field_declaration",
     "enum_variant",
     "associated_type",

@@ -1,4 +1,6 @@
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalDefinition;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
+
 use brokk_bifrost_analysis::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use brokk_bifrost_analysis::analyzer::usages::get_definition::*;
 use brokk_bifrost_analysis::analyzer::{
@@ -142,11 +144,11 @@ pub(crate) struct CSharpDefinitionProvider<'a> {
     session: Option<&'a ResolutionSession>,
     // Complete demand answers die with this resolution request. In bounded
     // sessions, the existing summary allowance bounds retained owners.
-    direct_ancestor_answers: RefCell<HashMap<CodeUnit, Vec<CodeUnit>>>,
-    parent_answers: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
+    direct_ancestor_answers: CaptureScopedMemo<RefCell<HashMap<CodeUnit, Vec<CodeUnit>>>>,
+    parent_answers: CaptureScopedMemo<RefCell<HashMap<CodeUnit, Option<CodeUnit>>>>,
     /// Declarations this request admitted although their compilation
     /// membership is unproven. An answer reached with one is not proven.
-    unproven_types: RefCell<Vec<CodeUnit>>,
+    unproven_types: CaptureScopedMemo<RefCell<Vec<CodeUnit>>>,
     /// The analyzer viewed through the compilation membership of the file
     /// holding the reference being resolved. Every declaration this provider
     /// returns, and every lookup of the shared usage resolver it calls, is
@@ -159,9 +161,9 @@ impl<'a> CSharpDefinitionProvider<'a> {
         Self {
             csharp,
             session: None,
-            direct_ancestor_answers: RefCell::default(),
-            parent_answers: RefCell::default(),
-            unproven_types: RefCell::default(),
+            direct_ancestor_answers: CaptureScopedMemo::default(),
+            parent_answers: CaptureScopedMemo::default(),
+            unproven_types: CaptureScopedMemo::default(),
             scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
                 csharp, reference,
             ),
@@ -176,9 +178,9 @@ impl<'a> CSharpDefinitionProvider<'a> {
         Self {
             csharp,
             session: Some(session),
-            direct_ancestor_answers: RefCell::default(),
-            parent_answers: RefCell::default(),
-            unproven_types: RefCell::default(),
+            direct_ancestor_answers: CaptureScopedMemo::default(),
+            parent_answers: CaptureScopedMemo::default(),
+            unproven_types: CaptureScopedMemo::default(),
             scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
                 csharp, reference,
             ),
@@ -204,9 +206,12 @@ impl<'a> CSharpDefinitionProvider<'a> {
     /// answer they reach is held to its proof.
     fn admit_visible_types(&self, types: graph_support::VisibleTypes) -> Vec<CodeUnit> {
         self.unproven_types
-            .borrow_mut()
-            .extend(types.unproven.iter().cloned());
-        types.declarations
+            .read(&memo_attribution(self.csharp), |unproven_types_memo| {
+                unproven_types_memo
+                    .borrow_mut()
+                    .extend(types.unproven.iter().cloned());
+                types.declarations
+            })
     }
 
     fn scope_step(&self) -> bool {
@@ -750,81 +755,89 @@ impl<'a> CSharpDefinitionProvider<'a> {
     /// compilation contributes no base, and an unproven one contributes its
     /// bases as doubt.
     fn direct_ancestors(&self, token: QueryToken<'_>, owner: &CodeUnit) -> Vec<CodeUnit> {
-        if !self.observe_cancellation() {
-            return Vec::new();
-        }
-        if let Some(ancestors) = self.direct_ancestor_answers.borrow().get(owner) {
-            return if self
-                .session
-                .is_none_or(|session| session.scope_steps(ancestors.len()))
-            {
-                ancestors.clone()
-            } else {
-                Vec::new()
-            };
-        }
-        if !self.summary_step() {
-            return Vec::new();
-        }
-
-        let mut parts = self.partial_type_parts(owner);
-        if !self.observe_cancellation() {
-            return Vec::new();
-        }
-        if parts.is_empty() {
-            parts.push(owner.clone());
-        }
-        let ancestors = graph_support::logical_direct_ancestors(
-            parts,
-            |part| {
-                if !self.scope_step() {
-                    return None;
+        self.direct_ancestor_answers.read(
+            &memo_attribution(self.csharp),
+            |direct_ancestor_answers_memo| {
+                if !self.observe_cancellation() {
+                    return Vec::new();
                 }
-                let raw = self.raw_supertypes(part);
-                self.observe_cancellation().then_some(raw)
+                if let Some(ancestors) = direct_ancestor_answers_memo.borrow().get(owner) {
+                    return if self
+                        .session
+                        .is_none_or(|session| session.scope_steps(ancestors.len()))
+                    {
+                        ancestors.clone()
+                    } else {
+                        Vec::new()
+                    };
+                }
+                if !self.summary_step() {
+                    return Vec::new();
+                }
+
+                let mut parts = self.partial_type_parts(owner);
+                if !self.observe_cancellation() {
+                    return Vec::new();
+                }
+                if parts.is_empty() {
+                    parts.push(owner.clone());
+                }
+                let ancestors = graph_support::logical_direct_ancestors(
+                    parts,
+                    |part| {
+                        if !self.scope_step() {
+                            return None;
+                        }
+                        let raw = self.raw_supertypes(part);
+                        self.observe_cancellation().then_some(raw)
+                    },
+                    |part, raw| {
+                        let candidates = self.supertype_candidates(token, part, raw);
+                        self.observe_cancellation().then_some(candidates)
+                    },
+                    |_| Some(()),
+                );
+                let Some(ancestors) = ancestors.filter(|_| self.observe_cancellation()) else {
+                    return Vec::new();
+                };
+                direct_ancestor_answers_memo
+                    .borrow_mut()
+                    .insert(owner.clone(), ancestors.clone());
+                ancestors
             },
-            |part, raw| {
-                let candidates = self.supertype_candidates(token, part, raw);
-                self.observe_cancellation().then_some(candidates)
-            },
-            |_| Some(()),
-        );
-        let Some(ancestors) = ancestors.filter(|_| self.observe_cancellation()) else {
-            return Vec::new();
-        };
-        self.direct_ancestor_answers
-            .borrow_mut()
-            .insert(owner.clone(), ancestors.clone());
-        ancestors
+        )
     }
 
     fn parent_of(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
-        let Some(session) = self.session else {
-            return analyzer.parent_of(unit);
-        };
-        if !session.observe_cancellation() {
-            return None;
-        }
-        if let Some(parent) = self.parent_answers.borrow().get(unit) {
-            if parent.is_some() && !self.scope_step() {
-                return None;
-            }
-            return parent.clone();
-        }
-        if !self.summary_step() {
-            return None;
-        }
-        let parent = analyzer.parent_of(unit);
-        if !self.observe_cancellation() {
-            return None;
-        }
-        if parent.is_some() && !self.scope_step() {
-            return None;
-        }
         self.parent_answers
-            .borrow_mut()
-            .insert(unit.clone(), parent.clone());
-        parent
+            .read(&memo_attribution(self.csharp), |parent_answers_memo| {
+                let Some(session) = self.session else {
+                    return analyzer.parent_of(unit);
+                };
+                if !session.observe_cancellation() {
+                    return None;
+                }
+                if let Some(parent) = parent_answers_memo.borrow().get(unit) {
+                    if parent.is_some() && !self.scope_step() {
+                        return None;
+                    }
+                    return parent.clone();
+                }
+                if !self.summary_step() {
+                    return None;
+                }
+                let parent = analyzer.parent_of(unit);
+                if !self.observe_cancellation() {
+                    return None;
+                }
+                if parent.is_some() && !self.scope_step() {
+                    return None;
+                }
+                parent_answers_memo
+                    .borrow_mut()
+                    .insert(unit.clone(), parent.clone());
+                parent
+            })
     }
 
     fn session(&self) -> Option<&ResolutionSession> {
@@ -1090,6 +1103,8 @@ fn csharp_external_member_evidence(
         ExactExternalCallProof::csharp_bound_external_member(&owner, &member, parameter_count)
     };
     CallEvidence {
+        native_resolution: None,
+        model_member_selection: None,
         call_application: proof.call_application(),
         dispatch_extensibility: proof.dispatch_extensibility(),
         exact_external_call: Some(proof),
@@ -1226,7 +1241,11 @@ fn hold_to_compilation_membership(
             definitions.scoped.doubt()
         ));
     }
-    let unproven = definitions.unproven_types.borrow();
+    let unproven = definitions
+        .unproven_types
+        .read(&memo_attribution(definitions.csharp), |cell| {
+            cell.borrow().clone()
+        });
     if !unproven.is_empty() {
         doubt.push(format!(
             "visible types {:?} depend on compilation membership the configuration does not prove",
@@ -3571,6 +3590,8 @@ fn csharp_external_constructor_evidence(
     let proof =
         ExactExternalCallProof::csharp_external_constructor(&owner, &member, parameter_count);
     CallEvidence {
+        native_resolution: None,
+        model_member_selection: None,
         call_application: proof.call_application(),
         dispatch_extensibility: proof.dispatch_extensibility(),
         exact_external_call: Some(proof),

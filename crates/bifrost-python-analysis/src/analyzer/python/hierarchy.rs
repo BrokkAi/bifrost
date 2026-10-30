@@ -1060,31 +1060,23 @@ impl TypeHierarchyProvider for PythonAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-python-analysis/src/analyzer/python/hierarchy.rs",
-            );
-
-        let ancestors: Vec<_> = self
-            .inner
-            .raw_supertypes_of(code_unit)
-            .iter()
-            .filter_map(|raw| resolve_base_class(self, token, code_unit, raw))
-            // Resolving a base spelling to a value or module does not prove a
-            // superclass. In particular, a rebound builtin can name a field.
-            .filter(CodeUnit::is_class)
-            .collect();
-        {
-            let cache_key = code_unit.clone();
-            let cache_value = Arc::new(ancestors.clone());
-            persistent_fill_guard.installed("direct_ancestors");
-            self.direct_ancestors.insert(cache_key, cache_value);
-        };
-        ancestors
+        let ancestors = super::read_memo(
+            self,
+            &self.direct_ancestors,
+            code_unit.clone(),
+            || {
+                Arc::new(
+                    self.inner
+                        .raw_supertypes_of(code_unit)
+                        .iter()
+                        .filter_map(|raw| resolve_base_class(self, token, code_unit, raw))
+                        .filter(CodeUnit::is_class)
+                        .collect(),
+                )
+            },
+            super::weight_code_unit_vec,
+        );
+        (*ancestors).clone()
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
@@ -1103,12 +1095,28 @@ impl TypeHierarchyProvider for PythonAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
-        descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
-            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                build_direct_descendant_index(self, self, scope)
-            })
-            .ok()
-            .flatten()
-        })
+        self.direct_descendant_index.read(
+            &super::memo_attribution(self),
+            |(memo, _)| {
+                descendants_from_variant_index(memo, scope, code_unit, || {
+                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                        self,
+                        || build_direct_descendant_index(self, self, scope),
+                    )
+                    .ok()
+                    .flatten()
+                })
+            },
+            |answer| {
+                if answer.is_some() {
+                    self.descendants_authority_digest()
+                        .map_or(super::AuthorityInputs::Unnamed, super::whole_fact)
+                } else {
+                    // A stopped build has no answer to certify. Do not start
+                    // an unbounded build after the request has stopped.
+                    super::AuthorityInputs::Unnamed
+                }
+            },
+        )
     }
 }

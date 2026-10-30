@@ -9,6 +9,15 @@
 //! capability impls the crate resolves through, the `LanguageSupport` SPI block,
 //! and the executable-semantics lowerer.
 
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+use brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily;
+use brokk_bifrost_analysis::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    AuthorityInputs, WorkspaceAuthorityMemo, record_workspace_authority_read,
+};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    ReplayingMemo, ReplayingMemoEntry, memo_attribution,
+};
 use brokk_bifrost_analysis::{
     delegate_inner_methods, delegate_inner_procedure_fact_methods,
     forward_file_identity_invalidation, forward_relational_definition_batch,
@@ -113,10 +122,6 @@ use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
 
 use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
 
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set;
-
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_vec_by_unit;
-
 use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
 
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::AnalyzerStoreContext;
@@ -208,6 +213,11 @@ use brokk_bifrost_php::test_detection::detect_php_test_assertion_smells;
 
 use crate::analyzer::php::clones::build_php_clone_candidate_data;
 
+type ReverseImports = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
+
+type MemoEntry<T> = Arc<ReplayingMemoEntry<T, ReadKey>>;
+type BoundedMemo<K, V> = Arc<ReplayingMemo<Cache<K, MemoEntry<V>>>>;
+
 #[derive(Clone)]
 pub struct PhpAnalyzer {
     inner: TreeSitterAnalyzer<PhpAdapter>,
@@ -220,7 +230,7 @@ pub struct PhpAnalyzer {
         ),
         Arc<brokk_bifrost_php::source_facts::PhpFileSourceFacts>,
     >,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_ancestors: BoundedMemo<CodeUnit, Arc<Vec<CodeUnit>>>,
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
@@ -228,17 +238,19 @@ pub struct PhpAnalyzer {
     /// gets an index that was never built over them (issue #1748). Two cells at
     /// most, because the exclusion verdict is a pure function of the analyzer
     /// and the file.
-    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+    direct_descendant_index: Arc<
+        WorkspaceAuthorityMemo<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+    >,
     /// The declarations of other files that one file's persisted import names
     /// resolve to, keyed by file because the persisted names are. An entry
     /// depends on the whole workspace's declarations, not only on its own
     /// file's blob, so both cells are built fresh by `update` rather than
     /// invalidated per changed file -- the same lifetime `direct_ancestors`
     /// has.
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    imported_code_units: BoundedMemo<ProjectFile, Arc<HashSet<CodeUnit>>>,
     /// Which files import each file, inverted from `imported_code_units` over
     /// the whole workspace in one pass.
-    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<WorkspaceAuthorityMemo<PoolSafeMemo<ReverseImports>>>,
     composer_autoload: Arc<PhpComposerAutoload>,
 }
 
@@ -256,14 +268,32 @@ impl brokk_bifrost_php::source_facts::PhpSourceFactProvider for PhpAnalyzer {
 }
 
 impl PhpAnalyzer {
+    fn authority_inputs(&self) -> AuthorityInputs<'static> {
+        let Some(key) =
+            brokk_bifrost_analysis::analyzer::workspace_authority::workspace_authority_file_input(
+                self,
+                Language::Php,
+                "composer.json",
+            )
+        else {
+            return AuthorityInputs::Unnamed;
+        };
+        AuthorityInputs::SourceAndFiles {
+            languages: &[Language::Php],
+            files: Arc::from([key]),
+        }
+    }
+
     pub(crate) fn update_all_with_progress(
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        Self::from_inner(
-            self.inner.update_all_with_progress(progress),
-            self.memo_budget,
-        )
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::from_inner(
+                self.inner.update_all_with_progress(progress),
+                self.memo_budget,
+            )
+        })
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
@@ -326,10 +356,38 @@ impl PhpAnalyzer {
                         .max(1)
                 },
             ),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            direct_ancestors: Arc::new(ReplayingMemo::new(build_weighted_cache(
+                memo_budget / 8,
+                |_key, entry: &MemoEntry<Arc<Vec<CodeUnit>>>| {
+                    u32::try_from(entry.retained_bytes(|key| {
+                        let mut heap = RetainedHeap::default();
+                        retained_read_key(&mut heap, key);
+                        heap.total()
+                    }))
+                    .unwrap_or(u32::MAX)
+                    .max(1)
+                },
+            ))),
+            direct_descendant_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PhpDirectDescendants,
+                KeyedPoolSafeMemo::new(),
+            )),
+            imported_code_units: Arc::new(ReplayingMemo::new(build_weighted_cache(
+                memo_budget / 8,
+                |_key, entry: &MemoEntry<Arc<HashSet<CodeUnit>>>| {
+                    u32::try_from(entry.retained_bytes(|key| {
+                        let mut heap = RetainedHeap::default();
+                        retained_read_key(&mut heap, key);
+                        heap.total()
+                    }))
+                    .unwrap_or(u32::MAX)
+                    .max(1)
+                },
+            ))),
+            reverse_import_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PhpReverseImports,
+                PoolSafeMemo::new(),
+            )),
             composer_autoload,
         }
     }
@@ -435,6 +493,15 @@ impl PhpAnalyzer {
     }
 
     pub(crate) fn target_has_composer_autoload_visibility(&self, target: &CodeUnit) -> bool {
+        if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+            self.read_ledger_attached()
+        }) {
+            record_workspace_authority_read(
+                self,
+                WorkspaceFactFamily::PhpComposerAutoload,
+                self.authority_inputs(),
+            );
+        }
         self.composer_autoload.target_is_autoloaded(self, target)
     }
 }
@@ -443,28 +510,24 @@ impl TestDetectionProvider for PhpAnalyzer {}
 
 impl TypeHierarchyProvider for PhpAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-php-analysis/src/analyzer/php/mod.rs",
-            );
-
-        let ancestors: Vec<_> = self
-            .inner
-            .raw_supertypes_of(code_unit)
-            .iter()
-            .filter_map(|raw| php_resolve_declared_supertype(self, code_unit, raw))
-            .collect();
-        {
-            let cache_key = code_unit.clone();
-            let cache_value = Arc::new(ancestors.clone());
-            persistent_fill_guard.installed("direct_ancestors");
-            self.direct_ancestors.insert(cache_key, cache_value);
-        };
-        ancestors
+        let ancestors = self.direct_ancestors.read(&memo_attribution(self), |cache, capture| {
+            Ok::<_, std::convert::Infallible>(cache.get(code_unit).unwrap_or_else(|| {
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let entry = Arc::new(capture.build_weighted(|| {
+                    let ancestors: Vec<CodeUnit> = self.inner.raw_supertypes_of(code_unit).iter()
+                            .filter_map(|raw| php_resolve_declared_supertype(self, code_unit, raw)).collect();
+                    let ancestors = Arc::new(ancestors);
+                    let bytes = brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_vec_by_unit(code_unit, &ancestors) as usize;
+                    (ancestors, bytes)
+                }));
+                if cache_fill.is_complete() {
+                cache.insert(code_unit.clone(), Arc::clone(&entry));
+                }
+                entry
+            }))
+        }).expect("ancestor memo build is infallible");
+        (**ancestors).clone()
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
@@ -478,13 +541,20 @@ impl TypeHierarchyProvider for PhpAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
-        descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
-            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                build_direct_descendant_index(self, self, scope)
-            })
-            .ok()
-            .flatten()
-        })
+        self.direct_descendant_index.read(
+            &memo_attribution(self),
+            |memo| {
+                descendants_from_variant_index(memo, scope, code_unit, || {
+                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                        self,
+                        || build_direct_descendant_index(self, self, scope),
+                    )
+                    .ok()
+                    .flatten()
+                })
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Php]),
+        )
     }
 }
 
@@ -661,6 +731,8 @@ impl CodeUnitIndex for PhpAnalyzer {
 }
 
 impl IAnalyzer for PhpAnalyzer {
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     delegate_inner_procedure_fact_methods!();
 
     forward_relational_definition_batch!();
@@ -743,16 +815,18 @@ impl IAnalyzer for PhpAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let inner = self.inner.update(changed_files);
-        let composer_autoload = if changed_files
-            .iter()
-            .any(PhpComposerAutoload::manifest_changed)
-        {
-            Arc::new(PhpComposerAutoload::from_project(inner.project()))
-        } else {
-            self.composer_autoload.clone()
-        };
-        Self::from_inner_with_composer(inner, self.memo_budget, composer_autoload)
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let inner = self.inner.update(changed_files);
+            let composer_autoload = if changed_files
+                .iter()
+                .any(PhpComposerAutoload::manifest_changed)
+            {
+                Arc::new(PhpComposerAutoload::from_project(inner.project()))
+            } else {
+                self.composer_autoload.clone()
+            };
+            Self::from_inner_with_composer(inner, self.memo_budget, composer_autoload)
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -1309,3 +1383,49 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for PhpA
 
 #[cfg(test)]
 mod acquisition_tests;
+
+#[cfg(test)]
+mod memo_read_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_php::source_facts::PhpSourceFactProvider;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#2445: PHP wrapper dropped workspace authority reads")]
+    fn composer_visibility_records_absent_manifest_inputs() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Php,
+            &[("service.php", "<?php class Service {}")],
+        );
+        let analyzer = PhpAnalyzer::from_project(fixture.test_project().clone());
+        let class = analyzer
+            .all_declarations()
+            .find(CodeUnit::is_class)
+            .unwrap();
+        assert!(!analyzer.target_has_composer_autoload_visibility(&class));
+        let (visible, reads) = capture_query_reads(&analyzer, || {
+            analyzer.target_has_composer_autoload_visibility(&class)
+        });
+        assert!(!visible);
+        assert!(reads.keys().iter().any(|key| matches!(key, ReadKey::PathAbsent { rel_path, .. } if rel_path.as_ref() == "composer.json")), "{:?}", reads.keys());
+        assert_eq!(reads.unattributed_reads(), 0);
+    }
+
+    #[test]
+    fn cached_source_facts_record_the_file_input() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Php,
+            &[("service.php", "<?php class Service {}")],
+        );
+        let analyzer = PhpAnalyzer::from_project(fixture.test_project().clone());
+        let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "service.php");
+        assert!(analyzer.php_source_facts_while(&file, &|| true).is_some());
+        let (facts, reads) = capture_query_reads(&analyzer, || {
+            analyzer.php_source_facts_while(&file, &|| true)
+        });
+        assert!(facts.is_some());
+        assert!(reads.keys().iter().any(|key| matches!(key, ReadKey::File { language: Language::Php, rel_path, .. } if rel_path.as_ref() == "service.php")));
+        assert_eq!(reads.unattributed_reads(), 0);
+    }
+}

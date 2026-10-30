@@ -459,6 +459,15 @@ where
                 )
             },
         );
-        (u64::from(weigher(key, &cached.value)) + evidence_bytes).min(u64::from(u32::MAX)) as u32
+        use brokk_bifrost_analysis::analyzer::store::cache_budget::{
+            RetainedHeap, retained_read_key,
+        };
+        let mut heap = RetainedHeap::default();
+        heap.slice(&cached.reads);
+        for key in cached.reads.iter() {
+            retained_read_key(&mut heap, key);
+        }
+        (u64::from(weigher(key, &cached.value)) + evidence_bytes + heap.total() as u64)
+            .min(u64::from(u32::MAX)) as u32
     })
 }

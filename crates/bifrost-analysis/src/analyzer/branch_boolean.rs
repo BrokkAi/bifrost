@@ -123,7 +123,7 @@ fn kotlin_result_context(node: Node<'_>, source: &str) -> Option<KotlinResultCon
                 if parent
                     .child(0)
                     .is_some_and(|child| child.kind() == "return")
-                    && single_named_child(parent)
+                    && single_runtime_named_child(parent)
                         .is_some_and(|child| child.id() == current.id()) =>
             {
                 return Some(kotlin_enclosing_function_context(parent, source));
@@ -131,7 +131,8 @@ fn kotlin_result_context(node: Node<'_>, source: &str) -> Option<KotlinResultCon
             // An expression body has one result expression. A block-bodied
             // function's statements are evaluated for effect in Kotlin.
             "function_body"
-                if single_named_child(parent).is_some_and(|child| child.id() == current.id()) =>
+                if single_runtime_named_child(parent)
+                    .is_some_and(|child| child.id() == current.id()) =>
             {
                 let function = parent.parent().filter(|owner| {
                     matches!(owner.kind(), "function_declaration" | "anonymous_function")
@@ -216,13 +217,13 @@ fn kotlin_declared_function_context(function: Node<'_>, source: &str) -> KotlinR
 
 fn kotlin_direct_result(mut body: Node<'_>) -> Option<Node<'_>> {
     if body.kind() == "control_structure_body" {
-        body = single_named_child(body)?;
+        body = single_runtime_named_child(body)?;
     }
     if body.kind() == "statements" {
-        body = single_named_child(body)?;
+        body = single_runtime_named_child(body)?;
     }
     while body.kind() == "parenthesized_expression" {
-        body = single_named_child(body)?;
+        body = single_runtime_named_child(body)?;
     }
     (!body.has_error() && !body.is_missing()).then_some(body)
 }
@@ -239,7 +240,7 @@ fn kotlin_when_boolean_result(source: &str, entry: Node<'_>) -> Option<(bool, bo
     if !kotlin_is_return_arm(result) {
         return None;
     }
-    let value = single_named_child(result)
+    let value = single_runtime_named_child(result)
         .and_then(kotlin_direct_result)
         .and_then(|node| kotlin_boolean_literal(source, node))?;
     Some((value, true))
@@ -261,15 +262,6 @@ fn kotlin_boolean_literal(source: &str, node: Node<'_>) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
-}
-
-fn single_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    let mut children = node
-        .named_children(&mut cursor)
-        .filter(|child| !child.is_extra());
-    let child = children.next()?;
-    children.next().is_none().then_some(child)
 }
 
 fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -400,7 +392,7 @@ fn scala_if_is_method_result(mut node: Node<'_>) -> bool {
             "parenthesized_expression" => node = parent,
             "return_expression" => return true,
             "block" | "indented_block" => {
-                let Some(last) = last_runtime_named_child(parent) else {
+                let Some(last) = last_named_child(parent) else {
                     return false;
                 };
                 if last.id() != node.id() {
@@ -416,18 +408,6 @@ fn scala_if_is_method_result(mut node: Node<'_>) -> bool {
             _ => return false,
         }
     }
-}
-
-fn last_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    let mut last = None;
-    for child in node
-        .named_children(&mut cursor)
-        .filter(|child| !child.is_extra())
-    {
-        last = Some(child);
-    }
-    last
 }
 
 fn scala_result_is_boolean(source: &str, method: Node<'_>, explicit_return: bool) -> bool {

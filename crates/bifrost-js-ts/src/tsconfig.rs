@@ -32,6 +32,35 @@ use brokk_bifrost_core::path_normalization::NormalizePath;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Core-side authority names passed to the analysis-owned recording bridge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsTsReadAuthority {
+    ModulePaths,
+    UnresolvedModulePaths {
+        language: brokk_bifrost_core::analyzer::Language,
+        paths: Vec<ProjectFile>,
+    },
+    ModulePathCandidates {
+        file: ProjectFile,
+        specifier: String,
+        answer: Option<[u8; 32]>,
+    },
+    LibrarySelection {
+        file: ProjectFile,
+        answer: Option<[u8; 32]>,
+    },
+    WorkspacePackages {
+        answer: [u8; 32],
+    },
+    ReceiverMembers,
+    JsxPropsOwners,
+    JsxComponentOwners,
+}
+
+/// Installed by an analyzer; paths include both successful and absent probes.
+/// The callback owns attribution, so this crate never constructs a capability.
+pub type JsTsConfigurationReadRecorder = Arc<dyn Fn(JsTsReadAuthority, &[PathBuf]) + Send + Sync>;
+
 /// Config file names consulted when walking up from an importing file, in priority
 /// order. `tsconfig.json` wins over `jsconfig.json` when both sit in the same directory.
 const CONFIG_FILENAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
@@ -52,6 +81,7 @@ const MAX_CONFIG_READS: u32 = 256;
 /// lazy.
 pub struct AliasResolver {
     root: PathBuf,
+    configuration_read_recorder: Option<JsTsConfigurationReadRecorder>,
     /// Symlink-resolved `root`, used to contain `extends` targets to the repo. Falls back
     /// to `root` when canonicalization fails (e.g. the root was deleted out from under us).
     canonical_root: PathBuf,
@@ -60,10 +90,10 @@ pub struct AliasResolver {
     /// project's own cached one, so the index inherits its ignore rules.
     project: Arc<dyn Project>,
     /// `directory of importing file` → nearest governing config file (if any).
-    nearest: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+    nearest: Mutex<HashMap<PathBuf, ConfigAnswer<Option<PathBuf>>>>,
     /// `config file path` → its fully-resolved alias map (extends already followed).
     /// `None` means the file was unreadable/unparseable or declared no usable `paths`.
-    maps: Mutex<HashMap<PathBuf, Arc<Option<AliasMap>>>>,
+    maps: Mutex<HashMap<PathBuf, Arc<ConfigAnswer<Option<AliasMap>>>>>,
     /// Same lifetime and growth as `maps`; contains config paths consulted by resolution.
     read_config_paths: Mutex<HashSet<PathBuf>>,
     /// The workspace's own npm packages, built on the first bare specifier that no
@@ -127,6 +157,14 @@ impl TypeScriptLibrarySelection {
     }
 }
 
+/// Only a scalar acquisition status accompanies each already-cached answer.
+/// It belongs to this derivation, never to the resolver's cumulative probe history.
+#[derive(Clone)]
+struct ConfigAnswer<T> {
+    value: T,
+    inputs_available: bool,
+}
+
 /// A flattened alias map ready for matching. `base_dir` is the absolute directory that
 /// `replacements` are joined against.
 #[derive(Debug, Clone)]
@@ -155,6 +193,7 @@ impl AliasResolver {
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         Self {
             root,
+            configuration_read_recorder: None,
             canonical_root,
             project,
             nearest: Mutex::new(HashMap::default()),
@@ -164,38 +203,122 @@ impl AliasResolver {
         }
     }
 
+    /// Attach the analysis-owned bridge before publishing this resolver.
+    pub fn with_configuration_read_recorder(
+        mut self,
+        recorder: JsTsConfigurationReadRecorder,
+    ) -> Self {
+        self.configuration_read_recorder = Some(recorder);
+        self
+    }
+
+    /// Cover a memo hit as well as a fresh core-side resolution operation.
+    pub fn record_authority_read(&self, authority: JsTsReadAuthority) {
+        if let Some(recorder) = &self.configuration_read_recorder {
+            let paths = match &authority {
+                JsTsReadAuthority::ModulePathCandidates { .. }
+                | JsTsReadAuthority::LibrarySelection { .. }
+                | JsTsReadAuthority::WorkspacePackages { .. } => Vec::new(),
+                _ => self
+                    .read_config_paths
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            };
+            recorder(authority, &paths);
+        }
+    }
+
+    /// Name the exact negative probes of a module-resolution answer.
+    pub fn record_unresolved_module_paths(
+        &self,
+        language: brokk_bifrost_core::analyzer::Language,
+        paths: Vec<ProjectFile>,
+    ) {
+        if let Some(recorder) = &self.configuration_read_recorder {
+            recorder(
+                JsTsReadAuthority::UnresolvedModulePaths { language, paths },
+                &[],
+            );
+        }
+    }
+
+    fn include_configuration_reads(&self, reads: HashSet<PathBuf>) {
+        self.read_config_paths.lock().unwrap().extend(reads);
+    }
+
     /// Candidate base paths (relative to the repo root, no extension) for a non-relative
     /// `specifier` imported from `source_file`, in TS precedence order. Empty when the
     /// specifier matches no alias. Extension/index resolution is left to the caller so a
     /// single source of truth (`collect_candidate_paths`) decides what exists on disk.
     pub fn candidate_bases(&self, source_file: &ProjectFile, specifier: &str) -> Vec<PathBuf> {
-        let Some(config_path) = self.nearest_config(source_file) else {
-            return Vec::new();
+        let bases = self.candidate_bases_inner(source_file, specifier);
+        self.record_authority_read(JsTsReadAuthority::ModulePathCandidates {
+            file: source_file.clone(),
+            specifier: specifier.to_owned(),
+            answer: bases
+                .inputs_available
+                .then(|| module_path_candidates_answer(&bases.value)),
+        });
+        bases.value
+    }
+
+    /// Replay this exact alias question without any source-language scan.
+    pub fn candidate_bases_fact_answer(
+        &self,
+        source_file: &ProjectFile,
+        specifier: &str,
+    ) -> Option<[u8; 32]> {
+        let bases = self.candidate_bases_inner(source_file, specifier);
+        bases
+            .inputs_available
+            .then(|| module_path_candidates_answer(&bases.value))
+    }
+
+    fn candidate_bases_inner(
+        &self,
+        source_file: &ProjectFile,
+        specifier: &str,
+    ) -> ConfigAnswer<Vec<PathBuf>> {
+        let nearest = self.nearest_config(source_file);
+        let Some(config_path) = nearest.value else {
+            return ConfigAnswer {
+                value: Vec::new(),
+                inputs_available: nearest.inputs_available,
+            };
         };
         let map = self.alias_map(&config_path);
-        let Some(map) = map.as_ref() else {
-            return Vec::new();
-        };
-
-        let Some(replacements) = best_match(&map.entries, specifier) else {
-            return Vec::new();
-        };
-
-        let mut bases = Vec::new();
-        for replacement in replacements {
-            let absolute = map.base_dir.join(&replacement).normalize();
-            let Ok(relative) = absolute.strip_prefix(&self.root) else {
-                // Alias points outside the repo (e.g. a sibling package not indexed);
-                // nothing the graph can resolve to, so skip it.
-                continue;
-            };
-            bases.push(relative.to_path_buf());
+        let inputs_available = nearest.inputs_available && map.inputs_available;
+        let value = map
+            .value
+            .as_ref()
+            .and_then(|map| {
+                best_match(&map.entries, specifier).map(|replacements| {
+                    replacements
+                        .into_iter()
+                        .filter_map(|replacement| {
+                            let absolute = map.base_dir.join(replacement).normalize();
+                            // Alias bases outside the workspace cannot select workspace targets.
+                            absolute
+                                .strip_prefix(&self.root)
+                                .ok()
+                                .map(Path::to_path_buf)
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        ConfigAnswer {
+            value,
+            inputs_available,
         }
-        bases
     }
 
     /// Whether config resolution read or attempted to read this workspace file.
     pub fn read_config_path(&self, file: &ProjectFile) -> bool {
+        self.record_authority_read(JsTsReadAuthority::ModulePaths);
         self.read_config_paths
             .lock()
             .unwrap()
@@ -235,45 +358,93 @@ impl AliasResolver {
         &self,
         source_file: &ProjectFile,
     ) -> TypeScriptLibrarySelection {
-        let Some(config_path) = self.nearest_config(source_file) else {
-            return TypeScriptLibrarySelection::incomplete(
-                "no governing tsconfig could be found for TypeScript library selection",
-            );
+        let selection = self.effective_library_selection_inner(source_file);
+        self.record_authority_read(JsTsReadAuthority::LibrarySelection {
+            file: source_file.clone(),
+            answer: selection
+                .inputs_available
+                .then(|| library_selection_answer(&selection.value)),
+        });
+        selection.value
+    }
+
+    /// Replay the library question under the resolver's fixed configuration bounds.
+    pub fn library_selection_fact_answer(&self, source_file: &ProjectFile) -> Option<[u8; 32]> {
+        let selection = self.effective_library_selection_inner(source_file);
+        selection
+            .inputs_available
+            .then(|| library_selection_answer(&selection.value))
+    }
+
+    fn effective_library_selection_inner(
+        &self,
+        source_file: &ProjectFile,
+    ) -> ConfigAnswer<TypeScriptLibrarySelection> {
+        let nearest = self.nearest_config(source_file);
+        let Some(config_path) = nearest.value else {
+            return ConfigAnswer {
+                value: TypeScriptLibrarySelection::incomplete(
+                    "no governing tsconfig could be found for TypeScript library selection",
+                ),
+                inputs_available: nearest.inputs_available,
+            };
         };
         let mut reads = HashSet::default();
-        let selection = effective_library_selection_for_config_with_reads(
+        let value = effective_library_selection_for_config_with_reads(
             &config_path,
             &self.canonical_root,
             &mut reads,
         );
-        self.read_config_paths.lock().unwrap().extend(reads);
-        selection
+        let inputs_available =
+            nearest.inputs_available && configuration_inputs_available(&self.root, &reads);
+        self.include_configuration_reads(reads);
+        ConfigAnswer {
+            value,
+            inputs_available,
+        }
     }
 
     /// The workspace package index, built once per resolver on first use.
     fn workspace_packages(&self) -> &WorkspacePackageIndex {
-        self.packages.get_or_init(|| {
+        let index = self.packages.get_or_init(|| {
+            let mut reads = HashSet::default();
             let index = match self.project.all_files_shared() {
-                Ok(files) => WorkspacePackageIndex::build(&self.root, &files),
+                Ok(files) => {
+                    WorkspacePackageIndex::build_with_reads(&self.root, &files, &mut reads)
+                }
                 // A workspace that cannot be listed has no readable manifests
                 // either; the empty index leaves every bare specifier external,
                 // which is the behavior that predates this index.
                 Err(_) => WorkspacePackageIndex::default(),
             };
+            self.read_config_paths.lock().unwrap().extend(reads);
             Arc::new(index)
-        })
+        });
+        self.record_authority_read(JsTsReadAuthority::WorkspacePackages {
+            answer: index.answer(),
+        });
+        index
+    }
+
+    /// Complete package selection answer, including an unavailable inventory.
+    pub fn workspace_package_answer(&self) -> [u8; 32] {
+        self.workspace_packages().answer()
     }
 
     /// Nearest `tsconfig.json`/`jsconfig.json` governing `source_file`, walking up from
     /// the file's directory to the repo root. Cached per directory.
-    fn nearest_config(&self, source_file: &ProjectFile) -> Option<PathBuf> {
+    fn nearest_config(&self, source_file: &ProjectFile) -> ConfigAnswer<Option<PathBuf>> {
         let dir = source_file.parent();
         if let Some(cached) = self.nearest.lock().unwrap().get(&dir) {
             return cached.clone();
         }
         let mut reads = HashSet::default();
-        let resolved = self.find_config_from(&dir, &mut reads);
-        self.read_config_paths.lock().unwrap().extend(reads);
+        let value = self.find_config_from(&dir, &mut reads);
+        let resolved = ConfigAnswer {
+            value,
+            inputs_available: configuration_inputs_available(&self.root, &reads),
+        };
+        self.include_configuration_reads(reads);
         self.nearest.lock().unwrap().insert(dir, resolved.clone());
         resolved
     }
@@ -300,17 +471,17 @@ impl AliasResolver {
     }
 
     /// Fully-resolved alias map for a config file, following `extends`. Cached.
-    fn alias_map(&self, config_path: &Path) -> Arc<Option<AliasMap>> {
+    fn alias_map(&self, config_path: &Path) -> Arc<ConfigAnswer<Option<AliasMap>>> {
         if let Some(cached) = self.maps.lock().unwrap().get(config_path) {
             return cached.clone();
         }
         let mut reads = HashSet::default();
-        let resolved = Arc::new(build_alias_map(
-            config_path,
-            &self.canonical_root,
-            &mut reads,
-        ));
-        self.read_config_paths.lock().unwrap().extend(reads);
+        let value = build_alias_map(config_path, &self.canonical_root, &mut reads);
+        let resolved = Arc::new(ConfigAnswer {
+            value,
+            inputs_available: configuration_inputs_available(&self.root, &reads),
+        });
+        self.include_configuration_reads(reads);
         self.maps
             .lock()
             .unwrap()
@@ -1157,6 +1328,46 @@ fn preceded_by_odd_backslashes(bytes: &[u8], index: usize) -> bool {
         j -= 1;
     }
     count % 2 == 1
+}
+
+/// Ordered alias bases, before extension and index probing.
+fn module_path_candidates_answer(bases: &[PathBuf]) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+    let mut hash = CanonicalHasher::new(b"js-ts-module-path-candidates-v1");
+    hash.sequence("bases", bases, |hash, path| {
+        hash.value(brokk_bifrost_core::path_utils::workspace_relative_slash_path(path).as_bytes());
+    });
+    hash.finish()
+}
+
+/// Effective library selection, including incomplete/negative answers.
+fn library_selection_answer(selection: &TypeScriptLibrarySelection) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+    let mut hash = CanonicalHasher::new(b"js-ts-library-selection-v1");
+    hash.value(&[u8::from(selection.is_explicit())]);
+    hash.sequence("libraries", selection.libraries(), |hash, value| {
+        hash.value(value.as_bytes())
+    });
+    hash.sequence("diagnostics", selection.diagnostics(), |hash, value| {
+        hash.value(value.as_bytes())
+    });
+    hash.finish()
+}
+/// Refuse a certificate when a consulted input could not be read. Missing
+/// probes are ordinary negative inputs; oversized or failed reads are not.
+fn configuration_inputs_available(root: &Path, paths: &HashSet<PathBuf>) -> bool {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    paths.iter().all(|path| {
+        if !path.starts_with(root) && !path.starts_with(&canonical) {
+            return true;
+        }
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.len() > MAX_CONFIG_BYTES => false,
+            Ok(metadata) if metadata.is_dir() => true,
+            Ok(_) => std::fs::read(path).is_ok(),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    })
 }
 
 #[cfg(test)]

@@ -718,19 +718,6 @@ pub enum CodeQueryPythonHierarchyEndpoint {
 }
 
 impl CodeQueryPythonHierarchyEndpoint {
-    pub fn canonical_id(&self) -> &str {
-        match self {
-            Self::Source {
-                canonical_declaration_id,
-                ..
-            } => canonical_declaration_id,
-            Self::ExternalClass {
-                canonical_symbol_id,
-                ..
-            } => canonical_symbol_id,
-        }
-    }
-
     pub fn display_name(&self) -> &str {
         match self {
             Self::Source {

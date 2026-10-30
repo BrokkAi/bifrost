@@ -25,6 +25,7 @@
 //! [`crate::analyzer::usages::effects`] and is unit-tested without a workspace.
 
 use super::*;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_cpp_analysis::analyzer::CppCallResultUseIndex;
 use brokk_bifrost_php_analysis::analyzer::php::PhpCallResultUseIndex;
 use brokk_bifrost_ruby_analysis::RubyCallResultUseIndex;
@@ -667,33 +668,40 @@ impl NativeCallResultUseIndex {
 }
 
 /// Per-query state shared by every effect row a single query derives.
+type JavaLambdaResultUses = HashMap<
+    (ProjectFile, ContentIdentity, Range),
+    Result<JavaCallResultUse, JavaCallResultUseOpen>,
+>;
+
 #[derive(Default)]
 pub(super) struct EffectTraversalCache {
     diagnostic_sources: PipelineRenderCache,
-    models: Option<Option<Arc<ResolvedActiveSemanticModels>>>,
-    keys: HashMap<CodeUnit, Option<ModeledProcedureKey>>,
-    answers: HashMap<ModeledProcedureKey, ModelAnswer>,
-    dispatch_answers: HashMap<(ProjectFile, Range), Arc<super::dispatch::DispatchSiteAnswer>>,
-    result_contract_names: Option<ResultContractNameInventory>,
-    reports: HashMap<String, Arc<ProcedureEffectReport>>,
-    facts: HashMap<ProjectFile, Option<Arc<FileFacts>>>,
+    models: CaptureScopedMemo<Option<Option<Arc<ResolvedActiveSemanticModels>>>>,
+    keys: CaptureScopedMemo<HashMap<CodeUnit, Option<ModeledProcedureKey>>>,
+    answers: CaptureScopedMemo<HashMap<ModeledProcedureKey, ModelAnswer>>,
+    dispatch_answers:
+        CaptureScopedMemo<HashMap<(ProjectFile, Range), Arc<super::dispatch::DispatchSiteAnswer>>>,
+    result_contract_names: CaptureScopedMemo<Option<Arc<ResultContractNameInventory>>>,
+    reports: CaptureScopedMemo<HashMap<String, Arc<ProcedureEffectReport>>>,
+    facts: CaptureScopedMemo<HashMap<ProjectFile, Option<Arc<FileFacts>>>>,
     rust_static_const_initializer_calls: HashMap<ProjectFile, Arc<HashSet<(usize, usize)>>>,
-    result_member_call_shapes: Option<ResultMemberCallShapeWindow>,
-    result_use_indexes: Option<ResultUseIndexWindow>,
+    result_member_call_shapes: CaptureScopedMemo<Option<ResultMemberCallShapeWindow>>,
+    result_use_indexes: CaptureScopedMemo<Option<ResultUseIndexWindow>>,
     java_result_use_indexes:
-        HashMap<(ProjectFile, ContentIdentity), JavaCallResultUseRelationIndex>,
-    java_lambda_result_uses: HashMap<
-        (ProjectFile, ContentIdentity, Range),
-        Result<JavaCallResultUse, JavaCallResultUseOpen>,
-    >,
-    native_result_use_indexes: HashMap<(ProjectFile, ContentIdentity), NativeCallResultUseIndex>,
+        CaptureScopedMemo<HashMap<(ProjectFile, ContentIdentity), JavaCallResultUseRelationIndex>>,
+    java_lambda_result_uses: CaptureScopedMemo<JavaLambdaResultUses>,
+    native_result_use_indexes:
+        CaptureScopedMemo<HashMap<(ProjectFile, ContentIdentity), NativeCallResultUseIndex>>,
     result_assignment_conversion_proofs:
-        std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
-    exact_sources: HashMap<ProjectFile, Option<Arc<str>>>,
-    exact_source_identities: std::cell::RefCell<HashMap<ProjectFile, Option<ContentIdentity>>>,
-    native_cpp_dispatches: HashMap<(ProjectFile, Range), Arc<NativeCallTargetLookup>>,
-    modeled_call_targets: Option<ModeledCallTargetWindow>,
-    conditional_wrapper_answers: HashMap<CodeUnit, ConditionalProcedureSummaryAnswer>,
+        CaptureScopedMemo<std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>>,
+    exact_sources: CaptureScopedMemo<HashMap<ProjectFile, Option<Arc<str>>>>,
+    exact_source_identities:
+        CaptureScopedMemo<std::cell::RefCell<HashMap<ProjectFile, Option<ContentIdentity>>>>,
+    native_cpp_dispatches:
+        CaptureScopedMemo<HashMap<(ProjectFile, Range), Arc<NativeCallTargetLookup>>>,
+    modeled_call_targets: CaptureScopedMemo<Option<ModeledCallTargetWindow>>,
+    conditional_wrapper_answers:
+        CaptureScopedMemo<HashMap<CodeUnit, ConditionalProcedureSummaryAnswer>>,
     conditional_wrapper_visiting: HashSet<CodeUnit>,
     result_contract_incomplete_diagnostics: HashSet<(ProjectFile, &'static str)>,
     /// Whether any derived row so far was not exhaustive, so the query's own
@@ -1336,7 +1344,11 @@ impl ResultUseIndex {
             return ExactResultAssignmentConversion::open();
         };
         let identity_operation = "Go result assignment source identity";
-        let cached_source_identity = proof.source_identities.borrow().get(proof.file).copied();
+        let cached_source_identity = proof
+            .source_identities
+            .read(&memo_attribution(proof.analyzer), |identities| {
+                identities.borrow().get(proof.file).copied()
+            });
         let source_identity = match cached_source_identity {
             Some(identity) => {
                 if !semantic.charge_consumer_traversal(proof.file, 0, identity_operation) {
@@ -1359,8 +1371,9 @@ impl ResultUseIndex {
                 };
                 proof
                     .source_identities
-                    .borrow_mut()
-                    .insert(proof.file.clone(), identity);
+                    .read(&memo_attribution(proof.analyzer), |identities| {
+                        identities.borrow_mut().insert(proof.file.clone(), identity)
+                    });
                 identity
             }
         };
@@ -1455,7 +1468,11 @@ impl ResultUseIndex {
                 binding_declaration,
                 source_identity,
             };
-            let cached = proof.proofs.borrow().get(&proof_key).copied();
+            let cached = proof
+                .proofs
+                .read(&memo_attribution(proof.analyzer), |proofs| {
+                    proofs.borrow().get(&proof_key).copied()
+                });
             let exact = if let Some(exact) = cached {
                 exact
                     && semantic.charge_consumer_traversal(
@@ -1484,7 +1501,11 @@ impl ResultUseIndex {
                         0,
                         "Go result assignment type proof",
                     );
-                proof.proofs.borrow_mut().insert(proof_key, exact);
+                proof
+                    .proofs
+                    .read(&memo_attribution(proof.analyzer), |proofs| {
+                        proofs.borrow_mut().insert(proof_key, exact)
+                    });
                 exact
             };
             if !exact {
@@ -1541,9 +1562,12 @@ struct ResultAssignmentConversionProofContext<'a> {
     overlay: &'a SemanticModelOverlay,
     file: &'a ProjectFile,
     source: &'a str,
-    source_identities: &'a std::cell::RefCell<HashMap<ProjectFile, Option<ContentIdentity>>>,
+    source_identities:
+        &'a CaptureScopedMemo<std::cell::RefCell<HashMap<ProjectFile, Option<ContentIdentity>>>>,
     modeled_target: &'a ModeledProcedureKey,
-    proofs: &'a std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
+    proofs: &'a CaptureScopedMemo<
+        std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
+    >,
     work: usize,
 }
 
@@ -1563,8 +1587,12 @@ fn result_assignment_conversion_proof_context<'a>(
     modeled_target: Option<&'a ModeledProcedureKey>,
     overlay: Option<&'a SemanticModelOverlay>,
     source: Option<&'a str>,
-    source_identities: &'a std::cell::RefCell<HashMap<ProjectFile, Option<ContentIdentity>>>,
-    proofs: &'a std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
+    source_identities: &'a CaptureScopedMemo<
+        std::cell::RefCell<HashMap<ProjectFile, Option<ContentIdentity>>>,
+    >,
+    proofs: &'a CaptureScopedMemo<
+        std::cell::RefCell<HashMap<ResultAssignmentConversionProofKey, bool>>,
+    >,
     work: Option<usize>,
 ) -> Option<ResultAssignmentConversionProofContext<'a>> {
     modeled_target
@@ -2139,15 +2167,19 @@ impl EffectTraversalCache {
         models: Option<Arc<ResolvedActiveSemanticModels>>,
     ) -> Self {
         Self {
-            models: Some(models),
+            models: CaptureScopedMemo::new(Some(models)),
             ..Self::default()
         }
     }
 
     fn models(&mut self, analyzer: &dyn IAnalyzer) -> Option<Arc<ResolvedActiveSemanticModels>> {
-        self.models
-            .get_or_insert_with(|| analyzer.active_semantic_models())
-            .clone()
+        let Self { models, .. } = self;
+        let attribution = memo_attribution(analyzer);
+        models.read_mut(&attribution, |models| {
+            models
+                .get_or_insert_with(|| analyzer.active_semantic_models())
+                .clone()
+        })
     }
 
     fn reviewed_cpp_libc_model_active(&mut self, analyzer: &dyn IAnalyzer) -> bool {
@@ -2169,32 +2201,57 @@ impl EffectTraversalCache {
         file: &ProjectFile,
         range: Range,
     ) -> Arc<super::dispatch::DispatchSiteAnswer> {
-        let key = (file.clone(), range);
-        if let Some(answer) = self.dispatch_answers.get(&key) {
-            return Arc::clone(answer);
-        }
-        let answer = Arc::new(semantic.dispatch_at_source(file, range));
-        self.dispatch_answers.insert(key, Arc::clone(&answer));
-        answer
+        let Self {
+            dispatch_answers, ..
+        } = self;
+        let attribution = memo_attribution(semantic.analyzer());
+        dispatch_answers.read_mut(&attribution, |dispatch_answers| {
+            let key = (file.clone(), range);
+            if let Some(answer) = dispatch_answers.get(&key) {
+                return Arc::clone(answer);
+            }
+            let answer = Arc::new(semantic.dispatch_at_source(file, range));
+            dispatch_answers.insert(key, Arc::clone(&answer));
+            answer
+        })
     }
 
     fn native_cpp_dispatch_for_shape(
         &self,
+        analyzer: &dyn IAnalyzer,
         shape: &CallShapeValue,
     ) -> Option<Arc<NativeCallTargetLookup>> {
-        let file = &shape.report.outcome.file;
-        is_cpp_native_file(file)
-            .then(|| {
-                self.native_cpp_dispatches
-                    .get(&(file.clone(), shape.report.outcome.range))
-                    .cloned()
-            })
-            .flatten()
+        let Self {
+            native_cpp_dispatches,
+            ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        native_cpp_dispatches.read(&attribution, |native_cpp_dispatches| {
+            let file = &shape.report.outcome.file;
+            is_cpp_native_file(file)
+                .then(|| {
+                    native_cpp_dispatches
+                        .get(&(file.clone(), shape.report.outcome.range))
+                        .cloned()
+                })
+                .flatten()
+        })
     }
 
-    fn has_native_cpp_dispatch(&self, file: &ProjectFile, range: Range) -> bool {
-        self.native_cpp_dispatches
-            .contains_key(&(file.clone(), range))
+    fn has_native_cpp_dispatch(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        range: Range,
+    ) -> bool {
+        let Self {
+            native_cpp_dispatches,
+            ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        native_cpp_dispatches.read(&attribution, |native_cpp_dispatches| {
+            native_cpp_dispatches.contains_key(&(file.clone(), range))
+        })
     }
 
     /// Exact Rust calls whose nearest enclosing executable context is a
@@ -2239,61 +2296,76 @@ impl EffectTraversalCache {
         semantic: &mut SemanticQueryContext<'_>,
         shape: &CallShapeValue,
     ) -> Result<JavaCallResultUse, JavaCallResultUseOpen> {
-        let source = shape
-            .source()
-            .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax)?;
-        let outcome = &shape.report.outcome;
-        let key = (
-            outcome.file.clone(),
-            ContentIdentity::hash_bytes(source.as_bytes()),
-        );
-        if !self.java_result_use_indexes.contains_key(&key) {
-            let mut parser = tree_sitter::Parser::new();
-            let language = crate::analyzer::parser_language_for(crate::analyzer::Language::Java)
-                .expect("the Java grammar is installed");
-            parser
-                .set_language(&language)
-                .expect("the installed Java grammar matches tree-sitter");
-            let tree = parser
-                .parse(source, None)
-                .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax)?;
-            self.java_result_use_indexes.insert(
-                key.clone(),
-                JavaCallResultUseRelationIndex::new(tree.root_node()),
-            );
-        }
-        let syntactic = self
-            .java_result_use_indexes
-            .get(&key)
-            .expect("the source index was just installed")
-            .at_span(outcome.range.start_byte, outcome.range.end_byte);
-        match syntactic {
-            Ok(site) => match site.for_port(0) {
-                CallResultUse::Discarded => return Ok(JavaCallResultUse::Discarded),
-                CallResultUse::Consumed => return Ok(JavaCallResultUse::OtherContext),
-                CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax) => {}
-                CallResultUse::Open(_) | CallResultUse::IntentionalDiscard(_) => {
-                    return Err(JavaCallResultUseOpen::UnclassifiedSyntax);
+        let Self {
+            java_result_use_indexes,
+            java_lambda_result_uses,
+            ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        java_result_use_indexes.read_mut(&attribution, |java_result_use_indexes| {
+            java_lambda_result_uses.read_mut(&attribution, |java_lambda_result_uses| {
+                let source = shape
+                    .source()
+                    .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax)?;
+                let outcome = &shape.report.outcome;
+                let key = (
+                    outcome.file.clone(),
+                    ContentIdentity::hash_bytes(source.as_bytes()),
+                );
+                if !java_result_use_indexes.contains_key(&key) {
+                    let mut parser = tree_sitter::Parser::new();
+                    let language =
+                        crate::analyzer::parser_language_for(crate::analyzer::Language::Java)
+                            .expect("the Java grammar is installed");
+                    parser
+                        .set_language(&language)
+                        .expect("the installed Java grammar matches tree-sitter");
+                    let tree = parser
+                        .parse(source, None)
+                        .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax)?;
+                    java_result_use_indexes.insert(
+                        key.clone(),
+                        JavaCallResultUseRelationIndex::new(tree.root_node()),
+                    );
                 }
-            },
-            Err(CallResultUseOpenReason::UnclassifiedSyntax) => {}
-            Err(CallResultUseOpenReason::MissingCall) => {
-                return Err(JavaCallResultUseOpen::MissingCall);
-            }
-            Err(CallResultUseOpenReason::AmbiguousCall) => {
-                return Err(JavaCallResultUseOpen::AmbiguousCall);
-            }
-            Err(_) => return Err(JavaCallResultUseOpen::UnclassifiedSyntax),
-        }
-        let lambda_key = (key.0, key.1, outcome.range);
-        if let Some(result) = self.java_lambda_result_uses.get(&lambda_key) {
-            return *result;
-        }
-        let result = semantic
-            .java_expression_lambda_result_use(analyzer, &outcome.file, source, outcome.range)
-            .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax);
-        self.java_lambda_result_uses.insert(lambda_key, result);
-        result
+                let syntactic = java_result_use_indexes
+                    .get(&key)
+                    .expect("the source index was just installed")
+                    .at_span(outcome.range.start_byte, outcome.range.end_byte);
+                match syntactic {
+                    Ok(site) => match site.for_port(0) {
+                        CallResultUse::Discarded => return Ok(JavaCallResultUse::Discarded),
+                        CallResultUse::Consumed => return Ok(JavaCallResultUse::OtherContext),
+                        CallResultUse::Open(CallResultUseOpenReason::UnclassifiedSyntax) => {}
+                        CallResultUse::Open(_) | CallResultUse::IntentionalDiscard(_) => {
+                            return Err(JavaCallResultUseOpen::UnclassifiedSyntax);
+                        }
+                    },
+                    Err(CallResultUseOpenReason::UnclassifiedSyntax) => {}
+                    Err(CallResultUseOpenReason::MissingCall) => {
+                        return Err(JavaCallResultUseOpen::MissingCall);
+                    }
+                    Err(CallResultUseOpenReason::AmbiguousCall) => {
+                        return Err(JavaCallResultUseOpen::AmbiguousCall);
+                    }
+                    Err(_) => return Err(JavaCallResultUseOpen::UnclassifiedSyntax),
+                }
+                let lambda_key = (key.0, key.1, outcome.range);
+                if let Some(result) = java_lambda_result_uses.get(&lambda_key) {
+                    return *result;
+                }
+                let result = semantic
+                    .java_expression_lambda_result_use(
+                        analyzer,
+                        &outcome.file,
+                        source,
+                        outcome.range,
+                    )
+                    .ok_or(JavaCallResultUseOpen::UnclassifiedSyntax);
+                java_lambda_result_uses.insert(lambda_key, result);
+                result
+            })
+        })
     }
 
     fn java_result_use_site_for_shape(
@@ -2325,29 +2397,35 @@ impl EffectTraversalCache {
 
     fn native_result_use_for_shape(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         shape: &CallShapeValue,
     ) -> Result<CallResultUseSite, CallResultUseOpenReason> {
-        let source = shape
-            .source()
-            .ok_or(CallResultUseOpenReason::UnclassifiedSyntax)?;
-        let outcome = &shape.report.outcome;
-        let language = crate::analyzer::common::language_for_file(&outcome.file);
-        let key = (
-            outcome.file.clone(),
-            ContentIdentity::hash_bytes(source.as_bytes()),
-        );
-        if !self.native_result_use_indexes.contains_key(&key) {
-            let mut parser = tree_sitter::Parser::new();
-            let grammar = crate::analyzer::parser_language_for(language)
-                .expect("the native result-use language grammar is installed");
-            parser
-                .set_language(&grammar)
-                .expect("the native result-use grammar matches tree-sitter");
-            let tree = parser
-                .parse(source, None)
-                .ok_or(CallResultUseOpenReason::RecoveredSyntax)?;
-            let index =
-                match language {
+        let Self {
+            native_result_use_indexes,
+            ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        native_result_use_indexes.read_mut(&attribution, |native_result_use_indexes| {
+            let source = shape
+                .source()
+                .ok_or(CallResultUseOpenReason::UnclassifiedSyntax)?;
+            let outcome = &shape.report.outcome;
+            let language = crate::analyzer::common::language_for_file(&outcome.file);
+            let key = (
+                outcome.file.clone(),
+                ContentIdentity::hash_bytes(source.as_bytes()),
+            );
+            if !native_result_use_indexes.contains_key(&key) {
+                let mut parser = tree_sitter::Parser::new();
+                let grammar = crate::analyzer::parser_language_for(language)
+                    .expect("the native result-use language grammar is installed");
+                parser
+                    .set_language(&grammar)
+                    .expect("the native result-use grammar matches tree-sitter");
+                let tree = parser
+                    .parse(source, None)
+                    .ok_or(CallResultUseOpenReason::RecoveredSyntax)?;
+                let index = match language {
                     crate::analyzer::Language::Go => NativeCallResultUseIndex::Go(
                         GoCallResultUseIndex::new(tree.root_node(), source),
                     ),
@@ -2372,13 +2450,14 @@ impl EffectTraversalCache {
                     ),
                     _ => return Err(CallResultUseOpenReason::UnsupportedSyntax),
                 };
-            self.native_result_use_indexes.insert(key.clone(), index);
-        }
-        self.native_result_use_indexes
-            .get(&key)
-            .expect("the native source index was just installed")
-            .at_span(outcome.range.start_byte, outcome.range.end_byte)
-            .cloned()
+                native_result_use_indexes.insert(key.clone(), index);
+            }
+            native_result_use_indexes
+                .get(&key)
+                .expect("the native source index was just installed")
+                .at_span(outcome.range.start_byte, outcome.range.end_byte)
+                .cloned()
+        })
     }
 
     /// The canonical identity of one workspace callable, cached per unit.
@@ -2395,42 +2474,63 @@ impl EffectTraversalCache {
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
     ) -> Option<ModeledProcedureKey> {
-        if let Some(key) = self.keys.get(unit) {
-            return key.clone();
-        }
-        let key = modeled_procedure_key_for_unit(analyzer, unit);
-        self.keys.insert(unit.clone(), key.clone());
-        key
+        let Self { keys, .. } = self;
+        let attribution = memo_attribution(analyzer);
+        keys.read_mut(&attribution, |keys| {
+            if let Some(key) = keys.get(unit) {
+                return key.clone();
+            }
+            let key = modeled_procedure_key_for_unit(analyzer, unit);
+            keys.insert(unit.clone(), key.clone());
+            key
+        })
     }
 
     fn answer_for(&mut self, analyzer: &dyn IAnalyzer, key: &ModeledProcedureKey) -> ModelAnswer {
-        if let Some(answer) = self.answers.get(key) {
-            return answer.clone();
+        if let Some(answer) = self.answers.read(&memo_attribution(analyzer), |answers| {
+            answers.get(key).cloned()
+        }) {
+            return answer;
         }
         let answer = lookup_declared_effects(self.models(analyzer).as_deref(), key);
-        self.answers.insert(key.clone(), answer.clone());
+        self.answers
+            .read_mut(&memo_attribution(analyzer), |answers| {
+                answers.insert(key.clone(), answer.clone())
+            });
         answer
     }
 
-    fn result_contract_names(&mut self, analyzer: &dyn IAnalyzer) -> &ResultContractNameInventory {
-        if self.result_contract_names.is_none() {
-            let mut inventory = ResultContractNameInventory::default();
-            if let Some(models) = self.models(analyzer) {
-                for (language, member, has_receiver, arity) in
-                    models.result_contract_name_inventory()
-                {
-                    inventory
-                        .members
-                        .entry((language, member, has_receiver))
-                        .or_default()
-                        .insert(arity);
+    fn result_contract_names(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+    ) -> Arc<ResultContractNameInventory> {
+        let models = self.models(analyzer);
+        let Self {
+            result_contract_names,
+            ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        result_contract_names.read_mut(&attribution, |result_contract_names| {
+            if result_contract_names.is_none() {
+                let mut inventory = ResultContractNameInventory::default();
+                if let Some(models) = models {
+                    for (language, member, has_receiver, arity) in
+                        models.result_contract_name_inventory()
+                    {
+                        inventory
+                            .members
+                            .entry((language, member, has_receiver))
+                            .or_default()
+                            .insert(arity);
+                    }
                 }
+                *result_contract_names = Some(Arc::new(inventory));
             }
-            self.result_contract_names = Some(inventory);
-        }
-        self.result_contract_names
-            .as_ref()
-            .expect("result-contract name inventory was initialized")
+            result_contract_names
+                .as_ref()
+                .expect("result-contract name inventory was initialized")
+                .clone()
+        })
     }
 
     fn may_name_result_contract(
@@ -2466,21 +2566,31 @@ impl EffectTraversalCache {
     }
 
     fn exact_source(&mut self, analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<Arc<str>> {
-        if !self.exact_sources.contains_key(file) {
-            // The identity is meaningful only for the exact bytes retained in
-            // this file window. Invalidate it whenever a new source snapshot
-            // is fetched, including after an explicit window preparation.
-            self.exact_source_identities.get_mut().remove(file);
-            let source = analyzer.indexed_source(file).map(Arc::from);
-            if source.is_none() {
-                analyzer.mark_execution_dependent();
-            }
-            self.exact_sources.insert(file.clone(), source);
-        }
-        self.exact_sources
-            .get(file)
-            .expect("the exact source cache was initialized")
-            .clone()
+        let Self {
+            exact_source_identities,
+            exact_sources,
+            ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        exact_source_identities.read_mut(&attribution, |exact_source_identities| {
+            exact_sources.read_mut(&attribution, |exact_sources| {
+                if !exact_sources.contains_key(file) {
+                    // The identity is meaningful only for the exact bytes retained in
+                    // this file window. Invalidate it whenever a new source snapshot
+                    // is fetched, including after an explicit window preparation.
+                    exact_source_identities.get_mut().remove(file);
+                    let source = analyzer.indexed_source(file).map(Arc::from);
+                    if source.is_none() {
+                        analyzer.mark_execution_dependent();
+                    }
+                    exact_sources.insert(file.clone(), source);
+                }
+                exact_sources
+                    .get(file)
+                    .expect("the exact source cache was initialized")
+                    .clone()
+            })
+        })
     }
 
     /// Derive exact structural call shapes once for the current result-contract
@@ -2493,48 +2603,53 @@ impl EffectTraversalCache {
         file: &ProjectFile,
         facts: Option<&FileFacts>,
     ) -> Option<Arc<ResultMemberCallShapesByRange>> {
-        let operation = "result-member call-shape indexing";
-        if self
-            .result_member_call_shapes
-            .as_ref()
-            .is_some_and(|window| &window.file == file)
-        {
-            if !semantic.charge_consumer_traversal(file, 0, operation) {
-                return None;
-            }
-            return self
-                .result_member_call_shapes
+        let Self {
+            result_member_call_shapes,
+            ..
+        } = self;
+        let attribution = memo_attribution(semantic.analyzer());
+        result_member_call_shapes.read_mut(&attribution, |result_member_call_shapes| {
+            let operation = "result-member call-shape indexing";
+            if result_member_call_shapes
                 .as_ref()
-                .and_then(|window| window.shapes.clone());
-        }
+                .is_some_and(|window| &window.file == file)
+            {
+                if !semantic.charge_consumer_traversal(file, 0, operation) {
+                    return None;
+                }
+                return result_member_call_shapes
+                    .as_ref()
+                    .and_then(|window| window.shapes.clone());
+            }
 
-        let shapes = facts.and_then(|facts| {
-            if !semantic.charge_consumer_traversal(file, facts.work_item_count(), operation) {
-                return None;
-            }
-            let mut shapes = ResultMemberCallShapesByRange::default();
-            // One call site cannot outnumber the snapshot's nodes. This keeps
-            // the structural helper explicitly bounded while preserving the
-            // complete file inventory paid for above.
-            for shape in call_shapes_in_file(facts, file, facts.nodes().len()) {
-                shapes
-                    .entry(shape.outcome.range)
-                    .and_modify(|existing| *existing = None)
-                    .or_insert(Some(shape));
-            }
-            // Cancellation can race with the synchronous structural walk.
-            // Recheck it before publishing proof-bearing cached data.
-            semantic
-                .charge_consumer_traversal(file, 0, operation)
-                .then(|| Arc::new(shapes))
-        });
-        self.result_member_call_shapes = Some(ResultMemberCallShapeWindow {
-            file: file.clone(),
-            shapes,
-        });
-        self.result_member_call_shapes
-            .as_ref()
-            .and_then(|window| window.shapes.clone())
+            let shapes = facts.and_then(|facts| {
+                if !semantic.charge_consumer_traversal(file, facts.work_item_count(), operation) {
+                    return None;
+                }
+                let mut shapes = ResultMemberCallShapesByRange::default();
+                // One call site cannot outnumber the snapshot's nodes. This keeps
+                // the structural helper explicitly bounded while preserving the
+                // complete file inventory paid for above.
+                for shape in call_shapes_in_file(facts, file, facts.nodes().len()) {
+                    shapes
+                        .entry(shape.outcome.range)
+                        .and_modify(|existing| *existing = None)
+                        .or_insert(Some(shape));
+                }
+                // Cancellation can race with the synchronous structural walk.
+                // Recheck it before publishing proof-bearing cached data.
+                semantic
+                    .charge_consumer_traversal(file, 0, operation)
+                    .then(|| Arc::new(shapes))
+            });
+            *result_member_call_shapes = Some(ResultMemberCallShapeWindow {
+                file: file.clone(),
+                shapes,
+            });
+            result_member_call_shapes
+                .as_ref()
+                .and_then(|window| window.shapes.clone())
+        })
     }
 
     /// Index the structured value and state rows used by result-contract
@@ -2548,97 +2663,109 @@ impl EffectTraversalCache {
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         derivation: &crate::structural::flow_state::FlowStateDerivation,
     ) -> Option<Arc<ResultUseIndex>> {
-        let operation = "result-use semantic indexing";
-        let artifact = Arc::downgrade(procedure.artifact());
-        let retains_artifact = self.result_use_indexes.as_ref().is_some_and(|window| {
-            &window.file == file && std::sync::Weak::ptr_eq(&window.artifact, &artifact)
-        });
-        if !retains_artifact {
-            self.result_use_indexes = Some(ResultUseIndexWindow {
-                file: file.clone(),
-                artifact,
-                indexes: HashMap::default(),
+        let Self {
+            result_use_indexes, ..
+        } = self;
+        let attribution = memo_attribution(semantic.analyzer());
+        result_use_indexes.read_mut(&attribution, |result_use_indexes| {
+            let operation = "result-use semantic indexing";
+            let artifact = Arc::downgrade(procedure.artifact());
+            let retains_artifact = result_use_indexes.as_ref().is_some_and(|window| {
+                &window.file == file && std::sync::Weak::ptr_eq(&window.artifact, &artifact)
             });
-        }
-
-        let key = (procedure.id(), derivation.generation);
-        if self
-            .result_use_indexes
-            .as_ref()
-            .is_some_and(|window| window.indexes.contains_key(&key))
-        {
-            if !semantic.charge_consumer_traversal(file, 0, operation) {
-                return None;
+            if !retains_artifact {
+                *result_use_indexes = Some(ResultUseIndexWindow {
+                    file: file.clone(),
+                    artifact,
+                    indexes: HashMap::default(),
+                });
             }
-            return self
-                .result_use_indexes
-                .as_ref()
-                .and_then(|window| window.indexes.get(&key))
-                .cloned()
-                .flatten();
-        }
 
-        let semantics = procedure.semantics();
-        let available = (|| {
-            // The builder scans semantic events once and then joins at most
-            // one pending assignment per event. Charge that exact linear
-            // upper bound before inspecting event contents.
-            for point in semantics.points() {
-                let steps = point.events.len().saturating_add(1).saturating_mul(2);
-                if !semantic.charge_consumer_traversal(file, steps, operation) {
+            let key = (procedure.id(), derivation.generation);
+            if result_use_indexes
+                .as_ref()
+                .is_some_and(|window| window.indexes.contains_key(&key))
+            {
+                if !semantic.charge_consumer_traversal(file, 0, operation) {
                     return None;
                 }
+                return result_use_indexes
+                    .as_ref()
+                    .and_then(|window| window.indexes.get(&key))
+                    .cloned()
+                    .flatten();
             }
-            let remaining_steps = semantics
-                .call_sites()
-                .len()
-                .saturating_add(
-                    semantics
-                        .call_sites()
-                        .iter()
-                        .map(|call| call.arguments.len())
-                        .sum::<usize>(),
-                )
-                .saturating_add(semantics.memory_locations().len())
-                .saturating_add(semantics.gaps().len())
-                .saturating_add(derivation.events.len());
-            if !semantic.charge_consumer_traversal(file, remaining_steps, operation) {
-                return None;
-            }
-            let index = Arc::new(build_result_use_index(procedure, derivation));
-            // Cancellation can race with the synchronous structured walk.
-            semantic
-                .charge_consumer_traversal(file, 0, operation)
-                .then_some(index)
-        })();
-        self.result_use_indexes
-            .as_mut()
-            .expect("result-use index window was initialized")
-            .indexes
-            .insert(key, available.clone());
-        available
+
+            let semantics = procedure.semantics();
+            let available = (|| {
+                // The builder scans semantic events once and then joins at most
+                // one pending assignment per event. Charge that exact linear
+                // upper bound before inspecting event contents.
+                for point in semantics.points() {
+                    let steps = point.events.len().saturating_add(1).saturating_mul(2);
+                    if !semantic.charge_consumer_traversal(file, steps, operation) {
+                        return None;
+                    }
+                }
+                let remaining_steps = semantics
+                    .call_sites()
+                    .len()
+                    .saturating_add(
+                        semantics
+                            .call_sites()
+                            .iter()
+                            .map(|call| call.arguments.len())
+                            .sum::<usize>(),
+                    )
+                    .saturating_add(semantics.memory_locations().len())
+                    .saturating_add(semantics.gaps().len())
+                    .saturating_add(derivation.events.len());
+                if !semantic.charge_consumer_traversal(file, remaining_steps, operation) {
+                    return None;
+                }
+                let index = Arc::new(build_result_use_index(procedure, derivation));
+                // Cancellation can race with the synchronous structured walk.
+                semantic
+                    .charge_consumer_traversal(file, 0, operation)
+                    .then_some(index)
+            })();
+            result_use_indexes
+                .as_mut()
+                .expect("result-use index window was initialized")
+                .indexes
+                .insert(key, available.clone());
+            available
+        })
     }
 
     fn replace_modeled_call_target_window(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: ProjectFile,
         lookups: HashMap<String, ModeledCallTargetLookup>,
     ) {
-        self.modeled_call_targets = Some(ModeledCallTargetWindow { file, lookups });
+        let Self {
+            modeled_call_targets,
+            ..
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        modeled_call_targets.read_mut(&attribution, |modeled_call_targets| {
+            *modeled_call_targets = Some(ModeledCallTargetWindow { file, lookups });
+        })
     }
 
     /// Release the source snapshot retained by one artifact-independent file
     /// window while preserving activated-model and declaration-key caches.
     pub(super) fn release_file_window(&mut self) {
-        self.exact_sources.clear();
-        self.exact_source_identities.get_mut().clear();
-        self.result_assignment_conversion_proofs.get_mut().clear();
-        self.result_member_call_shapes = None;
-        self.result_use_indexes = None;
+        self.exact_sources = CaptureScopedMemo::default();
+        self.exact_source_identities = CaptureScopedMemo::default();
+        self.result_assignment_conversion_proofs = CaptureScopedMemo::default();
+        self.result_member_call_shapes = CaptureScopedMemo::default();
+        self.result_use_indexes = CaptureScopedMemo::default();
         // Native target projections are bounded query-local results. Keep
         // them across file windows so repeated policy branches do not rerun
         // the same resolver work for the same call sites.
-        self.modeled_call_targets = None;
+        self.modeled_call_targets = CaptureScopedMemo::default();
     }
 }
 
@@ -2904,10 +3031,13 @@ pub(super) fn result_contract_call_expansions(
     let outcome = &shape.report.outcome;
     let Some(answer) = cache
         .modeled_call_targets
-        .as_ref()
-        .filter(|window| window.file == outcome.file)
-        .and_then(|window| window.lookups.get(&outcome.site_id))
-        .cloned()
+        .read(&memo_attribution(analyzer), |targets| {
+            targets
+                .as_ref()
+                .filter(|window| window.file == outcome.file)
+                .and_then(|window| window.lookups.get(&outcome.site_id))
+                .cloned()
+        })
     else {
         return Vec::new();
     };
@@ -3045,8 +3175,14 @@ pub(super) fn prepare_result_contract_call_lookups(
         .map(|shape| shape.report.as_ref())
         .collect::<Vec<_>>();
     prepare_modeled_call_target_lookups(analyzer, cache, limits, cancellation, file, &reports);
-    cache.exact_sources.remove(file);
-    cache.exact_source_identities.get_mut().remove(file);
+    cache
+        .exact_sources
+        .read_mut(&memo_attribution(analyzer), |sources| sources.remove(file));
+    cache
+        .exact_source_identities
+        .read_mut(&memo_attribution(analyzer), |identities| {
+            identities.get_mut().remove(file)
+        });
 }
 
 /// Resolve C/C++ targets once for the current B4 file window. The native
@@ -3079,11 +3215,13 @@ pub(super) fn prepare_native_cpp_dispatches(
         .iter()
         .copied()
         .filter(|shape| {
-            !cache.has_native_cpp_dispatch(file, shape.report.outcome.range)
-                && cache.native_result_use_for_shape(shape).is_ok_and(|site| {
-                    site.overrides().is_empty()
-                        && matches!(site.for_port(0), CallResultUse::Discarded)
-                })
+            !cache.has_native_cpp_dispatch(analyzer, file, shape.report.outcome.range)
+                && cache
+                    .native_result_use_for_shape(analyzer, shape)
+                    .is_ok_and(|site| {
+                        site.overrides().is_empty()
+                            && matches!(site.for_port(0), CallResultUse::Discarded)
+                    })
         })
         .collect::<Vec<_>>();
     if dispatch_shapes.is_empty() {
@@ -3105,12 +3243,18 @@ pub(super) fn prepare_native_cpp_dispatches(
         cancellation,
     );
     for (shape, lookup) in dispatch_shapes.into_iter().zip(lookups) {
-        if cache.native_cpp_dispatches.len() >= MAX_NATIVE_CPP_DISPATCH_QUERY_CACHE {
+        if cache
+            .native_cpp_dispatches
+            .read(&memo_attribution(analyzer), |dispatches| dispatches.len())
+            >= MAX_NATIVE_CPP_DISPATCH_QUERY_CACHE
+        {
             break;
         }
         cache
             .native_cpp_dispatches
-            .insert((file.clone(), shape.report.outcome.range), Arc::new(lookup));
+            .read_mut(&memo_attribution(analyzer), |dispatches| {
+                dispatches.insert((file.clone(), shape.report.outcome.range), Arc::new(lookup))
+            });
     }
 }
 
@@ -3124,6 +3268,7 @@ fn prepare_modeled_call_target_lookups(
 ) {
     let Some(exact_source) = cache.exact_source(analyzer, file) else {
         cache.replace_modeled_call_target_window(
+            analyzer,
             file.clone(),
             shapes
                 .iter()
@@ -3156,6 +3301,7 @@ fn prepare_modeled_call_target_lookups(
         cancellation,
     );
     cache.replace_modeled_call_target_window(
+        analyzer,
         file.clone(),
         shapes
             .iter()
@@ -3185,12 +3331,17 @@ fn prepare_result_operation_call_lookups(
         )
     });
     shapes.dedup_by(|left, right| left.outcome.site_id == right.outcome.site_id);
-    if cache.modeled_call_targets.as_ref().is_some_and(|window| {
-        &window.file == file
-            && shapes
-                .iter()
-                .all(|shape| window.lookups.contains_key(&shape.outcome.site_id))
-    }) {
+    if cache
+        .modeled_call_targets
+        .read(&memo_attribution(analyzer), |targets| {
+            targets.as_ref().is_some_and(|window| {
+                &window.file == file
+                    && shapes
+                        .iter()
+                        .all(|shape| window.lookups.contains_key(&shape.outcome.site_id))
+            })
+        })
+    {
         return;
     }
     prepare_modeled_call_target_lookups(analyzer, cache, limits, cancellation, file, &shapes);
@@ -3303,7 +3454,7 @@ pub(super) fn call_result_contract_expansions(
 
     let single_arm = (answer.arms.len() == 1).then(|| &answer.arms[0]);
     let target_id = single_arm.map(|arm| arm.target_id.clone());
-    let modeled_target = single_arm.and_then(|_| keys.first().cloned().flatten());
+    let modeled_target = single_arm.and_then(|_| keys.first().cloned()).flatten();
     let callee = single_arm
         .and_then(|arm| arm.target_unit.as_ref())
         .and_then(|unit| {
@@ -3449,7 +3600,7 @@ fn native_rust_call_result_obligation_expansions(
     shape: &CallShapeValue,
 ) -> Vec<PipelineExpansion> {
     let outcome = &shape.report.outcome;
-    let classification = cache.native_result_use_for_shape(shape);
+    let classification = cache.native_result_use_for_shape(analyzer, shape);
     if let Ok(site) = &classification {
         let result_use = site.for_port(0);
         if matches!(result_use, CallResultUse::Consumed) {
@@ -3962,7 +4113,7 @@ fn native_cpp_call_result_obligation_expansions(
     shape: &CallShapeValue,
 ) -> Vec<PipelineExpansion> {
     let outcome = &shape.report.outcome;
-    let classification = match cache.native_result_use_for_shape(shape) {
+    let classification = match cache.native_result_use_for_shape(analyzer, shape) {
         // The shared C++ call-result index intentionally omits the
         // `static_cast` wrapper and classifies its inner call. The normalized
         // call-shape lowering can still expose that wrapper as a call-shaped
@@ -4058,12 +4209,14 @@ fn native_cpp_call_result_obligation_expansions(
     }
 
     let reviewed_cpp_libc_model_active = cache.reviewed_cpp_libc_model_active(analyzer);
-    let native_dispatch = cache.native_cpp_dispatch_for_shape(shape).filter(|lookup| {
-        is_c_translation_unit(&outcome.file)
-            || lookup.exhaustive
-            || (lookup.targets.is_empty()
-                && (!could_be_reviewed_cpp_libc_call(shape) && reviewed_cpp_libc_model_active))
-    });
+    let native_dispatch = cache
+        .native_cpp_dispatch_for_shape(analyzer, shape)
+        .filter(|lookup| {
+            is_c_translation_unit(&outcome.file)
+                || lookup.exhaustive
+                || (lookup.targets.is_empty()
+                    && (!could_be_reviewed_cpp_libc_call(shape) && reviewed_cpp_libc_model_active))
+        });
     // The reviewed libc check needs an external dispatch arm. The native
     // prefetch only returns workspace targets, so a call it resolved to
     // workspace declarations cannot be a reviewed libc call. A targetless
@@ -4257,7 +4410,7 @@ fn native_go_call_result_obligation_expansions(
     shape: &CallShapeValue,
 ) -> Vec<PipelineExpansion> {
     let outcome = &shape.report.outcome;
-    let classification = cache.native_result_use_for_shape(shape);
+    let classification = cache.native_result_use_for_shape(analyzer, shape);
     let answer = cache.dispatch_at_source(semantic, &outcome.file, outcome.range);
     let dispatch_coverage = coverage_for(answer.coverage);
     let mut arm_targets = Vec::with_capacity(answer.arms.len());
@@ -5038,7 +5191,7 @@ fn csharp_call_result_obligation_expansions(
         modeled_arm_count: 0,
         terminal: true,
     };
-    let classification = match cache.native_result_use_for_shape(shape) {
+    let classification = match cache.native_result_use_for_shape(analyzer, shape) {
         Ok(site) => site.for_port(0),
         Err(reason) => {
             row.result_use = "open";
@@ -5398,7 +5551,7 @@ fn javascript_typescript_call_result_obligation_expansions(
         modeled_arm_count: 0,
         terminal: true,
     };
-    let result_use = match cache.native_result_use_for_shape(shape) {
+    let result_use = match cache.native_result_use_for_shape(analyzer, shape) {
         Ok(site) => site.for_port(0),
         Err(reason) => {
             row.result_use = "open";
@@ -5786,7 +5939,7 @@ fn ruby_call_result_obligation_expansions(
         modeled_arm_count: 0,
         terminal: true,
     };
-    let classification = match cache.native_result_use_for_shape(shape) {
+    let classification = match cache.native_result_use_for_shape(analyzer, shape) {
         Ok(site) => site.for_port(0),
         Err(reason) => {
             row.result_use = "open";
@@ -6154,7 +6307,7 @@ fn php_call_result_obligation_expansions(
         modeled_arm_count: 0,
         terminal: true,
     };
-    let classification = match cache.native_result_use_for_shape(shape) {
+    let classification = match cache.native_result_use_for_shape(analyzer, shape) {
         Ok(site) => site.for_port(0),
         Err(reason) => {
             row.result_use = "open";
@@ -6942,11 +7095,13 @@ fn complete_modeled_call_facts(
 )> {
     let answer = cache
         .modeled_call_targets
-        .as_ref()
-        .filter(|window| window.file == shape.outcome.file)?
-        .lookups
-        .get(&shape.outcome.site_id)?
-        .clone();
+        .read(&memo_attribution(analyzer), |targets| {
+            targets
+                .as_ref()
+                .filter(|window| window.file == shape.outcome.file)
+                .and_then(|window| window.lookups.get(&shape.outcome.site_id))
+                .cloned()
+        })?;
     if answer.coverage != ModeledCallTargetCoverage::Exhaustive || answer.arms.is_empty() {
         return None;
     }
@@ -7007,10 +7162,13 @@ fn modeled_call_proves_normal_continuation_absent(
 ) -> bool {
     let Some(lookup) = cache
         .modeled_call_targets
-        .as_ref()
-        .filter(|window| window.file == shape.outcome.file)
-        .and_then(|window| window.lookups.get(&shape.outcome.site_id))
-        .cloned()
+        .read(&memo_attribution(analyzer), |targets| {
+            targets
+                .as_ref()
+                .filter(|window| window.file == shape.outcome.file)
+                .and_then(|window| window.lookups.get(&shape.outcome.site_id))
+                .cloned()
+        })
     else {
         return false;
     };
@@ -8040,15 +8198,18 @@ fn failure_use_call_shapes(
 ) -> Option<Arc<ResultMemberCallShapesByRange>> {
     let facts = cache
         .facts
-        .entry(file.clone())
-        .or_insert_with(|| {
-            workspace
-                .analyzer()
-                .structural_fact_providers()
-                .into_iter()
-                .find_map(|provider| provider.structural_facts(file))
-        })
-        .clone();
+        .read_mut(&memo_attribution(workspace.analyzer()), |facts| {
+            facts
+                .entry(file.clone())
+                .or_insert_with(|| {
+                    workspace
+                        .analyzer()
+                        .structural_fact_providers()
+                        .into_iter()
+                        .find_map(|provider| provider.structural_facts(file))
+                })
+                .clone()
+        });
     cache.result_member_call_shapes(semantic, file, facts.as_deref())
 }
 
@@ -9779,10 +9940,13 @@ fn classify_call_argument_operation(
     }
     let Some(answer) = cache
         .modeled_call_targets
-        .as_ref()
-        .filter(|window| window.file == shape.outcome.file)
-        .and_then(|window| window.lookups.get(&shape.outcome.site_id))
-        .cloned()
+        .read(&memo_attribution(analyzer), |targets| {
+            targets
+                .as_ref()
+                .filter(|window| window.file == shape.outcome.file)
+                .and_then(|window| window.lookups.get(&shape.outcome.site_id))
+                .cloned()
+        })
     else {
         return unknown;
     };
@@ -10854,8 +11018,13 @@ fn conditional_summary_for_workspace_procedure(
     unit: &CodeUnit,
     depth: usize,
 ) -> ConditionalProcedureSummaryAnswer {
-    if let Some(answer) = cache.conditional_wrapper_answers.get(unit) {
-        return answer.clone();
+    if let Some(answer) = cache
+        .conditional_wrapper_answers
+        .read(&memo_attribution(analyzer), |answers| {
+            answers.get(unit).cloned()
+        })
+    {
+        return answer;
     }
     if depth >= MAX_CONDITIONAL_WRAPPER_DEPTH
         || !cache.conditional_wrapper_visiting.insert(unit.clone())
@@ -10917,7 +11086,9 @@ fn conditional_summary_for_workspace_procedure(
     cache.conditional_wrapper_visiting.remove(unit);
     cache
         .conditional_wrapper_answers
-        .insert(unit.clone(), answer.clone());
+        .read_mut(&memo_attribution(analyzer), |answers| {
+            answers.insert(unit.clone(), answer.clone())
+        });
     answer
 }
 
@@ -11967,14 +12138,17 @@ fn validate_result_contract_uses(
         .then(|| {
             model_cache
                 .facts
-                .entry(file.clone())
-                .or_insert_with(|| {
-                    analyzer
-                        .structural_fact_providers()
-                        .into_iter()
-                        .find_map(|provider| provider.structural_facts(file))
+                .read_mut(&memo_attribution(analyzer), |facts| {
+                    facts
+                        .entry(file.clone())
+                        .or_insert_with(|| {
+                            analyzer
+                                .structural_fact_providers()
+                                .into_iter()
+                                .find_map(|provider| provider.structural_facts(file))
+                        })
+                        .clone()
                 })
-                .clone()
         })
         .flatten();
     let result_member_call_shapes = needs_result_member_facts
@@ -13808,8 +13982,10 @@ fn procedure_effect_expansions_for_root(
         || declaration_identity(&declaration.unit),
         SemanticProcedureValue::wire_id,
     );
-    let report = match cache.reports.get(&identity) {
-        Some(report) => Arc::clone(report),
+    let report = match cache.reports.read(&memo_attribution(analyzer), |reports| {
+        reports.get(&identity).cloned()
+    }) {
+        Some(report) => report,
         None => {
             let graph = discover_effect_graph(
                 analyzer,
@@ -13833,7 +14009,9 @@ fn procedure_effect_expansions_for_root(
                 }
                 cache
                     .reports
-                    .insert(report.procedure_declaration_id.clone(), report);
+                    .read_mut(&memo_attribution(analyzer), |reports| {
+                        reports.insert(report.procedure_declaration_id.clone(), report)
+                    });
             }
             match selected {
                 Some(report) => report,
@@ -14054,8 +14232,10 @@ fn discover_effect_graph(
             continue;
         }
         let file = unit.source().clone();
-        let facts = match cache.facts.get(&file) {
-            Some(facts) => facts.clone(),
+        let facts = match cache.facts.read(&memo_attribution(analyzer), |facts| {
+            facts.get(&file).cloned()
+        }) {
+            Some(facts) => facts,
             None => {
                 let resolved = match receiver::receiver_facts_for_pipeline_row(
                     analyzer,
@@ -14071,7 +14251,9 @@ fn discover_effect_graph(
                     PipelineReceiverFacts::Available(facts) => Some(facts),
                     PipelineReceiverFacts::Unavailable | PipelineReceiverFacts::Halted => None,
                 };
-                cache.facts.insert(file.clone(), resolved.clone());
+                cache.facts.read_mut(&memo_attribution(analyzer), |facts| {
+                    facts.insert(file.clone(), resolved.clone())
+                });
                 resolved
             }
         };
@@ -14983,42 +15165,53 @@ func inspect(input *item) (result int) {
 
     #[test]
     fn effect_file_window_releases_file_local_caches() {
+        let analyzer = &crate::analyzer::MultiAnalyzer::default();
+        let attribution = memo_attribution(analyzer);
         let root = std::env::temp_dir().join("bifrost-rql-modeled-target-window");
         let first = ProjectFile::new(&root, "first.go");
         let second = ProjectFile::new(&root, "second.go");
         let mut cache = EffectTraversalCache {
-            result_member_call_shapes: Some(ResultMemberCallShapeWindow {
+            result_member_call_shapes: CaptureScopedMemo::new(Some(ResultMemberCallShapeWindow {
                 file: first.clone(),
                 shapes: Some(Arc::new(ResultMemberCallShapesByRange::default())),
-            }),
+            })),
             ..EffectTraversalCache::default()
         };
-        cache.result_assignment_conversion_proofs.get_mut().insert(
-            ResultAssignmentConversionProofKey {
-                file: first.clone(),
-                modeled_target: ModeledProcedureKey {
-                    language: "go".to_owned(),
-                    owner: "net".to_owned(),
-                    member: "Listen".to_owned(),
-                    has_receiver: false,
-                    parameter_count: 2,
-                },
-                result_ordinal: 1,
-                binding_declaration: Range {
-                    start_byte: 0,
-                    end_byte: 3,
-                    start_line: 1,
-                    end_line: 1,
-                },
-                source_identity: ContentIdentity::hash_bytes(b"var err error"),
-            },
-            true,
-        );
-        cache.exact_source_identities.get_mut().insert(
-            first.clone(),
-            Some(ContentIdentity::hash_bytes(b"var err error")),
-        );
+        cache
+            .result_assignment_conversion_proofs
+            .read_mut(&attribution, |proofs| {
+                proofs.get_mut().insert(
+                    ResultAssignmentConversionProofKey {
+                        file: first.clone(),
+                        modeled_target: ModeledProcedureKey {
+                            language: "go".to_owned(),
+                            owner: "net".to_owned(),
+                            member: "Listen".to_owned(),
+                            has_receiver: false,
+                            parameter_count: 2,
+                        },
+                        result_ordinal: 1,
+                        binding_declaration: Range {
+                            start_byte: 0,
+                            end_byte: 3,
+                            start_line: 1,
+                            end_line: 1,
+                        },
+                        source_identity: ContentIdentity::hash_bytes(b"var err error"),
+                    },
+                    true,
+                )
+            });
+        cache
+            .exact_source_identities
+            .read_mut(&attribution, |identities| {
+                identities.get_mut().insert(
+                    first.clone(),
+                    Some(ContentIdentity::hash_bytes(b"var err error")),
+                )
+            });
         cache.replace_modeled_call_target_window(
+            analyzer,
             first,
             [
                 ("first-a".to_owned(), lookup()),
@@ -15030,34 +15223,46 @@ func inspect(input *item) (result int) {
         assert_eq!(
             cache
                 .modeled_call_targets
-                .as_ref()
-                .expect("first file window")
-                .lookups
-                .len(),
+                .read(&attribution, |targets| targets
+                    .as_ref()
+                    .expect("first file window")
+                    .lookups
+                    .len()),
             2
         );
 
         cache.replace_modeled_call_target_window(
+            analyzer,
             second.clone(),
             [("second".to_owned(), lookup())].into_iter().collect(),
         );
-        let window = cache
-            .modeled_call_targets
-            .as_ref()
-            .expect("replacement file window");
-        assert_eq!(window.file, second);
-        assert_eq!(window.lookups.len(), 1);
-        assert!(window.lookups.contains_key("second"));
+        cache.modeled_call_targets.read(&attribution, |targets| {
+            let window = targets.as_ref().expect("replacement file window");
+            assert_eq!(window.file, second);
+            assert_eq!(window.lookups.len(), 1);
+            assert!(window.lookups.contains_key("second"));
+        });
 
         cache.release_file_window();
-        assert!(cache.result_member_call_shapes.is_none());
-        assert!(cache.modeled_call_targets.is_none());
+        assert!(
+            cache
+                .result_member_call_shapes
+                .read(&attribution, Option::is_none)
+        );
+        assert!(
+            cache
+                .modeled_call_targets
+                .read(&attribution, Option::is_none)
+        );
         assert!(
             cache
                 .result_assignment_conversion_proofs
-                .borrow()
-                .is_empty()
+                .read(&attribution, |proofs| proofs.borrow().is_empty())
         );
-        assert!(cache.exact_source_identities.borrow().is_empty());
+        assert!(
+            cache
+                .exact_source_identities
+                .read(&attribution, |identities| identities.borrow().is_empty())
+        );
     }
 }

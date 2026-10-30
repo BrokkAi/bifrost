@@ -27,7 +27,7 @@
 //! one compiled plan is not served under another. Adding an admitted partition
 //! or product kind requires updating the `policy_units` check constraint.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,14 +38,21 @@ use brokk_bifrost_analysis::analyzer::invalidation::{
     RetentionReason,
 };
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
-use brokk_bifrost_analysis::analyzer::semantic::SemanticWork;
+use brokk_bifrost_analysis::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
+use brokk_bifrost_analysis::analyzer::semantic::{
+    IcfgProvider, SemanticWork, StableDigest, WorkspaceIcfgProvider, type_flow_adapter,
+};
+use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use brokk_bifrost_analysis::analyzer::usages::CallRelationLimits;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerQueryScope, HeadInputs, IAnalyzer, Language, LookupMemo, LookupReplayLimits,
-    NoSummaryAnswers, Oid, ProjectFile, ReadKey, ReadVerdict, WorkspaceAnalyzer,
+    NoSummaryAnswers, Oid, ProjectFile, ReadKey, ReadVerdict, SummaryAnswers, WorkspaceAnalyzer,
     verify_read_set_for_artifact,
 };
+use brokk_bifrost_analysis::hash::HashMap;
 use brokk_bifrost_analysis::path_utils::rel_path_string;
+use brokk_bifrost_flow::type_flow::{FieldSlotIndex, FieldSlotIndexCache};
+use brokk_bifrost_flow::value_flow::ValueFlowCache;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
     merge_unit_rows, plan_seed_files,
@@ -135,6 +142,123 @@ impl UnitAttempt {
     }
 }
 
+/// Head-only field-slot answers, pinned for this policy's verification query.
+/// The language map has at most one entry per language; its acquired snapshots
+/// die with the verification query. The byte-capped cache
+/// and value-flow resources belong to the head run and are shared with evaluation.
+struct HeadFieldSlotAnswers<'a> {
+    workspace: &'a WorkspaceAnalyzer,
+    summaries: NoSummaryAnswers,
+    models: Option<Arc<ActiveSemanticModelSnapshot>>,
+    slots: RefCell<HashMap<Language, Option<Arc<FieldSlotIndex>>>>,
+    cache: FieldSlotIndexCache,
+    #[cfg(test)]
+    builds: Cell<usize>,
+    values: ValueFlowCache,
+    allotment: brokk_bifrost_rql::structural::search::CodeQueryRootAllotment,
+}
+
+impl<'a> HeadFieldSlotAnswers<'a> {
+    fn new(
+        workspace: &'a WorkspaceAnalyzer,
+        flow: &brokk_bifrost_flow::FlowWorkspaceState,
+        limits: &CodeQueryExecutionLimits,
+    ) -> Self {
+        let allotment =
+            brokk_bifrost_rql::structural::search::CodeQueryRootAllotment::from_execution_limits(
+                limits,
+            );
+        Self {
+            workspace,
+            summaries: NoSummaryAnswers,
+            models: workspace.analyzer().active_semantic_model_snapshot(),
+            slots: RefCell::default(),
+            cache: allotment
+                .summary_state(workspace, &flow.type_flow_summaries())
+                .field_slot_indexes(),
+            values: flow.value_flow_cache(),
+            allotment,
+            #[cfg(test)]
+            builds: Cell::new(0),
+        }
+    }
+
+    fn acquire(&self, language: Language) -> Option<Arc<FieldSlotIndex>> {
+        let adapter = type_flow_adapter(language)?;
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            self.workspace,
+            self.models.clone(),
+        );
+        let cancellation = self
+            .workspace
+            .analyzer()
+            .active_query_cancellation()
+            .unwrap_or_default();
+        let mut budget = self.allotment.semantic_budget();
+        // Verification asks only for complete, content-determined answers.
+        // Refused acquisitions invalidate the unit instead of proving absence.
+        match FieldSlotIndex::acquire(
+            self.workspace,
+            adapter,
+            provider.behavior_identity(),
+            self.models.clone(),
+            &self.cache,
+            self.values.clone(),
+            &mut budget,
+            &cancellation,
+        ) {
+            Ok(acquired) if acquired.index.is_shareable() && !cancellation.is_cancelled() => {
+                #[cfg(test)]
+                if acquired.kind
+                    == brokk_bifrost_flow::type_flow::FieldSlotIndexAcquisitionKind::Built
+                {
+                    self.builds.set(self.builds.get() + 1);
+                }
+                Some(acquired.index)
+            }
+            Ok(_) | Err(_) => None,
+        }
+    }
+}
+
+impl SummaryAnswers for HeadFieldSlotAnswers<'_> {
+    fn summary_content(&self, identity: StableDigest) -> Option<StableDigest> {
+        self.summaries.summary_content(identity)
+    }
+
+    fn workspace_fact(
+        &self,
+        family: WorkspaceFactFamily,
+        language: Language,
+        subject: &FactSubject,
+    ) -> Option<StableDigest> {
+        if family != WorkspaceFactFamily::FieldSlots {
+            return self.summaries.workspace_fact(family, language, subject);
+        }
+        if self
+            .workspace
+            .analyzer()
+            .active_query_cancellation()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return None;
+        }
+        if !matches!(subject, FactSubject::Class { .. } | FactSubject::Whole) {
+            return None;
+        }
+        let mut slots = self.slots.borrow_mut();
+        let index = slots
+            .entry(language)
+            .or_insert_with(|| self.acquire(language))
+            .as_ref()?;
+        match subject {
+            FactSubject::Class { class } => Some(index.class_content(*class)),
+            FactSubject::Whole => Some(index.digest()),
+            _ => unreachable!("field-slot subjects checked above"),
+        }
+    }
+}
+
 /// The reuse decision for one policy's units, and the state it amortizes.
 ///
 /// One of these is built per policy and lives for the whole of its sliced
@@ -151,6 +275,7 @@ pub(crate) struct UnitReuse<'a> {
     replay_limits: LookupReplayLimits,
     limits: CodeQueryExecutionLimits,
     memo: LookupMemo,
+    answers: HeadFieldSlotAnswers<'a>,
     /// Where this attempt's time went, handed to the incremental context once
     /// when the attempt ends so the per-unit loop never takes its lock.
     phase: Cell<UnitPhaseMetrics>,
@@ -177,6 +302,7 @@ impl<'a> UnitReuse<'a> {
         policy: &'a LoadedPolicy,
         incremental: &'a PolicyIncrementalContext<'a>,
         budget: &'a PolicyBudget,
+        flow: &brokk_bifrost_flow::FlowWorkspaceState,
     ) -> Self {
         let limits = budget.query_limits();
         Self {
@@ -187,6 +313,7 @@ impl<'a> UnitReuse<'a> {
             replay_limits: lookup_replay_limits(&limits),
             limits,
             memo: LookupMemo::new(),
+            answers: HeadFieldSlotAnswers::new(incremental.workspace(), flow, &limits),
             phase: Cell::default(),
         }
     }
@@ -208,14 +335,18 @@ impl<'a> UnitReuse<'a> {
     /// A persisted store answers one query instead of one per partition. A
     /// store that cannot answer has said nothing about what was published, so
     /// the policy widens instead of reading its silence as absence.
-    pub(crate) fn prefetch(&self, keys: &[PolicyUnitKey]) -> Result<(), WidenReason> {
+    pub(crate) fn prefetch(
+        &self,
+        keys: &[PolicyUnitKey],
+        row_node_count: Option<usize>,
+    ) -> Result<(), WidenReason> {
         let started = Instant::now();
         let loaded = self
             .incremental
             .store()
             .lock()
             .expect("policy-unit store mutex poisoned")
-            .prefetch(keys, self.budget);
+            .prefetch(keys, self.budget, row_node_count);
         let mut phase = self.phase.get();
         phase.prefetch += started.elapsed();
         self.phase.set(phase);
@@ -240,21 +371,6 @@ impl<'a> UnitReuse<'a> {
         &mut self,
         key: &PolicyUnitKey,
     ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
-        let degraded_fills = self
-            .incremental
-            .workspace()
-            .analyzer()
-            .degraded_persistent_fills();
-        if degraded_fills > 0 {
-            brokk_bifrost_analysis::profiling::note_with(|| {
-                format!(
-                    "policy.units unbounded origin={}:{} cause=degraded_persistent_fill count={degraded_fills}",
-                    file!(),
-                    line!()
-                )
-            });
-            return Err(WidenReason::UnitUnbounded);
-        }
         let started = Instant::now();
         let replayed_before = self.memo.replay_elapsed();
         let result = self.published_inner(key);
@@ -332,14 +448,9 @@ impl<'a> UnitReuse<'a> {
             &self.head_inputs,
             unit.reads(),
             self.replay_limits,
-            // A typestate root unit's read set does name procedure
-            // summaries, and this head answers none of them -- which is the
-            // right answer, not a missing one. A head that has solved nothing
-            // retains no summary under any identity, so the question cannot be
-            // asked here at all; what carries the dependency is the closure
-            // the recorder names beside each summary, one `Artifact` key per
-            // member, which verification re-derives from the head's own bytes.
-            &NoSummaryAnswers,
+            // Ordinary summaries remain unanswered; field-slot reads are
+            // checked against a complete snapshot acquired from this head.
+            &self.answers,
             &mut self.memo,
         ) {
             ReadVerdict::Unchanged => {
@@ -435,23 +546,12 @@ pub(crate) fn recompute_unit<T>(
         let started = Instant::now();
         let _reads = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
         let product = run();
-        let degraded_fills = analyzer.degraded_persistent_fills();
-        if degraded_fills > 0 {
-            brokk_bifrost_analysis::profiling::note_with(|| {
-                format!(
-                    "policy.units unbounded origin={}:{} cause=degraded_persistent_fill count={degraded_fills}",
-                    file!(),
-                    line!()
-                )
-            });
-        }
         if cancellation.is_some_and(CancellationToken::is_cancelled)
             || analyzer
                 .active_query_cancellation()
                 .is_some_and(|token| token.is_cancelled())
             || analyzer.project().analysis_generation() != generation_before
             || _reads.store_error().is_some()
-            || analyzer.degraded_persistent_fills() > 0
         {
             brokk_bifrost_analysis::profiling::note_with(|| {
                 format!(
@@ -669,7 +769,10 @@ pub(crate) fn sliced_query_units(
             }),
         ));
     }
-    reuse.prefetch(&keys)?;
+    reuse.prefetch(
+        &keys,
+        Some(brokk_bifrost_rql::structural::unit_plan_node_count(query)),
+    )?;
 
     let mut products = Vec::with_capacity(seed_files.len());
     for (file, key) in seed_files.iter().zip(keys.iter()) {
@@ -730,10 +833,8 @@ pub(crate) fn sliced_query_units(
     }
 
     let merged = merge_unit_rows(query, products);
-    if merged
-        .reached_limit(&execution.limits, query.limit)
-        .is_some()
-    {
+    if let Some(limit) = merged.reached_limit(&execution.limits, query.limit) {
+        attempt.set_widen_detail(Some(PlanWidenDetail::MergedLimit(limit)));
         return Err(WidenReason::MergedLimitReached);
     }
     Ok(SlicedQuery { merged, keys })
@@ -753,4 +854,372 @@ pub(super) fn check_exhaustive_rows(rows: &UnitExecutionResult) -> Result<(), Wi
         return Err(WidenReason::UnitDiagnostics);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cache_fill_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::common::{QueryCacheCell, complete_query_cache_cell};
+    use brokk_bifrost_analysis::analyzer::store::StoreError;
+    use brokk_bifrost_cpp_analysis::CppAnalyzer;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#7876: removing global degraded-fill refusal must keep consuming policy units unbounded"
+    )]
+    fn a_degraded_cache_fill_keeps_only_its_consuming_policy_unit_unbounded() {
+        let fixture = InlineTestProject::with_language(Language::Cpp)
+            .file("app.cpp", "int value = 1;")
+            .build();
+        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+        for reason in [
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(StoreError::new(
+                "injected cache provider failure",
+            )),
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(
+                fixture.file("app.cpp"),
+            ),
+        ] {
+            let cache = QueryCacheCell::new();
+            let ((value, failure), reads, _) = recompute_unit(&analyzer, None, || {
+                let scope = AnalyzerQueryScope::new(&analyzer);
+                let value = complete_query_cache_cell(&analyzer, &cache, || {
+                    match &reason {
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(
+                            error,
+                        ) => analyzer.record_query_failure(error.clone()),
+                        reason => analyzer.record_query_incomplete(reason.clone()),
+                    }
+                    17
+                });
+                (value, scope.read_completion())
+            });
+            assert_eq!(
+                value, 17,
+                "the degraded build returned its best-effort answer"
+            );
+            assert_eq!(
+                failure,
+                Err(reason.clone()),
+                "the failure reached the consuming request"
+            );
+            assert!(
+                cache.get().is_none(),
+                "the degraded value was not published: {reason:?}"
+            );
+            assert!(
+                reads.is_none(),
+                "the consuming policy unit must remain unbounded: {reason:?}"
+            );
+
+            let (value, reads, _) = recompute_unit(&analyzer, None, || {
+                complete_query_cache_cell(&analyzer, &cache, || 29)
+            });
+            assert_eq!(value, 29, "a later request rebuilt the cache");
+            assert_eq!(cache.get(), Some(&29));
+            assert!(
+                reads.is_some(),
+                "a later clean policy unit remains bounded: {reason:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod field_slot_verification_tests {
+    use super::*;
+    use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
+    use crate::inline_project::InlineTestProject;
+    use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
+    use crate::units::{
+        AssertFileProduct, IncrementalBaseState, PersistedPolicyUnitStore, PolicyUnitStore,
+        UnitSnapshots, WorkspaceUnitInputs, workspace_snapshot,
+    };
+    use brokk_bifrost_analysis::analyzer::ChangedFacts;
+    use brokk_bifrost_analysis::analyzer::semantic::ClassIdentity;
+    use brokk_bifrost_analysis::analyzer::workspace_authority::{
+        AuthorityInputs, record_workspace_authority_read,
+    };
+    use brokk_bifrost_analysis::{AnalyzerConfig, FilesystemProject};
+    use brokk_bifrost_flow::type_flow::field_slot_class_identity;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::Mutex;
+
+    #[test]
+    #[hardwon(
+        "#2445: unit verification could not answer FieldSlots reads, so such units never reused"
+    )]
+    fn field_slot_unit_reuses_across_commits_and_recomputes_after_first_write() {
+        let fixture = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file("app.py", "class Client:\n    pass\n")
+            .file("other.py", "def other():\n    return 1\n")
+            .file(
+                "writer.py",
+                "from app import Client\n\ndef write(client: Client):\n    pass\n",
+            )
+            .file(
+                "policy.rqlp",
+                r#"(policy
+              :schema-version 1 :id "test.field-slot-unit" :name "Field-slot unit"
+              :message "No reads" :severity warning
+              :analysis (analysis :type assertion
+                :subject (rql :schema-version 1 (function :capture "at"))
+                :asserts [(assert :id no-reads :at "at" :role value_reference :expect none)]))"#,
+            )
+            .build();
+        let build = || {
+            WorkspaceAnalyzer::build_persisted(
+                Arc::new(FilesystemProject::new(fixture.root()).expect("project")),
+                AnalyzerConfig::default(),
+            )
+            .expect("persisted workspace")
+        };
+        let base = build();
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry = PolicyRegistry::new_for_workspace(
+            fixture.root().to_path_buf(),
+            catalogs,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("registry");
+        let policy = registry
+            .load_policy_path("policy.rqlp")
+            .expect("policy")
+            .clone();
+        let second_source = std::fs::read_to_string(fixture.root().join("policy.rqlp"))
+            .unwrap()
+            .replace("test.field-slot-unit", "test.second-field-slot-unit");
+        let second_policy = registry
+            .register_policy_bytes_with_analyzer(
+                crate::source::PolicySourceIdentity::new("second.rqlp"),
+                second_source.as_bytes(),
+                base.analyzer(),
+            )
+            .expect("second policy")
+            .clone();
+        let budget = PolicyBudget::default();
+        let class = ClassIdentity::Workspace(
+            base.analyzer()
+                .get_definitions("app.Client")
+                .into_iter()
+                .next()
+                .expect("Client"),
+        );
+        let subjects = [
+            FactSubject::Class {
+                class: field_slot_class_identity(&class),
+            },
+            FactSubject::Whole,
+        ];
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let answers = HeadFieldSlotAnswers::new(&base, &flow, &budget.query_limits());
+        let index = answers
+            .acquire(Language::Python)
+            .expect("complete base field slots");
+        let before = [
+            index.class_content(field_slot_class_identity(&class)),
+            index.digest(),
+        ];
+        // Exercise the recorder -> persisted unit -> head verifier boundary.
+        // Query build reads are subsumed by these exact Class/Whole receipts,
+        // as in the RQL producer; no dispatch question obscures verification.
+        let (product, reads, _) = recompute_unit(base.analyzer(), None, || {
+            for (subject, answer) in subjects.iter().zip(before) {
+                record_workspace_authority_read(
+                    base.analyzer(),
+                    WorkspaceFactFamily::FieldSlots,
+                    AuthorityInputs::Fact {
+                        language: Language::Python,
+                        subject: subject.clone(),
+                        answer,
+                    },
+                );
+            }
+            PolicyUnitProduct::AssertFile(AssertFileProduct {
+                findings: Vec::new(),
+                unconcluded: Vec::new(),
+                row_completions: Vec::new(),
+                diagnostics: Vec::new(),
+                work: Default::default(),
+            })
+        });
+        let reads = reads.expect("bounded unit receipt");
+        assert_eq!(
+            reads.len(),
+            2,
+            "both FieldSlots reads must really be recorded: {reads:?}"
+        );
+        let unchanged = ChangedFacts::between(&base, &base);
+        let key = WorkspaceUnitInputs::of(&base, None).unit_key(
+            &policy,
+            UnitPartition::AssertFile {
+                language: Language::Python,
+                rel_path: "app.py".into(),
+                blob: unchanged
+                    .head_blob(Language::Python, "app.py")
+                    .expect("app blob"),
+                subjects: StableDigest::sha256(b"Client"),
+            },
+        );
+        let base_snapshot = workspace_snapshot(&base).expect("base snapshot");
+        let mut store = PersistedPolicyUnitStore::new(Arc::clone(base.store().expect("store")));
+        store.publish(PolicyUnit::new(
+            key.clone(),
+            product,
+            reads,
+            BudgetMode::Exhaustive,
+            vec![base_snapshot],
+        ));
+        assert_eq!(store.flush().expect("persist unit"), 1);
+        drop(store);
+
+        std::fs::write(
+            fixture.root().join("other.py"),
+            "def other():\n    return 2\n",
+        )
+        .expect("unrelated edit");
+        fixture.commit("unrelated second commit");
+        let head = build();
+        let changed = ChangedFacts::between(&base, &head);
+        let store = Mutex::new(PersistedPolicyUnitStore::new(Arc::clone(
+            head.store().expect("head store"),
+        )));
+        let context = PolicyIncrementalContext::new(
+            &store,
+            &head,
+            &changed,
+            WorkspaceUnitInputs::of(&head, None),
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots {
+                base: base_snapshot,
+                head: workspace_snapshot(&head).expect("head snapshot"),
+            },
+        );
+        let mut reuse = UnitReuse::new(&policy, &context, &budget, &flow);
+        reuse
+            .prefetch(std::slice::from_ref(&key), None)
+            .expect("load unit");
+        assert!(
+            reuse
+                .published(&key)
+                .expect("verify unchanged receipts")
+                .is_some(),
+            "the persisted policy unit must reuse after an unrelated commit"
+        );
+        for (subject, expected) in subjects.iter().zip(before) {
+            assert_eq!(
+                reuse.answers.workspace_fact(
+                    WorkspaceFactFamily::FieldSlots,
+                    Language::Python,
+                    subject
+                ),
+                Some(expected)
+            );
+        }
+        let second_reuse = UnitReuse::new(&second_policy, &context, &budget, &flow);
+        for (subject, expected) in subjects.iter().zip(before) {
+            assert_eq!(
+                second_reuse.answers.workspace_fact(
+                    WorkspaceFactFamily::FieldSlots,
+                    Language::Python,
+                    subject
+                ),
+                Some(expected),
+                "second policy verifies the same FieldSlots receipts"
+            );
+        }
+
+        let first_index = reuse
+            .answers
+            .acquire(Language::Python)
+            .expect("first policy snapshot");
+        let second_index = second_reuse
+            .answers
+            .acquire(Language::Python)
+            .expect("second policy snapshot");
+        assert!(
+            Arc::ptr_eq(&first_index, &second_index),
+            "two policies must use the same head cache, including nonpersistable products"
+        );
+        assert_eq!(
+            reuse.answers.builds.get() + second_reuse.answers.builds.get(),
+            1,
+            "one head field-slot build across policies"
+        );
+        let evaluation_cache =
+            brokk_bifrost_rql::structural::search::CodeQueryRootAllotment::from_execution_limits(
+                &budget.query_limits(),
+            )
+            .summary_state(&head, &flow.type_flow_summaries())
+            .field_slot_indexes();
+        let provider = WorkspaceIcfgProvider::new(&head);
+        let evaluation = FieldSlotIndex::acquire(
+            &head,
+            type_flow_adapter(Language::Python).unwrap(),
+            provider.behavior_identity(),
+            None,
+            &evaluation_cache,
+            flow.value_flow_cache(),
+            &mut reuse.answers.allotment.semantic_budget(),
+            &CancellationToken::default(),
+        )
+        .expect("evaluation snapshot");
+        assert_eq!(
+            evaluation.kind,
+            brokk_bifrost_flow::type_flow::FieldSlotIndexAcquisitionKind::MemoryHit
+        );
+        assert!(Arc::ptr_eq(&first_index, &evaluation.index));
+        drop(second_reuse);
+        drop(reuse);
+        drop(context);
+
+        std::fs::write(
+            fixture.root().join("writer.py"),
+            "from app import Client\n\ndef write(client: Client):\n    client.extra = 1\n",
+        )
+        .expect("first write in unimported file");
+        fixture.commit("first class field write");
+        let edited = build();
+        let changed = ChangedFacts::between(&head, &edited);
+        let store = Mutex::new(PersistedPolicyUnitStore::new(Arc::clone(
+            edited.store().expect("edited store"),
+        )));
+        let context = PolicyIncrementalContext::new(
+            &store,
+            &edited,
+            &changed,
+            WorkspaceUnitInputs::of(&edited, None),
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots {
+                base: workspace_snapshot(&head).expect("previous snapshot"),
+                head: workspace_snapshot(&edited).expect("edited snapshot"),
+            },
+        );
+        let mut reuse = UnitReuse::new(&policy, &context, &budget, &flow);
+        reuse
+            .prefetch(std::slice::from_ref(&key), None)
+            .expect("load edited unit");
+        assert!(
+            reuse
+                .published(&key)
+                .expect("verify edited receipts")
+                .is_none(),
+            "the unchanged consumer must recompute after a first write elsewhere"
+        );
+        for (subject, old) in subjects.iter().zip(before) {
+            let answer = reuse
+                .answers
+                .workspace_fact(WorkspaceFactFamily::FieldSlots, Language::Python, subject)
+                .expect("complete edited snapshot");
+            assert_ne!(
+                answer, old,
+                "both Class and Whole answers must see the new store"
+            );
+        }
+    }
 }

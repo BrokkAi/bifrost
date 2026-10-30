@@ -509,6 +509,12 @@ impl DispatchOracle for PolicyIcfgProvider<'_> {
 }
 
 impl IcfgProvider for PolicyIcfgProvider<'_> {
+    fn memo_attribution(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::workspace_authority::OwnedMemoCapability {
+        self.inner.memo_attribution()
+    }
+
     fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
         self.inner.behavior_identity()
     }
@@ -748,7 +754,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
         // procedure this evaluator solves is available to the MCP/search path
         // and the other way around. This evaluator used to construct its own
         // and lease a hardcoded generation, which shared nothing with anything.
-        let summaries = context.flow_state.typestate_summaries();
+        let summaries = context.flow_state.typestate_summaries(workspace);
         let selectors = self
             .selector_units
             .lock()
@@ -784,6 +790,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
             workspace,
             selectors,
             TypestateCompilationHashes::new(compiled.protocol.hash(), compiled.bindings.hash()),
+            &context.flow_resources(),
         );
         let sliced = self.evaluate_pass(
             authority,
@@ -1258,6 +1265,7 @@ impl<'a> RootUnits<'a> {
         workspace: &WorkspaceAnalyzer,
         selectors: super::selector_compiler::SelectorUnitOutcome,
         compilation: TypestateCompilationHashes,
+        flow: &brokk_bifrost_flow::FlowWorkspaceState,
     ) -> Self {
         let files_by_rel = workspace
             .analyzer()
@@ -1266,7 +1274,7 @@ impl<'a> RootUnits<'a> {
             .map(|file| (rel_path_string(&file), file))
             .collect();
         Self {
-            reuse: UnitReuse::new(policy, incremental, budget),
+            reuse: UnitReuse::new(policy, incremental, budget, flow),
             policy,
             incremental,
             files_by_rel,
@@ -1313,7 +1321,7 @@ impl<'a> RootUnits<'a> {
                 },
             ));
         }
-        self.reuse.prefetch(&self.keys)
+        self.reuse.prefetch(&self.keys, None)
     }
 
     /// The published product for one root, when the head still reads what its
@@ -1859,19 +1867,8 @@ fn evaluate_compiled_typestate(
                 root_work.retained_analysis_findings = root_retained_analysis_findings;
                 retained_analysis_findings =
                     retained_analysis_findings.saturating_add(root_retained_analysis_findings);
-                if root_ledger.is_some() && workspace.analyzer().degraded_persistent_fills() > 0 {
-                    brokk_bifrost_analysis::profiling::note_with(|| {
-                        format!(
-                            "policy.units unbounded origin={}:{} cause=degraded_persistent_fill count={}",
-                            file!(),
-                            line!(),
-                            workspace.analyzer().degraded_persistent_fills()
-                        )
-                    });
-                }
                 if let Some(ledger) = root_ledger.as_ref()
-                    && (workspace.analyzer().degraded_persistent_fills() > 0
-                        || cancellation.is_cancelled()
+                    && (cancellation.is_cancelled()
                         || solver_budget.refusal_count() > solver_refusals_before
                         || semantic_budget.as_ref().map(SemanticBudget::refusal_count)
                             != semantic_refusals_before
@@ -7365,7 +7362,11 @@ func MissingClose() {
             Some(&cancellation),
             &budget,
             &compiled,
-            &ProductionTypestateSummaryRepository::new(),
+            &ProductionTypestateSummaryRepository::new(
+                brokk_bifrost_analysis::analyzer::workspace_authority::workspace_memo_attribution(
+                    &workspace,
+                ),
+            ),
             None,
             None,
         ) {

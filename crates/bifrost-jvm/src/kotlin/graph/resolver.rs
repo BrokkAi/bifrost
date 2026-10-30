@@ -30,6 +30,7 @@ use crate::kotlin::syntax::{
 };
 use crate::kotlin::types::KotlinTypeName;
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::memo_attribution::CaptureScopedMemo;
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::named_children;
@@ -912,6 +913,8 @@ struct KotlinFileFacts {
     imports: Vec<ImportInfo>,
 }
 
+type KotlinScopeOwners = Vec<(usize, Vec<CodeUnit>)>;
+
 /// Turns spelled Kotlin names into fully-qualified names, for one file scan.
 ///
 /// Holds the per-file facts the ladder needs and caches the enclosing-scope
@@ -924,7 +927,7 @@ pub struct KotlinNameResolver<'a> {
     /// per reference and the answer only changes when the enclosing declaration
     /// changes, so without the cache a large file re-walks the owner chain
     /// hundreds of times.
-    owners_at: RefCell<Vec<(usize, Vec<CodeUnit>)>>,
+    owners_at: CaptureScopedMemo<RefCell<KotlinScopeOwners>>,
 }
 
 impl<'a> KotlinNameResolver<'a> {
@@ -1079,7 +1082,7 @@ impl<'a> KotlinNameResolver<'a> {
                     .map(|provider| provider.import_info_of(token, file))
                     .unwrap_or_default(),
             },
-            owners_at: RefCell::new(Vec::new()),
+            owners_at: CaptureScopedMemo::default(),
         }
     }
 
@@ -1112,7 +1115,7 @@ impl<'a> KotlinNameResolver<'a> {
                     .map(|provider| provider.import_info_of(token, unit.source()))
                     .unwrap_or_default(),
             },
-            owners_at: RefCell::new(Vec::new()),
+            owners_at: CaptureScopedMemo::default(),
         }
     }
 
@@ -1137,17 +1140,16 @@ impl<'a> KotlinNameResolver<'a> {
     /// class. The *ladder* is the same — Kotlin's precedence rules do not change
     /// between namespaces — so only the predicate differs.
     fn scope_owner_units_at(&self, byte: usize) -> Vec<CodeUnit> {
-        if let Some((_, owners)) = self
-            .owners_at
-            .borrow()
-            .iter()
-            .find(|(cached, _)| *cached == byte)
-        {
-            return owners.clone();
-        }
-        let owners = self.compute_scope_owner_units_at(byte);
-        self.owners_at.borrow_mut().push((byte, owners.clone()));
-        owners
+        self.owners_at
+            .read(&self.graph.reads.memo_attribution(), |memo| {
+                if let Some((_, owners)) = memo.borrow().iter().find(|(cached, _)| *cached == byte)
+                {
+                    return owners.clone();
+                }
+                let owners = self.compute_scope_owner_units_at(byte);
+                memo.borrow_mut().push((byte, owners.clone()));
+                owners
+            })
     }
 
     fn compute_scope_owner_units_at(&self, byte: usize) -> Vec<CodeUnit> {

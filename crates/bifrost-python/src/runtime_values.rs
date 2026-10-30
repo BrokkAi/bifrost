@@ -772,7 +772,9 @@ pub enum PythonModuleMemberMutation {
 ///     value. A `sys.modules` read is classified by its structured key;
 ///     dynamic-key results are possible aliases and use the same alias
 ///     handling. A table write matters only when its stored value is or may
-///     be this module.
+///     be this module. `sys.modules` passed as the mapping of pytest's
+///     `MonkeyPatch.setitem`/`delitem` or of `mock.patch.dict` is that table
+///     write, delete, or update; any other callee receiving it is an escape.
 ///
 /// A file that never binds the module proves the absence vacuously. The walk
 /// is iterative and bounded; exhausting the bound refuses every member.
@@ -1040,29 +1042,9 @@ fn python_sys_modules_lookup<'tree>(
                 };
                 let mut cursor = arguments.walk();
                 for argument in arguments.named_children(&mut cursor) {
-                    let identity = if argument.kind() == "keyword_argument" {
-                        argument
-                            .child_by_field_name("value")
-                            .map(|value| {
-                                python_sys_modules_stored_value(
-                                    value,
-                                    &proof,
-                                    budget,
-                                    &mut HashSet::default(),
-                                )
-                            })
-                            .unwrap_or(PythonSysModulesStoredValue::Unknown)
-                    } else if argument.kind() == "dictionary_splat" {
-                        PythonSysModulesStoredValue::Unknown
-                    } else {
-                        python_sys_modules_update_values(
-                            argument,
-                            &proof,
-                            budget,
-                            &mut HashSet::default(),
-                        )
-                    };
-                    if identity != PythonSysModulesStoredValue::Unrelated {
+                    if python_sys_modules_update_argument(argument, &proof, budget)
+                        != PythonSysModulesStoredValue::Unrelated
+                    {
                         return escaped();
                     }
                 }
@@ -1072,7 +1054,146 @@ fn python_sys_modules_lookup<'tree>(
             _ => return escaped(),
         }
     }
+    if parent.kind() == "argument_list"
+        && let Some(call) = parent.parent().filter(|call| call.kind() == "call")
+        && python_sys_modules_arguments(call)
+            .first()
+            .is_some_and(|first| first.id() == table.id())
+    {
+        // A test helper that edits the mapping it receives is the matching
+        // table operation; every other callee may keep or mutate the table.
+        match python_test_helper_call(call, source, bindings) {
+            Some(PythonTestHelperCall::MonkeyPatchSetItem(receiver))
+                if python_monkeypatch_receiver(receiver, &proof) =>
+            {
+                let value = python_sys_modules_arguments(call)
+                    .get(2)
+                    .copied()
+                    .or_else(|| python_sys_modules_keyword_argument(call, source, "value"));
+                return match value.map(|value| {
+                    python_sys_modules_stored_value(value, &proof, budget, &mut HashSet::default())
+                }) {
+                    Some(PythonSysModulesStoredValue::Unrelated) => {
+                        PythonSysModulesLookup::Unrelated
+                    }
+                    _ => escaped(),
+                };
+            }
+            Some(PythonTestHelperCall::MonkeyPatchDelItem(receiver))
+                if python_monkeypatch_receiver(receiver, &proof) =>
+            {
+                return PythonSysModulesLookup::Unrelated;
+            }
+            Some(PythonTestHelperCall::MockPatchDict) => {
+                let Some(arguments) = call.child_by_field_name("arguments") else {
+                    return escaped();
+                };
+                let mut cursor = arguments.walk();
+                for argument in arguments.named_children(&mut cursor) {
+                    let keyword = (argument.kind() == "keyword_argument")
+                        .then(|| argument.child_by_field_name("name"))
+                        .flatten()
+                        .map(|name| node_text(name, source));
+                    let identity = if argument.id() == table.id() || keyword == Some("clear") {
+                        PythonSysModulesStoredValue::Unrelated
+                    } else if keyword == Some("values") {
+                        argument
+                            .child_by_field_name("value")
+                            .map(|value| {
+                                python_sys_modules_update_values(
+                                    value,
+                                    &proof,
+                                    budget,
+                                    &mut HashSet::default(),
+                                )
+                            })
+                            .unwrap_or(PythonSysModulesStoredValue::Unknown)
+                    } else {
+                        python_sys_modules_update_argument(argument, &proof, budget)
+                    };
+                    if identity != PythonSysModulesStoredValue::Unrelated {
+                        return escaped();
+                    }
+                }
+                return PythonSysModulesLookup::Unrelated;
+            }
+            _ => {}
+        }
+    }
     escaped()
+}
+
+/// One argument of a `dict.update`-shaped call: a keyword stores its value
+/// under its name, and a positional argument supplies a mapping of entries.
+fn python_sys_modules_update_argument<'tree>(
+    argument: Node<'tree>,
+    proof: &PythonSysModulesProofContext<'_, 'tree>,
+    budget: &mut PythonRuntimeBudget,
+) -> PythonSysModulesStoredValue {
+    if argument.kind() == "keyword_argument" {
+        argument
+            .child_by_field_name("value")
+            .map(|value| {
+                python_sys_modules_stored_value(value, proof, budget, &mut HashSet::default())
+            })
+            .unwrap_or(PythonSysModulesStoredValue::Unknown)
+    } else if matches!(argument.kind(), "dictionary_splat" | "list_splat") {
+        PythonSysModulesStoredValue::Unknown
+    } else {
+        python_sys_modules_update_values(argument, proof, budget, &mut HashSet::default())
+    }
+}
+
+/// Whether a `setitem`/`delitem` receiver is a pytest `MonkeyPatch`: the
+/// `monkeypatch` fixture parameter, a parameter annotated `MonkeyPatch`, or a
+/// name whose only binding constructs one. The receiver must be bound once in
+/// its function so no other value can reach the call.
+fn python_monkeypatch_receiver(
+    receiver: Node<'_>,
+    proof: &PythonSysModulesProofContext<'_, '_>,
+) -> bool {
+    let source = proof.source;
+    let is_monkeypatch_class = |expression: Option<Node<'_>>| {
+        expression
+            .and_then(|expression| python_imported_path(expression, source, proof.bindings))
+            .is_some_and(|path| path.last().is_some_and(|name| name == "MonkeyPatch"))
+    };
+    if receiver.kind() != "identifier" {
+        return false;
+    }
+    let name = node_text(receiver, source);
+    let scope = python_alias_scope(receiver);
+    if scope.kind() != "function_definition"
+        || !python_sys_modules_has_one_binding(proof, scope, name)
+    {
+        return false;
+    }
+    if let Some(parameters) = scope.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        if let Some(parameter) = parameters
+            .named_children(&mut cursor)
+            .find(|parameter| python_parameter_name(*parameter, source).as_deref() == Some(name))
+        {
+            return name == "monkeypatch"
+                || is_monkeypatch_class(
+                    parameter
+                        .child_by_field_name("type")
+                        .and_then(|annotation| annotation.named_child(0)),
+                );
+        }
+    }
+    let key = (scope.start_byte(), scope.end_byte(), name.to_owned());
+    proof
+        .facts
+        .assignments
+        .get(&key)
+        .is_some_and(|values| match values.as_slice() {
+            [value] => {
+                value.kind() == "call"
+                    && is_monkeypatch_class(value.child_by_field_name("function"))
+            }
+            _ => false,
+        })
 }
 
 fn python_sys_modules_arguments(call: Node<'_>) -> Vec<Node<'_>> {
@@ -2626,6 +2747,46 @@ fn module_binding_use(
     }
 }
 
+/// A test-helper call whose effect on its arguments is known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PythonTestHelperCall<'tree> {
+    /// `unittest.mock.patch(target, ...)`.
+    MockPatch,
+    /// `unittest.mock.patch.dict(in_dict, values, clear=...)`.
+    MockPatchDict,
+    /// `<receiver>.setitem(dic, name, value)`, a pytest `MonkeyPatch` method
+    /// when the receiver is one.
+    MonkeyPatchSetItem(Node<'tree>),
+    /// `<receiver>.delitem(dic, name, raising=...)`.
+    MonkeyPatchDelItem(Node<'tree>),
+}
+
+fn python_test_helper_call<'tree>(
+    call: Node<'tree>,
+    source: &str,
+    bindings: &[crate::imports::PythonImportBinding],
+) -> Option<PythonTestHelperCall<'tree>> {
+    let function = call.child_by_field_name("function")?;
+    if let Some(path) = python_imported_path(function, source, bindings)
+        && let Some(patch) = path.windows(2).rposition(|pair| pair == ["mock", "patch"])
+    {
+        return match &path[patch + 2..] {
+            [] => Some(PythonTestHelperCall::MockPatch),
+            [method] if method == "dict" => Some(PythonTestHelperCall::MockPatchDict),
+            _ => None,
+        };
+    }
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let receiver = function.child_by_field_name("object")?;
+    match node_text(function.child_by_field_name("attribute")?, source) {
+        "setitem" => Some(PythonTestHelperCall::MonkeyPatchSetItem(receiver)),
+        "delitem" => Some(PythonTestHelperCall::MonkeyPatchDelItem(receiver)),
+        _ => None,
+    }
+}
+
 fn python_mock_patch_may_replace_module_member(
     call: Node<'_>,
     source: &str,
@@ -2633,13 +2794,7 @@ fn python_mock_patch_may_replace_module_member(
     module: &str,
     member: &str,
 ) -> bool {
-    let Some(function) = call.child_by_field_name("function") else {
-        return false;
-    };
-    let Some(path) = python_imported_path(function, source, bindings) else {
-        return false;
-    };
-    if path.len() < 2 || path[path.len() - 2] != "mock" || path[path.len() - 1] != "patch" {
+    if python_test_helper_call(call, source, bindings) != Some(PythonTestHelperCall::MockPatch) {
         return false;
     }
     let Some(arguments) = call.child_by_field_name("arguments") else {
@@ -3242,6 +3397,43 @@ mod module_member_mutation_tests {
             "import pkg.Other as shim\nimport sys\nsys.modules['shim'] = shim\n",
         ] {
             assert_eq!(mutation(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    #[hardwon("#8107: monkeypatch.setitem(sys.modules, ...) escaped every module workspace-wide")]
+    fn sys_modules_test_helper_edits_are_table_operations() {
+        for source in [
+            "import sys\ndef test(monkeypatch):\n    monkeypatch.setitem(sys.modules, 'dotenv', None)\n",
+            "import sys\ndef test(monkeypatch):\n    monkeypatch.delitem(sys.modules, 'dotenv', raising=False)\n",
+            "import sys\nimport pytest\ndef test(mp: pytest.MonkeyPatch):\n    mp.setitem(sys.modules, 'dotenv', None)\n",
+            "import sys\nimport pytest\ndef test():\n    mp = pytest.MonkeyPatch()\n    mp.setitem(sys.modules, 'dotenv', None)\n",
+            "import sys\nfrom unittest import mock\n@mock.patch.dict(sys.modules, {'dotenv': None})\ndef test():\n    pass\n",
+            "import sys\nfrom unittest.mock import patch\ndef test():\n    with patch.dict(sys.modules, values={'dotenv': None}, clear=True, extra=None):\n        pass\n",
+        ] {
+            assert_eq!(mutation(source), None, "{source}");
+        }
+        for source in [
+            // The stored value may be the queried module.
+            "import sys\ndef test(monkeypatch, fake):\n    monkeypatch.setitem(sys.modules, 'pkg.M', fake)\n",
+            "import pkg.M as target\nimport sys\ndef test(monkeypatch):\n    monkeypatch.setitem(sys.modules, 'shim', target)\n",
+            "import pkg.M as target\nimport sys\nfrom unittest import mock\nmock.patch.dict(sys.modules, {'shim': target})\n",
+            "import pkg.M as target\nimport sys\nfrom unittest import mock\nmock.patch.dict(sys.modules, values={'shim': target})\n",
+            "import pkg.M as target\nimport sys\nfrom unittest import mock\nmock.patch.dict(sys.modules, shim=target)\n",
+            // The receiver is not known to be a MonkeyPatch.
+            "import sys\ndef test(mp):\n    mp.setitem(sys.modules, 'dotenv', None)\n",
+            "import sys\ndef test(monkeypatch):\n    monkeypatch = other\n    monkeypatch.setitem(sys.modules, 'dotenv', None)\n",
+            // sys.modules is not the edited mapping.
+            "import sys\ndef test(monkeypatch):\n    monkeypatch.setitem(registry, sys.modules, None)\n",
+            "import sys\ndef test(monkeypatch):\n    monkeypatch.setattr(sys.modules, 'dotenv', None)\n",
+        ] {
+            assert!(
+                matches!(
+                    mutation(source),
+                    Some(PythonModuleMemberMutation::Escape(_))
+                ),
+                "{source}"
+            );
         }
     }
 

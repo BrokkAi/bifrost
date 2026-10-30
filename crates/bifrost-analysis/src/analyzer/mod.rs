@@ -210,12 +210,12 @@ pub mod workspace;
 /// Retain a lazy external index until one of its discovery inputs changes.
 #[doc(hidden)]
 pub fn updated_external_index<T>(
-    current: &std::sync::Arc<std::sync::OnceLock<T>>,
+    current: &std::sync::Arc<common::QueryCacheCell<T>>,
     changed_files: &std::collections::BTreeSet<ProjectFile>,
     is_dependency_input: impl Fn(&ProjectFile) -> bool,
-) -> std::sync::Arc<std::sync::OnceLock<T>> {
+) -> std::sync::Arc<common::QueryCacheCell<T>> {
     if changed_files.iter().any(is_dependency_input) {
-        std::sync::Arc::new(std::sync::OnceLock::new())
+        std::sync::Arc::new(common::QueryCacheCell::new())
     } else {
         std::sync::Arc::clone(current)
     }
@@ -381,7 +381,10 @@ pub use i_analyzer::SearchSymbolCandidates;
 pub use i_analyzer::SearchSymbolPatternBatch;
 pub use i_analyzer::WorkspaceFileIndex;
 pub use i_analyzer::WorkspaceFileIndexCell;
-pub use i_analyzer::{capture_query_reads, replay_query_read_keys};
+pub use i_analyzer::{
+    capture_query_reads, capture_subsumed_query_read_receipt, capture_subsumed_query_reads,
+    replay_query_read_keys, replay_query_read_receipt,
+};
 
 pub use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::InformationTier;
@@ -630,7 +633,18 @@ pub(crate) mod selected_services;
 pub mod store_support;
 
 pub use brokk_bifrost_core::analyzer::carried_context::CarriedContext;
+#[doc(hidden)]
+pub use brokk_bifrost_core::analyzer::project_reads::without_project_reads;
 pub use i_analyzer::{
     ReadAttribution, ReadAttributionGuard, read_attribution_fallback_count,
     read_attribution_records_reads,
 };
+
+pub use crate::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
+
+pub mod workspace_authority;
+pub use workspace_authority::{
+    AuthorityInputs, WorkspaceAuthorityMemo, record_workspace_authority_read,
+};
+
+mod project_read_facade;

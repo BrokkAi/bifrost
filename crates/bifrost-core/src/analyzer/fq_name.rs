@@ -741,6 +741,17 @@ impl SegmentInterner {
     /// `debug_assert!`: interning is far off the per-node parsing hot path, and
     /// the corrupted state must not propagate in a release build either.
     pub fn intern(&self, text: &str, kind: SegmentKind) -> SegmentId {
+        let id = self.intern_id(text, kind);
+        let key = (text, kind);
+        debug_assert_eq!(
+            self.resolve_entry(id),
+            key,
+            "an intern hit must name the same input pair"
+        );
+        id
+    }
+
+    fn intern_id(&self, text: &str, kind: SegmentKind) -> SegmentId {
         assert!(
             !text.is_empty(),
             "a segment text must not be empty (kind={kind:?}); \
@@ -801,6 +812,11 @@ impl SegmentInterner {
     pub fn resolve(&self, id: SegmentId) -> (&'static str, SegmentKind) {
         #[cfg(any(test, feature = "test-support"))]
         counters::record_resolve();
+        self.resolve_entry(id)
+    }
+
+    // Validation reads the same published slots without changing test counters.
+    fn resolve_entry(&self, id: SegmentId) -> (&'static str, SegmentKind) {
         let shard_idx = (id.0 as usize) % SHARD_COUNT;
         let (chunk, offset) = entry_slot((id.0 as usize) / SHARD_COUNT);
         // Both `expect`s are unreachable for an id this interner issued: the

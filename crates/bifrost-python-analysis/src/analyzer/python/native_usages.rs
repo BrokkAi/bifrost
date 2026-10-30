@@ -56,35 +56,46 @@ impl GraphUsageAnalyzer for PythonNativeUsageStrategy {
         let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
         let generation = python.inner.project().analysis_generation();
         let targets = unique_targets(overloads);
-        let result = match open_python_native_request(python, cancellation) {
-            Ok(PythonNativeOpen::Ready(request)) => {
-                let files = python.analyzed_files().into_iter().collect();
-                let scope = UsageScanScope::with_cancellation(&files, cancellation);
-                let session = ResolutionSession::bounded(
-                    ReceiverAnalysisBudget::default(),
-                    Some(cancellation),
-                );
-                request
-                    .operation
-                    .python_reverse_targets(
-                        &request.environment,
-                        &targets,
-                        &scope,
-                        PythonReverseLimits::default(),
-                        &session,
-                    )
-                    .map_err(|error| {
-                        DIAGNOSTICS.failure(primary, "native_store_error", error.to_string())
-                    })
-            }
-            Ok(PythonNativeOpen::Cancelled) => Err(DIAGNOSTICS.cancelled(primary)),
-            Ok(PythonNativeOpen::Unavailable { kind, message }) => {
-                Err(DIAGNOSTICS.failure(primary, kind, message))
-            }
-            Err(error) => {
-                Err(DIAGNOSTICS.failure(primary, "native_store_error", error.to_string()))
-            }
-        };
+        let (result, reads) =
+            brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
+                match open_python_native_request(python, cancellation) {
+                    Ok(PythonNativeOpen::Ready(request)) => {
+                        let files = python.analyzed_files().into_iter().collect();
+                        let scope = UsageScanScope::with_cancellation(&files, cancellation);
+                        let session = ResolutionSession::bounded(
+                            ReceiverAnalysisBudget::default(),
+                            Some(cancellation),
+                        );
+                        request
+                            .operation
+                            .python_reverse_targets(
+                                &request.environment,
+                                &targets,
+                                &scope,
+                                PythonReverseLimits::default(),
+                                &session,
+                            )
+                            .map_err(|error| {
+                                Box::new(DIAGNOSTICS.failure(
+                                    primary,
+                                    "native_store_error",
+                                    error.to_string(),
+                                ))
+                            })
+                    }
+                    Ok(PythonNativeOpen::Cancelled) => {
+                        Err(Box::new(DIAGNOSTICS.cancelled(primary)))
+                    }
+                    Ok(PythonNativeOpen::Unavailable { kind, message }) => {
+                        Err(Box::new(DIAGNOSTICS.failure(primary, kind, message)))
+                    }
+                    Err(error) => Err(Box::new(DIAGNOSTICS.failure(
+                        primary,
+                        "native_store_error",
+                        error.to_string(),
+                    ))),
+                }
+            });
         let files = result
             .as_ref()
             .ok()
@@ -105,6 +116,7 @@ impl GraphUsageAnalyzer for PythonNativeUsageStrategy {
             targets,
             files,
             result: Mutex::new(Some(result)),
+            reads,
         }))
     }
 
@@ -220,7 +232,9 @@ struct PreparedPythonUsageQuery {
     generation: u64,
     targets: Vec<CodeUnit>,
     files: HashSet<ProjectFile>,
-    result: Mutex<Option<Result<PythonNativeReverseResult, GraphUsageOutcome>>>,
+    /// The failed outcome is boxed: it is far larger than the success value.
+    result: Mutex<Option<Result<PythonNativeReverseResult, Box<GraphUsageOutcome>>>>,
+    reads: std::sync::Arc<brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger>,
 }
 
 impl PreparedUsageQuery for PreparedPythonUsageQuery {
@@ -247,6 +261,11 @@ impl PreparedUsageQuery for PreparedPythonUsageQuery {
             self.generation,
             "the selected Python generation changed between prepare and find"
         );
+        debug_assert_eq!(
+            self.reads.digest(),
+            brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest(&self.reads.keys())
+        );
+        brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(analyzer, &self.reads);
         let result = self
             .result
             .lock()
@@ -257,7 +276,7 @@ impl PreparedUsageQuery for PreparedPythonUsageQuery {
             Ok(result) => {
                 project_usage_result(python, overloads, &self.targets, result, scope, max_usages)
             }
-            Err(outcome) => outcome,
+            Err(outcome) => *outcome,
         }
     }
 }

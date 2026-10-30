@@ -588,7 +588,7 @@ fn sliced_assertion_run(
         // units do not hold.
         subject_batch: None,
     };
-    let mut reuse = UnitReuse::new(policy, incremental, budget);
+    let mut reuse = UnitReuse::new(policy, incremental, budget, &context.flow_resources());
     let subject_units = {
         let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
             format!("policy.subject_query[{}]", policy.definition().metadata.id)
@@ -637,7 +637,7 @@ fn sliced_assertion_run(
         ));
     }
     attempt.enumerated(assert_keys.len());
-    reuse.prefetch(&assert_keys)?;
+    reuse.prefetch(&assert_keys, None)?;
 
     let mut totals = AssertionRunTotals::of_subject(&rows);
     let presentation = run.plan.presentation(policy);
@@ -2392,7 +2392,7 @@ fn sliced_relational_bindings(
         // Binding queries are not counted as batch consumers.
         subject_batch: None,
     };
-    let mut reuse = UnitReuse::new(policy, incremental, budget);
+    let mut reuse = UnitReuse::new(policy, incremental, budget, &context.flow_resources());
     let mut executed = Vec::with_capacity(queries.len());
     let mut keys = Vec::new();
     assert_eq!(

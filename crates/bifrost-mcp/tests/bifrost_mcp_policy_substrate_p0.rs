@@ -139,10 +139,11 @@ fn mcp_run_policy_reports_the_forbidden_transitive_effect() {
     );
 }
 
-/// The tree with an unresolved callee: `run_policy` abstains rather than
-/// returning a clean verdict, and it says which claim it could not make.
+/// The tree with an unresolved callee: the run abstains with an inconclusive
+/// completion rather than a complete one, and it says which claim it could not
+/// make. The inconclusive verdict is advisory (#8111), so the exit status is 0.
 #[test]
-fn mcp_run_policy_abstains_instead_of_reporting_a_clean_verdict() {
+fn mcp_run_policy_abstains_with_an_advisory_inconclusive_verdict() {
     let structured = run_policy_over(UNRELIABLE_APP);
     common::policy_report::assert_mcp_policy_abstains(&structured);
     let run = &structured["report"]["runs"][0];

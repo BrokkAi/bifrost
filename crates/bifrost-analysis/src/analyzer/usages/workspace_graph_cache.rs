@@ -181,7 +181,9 @@ pub enum WorkspaceUsageGraphCacheAcquisition {
 #[doc(hidden)]
 pub struct SnapshotWorkspaceUsageGraphCache {
     max_retained_bytes: u64,
-    values: CompleteValueCache<WorkspaceUsageGraphCacheKey, WorkspaceUsageRankingGraph>,
+    values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo<
+        CompleteValueCache<WorkspaceUsageGraphCacheKey, WorkspaceUsageRankingGraph>,
+    >,
     #[doc(hidden)]
     pub verdicts: ArtifactVerdictLog,
 }
@@ -190,13 +192,16 @@ impl SnapshotWorkspaceUsageGraphCache {
     pub(crate) fn new(max_retained_bytes: u64) -> Self {
         Self {
             max_retained_bytes,
-            values: CompleteValueCache::new(
-                max_retained_bytes,
-                |key: &WorkspaceUsageGraphCacheKey, graph: &Arc<WorkspaceUsageRankingGraph>| {
-                    key.retained_bytes()
-                        .saturating_add(graph.retained_bytes())
-                        .min(u32::MAX as usize) as u32
-                },
+            values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo::new(
+                crate::analyzer::WorkspaceFactFamily::WorkspaceUsageGraph,
+                CompleteValueCache::new(
+                    max_retained_bytes,
+                    |key: &WorkspaceUsageGraphCacheKey, graph: &Arc<WorkspaceUsageRankingGraph>| {
+                        key.retained_bytes()
+                            .saturating_add(graph.retained_bytes())
+                            .min(u32::MAX as usize) as u32
+                    },
+                ),
             ),
             verdicts: ArtifactVerdictLog::default(),
         }
@@ -231,12 +236,14 @@ impl SnapshotWorkspaceUsageGraphCache {
     #[doc(hidden)]
     pub fn acquire(
         &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
         key: WorkspaceUsageGraphCacheKey,
         cancellation: &CancellationToken,
         build: impl FnOnce() -> WorkspaceUsageGraphCacheBuildOutcome,
         content_is_current: impl Fn() -> bool,
     ) -> WorkspaceUsageGraphCacheAcquisition {
         match self.acquire_fallible(
+            analyzer,
             key,
             cancellation,
             || Ok::<_, std::convert::Infallible>(build()),
@@ -250,12 +257,33 @@ impl SnapshotWorkspaceUsageGraphCache {
     #[doc(hidden)]
     pub fn acquire_fallible<E>(
         &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
         key: WorkspaceUsageGraphCacheKey,
         cancellation: &CancellationToken,
         build: impl FnOnce() -> Result<WorkspaceUsageGraphCacheBuildOutcome, E>,
         content_is_current: impl Fn() -> bool,
     ) -> Result<WorkspaceUsageGraphCacheAcquisition, E> {
-        let (acquisition, wait) = self.values.acquire(&key, cancellation);
+        let languages = analyzer
+            .languages()
+            .into_iter()
+            .filter(|language| key.ecosystems.contains(&UsageEcosystem::of(*language)))
+            .collect::<Vec<_>>();
+        self.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(analyzer),
+            |values| self.acquire_value(values, key, cancellation, build, content_is_current),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&languages),
+        )
+    }
+
+    fn acquire_value<E>(
+        &self,
+        values: &CompleteValueCache<WorkspaceUsageGraphCacheKey, WorkspaceUsageRankingGraph>,
+        key: WorkspaceUsageGraphCacheKey,
+        cancellation: &CancellationToken,
+        build: impl FnOnce() -> Result<WorkspaceUsageGraphCacheBuildOutcome, E>,
+        content_is_current: impl Fn() -> bool,
+    ) -> Result<WorkspaceUsageGraphCacheAcquisition, E> {
+        let (acquisition, wait) = values.acquire(&key, cancellation);
         Ok(match acquisition {
             CompleteValueAcquisition::Cached { value } => {
                 if content_is_current() {
@@ -331,13 +359,25 @@ impl SnapshotWorkspaceUsageGraphCache {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn len_for_test(&self) -> u64 {
-        self.values.len_for_test()
+        self.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(
+                &crate::analyzer::MultiAnalyzer::default(),
+            ),
+            |values| values.len_for_test(),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn waiting_count_for_test(&self) -> usize {
-        self.values.waiting_count_for_test()
+        self.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(
+                &crate::analyzer::MultiAnalyzer::default(),
+            ),
+            |values| values.waiting_count_for_test(),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
+        )
     }
 }
 

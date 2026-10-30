@@ -209,13 +209,13 @@ pub mod jvm_extraction_tests {
         let semantic = SemanticId::local(source.get(), token);
         begin_production_selected_sql_trace_on_connection(connection);
         let first = operation
-            .jvm_import_token_metadata(blob, source, semantic, &cancellation)
+            .import_token_metadata(blob, source, semantic, &cancellation)
             .unwrap()
             .unwrap();
         assert!(Arc::ptr_eq(
             &first,
             &operation
-                .jvm_import_token_metadata(blob, source, semantic, &cancellation)
+                .import_token_metadata(blob, source, semantic, &cancellation)
                 .unwrap()
                 .unwrap()
         ));
@@ -229,7 +229,7 @@ pub mod jvm_extraction_tests {
         }).unwrap();
         begin_production_selected_sql_trace_on_connection(connection);
         let staged = operation
-            .jvm_import_token_metadata(blob, source, semantic, &cancellation)
+            .import_token_metadata(blob, source, semantic, &cancellation)
             .unwrap()
             .unwrap();
         let cost = finish_production_selected_sql_trace_on_connection(connection);
@@ -270,13 +270,13 @@ pub mod jvm_extraction_tests {
         let absent = SemanticId::local(source.get(), u32::MAX);
         begin_production_selected_sql_trace_on_connection(connection);
         let empty = operation
-            .jvm_import_token_metadata(blob, source, absent, &cancellation)
+            .import_token_metadata(blob, source, absent, &cancellation)
             .unwrap()
             .unwrap();
         assert!(Arc::ptr_eq(
             &empty,
             &operation
-                .jvm_import_token_metadata(blob, source, absent, &cancellation)
+                .import_token_metadata(blob, source, absent, &cancellation)
                 .unwrap()
                 .unwrap()
         ));
@@ -288,7 +288,7 @@ pub mod jvm_extraction_tests {
         assert!(!Arc::ptr_eq(
             &staged,
             &operation
-                .jvm_import_token_metadata(blob, source, semantic, &cancellation)
+                .import_token_metadata(blob, source, semantic, &cancellation)
                 .unwrap()
                 .unwrap()
         ));
@@ -527,6 +527,7 @@ pub mod jvm_extraction_tests {
         // A staged member alone, with no staged path or gap, must keep its host
         // in the uncertainty inventory independently of the requested names.
         let SelectedPackageRows::Ready(members) = operation
+            .ready
             .selected_package_members_by_lookup(other, &cancellation)
             .unwrap()
         else {
@@ -1495,6 +1496,7 @@ pub mod jvm_extraction_tests {
                 .unwrap()
                 .unwrap();
             let SelectedPackageRows::Ready(references) = operation
+                .ready
                 .selected_package_references(caller.ordinal(), &cancellation)
                 .unwrap()
             else {
@@ -1522,6 +1524,7 @@ pub mod jvm_extraction_tests {
                     .all(|candidate| candidate.token == reference.token)
             );
             let SelectedPackageRows::Ready(members) = operation
+                .ready
                 .selected_package_members_for_lookup(
                     target.ordinal(),
                     reference.lookup,
@@ -1547,6 +1550,7 @@ pub mod jvm_extraction_tests {
             let mut all_members = BTreeSet::new();
             for reference in &references {
                 let SelectedPackageRows::Ready(rows) = operation
+                    .ready
                     .selected_package_members_for_lookup(
                         target.ordinal(),
                         reference.lookup,
@@ -1579,6 +1583,7 @@ pub mod jvm_extraction_tests {
             Ok(())
         }).unwrap();
             let SelectedPackageRows::Ready(staged_references) = operation
+                .ready
                 .selected_package_references(caller.ordinal(), &cancellation)
                 .unwrap()
             else {
@@ -1586,6 +1591,7 @@ pub mod jvm_extraction_tests {
             };
             assert_eq!(staged_references, references);
             let SelectedPackageRows::Ready(staged_members) = operation
+                .ready
                 .selected_package_members_for_lookup(
                     target.ordinal(),
                     reference.lookup,
@@ -1639,6 +1645,7 @@ pub mod jvm_extraction_tests {
             Ok(())
         }).unwrap();
             let SelectedPackageRows::Ready(old_name) = operation
+                .ready
                 .selected_package_members_for_lookup(
                     target.ordinal(),
                     reference.lookup,
@@ -1653,6 +1660,7 @@ pub mod jvm_extraction_tests {
                 "stage rename must withdraw ordinary lookup: {old_name:?}"
             );
             let SelectedPackageRows::Ready(new_name) = operation
+                .ready
                 .selected_package_members_for_lookup(target.ordinal(), replacement, &cancellation)
                 .unwrap()
             else {
@@ -1666,12 +1674,14 @@ pub mod jvm_extraction_tests {
             cancellation.cancel();
             assert!(matches!(
                 operation
+                    .ready
                     .selected_package_references(caller.ordinal(), &cancellation)
                     .unwrap(),
                 SelectedPackageRows::Cancelled
             ));
             assert!(matches!(
                 operation
+                    .ready
                     .selected_package_members_for_lookup(
                         target.ordinal(),
                         reference.lookup,

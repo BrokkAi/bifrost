@@ -313,7 +313,9 @@ impl AtomicJavaUsageEvidenceCacheStats {
 /// Snapshot-owned complete Java evidence with cancellation-aware single-flight.
 pub struct SnapshotJavaUsageEvidenceCache {
     max_retained_bytes: u64,
-    values: CompleteValueCache<JavaUsageEvidenceCacheKey, JavaFileUsageEvidence>,
+    values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo<
+        CompleteValueCache<JavaUsageEvidenceCacheKey, JavaFileUsageEvidence>,
+    >,
     stats: AtomicJavaUsageEvidenceCacheStats,
 }
 
@@ -321,11 +323,14 @@ impl SnapshotJavaUsageEvidenceCache {
     pub(crate) fn new(max_retained_bytes: u64) -> Self {
         Self {
             max_retained_bytes,
-            values: CompleteValueCache::new(
-                max_retained_bytes,
-                |key: &JavaUsageEvidenceCacheKey, evidence: &Arc<JavaFileUsageEvidence>| {
-                    retained_bytes(key, evidence).clamp(1, u32::MAX as u64) as u32
-                },
+            values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo::new(
+                crate::analyzer::WorkspaceFactFamily::JavaUsageEvidence,
+                CompleteValueCache::new(
+                    max_retained_bytes,
+                    |key: &JavaUsageEvidenceCacheKey, evidence: &Arc<JavaFileUsageEvidence>| {
+                        retained_bytes(key, evidence).clamp(1, u32::MAX as u64) as u32
+                    },
+                ),
             ),
             stats: AtomicJavaUsageEvidenceCacheStats::default(),
         }
@@ -340,12 +345,29 @@ impl SnapshotJavaUsageEvidenceCache {
     /// omitted and cancelled outcomes are deliberately uncached.
     pub fn acquire(
         &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
         key: JavaUsageEvidenceCacheKey,
         cancellation: &CancellationToken,
         build: impl FnOnce() -> JavaUsageEvidenceBuildOutcome,
         content_is_current: impl Fn() -> bool,
     ) -> JavaUsageEvidenceCacheAcquisition {
-        let (acquisition, wait) = self.values.acquire(&key, cancellation);
+        let languages = analyzer.languages().into_iter().collect::<Vec<_>>();
+        self.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(analyzer),
+            |values| self.acquire_value(values, key, cancellation, build, content_is_current),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&languages),
+        )
+    }
+
+    fn acquire_value(
+        &self,
+        values: &CompleteValueCache<JavaUsageEvidenceCacheKey, JavaFileUsageEvidence>,
+        key: JavaUsageEvidenceCacheKey,
+        cancellation: &CancellationToken,
+        build: impl FnOnce() -> JavaUsageEvidenceBuildOutcome,
+        content_is_current: impl Fn() -> bool,
+    ) -> JavaUsageEvidenceCacheAcquisition {
+        let (acquisition, wait) = values.acquire(&key, cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
                 if !content_is_current() {
@@ -428,12 +450,24 @@ impl SnapshotJavaUsageEvidenceCache {
 
     #[cfg(test)]
     pub(crate) fn len_for_test(&self) -> u64 {
-        self.values.len_for_test()
+        self.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(
+                &crate::analyzer::MultiAnalyzer::default(),
+            ),
+            |values| values.len_for_test(),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn waiting_count_for_test(&self) -> usize {
-        self.values.waiting_count_for_test()
+        self.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(
+                &crate::analyzer::MultiAnalyzer::default(),
+            ),
+            |values| values.waiting_count_for_test(),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
+        )
     }
 }
 
@@ -515,7 +549,13 @@ mod tests {
         let cache = Arc::new(SnapshotJavaUsageEvidenceCache::new(1024 * 1024));
         let cancellation = CancellationToken::default();
         let key = key(1);
-        let (leader, _) = cache.values.acquire(&key, &cancellation);
+        let (leader, _) = cache.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(
+                &crate::analyzer::MultiAnalyzer::default(),
+            ),
+            |values| values.acquire(&key, &cancellation),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
+        );
         let CompleteValueAcquisition::Leader { permit } = leader else {
             panic!("first exact key must lead")
         };
@@ -524,6 +564,7 @@ mod tests {
         let follower_key = key.clone();
         let follower = thread::spawn(move || {
             follower_cache.acquire(
+                &crate::analyzer::MultiAnalyzer::default(),
                 follower_key,
                 &CancellationToken::default(),
                 || panic!("follower must not build"),
@@ -576,6 +617,7 @@ mod tests {
         ];
         for (index, key) in keys.into_iter().enumerate() {
             let (_, lifecycle) = ready(cache.acquire(
+                &crate::analyzer::MultiAnalyzer::default(),
                 key,
                 &cancellation,
                 || {
@@ -595,6 +637,7 @@ mod tests {
         let cache = SnapshotJavaUsageEvidenceCache::new(1024 * 1024);
         let cancellation = CancellationToken::default();
         let cancelled = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || JavaUsageEvidenceBuildOutcome::Cancelled,
@@ -619,6 +662,7 @@ mod tests {
         ];
         for (index, reason) in omissions.into_iter().enumerate() {
             let omitted = cache.acquire(
+                &crate::analyzer::MultiAnalyzer::default(),
                 key(index as u64 + 2),
                 &cancellation,
                 || JavaUsageEvidenceBuildOutcome::Omitted(reason),
@@ -638,6 +682,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         let current = AtomicBool::new(false);
         let stale = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || JavaUsageEvidenceBuildOutcome::Complete(evidence(1)),
@@ -648,6 +693,7 @@ mod tests {
 
         current.store(true, Ordering::SeqCst);
         let (_, lifecycle) = ready(cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || JavaUsageEvidenceBuildOutcome::Complete(evidence(2)),
@@ -662,6 +708,7 @@ mod tests {
         let cache = SnapshotJavaUsageEvidenceCache::new(1);
         let cancellation = CancellationToken::default();
         let first = ready(cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || JavaUsageEvidenceBuildOutcome::Complete(evidence(1)),
@@ -671,6 +718,7 @@ mod tests {
         assert_eq!(0, cache.len_for_test());
 
         let second = ready(cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || JavaUsageEvidenceBuildOutcome::Complete(evidence(2)),
@@ -688,7 +736,13 @@ mod tests {
         let cache = Arc::new(SnapshotJavaUsageEvidenceCache::new(1024 * 1024));
         let cancellation = CancellationToken::default();
         let key = key(1);
-        let (acquisition, _) = cache.values.acquire(&key, &cancellation);
+        let (acquisition, _) = cache.values.read(
+            &crate::analyzer::workspace_authority::memo_attribution(
+                &crate::analyzer::MultiAnalyzer::default(),
+            ),
+            |values| values.acquire(&key, &cancellation),
+            |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
+        );
         let CompleteValueAcquisition::Leader { permit } = acquisition else {
             panic!("first exact key must lead")
         };
@@ -699,6 +753,7 @@ mod tests {
         let follower_key = key.clone();
         let follower = thread::spawn(move || {
             follower_cache.acquire(
+                &crate::analyzer::MultiAnalyzer::default(),
                 follower_key,
                 &follower_cancel,
                 || panic!("cancelled follower must not build"),
@@ -715,6 +770,7 @@ mod tests {
         let built = Arc::new(evidence(1));
         permit.publish_complete(Arc::clone(&built));
         let (received, lifecycle) = ready(cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key,
             &cancellation,
             || panic!("published leader must be ready"),
@@ -730,6 +786,7 @@ mod tests {
         let key = key(1);
         let cancellation = CancellationToken::default();
         let (_, lifecycle) = ready(caches.java_usage_evidence().acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key.clone(),
             &cancellation,
             || JavaUsageEvidenceBuildOutcome::Complete(evidence(1)),
@@ -739,6 +796,7 @@ mod tests {
 
         let carried = caches.carry_content_keyed_values_forward();
         let (reused, lifecycle) = ready(carried.java_usage_evidence().acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             key,
             &cancellation,
             || panic!("carried cache must hit"),

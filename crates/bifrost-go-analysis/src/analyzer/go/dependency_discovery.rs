@@ -665,6 +665,8 @@ fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, 
     let build_configuration = host_build_configuration(config);
     let mut env = reviewed_host_environment(|name| std::env::var_os(name));
     env.extend([
+        // #7002: belt-and-braces against git credential prompts; downloads and VCS stamping are already disabled.
+        os_env("GIT_TERMINAL_PROMPT", "0"),
         os_env("GOTOOLCHAIN", "local"),
         os_env("GOPROXY", "off"),
         os_env("GOSUMDB", "off"),
@@ -2037,6 +2039,7 @@ mod tests {
                 .any(|arg| arg == "-tags=integration,safe")
         );
         let env: BTreeMap<_, _> = invocations[1].env.iter().cloned().collect();
+        assert_eq!(env.get(OsStr::new("GIT_TERMINAL_PROMPT")).unwrap(), "0");
         assert_eq!(env.get(OsStr::new("GOTOOLCHAIN")).unwrap(), "local");
         assert_eq!(env.get(OsStr::new("GOPROXY")).unwrap(), "off");
         assert_eq!(env.get(OsStr::new("GOSUMDB")).unwrap(), "off");

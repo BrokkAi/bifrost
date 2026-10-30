@@ -96,7 +96,7 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
     /// The top-level declarations each Kotlin package exports, built once per
     /// analyzer generation. The uncached build is
     /// [`crate::kotlin::imports::build_kotlin_top_level_declarations_by_package`].
-    fn top_level_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>>;
+    fn top_level_declarations_by_package(&self) -> Arc<HashMap<String, Arc<Vec<CodeUnit>>>>;
 
     /// Whether the shared JVM dependency index holds nothing. See this module's
     /// note: the index behind it stays in `brokk-bifrost-analysis`.

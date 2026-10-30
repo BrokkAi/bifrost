@@ -3256,6 +3256,12 @@ func localAlias(t *Local) {
     t.Fatal("alias")
 }
 
+type Defined testing.T
+
+func definedType(t *Defined) {
+    t.Fatal("defined")
+}
+
 func methodExpression(t *testing.T) {
     (*testing.T).Fatal(t, "expression")
 }
@@ -3278,7 +3284,7 @@ func methodExpression(t *testing.T) {
             .structural_facts(&file)
             .expect("Go structural facts");
         let shapes = call_shapes_in_file(&facts, &file, usize::MAX);
-        assert_eq!(shapes.len(), 4, "fixture contains four calls: {shapes:#?}");
+        assert_eq!(shapes.len(), 5, "fixture contains five calls: {shapes:#?}");
         let source: Arc<str> = Arc::from(source);
         let lookups = shapes
             .iter()
@@ -3302,38 +3308,49 @@ func methodExpression(t *testing.T) {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let exact = &lookups["t.Fatal(\"concrete\")"];
-        assert_eq!(exact.coverage, ModeledCallTargetCoverage::Exhaustive);
-        assert_eq!(
-            exact.call_application,
-            ModeledCallApplication::BoundReceiver
-        );
-        let [arm] = exact.arms.as_slice() else {
-            panic!("one exact concrete-receiver arm: {exact:#?}");
-        };
-        assert_eq!(arm.key.language, "go");
-        assert_eq!(arm.key.owner, "testing.T");
-        assert_eq!(arm.key.member, "Fatal");
-        assert!(arm.key.has_receiver);
-        assert_eq!(arm.key.parameter_count, 1);
-        assert_eq!(arm.origin, ModeledCallTargetOrigin::UnmaterializedExternal);
         let snapshot = workspace
             .analyzer()
             .active_semantic_model_snapshot()
             .expect("activation publishes one atomic model snapshot");
-        assert!(snapshot.active_models().proves_normal_continuation_absent(
-            ProcedureSummaryMemberKey::new(
-                &arm.key.language,
-                &arm.key.owner,
-                &arm.key.member,
-                arm.key.has_receiver,
-                arm.key.parameter_count,
-            )
-        ));
+        // `type Local = testing.T` is an alias, so `*Local` is the identical
+        // type `*testing.T` and its call binds exactly like the spelled one.
+        for call in ["t.Fatal(\"concrete\")", "t.Fatal(\"alias\")"] {
+            let exact = &lookups[call];
+            assert_eq!(
+                exact.coverage,
+                ModeledCallTargetCoverage::Exhaustive,
+                "{call}: {exact:#?}"
+            );
+            assert_eq!(
+                exact.call_application,
+                ModeledCallApplication::BoundReceiver,
+                "{call}: {exact:#?}"
+            );
+            let [arm] = exact.arms.as_slice() else {
+                panic!("one exact concrete-receiver arm: {call}: {exact:#?}");
+            };
+            assert_eq!(arm.key.language, "go");
+            assert_eq!(arm.key.owner, "testing.T");
+            assert_eq!(arm.key.member, "Fatal");
+            assert!(arm.key.has_receiver);
+            assert_eq!(arm.key.parameter_count, 1);
+            assert_eq!(arm.origin, ModeledCallTargetOrigin::UnmaterializedExternal);
+            assert!(snapshot.active_models().proves_normal_continuation_absent(
+                ProcedureSummaryMemberKey::new(
+                    &arm.key.language,
+                    &arm.key.owner,
+                    &arm.key.member,
+                    arm.key.has_receiver,
+                    arm.key.parameter_count,
+                )
+            ));
+        }
 
+        // `type Defined testing.T` is a distinct type without T's methods;
+        // its `Fatal` is promoted from the unmodeled `testing.common`.
         for call in [
             "t.Fatal(\"interface\")",
-            "t.Fatal(\"alias\")",
+            "t.Fatal(\"defined\")",
             "(*testing.T).Fatal(t, \"expression\")",
         ] {
             let lookup = &lookups[call];

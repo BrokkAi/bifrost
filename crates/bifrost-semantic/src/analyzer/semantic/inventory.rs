@@ -145,8 +145,14 @@ pub struct ProcedureEnumerationFrame<'tree> {
     pub declaration_path: usize,
 }
 
+/// Baseline context inherited by every child, with optional body-specific overrides.
+/// A matching callable body overrides both the baseline and container body scope.
 #[doc(hidden)]
 pub struct ProcedureWalkScopes {
+    #[doc(hidden)]
+    pub child_lexical_parent: Option<ProcedureId>,
+    #[doc(hidden)]
+    pub child_declaration_path: usize,
     #[doc(hidden)]
     pub container_body: Option<(usize, usize)>,
     #[doc(hidden)]
@@ -160,6 +166,7 @@ pub enum ProcedureWalkStep<T> {
         scopes: ProcedureWalkScopes,
     },
     ExceededBudget(ProcedureInventoryStop),
+    Cancelled,
 }
 
 #[doc(hidden)]
@@ -411,11 +418,14 @@ pub fn walk_procedure_tree<'tree, T>(
     }];
 
     while let Some(frame) = stack.pop() {
-        if cancellation.is_cancelled() {
-            return Ok(ProcedureTreeWalkOutcome::Cancelled);
-        }
-        if let Err(stop) = inventory.charge_traversal_entry() {
-            return Ok(ProcedureTreeWalkOutcome::ExceededBudget(stop));
+        match charge_prepass(inventory, cancellation) {
+            Ok(()) => {}
+            Err(ProcedureInventoryPrepassStop::Budget(stop)) => {
+                return Ok(ProcedureTreeWalkOutcome::ExceededBudget(stop));
+            }
+            Err(ProcedureInventoryPrepassStop::Cancelled) => {
+                return Ok(ProcedureTreeWalkOutcome::Cancelled);
+            }
         }
         let scopes = match visit(frame, inventory)? {
             ProcedureWalkStep::Continue { value, scopes } => {
@@ -427,9 +437,10 @@ pub fn walk_procedure_tree<'tree, T>(
             ProcedureWalkStep::ExceededBudget(stop) => {
                 return Ok(ProcedureTreeWalkOutcome::ExceededBudget(stop));
             }
+            ProcedureWalkStep::Cancelled => return Ok(ProcedureTreeWalkOutcome::Cancelled),
         };
 
-        let child_path = frame.declaration_path;
+        let child_path = scopes.child_declaration_path;
         for child in children_of(frame.node).into_iter().rev() {
             let child_path = scopes
                 .container_body
@@ -440,7 +451,7 @@ pub fn walk_procedure_tree<'tree, T>(
                 .callable_body
                 .filter(|(body_id, _, _)| *body_id == child.id())
                 .map(|(_, procedure, path)| (Some(procedure), path))
-                .unwrap_or((frame.lexical_parent, child_path));
+                .unwrap_or((scopes.child_lexical_parent, child_path));
             stack.push(ProcedureEnumerationFrame {
                 node: child,
                 lexical_parent,

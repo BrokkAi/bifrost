@@ -1,0 +1,35 @@
+{
+  "warn_fraction": 0.9,
+  "rules": [
+    {
+      "registry": "crates.io",
+      "pattern": "\\.crate$",
+      "limit_bytes": 10485760,
+      "source": "crates.io's default max_upload_size of 10 MiB per .crate; no Bifrost crate has a raised limit. v0.14.3's largest, brokk-bifrost-store, was 3251619 bytes."
+    },
+    {
+      "registry": "PyPI brokk-bifrost-searchtools",
+      "pattern": "^brokk_bifrost_searchtools-.*\\.(whl|tar\\.gz)$",
+      "limit_bytes": 104857600,
+      "source": "PyPI's default per-file limit of 100 MiB. v0.14.2's manylinux aarch64 wheel (104698118 bytes) uploaded; v0.14.3's was refused with 400 File too large (release run 40897040195)."
+    },
+    {
+      "registry": "PyPI brokk-bifrost",
+      "pattern": "^brokk_bifrost-.*\\.whl$",
+      "limit_bytes": 104857600,
+      "source": "PyPI's default per-file limit of 100 MiB; the project has no raised limit."
+    },
+    {
+      "registry": "npm",
+      "pattern": "^(brokkai-bifrost-|brokkai-dsh-plugin-bifrost-).*\\.tgz$",
+      "limit_bytes": 200000000,
+      "source": "npm publishes no exact tarball limit. @brokkai/bifrost-darwin-universal@0.14.2 (199943577 bytes) published; 0.14.3 (205.5 MB) was refused with 413 Payload Too Large (release run 40897040195). This is the largest size known to pass, rounded up to 200 MB."
+    },
+    {
+      "registry": "GitHub release",
+      "pattern": "^(bifrost-v.*\\.(tar\\.gz|zip)|bifrost-semantic-pack-v.*\\.tar\\.gz|bifrost-agent-.*\\.tar\\.gz|brokk-bifrost-agent-.*\\.tgz)(\\.sha256)?$",
+      "limit_bytes": 2147483648,
+      "source": "GitHub's 2 GiB limit per release asset."
+    }
+  ]
+}

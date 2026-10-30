@@ -26,6 +26,7 @@ use crate::graph::syntax::{
 };
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
+use brokk_bifrost_core::analyzer::memo_attribution::CaptureScopedMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as node_is_within;
@@ -106,13 +107,14 @@ pub struct ScanCtx<'a> {
     pub max_usages: usize,
     pub external_hit_count: usize,
     pub limit_exceeded: &'a mut bool,
-    pub enclosing_cache: RefCell<HashMap<(usize, usize), EnclosingContext>>,
-    pub enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
+    pub enclosing_cache: CaptureScopedMemo<RefCell<HashMap<(usize, usize), EnclosingContext>>>,
+    pub enclosing_owner_cache: CaptureScopedMemo<RefCell<HashMap<CodeUnit, Option<CodeUnit>>>>,
     lexical_scope_cache: LexicalScopeCache,
-    lexical_free_function_cache: RefCell<HashMap<(String, String), bool>>,
-    member_owner_cache: RefCell<HashMap<CodeUnit, EnclosingMemberOwnerResolution>>,
-    global_field_internal_linkage_cache: RefCell<HashMap<CodeUnit, bool>>,
-    receiver_canonical_type_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
+    lexical_free_function_cache: CaptureScopedMemo<RefCell<HashMap<(String, String), bool>>>,
+    member_owner_cache:
+        CaptureScopedMemo<RefCell<HashMap<CodeUnit, EnclosingMemberOwnerResolution>>>,
+    global_field_internal_linkage_cache: CaptureScopedMemo<RefCell<HashMap<CodeUnit, bool>>>,
+    receiver_canonical_type_cache: CaptureScopedMemo<RefCell<HashMap<CodeUnit, Option<CodeUnit>>>>,
 }
 
 impl ScanCtx<'_> {
@@ -268,13 +270,15 @@ pub fn scan_prepared_file(
         max_usages: state.max_usages,
         external_hit_count,
         limit_exceeded: state.limit_exceeded,
-        enclosing_cache: RefCell::new(HashMap::default()),
-        enclosing_owner_cache: RefCell::new(HashMap::default()),
+        enclosing_cache: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
+        enclosing_owner_cache: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
         lexical_scope_cache: LexicalScopeCache::new(visibility, file),
-        lexical_free_function_cache: RefCell::new(HashMap::default()),
-        member_owner_cache: RefCell::new(HashMap::default()),
-        global_field_internal_linkage_cache: RefCell::new(HashMap::default()),
-        receiver_canonical_type_cache: RefCell::new(HashMap::default()),
+        lexical_free_function_cache: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
+        member_owner_cache: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
+        global_field_internal_linkage_cache: CaptureScopedMemo::new(RefCell::new(
+            HashMap::default(),
+        )),
+        receiver_canonical_type_cache: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
     };
     if needs_using_enum_member_resolution {
         collect_semantic_using_enums(prepared.tree().root_node(), &mut ctx);
@@ -7874,7 +7878,12 @@ fn resolves_to_lexical_free_function(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool 
     let name = node_text(node, ctx.source);
     let namespace = enclosing_namespace_components(node, ctx.source).join(".");
     let key = (namespace.clone(), name.to_string());
-    if let Some(resolved) = ctx.lexical_free_function_cache.borrow().get(&key).copied() {
+    if let Some(resolved) = ctx
+        .lexical_free_function_cache
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells.borrow().get(&key).copied()
+        })
+    {
         return resolved;
     }
     let resolved = ctx
@@ -7886,8 +7895,9 @@ fn resolves_to_lexical_free_function(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool 
                 && unit.package_name() == namespace
         });
     ctx.lexical_free_function_cache
-        .borrow_mut()
-        .insert(key, resolved);
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells.borrow_mut().insert(key, resolved)
+        });
     resolved
 }
 
@@ -8373,11 +8383,16 @@ fn bare_global_field_uniquely_resolves_to_target(text: &str, ctx: &ScanCtx<'_>) 
         if !name_matches_terminal(cpp_name_for(unit).as_str(), text) {
             continue;
         }
-        if same_visible_global_field_symbol(
-            &ctx.analyzer,
-            &mut ctx.global_field_internal_linkage_cache.borrow_mut(),
-            unit,
-            &ctx.spec.target,
+        if ctx.global_field_internal_linkage_cache.read(
+            &ctx.visibility.reads.memo_attribution(),
+            |cells| {
+                same_visible_global_field_symbol(
+                    &ctx.analyzer,
+                    &mut cells.borrow_mut(),
+                    unit,
+                    &ctx.spec.target,
+                )
+            },
         ) {
             matched_target = true;
         } else {
@@ -8419,11 +8434,16 @@ fn global_field_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 has_persisted_global_field_identity(unit)
                     && unit.identifier() == ctx.spec.member_name
                     && cpp_namespace_for(unit).as_deref() == Some(namespace.as_str())
-                    && !same_visible_global_field_symbol(
-                        &ctx.analyzer,
-                        &mut ctx.global_field_internal_linkage_cache.borrow_mut(),
-                        unit,
-                        &ctx.spec.target,
+                    && !ctx.global_field_internal_linkage_cache.read(
+                        &ctx.visibility.reads.memo_attribution(),
+                        |cells| {
+                            same_visible_global_field_symbol(
+                                &ctx.analyzer,
+                                &mut cells.borrow_mut(),
+                                unit,
+                                &ctx.spec.target,
+                            )
+                        },
                     )
             })
 }
@@ -8944,11 +8964,16 @@ fn receiver_type_units_with_budget(
                 }
                 if let Some(first) = global_fields.first()
                     && global_fields.iter().skip(1).any(|field| {
-                        !same_visible_global_field_symbol(
-                            &ctx.analyzer,
-                            &mut ctx.global_field_internal_linkage_cache.borrow_mut(),
-                            first,
-                            field,
+                        !ctx.global_field_internal_linkage_cache.read(
+                            &ctx.visibility.reads.memo_attribution(),
+                            |cells| {
+                                same_visible_global_field_symbol(
+                                    &ctx.analyzer,
+                                    &mut cells.borrow_mut(),
+                                    first,
+                                    field,
+                                )
+                            },
                         )
                     })
                 {
@@ -9410,15 +9435,21 @@ fn canonical_receiver_units(units: Vec<CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<Code
 }
 
 fn canonical_receiver_unit(unit: &CodeUnit, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
-    if let Some(cached) = ctx.receiver_canonical_type_cache.borrow().get(unit) {
-        return cached.clone();
+    if let Some(cached) = ctx
+        .receiver_canonical_type_cache
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells.borrow().get(unit).cloned()
+        })
+    {
+        return cached;
     }
     let canonical = ctx
         .visibility
         .canonical_visible_full_type_unit(&ctx.analyzer, ctx.file, unit);
     ctx.receiver_canonical_type_cache
-        .borrow_mut()
-        .insert(unit.clone(), canonical.clone());
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells.borrow_mut().insert(unit.clone(), canonical.clone())
+        });
     canonical
 }
 
@@ -10008,15 +10039,17 @@ pub enum LexicalScopeResolution {
 /// One scan's memo of lexical scope reconstructions for one file, keyed by
 /// the reconstruction's anchor range and flags, with the file's recovered
 /// namespace regions that the key and the reconstruction both read.
+type LexicalScopeResolutions = HashMap<(usize, usize, bool, bool), LexicalScopeResolution>;
+
 pub struct LexicalScopeCache {
-    resolutions: RefCell<HashMap<(usize, usize, bool, bool), LexicalScopeResolution>>,
+    resolutions: CaptureScopedMemo<RefCell<LexicalScopeResolutions>>,
     orphaned: Arc<OrphanedNamespaceScopeIndex>,
 }
 
 impl LexicalScopeCache {
     fn new(visibility: &VisibilityIndex<'_>, file: &ProjectFile) -> Self {
         Self {
-            resolutions: RefCell::new(HashMap::default()),
+            resolutions: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
             orphaned: orphaned_namespace_scopes(visibility, file),
         }
     }
@@ -10241,7 +10274,12 @@ fn cached_enclosing_lexical_scope_components_with_unresolved_owner(
         allow_structured_unresolved_owner,
         ignore_function_owner,
     );
-    if let Some(cached) = cache.resolutions.borrow().get(&key).cloned() {
+    if let Some(cached) = cache
+        .resolutions
+        .read(&visibility.reads.memo_attribution(), |cells| {
+            cells.borrow().get(&key).cloned()
+        })
+    {
         return cached;
     }
     let resolved = enclosing_lexical_scope_components_with_unresolved_owner(
@@ -10254,7 +10292,11 @@ fn cached_enclosing_lexical_scope_components_with_unresolved_owner(
         ignore_function_owner,
         orphaned,
     );
-    cache.resolutions.borrow_mut().insert(key, resolved.clone());
+    cache
+        .resolutions
+        .read(&visibility.reads.memo_attribution(), |cells| {
+            cells.borrow_mut().insert(key, resolved.clone())
+        });
     resolved
 }
 
@@ -11960,7 +12002,7 @@ fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIn
     project
 }
 
-fn project_using_index<'a>(visibility: &'a VisibilityIndex<'_>) -> &'a ProjectUsingIndex {
+fn project_using_index(visibility: &VisibilityIndex<'_>) -> Arc<ProjectUsingIndex> {
     visibility.project_using_index(|| build_project_using_index(visibility))
 }
 
@@ -12172,7 +12214,8 @@ pub fn effective_using_bindings_for_name(
     imports
         .projection_cell(name)
         .get_or_init(|| {
-            let project = project_using_index(visibility);
+            let retained_project = project_using_index(visibility);
+            let project = retained_project.as_ref();
             let name_bindings = project.ordinary_by_name.get(name);
             if name_bindings.is_none() && project.directives.is_empty() {
                 return Arc::from(Vec::new());
@@ -13740,7 +13783,12 @@ fn cached_declaring_member_owner(
     receiver_owner: &CodeUnit,
     ctx: &ScanCtx<'_>,
 ) -> EnclosingMemberOwnerResolution {
-    if let Some(cached) = ctx.member_owner_cache.borrow().get(receiver_owner).cloned() {
+    if let Some(cached) = ctx
+        .member_owner_cache
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells.borrow().get(receiver_owner).cloned()
+        })
+    {
         return cached;
     }
     let resolved = resolve_declaring_member_owner(
@@ -13756,8 +13804,11 @@ fn cached_declaring_member_owner(
         resolved
     };
     ctx.member_owner_cache
-        .borrow_mut()
-        .insert(receiver_owner.clone(), resolved.clone());
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells
+                .borrow_mut()
+                .insert(receiver_owner.clone(), resolved.clone())
+        });
     resolved
 }
 

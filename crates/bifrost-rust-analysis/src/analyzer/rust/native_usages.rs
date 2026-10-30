@@ -430,27 +430,29 @@ impl NativeUsageProjection for RustUsageProjection<'_, '_> {
         file: &ProjectFile,
         _pending: &[NativeUsageSite],
     ) -> Result<NativeUsageFile<Self::Context>, Self::Error> {
-        let source = self.rust.indexed_source(file).ok_or_else(|| {
-            brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
-                "selected usage source is unavailable for {file}"
-            ))
-        })?;
-        #[cfg(test)]
-        if _pending
-            .iter()
-            .any(|hit| hit.origin == NativeUsageOrigin::ReferenceEdge)
-        {
-            self.snippet_sources.push(file.clone());
-        }
-        if !self
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::SelectedNativeSourceError;
+        let source = self
             .rust
             .inner
-            .source_matches_selected_native_content(file, &source)
-        {
-            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                format!("selected usage source changed for {file}"),
-            ));
-        }
+            .selected_native_usage_source(file, || {
+                #[cfg(test)]
+                if _pending
+                    .iter()
+                    .any(|hit| hit.origin == NativeUsageOrigin::ReferenceEdge)
+                {
+                    self.snippet_sources.push(file.clone());
+                }
+            })
+            .map_err(|error| {
+                brokk_bifrost_analysis::analyzer::store::StoreError::new(match error {
+                    SelectedNativeSourceError::Unavailable => {
+                        format!("selected usage source is unavailable for {file}")
+                    }
+                    SelectedNativeSourceError::Stale => {
+                        format!("selected usage source changed for {file}")
+                    }
+                })
+            })?;
         let prepared = self
             .rust
             .prepared_syntax(self.syntax_scope.token(), file)

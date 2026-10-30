@@ -14,6 +14,7 @@ use brokk_bifrost_analysis::analyzer::structural::failure_handlers::{
     kotlin_catch_body_shape, php_catch_body_shape, python_except_body_shape,
     ruby_rescue_body_shape, scala_catch_body_shapes,
 };
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_analysis::analyzer::{WorkspaceAnalyzer, resolve_analyzer};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_csharp_analysis::{CSharpAnalyzer, csharp_catch_facts};
@@ -37,11 +38,13 @@ pub(super) struct FailureHandlerStateCache {
     // Compatibility executions with no caller token share this query-owned
     // token; supplied cancellation is always forwarded instead.
     uncancelled: CancellationToken,
-    syntax: HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
-    go_branches: HashMap<ProjectFile, HashMap<Range, Vec<NativeFailureBranch>>>,
-    regions: HashMap<
-        ProjectFile,
-        brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions,
+    syntax: CaptureScopedMemo<HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>>,
+    go_branches: CaptureScopedMemo<HashMap<ProjectFile, HashMap<Range, Vec<NativeFailureBranch>>>>,
+    regions: CaptureScopedMemo<
+        HashMap<
+            ProjectFile,
+            brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions,
+        >,
     >,
     reported: HashSet<(String, &'static str)>,
 }
@@ -273,7 +276,9 @@ pub(super) fn failure_handler_state_expansions(
             diagnostics,
         );
     }
-    if !cache.syntax.contains_key(&seed.file) {
+    if !cache.syntax.read(&memo_attribution(analyzer), |syntax| {
+        syntax.contains_key(&seed.file)
+    }) {
         let outcome = analyzer
             .structural_fact_providers()
             .into_iter()
@@ -285,9 +290,20 @@ pub(super) fn failure_handler_state_expansions(
                     cancellation,
                 )
             });
-        cache.syntax.insert(seed.file.clone(), outcome);
+        cache
+            .syntax
+            .read_mut(&memo_attribution(analyzer), |syntax| {
+                syntax.insert(seed.file.clone(), Arc::new(outcome))
+            });
     }
-    let syntax = match cache.syntax.get(&seed.file).expect("syntax was cached") {
+    let syntax = match cache
+        .syntax
+        .read(&memo_attribution(analyzer), |syntax| {
+            syntax.get(&seed.file).cloned()
+        })
+        .expect("syntax was cached")
+        .as_ref()
+    {
         StructuralSyntaxLimitedOutcome::Available(syntax) => {
             let actual = ContentIdentity::from_digest(StableDigest::from_array(
                 syntax.prepared().source_sha256(),
@@ -346,18 +362,21 @@ pub(super) fn failure_handler_state_expansions(
         let branches = if seed.language == Language::Go {
             cache
                 .go_branches
-                .entry(seed.file.clone())
-                .or_insert_with(|| {
-                    go_failure_handler_file_body_shapes(
-                        workspace,
-                        &seed.file,
-                        &syntax,
-                        cancellation,
-                    )
+                .read_mut(&memo_attribution(analyzer), |go_branches| {
+                    go_branches
+                        .entry(seed.file.clone())
+                        .or_insert_with(|| {
+                            go_failure_handler_file_body_shapes(
+                                workspace,
+                                &seed.file,
+                                &syntax,
+                                cancellation,
+                            )
+                        })
+                        .get(&handler_seed)
+                        .cloned()
+                        .unwrap_or_default()
                 })
-                .get(&handler_seed)
-                .cloned()
-                .unwrap_or_default()
         } else {
             native_hook.expect("native hook exists for native seed")(
                 workspace,
@@ -468,20 +487,24 @@ pub(super) fn failure_handler_state_expansions(
                 csharp,
                 analyzer.semantic_model_overlay(),
             );
-        let regions = cache.regions.entry(seed.file.clone()).or_insert_with(|| {
-            brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
-                .expect("handler language is registered")
-                .structural_spec()
-                .conditional_regions(syntax.tree().root_node(), syntax.source())
-        });
-        let facts = csharp_catch_facts(
-            csharp,
-            scope.token(),
-            &seed.file,
-            &syntax,
-            handler_seed,
-            regions,
-        );
+        let facts = cache
+            .regions
+            .read_mut(&memo_attribution(analyzer), |regions| {
+                let regions = regions.entry(seed.file.clone()).or_insert_with(|| {
+                    brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
+                        .expect("handler language is registered")
+                        .structural_spec()
+                        .conditional_regions(syntax.tree().root_node(), syntax.source())
+                });
+                csharp_catch_facts(
+                    csharp,
+                    scope.token(),
+                    &seed.file,
+                    &syntax,
+                    handler_seed,
+                    regions,
+                )
+            });
         let (verdict, body_reason) = match facts.body.state {
             HandlerBodyState::Open(gap) => ("unknown", Some(handler_gap_label(analyzer, gap))),
             HandlerBodyState::Nonempty => ("nonempty", None),

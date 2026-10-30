@@ -238,21 +238,26 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PythonAda
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
         module_code_unit(self.project(), file)
     }
-    fn hydrate_path_synthetic_module_unit(
+    fn path_synthetic_module_from_published_name(
         &self,
         file: &ProjectFile,
+        name: &str,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<CodeUnit>> {
-        match self.project().selected_module_name(file)? {
-            Some(name) => brokk_bifrost_python::declarations::module_code_unit_from_name(
-                file, &name,
-            )
+        brokk_bifrost_python::declarations::module_code_unit_from_name(file, name)
             .map(Some)
             .ok_or_else(|| {
                 brokk_bifrost_analysis::analyzer::store::StoreError::corrupt(format!(
                     "published Python module {name:?} is not a suffix of its mounted path {:?}",
                     file.rel_path()
                 ))
-            }),
+            })
+    }
+    fn hydrate_path_synthetic_module_unit(
+        &self,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<CodeUnit>> {
+        match self.project().selected_module_name(file)? {
+            Some(name) => self.path_synthetic_module_from_published_name(file, &name),
             None => Ok(module_code_unit(self.project(), file)),
         }
     }
@@ -307,6 +312,43 @@ mod published_module_read_tests {
                     "selected module read denied",
                 )
             })
+        }
+    }
+
+    #[test]
+    fn path_module_set_reconstructs_src_layout_packages_and_root_initializer() {
+        use crate::analyzer::python::PythonAnalyzer;
+        use brokk_bifrost_analysis::analyzer::{
+            AnalyzerQueryScope, multi_analyzer::resolve_analyzer,
+        };
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Python)
+            .file(
+                "setup.py",
+                "from setuptools import setup\nsetup(packages=['pkg'], package_dir={'': 'src'})\n",
+            )
+            .file("src/__init__.py", "# import-root initializer\n")
+            .file("src/pkg/__init__.py", "from .module import Item\n")
+            .file("src/pkg/module.py", "class Item: pass\n")
+            .build();
+        for _ in 0..2 {
+            let workspace = fixture.workspace_analyzer(Default::default());
+            let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+            let analyzer = &python.inner;
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
+            let kept = analyzer
+                .path_synthetic_modules_named_for_test("module")
+                .unwrap();
+            assert_eq!(
+                kept.iter().map(CodeUnit::fq_name).collect::<Vec<_>>(),
+                ["pkg.module"]
+            );
+            assert_eq!(analyzer.path_synthetic_module_hydrations_for_test(), 1);
+            let modules = analyzer.path_synthetic_modules_for_test().unwrap();
+            let mut names = modules.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, ["__init__", "pkg", "pkg.module", "setup"]);
+            assert!(scope.store_error().is_none(), "{:?}", scope.store_error());
+            assert!(scope.captured_read_incompleteness().is_empty());
         }
     }
 

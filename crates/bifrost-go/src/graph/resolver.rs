@@ -188,6 +188,26 @@ pub struct GoEdgeIndex {
 }
 
 impl GoEdgeIndex {
+    /// Digest the complete legacy alias projection with deterministic ordering.
+    pub fn read_answer(&self) -> [u8; 32] {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+
+        let mut hash = CanonicalHasher::new(b"go-legacy-alias-index-v1");
+        let mut non_alias_types: Vec<_> = self.non_alias_type_fqns.iter().collect();
+        non_alias_types.sort_unstable();
+        hash.sequence("non_alias_types", &non_alias_types, |hash, name| {
+            hash.value(name.as_bytes())
+        });
+
+        let mut aliases: Vec<_> = self.type_alias_targets.iter().collect();
+        aliases.sort_unstable();
+        hash.sequence("aliases", &aliases, |hash, (name, target)| {
+            hash.value(name.as_bytes());
+            hash.value(target.as_bytes());
+        });
+        hash.finish()
+    }
+
     pub fn is_known_non_alias_type(&self, fq_name: &str) -> bool {
         self.non_alias_type_fqns.contains(fq_name)
     }
@@ -204,6 +224,7 @@ impl GoEdgeIndex {
 /// once keeps hierarchy and legacy alias construction on one source-authoritative
 /// pass without reparsing project files.
 pub struct GoWorkspaceIndexes {
+    pub usage_answer: [u8; 32],
     pub hierarchy: Arc<crate::hierarchy::GoHierarchyIndex>,
     pub edges: Arc<GoEdgeIndex>,
 }
@@ -218,7 +239,9 @@ pub fn build_go_workspace_indexes(
     let fact_files = load_complete_go_fact_files(source, files.iter().cloned())?;
     let edges = build_go_edge_index_from_facts(source, &fact_files)?;
     let hierarchy = crate::hierarchy::GoHierarchyIndex::build_from_fact_files(source, fact_files);
+    let usage_answer = edges.read_answer();
     Ok(GoWorkspaceIndexes {
+        usage_answer,
         hierarchy: Arc::new(hierarchy),
         edges: Arc::new(edges),
     })
@@ -650,44 +673,6 @@ fn import_bindings_from_imports(
     bindings.dot_external.sort();
     bindings.dot_external.dedup();
     bindings
-}
-
-/// Resolve every name `file`'s import block binds, workspace and external.
-///
-/// `declared_package_name` reads the activated semantic-model overlay from the
-/// analysis side; passing it here keeps diagnostics and `get_definition` on
-/// one package identity instead of two that agree by accident.
-/// Workspace clauses come from canonical target properties on demand. A known
-/// workspace target with no clause is unavailable, never an external fallback.
-pub fn resolve_go_import_bindings(
-    source: GoGraphSource<'_>,
-    file: &ProjectFile,
-    package_clause: impl Fn(&ProjectFile) -> Option<String>,
-    declared_package_name: impl Fn(&str) -> Option<String>,
-) -> Result<GoImportBindings, GoGraphBuildError> {
-    let files = source.index.analyzed_files();
-    let dir_index = build_parent_dir_index(files.iter());
-    let imports = checked_import_infos(source, file)?;
-    let mut unavailable_files = Vec::new();
-    let bindings = import_bindings_from_imports(
-        file,
-        &imports,
-        &dir_index,
-        source.workspace_paths,
-        |target| {
-            let clause = package_clause(target).filter(|clause| !clause.is_empty());
-            if clause.is_none() {
-                unavailable_files.push(target.clone());
-            }
-            clause
-        },
-        declared_package_name,
-    );
-    if unavailable_files.is_empty() {
-        Ok(bindings)
-    } else {
-        Err(GoGraphBuildError::from_files(unavailable_files))
-    }
 }
 
 fn checked_import_infos(

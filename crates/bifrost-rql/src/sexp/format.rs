@@ -116,12 +116,18 @@ impl Formatter<'_, '_> {
 
         self.push_indent(depth, output);
         output.push(open);
+        let content_start = expr.range.start + open.len_utf8();
         if items.is_empty() {
+            let closing_start = expr.range.end.saturating_sub(close.len_utf8());
+            if !comments_in(self.source, content_start..closing_start).is_empty() {
+                output.push('\n');
+                self.render_comments(content_start..closing_start, depth + 1, output);
+                self.push_indent(depth, output);
+            }
             output.push(close);
             return;
         }
 
-        let content_start = expr.range.start + open.len_utf8();
         let keep_head = matches!(expr.kind, ExprKind::List(_))
             && comments_in(self.source, content_start..items[0].range.start).is_empty()
             && items[0].is_atom();
@@ -253,3 +259,6 @@ mod tests {
         assert_eq!(format("(call :name \"demo\"", 120), None);
     }
 }
+
+#[cfg(test)]
+mod preservation_tests;

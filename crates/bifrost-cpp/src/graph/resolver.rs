@@ -34,15 +34,17 @@ use brokk_bifrost_core::analyzer::cpp_facts::{
     CppStructuredAliasTarget as StructuredAliasTarget,
 };
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::memo_attribution::{ReplayingMemo, ReplayingMemoEntry};
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CallableLinkage, CodeUnitType, CppFieldLinkage, CppTemplateExpression,
     CppTemplateMetadata, CppTemplateParameterMetadata, CppTemplateTerm, Language, LanguageDialect,
     SignatureMetadata, StructuredTypeName,
 };
-use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
+use brokk_bifrost_core::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSourceOrigin, PreparedSyntaxSource};
+use brokk_bifrost_core::analyzer::project_reads::{OpaqueReadReceipt, ReadCapability};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as node_range_contains;
 use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
@@ -67,7 +69,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -708,20 +710,125 @@ impl CppScanBinding {
     }
 }
 
+// Visibility data is shared by several captures in one definition batch.
+// Receipts belong to completed values, not to allocation of a lazy cell.
+type VisibilityEntry<T> = Arc<ReplayingMemoEntry<T, OpaqueReadReceipt>>;
+type VisibilityMemo<K, V> =
+    ReplayingMemo<KeyedPoolSafeMemo<K, ReplayingMemoEntry<V, OpaqueReadReceipt>>>;
+type BoundedVisibilityMemo<K, V> = ReplayingMemo<Mutex<HashMap<K, VisibilityEntry<V>>>>;
+// Keep the existing map accounting projection while each cell owns a receipt.
+type IncludeProtectionMemo = ReplayingMemo<
+    Mutex<
+        HashMap<
+            ProjectFile,
+            Arc<PoolSafeMemo<ReplayingMemoEntry<MacroIncludeProtection, OpaqueReadReceipt>>>,
+        >,
+    >,
+>;
+type VisibilityOnce<T> = ReplayingMemo<OnceLock<VisibilityEntry<T>>>;
+
+fn try_visibility_memo_value<K: Eq + Hash + Clone, V: Clone, E>(
+    memo: &VisibilityMemo<K, V>,
+    reads: &ReadCapability,
+    key: K,
+    build: impl FnOnce() -> Result<V, E>,
+) -> Result<V, E> {
+    let value = memo.read(&reads.memo_attribution(), |entries, capture| {
+        entries
+            .cell(&key)
+            .get_or_try_build_pool_independent(|| capture.try_build(build))
+    })?;
+    Ok((*value).clone())
+}
+
+pub(crate) fn visibility_memo_value<K: Eq + Hash + Clone, V: Clone>(
+    memo: &VisibilityMemo<K, V>,
+    reads: &ReadCapability,
+    key: K,
+    build: impl FnOnce() -> V,
+) -> V {
+    try_visibility_memo_value(memo, reads, key, || {
+        Ok::<_, std::convert::Infallible>(build())
+    })
+    .expect("infallible C++ visibility build")
+}
+
+fn bounded_visibility_memo_value<K: Eq + Hash + Clone, V: Clone>(
+    memo: &BoundedVisibilityMemo<K, V>,
+    reads: &ReadCapability,
+    key: &K,
+    capacity: usize,
+    build: impl FnOnce() -> V,
+) -> V {
+    let value = memo
+        .read(&reads.memo_attribution(), |entries, capture| {
+            if let Some(value) = entries
+                .lock()
+                .expect("C++ bounded visibility memo poisoned")
+                .get(key)
+                .cloned()
+            {
+                return Ok::<_, std::convert::Infallible>(value);
+            }
+            let value = Arc::new(capture.build(build));
+            let mut entries = entries
+                .lock()
+                .expect("C++ bounded visibility memo poisoned");
+            if let Some(existing) = entries.get(key).cloned() {
+                return Ok(existing);
+            }
+            if entries.len() < capacity {
+                entries.insert(key.clone(), Arc::clone(&value));
+            }
+            Ok(value)
+        })
+        .expect("infallible bounded C++ visibility build");
+    (*value).clone()
+}
+
+fn visibility_once_value<T: Clone>(
+    memo: &VisibilityOnce<T>,
+    reads: &ReadCapability,
+    build: impl FnOnce() -> T,
+) -> T {
+    let value = memo
+        .read(&reads.memo_attribution(), |cell, capture| {
+            Ok::<_, std::convert::Infallible>(Arc::clone(
+                cell.get_or_init(|| Arc::new(capture.build(build))),
+            ))
+        })
+        .expect("infallible C++ visibility cell build");
+    (*value).clone()
+}
+
+pub struct VisibilityCell<T> {
+    memo: VisibilityOnce<T>,
+    reads: ReadCapability,
+}
+impl<T: Clone> VisibilityCell<T> {
+    fn new(reads: ReadCapability) -> Self {
+        Self {
+            memo: VisibilityOnce::default(),
+            reads,
+        }
+    }
+    pub fn get_or_init(&self, build: impl FnOnce() -> T) -> T {
+        visibility_once_value(&self.memo, &self.reads, build)
+    }
+    pub fn get(&self) -> Option<T> {
+        self.memo
+            .read(&self.reads.memo_attribution(), |cell, _| {
+                cell.get().cloned().ok_or(())
+            })
+            .ok()
+            .map(|value| (*value).clone())
+    }
+}
+
 type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
 pub type OrdinaryTypeImportCell = Arc<EffectiveUsingIndex>;
-pub type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
-type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
-type MacroEnvironmentCheckpointCell = Arc<OnceLock<MacroEnvironmentCheckpoints>>;
-type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
-type MacroLexicalTemplateCache =
-    HashMap<(ProjectFile, usize), Option<crate::graph::macro_lexical::MacroTemplate>>;
-
-type MacroLocalBindingTemplateCache =
-    HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
-type MacroReplacementBodyCache = HashMap<(ProjectFile, usize), Option<Arc<ParsedReplacementBody>>>;
-type MacroTypeParameterCache = HashMap<(ProjectFile, usize), Option<Arc<[usize]>>>;
-type StructuredIncludeFactCell = Arc<OnceLock<Arc<[StructuredIncludeFact]>>>;
+pub type MacroEventCell = Arc<VisibilityCell<Arc<[MacroEvent]>>>;
+type MacroEnvironmentCheckpointCell = Arc<VisibilityCell<Arc<MacroEnvironmentCheckpoints>>>;
 
 struct StructuredIncludeFact {
     start_byte: usize,
@@ -784,19 +891,6 @@ impl MacroEnvironmentCheckpoints {
         );
         &self.checkpoints[index - 1]
     }
-}
-
-fn clone_or_default_file_cell<T: Default + Clone>(
-    cells: &Mutex<HashMap<ProjectFile, T>>,
-    file: &ProjectFile,
-    poison_message: &str,
-) -> T {
-    cells
-        .lock()
-        .expect(poison_message)
-        .entry(file.clone())
-        .or_default()
-        .clone()
 }
 
 impl MacroEnvironment {
@@ -930,26 +1024,28 @@ pub struct ProjectUsingIndex {
     pub directives: Vec<OrdinaryTypeImport>,
 }
 
-type EffectiveUsingProjectionCell = Arc<OnceLock<Arc<[OrdinaryTypeImport]>>>;
+type EffectiveUsingProjectionCell = Arc<VisibilityCell<Arc<[OrdinaryTypeImport]>>>;
 
 pub struct EffectiveUsingIndex {
-    projected_by_name: Mutex<HashMap<String, EffectiveUsingProjectionCell>>,
+    reads: ReadCapability,
+    projected_by_name: VisibilityMemo<String, EffectiveUsingProjectionCell>,
 }
 
 impl EffectiveUsingIndex {
-    fn new(_root: ProjectFile) -> Self {
+    fn new(_root: ProjectFile, reads: ReadCapability) -> Self {
         Self {
-            projected_by_name: Mutex::new(HashMap::default()),
+            reads,
+            projected_by_name: VisibilityMemo::default(),
         }
     }
 
     pub fn projection_cell(&self, name: &str) -> EffectiveUsingProjectionCell {
-        self.projected_by_name
-            .lock()
-            .expect("C++ effective-using projection cache poisoned")
-            .entry(name.to_string())
-            .or_default()
-            .clone()
+        visibility_memo_value(
+            &self.projected_by_name,
+            &self.reads,
+            name.to_owned(),
+            || Arc::new(VisibilityCell::new(self.reads.clone())),
+        )
     }
 }
 
@@ -966,14 +1062,7 @@ pub enum OrdinaryTypeImportResolution {
     Missing,
 }
 
-type CallableReferenceSpecCell = Arc<OnceLock<Option<TargetSpec>>>;
 type ConditionalIncludeProjectionIndex = HashMap<ProjectFile, Arc<[ConditionalIncludeProjection]>>;
-type ConditionalIncludeProjectionCell = Arc<PoolSafeMemo<ConditionalIncludeProjectionIndex>>;
-type ConditionalIncludeProjectionCache = HashMap<ProjectFile, ConditionalIncludeProjectionCell>;
-type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
-type ParserAliasTargetMatchCell = Arc<OnceLock<bool>>;
-type IndexedStructuralClassScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
-type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 
 /// One callable declaration's inputs to [`VisibilityIndex::same_logical_callable`],
 /// read from its declaration syntax rather than from its persisted signature
@@ -1043,24 +1132,25 @@ impl std::ops::Deref for VisibilityIndex<'_> {
 /// Owned visibility facts. They retain no source or request-scope borrow.
 /// The caller keeps these facts inside the query that built them.
 pub struct VisibilityIndexData {
+    pub(crate) reads: ReadCapability,
     pub visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     global_field_internal_linkage: HashMap<CodeUnit, bool>,
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
-    alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
-    visible_parser_alias_name_sets: RwLock<HashMap<ProjectFile, VisibleParserAliasNameSetCell>>,
-    parser_alias_target_matches:
-        RwLock<HashMap<(ProjectFile, String, LogicalSymbolKey), ParserAliasTargetMatchCell>>,
-    ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
-    project_using_index: OnceLock<ProjectUsingIndex>,
-    namespace_alias_sites: Mutex<HashMap<ProjectFile, super::namespace_alias::NamespaceAliasCell>>,
+    alias_cells: VisibilityMemo<ProjectFile, AliasCell>,
+    visible_parser_alias_name_sets: VisibilityMemo<ProjectFile, Arc<HashSet<String>>>,
+    parser_alias_target_matches: VisibilityMemo<(ProjectFile, String, LogicalSymbolKey), bool>,
+    ordinary_type_import_cells: VisibilityMemo<ProjectFile, OrdinaryTypeImportCell>,
+    project_using_index: VisibilityOnce<Arc<ProjectUsingIndex>>,
+    namespace_alias_sites: VisibilityMemo<ProjectFile, super::namespace_alias::NamespaceAliasCell>,
     callable_reference_specs:
-        Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
-    structured_include_fact_cells: Mutex<HashMap<ProjectFile, StructuredIncludeFactCell>>,
-    include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
-    compile_proven_guard_cells: Mutex<HashMap<ProjectFile, Arc<HashSet<PreprocessorGuard>>>>,
-    include_path_admission_cells: Mutex<HashMap<ProjectFile, IncludePathAdmission>>,
-    conditional_include_projection_cells: Mutex<ConditionalIncludeProjectionCache>,
+        VisibilityMemo<(ProjectFile, LogicalSymbolKey), Option<Arc<TargetSpec>>>,
+    structured_include_fact_cells: VisibilityMemo<ProjectFile, Arc<[StructuredIncludeFact]>>,
+    include_activation_cells: VisibilityMemo<(ProjectFile, ProjectFile), Option<usize>>,
+    compile_proven_guard_cells: VisibilityMemo<ProjectFile, Arc<HashSet<PreprocessorGuard>>>,
+    include_path_admission_cells: VisibilityMemo<ProjectFile, IncludePathAdmission>,
+    conditional_include_projection_cells:
+        VisibilityMemo<ProjectFile, Arc<ConditionalIncludeProjectionIndex>>,
     #[cfg(any(test, feature = "test-support"))]
     conditional_include_projection_index_build_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
@@ -1085,40 +1175,45 @@ pub struct VisibilityIndexData {
     parser_alias_fallback_files: AtomicUsize,
     parser_alias_source_parses: AtomicUsize,
     parser_alias_fallback_elapsed_micros: AtomicUsize,
-    field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
-    structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
-    callable_comparables: Mutex<HashMap<CodeUnit, Option<Arc<ExtractedComparable>>>>,
-    class_definition_agreements: Mutex<HashMap<(CodeUnit, CodeUnit), bool>>,
+    field_type_facts: VisibilityMemo<CodeUnit, Option<DeclaredFieldTypeFact>>,
+    structured_alias_targets: VisibilityMemo<CodeUnit, Option<StructuredAliasTarget>>,
+    callable_comparables: VisibilityMemo<CodeUnit, Option<Arc<ExtractedComparable>>>,
+    class_definition_agreements: VisibilityMemo<(CodeUnit, CodeUnit), bool>,
     /// Complete callable metadata is expensive for reconciled C++ members:
     /// each read can rebuild the declaration/definition evidence. Reuse it
     /// across the member, arity, identity, and navigation phases of this
     /// visibility query, with an explicit cap so the query never retains a
     /// workspace-sized unit table.
-    callable_metadata: Mutex<HashMap<CodeUnit, Arc<Vec<SignatureMetadata>>>>,
-    comparable_name_declarations: Mutex<HashMap<StructuredTypeName, Option<CodeUnit>>>,
-    indexed_structural_class_scopes: Mutex<IndexedStructuralClassScopeCache>,
-    indexed_enclosing_owner_scopes: Mutex<IndexedEnclosingOwnerScopeCache>,
-    precise_parent_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
-    c_tag_kind_cache: Mutex<HashMap<CodeUnit, Option<CppCTagKind>>>,
-    c_tag_complete_definition_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
-    macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
-    macro_event_name_sets: Mutex<HashMap<ProjectFile, Arc<HashSet<String>>>>,
-    pub macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
+    callable_metadata: BoundedVisibilityMemo<CodeUnit, Arc<Vec<SignatureMetadata>>>,
+    comparable_name_declarations: VisibilityMemo<StructuredTypeName, Option<CodeUnit>>,
+    indexed_structural_class_scopes:
+        VisibilityMemo<(ProjectFile, usize, usize), Option<Vec<String>>>,
+    indexed_enclosing_owner_scopes:
+        VisibilityMemo<(ProjectFile, usize, usize), Option<Vec<String>>>,
+    precise_parent_cache: VisibilityMemo<CodeUnit, Option<CodeUnit>>,
+    c_tag_kind_cache: VisibilityMemo<CodeUnit, Option<CppCTagKind>>,
+    c_tag_complete_definition_cache: VisibilityMemo<CodeUnit, Option<CodeUnit>>,
+    macro_event_cells: VisibilityMemo<ProjectFile, MacroEventCell>,
+    macro_event_name_sets: VisibilityMemo<ProjectFile, Arc<HashSet<String>>>,
+    pub macro_include_protection_cells: IncludeProtectionMemo,
     // The environment at selected event prefixes of each file, built once and read by every
     // worker. The authoritative differential shares this index across target workers whose
     // frontiers interleave arbitrarily and move backwards, so a forward cursor -- per worker or
     // not -- replayed a file's events once per backward request. Checkpoints answer any position
     // with a binary search and at most one stride of replay, and being immutable they need no
     // per-worker copy (#1496).
-    macro_environment_checkpoints: Mutex<HashMap<ProjectFile, MacroEnvironmentCheckpointCell>>,
-    macro_replacements: Mutex<MacroReplacementCache>,
-    macro_local_binding_templates: Mutex<MacroLocalBindingTemplateCache>,
-    pub(crate) macro_lexical_templates: Mutex<MacroLexicalTemplateCache>,
+    macro_environment_checkpoints: VisibilityMemo<ProjectFile, MacroEnvironmentCheckpointCell>,
+    macro_replacements: VisibilityMemo<(ProjectFile, usize), Arc<ParsedMacroReplacement>>,
+    macro_local_binding_templates:
+        VisibilityMemo<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>,
+    pub(crate) macro_lexical_templates:
+        VisibilityMemo<(ProjectFile, usize), Option<crate::graph::macro_lexical::MacroTemplate>>,
     macro_lexical_indexes:
-        Mutex<HashMap<ProjectFile, Arc<crate::graph::macro_lexical::MacroLexicalIndex>>>,
-    macro_replacement_bodies: Mutex<MacroReplacementBodyCache>,
-    macro_type_parameters: Mutex<MacroTypeParameterCache>,
-    callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
+        BoundedVisibilityMemo<ProjectFile, Arc<crate::graph::macro_lexical::MacroLexicalIndex>>,
+    macro_replacement_bodies:
+        VisibilityMemo<(ProjectFile, usize), Option<Arc<ParsedReplacementBody>>>,
+    macro_type_parameters: VisibilityMemo<(ProjectFile, usize), Option<Arc<[usize]>>>,
+    callable_parameter_macro_arities: VisibilityMemo<(ProjectFile, String), Option<CallableArity>>,
     #[cfg(any(test, feature = "test-support"))]
     pub macro_replacement_parse_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
@@ -1987,33 +2082,22 @@ impl<'a> VisibilityIndex<'a> {
         root: Node<'_>,
         source: &str,
     ) -> Arc<crate::graph::macro_lexical::MacroLexicalIndex> {
-        if let Some(index) = self
-            .macro_lexical_indexes
-            .lock()
-            .expect("macro lexical index cache poisoned")
-            .get(file)
-            .cloned()
-        {
-            debug_assert_eq!(
-                index.source_len,
-                source.len(),
-                "macro lexical index for {file:?} was built from a different source"
-            );
-            return index;
-        }
-        let index = Arc::new(crate::graph::macro_lexical::build_index(
-            self, file, root, source,
-        ));
-        let mut cache = self
-            .macro_lexical_indexes
-            .lock()
-            .expect("macro lexical index cache poisoned");
-        if let Some(existing) = cache.get(file).cloned() {
-            return existing;
-        }
-        if cache.len() < MACRO_LEXICAL_INDEX_CACHE_CAP {
-            cache.insert(file.clone(), Arc::clone(&index));
-        }
+        let index = bounded_visibility_memo_value(
+            &self.macro_lexical_indexes,
+            &self.reads,
+            file,
+            MACRO_LEXICAL_INDEX_CACHE_CAP,
+            || {
+                Arc::new(crate::graph::macro_lexical::build_index(
+                    self, file, root, source,
+                ))
+            },
+        );
+        debug_assert_eq!(
+            index.source_len,
+            source.len(),
+            "macro lexical index for {file:?} was built from a different source"
+        );
         index
     }
 
@@ -2023,24 +2107,13 @@ impl<'a> VisibilityIndex<'a> {
     /// metadata lookup, so keep the answer on this per-query index and cap it
     /// explicitly.
     fn callable_metadata(&self, unit: &CodeUnit) -> Arc<Vec<SignatureMetadata>> {
-        if let Some(metadata) = self
-            .callable_metadata
-            .lock()
-            .expect("C++ callable metadata cache poisoned")
-            .get(unit)
-            .cloned()
-        {
-            return metadata;
-        }
-        let metadata = Arc::new(self.cpp.stored_signature_metadata(unit));
-        let mut cache = self
-            .callable_metadata
-            .lock()
-            .expect("C++ callable metadata cache poisoned");
-        if cache.len() < CALLABLE_METADATA_CACHE_CAP {
-            cache.insert(unit.clone(), Arc::clone(&metadata));
-        }
-        metadata
+        bounded_visibility_memo_value(
+            &self.callable_metadata,
+            &self.reads,
+            unit,
+            CALLABLE_METADATA_CACHE_CAP,
+            || Arc::new(self.cpp.stored_signature_metadata(unit)),
+        )
     }
 
     /// Callable linkage backed by the query-local metadata memo.
@@ -2086,7 +2159,7 @@ impl<'a> VisibilityIndex<'a> {
         has_unresolved_include_visible_before_in_prepared(
             file,
             prepared.as_ref(),
-            self.cpp.include_target_index(),
+            &self.cpp.include_target_index(),
             &facts,
             before_byte,
             &|guards: Option<&HashSet<PreprocessorGuard>>| {
@@ -2100,14 +2173,12 @@ impl<'a> VisibilityIndex<'a> {
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
     ) -> Arc<[StructuredIncludeFact]> {
-        let cell = self
-            .structured_include_fact_cells
-            .lock()
-            .expect("C++ structured include-fact cache poisoned")
-            .entry(file.clone())
-            .or_default()
-            .clone();
-        Arc::clone(cell.get_or_init(|| collect_structured_include_facts(prepared)))
+        visibility_memo_value(
+            &self.structured_include_fact_cells,
+            &self.reads,
+            file.clone(),
+            || collect_structured_include_facts(prepared),
+        )
     }
 
     /// A [`VisibilityIndex`] over a caller-supplied visible-declaration map,
@@ -2119,6 +2190,7 @@ impl<'a> VisibilityIndex<'a> {
     /// to write inline is here instead of thirty-three public fields.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_visible_files_for_test(
+        reads: ReadCapability,
         cpp: &'a dyn CppSource,
         token: QueryToken<'a>,
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
@@ -2141,6 +2213,7 @@ impl<'a> VisibilityIndex<'a> {
             cpp,
             token,
             data: Arc::new(VisibilityIndexData {
+                reads,
                 visible_by_identifier: build_visible_identifier_index(
                     &CppGraphSource::from_source(cpp, token),
                     &visible_by_file,
@@ -2150,18 +2223,18 @@ impl<'a> VisibilityIndex<'a> {
                 global_field_internal_linkage,
                 visible_by_file,
                 visible_source_files_by_root,
-                alias_cells: Mutex::new(HashMap::default()),
-                visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
-                parser_alias_target_matches: RwLock::new(HashMap::default()),
-                ordinary_type_import_cells: Mutex::new(HashMap::default()),
-                project_using_index: OnceLock::new(),
-                namespace_alias_sites: Mutex::new(HashMap::default()),
-                callable_reference_specs: Mutex::new(HashMap::default()),
-                structured_include_fact_cells: Mutex::new(HashMap::default()),
-                include_activation_cells: Mutex::new(HashMap::default()),
-                compile_proven_guard_cells: Mutex::new(HashMap::default()),
-                include_path_admission_cells: Mutex::new(HashMap::default()),
-                conditional_include_projection_cells: Mutex::new(HashMap::default()),
+                alias_cells: VisibilityMemo::default(),
+                visible_parser_alias_name_sets: VisibilityMemo::default(),
+                parser_alias_target_matches: VisibilityMemo::default(),
+                ordinary_type_import_cells: VisibilityMemo::default(),
+                project_using_index: ReplayingMemo::new(OnceLock::new()),
+                namespace_alias_sites: VisibilityMemo::default(),
+                callable_reference_specs: VisibilityMemo::default(),
+                structured_include_fact_cells: VisibilityMemo::default(),
+                include_activation_cells: VisibilityMemo::default(),
+                compile_proven_guard_cells: VisibilityMemo::default(),
+                include_path_admission_cells: VisibilityMemo::default(),
+                conditional_include_projection_cells: VisibilityMemo::default(),
                 conditional_include_projection_index_build_count: AtomicUsize::new(0),
                 conditional_include_projection_state_count: AtomicUsize::new(0),
                 conditional_include_target_state_count: AtomicUsize::new(0),
@@ -2176,28 +2249,28 @@ impl<'a> VisibilityIndex<'a> {
                 parser_alias_fallback_files: AtomicUsize::new(0),
                 parser_alias_source_parses: AtomicUsize::new(0),
                 parser_alias_fallback_elapsed_micros: AtomicUsize::new(0),
-                field_type_facts: Mutex::new(HashMap::default()),
-                structured_alias_targets: Mutex::new(HashMap::default()),
-                callable_comparables: Mutex::new(HashMap::default()),
-                class_definition_agreements: Mutex::new(HashMap::default()),
-                callable_metadata: Mutex::new(HashMap::default()),
-                comparable_name_declarations: Mutex::new(HashMap::default()),
-                indexed_structural_class_scopes: Mutex::new(HashMap::default()),
-                indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
-                precise_parent_cache: Mutex::new(HashMap::default()),
-                c_tag_kind_cache: Mutex::new(HashMap::default()),
-                c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
-                macro_event_cells: Mutex::new(HashMap::default()),
-                macro_event_name_sets: Mutex::new(HashMap::default()),
-                macro_include_protection_cells: Mutex::new(HashMap::default()),
-                macro_environment_checkpoints: Mutex::new(HashMap::default()),
-                macro_replacements: Mutex::new(HashMap::default()),
-                macro_local_binding_templates: Mutex::new(HashMap::default()),
-                macro_lexical_templates: Mutex::new(HashMap::default()),
-                macro_lexical_indexes: Mutex::new(HashMap::default()),
-                macro_replacement_bodies: Mutex::new(HashMap::default()),
-                macro_type_parameters: Mutex::new(HashMap::default()),
-                callable_parameter_macro_arities: Mutex::new(HashMap::default()),
+                field_type_facts: VisibilityMemo::default(),
+                structured_alias_targets: VisibilityMemo::default(),
+                callable_comparables: VisibilityMemo::default(),
+                class_definition_agreements: VisibilityMemo::default(),
+                callable_metadata: ReplayingMemo::new(Mutex::new(HashMap::default())),
+                comparable_name_declarations: VisibilityMemo::default(),
+                indexed_structural_class_scopes: VisibilityMemo::default(),
+                indexed_enclosing_owner_scopes: VisibilityMemo::default(),
+                precise_parent_cache: VisibilityMemo::default(),
+                c_tag_kind_cache: VisibilityMemo::default(),
+                c_tag_complete_definition_cache: VisibilityMemo::default(),
+                macro_event_cells: VisibilityMemo::default(),
+                macro_event_name_sets: VisibilityMemo::default(),
+                macro_include_protection_cells: IncludeProtectionMemo::default(),
+                macro_environment_checkpoints: VisibilityMemo::default(),
+                macro_replacements: VisibilityMemo::default(),
+                macro_local_binding_templates: VisibilityMemo::default(),
+                macro_lexical_templates: VisibilityMemo::default(),
+                macro_lexical_indexes: ReplayingMemo::new(Mutex::new(HashMap::default())),
+                macro_replacement_bodies: VisibilityMemo::default(),
+                macro_type_parameters: VisibilityMemo::default(),
+                callable_parameter_macro_arities: VisibilityMemo::default(),
                 macro_replacement_parse_count: AtomicUsize::new(0),
                 macro_event_application_count: AtomicUsize::new(0),
                 macro_environment_checkpoint_build_count: AtomicUsize::new(0),
@@ -2224,15 +2297,17 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn build(
+        reads: ReadCapability,
         cpp: &'a dyn CppSource,
         token: QueryToken<'a>,
         analyzer: &CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
     ) -> Self {
-        Self::build_with_cancellation(cpp, token, analyzer, roots, None)
+        Self::build_with_cancellation(reads, cpp, token, analyzer, roots, None)
     }
 
     pub fn build_with_cancellation(
+        reads: ReadCapability,
         cpp: &'a dyn CppSource,
         token: QueryToken<'a>,
         analyzer: &CppGraphSource<'_>,
@@ -2249,7 +2324,7 @@ impl<'a> VisibilityIndex<'a> {
                     .unwrap_or_default()
                     .into_iter()
                     .flat_map(|include| {
-                        resolve_include_targets_with_index(file, &include, include_targets)
+                        resolve_include_targets_with_index(file, &include, &include_targets)
                     })
                     .collect()
             });
@@ -2421,22 +2496,23 @@ impl<'a> VisibilityIndex<'a> {
             cpp,
             token,
             data: Arc::new(VisibilityIndexData {
+                reads,
                 visible_by_file,
                 visible_by_identifier,
                 global_field_internal_linkage,
                 visible_source_files_by_root,
-                alias_cells: Mutex::new(HashMap::default()),
-                visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
-                parser_alias_target_matches: RwLock::new(HashMap::default()),
-                ordinary_type_import_cells: Mutex::new(HashMap::default()),
-                project_using_index: OnceLock::new(),
-                namespace_alias_sites: Mutex::new(HashMap::default()),
-                callable_reference_specs: Mutex::new(HashMap::default()),
-                structured_include_fact_cells: Mutex::new(HashMap::default()),
-                include_activation_cells: Mutex::new(HashMap::default()),
-                compile_proven_guard_cells: Mutex::new(HashMap::default()),
-                include_path_admission_cells: Mutex::new(HashMap::default()),
-                conditional_include_projection_cells: Mutex::new(HashMap::default()),
+                alias_cells: VisibilityMemo::default(),
+                visible_parser_alias_name_sets: VisibilityMemo::default(),
+                parser_alias_target_matches: VisibilityMemo::default(),
+                ordinary_type_import_cells: VisibilityMemo::default(),
+                project_using_index: ReplayingMemo::new(OnceLock::new()),
+                namespace_alias_sites: VisibilityMemo::default(),
+                callable_reference_specs: VisibilityMemo::default(),
+                structured_include_fact_cells: VisibilityMemo::default(),
+                include_activation_cells: VisibilityMemo::default(),
+                compile_proven_guard_cells: VisibilityMemo::default(),
+                include_path_admission_cells: VisibilityMemo::default(),
+                conditional_include_projection_cells: VisibilityMemo::default(),
                 #[cfg(any(test, feature = "test-support"))]
                 conditional_include_projection_index_build_count: AtomicUsize::new(0),
                 #[cfg(any(test, feature = "test-support"))]
@@ -2461,28 +2537,28 @@ impl<'a> VisibilityIndex<'a> {
                 parser_alias_fallback_files: AtomicUsize::new(0),
                 parser_alias_source_parses: AtomicUsize::new(0),
                 parser_alias_fallback_elapsed_micros: AtomicUsize::new(0),
-                field_type_facts: Mutex::new(HashMap::default()),
-                structured_alias_targets: Mutex::new(HashMap::default()),
-                callable_comparables: Mutex::new(HashMap::default()),
-                class_definition_agreements: Mutex::new(HashMap::default()),
-                callable_metadata: Mutex::new(HashMap::default()),
-                comparable_name_declarations: Mutex::new(HashMap::default()),
-                indexed_structural_class_scopes: Mutex::new(HashMap::default()),
-                indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
-                precise_parent_cache: Mutex::new(HashMap::default()),
-                c_tag_kind_cache: Mutex::new(HashMap::default()),
-                c_tag_complete_definition_cache: Mutex::new(HashMap::default()),
-                macro_event_cells: Mutex::new(HashMap::default()),
-                macro_event_name_sets: Mutex::new(HashMap::default()),
-                macro_include_protection_cells: Mutex::new(HashMap::default()),
-                macro_environment_checkpoints: Mutex::new(HashMap::default()),
-                macro_replacements: Mutex::new(HashMap::default()),
-                macro_local_binding_templates: Mutex::new(HashMap::default()),
-                macro_lexical_templates: Mutex::new(HashMap::default()),
-                macro_lexical_indexes: Mutex::new(HashMap::default()),
-                macro_replacement_bodies: Mutex::new(HashMap::default()),
-                macro_type_parameters: Mutex::new(HashMap::default()),
-                callable_parameter_macro_arities: Mutex::new(HashMap::default()),
+                field_type_facts: VisibilityMemo::default(),
+                structured_alias_targets: VisibilityMemo::default(),
+                callable_comparables: VisibilityMemo::default(),
+                class_definition_agreements: VisibilityMemo::default(),
+                callable_metadata: ReplayingMemo::new(Mutex::new(HashMap::default())),
+                comparable_name_declarations: VisibilityMemo::default(),
+                indexed_structural_class_scopes: VisibilityMemo::default(),
+                indexed_enclosing_owner_scopes: VisibilityMemo::default(),
+                precise_parent_cache: VisibilityMemo::default(),
+                c_tag_kind_cache: VisibilityMemo::default(),
+                c_tag_complete_definition_cache: VisibilityMemo::default(),
+                macro_event_cells: VisibilityMemo::default(),
+                macro_event_name_sets: VisibilityMemo::default(),
+                macro_include_protection_cells: IncludeProtectionMemo::default(),
+                macro_environment_checkpoints: VisibilityMemo::default(),
+                macro_replacements: VisibilityMemo::default(),
+                macro_local_binding_templates: VisibilityMemo::default(),
+                macro_lexical_templates: VisibilityMemo::default(),
+                macro_lexical_indexes: ReplayingMemo::new(Mutex::new(HashMap::default())),
+                macro_replacement_bodies: VisibilityMemo::default(),
+                macro_type_parameters: VisibilityMemo::default(),
+                callable_parameter_macro_arities: VisibilityMemo::default(),
                 #[cfg(any(test, feature = "test-support"))]
                 macro_replacement_parse_count: AtomicUsize::new(0),
                 #[cfg(any(test, feature = "test-support"))]
@@ -2741,33 +2817,30 @@ impl<'a> VisibilityIndex<'a> {
         binding: &MacroBinding,
         replacement: &str,
     ) -> Arc<ParsedMacroReplacement> {
-        let key = (binding.source.clone(), binding.declaration_byte);
-        let mut cache = self
-            .macro_replacements
-            .lock()
-            .expect("C++ macro replacement cache poisoned");
-        if let Some(parsed) = cache.get(&key) {
-            return Arc::clone(parsed);
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        self.macro_replacement_parse_count
-            .fetch_add(1, Ordering::Relaxed);
-        let parsed = parse_sentinel(
-            "void __bifrost_macro_arity() { __bifrost_macro_call(",
-            SentinelInput::replacement(replacement),
-            "); }",
-        );
-        let parsed = if parsed.tree.root_node().has_error() {
-            ParsedMacroReplacement::Unsupported
-        } else {
-            ParsedMacroReplacement::Parsed {
-                source: parsed.source,
-                tree: parsed.tree,
-            }
-        };
-        let parsed = Arc::new(parsed);
-        cache.insert(key, Arc::clone(&parsed));
-        parsed
+        visibility_memo_value(
+            &self.macro_replacements,
+            &self.reads,
+            (binding.source.clone(), binding.declaration_byte),
+            || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.macro_replacement_parse_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let parsed = parse_sentinel(
+                    "void __bifrost_macro_arity() { __bifrost_macro_call(",
+                    SentinelInput::replacement(replacement),
+                    "); }",
+                );
+                let parsed = if parsed.tree.root_node().has_error() {
+                    ParsedMacroReplacement::Unsupported
+                } else {
+                    ParsedMacroReplacement::Parsed {
+                        source: parsed.source,
+                        tree: parsed.tree,
+                    }
+                };
+                Arc::new(parsed)
+            },
+        )
     }
 
     /// Recover a typed local declared by an active C function-like macro.
@@ -3016,7 +3089,7 @@ impl<'a> VisibilityIndex<'a> {
         )?;
         let reference_conditions = owning_preprocessor_conditionals(root, reference, source);
         let cell = self.macro_event_cell(file);
-        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let events = cell.get_or_init(|| Arc::from(self.collect_macro_events(file)));
         let event = events
             .iter()
             .find(|event| event.byte() == binding.declaration_byte)?;
@@ -3120,56 +3193,49 @@ impl<'a> VisibilityIndex<'a> {
         parameters: &[String],
         replacement: &str,
     ) -> Option<Arc<MacroLocalBindingTemplate>> {
-        let key = (binding.source.clone(), binding.declaration_byte);
-        if let Some(template) = self
-            .macro_local_binding_templates
-            .lock()
-            .expect("C++ macro local-binding cache poisoned")
-            .get(&key)
-        {
-            return template.clone();
-        }
-        let template = (|| {
-            let body = self.parsed_macro_replacement_body(&key, parameters, replacement)?;
-            let sentinel = body.source.as_str();
-            let statements = body.statements()?;
-            let declaration = single_named_child_matching(statements, |child| !child.is_extra())?;
-            if declaration.kind() != "declaration" {
-                return None;
-            }
-            let type_node = declaration
-                .child_by_field_name("type")
-                .or_else(|| first_type_child(declaration))?;
-            let declarator = declaration.child_by_field_name("declarator").or_else(|| {
-                let mut cursor = declaration.walk();
-                declaration.named_children(&mut cursor).find_map(|child| {
-                    if child.kind() == "init_declarator" {
-                        child.child_by_field_name("declarator")
-                    } else {
-                        is_declarator_node(child).then_some(child)
-                    }
-                })
-            })?;
-            let name = extract_variable_name(declarator, sentinel)?;
-            let pointer_depth =
-                declared_name_binding(declaration, type_node, &name, sentinel)?.pointer_depth;
-            let type_text = node_text(type_node, sentinel).trim();
-            let declared_type = parameters
-                .iter()
-                .position(|parameter| parameter == type_text)
-                .map(MacroLocalBindingTypeTemplate::Parameter)
-                .unwrap_or_else(|| MacroLocalBindingTypeTemplate::Fixed(type_text.to_string()));
-            Some(Arc::new(MacroLocalBindingTemplate {
-                name,
-                declared_type,
-                pointer_depth,
-            }))
-        })();
-        self.macro_local_binding_templates
-            .lock()
-            .expect("C++ macro local-binding cache poisoned")
-            .insert(key, template.clone());
-        template
+        visibility_memo_value(
+            &self.macro_local_binding_templates,
+            &self.reads,
+            (binding.source.clone(), binding.declaration_byte),
+            || {
+                let key = (binding.source.clone(), binding.declaration_byte);
+                let body = self.parsed_macro_replacement_body(&key, parameters, replacement)?;
+                let sentinel = body.source.as_str();
+                let statements = body.statements()?;
+                let declaration =
+                    single_named_child_matching(statements, |child| !child.is_extra())?;
+                if declaration.kind() != "declaration" {
+                    return None;
+                }
+                let type_node = declaration
+                    .child_by_field_name("type")
+                    .or_else(|| first_type_child(declaration))?;
+                let declarator = declaration.child_by_field_name("declarator").or_else(|| {
+                    let mut cursor = declaration.walk();
+                    declaration.named_children(&mut cursor).find_map(|child| {
+                        if child.kind() == "init_declarator" {
+                            child.child_by_field_name("declarator")
+                        } else {
+                            is_declarator_node(child).then_some(child)
+                        }
+                    })
+                })?;
+                let name = extract_variable_name(declarator, sentinel)?;
+                let pointer_depth =
+                    declared_name_binding(declaration, type_node, &name, sentinel)?.pointer_depth;
+                let type_text = node_text(type_node, sentinel).trim();
+                let declared_type = parameters
+                    .iter()
+                    .position(|parameter| parameter == type_text)
+                    .map(MacroLocalBindingTypeTemplate::Parameter)
+                    .unwrap_or_else(|| MacroLocalBindingTypeTemplate::Fixed(type_text.to_string()));
+                Some(Arc::new(MacroLocalBindingTemplate {
+                    name,
+                    declared_type,
+                    pointer_depth,
+                }))
+            },
+        )
     }
 
     /// The parsed replacement body of the function-like macro `definition`
@@ -3216,38 +3282,30 @@ impl<'a> VisibilityIndex<'a> {
         parameters: &[String],
         replacement: &str,
     ) -> Option<Arc<ParsedReplacementBody>> {
-        if let Some(body) = self
-            .macro_replacement_bodies
-            .lock()
-            .expect("C++ macro replacement body cache poisoned")
-            .get(key)
-        {
-            return body.clone();
-        }
-        let body = (|| {
-            if replacement.trim().is_empty() {
-                return None;
-            }
-            let (source, tree, original_offsets) =
-                Self::parse_macro_replacement_body(replacement, parameters)?;
-            let body = ParsedReplacementBody {
-                source,
-                tree,
-                body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
-                parameters: parameters.to_vec(),
-                original_offsets,
-            };
-            body.statements()?;
-            if body.expands_variadic_arguments() {
-                return None;
-            }
-            Some(Arc::new(body))
-        })();
-        self.macro_replacement_bodies
-            .lock()
-            .expect("C++ macro replacement body cache poisoned")
-            .insert(key.clone(), body.clone());
-        body
+        visibility_memo_value(
+            &self.macro_replacement_bodies,
+            &self.reads,
+            key.clone(),
+            || {
+                if replacement.trim().is_empty() {
+                    return None;
+                }
+                let (source, tree, original_offsets) =
+                    Self::parse_macro_replacement_body(replacement, parameters)?;
+                let body = ParsedReplacementBody {
+                    source,
+                    tree,
+                    body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
+                    parameters: parameters.to_vec(),
+                    original_offsets,
+                };
+                body.statements()?;
+                if body.expands_variadic_arguments() {
+                    return None;
+                }
+                Some(Arc::new(body))
+            },
+        )
     }
 
     /// Parse a replacement while preserving a map from the parse buffer back
@@ -3395,45 +3453,37 @@ impl<'a> VisibilityIndex<'a> {
         parameters: &[String],
         replacement: &str,
     ) -> Option<Arc<[usize]>> {
-        if let Some(indices) = self
-            .macro_type_parameters
-            .lock()
-            .expect("C++ macro type-parameter cache poisoned")
-            .get(key)
-        {
-            return indices.clone();
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        self.macro_replacement_parse_count
-            .fetch_add(1, Ordering::Relaxed);
-        let indices = (|| {
-            if replacement.trim().is_empty() {
-                return None;
-            }
-            // Keep this parser permissive. Type-role extraction predates the
-            // replacement-body model and deliberately survives unrelated
-            // token-pasting or recovery elsewhere in a production macro.
-            let parsed = parse_sentinel(
-                MACRO_BODY_SENTINEL_PREFIX,
-                SentinelInput::replacement(replacement),
-                MACRO_BODY_SENTINEL_SUFFIX,
-            );
-            let (source, tree, original_offsets) =
-                (parsed.source, parsed.tree, parsed.original_offsets);
-            let body = ParsedReplacementBody {
-                source,
-                tree,
-                body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
-                parameters: parameters.to_vec(),
-                original_offsets: original_offsets.into_boxed_slice(),
-            };
-            macro_replacement_type_parameters(&body, parameters).map(Arc::from)
-        })();
-        self.macro_type_parameters
-            .lock()
-            .expect("C++ macro type-parameter cache poisoned")
-            .insert(key.clone(), indices.clone());
-        indices
+        visibility_memo_value(
+            &self.macro_type_parameters,
+            &self.reads,
+            key.clone(),
+            || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.macro_replacement_parse_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if replacement.trim().is_empty() {
+                    return None;
+                }
+                // Keep this parser permissive. Type-role extraction predates the
+                // replacement-body model and deliberately survives unrelated
+                // token-pasting or recovery elsewhere in a production macro.
+                let parsed = parse_sentinel(
+                    MACRO_BODY_SENTINEL_PREFIX,
+                    SentinelInput::replacement(replacement),
+                    MACRO_BODY_SENTINEL_SUFFIX,
+                );
+                let (source, tree, original_offsets) =
+                    (parsed.source, parsed.tree, parsed.original_offsets);
+                let body = ParsedReplacementBody {
+                    source,
+                    tree,
+                    body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
+                    parameters: parameters.to_vec(),
+                    original_offsets: original_offsets.into_boxed_slice(),
+                };
+                macro_replacement_type_parameters(&body, parameters).map(Arc::from)
+            },
+        )
     }
 
     fn decode_macro_definition(node: Node<'_>, source: &str) -> MacroDefinition {
@@ -3480,40 +3530,32 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn macro_event_cell(&self, file: &ProjectFile) -> MacroEventCell {
-        clone_or_default_file_cell(
-            &self.macro_event_cells,
-            file,
-            "C++ macro event cache poisoned",
-        )
+        visibility_memo_value(&self.macro_event_cells, &self.reads, file.clone(), || {
+            Arc::new(VisibilityCell::new(self.reads.clone()))
+        })
     }
 
     fn file_defines_macro_name(&self, file: &ProjectFile, name: &str) -> bool {
-        if let Some(names) = self
-            .macro_event_name_sets
-            .lock()
-            .expect("C++ macro event-name cache poisoned")
-            .get(file)
-            .cloned()
-        {
-            return names.contains(name);
-        }
-        let cell = self.macro_event_cell(file);
-        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
-        let names = Arc::new(
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    MacroEvent::Define { name, .. } => Some(name.clone()),
-                    MacroEvent::Undef { .. }
-                    | MacroEvent::Include { .. }
-                    | MacroEvent::Invalidate { .. } => None,
-                })
-                .collect(),
+        let names = visibility_memo_value(
+            &self.macro_event_name_sets,
+            &self.reads,
+            file.clone(),
+            || {
+                let cell = self.macro_event_cell(file);
+                let events = cell.get_or_init(|| Arc::from(self.collect_macro_events(file)));
+                Arc::new(
+                    events
+                        .iter()
+                        .filter_map(|event| match event {
+                            MacroEvent::Define { name, .. } => Some(name.clone()),
+                            MacroEvent::Undef { .. }
+                            | MacroEvent::Include { .. }
+                            | MacroEvent::Invalidate { .. } => None,
+                        })
+                        .collect(),
+                )
+            },
         );
-        self.macro_event_name_sets
-            .lock()
-            .expect("C++ macro event-name cache poisoned")
-            .insert(file.clone(), Arc::clone(&names));
         names.contains(name)
     }
 
@@ -3521,10 +3563,11 @@ impl<'a> VisibilityIndex<'a> {
         &self,
         file: &ProjectFile,
     ) -> MacroEnvironmentCheckpointCell {
-        clone_or_default_file_cell(
+        visibility_memo_value(
             &self.macro_environment_checkpoints,
-            file,
-            "C++ macro environment checkpoint cache poisoned",
+            &self.reads,
+            file.clone(),
+            || Arc::new(VisibilityCell::new(self.reads.clone())),
         )
     }
 
@@ -3538,11 +3581,11 @@ impl<'a> VisibilityIndex<'a> {
         self.macro_environment_request_count
             .fetch_add(1, Ordering::Relaxed);
         let cell = self.macro_event_cell(file);
-        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let events = cell.get_or_init(|| Arc::from(self.collect_macro_events(file)));
         let frontier = events.partition_point(|event| event.byte() < before_byte);
         let checkpoint_cell = self.macro_environment_checkpoint_cell(file);
-        let checkpoints =
-            checkpoint_cell.get_or_init(|| self.build_macro_environment_checkpoints(file, events));
+        let checkpoints = checkpoint_cell
+            .get_or_init(|| Arc::new(self.build_macro_environment_checkpoints(file, &events)));
         let checkpoint = checkpoints.at_or_before(frontier);
         if checkpoint.frontier == frontier {
             return Arc::clone(&checkpoint.environment);
@@ -3960,8 +4003,8 @@ impl<'a> VisibilityIndex<'a> {
             MacroIncludeProtection::None => {}
         }
         let cell = self.macro_event_cell(file);
-        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
-        for event in events {
+        let events = cell.get_or_init(|| Arc::from(self.collect_macro_events(file)));
+        for event in events.iter() {
             self.apply_macro_event(file, event, environment, include_stack);
         }
         include_stack.remove(file);
@@ -4304,8 +4347,8 @@ impl<'a> VisibilityIndex<'a> {
             MacroIncludeProtection::None => {}
         }
         let cell = self.macro_event_cell(file);
-        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
-        for event in events {
+        let events = cell.get_or_init(|| Arc::from(self.collect_macro_events(file)));
+        for event in events.iter() {
             #[cfg(any(test, feature = "test-support"))]
             self.macro_event_application_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -4381,25 +4424,31 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn macro_include_protection(&self, file: &ProjectFile) -> MacroIncludeProtection {
-        let cell = self
+        let value = self
             .macro_include_protection_cells
-            .lock()
-            .expect("C++ include protection cache poisoned")
-            .entry(file.clone())
-            .or_default()
-            .clone();
-        cell.get_or_init(|| {
-            self.cpp.prepared_syntax(self.token, file).map_or(
-                MacroIncludeProtection::None,
-                |prepared| {
-                    top_level_macro_include_protection(
-                        prepared.tree().root_node(),
-                        prepared.source(),
-                    )
-                },
-            )
-        })
-        .clone()
+            .read(&self.reads.memo_attribution(), |cells, capture| {
+                let cell = cells
+                    .lock()
+                    .expect("C++ include protection cache poisoned")
+                    .entry(file.clone())
+                    .or_insert_with(|| Arc::new(PoolSafeMemo::new()))
+                    .clone();
+                Ok::<_, std::convert::Infallible>(cell.get_or_build_pool_independent(|| {
+                    capture.build(|| {
+                        self.cpp.prepared_syntax(self.token, file).map_or(
+                            MacroIncludeProtection::None,
+                            |prepared| {
+                                top_level_macro_include_protection(
+                                    prepared.tree().root_node(),
+                                    prepared.source(),
+                                )
+                            },
+                        )
+                    })
+                }))
+            })
+            .expect("infallible include protection build");
+        (*value).clone()
     }
 
     fn collect_macro_events(&self, file: &ProjectFile) -> Vec<MacroEvent> {
@@ -4407,19 +4456,19 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn ordinary_type_import_cell(&self, file: &ProjectFile) -> OrdinaryTypeImportCell {
-        self.ordinary_type_import_cells
-            .lock()
-            .expect("C++ ordinary type import cache poisoned")
-            .entry(file.clone())
-            .or_insert_with(|| Arc::new(EffectiveUsingIndex::new(file.clone())))
-            .clone()
+        visibility_memo_value(
+            &self.ordinary_type_import_cells,
+            &self.reads,
+            file.clone(),
+            || Arc::new(EffectiveUsingIndex::new(file.clone(), self.reads.clone())),
+        )
     }
 
     pub fn project_using_index(
         &self,
         build: impl FnOnce() -> ProjectUsingIndex,
-    ) -> &ProjectUsingIndex {
-        self.project_using_index.get_or_init(build)
+    ) -> Arc<ProjectUsingIndex> {
+        visibility_once_value(&self.project_using_index, &self.reads, || Arc::new(build()))
     }
 
     pub fn all_visible_source_files(&self) -> Vec<ProjectFile> {
@@ -4440,12 +4489,12 @@ impl<'a> VisibilityIndex<'a> {
         &self,
         root: &ProjectFile,
     ) -> super::namespace_alias::NamespaceAliasCell {
-        self.namespace_alias_sites
-            .lock()
-            .expect("C++ namespace alias cache poisoned")
-            .entry(root.clone())
-            .or_default()
-            .clone()
+        visibility_memo_value(
+            &self.namespace_alias_sites,
+            &self.reads,
+            root.clone(),
+            || Arc::new(VisibilityCell::new(self.reads.clone())),
+        )
     }
 
     /// `root` and every source file its include closure makes visible.
@@ -4471,46 +4520,33 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     fn visible_parser_alias_name_is_visible(&self, file: &ProjectFile, name: &str) -> bool {
-        let cached = self
-            .visible_parser_alias_name_sets
-            .read()
-            .expect("visible parser alias-name cache poisoned")
-            .get(file)
-            .cloned();
-        let cell = if let Some(cached) = cached {
-            cached
-        } else {
-            let mut cells = self
-                .visible_parser_alias_name_sets
-                .write()
-                .expect("visible parser alias-name cache poisoned");
-            Arc::clone(
-                cells
-                    .entry(file.clone())
-                    .or_insert_with(|| Arc::new(OnceLock::new())),
-            )
-        };
-        if let Some(names) = cell.get() {
-            return names.contains(name);
-        }
-        let mut names = HashSet::default();
-        let visible_files = self
-            .visible_source_files_by_root
-            .get(file)
-            .cloned()
-            .unwrap_or_else(|| HashSet::from_iter([file.clone()]));
-        for visible_file in visible_files {
-            let Some(aliases) = self.canonical_alias_cell(self.cpp, &visible_file) else {
-                return false;
-            };
-            for alias in aliases.get().expect("published canonical aliases").iter() {
-                names.insert(alias.name.clone());
-            }
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        self.visible_parser_alias_name_set_build_count
-            .fetch_add(1, Ordering::Relaxed);
-        cell.get_or_init(|| names).contains(name)
+        try_visibility_memo_value(
+            &self.visible_parser_alias_name_sets,
+            &self.reads,
+            file.clone(),
+            || {
+                let mut names = HashSet::default();
+                let visible_files = self
+                    .visible_source_files_by_root
+                    .get(file)
+                    .cloned()
+                    .unwrap_or_else(|| HashSet::from_iter([file.clone()]));
+                for visible_file in visible_files {
+                    let aliases = self
+                        .canonical_alias_cell(self.cpp, &visible_file)
+                        .ok_or(())?;
+                    for alias in aliases.get().expect("published canonical aliases").iter() {
+                        names.insert(alias.name.clone());
+                    }
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                self.visible_parser_alias_name_set_build_count
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ()>(Arc::new(names))
+            },
+        )
+        .ok()
+        .is_some_and(|names| names.contains(name))
     }
 
     pub fn parser_alias_name_may_resolve_to_target(
@@ -4522,41 +4558,26 @@ impl<'a> VisibilityIndex<'a> {
         let started = std::time::Instant::now();
         self.parser_alias_fallback_calls
             .fetch_add(1, Ordering::Relaxed);
-        let key = (
-            file.clone(),
-            alias_name.to_string(),
-            logical_symbol_key(target),
+        let matched = visibility_memo_value(
+            &self.parser_alias_target_matches,
+            &self.reads,
+            (
+                file.clone(),
+                alias_name.to_string(),
+                logical_symbol_key(target),
+            ),
+            || {
+                any_visible_source_file_matches(
+                    &self.visible_source_files_by_root,
+                    file,
+                    |visible_file| {
+                        self.parser_alias_fallback_files
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.file_alias_matches(self.cpp, visible_file, alias_name, target)
+                    },
+                )
+            },
         );
-        let cached = self
-            .parser_alias_target_matches
-            .read()
-            .expect("parser alias target-match cache poisoned")
-            .get(&key)
-            .cloned();
-        let cell = if let Some(cached) = cached {
-            cached
-        } else {
-            let mut cells = self
-                .parser_alias_target_matches
-                .write()
-                .expect("parser alias target-match cache poisoned");
-            Arc::clone(
-                cells
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(OnceLock::new())),
-            )
-        };
-        let matched = *cell.get_or_init(|| {
-            any_visible_source_file_matches(
-                &self.visible_source_files_by_root,
-                file,
-                |visible_file| {
-                    self.parser_alias_fallback_files
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.file_alias_matches(self.cpp, visible_file, alias_name, target)
-                },
-            )
-        });
         self.parser_alias_fallback_elapsed_micros.fetch_add(
             started.elapsed().as_micros().min(usize::MAX as u128) as usize,
             Ordering::Relaxed,
@@ -4651,66 +4672,58 @@ impl<'a> VisibilityIndex<'a> {
             return None;
         }
         let cache_key = (target.source().clone(), macro_name.clone());
-        if let Some(cached) = self
-            .callable_parameter_macro_arities
-            .lock()
-            .expect("C++ callable parameter-macro arity cache poisoned")
-            .get(&cache_key)
-            .copied()
-        {
-            return cached;
-        }
-        let mut visible_files = HashSet::default();
-        collect_include_closure(
-            &self.cpp_source(),
-            self.cpp.include_target_index(),
-            target.source(),
-            &mut visible_files,
-            None,
-        );
-        let mut arities = Vec::new();
-        for visible_file in visible_files {
-            let cell = self.macro_event_cell(&visible_file);
-            for event in
-                cell.get_or_init(|| self.collect_macro_events(&visible_file).into_boxed_slice())
-            {
-                let MacroEvent::Define { name, binding, .. } = event else {
-                    continue;
-                };
-                if name != macro_name {
-                    continue;
+        visibility_memo_value(
+            &self.callable_parameter_macro_arities,
+            &self.reads,
+            cache_key,
+            || {
+                let mut visible_files = HashSet::default();
+                collect_include_closure(
+                    &self.cpp_source(),
+                    &self.cpp.include_target_index(),
+                    target.source(),
+                    &mut visible_files,
+                    None,
+                );
+                let mut arities = Vec::new();
+                for visible_file in visible_files {
+                    let cell = self.macro_event_cell(&visible_file);
+                    for event in cell
+                        .get_or_init(|| Arc::from(self.collect_macro_events(&visible_file)))
+                        .iter()
+                    {
+                        let MacroEvent::Define { name, binding, .. } = event else {
+                            continue;
+                        };
+                        if name != macro_name {
+                            continue;
+                        }
+                        let MacroDefinition::Object { replacement } = &binding.definition else {
+                            continue;
+                        };
+                        let Some(arity) = parse_macro_parameter_list_arity(replacement) else {
+                            continue;
+                        };
+                        if !arities.contains(&arity) {
+                            arities.push(arity);
+                        }
+                    }
                 }
-                let MacroDefinition::Object { replacement } = &binding.definition else {
-                    continue;
-                };
-                let Some(arity) = parse_macro_parameter_list_arity(replacement) else {
-                    continue;
-                };
-                if !arities.contains(&arity) {
-                    arities.push(arity);
-                }
-            }
-        }
-        let resolved = (|| {
-            let required = arities
-                .iter()
-                .filter_map(|arity| (0..=arity.total()).find(|count| arity.accepts(*count)))
-                .min()?;
-            let total = arities.iter().map(|arity| arity.total()).max()?;
-            let repeated = arities
-                .iter()
-                .any(|arity| arity.accepts(arity.total().saturating_add(1)));
-            // Preprocessor conditions can leave more than one object-like parameter
-            // bundle active in the target header's include closure. Preserve their
-            // conservative callable envelope instead of choosing whichever definition
-            // happened to be visited first.
-            Some(CallableArity::new(required, total, repeated))
-        })();
-        self.callable_parameter_macro_arities
-            .lock()
-            .expect("C++ callable parameter-macro arity cache poisoned")
-            .insert(cache_key, resolved);
-        resolved
+                let required = arities
+                    .iter()
+                    .filter_map(|arity| (0..=arity.total()).find(|count| arity.accepts(*count)))
+                    .min()?;
+                let total = arities.iter().map(|arity| arity.total()).max()?;
+                let repeated = arities
+                    .iter()
+                    .any(|arity| arity.accepts(arity.total().saturating_add(1)));
+                // Preprocessor conditions can leave more than one object-like parameter
+                // bundle active in the target header's include closure. Preserve their
+                // conservative callable envelope instead of choosing whichever definition
+                // happened to be visited first.
+                Some(CallableArity::new(required, total, repeated))
+            },
+        )
     }
 
     pub fn include_activation_for_source(
@@ -4720,33 +4733,24 @@ impl<'a> VisibilityIndex<'a> {
         prepared: &PreparedSyntaxTree,
         donor_source: &ProjectFile,
     ) -> Option<usize> {
-        let key = (file.clone(), donor_source.clone());
-        if let Some(cached) = self
-            .include_activation_cells
-            .lock()
-            .expect("C++ include activation cache poisoned")
-            .get(&key)
-            .copied()
-        {
-            return cached;
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        self.include_activation_build_count
-            .fetch_add(1, Ordering::Relaxed);
-        let effective = OnceCell::new();
-        let activation =
-            find_include_activation(cpp, self.token, file, prepared, donor_source, &|| {
-                effective
-                    .get_or_init(|| {
-                        self.effective_reference_guards(file, Some(&HashSet::default()))
-                    })
-                    .as_ref()
-            });
-        let mut cells = self
-            .include_activation_cells
-            .lock()
-            .expect("C++ include activation cache poisoned");
-        *cells.entry(key).or_insert(activation)
+        visibility_memo_value(
+            &self.include_activation_cells,
+            &self.reads,
+            (file.clone(), donor_source.clone()),
+            || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.include_activation_build_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let effective = OnceCell::new();
+                find_include_activation(cpp, self.token, file, prepared, donor_source, &|| {
+                    effective
+                        .get_or_init(|| {
+                            self.effective_reference_guards(file, Some(&HashSet::default()))
+                        })
+                        .as_ref()
+                })
+            },
+        )
     }
 
     pub fn conditional_include_projections_for_source(
@@ -4756,37 +4760,35 @@ impl<'a> VisibilityIndex<'a> {
         donor_source: &ProjectFile,
     ) -> Arc<[ConditionalIncludeProjection]> {
         static EMPTY: OnceLock<Arc<[ConditionalIncludeProjection]>> = OnceLock::new();
-        let cell = self
-            .conditional_include_projection_cells
-            .lock()
-            .expect("C++ conditional include projection cache poisoned")
-            .entry(file.clone())
-            .or_insert_with(|| Arc::new(PoolSafeMemo::new()))
-            .clone();
-        let index = cell.get_or_build_pool_independent(|| {
-            #[cfg(any(test, feature = "test-support"))]
-            self.conditional_include_projection_index_build_count
-                .fetch_add(1, Ordering::Relaxed);
-            let effective = OnceCell::new();
-            find_conditional_include_projection_index(
-                self.cpp,
-                self.token,
-                file,
-                prepared,
-                &|| {
-                    effective
-                        .get_or_init(|| {
-                            self.effective_reference_guards(file, Some(&HashSet::default()))
-                        })
-                        .as_ref()
-                },
-                &|| {
-                    #[cfg(any(test, feature = "test-support"))]
-                    self.conditional_include_projection_state_count
-                        .fetch_add(1, Ordering::Relaxed);
-                },
-            )
-        });
+        let index = visibility_memo_value(
+            &self.conditional_include_projection_cells,
+            &self.reads,
+            file.clone(),
+            || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.conditional_include_projection_index_build_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let effective = OnceCell::new();
+                Arc::new(find_conditional_include_projection_index(
+                    self.cpp,
+                    self.token,
+                    file,
+                    prepared,
+                    &|| {
+                        effective
+                            .get_or_init(|| {
+                                self.effective_reference_guards(file, Some(&HashSet::default()))
+                            })
+                            .as_ref()
+                    },
+                    &|| {
+                        #[cfg(any(test, feature = "test-support"))]
+                        self.conditional_include_projection_state_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    },
+                ))
+            },
+        );
         index
             .get(donor_source)
             .cloned()
@@ -4796,8 +4798,10 @@ impl<'a> VisibilityIndex<'a> {
     fn include_language_guard_is_stable(&self, file: &ProjectFile) -> bool {
         let mut macro_events = |file: &ProjectFile| {
             let cell = self.macro_event_cell(file);
-            cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice())
-                .clone()
+            cell.get_or_init(|| Arc::from(self.collect_macro_events(file)))
+                .as_ref()
+                .to_vec()
+                .into_boxed_slice()
         };
         include_language_guard_is_stable_with(
             self.cpp,
@@ -5103,25 +5107,28 @@ impl<'a> VisibilityIndex<'a> {
         candidate: &CodeUnit,
         reference_byte: usize,
     ) -> Option<CallableArity> {
-        let key = (file.clone(), logical_symbol_key(candidate));
-        let cell = self
-            .callable_reference_specs
-            .lock()
-            .expect("C++ callable reference-spec cache poisoned")
-            .entry(key)
-            .or_default()
-            .clone();
-        let spec = cell.get_or_init(|| {
-            let prepared = self.cpp.prepared_syntax(self.token, file)?;
-            let spec = TargetSpec::from_target(analyzer, candidate)?;
-            let spec = spec
-                .with_visible_callable_arities(analyzer, self.cpp, self, file, prepared.as_ref())
-                .into_owned();
-            #[cfg(any(test, feature = "test-support"))]
-            self.callable_reference_spec_build_count
-                .fetch_add(1, Ordering::Relaxed);
-            Some(spec)
-        });
+        let spec = visibility_memo_value(
+            &self.callable_reference_specs,
+            &self.reads,
+            (file.clone(), logical_symbol_key(candidate)),
+            || {
+                let prepared = self.cpp.prepared_syntax(self.token, file)?;
+                let spec = TargetSpec::from_target(analyzer, candidate)?;
+                let spec = spec
+                    .with_visible_callable_arities(
+                        analyzer,
+                        self.cpp,
+                        self,
+                        file,
+                        prepared.as_ref(),
+                    )
+                    .into_owned();
+                #[cfg(any(test, feature = "test-support"))]
+                self.callable_reference_spec_build_count
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(Arc::new(spec))
+            },
+        );
         spec.as_ref()?.callable_arity_at(reference_byte)
     }
 
@@ -5287,20 +5294,12 @@ impl<'a> VisibilityIndex<'a> {
     /// which empties the intersection. A file nothing covers or reaches has
     /// no facts and every check runs on source structure alone.
     pub fn compile_proven_guards(&self, file: &ProjectFile) -> Arc<HashSet<PreprocessorGuard>> {
-        if let Some(cached) = self
-            .compile_proven_guard_cells
-            .lock()
-            .expect("C++ compile-proven guard cache poisoned")
-            .get(file)
-        {
-            return Arc::clone(cached);
-        }
-        let proven = Arc::new(compile_proven_guard_facts(self.cpp, file));
-        self.compile_proven_guard_cells
-            .lock()
-            .expect("C++ compile-proven guard cache poisoned")
-            .insert(file.clone(), Arc::clone(&proven));
-        proven
+        visibility_memo_value(
+            &self.compile_proven_guard_cells,
+            &self.reads,
+            file.clone(),
+            || Arc::new(compile_proven_guard_facts(self.cpp, file)),
+        )
     }
 
     /// The rule a conditional `#include` path's guards face on the way to a
@@ -5313,25 +5312,18 @@ impl<'a> VisibilityIndex<'a> {
     /// the answer depends on nothing else, and the callers ask it once per
     /// candidate.
     fn include_path_admission(&self, file: &ProjectFile) -> IncludePathAdmission {
-        if let Some(cached) = self
-            .include_path_admission_cells
-            .lock()
-            .expect("C++ include-path admission cache poisoned")
-            .get(file)
-            .copied()
-        {
-            return cached;
-        }
-        let admission = if self.compile_context_is_absent(file) {
-            IncludePathAdmission::Compatible
-        } else {
-            IncludePathAdmission::Proven
-        };
-        self.include_path_admission_cells
-            .lock()
-            .expect("C++ include-path admission cache poisoned")
-            .insert(file.clone(), admission);
-        admission
+        visibility_memo_value(
+            &self.include_path_admission_cells,
+            &self.reads,
+            file.clone(),
+            || {
+                if self.compile_context_is_absent(file) {
+                    IncludePathAdmission::Compatible
+                } else {
+                    IncludePathAdmission::Proven
+                }
+            },
+        )
     }
 
     /// Whether no compile data covers the compilations of `file`: it has no
@@ -6205,7 +6197,7 @@ impl<'a> VisibilityIndex<'a> {
             return true;
         }
         let cell = self.macro_event_cell(file);
-        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let events = cell.get_or_init(|| Arc::from(self.collect_macro_events(file)));
         let mut visited = HashSet::from_iter([file.clone()]);
         !events.iter().any(|event| {
             event.byte() >= start_byte
@@ -6244,7 +6236,7 @@ impl<'a> VisibilityIndex<'a> {
             return false;
         }
         let cell = self.macro_event_cell(file);
-        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let events = cell.get_or_init(|| Arc::from(self.collect_macro_events(file)));
         events
             .iter()
             .any(|event| self.macro_event_may_mutate_guards(event, guards, visited))
@@ -6626,20 +6618,12 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         candidate: &CodeUnit,
     ) -> Option<CppCTagKind> {
-        if let Some(kind) = self
-            .c_tag_kind_cache
-            .lock()
-            .expect("C tag kind cache poisoned")
-            .get(candidate)
-        {
-            return *kind;
-        }
-        let kind = indexed_c_tag_kind(analyzer, candidate);
-        self.c_tag_kind_cache
-            .lock()
-            .expect("C tag kind cache poisoned")
-            .insert(candidate.clone(), kind);
-        kind
+        visibility_memo_value(
+            &self.c_tag_kind_cache,
+            &self.reads,
+            candidate.clone(),
+            || indexed_c_tag_kind(analyzer, candidate),
+        )
     }
 
     fn cached_unique_c_tag_complete_definition(
@@ -6648,35 +6632,29 @@ impl<'a> VisibilityIndex<'a> {
         target: &CodeUnit,
         target_tag: CppCTagKind,
     ) -> Option<CodeUnit> {
-        if let Some(definition) = self
-            .c_tag_complete_definition_cache
-            .lock()
-            .expect("C tag complete-definition cache poisoned")
-            .get(target)
-        {
-            return definition.clone();
-        }
-        let complete_definitions = analyzer
-            .definitions(&target.fq_name())
-            .filter(|candidate| {
-                candidate.is_class()
-                    && !declared_type_alias(analyzer, candidate)
-                    && is_c_source_file(candidate.source())
-                    && analyzer.parent_of(candidate).is_none()
-                    && cpp_class_declaration_strength(analyzer, candidate)
-                        == CppClassDeclarationStrength::Full
-                    && self.cached_c_tag_kind(analyzer, candidate) == Some(target_tag)
-            })
-            .collect::<HashSet<_>>();
-        let definition = (complete_definitions.len() == 1)
-            .then(|| complete_definitions.into_iter().next())
-            .flatten()
-            .filter(|candidate| same_visible_symbol(candidate, target));
-        self.c_tag_complete_definition_cache
-            .lock()
-            .expect("C tag complete-definition cache poisoned")
-            .insert(target.clone(), definition.clone());
-        definition
+        visibility_memo_value(
+            &self.c_tag_complete_definition_cache,
+            &self.reads,
+            target.clone(),
+            || {
+                let complete_definitions = analyzer
+                    .definitions(&target.fq_name())
+                    .filter(|candidate| {
+                        candidate.is_class()
+                            && !declared_type_alias(analyzer, candidate)
+                            && is_c_source_file(candidate.source())
+                            && analyzer.parent_of(candidate).is_none()
+                            && cpp_class_declaration_strength(analyzer, candidate)
+                                == CppClassDeclarationStrength::Full
+                            && self.cached_c_tag_kind(analyzer, candidate) == Some(target_tag)
+                    })
+                    .collect::<HashSet<_>>();
+                (complete_definitions.len() == 1)
+                    .then(|| complete_definitions.into_iter().next())
+                    .flatten()
+                    .filter(|candidate| same_visible_symbol(candidate, target))
+            },
+        )
     }
 
     pub fn c_tag_declaration_family_matches_target(
@@ -8882,20 +8860,9 @@ impl<'a> VisibilityIndex<'a> {
         } else {
             (right.clone(), left.clone())
         };
-        if let Some(cached) = self
-            .class_definition_agreements
-            .lock()
-            .expect("C++ class definition agreement cache poisoned")
-            .get(&key)
-        {
-            return *cached;
-        }
-        let agree = self.class_definitions_agree(analyzer, left, right);
-        self.class_definition_agreements
-            .lock()
-            .expect("C++ class definition agreement cache poisoned")
-            .insert(key, agree);
-        agree
+        visibility_memo_value(&self.class_definition_agreements, &self.reads, key, || {
+            self.class_definitions_agree(analyzer, left, right)
+        })
     }
 
     fn class_definitions_agree(
@@ -9252,50 +9219,45 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         name: &StructuredTypeName,
     ) -> Option<CodeUnit> {
-        // The same parameter-name pair is commonly compared once for every
-        // physical declaration in a candidate set. Keep the index lookup under
-        // the cache lock so concurrent workers cannot all miss the same key
-        // and repeat the workspace candidate filter. `None` is a meaningful
-        // result too: unresolved and ambiguous names must remain unresolved on
-        // every later comparison.
-        let mut cache = self
-            .comparable_name_declarations
-            .lock()
-            .expect("C++ comparable name declaration cache poisoned");
-        if let Some(cached) = cache.get(name) {
-            return cached.clone();
-        }
-        let interner = segment_interner();
-        let identifier = name.path().last()?;
-        let candidates_by_identifier = self.cpp.visibility_identifier_candidates(identifier);
-        let first_depth = if name.is_absolute() {
-            0
-        } else {
-            name.lexical_scope().len()
-        };
-        let mut resolved = None;
-        for depth in (0..=first_depth).rev() {
-            let mut structured = FqName::new();
-            for component in name.lexical_scope()[..depth].iter().chain(name.path()) {
-                structured.push(interner.intern(component, SegmentKind::Unknown));
-            }
-            let mut candidates = candidates_by_identifier
-                .iter()
-                .filter(|unit| unit.fq().same_segment_texts(&structured))
-                .filter(|unit| {
-                    unit.kind() == CodeUnitType::Class || declared_type_alias(analyzer, unit)
-                })
-                .cloned();
-            let Some(first) = candidates.next() else {
-                continue;
-            };
-            resolved = candidates
-                .all(|unit| same_logical_symbol(&unit, &first))
-                .then_some(first);
-            break;
-        }
-        cache.insert(name.clone(), resolved.clone());
-        resolved
+        visibility_memo_value(
+            &self.comparable_name_declarations,
+            &self.reads,
+            name.clone(),
+            || {
+                let interner = segment_interner();
+                let identifier = name.path().last()?;
+                let candidates_by_identifier =
+                    self.cpp.visibility_identifier_candidates(identifier);
+                let first_depth = if name.is_absolute() {
+                    0
+                } else {
+                    name.lexical_scope().len()
+                };
+                let mut resolved = None;
+                for depth in (0..=first_depth).rev() {
+                    let mut structured = FqName::new();
+                    for component in name.lexical_scope()[..depth].iter().chain(name.path()) {
+                        structured.push(interner.intern(component, SegmentKind::Unknown));
+                    }
+                    let mut candidates = candidates_by_identifier
+                        .iter()
+                        .filter(|unit| unit.fq().same_segment_texts(&structured))
+                        .filter(|unit| {
+                            unit.kind() == CodeUnitType::Class
+                                || declared_type_alias(analyzer, unit)
+                        })
+                        .cloned();
+                    let Some(first) = candidates.next() else {
+                        continue;
+                    };
+                    resolved = candidates
+                        .all(|unit| same_logical_symbol(&unit, &first))
+                        .then_some(first);
+                    break;
+                }
+                resolved
+            },
+        )
     }
 
     /// The comparison inputs of one callable declaration, extracted once.
@@ -9308,23 +9270,15 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         unit: &CodeUnit,
     ) -> Option<Arc<ExtractedComparable>> {
-        if let Some(cached) = self
-            .callable_comparables
-            .lock()
-            .expect("C++ callable comparable cache poisoned")
-            .get(unit)
-            .cloned()
-        {
-            return cached;
-        }
-        let extracted = self
-            .extract_callable_comparable(analyzer, unit)
-            .map(Arc::new);
-        self.callable_comparables
-            .lock()
-            .expect("C++ callable comparable cache poisoned")
-            .insert(unit.clone(), extracted.clone());
-        extracted
+        visibility_memo_value(
+            &self.callable_comparables,
+            &self.reads,
+            unit.clone(),
+            || {
+                self.extract_callable_comparable(analyzer, unit)
+                    .map(Arc::new)
+            },
+        )
     }
 
     fn extract_callable_comparable(
@@ -9409,32 +9363,24 @@ impl<'a> VisibilityIndex<'a> {
         cpp: &dyn CppSource,
         file: &ProjectFile,
     ) -> Option<Arc<OnceLock<Box<[CppAlias]>>>> {
-        let cell = {
-            let mut cells = self.alias_cells.lock().expect("alias cell map lock");
-            Arc::clone(
-                cells
+        try_visibility_memo_value(&self.alias_cells, &self.reads, file.clone(), || {
+            let aliases = aliases_from_canonical_source(cpp, self.token, file).ok_or(())?;
+            self.parser_alias_source_parses
+                .fetch_add(1, Ordering::Relaxed);
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                *self
+                    .alias_source_parse_counts
+                    .lock()
+                    .expect("alias source parse count lock")
                     .entry(file.clone())
-                    .or_insert_with(|| Arc::new(OnceLock::new())),
-            )
-        };
-        if cell.get().is_none() {
-            let aliases = aliases_from_canonical_source(cpp, self.token, file)?;
-            cell.get_or_init(|| {
-                self.parser_alias_source_parses
-                    .fetch_add(1, Ordering::Relaxed);
-                #[cfg(any(test, feature = "test-support"))]
-                {
-                    *self
-                        .alias_source_parse_counts
-                        .lock()
-                        .expect("alias source parse count lock")
-                        .entry(file.clone())
-                        .or_default() += 1;
-                }
-                aliases.into_boxed_slice()
-            });
-        }
-        Some(cell)
+                    .or_default() += 1;
+            }
+            let cell = Arc::new(OnceLock::new());
+            cell.get_or_init(|| aliases.into_boxed_slice());
+            Ok::<_, ()>(cell)
+        })
+        .ok()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -9661,98 +9607,89 @@ impl<'a> VisibilityIndex<'a> {
         source: &str,
     ) -> Option<Vec<String>> {
         let key = (file.clone(), class.start_byte(), class.end_byte());
-        if let Some(cached) = self
-            .indexed_structural_class_scopes
-            .lock()
-            .expect("C++ indexed structural-class scope cache poisoned")
-            .get(&key)
-            .cloned()
-        {
-            return cached;
-        }
-        let resolved = (|| {
-            let name = class.child_by_field_name("name")?;
-            let identifier = if name.kind() == "template_type" {
-                node_text(name.child_by_field_name("name")?, source).to_string()
-            } else {
-                let mut components = Vec::new();
-                append_cpp_name_components(name, source, &mut components)?;
-                components.last()?.clone()
-            };
-            let visible = self
-                .visible_identifier_candidates(file, &identifier)
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut visible = visible;
-            for candidate in
-                self.visible_by_file
-                    .get(file)
-                    .into_iter()
-                    .flatten()
-                    .filter(|candidate| {
-                        self.cpp_template_metadata
-                            .get(candidate)
-                            .is_some_and(|metadata| metadata.primary_name == identifier)
-                    })
-            {
-                if !visible
-                    .iter()
-                    .any(|existing| same_logical_symbol(existing, candidate))
-                {
-                    visible.push(candidate.clone());
-                }
-            }
-            // Built once per call rather than per candidate; `cpp_source` rebuilds
-            // the five-field source from the same `self.cpp` on every call.
-            let cpp_source = self.cpp_source();
-            let candidates = visible
-                .iter()
-                .filter(|candidate| {
-                    candidate.source() == file
-                        && candidate.is_class()
-                        && !declared_type_alias(&cpp_source, candidate)
-                        && self.cpp.ranges(candidate).iter().any(|range| {
-                            range.start_byte <= class.start_byte()
-                                && class.end_byte() <= range.end_byte
+        visibility_memo_value(
+            &self.indexed_structural_class_scopes,
+            &self.reads,
+            key,
+            || {
+                let name = class.child_by_field_name("name")?;
+                let identifier = if name.kind() == "template_type" {
+                    node_text(name.child_by_field_name("name")?, source).to_string()
+                } else {
+                    let mut components = Vec::new();
+                    append_cpp_name_components(name, source, &mut components)?;
+                    components.last()?.clone()
+                };
+                let visible = self
+                    .visible_identifier_candidates(file, &identifier)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut visible = visible;
+                for candidate in
+                    self.visible_by_file
+                        .get(file)
+                        .into_iter()
+                        .flatten()
+                        .filter(|candidate| {
+                            self.cpp_template_metadata
+                                .get(candidate)
+                                .is_some_and(|metadata| metadata.primary_name == identifier)
                         })
-                })
-                .collect::<Vec<_>>();
-            let owner = if name.kind() == "template_type" {
-                let expected = normalize_cpp_whitespace(node_text(name, source));
-                let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
-                let exact = candidates
+                {
+                    if !visible
+                        .iter()
+                        .any(|existing| same_logical_symbol(existing, candidate))
+                    {
+                        visible.push(candidate.clone());
+                    }
+                }
+                // Built once per call rather than per candidate; `cpp_source` rebuilds
+                // the five-field source from the same `self.cpp` on every call.
+                let cpp_source = self.cpp_source();
+                let candidates = visible
                     .iter()
-                    .copied()
                     .filter(|candidate| {
-                        candidate
-                            .fq()
-                            .segments()
-                            .iter()
-                            .rev()
-                            .find_map(|&segment| {
-                                let (text, kind) = interner.resolve(segment);
-                                matches!(
+                        candidate.source() == file
+                            && candidate.is_class()
+                            && !declared_type_alias(&cpp_source, candidate)
+                            && self.cpp.ranges(candidate).iter().any(|range| {
+                                range.start_byte <= class.start_byte()
+                                    && class.end_byte() <= range.end_byte
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let owner = if name.kind() == "template_type" {
+                    let expected = normalize_cpp_whitespace(node_text(name, source));
+                    let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
+                    let exact = candidates
+                        .iter()
+                        .copied()
+                        .filter(|candidate| {
+                            candidate
+                                .fq()
+                                .segments()
+                                .iter()
+                                .rev()
+                                .find_map(|&segment| {
+                                    let (text, kind) = interner.resolve(segment);
+                                    matches!(
                                     kind,
                                     brokk_bifrost_core::analyzer::fq_name::SegmentKind::Type
                                         | brokk_bifrost_core::analyzer::fq_name::SegmentKind::Nested
                                 )
-                                .then_some(text)
-                            })
-                            .is_some_and(|text| text == expected)
-                    })
-                    .collect::<Vec<_>>();
-                unique_logical_type_candidate(exact)
-                    .or_else(|| unique_logical_type_candidate(candidates.clone()))?
-            } else {
-                unique_logical_type_candidate(candidates)?
-            };
-            Some(canonical_cpp_scope_components(&owner))
-        })();
-        self.indexed_structural_class_scopes
-            .lock()
-            .expect("C++ indexed structural-class scope cache poisoned")
-            .insert(key, resolved.clone());
-        resolved
+                                    .then_some(text)
+                                })
+                                .is_some_and(|text| text == expected)
+                        })
+                        .collect::<Vec<_>>();
+                    unique_logical_type_candidate(exact)
+                        .or_else(|| unique_logical_type_candidate(candidates.clone()))?
+                } else {
+                    unique_logical_type_candidate(candidates)?
+                };
+                Some(canonical_cpp_scope_components(&owner))
+            },
+        )
     }
 
     pub fn indexed_enclosing_owner_scope(
@@ -9773,40 +9710,31 @@ impl<'a> VisibilityIndex<'a> {
             })
             .unwrap_or(node);
         let key = (file.clone(), anchor.start_byte(), anchor.end_byte());
-        if let Some(cached) = self
-            .indexed_enclosing_owner_scopes
-            .lock()
-            .expect("C++ indexed enclosing-owner scope cache poisoned")
-            .get(&key)
-            .cloned()
-        {
-            return cached;
-        }
-        let resolved = (|| {
-            let range = Range {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                start_line: node.start_position().row,
-                end_line: node.end_position().row,
-            };
-            let start = analyzer.enclosing_code_unit(file, &range)?;
-            let owner = brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(
-                start,
-                |unit| self.cached_precise_parent_of(analyzer, unit),
-            )
-            .find(|unit| {
-                unit.is_class()
-                    && !analyzer
-                        .type_alias_provider()
-                        .is_some_and(|provider| provider.is_type_alias(unit))
-            })?;
-            Some(canonical_cpp_scope_components(&owner))
-        })();
-        self.indexed_enclosing_owner_scopes
-            .lock()
-            .expect("C++ indexed enclosing-owner scope cache poisoned")
-            .insert(key, resolved.clone());
-        resolved
+        visibility_memo_value(
+            &self.indexed_enclosing_owner_scopes,
+            &self.reads,
+            key,
+            || {
+                let range = Range {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    start_line: node.start_position().row,
+                    end_line: node.end_position().row,
+                };
+                let start = analyzer.enclosing_code_unit(file, &range)?;
+                let owner = brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(
+                    start,
+                    |unit| self.cached_precise_parent_of(analyzer, unit),
+                )
+                .find(|unit| {
+                    unit.is_class()
+                        && !analyzer
+                            .type_alias_provider()
+                            .is_some_and(|provider| provider.is_type_alias(unit))
+                })?;
+                Some(canonical_cpp_scope_components(&owner))
+            },
+        )
     }
 
     fn cached_precise_parent_of(
@@ -9814,21 +9742,12 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         code_unit: &CodeUnit,
     ) -> Option<CodeUnit> {
-        if let Some(cached) = self
-            .precise_parent_cache
-            .lock()
-            .expect("C++ precise-parent cache poisoned")
-            .get(code_unit)
-            .cloned()
-        {
-            return cached;
-        }
-        let resolved = precise_parent_resolution(analyzer, code_unit).map(|owner| owner.unit);
-        self.precise_parent_cache
-            .lock()
-            .expect("C++ precise-parent cache poisoned")
-            .insert(code_unit.clone(), resolved.clone());
-        resolved
+        visibility_memo_value(
+            &self.precise_parent_cache,
+            &self.reads,
+            code_unit.clone(),
+            || precise_parent_resolution(analyzer, code_unit).map(|owner| owner.unit),
+        )
     }
 
     pub fn callable_is_constructor_declaration(
@@ -9932,21 +9851,9 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         field: &CodeUnit,
     ) -> Option<DeclaredFieldTypeFact> {
-        if let Some(cached) = self
-            .field_type_facts
-            .lock()
-            .expect("C++ field type fact cache poisoned")
-            .get(field)
-            .cloned()
-        {
-            return cached;
-        }
-        let decoded = decode_field_declared_type_fact(analyzer, field);
-        self.field_type_facts
-            .lock()
-            .expect("C++ field type fact cache poisoned")
-            .insert(field.clone(), decoded.clone());
-        decoded
+        visibility_memo_value(&self.field_type_facts, &self.reads, field.clone(), || {
+            decode_field_declared_type_fact(analyzer, field)
+        })
     }
 
     fn structured_alias_target(
@@ -9954,21 +9861,12 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         unit: &CodeUnit,
     ) -> Option<StructuredAliasTarget> {
-        if let Some(cached) = self
-            .structured_alias_targets
-            .lock()
-            .expect("C++ structured alias target cache poisoned")
-            .get(unit)
-            .cloned()
-        {
-            return cached;
-        }
-        let decoded = decode_structured_alias_target(analyzer, unit);
-        self.structured_alias_targets
-            .lock()
-            .expect("C++ structured alias target cache poisoned")
-            .insert(unit.clone(), decoded.clone());
-        decoded
+        visibility_memo_value(
+            &self.structured_alias_targets,
+            &self.reads,
+            unit.clone(),
+            || decode_structured_alias_target(analyzer, unit),
+        )
     }
 
     pub fn type_candidates<'b>(
@@ -11352,7 +11250,7 @@ fn collect_macro_events(
                 };
                 let include = crate::imports::include_path_literal_value(path, source);
                 let targets = include.map_or_else(Vec::new, |include| {
-                    resolve_include_targets_with_index(file, include, cpp.include_target_index())
+                    resolve_include_targets_with_index(file, include, &cpp.include_target_index())
                 });
                 // An include no indexed file can answer -- its final path component names
                 // no analyzable workspace file -- crosses into sources this index does not
@@ -11434,7 +11332,7 @@ fn find_include_activation<'guards>(
                     if let Some(target) = unique_include_target(resolve_include_targets_with_index(
                         file,
                         include,
-                        include_targets,
+                        &include_targets,
                     )) {
                         direct_includes.push((node.end_byte(), target));
                     }
@@ -11486,7 +11384,7 @@ fn find_conditional_include_projection_index<'guards>(
                 let Some(target) = unique_include_target(resolve_include_targets_with_index(
                     file,
                     include,
-                    include_targets,
+                    &include_targets,
                 )) else {
                     continue;
                 };
@@ -11562,7 +11460,7 @@ fn find_conditional_include_projection_index<'guards>(
                     let Some(target) = unique_include_target(resolve_include_targets_with_index(
                         &current_file,
                         include,
-                        include_targets,
+                        &include_targets,
                     )) else {
                         continue;
                     };
@@ -11627,7 +11525,7 @@ fn find_conditional_include_projection_for_source<'guards>(
                 let Some(target) = unique_include_target(resolve_include_targets_with_index(
                     file,
                     include,
-                    include_targets,
+                    &include_targets,
                 )) else {
                     continue;
                 };
@@ -11675,7 +11573,7 @@ fn find_conditional_include_projection_for_source<'guards>(
                     let Some(target) = unique_include_target(resolve_include_targets_with_index(
                         &current_file,
                         include,
-                        include_targets,
+                        &include_targets,
                     )) else {
                         continue;
                     };
@@ -11798,7 +11696,7 @@ fn unconditional_include_reaches<'guards>(
                     for (include, _) in include_path_from_node(node, prepared.source()).into_iter()
                     {
                         if let Some(target) = unique_include_target(
-                            resolve_include_targets_with_index(&file, include, include_targets),
+                            resolve_include_targets_with_index(&file, include, &include_targets),
                         ) {
                             files.push(target);
                         }
@@ -11890,7 +11788,7 @@ where
         // needs every include source: an opaque header may change it.
         for fact in include_facts(&file, prepared.as_ref()).iter() {
             let targets =
-                resolve_include_targets_with_index(&file, &fact.path, cpp.include_target_index());
+                resolve_include_targets_with_index(&file, &fact.path, &cpp.include_target_index());
             if targets.is_empty() {
                 return false;
             }
@@ -12045,13 +11943,13 @@ fn compile_proven_guard_facts(
     cpp: &dyn CppSource,
     file: &ProjectFile,
 ) -> HashSet<PreprocessorGuard> {
-    if let Some(facts) = context_guard_facts(cpp.compile_contexts_for(file), file) {
+    if let Some(facts) = context_guard_facts(&cpp.compile_contexts_for(file), file) {
         return facts;
     }
     let mut translation_units = cpp.reaching_translation_units(file).into_iter();
     let Some(mut facts) = translation_units.next().and_then(|translation_unit| {
         context_guard_facts(
-            cpp.compile_contexts_for(&translation_unit),
+            &cpp.compile_contexts_for(&translation_unit),
             &translation_unit,
         )
     }) else {
@@ -12059,7 +11957,7 @@ fn compile_proven_guard_facts(
     };
     for translation_unit in translation_units {
         let Some(reached) = context_guard_facts(
-            cpp.compile_contexts_for(&translation_unit),
+            &cpp.compile_contexts_for(&translation_unit),
             &translation_unit,
         ) else {
             facts.clear();
@@ -12830,6 +12728,9 @@ type ReferenceGuardAugmenter<'a> =
 /// no source guard environment, but retains file-level language and build facts.
 /// Position-based questions augment their source environment with the same
 /// effective context as declaration and include proofs.
+// These cells never escape the resolution call that constructs them. Its
+// prepared-source read and the first guard augmentation dominate every local
+// hit in that same capture. Do not retain this context in VisibilityIndexData.
 struct CallableReferenceContext<'a> {
     effective_guards: &'a ReferenceGuardAugmenter<'a>,
     file: &'a ProjectFile,
@@ -18897,7 +18798,7 @@ fn target_forward_owner_resolution(
     let mut visible_files = HashSet::default();
     collect_include_closure(
         analyzer,
-        cpp.include_target_index(),
+        &cpp.include_target_index(),
         code_unit.source(),
         &mut visible_files,
         None,
@@ -19074,7 +18975,7 @@ fn visible_full_cpp_owner(
     let mut visible_files = HashSet::default();
     collect_include_closure(
         analyzer,
-        cpp.include_target_index(),
+        &cpp.include_target_index(),
         code_unit.source(),
         &mut visible_files,
         None,
@@ -19126,7 +19027,7 @@ fn directly_included_owner(
             resolve_include_targets_with_index(
                 code_unit.source(),
                 &include,
-                cpp.include_target_index(),
+                &cpp.include_target_index(),
             )
         })
         .collect();
@@ -19964,7 +19865,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: spliced macro tokens need physical source coordinates"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: spliced macro tokens need physical source coordinates"
     )]
     fn macro_splices_preserve_statement_origin_ranges() {
         for newline in ["\n", "\r\n"] {

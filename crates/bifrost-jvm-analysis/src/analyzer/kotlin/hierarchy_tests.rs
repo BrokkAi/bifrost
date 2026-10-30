@@ -12,13 +12,13 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
-use crate::inline_project::InlineTestProject;
+use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 use brokk_bifrost_core::analyzer::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
 
-fn fixture() -> (ProjectFile, KotlinAnalyzer) {
+fn fixture() -> (BuiltInlineTestProject, ProjectFile, KotlinAnalyzer) {
     let fixture = InlineTestProject::with_language(Language::Kotlin)
         .file(
             "lib/Library.kt",
@@ -47,7 +47,7 @@ fn fixture() -> (ProjectFile, KotlinAnalyzer) {
         .build();
     let wild = ProjectFile::new(fixture.root(), "wild/Child.kt");
     let analyzer = KotlinAnalyzer::new(fixture.project_arc());
-    (wild, analyzer)
+    (fixture, wild, analyzer)
 }
 
 fn base_unit(analyzer: &KotlinAnalyzer) -> CodeUnit {
@@ -79,7 +79,7 @@ fn sorted_names(units: HashSet<CodeUnit>) -> Vec<String> {
 #[test]
 #[brokk_bifrost_test_macros::hardwon("#2868: Mirai usage scans exceeded the 600-second probe cap")]
 fn kotlin_descendant_index_populates_the_ancestor_memo() {
-    let (wild, analyzer) = fixture();
+    let (_project, wild, analyzer) = fixture();
     let base = base_unit(&analyzer);
 
     let whole = sorted_names(analyzer.get_direct_descendants(&base));
@@ -105,7 +105,7 @@ fn kotlin_descendant_index_populates_the_ancestor_memo() {
 
     let first = class_unit(&analyzer, "app.First");
     assert!(
-        analyzer.direct_ancestors.get(&first).is_some(),
+        ancestor_is_cached(&analyzer, &first),
         "the descendant-index build must publish per-class ancestry into the \
          analyzer's ancestor memo"
     );
@@ -120,16 +120,52 @@ fn kotlin_descendant_index_populates_the_ancestor_memo() {
         "a warm ancestry answer must keep its resolved supertypes: {warm_names:?}"
     );
 
-    let (_unused_wild, cold_analyzer) = fixture();
+    let (_cold_project, _unused_wild, cold_analyzer) = fixture();
     let cold_first = class_unit(&cold_analyzer, "app.First");
     assert!(
-        cold_analyzer.direct_ancestors.get(&cold_first).is_none(),
+        !ancestor_is_cached(&cold_analyzer, &cold_first),
         "a fresh analyzer starts without published ancestry"
     );
     cold_analyzer.get_direct_ancestors(&cold_first);
     assert!(
-        cold_analyzer.direct_ancestors.get(&cold_first).is_some(),
+        ancestor_is_cached(&cold_analyzer, &cold_first),
         "the per-unit ancestor path publishes through the same memo the \
          descendant-index build reads"
     );
+}
+
+// A generation may be warmed outside any policy capture. Each subsequent
+// capture must inherit the receipt, rather than depending on a caller's parse.
+#[test]
+#[brokk_bifrost_test_macros::hardwon("#7496: Kotlin warm ancestor hits lost their build reads")]
+fn ancestor_hits_replay_inputs_in_successive_captures() {
+    use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
+    let (_project, _, analyzer) = fixture();
+    let child = class_unit(&analyzer, "app.First");
+    let expected = analyzer.get_direct_ancestors(&child);
+    assert_eq!(expected.len(), 2);
+    let (first, reads) = capture_query_reads(&analyzer, || analyzer.get_direct_ancestors(&child));
+    let (second, second_reads) =
+        capture_query_reads(&analyzer, || analyzer.get_direct_ancestors(&child));
+    assert_eq!(first, expected);
+    assert_eq!(second, expected);
+    assert_eq!(reads.unattributed_reads(), 0);
+    assert_eq!(second_reads.unattributed_reads(), 0);
+    assert_eq!(reads.keys(), second_reads.keys());
+    assert!(
+        reads.keys().iter().any(|key| matches!(key,
+            ReadKey::File { rel_path, .. } if rel_path.as_ref() == "lib/Library.kt"
+        )),
+        "warm hits retain the imported declarations: {reads:?}"
+    );
+}
+
+fn ancestor_is_cached(analyzer: &KotlinAnalyzer, owner: &CodeUnit) -> bool {
+    analyzer
+        .direct_ancestors
+        .read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer),
+            |cache, _| cache.get(owner).ok_or(()),
+        )
+        .is_ok()
 }

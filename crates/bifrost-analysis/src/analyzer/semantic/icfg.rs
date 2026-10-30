@@ -104,7 +104,8 @@ pub fn record_dispatch_read(
     record_dispatch_read_attribution(workspace, &attribution);
 }
 
-pub(crate) fn record_dispatch_read_attribution(
+#[doc(hidden)]
+pub fn record_dispatch_read_attribution(
     workspace: &WorkspaceAnalyzer,
     attribution: &DispatchReadAttribution,
 ) {
@@ -314,6 +315,9 @@ pub struct CallTransferSet {
 }
 
 pub trait IcfgProvider: DispatchOracle {
+    /// Query-owned attribution, including helpers without a carried thread frame.
+    fn memo_attribution(&self) -> crate::analyzer::workspace_authority::OwnedMemoCapability;
+
     /// Stable identity of provider state that can change emitted topology.
     fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
         IcfgProviderBehaviorIdentity::hash_bytes(DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN)
@@ -375,8 +379,15 @@ pub struct WorkspaceIcfgProvider<'a> {
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct CachedCallTransferOutcome {
+    reads: Arc<crate::analyzer::usages::common::QueryMemoReads>,
     outcome: SemanticOutcome<CallTransferSet>,
     dispatch_read: DispatchReadAttribution,
+}
+
+#[derive(Clone)]
+pub struct CachedExitProfileOutcome {
+    outcome: SemanticOutcome<IcfgExitProfile>,
+    reads: Arc<crate::analyzer::usages::common::QueryMemoReads>,
 }
 
 #[doc(hidden)]
@@ -385,7 +396,7 @@ pub struct QueryLocalIcfgOutcomeCache<'a> {
     #[doc(hidden)]
     pub call_transfers: Mutex<HashMap<CallTransferCacheKey, CachedCallTransferOutcome>>,
     #[doc(hidden)]
-    pub exit_profiles: Mutex<HashMap<ExitProfileCacheKey, SemanticOutcome<IcfgExitProfile>>>,
+    pub exit_profiles: Mutex<HashMap<ExitProfileCacheKey, CachedExitProfileOutcome>>,
     #[doc(hidden)]
     pub dispatch_sessions:
         Mutex<HashMap<ExactArtifactAllocation, Arc<Mutex<PreparedWorkspaceDispatchSession<'a>>>>>,
@@ -419,31 +430,45 @@ impl<'a> QueryLocalIcfgOutcomeCache<'a> {
         }
     }
 
-    fn call_transfer(&self, key: &CallTransferCacheKey) -> Option<CachedCallTransferOutcome> {
+    fn call_transfer(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        key: &CallTransferCacheKey,
+    ) -> Option<CachedCallTransferOutcome> {
         let local = self
             .call_transfers
             .lock()
             .expect("query-local ICFG call-transfer cache mutex is not poisoned")
             .get(key)
             .cloned();
+        if let Some(cached) = local.as_ref() {
+            crate::analyzer::usages::common::replay_memo_reads(&cached.reads, analyzer);
+        }
         local.or_else(|| {
             self.parent
                 .as_deref()
-                .and_then(|parent| parent.call_transfer(key))
+                .and_then(|parent| parent.call_transfer(analyzer, key))
         })
     }
 
-    fn exit_profile(&self, key: &ExitProfileCacheKey) -> Option<SemanticOutcome<IcfgExitProfile>> {
+    fn exit_profile(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        key: &ExitProfileCacheKey,
+    ) -> Option<SemanticOutcome<IcfgExitProfile>> {
         let local = self
             .exit_profiles
             .lock()
             .expect("query-local ICFG exit-profile cache mutex is not poisoned")
             .get(key)
             .cloned();
-        local.or_else(|| {
+        if let Some(cached) = local.as_ref() {
+            crate::analyzer::usages::common::replay_memo_reads(&cached.reads, analyzer);
+        }
+        local.map(|cached| cached.outcome).or_else(|| {
             self.parent
                 .as_deref()
-                .and_then(|parent| parent.exit_profile(key))
+                .and_then(|parent| parent.exit_profile(analyzer, key))
         })
     }
 
@@ -1077,6 +1102,10 @@ impl HeapOracle for WorkspaceIcfgProvider<'_> {
 }
 
 impl IcfgProvider for WorkspaceIcfgProvider<'_> {
+    fn memo_attribution(&self) -> crate::analyzer::workspace_authority::OwnedMemoCapability {
+        crate::analyzer::workspace_authority::workspace_memo_attribution(self.oracle.workspace())
+    }
+
     fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
         self.behavior_identity
     }
@@ -1093,6 +1122,66 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         callee_exit: &ProgramPointHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+        let mut publication = None;
+        let (outcome, reads) = crate::analyzer::usages::common::capture_memo_reads(
+            self.workspace().analyzer(),
+            || self.exit_profile_with_memo(callee_entry, callee_exit, request, &mut publication),
+        );
+        if let Some((key, cached)) = publication {
+            self.outcome_cache
+                .exit_profiles
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .insert(
+                    key,
+                    CachedExitProfileOutcome {
+                        outcome: cached,
+                        reads: Arc::new(reads),
+                    },
+                );
+        }
+        outcome
+    }
+
+    fn call_transfers(
+        &self,
+        caller: &ProcedureHandle,
+        call: CallSiteId,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        self.call_transfers_in_context(caller, call, &OracleCallContext::empty(), request)
+    }
+
+    fn call_transfers_in_context(
+        &self,
+        caller: &ProcedureHandle,
+        call: CallSiteId,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        WorkspaceIcfgProvider::call_transfers_in_context(self, caller, call, context, request)
+    }
+
+    fn snapshot(
+        &self,
+        root: &ProcedureHandle,
+        limits: IcfgSnapshotLimits,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
+        self.with_snapshot_transaction(request, |provider, request| {
+            provider.materialize_snapshot(root, limits, request)
+        })
+    }
+}
+
+impl WorkspaceIcfgProvider<'_> {
+    fn exit_profile_with_memo(
+        &self,
+        callee_entry: &ProgramPointHandle,
+        callee_exit: &ProgramPointHandle,
+        request: &mut SemanticRequest<'_>,
+        publication: &mut Option<(ExitProfileCacheKey, SemanticOutcome<IcfgExitProfile>)>,
+    ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
@@ -1103,7 +1192,10 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let cacheable_request =
             request.execution_budget().is_none() && request.artifact_collector().is_none();
         let key = (callee_entry.clone(), callee_exit.clone());
-        let cached = cacheable_request.then(|| self.outcome_cache.exit_profile(&key));
+        let cached = cacheable_request.then(|| {
+            self.outcome_cache
+                .exit_profile(self.workspace().analyzer(), &key)
+        });
         if let Some(outcome) = cached.flatten() {
             return Ok(outcome);
         }
@@ -1172,24 +1264,11 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         };
         *work = work.conservative_add(refinements.work());
         if cacheable_request && let Some(cached) = outcome.completed_replay() {
-            self.outcome_cache
-                .exit_profiles
-                .lock()
-                .expect("query-local ICFG cache mutex is not poisoned")
-                .insert(key, cached);
+            *publication = Some((key, cached));
         }
         Ok(outcome)
     }
 
-    fn call_transfers(
-        &self,
-        caller: &ProcedureHandle,
-        call: CallSiteId,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
-        self.call_transfers_in_context(caller, call, &OracleCallContext::empty(), request)
-    }
-
     fn call_transfers_in_context(
         &self,
         caller: &ProcedureHandle,
@@ -1197,28 +1276,39 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
-        WorkspaceIcfgProvider::call_transfers_in_context(self, caller, call, context, request)
+        let mut publication = None;
+        let (outcome, reads) = crate::analyzer::usages::common::capture_memo_reads(
+            self.workspace().analyzer(),
+            || self.call_transfers_with_memo(caller, call, context, request, &mut publication),
+        );
+        if let Some((key, cached, dispatch_read)) = publication {
+            self.outcome_cache
+                .call_transfers
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .insert(
+                    key,
+                    CachedCallTransferOutcome {
+                        outcome: cached,
+                        dispatch_read,
+                        reads: Arc::new(reads),
+                    },
+                );
+        }
+        outcome
     }
 
-    fn snapshot(
-        &self,
-        root: &ProcedureHandle,
-        limits: IcfgSnapshotLimits,
-        request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
-        self.with_snapshot_transaction(request, |provider, request| {
-            provider.materialize_snapshot(root, limits, request)
-        })
-    }
-}
-
-impl WorkspaceIcfgProvider<'_> {
-    fn call_transfers_in_context(
+    fn call_transfers_with_memo(
         &self,
         caller: &ProcedureHandle,
         call: CallSiteId,
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
+        publication: &mut Option<(
+            CallTransferCacheKey,
+            SemanticOutcome<CallTransferSet>,
+            DispatchReadAttribution,
+        )>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
@@ -1233,7 +1323,10 @@ impl WorkspaceIcfgProvider<'_> {
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope semantic call site"))?;
         let cache_key = (caller.clone(), call, context.clone());
-        let cached = cacheable_request.then(|| self.outcome_cache.call_transfer(&cache_key));
+        let cached = cacheable_request.then(|| {
+            self.outcome_cache
+                .call_transfer(self.workspace().analyzer(), &cache_key)
+        });
         if let Some(cached) = cached.flatten() {
             record_dispatch_read_attribution(self.workspace(), &cached.dispatch_read);
             return Ok(cached.outcome);
@@ -1621,17 +1714,7 @@ impl WorkspaceIcfgProvider<'_> {
             self.outcome_cache.publish_snapshot(&dispatch_cache);
         }
         if cacheable_request && let Some(cached) = outcome.completed_replay() {
-            self.outcome_cache
-                .call_transfers
-                .lock()
-                .expect("query-local ICFG cache mutex is not poisoned")
-                .insert(
-                    cache_key,
-                    CachedCallTransferOutcome {
-                        outcome: cached,
-                        dispatch_read,
-                    },
-                );
+            *publication = Some((cache_key, cached, dispatch_read));
         }
         Ok(outcome)
     }

@@ -102,6 +102,23 @@ pub fn xml_configuration_adapter_epoch() -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn raw_scalar_value<'a>(
+    document: &ConfigurationDocumentFacts,
+    source: &'a str,
+    fact_id: ConfigurationFactId,
+    format: ConfigurationFormat,
+) -> Option<&'a str> {
+    if document.format() != format {
+        return None;
+    }
+    let fact = document.fact(fact_id)?;
+    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
+        return None;
+    };
+    let range = fact.evidence();
+    source.get(range.start_byte()..range.end_byte())
+}
+
 /// Decode the scalar selected by one XML fact without retaining decoded text
 /// in the persistent fact arena. Attribute ranges contain the authored value;
 /// element-text ranges contain the authored text between tags. The caller
@@ -160,15 +177,7 @@ pub fn decoded_properties_scalar_value(
     source: &str,
     fact_id: ConfigurationFactId,
 ) -> Option<String> {
-    if document.format() != ConfigurationFormat::Properties {
-        return None;
-    }
-    let fact = document.fact(fact_id)?;
-    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
-        return None;
-    };
-    let range = fact.evidence();
-    let raw = source.get(range.start_byte()..range.end_byte())?;
+    let raw = raw_scalar_value(document, source, fact_id, ConfigurationFormat::Properties)?;
     Some(decode_properties_value(raw))
 }
 
@@ -180,15 +189,7 @@ pub fn decoded_json_scalar_value(
     source: &str,
     fact_id: ConfigurationFactId,
 ) -> Option<String> {
-    if document.format() != ConfigurationFormat::Json {
-        return None;
-    }
-    let fact = document.fact(fact_id)?;
-    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
-        return None;
-    };
-    let range = fact.evidence();
-    let raw = source.get(range.start_byte()..range.end_byte())?;
+    let raw = raw_scalar_value(document, source, fact_id, ConfigurationFormat::Json)?;
     serde_json::from_str::<String>(raw).ok()
 }
 
@@ -201,15 +202,7 @@ pub fn decoded_yaml_scalar_value(
     source: &str,
     fact_id: ConfigurationFactId,
 ) -> Option<String> {
-    if document.format() != ConfigurationFormat::Yaml {
-        return None;
-    }
-    let fact = document.fact(fact_id)?;
-    let ConfigurationNodeKind::Scalar { .. } = fact.kind() else {
-        return None;
-    };
-    let range = fact.evidence();
-    let raw = source.get(range.start_byte()..range.end_byte())?;
+    let raw = raw_scalar_value(document, source, fact_id, ConfigurationFormat::Yaml)?;
     serde_saphyr::from_str::<String>(raw).ok()
 }
 

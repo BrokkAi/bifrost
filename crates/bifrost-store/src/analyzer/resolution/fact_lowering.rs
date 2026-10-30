@@ -19,6 +19,7 @@ use brokk_bifrost_test_macros::hardwon;
 #[doc(hidden)]
 pub mod package;
 
+use super::precedence::{EFFECTIVE_NAMESPACES, ScopeChoice};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::resolution_facts::{
@@ -1087,20 +1088,19 @@ fn lower_scope_timelines_and_paths(
                         PartialPath::new(
                             open_endpoint(node, variable),
                             open_endpoint(previous, variable),
-                            if language == Language::Go {
-                                go_spelling_precedence(
+                            precedence_rules(language)
+                                .continuation_precedence(
                                     identities,
                                     timeline.fact.id,
                                     Some(insertion.position),
-                                    1,
                                 )
-                            } else {
-                                checkpoint_fallback_precedence(
-                                    identities,
-                                    timeline.fact.id,
-                                    insertion.position,
-                                )
-                            },
+                                .unwrap_or_else(|| {
+                                    checkpoint_fallback_precedence(
+                                        identities,
+                                        timeline.fact.id,
+                                        insertion.position,
+                                    )
+                                }),
                             [WitnessStep::Node(previous)],
                             ResolutionCompletion::Complete,
                         ),
@@ -1118,20 +1118,19 @@ fn lower_scope_timelines_and_paths(
                 PartialPath::new(
                     open_endpoint(checkpoint.node, variable),
                     open_endpoint(previous, variable),
-                    if language == Language::Go {
-                        go_spelling_precedence(
+                    precedence_rules(language)
+                        .continuation_precedence(
                             identities,
                             timeline.fact.id,
                             Some(checkpoint.position),
-                            1,
                         )
-                    } else {
-                        checkpoint_fallback_precedence(
-                            identities,
-                            timeline.fact.id,
-                            checkpoint.position,
-                        )
-                    },
+                        .unwrap_or_else(|| {
+                            checkpoint_fallback_precedence(
+                                identities,
+                                timeline.fact.id,
+                                checkpoint.position,
+                            )
+                        }),
                     [WitnessStep::Node(previous)],
                     ResolutionCompletion::Complete,
                 ),
@@ -1159,12 +1158,18 @@ fn lower_scope_timelines_and_paths(
                 PartialPath::new(
                     open_endpoint(timeline.head, variable),
                     open_endpoint(parent_checkpoint, variable),
-                    if language == Language::Go {
-                        go_spelling_precedence(identities, timeline.fact.id, None, 1)
+                    if let Some(steps) = precedence_rules(language).continuation_precedence(
+                        identities,
+                        timeline.fact.id,
+                        None,
+                    ) {
+                        steps
                     } else if timeline.fact.kind == ResolutionScopeKind::TypeBody {
                         type_body_enclosing_precedence(identities, timeline.fact.id)
-                    } else if language == Language::Rust {
-                        rust_scope_outward_precedence(identities, timeline.fact.id)
+                    } else if let Some(namespaces) =
+                        precedence_rules(language).scope_choice_namespaces()
+                    {
+                        scope_choice_outward_precedence(identities, timeline.fact.id, namespaces)
                     } else {
                         scope_fallback_precedence(identities, timeline.fact.id)
                     },
@@ -2977,13 +2982,14 @@ fn lower_root_import_paths(
 /// rustc does: a block's own items and imports, globs included, win over
 /// every enclosing scope, and a named import wins over a glob. Both take the
 /// continuation's rank on the scope choice and are ordered after it on the
-/// scope's import choice (`rust_scope_outward_precedence`): named first, then
+/// scope's import choice (`scope_choice_outward_precedence`): named first, then
 /// globs together with an unexpanded item macro's fallback branch
 /// (`lower_unexpanded_item_macro_branches`), then the continuation. Java single
 /// imports rank above on-demand imports at the same compilation-unit choice.
 /// Scala and Kotlin named imports follow the same ordering; Kotlin implicit
-/// imports are ranked separately by the selected JVM context. Other languages
-/// keep one wildcard-tier step, below their outward lookup.
+/// imports are ranked separately by the selected JVM context. C# uses the
+/// shared scope-choice form with aliases before usings, then outward lookup.
+/// Other languages keep one wildcard-tier step, below their outward lookup.
 fn root_import_precedence(
     identities: &mut ResolutionIdentityCatalogBuilder,
     language: Language,
@@ -2991,12 +2997,19 @@ fn root_import_precedence(
     choice: SemanticId,
     namespace: ResolutionNamespace,
 ) -> Vec<PrecedenceStep> {
-    super::precedence::precedence_rules(language).root_import_steps(
+    precedence_rules(language).root_import_steps(
         identities,
         &import.fact,
         import.kind,
         choice,
         namespace,
+    )
+}
+
+fn precedence_rules(language: Language) -> &'static dyn super::precedence::PrecedenceRules {
+    crate::analyzer::store::store_language_support_for_hook(language, "precedence_rules").map_or(
+        &super::precedence::DefaultPrecedenceRules as &dyn super::precedence::PrecedenceRules,
+        |support| support.precedence_rules(),
     )
 }
 
@@ -3009,53 +3022,76 @@ pub(super) fn rust_root_import_precedence(
 ) -> Vec<PrecedenceStep> {
     let import_choice = identities.semantic(import_choice_identity(import.root_scope, namespace));
     let import_token = identities.semantic(root_import_token_identity(import.site, namespace));
-    vec![
-        registered_precedence_step(identities, choice, 1, namespace),
-        // This source token guards the following import-choice rank. Selected
-        // activation qualifies that rank under the reference site's premise.
-        registered_precedence_step(identities, import_token, 0, namespace),
-        registered_precedence_step(
-            identities,
-            import_choice,
-            if kind == ResolutionRootImportKind::Named {
-                RUST_NAMED_IMPORT_RANK
-            } else {
-                RUST_GLOB_IMPORT_RANK
-            },
-            namespace,
-        ),
-    ]
+    // Rust's source-token guard lets selected cfg activation qualify the
+    // following import-choice rank under the reference site's premise.
+    let guard = precedence_step(import_token, 0);
+    scope_choice_precedence(
+        identities,
+        choice,
+        &[guard],
+        import_choice,
+        namespace,
+        match kind {
+            ResolutionRootImportKind::Named => ScopeChoice::MemberOrAlias,
+            ResolutionRootImportKind::Glob => ScopeChoice::Import,
+        },
+    )
 }
 
-/// Ranks on a Rust scope's import choice (`import_choice_identity`).
-const RUST_NAMED_IMPORT_RANK: u32 = 0;
-const RUST_GLOB_IMPORT_RANK: u32 = 1;
-const RUST_OUTWARD_RANK: u32 = 2;
+/// Assemble one scope level: the scope choice at ordinal 1, then the
+/// language-supplied guard steps, then the import choice at ordinal 0 for a
+/// member or alias, 1 for a use or import, or 2 for outward continuation.
+/// Languages classify their bindings; named/glob choices use 0/1 respectively.
+/// Inner scopes precede outer scopes on the path, so depth precedes origin.
+pub fn scope_choice_precedence(
+    identities: &mut ResolutionIdentityCatalogBuilder,
+    choice: SemanticId,
+    guards: &[PrecedenceStep],
+    import_choice: SemanticId,
+    namespace: ResolutionNamespace,
+    binding: ScopeChoice,
+) -> Vec<PrecedenceStep> {
+    let mut steps = Vec::with_capacity(guards.len() + 2);
+    steps.push(registered_precedence_step(identities, choice, 1, namespace));
+    steps.extend(
+        guards
+            .iter()
+            .map(|&step| identities.register_precedence_namespace(step, namespace)),
+    );
+    steps.push(registered_precedence_step(
+        identities,
+        import_choice,
+        binding as u32,
+        namespace,
+    ));
+    steps
+}
 
-/// A Rust scope's outward continuation: the ordinary fallback on the scope
-/// choice, then the last rank on the scope's import choice, below the scope's
-/// own named and glob imports.
-fn rust_scope_outward_precedence(
+/// A scope level's outward continuation: scope fallback precedes the last
+/// import-choice rank, below the level's own bindings. The language supplies
+/// the namespaces participating in that scope level.
+pub fn scope_choice_outward_precedence(
     identities: &mut ResolutionIdentityCatalogBuilder,
     scope: ResolutionScopeId,
+    namespaces: &[ResolutionNamespace],
 ) -> Vec<PrecedenceStep> {
-    let mut steps = scope_fallback_precedence(identities, scope);
-    for namespace in EFFECTIVE_NAMESPACES {
+    let mut steps = scope_fallback_precedence_for_namespaces(identities, scope, namespaces);
+    for &namespace in namespaces {
         let semantic = identities.semantic(import_choice_identity(scope, namespace));
         steps.push(registered_precedence_step(
             identities,
             semantic,
-            RUST_OUTWARD_RANK,
+            ScopeChoice::Outward as u32,
             namespace,
         ));
     }
     steps
 }
 
-/// The choice point that orders a Rust scope's named imports, glob imports
-/// (with an unexpanded item macro's fallback branch) and outward
-/// continuation, after they tie on the scope choice. Nothing else shares it.
-fn import_choice_identity(
+/// The choice point shared by Rust and C# for members/aliases, imports
+/// (including Rust item-macro fallback) and outward continuation, after they
+/// tie on the scope choice. Its domain remains fragment-local.
+pub fn import_choice_identity(
     scope: ResolutionScopeId,
     namespace: ResolutionNamespace,
 ) -> ResolutionSemanticIdentity {
@@ -4944,24 +4980,6 @@ fn effective_declaration_namespace(namespace: ResolutionNamespace) -> Resolution
     namespace
 }
 
-/// Every namespace a declaration can occupy, and so every namespace whose
-/// choice points a scope, checkpoint or import rank publishes.
-///
-/// `Macro` is Rust's alone. A `macro_rules!` item is a source-order binder
-/// (textual scope), and rustc resolves a single-segment macro name in textual
-/// scope first: a visible `macro_rules!` beats every import, glob or named,
-/// of the scope (checked with rustc 1.97), and a macro-expanded definition
-/// cannot shadow it (E0659). Without a macro rank on the checkpoint
-/// continuation, the binder did not shadow that continuation, so a glob from
-/// an unindexed crate kept its open boundary beside the found macro.
-const EFFECTIVE_NAMESPACES: [ResolutionNamespace; 5] = [
-    ResolutionNamespace::Type,
-    ResolutionNamespace::Value,
-    ResolutionNamespace::Callable,
-    ResolutionNamespace::Constructor,
-    ResolutionNamespace::Macro,
-];
-
 fn precedence_step(semantic: SemanticId, ordinal: u32) -> PrecedenceStep {
     PrecedenceStep {
         tier: PrecedenceTier::LexicalBinding,
@@ -5051,9 +5069,17 @@ fn scope_fallback_precedence(
     identities: &mut ResolutionIdentityCatalogBuilder,
     scope: ResolutionScopeId,
 ) -> Vec<PrecedenceStep> {
-    EFFECTIVE_NAMESPACES
-        .into_iter()
-        .map(|namespace| {
+    scope_fallback_precedence_for_namespaces(identities, scope, &EFFECTIVE_NAMESPACES)
+}
+
+fn scope_fallback_precedence_for_namespaces(
+    identities: &mut ResolutionIdentityCatalogBuilder,
+    scope: ResolutionScopeId,
+    namespaces: &[ResolutionNamespace],
+) -> Vec<PrecedenceStep> {
+    namespaces
+        .iter()
+        .map(|&namespace| {
             let semantic = identities.semantic(scope_choice_identity(scope, namespace));
             registered_precedence_step(identities, semantic, 1, namespace)
         })
@@ -7033,18 +7059,14 @@ fn lower_unexpanded_item_macro_branches(
     let mut precedence = Vec::with_capacity(EFFECTIVE_NAMESPACES.len() * 2);
     for namespace in EFFECTIVE_NAMESPACES {
         let scope_choice = identities.semantic(scope_choice_identity(scope, namespace));
-        precedence.push(registered_precedence_step(
+        let import_choice = identities.semantic(import_choice_identity(scope, namespace));
+        precedence.extend(scope_choice_precedence(
             identities,
             scope_choice,
-            1,
-            namespace,
-        ));
-        let import_choice = identities.semantic(import_choice_identity(scope, namespace));
-        precedence.push(registered_precedence_step(
-            identities,
+            &[],
             import_choice,
-            RUST_GLOB_IMPORT_RANK,
             namespace,
+            ScopeChoice::Import,
         ));
     }
     paths.push((

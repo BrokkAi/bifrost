@@ -739,7 +739,7 @@ pub(super) fn apply_plan_step(
     rows: Vec<PipelineRow>,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
-    terminal_cap: Option<usize>,
+    max_step_outputs: usize,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
 ) -> PlanExecution {
@@ -1353,11 +1353,6 @@ pub(super) fn apply_plan_step(
             );
         }
     }
-    let max_step_outputs = if final_in_authored_suffix {
-        terminal_cap.unwrap_or(limits.max_pipeline_rows)
-    } else {
-        limits.max_pipeline_rows
-    };
     let import_access = if use_persisted_imports {
         persisted_import_adjacency
             .as_ref()
@@ -2188,7 +2183,12 @@ fn apply_call_bindings_pipeline_step(
                 .callee_range
                 .map(|range| (value.report.outcome.file.clone(), range))
         });
-        if let Err(error) = service.prefetch_call_bindings(&mut call_cache.bindings, candidates) {
+        if let Err(error) = call_cache
+            .bindings
+            .read_mut(&memo_attribution(analyzer), |memo| {
+                service.prefetch_call_bindings(memo, candidates)
+            })
+        {
             diagnostics.push(CodeQueryDiagnostic {
                 related: Vec::new(),
                 source: None,
@@ -2243,18 +2243,22 @@ fn apply_call_bindings_pipeline_step(
         let indexed = indexed_declarations
             .as_deref_mut()
             .expect("semantic declaration index exists");
-        let expansions = call_binding::call_binding_expansions(
-            analyzer,
-            semantic.as_mut(),
-            indexed,
-            &mut call_cache.bindings,
-            occurrence_cache,
-            environment_cache,
-            identity_request,
-            value,
-            cancellation,
-            diagnostics,
-        );
+        let expansions = call_cache
+            .bindings
+            .read_mut(&memo_attribution(analyzer), |memo| {
+                call_binding::call_binding_expansions(
+                    analyzer,
+                    semantic.as_mut(),
+                    indexed,
+                    memo,
+                    occurrence_cache,
+                    environment_cache,
+                    identity_request,
+                    value,
+                    cancellation,
+                    diagnostics,
+                )
+            });
 
         if let Some(instrumentation) = instrumentation.as_deref_mut() {
             instrumentation.relation_expansions = instrumentation
@@ -2589,7 +2593,11 @@ fn apply_pipeline_step_general<'a>(
                 control_relation_cache.release_file_window();
             }
             if release_effect_file_windows {
-                call_cache.effects.release_file_window();
+                call_cache
+                    .effects
+                    .read_mut(&memo_attribution(analyzer), |effects| {
+                        effects.release_file_window()
+                    });
             }
             if let Some(semantic) = semantic.as_mut() {
                 semantic.release_definition_operations();
@@ -2621,7 +2629,11 @@ fn apply_pipeline_step_general<'a>(
                         || window_native_cpp_dispatch
                         || window_result_subject_artifacts
                     {
-                        call_cache.effects.release_file_window();
+                        call_cache
+                            .effects
+                            .read_mut(&memo_attribution(analyzer), |effects| {
+                                effects.release_file_window()
+                            });
                     }
                 }
                 artifact_window_file = Some(file.clone());
@@ -2768,13 +2780,17 @@ fn apply_pipeline_step_general<'a>(
                             candidate_shape
                         }),
                 );
-                effects::prepare_result_contract_call_lookups(
-                    analyzer,
-                    &mut call_cache.effects,
-                    limits,
-                    cancellation,
-                    &file_shapes,
-                );
+                call_cache
+                    .effects
+                    .read_mut(&memo_attribution(analyzer), |memo| {
+                        effects::prepare_result_contract_call_lookups(
+                            analyzer,
+                            memo,
+                            limits,
+                            cancellation,
+                            &file_shapes,
+                        )
+                    });
                 result_contract_file_prepared = true;
             }
         }
@@ -2802,13 +2818,17 @@ fn apply_pipeline_step_general<'a>(
                         candidate_shape
                     }),
             );
-            effects::prepare_native_cpp_dispatches(
-                analyzer,
-                &mut call_cache.effects,
-                limits,
-                cancellation,
-                &file_shapes,
-            );
+            call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::prepare_native_cpp_dispatches(
+                        analyzer,
+                        memo,
+                        limits,
+                        cancellation,
+                        &file_shapes,
+                    )
+                });
             native_cpp_file_prepared = true;
         }
         let mut row_exhausted = false;
@@ -3135,6 +3155,7 @@ fn apply_pipeline_step_general<'a>(
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::PythonComparisonConstants) => {
                 super::python_comparisons::comparison_constants_expansions(
+                    analyzer,
                     environment_cache,
                     seed,
                     diagnostics,
@@ -4269,33 +4290,61 @@ fn apply_pipeline_step_general<'a>(
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::CallShape) => {
                 let fact_range = seed.facts.node(seed.fact_match.node).range;
-                call_shape::call_shape_expansions_for_input(
-                    analyzer,
-                    semantic.as_mut(),
-                    &row.traces,
-                    &seed.file,
-                    fact_range,
-                    Some(&seed.facts),
-                    Some(seed.fact_match.node),
-                    &mut call_cache.bindings,
-                    receiver_facts,
-                    budget,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    &mut call_cache.reported_suppressed_shapes,
-                    cache_profile,
-                    &mut row_exhausted,
-                )
+                call_cache
+                    .bindings
+                    .read_mut(&memo_attribution(analyzer), |memo| {
+                        call_shape::call_shape_expansions_for_input(
+                            analyzer,
+                            semantic.as_mut(),
+                            &row.traces,
+                            &seed.file,
+                            fact_range,
+                            Some(&seed.facts),
+                            Some(seed.fact_match.node),
+                            memo,
+                            receiver_facts,
+                            budget,
+                            limits,
+                            cancellation,
+                            diagnostics,
+                            &mut call_cache.reported_suppressed_shapes,
+                            cache_profile,
+                            &mut row_exhausted,
+                        )
+                    })
             }
-            (PipelineValue::CallShape(value), QueryStep::ExactExternalCallee) => {
-                call_shape::exact_external_callee_expansions(
-                    analyzer,
-                    &mut call_cache.bindings,
-                    value,
-                    cancellation,
-                )
-            }
+            (PipelineValue::CallShape(value), QueryStep::ExactExternalCallee) => call_cache
+                .bindings
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    call_shape::exact_external_callee_expansions(
+                        analyzer,
+                        memo,
+                        value,
+                        cancellation,
+                    )
+                }),
+            (PipelineValue::Occurrence(value), QueryStep::CallShape) => call_cache
+                .bindings
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    call_shape::call_shape_expansions_for_input(
+                        analyzer,
+                        semantic.as_mut(),
+                        &row.traces,
+                        value.file(),
+                        value.row.range,
+                        None,
+                        None,
+                        memo,
+                        receiver_facts,
+                        budget,
+                        limits,
+                        cancellation,
+                        diagnostics,
+                        &mut call_cache.reported_suppressed_shapes,
+                        cache_profile,
+                        &mut row_exhausted,
+                    )
+                }),
             (PipelineValue::CallShape(value), QueryStep::CallResultUse) => {
                 python_rule_facts::call_result_use_expansions(
                     analyzer,
@@ -4425,44 +4474,28 @@ fn apply_pipeline_step_general<'a>(
                 expansions
             }
             (PipelineValue::CallSite(site), QueryStep::CallShape) => {
-                call_shape::call_shape_expansions_for_input(
-                    analyzer,
-                    semantic.as_mut(),
-                    &row.traces,
-                    &site.0.file,
-                    site.0.range,
-                    None,
-                    None,
-                    &mut call_cache.bindings,
-                    receiver_facts,
-                    budget,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    &mut call_cache.reported_suppressed_shapes,
-                    cache_profile,
-                    &mut row_exhausted,
-                )
-            }
-            (PipelineValue::Occurrence(value), QueryStep::CallShape) => {
-                call_shape::call_shape_expansions_for_input(
-                    analyzer,
-                    semantic.as_mut(),
-                    &row.traces,
-                    value.file(),
-                    value.row.range,
-                    None,
-                    None,
-                    &mut call_cache.bindings,
-                    receiver_facts,
-                    budget,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    &mut call_cache.reported_suppressed_shapes,
-                    cache_profile,
-                    &mut row_exhausted,
-                )
+                call_cache
+                    .bindings
+                    .read_mut(&memo_attribution(analyzer), |memo| {
+                        call_shape::call_shape_expansions_for_input(
+                            analyzer,
+                            semantic.as_mut(),
+                            &row.traces,
+                            &site.0.file,
+                            site.0.range,
+                            None,
+                            None,
+                            memo,
+                            receiver_facts,
+                            budget,
+                            limits,
+                            cancellation,
+                            diagnostics,
+                            &mut call_cache.reported_suppressed_shapes,
+                            cache_profile,
+                            &mut row_exhausted,
+                        )
+                    })
             }
             (
                 PipelineValue::StructuralMatch(seed),
@@ -4567,17 +4600,23 @@ fn apply_pipeline_step_general<'a>(
                 PipelineValue::Semantic(SemanticPipelineValue::CallResult(result)),
                 QueryStep::ResultSubjectUses,
             ) => {
-                let expanded = effects::result_subject_use_expansions(
-                    workspace.expect("result-subject use expansion requires a semantic workspace"),
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for semantic steps"),
-                    &mut call_cache.effects,
-                    flow_state_cache,
-                    limits,
-                    cancellation,
-                    result,
-                );
+                let expanded = call_cache
+                    .effects
+                    .read_mut(&memo_attribution(analyzer), |memo| {
+                        effects::result_subject_use_expansions(
+                            workspace.expect(
+                                "result-subject use expansion requires a semantic workspace",
+                            ),
+                            semantic
+                                .as_mut()
+                                .expect("semantic context exists for semantic steps"),
+                            memo,
+                            flow_state_cache,
+                            limits,
+                            cancellation,
+                            result,
+                        )
+                    });
                 expanded
                     .uses
                     .into_iter()
@@ -4650,127 +4689,149 @@ fn apply_pipeline_step_general<'a>(
             (PipelineValue::CallArgumentGroup(value), QueryStep::CallArguments) => {
                 call_shape::call_argument_expansions(value)
             }
-            (PipelineValue::CallShape(value), QueryStep::CallEffects) => {
-                effects::call_effect_expansions(
-                    analyzer,
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for semantic steps"),
-                    &mut call_cache.effects,
-                    diagnostics,
-                    value,
-                )
-            }
-            (PipelineValue::CallShape(value), QueryStep::ResultContractCalls) => {
-                effects::result_contract_call_expansions(
-                    analyzer,
-                    &mut call_cache.effects,
-                    diagnostics,
-                    value,
-                )
-            }
-            (PipelineValue::CallShape(value), QueryStep::CallResultContracts) => {
-                effects::call_result_contract_expansions(
-                    analyzer,
-                    workspace.expect("result-contract validation requires a semantic workspace"),
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for semantic steps"),
-                    &mut call_cache.effects,
-                    flow_state_cache,
-                    cancellation,
-                    diagnostics,
-                    value,
-                )
-            }
-            (PipelineValue::CallShape(value), QueryStep::CallResultObligations) => {
-                effects::call_result_obligation_expansions(
-                    analyzer,
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for semantic steps"),
-                    &mut call_cache.effects,
-                    diagnostics,
-                    value,
-                )
-            }
-            (PipelineValue::CallResultContract(value), QueryStep::ResultContractUses) => {
-                effects::result_contract_use_expansions(
-                    analyzer,
-                    workspace.expect("result-contract validation requires a semantic workspace"),
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for semantic steps"),
-                    &mut call_cache.effects,
-                    flow_state_cache,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    value,
-                )
-            }
+            (PipelineValue::CallShape(value), QueryStep::CallEffects) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::call_effect_expansions(
+                        analyzer,
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists for semantic steps"),
+                        memo,
+                        diagnostics,
+                        value,
+                    )
+                }),
+            (PipelineValue::CallShape(value), QueryStep::ResultContractCalls) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::result_contract_call_expansions(analyzer, memo, diagnostics, value)
+                }),
+            (PipelineValue::CallShape(value), QueryStep::CallResultContracts) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::call_result_contract_expansions(
+                        analyzer,
+                        workspace
+                            .expect("result-contract validation requires a semantic workspace"),
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists for semantic steps"),
+                        memo,
+                        flow_state_cache,
+                        cancellation,
+                        diagnostics,
+                        value,
+                    )
+                }),
+            (PipelineValue::CallShape(value), QueryStep::CallResultObligations) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::call_result_obligation_expansions(
+                        analyzer,
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists for semantic steps"),
+                        memo,
+                        diagnostics,
+                        value,
+                    )
+                }),
+            (PipelineValue::CallResultContract(value), QueryStep::ResultContractUses) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::result_contract_use_expansions(
+                        analyzer,
+                        workspace
+                            .expect("result-contract validation requires a semantic workspace"),
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists for semantic steps"),
+                        memo,
+                        flow_state_cache,
+                        limits,
+                        cancellation,
+                        diagnostics,
+                        value,
+                    )
+                }),
             (PipelineValue::CallResultContract(value), QueryStep::ResultContractOperationUses) => {
-                effects::result_contract_operation_use_expansions(
-                    analyzer,
-                    workspace.expect("result-contract validation requires a semantic workspace"),
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for semantic steps"),
-                    &mut call_cache.effects,
-                    flow_state_cache,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    value,
-                )
+                call_cache
+                    .effects
+                    .read_mut(&memo_attribution(analyzer), |memo| {
+                        effects::result_contract_operation_use_expansions(
+                            analyzer,
+                            workspace
+                                .expect("result-contract validation requires a semantic workspace"),
+                            semantic
+                                .as_mut()
+                                .expect("semantic context exists for semantic steps"),
+                            memo,
+                            flow_state_cache,
+                            limits,
+                            cancellation,
+                            diagnostics,
+                            value,
+                        )
+                    })
             }
             (
                 PipelineValue::CallResultContract(value),
                 QueryStep::ResultContractFailureUses(filter),
-            ) => effects::result_contract_failure_use_expansions(
-                analyzer,
-                workspace.expect("failure-use projection requires a semantic workspace"),
-                semantic
-                    .as_mut()
-                    .expect("semantic context exists for semantic steps"),
-                &mut call_cache.effects,
-                flow_state_cache,
-                cancellation,
-                diagnostics,
-                filter,
-                value,
-            ),
-            (PipelineValue::Declaration(declaration), QueryStep::ProcedureEffects) => {
-                effects::procedure_effect_expansions(
-                    analyzer,
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for semantic steps"),
-                    &mut call_cache.effects,
-                    budget,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    cache_profile,
-                    declaration,
-                )
-            }
+            ) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::result_contract_failure_use_expansions(
+                        analyzer,
+                        workspace.expect("failure-use projection requires a semantic workspace"),
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists for semantic steps"),
+                        memo,
+                        flow_state_cache,
+                        cancellation,
+                        diagnostics,
+                        filter,
+                        value,
+                    )
+                }),
+            (PipelineValue::Declaration(declaration), QueryStep::ProcedureEffects) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::procedure_effect_expansions(
+                        analyzer,
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists for semantic steps"),
+                        memo,
+                        budget,
+                        limits,
+                        cancellation,
+                        diagnostics,
+                        cache_profile,
+                        declaration,
+                    )
+                }),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::ProcedureEffects,
-            ) => effects::procedure_effect_expansions_for_procedure(
-                analyzer,
-                semantic
-                    .as_mut()
-                    .expect("semantic context exists for semantic steps"),
-                &mut call_cache.effects,
-                budget,
-                limits,
-                cancellation,
-                diagnostics,
-                cache_profile,
-                procedure,
-            ),
+            ) => call_cache
+                .effects
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    effects::procedure_effect_expansions_for_procedure(
+                        analyzer,
+                        semantic
+                            .as_mut()
+                            .expect("semantic context exists for semantic steps"),
+                        memo,
+                        budget,
+                        limits,
+                        cancellation,
+                        diagnostics,
+                        cache_profile,
+                        procedure,
+                    )
+                }),
             (PipelineValue::CallBinding(value), QueryStep::ResolvedCall(filter)) => {
                 filter_witnessed_candidate |= match filter.proof {
                     ResolvedCallProof::Exact => true,
@@ -5292,16 +5353,20 @@ fn apply_pipeline_step_general<'a>(
                     unreachable!("semantic query steps require a workspace-backed context");
                 };
                 let procedures = semantic.cfg().procedure_of_declaration(declaration);
-                python_rule_facts::overly_complex_delete_expansions(
-                    analyzer,
-                    environment_cache,
-                    semantic,
-                    &mut call_cache.bindings,
-                    declaration,
-                    &procedures,
-                    cancellation,
-                    diagnostics,
-                )
+                call_cache
+                    .bindings
+                    .read_mut(&memo_attribution(analyzer), |memo| {
+                        python_rule_facts::overly_complex_delete_expansions(
+                            analyzer,
+                            environment_cache,
+                            semantic,
+                            memo,
+                            declaration,
+                            &procedures,
+                            cancellation,
+                            diagnostics,
+                        )
+                    })
             }
             (
                 PipelineValue::Declaration(declaration),
@@ -5437,20 +5502,24 @@ fn apply_pipeline_step_general<'a>(
                         None
                     }
                 };
-                effects::nilness_operation_expansions(
-                    analyzer,
-                    workspace.expect("nilness operations require a semantic workspace"),
-                    semantic
-                        .as_mut()
-                        .expect("semantic context exists for nilness operations"),
-                    &mut call_cache.effects,
-                    flow_state_cache,
-                    limits,
-                    cancellation,
-                    diagnostics,
-                    procedure,
-                    facts.as_deref(),
-                )
+                call_cache
+                    .effects
+                    .read_mut(&memo_attribution(analyzer), |memo| {
+                        effects::nilness_operation_expansions(
+                            analyzer,
+                            workspace.expect("nilness operations require a semantic workspace"),
+                            semantic
+                                .as_mut()
+                                .expect("semantic context exists for nilness operations"),
+                            memo,
+                            flow_state_cache,
+                            limits,
+                            cancellation,
+                            diagnostics,
+                            procedure,
+                            facts.as_deref(),
+                        )
+                    })
             }
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
@@ -6177,7 +6246,11 @@ fn apply_pipeline_step_general<'a>(
         control_relation_cache.release_file_window();
     }
     if release_effect_file_windows {
-        call_cache.effects.release_file_window();
+        call_cache
+            .effects
+            .read_mut(&memo_attribution(analyzer), |effects| {
+                effects.release_file_window()
+            });
     }
 
     if step == &QueryStep::ProcedureOf {

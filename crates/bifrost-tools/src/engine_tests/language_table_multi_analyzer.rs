@@ -95,6 +95,7 @@ mod ruby_extraction_tests {
                 .workspace_content_identity()
                 .expect("a two-language analyzer states a whole-workspace identity");
             let acquisition = analyzer.snapshot_caches.derived_layers().acquire(
+                analyzer,
                 request,
                 content,
                 &cancellation,

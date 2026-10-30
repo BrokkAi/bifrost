@@ -1964,6 +1964,24 @@ impl<'a> SemanticRequest<'a> {
         self.value_type_barrier_context
     }
 
+    pub fn classify_value_type_barrier(
+        &mut self,
+        observation: &crate::analyzer::semantic::BarrierObservation,
+        predicate: crate::analyzer::semantic::ValueTypePredicate,
+    ) -> Result<
+        crate::analyzer::semantic::ValueTypeBarrierDecision,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let Some(context) = self.value_type_barrier_context() else {
+            return Ok(
+                crate::analyzer::semantic::ValueTypeBarrierDecision::Undecided(
+                    crate::analyzer::semantic::ValueTypeBarrierReason::UnavailableObservation,
+                ),
+            );
+        };
+        context.classify(observation, predicate, self)
+    }
+
     pub fn execution_budget(&self) -> Option<&SemanticExecutionBudget> {
         self.execution.as_ref()
     }

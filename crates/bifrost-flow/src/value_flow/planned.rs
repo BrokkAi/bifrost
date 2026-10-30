@@ -29,14 +29,12 @@ use crate::dataflow::{
 use super::{
     BackwardValueFlowResult, ValueFlowMayStatus, ValueFlowPlan, ValueFlowSinkId,
     ValueFlowSolveError, ValueFlowSourceId, ValueFlowSummaryResult,
-    backward_client::BackwardValueFlowSolveError,
+    backward_client::BackwardValueFlowSolveError, result::meeting_may_status,
 };
 
-/// The context-expanded snapshot nodes bound to one value-flow observation.
+/// The context-expanded snapshot nodes bound to a plan's source and sink observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueFlowSnapshotObservationBindings {
-    sources: Box<[(ValueFlowSourceId, Box<[IcfgNodeId]>)]>,
-    sinks: Box<[(ValueFlowSinkId, Box<[IcfgNodeId]>)]>,
     source_nodes: Box<[IcfgNodeId]>,
     sink_nodes: Box<[IcfgNodeId]>,
 }
@@ -49,31 +47,6 @@ impl ValueFlowSnapshotObservationBindings {
     pub const fn sink_nodes(&self) -> &[IcfgNodeId] {
         &self.sink_nodes
     }
-
-    pub fn source_bindings(&self) -> &[(ValueFlowSourceId, Box<[IcfgNodeId]>)] {
-        &self.sources
-    }
-
-    pub fn sink_bindings(&self) -> &[(ValueFlowSinkId, Box<[IcfgNodeId]>)] {
-        &self.sinks
-    }
-
-    pub fn source_nodes_for(&self, source: ValueFlowSourceId) -> Option<&[IcfgNodeId]> {
-        observation_nodes_for(&self.sources, source)
-    }
-
-    pub fn sink_nodes_for(&self, sink: ValueFlowSinkId) -> Option<&[IcfgNodeId]> {
-        observation_nodes_for(&self.sinks, sink)
-    }
-}
-
-fn observation_nodes_for<I: Copy + PartialEq>(
-    bindings: &[(I, Box<[IcfgNodeId]>)],
-    id: I,
-) -> Option<&[IcfgNodeId]> {
-    bindings
-        .iter()
-        .find_map(|(candidate, nodes)| (*candidate == id).then_some(nodes.as_ref()))
 }
 
 /// Value-flow-specific direction plan and its shared-snapshot observation
@@ -299,7 +272,7 @@ pub fn solve_value_flow_planned_backward(
     let completion = PlannedDataflowCompletion::new(
         native.coverage().input_status(),
         native.termination(),
-        native.is_complete() && plan.discovery_complete(),
+        result.is_complete(),
     );
     Ok(PlannedDataflowResult::new(
         direction_plan.dataflow_plan(),
@@ -393,24 +366,6 @@ where
     )
 }
 
-/// Adapt an existing forward summary solve into the canonical planned result.
-///
-/// The summary route is intentionally an adapter rather than a second solve:
-/// its provider and root remain owned by the existing summary entry point, and
-/// its semantic work is copied from the native result into the shared envelope.
-pub fn adapt_value_flow_summary_result(
-    direction_plan: &ValueFlowDirectionPlan,
-    summary: ValueFlowSummaryResult,
-) -> Result<ValueFlowPlannedResult, ValueFlowPlannedSolveError> {
-    adapt_value_flow_summary_result_with_witness_retention(
-        direction_plan,
-        summary,
-        WitnessRetentionLimits::disabled(),
-        SemanticWork::default(),
-        IcfgInputStatus::Complete,
-    )
-}
-
 fn adapt_value_flow_summary_result_with_witness_retention(
     direction_plan: &ValueFlowDirectionPlan,
     summary: ValueFlowSummaryResult,
@@ -489,11 +444,7 @@ fn canonical_backward_findings(
             meeting.source(),
             meeting.sink(),
             meeting.path_qualities(),
-            if uncertain {
-                ValueFlowMayStatus::Unproven
-            } else {
-                ValueFlowMayStatus::Proven
-            },
+            meeting_may_status(uncertain, meeting.path_qualities()),
             uncertain,
         )
     })
@@ -536,13 +487,7 @@ fn canonicalize_findings(
                 previous.path_qualities.insert(quality);
             }
             previous.uncertain |= finding.uncertain;
-            previous.may = if previous.uncertain {
-                ValueFlowMayStatus::Unproven
-            } else if previous.path_qualities.has_proven_path() {
-                ValueFlowMayStatus::Proven
-            } else {
-                ValueFlowMayStatus::Unproven
-            };
+            previous.may = meeting_may_status(previous.uncertain, previous.path_qualities);
         } else {
             canonical.push(finding);
         }
@@ -654,34 +599,28 @@ fn bind_observations(
     plan: &ValueFlowPlan,
     snapshot: &IcfgSnapshot,
 ) -> Result<ValueFlowSnapshotObservationBindings, ValueFlowDirectionPlanError> {
-    let mut sources = Vec::with_capacity(plan.sources().len());
     let mut source_nodes = Vec::new();
     for (source, spec) in plan.sources() {
-        let nodes = snapshot_node_ids_for_points(snapshot, std::slice::from_ref(&spec.point()))
-            .into_boxed_slice();
+        let nodes = snapshot_node_ids_for_points(snapshot, std::slice::from_ref(&spec.point()));
         if nodes.is_empty() {
             return Err(ValueFlowDirectionPlanError::MissingSourceObservation {
                 source,
                 point: spec.point().clone(),
             });
         }
-        source_nodes.extend(nodes.iter().copied());
-        sources.push((source, nodes));
+        source_nodes.extend(nodes);
     }
 
-    let mut sinks = Vec::with_capacity(plan.sinks().len());
     let mut sink_nodes = Vec::new();
     for (sink, spec) in plan.sinks() {
-        let nodes = snapshot_node_ids_for_points(snapshot, std::slice::from_ref(&spec.point()))
-            .into_boxed_slice();
+        let nodes = snapshot_node_ids_for_points(snapshot, std::slice::from_ref(&spec.point()));
         if nodes.is_empty() {
             return Err(ValueFlowDirectionPlanError::MissingSinkObservation {
                 sink,
                 point: spec.point().clone(),
             });
         }
-        sink_nodes.extend(nodes.iter().copied());
-        sinks.push((sink, nodes));
+        sink_nodes.extend(nodes);
     }
 
     source_nodes.sort_unstable();
@@ -689,8 +628,6 @@ fn bind_observations(
     sink_nodes.sort_unstable();
     sink_nodes.dedup();
     Ok(ValueFlowSnapshotObservationBindings {
-        sources: sources.into_boxed_slice(),
-        sinks: sinks.into_boxed_slice(),
         source_nodes: source_nodes.into_boxed_slice(),
         sink_nodes: sink_nodes.into_boxed_slice(),
     })

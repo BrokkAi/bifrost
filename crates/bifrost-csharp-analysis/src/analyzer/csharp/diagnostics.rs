@@ -75,6 +75,7 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
         return report;
     };
     let external = RetainedCSharpExternal {
+        analyzer,
         csharp,
         index: csharp.retained_external_index(),
         overlay: analyzer.semantic_model_overlay(),
@@ -94,6 +95,7 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
 /// state a host produced earlier. Nothing here reads an assembly, opens
 /// `project.assets.json`, or starts discovery.
 struct RetainedCSharpExternal<'a> {
+    analyzer: &'a dyn IAnalyzer,
     csharp: &'a CSharpAnalyzer,
     index: Option<&'a CSharpExternalDeclarationIndex>,
     overlay: Option<Arc<SemanticModelOverlay>>,
@@ -131,6 +133,22 @@ impl RetainedCSharpExternal<'_> {
         let index = self.index.expect("readable index was built");
         let detail = match forwards {
             Ok(Some(reasons)) if reasons.is_empty() => {
+                // The cell answers from the overlay this call obtained, whose
+                // getter recorded the Models key, and lives for this call only.
+                if let Some(overlay) = self.overlay.as_ref() {
+                    let key = brokk_bifrost_analysis::analyzer::ReadKey::Models(
+                        brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(
+                            overlay.active_model_set_hash(),
+                        ),
+                    );
+                    debug_assert!(
+                        brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers(
+                            self.analyzer,
+                            &key,
+                        ),
+                        "forward-source coverage requires the selected model publication key"
+                    );
+                }
                 let coverage = self.forward_sources_complete.get_or_init(|| {
                     let packs = index.forwarding_packs();
                     if packs.is_empty() {

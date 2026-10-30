@@ -10,6 +10,8 @@
 //! published per-endpoint relations and the source that reads them.
 
 pub(crate) mod forward;
+#[doc(hidden)]
+pub use forward::RUST_DEMAND_INSTALLER;
 pub(crate) mod inventory;
 pub(crate) mod relations;
 

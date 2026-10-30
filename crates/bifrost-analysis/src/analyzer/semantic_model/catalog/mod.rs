@@ -262,6 +262,17 @@ impl Drop for CatalogLease<'_> {
 }
 
 impl SemanticPackCatalog {
+    // Catalog selection and decoding precede model publication. Queries read
+    // the immutable published set and record its Models key instead.
+    fn outside_capture(&self) -> &Self {
+        let is_capturing = crate::analyzer::i_analyzer::has_read_attribution_ledgers();
+        debug_assert!(
+            !is_capturing,
+            "catalog acquisition must precede captured semantic reads"
+        );
+        self
+    }
+
     pub fn open(
         root: &Path,
         mode: CatalogOpenMode,
@@ -437,6 +448,7 @@ impl SemanticPackCatalog {
 
     fn active_reader_connection(&self) -> Result<Connection, CatalogError> {
         let mut session = self
+            .outside_capture()
             .session_catalog
             .lock()
             .expect("session semantic catalog mutex poisoned");
@@ -508,7 +520,7 @@ impl SemanticPackCatalog {
         Ok((
             CatalogRuntimeSourceReader {
                 connection: Arc::new(Mutex::new(connection)),
-                session_catalog: Arc::clone(&self.session_catalog),
+                session_catalog: Arc::clone(&self.outside_capture().session_catalog),
                 _ephemeral_root: self._ephemeral_root.as_ref().map(Arc::clone),
             },
             identities,
@@ -517,12 +529,16 @@ impl SemanticPackCatalog {
 
     fn shared_generated_catalog(&self) -> Option<&Self> {
         let root = self.shared_generated_root.as_ref()?;
-        if let Some(catalog) = self.shared_generated.get() {
+        if let Some(catalog) = self.outside_capture().shared_generated.get() {
             return Some(catalog);
         }
         match Self::open(root, CatalogOpenMode::ReadWrite, self.options.clone()) {
             // A concurrent first use may have stored its own open; keep that one.
-            Ok(catalog) => Some(self.shared_generated.get_or_init(|| Box::new(catalog))),
+            Ok(catalog) => Some(
+                self.outside_capture()
+                    .shared_generated
+                    .get_or_init(|| Box::new(catalog)),
+            ),
             Err(error) => {
                 eprintln!(
                     "shared generated cache {root:?} is unavailable; using the workspace catalog: {error}"
@@ -725,6 +741,7 @@ impl SemanticPackCatalog {
     ) -> Result<(), CatalogError> {
         let digest = &manifest.content_sha256;
         if self
+            .outside_capture()
             .verified_manifest_inventories
             .lock()
             .expect("semantic-pack inventory mutex poisoned")
@@ -736,7 +753,8 @@ impl SemanticPackCatalog {
             .map_err(|error| CatalogError::Artifact(error.to_string()))?;
         self.manifest_inventory_validations
             .fetch_add(1, Ordering::Relaxed);
-        self.verified_manifest_inventories
+        self.outside_capture()
+            .verified_manifest_inventories
             .lock()
             .expect("semantic-pack inventory mutex poisoned")
             .insert(digest.clone());
@@ -780,6 +798,7 @@ impl SemanticPackCatalog {
             return Ok(());
         }
         let mut checked = self
+            .outside_capture()
             .validated_python_profile_packs
             .lock()
             .expect("Python profile validation mutex poisoned");
@@ -862,6 +881,7 @@ impl SemanticPackCatalog {
         }
         self.manifest_decodes.fetch_add(1, Ordering::Relaxed);
         let mut memo = self
+            .outside_capture()
             .decoded_manifests
             .lock()
             .expect("semantic-pack manifest memo mutex poisoned");
@@ -877,12 +897,17 @@ impl SemanticPackCatalog {
 
     /// The memoized decode of one stored manifest, when this catalog has it.
     fn memoized_manifest(&self, manifest_digest: &str) -> Option<Arc<CompiledPackManifest>> {
-        self.decoded_manifests
+        let memo = self
+            .outside_capture()
+            .decoded_manifests
             .lock()
-            .expect("semantic-pack manifest memo mutex poisoned")
-            .entries
-            .get(manifest_digest)
-            .map(Arc::clone)
+            .expect("semantic-pack manifest memo mutex poisoned");
+        let manifest = memo.entries.get(manifest_digest)?;
+        debug_assert_eq!(
+            manifest.content_sha256, manifest_digest,
+            "decoded manifest memo is an immutable content transform"
+        );
+        Some(Arc::clone(manifest))
     }
 
     /// Decode one stored manifest, reading its bytes only on a memo miss.
@@ -1023,6 +1048,7 @@ impl SemanticPackCatalog {
         }
 
         let session_packs = self
+            .outside_capture()
             .session_packs
             .lock()
             .expect("semantic-pack session mutex poisoned");
@@ -1048,6 +1074,7 @@ impl SemanticPackCatalog {
         drop(session_packs);
 
         let mut session_activations = self
+            .outside_capture()
             .session_activations
             .lock()
             .expect("semantic-pack session activation mutex poisoned");
@@ -1697,7 +1724,8 @@ impl SemanticPackCatalog {
                 Ok(Some(production))
             }
             Err(error) => {
-                self.rejected_manifests
+                self.outside_capture()
+                    .rejected_manifests
                     .lock()
                     .expect("semantic-pack rejection mutex poisoned")
                     .insert(manifest_digest.clone());
@@ -1806,7 +1834,8 @@ impl SemanticPackCatalog {
         );
         match install_result {
             Ok(inserted_manifest) => {
-                self.rejected_manifests
+                self.outside_capture()
+                    .rejected_manifests
                     .lock()
                     .expect("semantic-pack rejection mutex poisoned")
                     .remove(&validated.manifest.content_sha256);
@@ -2459,6 +2488,7 @@ impl SemanticPackCatalog {
             validate_exact_go_source(artifact, packages)?;
         }
         let mut session_packs = self
+            .outside_capture()
             .session_packs
             .lock()
             .expect("semantic-pack session mutex poisoned");
@@ -2468,6 +2498,7 @@ impl SemanticPackCatalog {
         {
             {
                 let mut session_catalog_guard = self
+                    .outside_capture()
                     .session_catalog
                     .lock()
                     .expect("session callable-values connection mutex poisoned");
@@ -2663,16 +2694,7 @@ impl SemanticPackCatalog {
         let desired = SemanticPackActiveSet::from_members(members)
             .map_err(|error| CatalogError::Integrity(error.to_string()))?;
         if store.is_ephemeral() {
-            if desired
-                .members
-                .iter()
-                .any(|member| durable_activation_kind(member.source_kind).is_some())
-            {
-                return Err(CatalogError::Integrity(
-                    "ephemeral workspaces can activate only session semantic packs".to_owned(),
-                ));
-            }
-            self.validate_active_members(&desired.members, true, None)?;
+            self.validate_ephemeral_active_members(&desired.members)?;
             let stored = store
                 .replace_semantic_pack_active_set(&desired.members)
                 .map_err(|error| CatalogError::Integrity(error.to_string()))?;
@@ -2714,16 +2736,7 @@ impl SemanticPackCatalog {
                 None => SemanticPackActiveSet::from_members(&[])
                     .map_err(|error| CatalogError::Integrity(error.to_string()))?,
             };
-            if desired
-                .members
-                .iter()
-                .any(|member| durable_activation_kind(member.source_kind).is_some())
-            {
-                return Err(CatalogError::Integrity(
-                    "ephemeral workspaces can activate only session semantic packs".to_owned(),
-                ));
-            }
-            self.validate_active_members(&desired.members, true, None)?;
+            self.validate_ephemeral_active_members(&desired.members)?;
             self.replace_session_activations(scope_id, &desired, store);
             return Ok((!desired.members.is_empty()).then_some(desired));
         }
@@ -2743,6 +2756,21 @@ impl SemanticPackCatalog {
         Ok((!desired.members.is_empty()).then_some(desired))
     }
 
+    fn validate_ephemeral_active_members(
+        &self,
+        members: &[SemanticPackActiveReference],
+    ) -> Result<(), CatalogError> {
+        if members
+            .iter()
+            .any(|member| durable_activation_kind(member.source_kind).is_some())
+        {
+            return Err(CatalogError::Integrity(
+                "ephemeral workspaces can activate only session semantic packs".to_owned(),
+            ));
+        }
+        self.validate_active_members(members, true, None)
+    }
+
     fn validate_active_members(
         &self,
         members: &[SemanticPackActiveReference],
@@ -2754,6 +2782,7 @@ impl SemanticPackCatalog {
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
         let session_packs = self
+            .outside_capture()
             .session_packs
             .lock()
             .expect("semantic-pack session mutex poisoned");
@@ -2829,6 +2858,7 @@ impl SemanticPackCatalog {
             .cloned()
             .collect::<Vec<_>>();
         let mut activations = self
+            .outside_capture()
             .session_activations
             .lock()
             .expect("semantic-pack session activation mutex poisoned");
@@ -3249,6 +3279,7 @@ impl SemanticPackCatalog {
 
         let mut candidates = Vec::new();
         let rejected_manifests = self
+            .outside_capture()
             .rejected_manifests
             .lock()
             .expect("semantic-pack rejection mutex poisoned");
@@ -3317,7 +3348,8 @@ impl SemanticPackCatalog {
         drop(rejected_manifests);
         for (manifest_digest, error) in corrupt {
             candidates.retain(|candidate| candidate.manifest_digest != manifest_digest);
-            self.rejected_manifests
+            self.outside_capture()
+                .rejected_manifests
                 .lock()
                 .expect("semantic-pack rejection mutex poisoned")
                 .insert(manifest_digest.clone());
@@ -3327,6 +3359,7 @@ impl SemanticPackCatalog {
         }
 
         let session_packs = self
+            .outside_capture()
             .session_packs
             .lock()
             .expect("semantic-pack session mutex poisoned");
@@ -3404,6 +3437,7 @@ impl SemanticPackCatalog {
         let mut misses: Vec<SemanticPackVersionNearMiss> = Vec::new();
         {
             let rejected_manifests = self
+                .outside_capture()
                 .rejected_manifests
                 .lock()
                 .expect("semantic-pack rejection mutex poisoned");
@@ -3426,6 +3460,7 @@ impl SemanticPackCatalog {
             }
         }
         let session_packs = self
+            .outside_capture()
             .session_packs
             .lock()
             .expect("semantic-pack session mutex poisoned");
@@ -3496,7 +3531,8 @@ impl SemanticPackCatalog {
                 }
                 let mut reason = error.to_string();
                 if matches!(candidate.location, CatalogCandidateLocation::Durable) {
-                    self.rejected_manifests
+                    self.outside_capture()
+                        .rejected_manifests
                         .lock()
                         .expect("semantic-pack rejection mutex poisoned")
                         .insert(candidate.manifest_digest.clone());
@@ -3684,6 +3720,7 @@ impl SemanticPackCatalog {
             );
         }
         let mut session_activations = self
+            .outside_capture()
             .session_activations
             .lock()
             .expect("semantic-pack session activation mutex poisoned");
@@ -3699,6 +3736,7 @@ impl SemanticPackCatalog {
             }
         }
         let session_packs = self
+            .outside_capture()
             .session_packs
             .lock()
             .expect("semantic-pack session mutex poisoned");
@@ -3787,6 +3825,7 @@ impl SemanticPackCatalog {
                 let decoded = self.load_decoded(candidate)?;
                 if matches!(candidate.location, CatalogCandidateLocation::Session { .. }) {
                     let mut session = self
+                        .outside_capture()
                         .session_catalog
                         .lock()
                         .expect("session semantic catalog mutex poisoned");
@@ -3858,6 +3897,7 @@ impl SemanticPackCatalog {
             }
             CatalogCandidateLocation::Session { .. } => {
                 let session = self
+                    .outside_capture()
                     .session_catalog
                     .lock()
                     .expect("session semantic catalog mutex poisoned");
@@ -3895,6 +3935,7 @@ impl SemanticPackCatalog {
                 shard_ordinal,
             } => {
                 let packs = self
+                    .outside_capture()
                     .session_packs
                     .lock()
                     .expect("semantic-pack session mutex poisoned");
@@ -3932,6 +3973,7 @@ impl SemanticPackCatalog {
             }
             CatalogCandidateLocation::Session { .. } => {
                 let session = self
+                    .outside_capture()
                     .session_catalog
                     .lock()
                     .expect("session semantic catalog mutex poisoned");
@@ -4191,6 +4233,7 @@ impl SemanticPackCatalog {
         shard_ordinal: usize,
     ) -> Result<LoadedCatalogShard, CatalogError> {
         let session_packs = self
+            .outside_capture()
             .session_packs
             .lock()
             .expect("semantic-pack session mutex poisoned");
@@ -5844,6 +5887,57 @@ pub(crate) mod native_compatibility_catalog_tests {
     }
 
     #[test]
+    fn cached_manifest_content_does_not_authorize_a_quarantined_catalog_candidate() {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let pack = compiled_pack(8);
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "memo-fixture".into(),
+                },
+            )
+            .unwrap();
+        let candidate = catalog
+            .candidates(&query("9.0.0", "21.0.2"))
+            .unwrap()
+            .remove(0);
+        let first = catalog
+            .stored_manifest(candidate.manifest_digest())
+            .unwrap();
+        let decodes = catalog.manifest_decode_count();
+        let second = catalog
+            .stored_manifest(candidate.manifest_digest())
+            .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the second read must hit the immutable decode memo"
+        );
+        assert_eq!(second.content_sha256, candidate.manifest_digest());
+        assert_eq!(catalog.manifest_decode_count(), decodes);
+        // Lazy durable loads still consult current pack/shard admission after
+        // obtaining the immutable manifest, even when its decode is retained.
+        catalog
+            .quarantine(
+                candidate.manifest_digest(),
+                "fixture admission changed",
+                &super::CatalogError::Unavailable,
+            )
+            .unwrap();
+        assert!(matches!(
+            catalog.load_durable(&candidate),
+            Err(super::CatalogError::Unavailable)
+        ));
+        assert!(
+            catalog
+                .candidates(&query("9.0.0", "21.0.2"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     #[hardwon("#3815: native pack admission incorrectly inherited the legacy engine-version gate")]
     fn schema_eight_ignores_engine_version_while_legacy_range_still_filters() {
         let root = tempfile::tempdir().unwrap();
@@ -6384,3 +6478,38 @@ pub use crate::analyzer::store::model_catalog::{
     CatalogPackSourceKind, CatalogRuntimeSourceReader, DurablePackSourceKind,
     activation_catalog_kind, durable_activation_kind, parse_semantic_pack_activation_source_kind,
 };
+
+#[cfg(test)]
+mod connection_read_tests {
+    use super::*;
+    use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+
+    #[test]
+    fn catalog_connection_reads_live_sql_state_across_captures() {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let analyzer = MultiAnalyzer::default();
+        let connection = catalog.connection.lock().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE memo_probe(value INTEGER); INSERT INTO memo_probe VALUES (1)",
+            )
+            .unwrap();
+        for value in [1, 2] {
+            connection
+                .execute("UPDATE memo_probe SET value = ?1", [value])
+                .unwrap();
+            let (actual, reads) = capture_query_reads(&analyzer, || {
+                connection
+                    .query_row("SELECT value FROM memo_probe", [], |row| {
+                        row.get::<_, i32>(0)
+                    })
+                    .unwrap()
+            });
+            assert_eq!(actual, value);
+            assert!(
+                reads.keys().is_empty(),
+                "a connection handle retains no query answer"
+            );
+        }
+    }
+}

@@ -3775,24 +3775,12 @@ fn finish(
             None,
             "rustdoc JSON contains no externally visible Rust declarations",
         );
-        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        return ArtifactProduction {
-            artifact_sha256: Some(artifact_sha256.to_owned()),
-            pack: None,
-            completeness: Completeness::Partial,
-            diagnostics,
-            suppressed_diagnostics,
-        };
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let collection_flows = collection_flow_facts(&types, &members);
-    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
-        request,
-        artifact_sha256,
-        "bifrost-rustdoc-json",
-        "rust",
-        diagnostics,
-        suppressed_diagnostics,
+    let shards = if types.is_empty() {
+        Vec::new()
+    } else {
+        let collection_flows = collection_flow_facts(&types, &members);
         vec![AuthoredShard {
             id: "declarations.rust.external".to_owned(),
             activation: request.activation.clone(),
@@ -3809,7 +3797,16 @@ fn finish(
             deferred_yields: None,
             conditional_type_refinements: None,
             callable_values: None,
-        }],
+        }]
+    };
+    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
+        request,
+        artifact_sha256,
+        "bifrost-rustdoc-json",
+        "rust",
+        diagnostics,
+        suppressed_diagnostics,
+        shards,
     )
 }
 

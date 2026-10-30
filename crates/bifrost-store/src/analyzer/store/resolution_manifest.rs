@@ -530,6 +530,7 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_package_routes WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_package_route_segments WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_singleton_relations WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_compilation_imports WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_paths WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_sites WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_gaps WHERE blob_id = ?1),

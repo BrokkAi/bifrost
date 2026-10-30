@@ -21,6 +21,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+const JVM_LANGUAGES: [Language; 3] = [Language::Java, Language::Scala, Language::Kotlin];
+
+fn cross_language_jvm_candidate(
+    target: &CodeUnit,
+    target_language: Language,
+    candidate_language: Language,
+) -> bool {
+    (target.is_class()
+        && JVM_LANGUAGES.contains(&target_language)
+        && JVM_LANGUAGES.contains(&candidate_language))
+        || (target_language == Language::Java
+            && (target.is_function() || target.is_field())
+            && candidate_language == Language::Scala)
+}
+
 /// Candidate provider that walks the import graph and type hierarchy.
 ///
 /// 1. Expand the target by polymorphism (target + descendants of its parent class).
@@ -512,8 +527,6 @@ fn add_cross_language_jvm_candidates(
     candidates: &mut HashSet<ProjectFile>,
     cancellation: Option<&CancellationToken>,
 ) {
-    const JVM_LANGUAGES: [Language; 3] = [Language::Java, Language::Scala, Language::Kotlin];
-
     let target_language = language_for_target(target);
     if !JVM_LANGUAGES.contains(&target_language) {
         return;
@@ -521,14 +534,10 @@ fn add_cross_language_jvm_candidates(
 
     let target_name = target.identifier();
     let target_fq_name = target.fq_name();
-    let candidate_languages: &[Language] = if target.is_class() {
-        &JVM_LANGUAGES
-    } else if target_language == Language::Java && (target.is_function() || target.is_field()) {
-        &[Language::Scala]
-    } else {
-        return;
-    };
-    for &language in candidate_languages {
+    for language in JVM_LANGUAGES {
+        if !cross_language_jvm_candidate(target, target_language, language) {
+            continue;
+        }
         if language == target_language {
             continue;
         }
@@ -667,18 +676,12 @@ impl CandidateFileProvider for ExplicitCandidateProvider {
         let language = language_for_target(target);
         // Cross-language files must reach the strategy whenever it has a
         // structured scanner for that target shape.
-        const JVM_LANGUAGES: [Language; 3] = [Language::Java, Language::Scala, Language::Kotlin];
         self.files
             .iter()
             .filter(|file| {
                 let file_language = language_for_file(file);
                 file_language == language
-                    || (target.is_class()
-                        && JVM_LANGUAGES.contains(&language)
-                        && JVM_LANGUAGES.contains(&file_language))
-                    || (language == Language::Java
-                        && (target.is_function() || target.is_field())
-                        && file_language == Language::Scala)
+                    || cross_language_jvm_candidate(target, language, file_language)
             })
             .cloned()
             .collect()

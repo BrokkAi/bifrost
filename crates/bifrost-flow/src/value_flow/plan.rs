@@ -76,7 +76,6 @@ pub const MAX_VALUE_FLOW_CARRIERS: usize = 262_144;
 pub const MAX_VALUE_FLOW_RELATIONS: usize = 1_000_000;
 pub const MAX_VALUE_FLOW_SOURCES: usize = 65_536;
 pub const MAX_VALUE_FLOW_SINKS: usize = 65_536;
-pub const MAX_VALUE_FLOW_ACCESS_PATH: usize = 64;
 const DEFAULT_VALUE_FLOW_ACCESS_PATH: usize = 8;
 const FALLBACK_COMPONENT_SUMMARY_IDENTITY: &[u8] =
     b"bifrost-value-flow-fallback-component-summary-identity-v1";
@@ -158,54 +157,6 @@ impl ValueFlowPlanLimits {
     /// The most sinks one plan observes.
     pub const fn max_sinks(&self) -> usize {
         self.max_sinks
-    }
-
-    pub fn new(
-        max_carriers: usize,
-        max_relations: usize,
-        max_sources: usize,
-        max_sinks: usize,
-    ) -> Result<Self, ValueFlowPlanError> {
-        Self::with_access_path_limit(
-            max_carriers,
-            max_relations,
-            max_sources,
-            max_sinks,
-            DEFAULT_VALUE_FLOW_ACCESS_PATH,
-        )
-    }
-
-    /// Construct plan limits with an explicit bound for paths projected over
-    /// an exact call binding. Snapshot paths are already bounded by the
-    /// semantic oracle; this second bound controls the caller-path plus
-    /// callee-selector concatenation performed by this plan.
-    pub fn with_access_path_limit(
-        max_carriers: usize,
-        max_relations: usize,
-        max_sources: usize,
-        max_sinks: usize,
-        max_access_path: usize,
-    ) -> Result<Self, ValueFlowPlanError> {
-        if max_carriers == 0
-            || max_carriers > MAX_VALUE_FLOW_CARRIERS
-            || max_relations == 0
-            || max_relations > MAX_VALUE_FLOW_RELATIONS
-            || max_sources == 0
-            || max_sources > MAX_VALUE_FLOW_SOURCES
-            || max_sinks == 0
-            || max_sinks > MAX_VALUE_FLOW_SINKS
-            || max_access_path == 0
-            || max_access_path > MAX_VALUE_FLOW_ACCESS_PATH
-        {
-            return Err(ValueFlowPlanError::InvalidLimits);
-        }
-        Ok(Self {
-            max_carriers,
-            max_relations,
-            max_sources,
-            max_sinks,
-            max_access_path,
-        })
     }
 }
 
@@ -461,7 +412,7 @@ impl ValueFlowCarrierSummaryIdentity {
         &self,
         procedure: &crate::analyzer::semantic::SemanticLocator,
     ) -> StableDigest {
-        self.fingerprint_with(Some(procedure), None)
+        self.fingerprint_with(procedure, None)
     }
 
     #[cfg(test)]
@@ -482,7 +433,7 @@ impl ValueFlowCarrierSummaryIdentity {
             crate::analyzer::semantic::SemanticLocator,
         >,
     ) -> StableDigest {
-        self.fingerprint_with(Some(procedure), Some(internal_source_owners))
+        self.fingerprint_with(procedure, Some(internal_source_owners))
     }
 
     pub(crate) fn edge_kill_sources(&self) -> impl Iterator<Item = &ValueFlowEventKey> {
@@ -511,17 +462,15 @@ impl ValueFlowCarrierSummaryIdentity {
 
     fn fingerprint_with(
         &self,
-        procedure: Option<&crate::analyzer::semantic::SemanticLocator>,
+        procedure: &crate::analyzer::semantic::SemanticLocator,
         internal_source_owners: Option<
             &HashMap<ValueFlowEventKey, crate::analyzer::semantic::SemanticLocator>,
         >,
     ) -> StableDigest {
         let domain: &[u8] = if internal_source_owners.is_some() {
             b"bifrost-value-flow-procedure-closure-summary-identity-v8"
-        } else if procedure.is_some() {
-            b"bifrost-value-flow-procedure-local-summary-identity-v6"
         } else {
-            b"bifrost-value-flow-carrier-summary-identity-v5"
+            b"bifrost-value-flow-procedure-local-summary-identity-v6"
         };
         let mut digest = LengthDelimitedDigest::new(domain);
         digest.push(self.unmodeled_call_behavior.label().as_bytes());
@@ -531,7 +480,7 @@ impl ValueFlowCarrierSummaryIdentity {
         }
         push_summary_len(&mut digest, self.fallback_globals.len());
         for carrier in &self.fallback_globals {
-            push_summary_carrier(&mut digest, carrier, procedure);
+            push_summary_carrier(&mut digest, carrier, Some(procedure));
         }
         push_summary_bool(&mut digest, self.has_snapshot);
 
@@ -542,8 +491,8 @@ impl ValueFlowCarrierSummaryIdentity {
             digest.push(&rule.event_index.to_le_bytes());
             push_relation_kind(&mut digest, rule.kind);
             push_value_transfer(&mut digest, rule.transfer);
-            push_summary_carrier(&mut digest, &rule.source, procedure);
-            push_summary_carrier(&mut digest, &rule.target, procedure);
+            push_summary_carrier(&mut digest, &rule.source, Some(procedure));
+            push_summary_carrier(&mut digest, &rule.target, Some(procedure));
             push_proof_status(&mut digest, &rule.proof);
             push_evidence_completeness(&mut digest, &rule.completeness);
             if rule.policy_local {
@@ -557,25 +506,20 @@ impl ValueFlowCarrierSummaryIdentity {
         for rule in &self.call_rules {
             digest.push(b"call_rule");
             digest.push(&rule.call.get().to_le_bytes());
-            if procedure.is_some() {
-                digest.push(
-                    rule.callee_artifact
-                        .procedure_environment_fingerprint()
-                        .as_bytes(),
-                );
-                push_declaration_shape(&mut digest, &rule.callee_declaration);
-            } else {
-                digest.push(rule.callee_artifact.public_fingerprint().as_bytes());
-                push_declaration(&mut digest, &rule.callee_declaration);
-            }
+            digest.push(
+                rule.callee_artifact
+                    .procedure_environment_fingerprint()
+                    .as_bytes(),
+            );
+            push_declaration_shape(&mut digest, &rule.callee_declaration);
             digest.push(match rule.kind {
                 CallFlowRuleKind::Call => b"call",
                 CallFlowRuleKind::NormalReturn => b"normal_return",
                 CallFlowRuleKind::ExceptionalReturn => b"exceptional_return",
             });
             push_value_transfer(&mut digest, rule.transfer);
-            push_summary_carrier(&mut digest, &rule.source, procedure);
-            push_summary_carrier(&mut digest, &rule.target, procedure);
+            push_summary_carrier(&mut digest, &rule.source, Some(procedure));
+            push_summary_carrier(&mut digest, &rule.target, Some(procedure));
             push_proof_status(&mut digest, &rule.proof);
             push_evidence_completeness(&mut digest, &rule.completeness);
         }
@@ -593,14 +537,18 @@ impl ValueFlowCarrierSummaryIdentity {
             digest.push(&rule.call.get().to_le_bytes());
             push_summary_len(&mut digest, rule.inputs.len());
             for input in &rule.inputs {
-                push_summary_carrier(&mut digest, input, procedure);
+                push_summary_carrier(&mut digest, input, Some(procedure));
             }
             push_summary_len(&mut digest, rule.reachable_components.len());
             for component in &rule.reachable_components {
                 digest.push(component.as_bytes());
             }
-            push_optional_carrier(&mut digest, rule.normal_output.as_ref(), procedure);
-            push_optional_carrier(&mut digest, rule.exceptional_output.as_ref(), procedure);
+            push_optional_carrier(&mut digest, rule.normal_output.as_ref(), Some(procedure));
+            push_optional_carrier(
+                &mut digest,
+                rule.exceptional_output.as_ref(),
+                Some(procedure),
+            );
         }
 
         push_summary_len(&mut digest, self.location_bindings.len());
@@ -608,7 +556,7 @@ impl ValueFlowCarrierSummaryIdentity {
             digest.push(b"location_binding");
             digest.push(&binding.call.get().to_le_bytes());
             push_summary_port(&mut digest, &binding.port);
-            push_optional_carrier(&mut digest, binding.carrier.as_ref(), procedure);
+            push_optional_carrier(&mut digest, binding.carrier.as_ref(), Some(procedure));
         }
 
         push_summary_len(&mut digest, self.conditional_sources.len());
@@ -619,8 +567,8 @@ impl ValueFlowCarrierSummaryIdentity {
                 ValueFlowObservationPhase::BeforeEffects => b"before_effects",
                 ValueFlowObservationPhase::AfterEffects => b"after_effects",
             });
-            push_summary_event(&mut digest, &source.key, procedure);
-            push_summary_carrier(&mut digest, &source.carrier, procedure);
+            push_summary_event(&mut digest, &source.key, Some(procedure));
+            push_summary_carrier(&mut digest, &source.carrier, Some(procedure));
             push_proof_status(&mut digest, &source.proof);
             push_evidence_completeness(&mut digest, &source.completeness);
             let triggers = source
@@ -634,7 +582,7 @@ impl ValueFlowCarrierSummaryIdentity {
             for trigger in triggers {
                 let source_procedure = internal_source_owners
                     .and_then(|owners| owners.get(trigger))
-                    .or(procedure);
+                    .or(Some(procedure));
                 push_summary_event(&mut digest, trigger, source_procedure);
             }
         }
@@ -687,7 +635,7 @@ impl ValueFlowCarrierSummaryIdentity {
             digest.push(&point.get().to_le_bytes());
             digest.push(&target.get().to_le_bytes());
             digest.push(kind.label().as_bytes());
-            push_summary_carrier(&mut digest, carrier, procedure);
+            push_summary_carrier(&mut digest, carrier, Some(procedure));
             push_edge_kill_labels(&mut digest, labels);
             // An external source arrives as the reusable entry placeholder;
             // its exact membership is keyed by that entry's behavior
@@ -697,8 +645,7 @@ impl ValueFlowCarrierSummaryIdentity {
             for source in sources {
                 let source_procedure = internal_source_owners
                     .and_then(|owners| owners.get(source))
-                    .or(procedure)
-                    .expect("a retained source has a procedure-local owner");
+                    .unwrap_or(procedure);
                 push_summary_event(&mut digest, source, Some(source_procedure));
             }
         }
@@ -886,22 +833,6 @@ fn push_summary_event(
     procedure: Option<&crate::analyzer::semantic::SemanticLocator>,
 ) {
     push_summary_identity(digest, event, procedure);
-}
-
-fn push_declaration(digest: &mut LengthDelimitedDigest, declaration: &DeclarationLocator) {
-    push_summary_len(digest, declaration.segments().len());
-    for segment in declaration.segments() {
-        digest.push(segment.kind().stable_label().as_bytes());
-        match segment.name() {
-            Some(name) => {
-                digest.push(b"named");
-                digest.push(name.as_bytes());
-            }
-            None => digest.push(b"anonymous"),
-        }
-        digest.push_anchor(segment.anchor());
-        digest.push(&segment.sibling_ordinal().to_le_bytes());
-    }
 }
 
 fn push_relation_kind(digest: &mut LengthDelimitedDigest, kind: ValueFlowRelationKind) {
@@ -1602,11 +1533,6 @@ impl ValueFlowReturnedCallable {
     pub const fn closure(&self) -> &ProcedureHandle {
         &self.closure
     }
-
-    /// The closure's environment slots, in the closure's own procedure.
-    pub fn captures(&self) -> &[MemoryLocationId] {
-        &self.captures
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1620,10 +1546,6 @@ struct BoundSummaryLocationBinding {
 impl ValueFlowCuratedCallModel {
     pub fn new(call: CallSiteHandle, model: CuratedCallModel) -> Self {
         Self { call, model }
-    }
-
-    pub fn call(&self) -> &CallSiteHandle {
-        &self.call
     }
 
     pub const fn model(&self) -> &CuratedCallModel {
@@ -1887,7 +1809,17 @@ impl EdgeKillIndex {
             .saturating_add(
                 self.by_edge
                     .values()
-                    .map(|kills| size_of_val(kills.as_ref()))
+                    .map(|kills| {
+                        kills
+                            .iter()
+                            .fold(size_of_val(kills.as_ref()), |total, kill| {
+                                total.saturating_add(
+                                    kill.labels
+                                        .as_ref()
+                                        .map_or(0, TaintClassSet::retained_heap_bytes),
+                                )
+                            })
+                    })
                     .fold(0usize, usize::saturating_add),
             )
     }
@@ -2408,25 +2340,6 @@ impl ValueFlowPlan {
             ValueFlowPlanLimits::default(),
             unmodeled_call_behavior,
             resolved_external_calls,
-        )
-    }
-
-    pub fn with_limits(
-        root: ProcedureHandle,
-        snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
-        bindings: Vec<ValueFlowInput<CallBindings>>,
-        sources: impl Into<ValueFlowSources>,
-        sinks: Vec<ValueFlowSinkSpec>,
-        limits: ValueFlowPlanLimits,
-    ) -> Result<Self, ValueFlowPlanError> {
-        Self::with_limits_and_call_behavior(
-            root,
-            snapshots,
-            bindings,
-            sources,
-            sinks,
-            limits,
-            UnmodeledCallBehavior::default(),
         )
     }
 
@@ -3156,11 +3069,17 @@ impl ValueFlowPlan {
                 .saturating_add(sink.spec.completeness().retained_heap_bytes())
         });
         let edge_kill_heap = self.edge_kills.iter().fold(0usize, |total, kill| {
-            total.saturating_add(
-                kill.carrier
-                    .stable_key()
-                    .map_or(0, |key| key.retained_bytes()),
-            )
+            total
+                .saturating_add(
+                    kill.carrier
+                        .stable_key()
+                        .map_or(0, |key| key.retained_bytes()),
+                )
+                .saturating_add(
+                    kill.labels
+                        .as_ref()
+                        .map_or(0, TaintClassSet::retained_heap_bytes),
+                )
         });
 
         std::mem::size_of::<Self>()
@@ -4953,6 +4872,24 @@ impl ValueFlowPlan {
         })
     }
 
+    /// Reuse discovery's per-procedure completeness decision for local pruning.
+    /// Refinable has only unresolved call-target gaps: the existing openness
+    /// classifier already discharged every relevant non-call gap. Dispatch
+    /// cannot hide a local use because receiver and argument operands are
+    /// lowered regardless of the selected target, and captures are never
+    /// killed. Missing or Incomplete snapshots cannot certify local liveness.
+    pub(crate) fn procedure_flow_is_complete(&self, procedure: &ProcedureHandle) -> bool {
+        self.snapshot_procedures
+            .iter()
+            .position(|candidate| candidate == procedure)
+            .is_some_and(|index| {
+                matches!(
+                    self.snapshot_discoveries[index],
+                    SnapshotDiscovery::Complete | SnapshotDiscovery::Refinable { .. }
+                )
+            })
+    }
+
     pub(crate) fn has_snapshot(&self, procedure: &ProcedureHandle) -> bool {
         self.snapshot_procedures
             .iter()
@@ -5595,75 +5532,12 @@ impl ValueFlowPlan {
         }
     }
 
-    /// Applies one call's modeled transfers to one already-active incoming
-    /// fact (`input`), composing sibling transfers on the *same* call so a
-    /// value one transfer just wrote to a port (typically `Receiver`) can
-    /// feed a second transfer that reads that same port (#2567).
-    ///
-    /// Before this fix, the loop below tested every transfer's own `input`
-    /// port against `input` only -- the one fact this invocation started
-    /// with -- so a summary like `HashMap.put`'s, whose authored transfers
-    /// deliberately chain through the receiver (`parameter[1] -> receiver`,
-    /// then `receiver -> normal_return`, so "the value just written" can be
-    /// read back through the method's own return value), never composed:
-    /// the second transfer's `input` (`Receiver`) only ever matched a fact
-    /// that already carried the receiver's value *before* the call, which a
-    /// freshly constructed or freshly received map never does. A run could
-    /// then reach `ProvenBySummary` (every transfer's ports structurally
-    /// bind, which is all `model_is_fully_bindable`'s completion-time check
-    /// asks) while silently dropping the one flow the fixture carries -- a
-    /// false green in the sense the project's own no-false-greens property
-    /// forbids.
-    ///
-    /// The fix below runs a small, local fixed point over `transfers`
-    /// (bounded by `transfers.len()`, since every transfer fires at most
-    /// once): `reached` starts containing only `input`, and a transfer fires
-    /// once its own `input` port's live carrier appears in `reached`,
-    /// whether that is because `input` itself is that carrier (an ordinary,
-    /// direct one-hop transfer, unchanged from before this fix) or because
-    /// an earlier-firing sibling transfer *on this same call* just wrote
-    /// that carrier as its own output. This is deliberately scoped to one
-    /// call's own transfer list -- it never reads or writes any state
-    /// outside this one invocation, so it cannot compose a value across two
-    /// different calls (that composition, when it happens at all, still
-    /// only happens because two calls' `Receiver` ports resolve to the same
-    /// underlying carrier, which is the ordinary cross-call value-flow
-    /// carrier identity this function never touches).
-    ///
-    /// A transfer fires **at most once** per invocation (`fired`), which
-    /// bounds every pass to firing at least one new transfer or terminating,
-    /// so the loop always halts within `transfers.len()` passes even for a
-    /// pathological cyclic or self-referencing (`receiver -> receiver`)
-    /// summary -- it can never double-apply a transfer to its own output.
-    ///
-    /// Sanitize composition: `reached` also carries, for every carrier it
-    /// contains, the union of every sanitize effect's removed labels along
-    /// whichever path first reached that carrier (`sanitize_removed_labels`,
-    /// #1923). A transfer that fires by composition (not directly against
-    /// `input`) reports that accumulated union as its own `removed_labels`,
-    /// not only its own effect. This is exactly equivalent to composing one
-    /// `TaintEdgeFunction::kill` per hop: `kill(A)` composed with `kill(B)`
-    /// is `kill(A ∪ B)`, because both are monotonic label removals over
-    /// independent label dimensions, so the order they are removed in
-    /// cannot matter (verified against `TaintEdgeFunction::compose`'s own
-    /// definition in `taint/client.rs`). A sanitize declared on a *second*
-    /// hop of a chain therefore still cuts labels a *first* hop let through,
-    /// exactly as a single-hop sanitize already did.
-    ///
-    /// Scope note, checked against every sanitize effect shipped in this
-    /// repository (`semantic-packs/sanitizers/**/*.json`): every one is a
-    /// direct `parameter[n] -> normal_return` pair, never a self-loop
-    /// (`port -> itself`) and never downstream of a port two or more
-    /// transfers also write to. `reached` therefore records the *first*
-    /// path that reaches a given carrier and does not update it if a later
-    /// transfer reaches that same carrier by a different path with a
-    /// different accumulated label set (which would matter only for a
-    /// summary with divergent per-path sanitize outcomes converging on one
-    /// port, or a self-loop transfer carrying its own sanitize -- neither
-    /// occurs in any shipped content today). Deterministic either way
-    /// (`transfers` is a stable slice, walked in the same index order every
-    /// pass, with no unordered collection involved), but this is the one
-    /// documented limitation of the composition below.
+    /// Compose one call's modeled transfers from an active incoming carrier.
+    /// Each carrier retains the labels removed on every path reaching it:
+    /// labels accumulate by union along an edge and intersect where paths
+    /// converge. Iterate to a fixed point before emitting transfers, so a
+    /// label survives whenever any path preserves it, including through
+    /// cycles. Then visit each transfer with a reached input exactly once.
     #[allow(clippy::too_many_arguments)]
     fn visit_modeled_transfers<'a>(
         &'a self,
@@ -5730,47 +5604,59 @@ impl ValueFlowPlan {
             }
         }
 
-        // The composition fixed point (see the doc comment above for the
-        // full rationale). `reached` maps a carrier this call's own transfer
-        // graph has made active, starting from `input`, to the accumulated
-        // union of sanitize labels removed along the path that reached it.
         let mut reached: Vec<(ValueFlowCarrierId, Vec<Box<str>>)> = vec![(input, Vec::new())];
-        let mut fired = vec![false; carrier_bound.len()];
-        'compose: loop {
+        loop {
             let mut progressed = false;
-            for (index, (source, target, transfer)) in carrier_bound.iter().enumerate() {
-                if fired[index] {
-                    continue;
-                }
-                let Some(prefix) = reached
+            for (source, target, transfer) in &carrier_bound {
+                let Some(mut candidate) = reached
                     .iter()
                     .find(|(carrier, _)| carrier == source)
                     .map(|(_, labels)| labels.clone())
                 else {
                     continue;
                 };
-                fired[index] = true;
-                progressed = true;
-                let mut removed_labels = prefix;
-                removed_labels.extend(
+                candidate.extend(
                     sanitize_removed_labels(effects, transfer.input(), transfer.exit().port())
                         .iter()
                         .cloned(),
                 );
-                if !reached.iter().any(|(carrier, _)| carrier == target) {
-                    reached.push((*target, removed_labels.clone()));
-                }
-                let keep_going = visitor(BoundBoundaryTransfer {
-                    target: *target,
-                    proven_complete: summary_evidence_is_proven_complete(transfer.evidence()),
-                    authored_complete: false,
-                    removed_labels,
-                });
-                if !keep_going {
-                    break 'compose;
+                candidate.sort_unstable();
+                candidate.dedup();
+                if let Some((_, labels)) = reached.iter_mut().find(|(carrier, _)| carrier == target)
+                {
+                    let previous_len = labels.len();
+                    labels.retain(|label| candidate.binary_search(label).is_ok());
+                    progressed |= labels.len() != previous_len;
+                } else {
+                    reached.push((*target, candidate));
+                    progressed = true;
                 }
             }
             if !progressed {
+                break;
+            }
+        }
+        for (source, target, transfer) in &carrier_bound {
+            let Some(mut removed_labels) = reached
+                .iter()
+                .find(|(carrier, _)| carrier == source)
+                .map(|(_, labels)| labels.clone())
+            else {
+                continue;
+            };
+            removed_labels.extend(
+                sanitize_removed_labels(effects, transfer.input(), transfer.exit().port())
+                    .iter()
+                    .cloned(),
+            );
+            removed_labels.sort_unstable();
+            removed_labels.dedup();
+            if !visitor(BoundBoundaryTransfer {
+                target: *target,
+                proven_complete: summary_evidence_is_proven_complete(transfer.evidence()),
+                authored_complete: false,
+                removed_labels,
+            }) {
                 break;
             }
         }
@@ -7340,6 +7226,10 @@ fn assign_carrier_ids(
             .iter()
             .any(|(_, carrier)| !carrier.denotes_same_entity(representative))
         {
+            // Equal keys can still denote different entities through outer cardinality,
+            // port variant (ProcedurePort versus CaptureSlot), or artifact-scoped
+            // ordinary roots. #7933 tracks which become key discriminants and which
+            // remain deliberate refusals.
             return Err(ValueFlowPlanError::StableCarrierCollision);
         }
         let id = ValueFlowCarrierId::try_from_index(ordinal)
@@ -7805,12 +7695,19 @@ fn caller_origin_paths<'snapshot>(
         completeness: EvidenceCompleteness::Complete,
         depth: 0,
     }];
-    let mut visited = HashSet::default();
+    let mut expanded = HashMap::<_, u8>::default();
     let mut search = CallerOriginSearch::default();
     while let Some(current) = pending.pop() {
-        if !visited.insert(current.value.clone()) {
+        // Expand once initially and again for each newly observed deficit.
+        // Independent alias paths must not erase weaker evidence at a join.
+        let classes = 1
+            | (u8::from(current.proof != ProofStatus::Proven) << 1)
+            | (u8::from(current.completeness != EvidenceCompleteness::Complete) << 2);
+        let seen = expanded.entry(current.value.clone()).or_default();
+        if classes & !*seen == 0 {
             continue;
         }
+        *seen |= classes;
         if current.depth >= path_limits.access_path_length() {
             search.incomplete = true;
             continue;
@@ -8193,7 +8090,7 @@ fn append_call_location_rules<'snapshot>(
 ///
 /// A member locator carries the enclosing declaration chain of the *use site*,
 /// which is why the storage key in
-/// [`crate::dataflow::reusable_summary::SummaryLocationKey::from_locator`]
+/// [`crate::dataflow::reusable_summary::SummaryLocationKey`]
 /// deliberately leaves that chain out: one field declaration is shared by
 /// accesses from different procedures. Grafting the callee's spelling onto a
 /// caller root would therefore build a location the caller never names, and the
@@ -9238,3 +9135,7 @@ mod activation_properties {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "constructor_boundaries.rs"]
+mod constructor_boundaries;

@@ -87,14 +87,22 @@ const STRATEGY: &str = "RubyUsageGraphStrategy";
 /// Ruby resolution performed by `visit`.
 pub(crate) fn with_ruby_graph_source<R>(
     analyzer: &dyn IAnalyzer,
-    visit: impl FnOnce(RubyGraphSource<'_>) -> R,
+    visit: impl FnOnce(
+        RubyGraphSource<
+            '_,
+            brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+        >,
+    ) -> R,
 ) -> R {
     let support = AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
         consume(&support);
     };
     let scope = AnalyzerQueryScope::new(analyzer);
+    let attribution =
+        brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer);
     visit(RubyGraphSource {
+        attribution: &attribution,
         token: scope.token(),
         index: analyzer,
         definitions: &definitions,
@@ -105,7 +113,10 @@ pub(crate) fn with_ruby_graph_source<R>(
 /// on-demand parsing, with [`brokk_bifrost_ruby::graph::inverted::scan_file`]
 /// resolving each file.
 fn build_ruby_edges<Output, F>(
-    graph: RubyGraphSource<'_>,
+    graph: RubyGraphSource<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     analyzer: &dyn IAnalyzer,
     ruby: &RubyAnalyzer,
     files: &[ProjectFile],
@@ -219,7 +230,10 @@ impl<'a> UsageQueryResolver<'a> for RubyQueryResolver<'a> {
 impl RubyQueryResolver<'_> {
     fn find_usages_with(
         &self,
-        graph: RubyGraphSource<'_>,
+        graph: RubyGraphSource<
+            '_,
+            brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+        >,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         scan_scope: &UsageScanScope<'_>,

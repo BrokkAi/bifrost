@@ -21,6 +21,165 @@ mod csharp_extraction_tests {
     use brokk_bifrost_core::test_support::write_file;
     use brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAdapter;
 
+    #[test]
+    fn csharp_linked_file_access_agrees_per_caller_compilation() {
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::analyzer::read_ledger::{DerivationExecutionCause, reason};
+        use brokk_bifrost_analysis::analyzer::resolution::selected_context::SelectedContextIdentities;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_units::{
+            ACCESS_UNKNOWN, CSharpUnitAccess, CSharpUnitReader, PLACEMENT_SQL,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_sql_trace::{
+            begin_production_selected_sql_trace_on_connection,
+            finish_production_selected_sql_trace_on_connection,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+        };
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+        use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
+        use brokk_bifrost_core::{analyzer::Language, cancellation::CancellationToken};
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "engine_tests::csharp_store::csharp_extraction_tests::csharp_linked_file_access_agrees_per_caller_compilation", "--nocapture"])
+                .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "the child must run: {output:?}"
+            );
+            return;
+        }
+        let project = "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><Compile Include=\"../Linked.cs\" /></ItemGroup></Project>";
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A/A.csproj", project)
+            .file("B/B.csproj", project)
+            .file("Linked.cs", "class Linked {}")
+            .file("A/Caller.cs", "class Caller {}")
+            .file("A/Target.cs", "class Target {}")
+            .file("B/Hidden.cs", "class Hidden {}")
+            .file("Outside.cs", "class Outside {}")
+            .build();
+        let context =
+            single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+        let workspace_id = context.workspace_id.clone();
+        let store = Arc::clone(&context.store);
+        let _workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+            fixture.project_dyn(),
+            AnalyzerConfig::default(),
+            context,
+        )
+        .unwrap();
+        let snapshots = store
+            .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".to_owned()])
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("selected C# inventory");
+        };
+        let identities = SelectedContextIdentities::new();
+        let mut reader =
+            CSharpUnitReader::new(&selection, &snapshots["csharp"], &identities).unwrap();
+        begin_production_selected_sql_trace_on_connection(selection.connection());
+        let linked = reader.placements("Linked.cs").unwrap().unwrap();
+        let cost = finish_production_selected_sql_trace_on_connection(selection.connection());
+        assert_eq!(
+            linked
+                .iter()
+                .map(|p| p.project_path.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("A/A.csproj"), Some("B/B.csproj")]
+        );
+        assert_eq!(
+            cost.statements
+                .iter()
+                .filter(|sql| sql.as_str() == PLACEMENT_SQL)
+                .count(),
+            2,
+            "{cost:?}"
+        );
+        assert_eq!(
+            cost.rows_by_shape()
+                .iter()
+                .find(|(_, _, sql)| *sql == PLACEMENT_SQL)
+                .map(|(rows, _, _)| *rows),
+            Some(2),
+            "{cost:?}"
+        );
+        let caller = reader.placements("A/Caller.cs").unwrap().unwrap();
+        let target = reader.placements("A/Target.cs").unwrap().unwrap();
+        let hidden = reader.placements("B/Hidden.cs").unwrap().unwrap();
+        begin_production_selected_sql_trace_on_connection(selection.connection());
+        assert_eq!(
+            reader.access(Some(&caller), Some(&target)).unwrap(),
+            CSharpUnitAccess::Visible
+        );
+        assert_eq!(
+            reader.access(Some(&caller), Some(&hidden)).unwrap(),
+            CSharpUnitAccess::NotVisible
+        );
+        let CSharpUnitAccess::Unknown { kind, evidence } =
+            reader.access(Some(&linked), Some(&target)).unwrap()
+        else {
+            panic!("linked callers disagree");
+        };
+        assert_eq!(kind, ACCESS_UNKNOWN);
+        assert_eq!(
+            reason::classify_known(kind),
+            Some(Some(DerivationExecutionCause::Provider))
+        );
+        assert!(
+            evidence.contains("A/A.csproj") && evidence.contains("B/B.csproj"),
+            "{evidence}"
+        );
+        // A target linked into both projects is visible to A even though B is not.
+        assert_eq!(
+            reader.access(Some(&caller), Some(&linked)).unwrap(),
+            CSharpUnitAccess::Visible
+        );
+        let outside = reader.placements("Outside.cs").unwrap().unwrap();
+        assert!(outside.is_empty());
+        assert!(matches!(
+            reader.access(Some(&caller), Some(&outside)).unwrap(),
+            CSharpUnitAccess::Unknown { .. }
+        ));
+        let unselected = reader.placements("NotSelected.cs").unwrap();
+        assert!(unselected.is_none());
+        assert!(matches!(
+            reader.access(unselected.as_deref(), Some(&target)).unwrap(),
+            CSharpUnitAccess::Unknown { .. }
+        ));
+        let cost = finish_production_selected_sql_trace_on_connection(selection.connection());
+        // These are M2's real closure statements on the held connection, not
+        // constructed pair answers or a memo that was never populated.
+        let closures: Vec<_> = cost
+            .statements
+            .iter()
+            .filter(|sql| sql.contains("WITH RECURSIVE reach"))
+            .collect();
+        assert!(
+            closures
+                .iter()
+                .any(|sql| sql.contains("references_complete")),
+            "{cost:?}"
+        );
+        assert!(
+            closures.iter().any(|sql| sql.contains("expand")),
+            "{cost:?}"
+        );
+    }
+
     #[brokk_bifrost_test_macros::hardwon(
         "5304870f83d5: production C# test-like calls were misclassified by runner-name matching"
     )]

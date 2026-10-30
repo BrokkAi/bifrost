@@ -610,6 +610,8 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSyntaxKind;
 
+    use crate::analyzer::rust::test_support::inline_source_project;
+
     use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
     use crate::inline_project::InlineTestProject;
@@ -936,16 +938,9 @@ mod tests {
         )
     }
 
+    #[track_caller]
     fn fixture() -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
-        let fixture = InlineTestProject::with_language(Language::Rust)
-            .file(
-                "Cargo.toml",
-                "[package]\nname = \"native_call_projection\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            )
-            .file("src/lib.rs", source())
-            .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
-        (fixture, rust)
+        inline_source_project("native_call_projection", source())
     }
 
     #[test]

@@ -3004,31 +3004,17 @@ mod tests {
 
     use crate::analyzer::semantic_model::CompilerOptions;
 
-    use crate::analyzer::semantic_model::SemanticModelActivationControl;
-
     use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
 
-    use crate::analyzer::semantic_model::SemanticModelActivationRequest;
-
-    use crate::analyzer::semantic_model::SemanticModelControlAction;
-
-    use crate::analyzer::semantic_model::SemanticModelControlScope;
-
-    use crate::analyzer::semantic_model::SemanticModelPackSelector;
-
-    use crate::analyzer::semantic_model::SemanticModelRuntimeLimits;
+    use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelRuntimeOutcome;
-
-    use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
 
     use crate::analyzer::semantic_model::SessionPackSource;
 
     use crate::analyzer::semantic_model::SessionPackSourceKind;
 
     use crate::analyzer::semantic_model::SourceFormat;
-
-    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::acquire_active_semantic_models;
 
     use crate::analyzer::semantic_model::compile_source;
 
@@ -3651,6 +3637,7 @@ pub fn run() { let first = Item; let second = Item; }
         activate_model_pack(fixture, source, "fixture.rust-imported-constructor", "std");
     }
 
+    #[track_caller]
     fn activate_model_pack(
         fixture: &AnalyzerFixture,
         source: serde_json::Value,
@@ -3674,41 +3661,24 @@ pub fn run() { let first = Item; let second = Item; }
                 },
             )
             .expect("register Rust model fixture");
-        let request = SemanticModelActivationRequest {
-            approximate_standard_libraries: Vec::new(),
-            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
-                .expect("crate version parses"),
-            evidence: vec![SemanticModelActivationEvidence {
-                language: "rust".to_owned(),
-                ecosystem: "cargo".to_owned(),
-                package: Some(CatalogCoordinate {
-                    name: package.to_owned(),
-                    version: None,
-                }),
-                module: None,
-                toolchain: None,
-                target: None,
-                configuration: None,
-                artifact_sha256: None,
-            }],
-            controls: vec![SemanticModelActivationControl {
-                scope: SemanticModelControlScope::Workspace,
-                action: SemanticModelControlAction::Enable,
-                selector: SemanticModelPackSelector {
-                    pack_id: pack_id.to_owned(),
-                    version: None,
-                    manifest_digest: None,
-                },
-            }],
-            limits: SemanticModelRuntimeLimits::default(),
-        };
         assert!(matches!(
-            acquire_active_semantic_models(
+            brokk_bifrost_analysis::test_support::activate_semantic_model_fixture(
                 fixture.analyzer.analyzer(),
                 &catalog,
-                None,
-                &request,
-                &brokk_bifrost_core::cancellation::CancellationToken::new(),
+                pack_id,
+                SemanticModelActivationEvidence {
+                    language: "rust".to_owned(),
+                    ecosystem: "cargo".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: package.to_owned(),
+                        version: None,
+                    }),
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                },
             ),
             SemanticModelRuntimeOutcome::Ready { .. }
         ));

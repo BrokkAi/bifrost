@@ -603,10 +603,7 @@ mod tests {
     }
 
     fn first_node_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
-        crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
-            node.kind() == kind
-        })
-        .unwrap_or_else(|| panic!("missing {kind} node"))
+        crate::analyzer::test_support::first_named_kind(root, kind)
     }
 
     fn assert_default_export_name_at_header(source: &str, name: Range) -> usize {
@@ -1002,5 +999,32 @@ mod tests {
         .expect("declaration name");
 
         assert_eq!(&source[name.start_byte..name.end_byte], "method2");
+    }
+}
+
+#[cfg(test)]
+mod memo_input_tests {
+    use super::*;
+    use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+
+    #[test]
+    fn line_start_hits_only_project_the_selected_content() {
+        let analyzer = MultiAnalyzer::default();
+        let context = DeclarationNameRangeContext {
+            content: Arc::from("a\nb\n"),
+            line_starts: OnceLock::new(),
+            tree: None,
+        };
+        assert_eq!(context.line_starts(), &[0, 2, 4]);
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert_eq!(
+                context.line_starts(),
+                compute_line_starts(context.content())
+            );
+        });
+        assert!(
+            reads.keys().is_empty(),
+            "the selected source is the only input"
+        );
     }
 }

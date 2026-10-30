@@ -21,7 +21,7 @@ use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::declarations::python_module_name;
 use crate::graph_support::{
@@ -43,8 +43,6 @@ pub struct PythonUsageIndex {
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
     literal_importlib_importers: HashMap<ProjectFile, Vec<ProjectFile>>,
-    module_binding_timelines: Mutex<HashMap<ProjectFile, Arc<ModuleBindingTimeline>>>,
-    scope_facts_by_file: Mutex<HashMap<ProjectFile, Arc<PythonScopeFacts>>>,
 }
 
 pub type ModuleBindingTimeline = HashMap<String, Vec<ModuleBindingEvent>>;
@@ -140,6 +138,79 @@ fn is_namespace_binding_for_module(binding: &ImportBinding, module: &str) -> boo
 }
 
 impl PythonUsageIndex {
+    /// The complete immutable authority. Lazy per-file syntax memos are not part of it.
+    pub fn authority_rows(&self) -> Vec<String> {
+        let mut rows = self.module_spellings.authority_rows();
+        for (name, files) in &self.module_index {
+            for file in files {
+                rows.push(format!(
+                    "module:{name:?}:{:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(file)
+                ));
+            }
+        }
+        for (file, exports) in &self.exports_by_file {
+            rows.push(format!(
+                "exports:{:?}:{:?}",
+                brokk_bifrost_core::path_utils::rel_path_string(file),
+                exports.exports_by_name.is_empty()
+            ));
+            for (name, export) in &exports.exports_by_name {
+                rows.push(format!(
+                    "export:{:?}:{name:?}:{export:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(file)
+                ));
+            }
+            for star in &exports.reexport_stars {
+                rows.push(format!(
+                    "star:{:?}:{star:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(file)
+                ));
+            }
+        }
+        for ((file, name), targets) in &self.reexport_edges {
+            for (target, export) in targets {
+                rows.push(format!(
+                    "reexport:{:?}:{name:?}:{:?}:{export:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(file),
+                    brokk_bifrost_core::path_utils::rel_path_string(target)
+                ));
+            }
+        }
+        for (file, targets) in &self.star_reexports {
+            for target in targets {
+                rows.push(format!(
+                    "star_target:{:?}:{:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(file),
+                    brokk_bifrost_core::path_utils::rel_path_string(target)
+                ));
+            }
+        }
+        for (file, edges) in &self.importer_reverse {
+            for edge in edges {
+                rows.push(format!(
+                    "importer:{:?}:{:?}:{:?}:{:?}:{:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(file),
+                    brokk_bifrost_core::path_utils::rel_path_string(&edge.importer),
+                    edge.local_name,
+                    brokk_bifrost_core::path_utils::rel_path_string(&edge.target_file),
+                    edge.kind
+                ));
+            }
+        }
+        for (file, importers) in &self.literal_importlib_importers {
+            for importer in importers {
+                rows.push(format!(
+                    "literal:{:?}:{:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(file),
+                    brokk_bifrost_core::path_utils::rel_path_string(importer)
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
     /// Takes [`PythonSource`], not [`PythonUsageSource`]: the cell this
     /// build fills is only reachable through the latter, so the narrower
     /// parameter is what stops the build from re-entering it.
@@ -397,8 +468,6 @@ impl PythonUsageIndex {
             star_reexports,
             importer_reverse,
             literal_importlib_importers,
-            module_binding_timelines: Mutex::new(HashMap::default()),
-            scope_facts_by_file: Mutex::new(HashMap::default()),
         })
     }
 
@@ -473,56 +542,6 @@ impl PythonUsageIndex {
             &self.module_spellings,
             importing_file,
             module_specifier,
-        )
-    }
-
-    pub fn module_binding_timeline(
-        &self,
-        file: &ProjectFile,
-        build: impl FnOnce() -> ModuleBindingTimeline,
-    ) -> Arc<ModuleBindingTimeline> {
-        if let Some(cached) = self
-            .module_binding_timelines
-            .lock()
-            .expect("Python module-binding timeline cache mutex poisoned")
-            .get(file)
-            .cloned()
-        {
-            return cached;
-        }
-
-        let timeline = Arc::new(build());
-        self.module_binding_timelines
-            .lock()
-            .expect("Python module-binding timeline cache mutex poisoned")
-            .entry(file.clone())
-            .or_insert_with(|| timeline.clone())
-            .clone()
-    }
-
-    pub fn scope_facts(
-        &self,
-        file: &ProjectFile,
-        build: impl FnOnce() -> Option<PythonScopeFacts>,
-    ) -> Option<Arc<PythonScopeFacts>> {
-        if let Some(cached) = self
-            .scope_facts_by_file
-            .lock()
-            .expect("Python scope-facts cache mutex poisoned")
-            .get(file)
-            .cloned()
-        {
-            return Some(cached);
-        }
-
-        let facts = Arc::new(build()?);
-        Some(
-            self.scope_facts_by_file
-                .lock()
-                .expect("Python scope-facts cache mutex poisoned")
-                .entry(file.clone())
-                .or_insert_with(|| facts.clone())
-                .clone(),
         )
     }
 }
@@ -654,7 +673,10 @@ pub fn usage_module_binding_timeline(
     file: &ProjectFile,
     build: impl FnOnce() -> ModuleBindingTimeline,
 ) -> Arc<ModuleBindingTimeline> {
-    python.usage_index().module_binding_timeline(file, build)
+    let mut build = Some(build);
+    python.module_binding_timeline(file, &mut || {
+        build.take().expect("memo builds at most once")()
+    })
 }
 
 pub fn usage_scope_facts(
@@ -662,7 +684,10 @@ pub fn usage_scope_facts(
     file: &ProjectFile,
     build: impl FnOnce() -> Option<PythonScopeFacts>,
 ) -> Option<Arc<PythonScopeFacts>> {
-    python.usage_index().scope_facts(file, build)
+    let mut build = Some(build);
+    python.scope_facts(file, &mut || {
+        build.take().expect("memo builds at most once")()
+    })
 }
 
 #[cfg(test)]
@@ -689,40 +714,5 @@ mod tests {
 
         let cycle = HashMap::from_iter([(first.clone(), second.clone()), (second, first.clone())]);
         assert_eq!(canonical_module_replacement(&first, &cycle), None);
-    }
-
-    #[test]
-    #[hardwon(
-        "ddf65ec23b34: repeated graph queries rebuilt generation-stable Python binding facts"
-    )]
-    fn module_binding_timeline_is_reused_within_index_generation() {
-        let root = tempfile::tempdir().expect("temporary project root");
-        let file = ProjectFile::new(root.path(), "consumer.py");
-        let index = PythonUsageIndex::default();
-        let first = index.module_binding_timeline(&file, || {
-            ModuleBindingTimeline::from_iter([(
-                "target".to_string(),
-                vec![ModuleBindingEvent {
-                    visible_from: 12,
-                    conditional: false,
-                    kind: ModuleBindingEventKind::Other,
-                }],
-            )])
-        });
-        let second = index.module_binding_timeline(&file, || {
-            panic!("cached timeline should avoid rebuilding the file")
-        });
-
-        assert!(Arc::ptr_eq(&first, &second));
-
-        let first_facts = index
-            .scope_facts(&file, || Some(PythonScopeFacts::default()))
-            .unwrap();
-        let second_facts = index
-            .scope_facts(&file, || {
-                panic!("cached scope facts should avoid rebuilding the file")
-            })
-            .unwrap();
-        assert!(Arc::ptr_eq(&first_facts, &second_facts));
     }
 }

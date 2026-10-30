@@ -23,7 +23,9 @@ use crate::java::graph_support::{
 };
 use crate::java::structural::expression_name_node;
 use brokk_bifrost_core::CancellationToken;
+use brokk_bifrost_core::analyzer::memo_attribution::CaptureScopedMemo;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::project_reads::ReadCapability;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
@@ -109,6 +111,7 @@ pub struct PreparedJavaFile {
 }
 
 pub struct ReturnTypeCaches<'a> {
+    pub reads: &'a ReadCapability,
     pub method_return: &'a MethodReturnCache,
     pub method_anonymous_return: &'a MethodAnonymousReturnCache,
     pub file_return: &'a FileReturnCache,
@@ -119,17 +122,29 @@ pub struct ReturnTypeCaches<'a> {
 /// One usage query scans many files, and a referenced file's return facts are
 /// the same for every scanned file in that query. The owner lives beside the
 /// query's file loop so `build_java_file_return_facts` parses each referenced
-/// file once per query, not once per scanned file.
-#[derive(Default)]
+/// file once per query, not once per scanned file. Each file's evidence build
+/// can attach a different read capture, so these shared return projections
+/// replay their own build receipts instead of binding to the first capture.
 pub struct OwnedReturnTypeCaches {
+    reads: ReadCapability,
     method_return: MethodReturnCache,
     method_anonymous_return: MethodAnonymousReturnCache,
     file_return: FileReturnCache,
 }
 
 impl OwnedReturnTypeCaches {
+    pub fn new(reads: ReadCapability) -> Self {
+        Self {
+            reads,
+            method_return: MethodReturnCache::default(),
+            method_anonymous_return: MethodAnonymousReturnCache::default(),
+            file_return: FileReturnCache::default(),
+        }
+    }
+
     pub fn caches(&self) -> ReturnTypeCaches<'_> {
         ReturnTypeCaches {
+            reads: &self.reads,
             method_return: &self.method_return,
             method_anonymous_return: &self.method_anonymous_return,
             file_return: &self.file_return,
@@ -138,6 +153,7 @@ impl OwnedReturnTypeCaches {
 }
 
 pub struct ScanCtx<'a> {
+    pub reads: &'a ReadCapability,
     pub java: &'a dyn JavaSource,
     pub graph: &'a JavaGraphSource<'a>,
     pub file: &'a ProjectFile,
@@ -152,9 +168,11 @@ pub struct ScanCtx<'a> {
     pub max_usages: usize,
     pub limit_exceeded: &'a mut bool,
     pub class_ranges: ClassRangeIndex,
-    pub method_call_return_cache:
+    pub method_call_return_cache: CaptureScopedMemo<
         RefCell<HashMap<MethodCallReturnCacheKey, ReceiverAnalysisOutcome<String>>>,
-    pub receiver_target_match_cache: RefCell<HashMap<String, ReceiverTargetMatch>>,
+    >,
+    pub receiver_target_match_cache:
+        CaptureScopedMemo<RefCell<HashMap<String, ReceiverTargetMatch>>>,
     pub method_return_cache: &'a MethodReturnCache,
     pub method_anonymous_return_cache: &'a MethodAnonymousReturnCache,
     pub file_return_cache: &'a FileReturnCache,
@@ -330,6 +348,7 @@ fn scan_prepared_file(
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     seed_class_binding(java, token, graph, file, spec, &mut bindings);
     let mut ctx = ScanCtx {
+        reads: return_caches.reads,
         java,
         graph,
         file,
@@ -344,8 +363,8 @@ fn scan_prepared_file(
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
         class_ranges: prepared.class_ranges.clone(),
-        method_call_return_cache: RefCell::new(HashMap::default()),
-        receiver_target_match_cache: RefCell::new(HashMap::default()),
+        method_call_return_cache: CaptureScopedMemo::default(),
+        receiver_target_match_cache: CaptureScopedMemo::default(),
         method_return_cache: return_caches.method_return,
         method_anonymous_return_cache: return_caches.method_anonymous_return,
         file_return_cache: return_caches.file_return,

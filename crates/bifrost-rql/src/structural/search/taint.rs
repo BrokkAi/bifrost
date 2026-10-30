@@ -49,7 +49,8 @@ impl TaintQueryState {
             );
             return Vec::new();
         };
-        let Some(handle) = analysis_context.taint_result_handle(taint_ref) else {
+        let Some(handle) = analysis_context.taint_result_handle(workspace.analyzer(), taint_ref)
+        else {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::UnresolvedTaintResultReference,
                 format!("taint result reference `{taint_ref}` is not registered"),

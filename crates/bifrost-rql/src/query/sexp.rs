@@ -4812,3 +4812,6 @@ mod tests {
         assert!(error.message.contains("configuration facts"));
     }
 }
+
+#[cfg(test)]
+mod authoring_tests;

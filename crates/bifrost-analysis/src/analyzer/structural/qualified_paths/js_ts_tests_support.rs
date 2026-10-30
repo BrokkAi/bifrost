@@ -1,16 +1,11 @@
 use super::*;
 
-use crate::analyzer::AnalyzerConfig;
 use crate::analyzer::Language;
-use crate::analyzer::Project;
-use crate::analyzer::TestProject;
 use crate::analyzer::WorkspaceAnalyzer;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tempfile::TempDir;
+use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 #[doc(hidden)]
 pub struct Fixture {
-    _temp: TempDir,
+    _project: BuiltInlineTestProject,
     workspace: WorkspaceAnalyzer,
     file: ProjectFile,
     source: String,
@@ -24,24 +19,18 @@ impl Fixture {
     /// The first file is the one rows are derived for.
     #[doc(hidden)]
     pub fn with_files(language: Language, files: &[(&str, &str)]) -> Self {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-        let mut subject = None;
+        assert!(!files.is_empty(), "at least one fixture file");
+        let mut builder = InlineTestProject::with_language(language);
         for (relative_path, source) in files {
-            let file = ProjectFile::new(root.clone(), *relative_path);
-            file.write(source).expect("write fixture source");
-            subject.get_or_insert(file);
+            builder = builder.file(*relative_path, *source);
         }
-        let project = TestProject::new(root, language);
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(project) as Arc<dyn Project>,
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
+        let project = builder.build();
+        let file = project.file(files[0].0);
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
         Self {
-            _temp: temp,
+            _project: project,
             workspace,
-            file: subject.expect("at least one fixture file"),
+            file,
             source: files[0].1.to_owned(),
         }
     }

@@ -98,6 +98,11 @@ fn kotlin_graph_source<'a>(
     relational_definitions: &'a dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier,
 ) -> KotlinGraphSource<'a> {
     KotlinGraphSource {
+        reads: brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            crate::analyzer::kotlin::KotlinAnalyzer,
+        >(analyzer)
+        .expect("a Kotlin graph requires its language analyzer")
+        .read_capability(),
         index: analyzer,
         hierarchy: analyzer.type_hierarchy_provider(),
         imports: analyzer.import_analysis_provider(),

@@ -49,6 +49,7 @@ use crate::graph::syntax::is_declaration_constant;
 use crate::graph_support::RubySource;
 use crate::imports::{ruby_symbol_name, ruby_zeitwerk_visible_files_for};
 use crate::syntax::single_static_string_content_node;
+use brokk_bifrost_core::analyzer::memo_attribution::MemoAttribution;
 use brokk_bifrost_core::analyzer::model::{
     Range, SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
     SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
@@ -108,8 +109,8 @@ pub trait RubyGemSurface {
 }
 
 /// Collect Ruby semantic diagnostics and the proof or suppression behind each.
-pub fn collect_ruby_semantic_diagnostics(
-    graph: RubyGraphSource<'_>,
+pub fn collect_ruby_semantic_diagnostics<A: MemoAttribution>(
+    graph: RubyGraphSource<'_, A>,
     ruby: &dyn RubySource,
     gems: &dyn RubyGemSurface,
     file: &ProjectFile,
@@ -226,8 +227,8 @@ pub fn collect_ruby_semantic_diagnostics(
     collector.report
 }
 
-struct RubyDiagnosticCollector<'a> {
-    semantic: RubySemanticIndex<'a>,
+struct RubyDiagnosticCollector<'a, A: MemoAttribution> {
+    semantic: RubySemanticIndex<'a, A>,
     ruby: &'a dyn RubySource,
     gems: &'a dyn RubyGemSurface,
     file: &'a ProjectFile,
@@ -245,7 +246,7 @@ enum ScanFrame<'tree> {
     ExitNamespace(usize),
 }
 
-impl RubyDiagnosticCollector<'_> {
+impl<A: MemoAttribution> RubyDiagnosticCollector<'_, A> {
     fn scan_tree(&mut self, root: Node<'_>) {
         let mut lexical_stack = Vec::new();
         let mut stack = vec![ScanFrame::Node(root)];
@@ -580,7 +581,7 @@ fn unresolved_load_directive_reason(
     };
     for load in facts.loads.iter().filter(|load| load.generic) {
         let import = &load.import;
-        if crate::imports::resolve_required_file(file, load).is_some() {
+        if crate::imports::resolve_required_file(ruby, file, load).is_some() {
             continue;
         }
         let Some(load_path) = import.identifier.as_deref() else {
@@ -608,8 +609,8 @@ fn unresolved_load_directive_reason(
 
 /// Why the visible closure this file resolves against is not a surface absence
 /// can be proven on, if it is not.
-fn visible_surface_reason(
-    graph: RubyGraphSource<'_>,
+fn visible_surface_reason<A: MemoAttribution>(
+    graph: RubyGraphSource<'_, A>,
     ruby: &dyn RubySource,
     gems: &dyn RubyGemSurface,
     file: &ProjectFile,

@@ -15,8 +15,22 @@ use crate::analyzer::invalidation::{
     InvalidationReason, RetentionReason,
 };
 
+use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::semantic::ids::StableDigest;
+use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry, memo_attribution};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use brokk_bifrost_store::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+
+type DerivedLayerEntry = ReplayingMemoEntry<Arc<DerivedLayer>, ReadKey>;
+
+fn entry_retained_bytes(entry: &DerivedLayerEntry) -> usize {
+    entry.retained_bytes(|key| {
+        let mut heap = RetainedHeap::default();
+        retained_read_key(&mut heap, key);
+        heap.total()
+    })
+}
+
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
@@ -221,7 +235,7 @@ struct DerivedLayerObservations {
 /// against content that has moved is refused rather than published.
 pub struct SnapshotDerivedLayerCache {
     max_retained_bytes: u64,
-    values: CompleteValueCache<DerivedLayerKey, DerivedLayer>,
+    values: ReplayingMemo<CompleteValueCache<DerivedLayerKey, DerivedLayerEntry>>,
     observations: Mutex<Vec<(WorkspaceContentIdentity, DerivedLayerObservations)>>,
     verdicts: ArtifactVerdictLog,
 }
@@ -236,9 +250,12 @@ impl SnapshotDerivedLayerCache {
     pub fn new(max_retained_bytes: u64) -> Self {
         Self {
             max_retained_bytes,
-            values: CompleteValueCache::new(max_retained_bytes, |_, layer: &Arc<DerivedLayer>| {
-                layer.retained_bytes().clamp(1, u32::MAX as u64) as u32
-            }),
+            values: ReplayingMemo::new(CompleteValueCache::new(
+                max_retained_bytes,
+                |_, entry: &Arc<DerivedLayerEntry>| {
+                    entry_retained_bytes(entry).clamp(1, u32::MAX as usize) as u32
+                },
+            )),
             observations: Mutex::new(Vec::new()),
             verdicts: ArtifactVerdictLog::default(),
         }
@@ -293,6 +310,7 @@ impl SnapshotDerivedLayerCache {
 
     pub fn get_ready(
         &self,
+        analyzer: &dyn IAnalyzer,
         request: DerivedLayerRequest,
         workspace_content: WorkspaceContentIdentity,
         cancellation: &CancellationToken,
@@ -301,7 +319,13 @@ impl SnapshotDerivedLayerCache {
             request,
             workspace_content,
         };
-        let ready = self.values.get_ready(&key, cancellation);
+        let ready = self
+            .values
+            .read(&memo_attribution(analyzer), |values, _| {
+                values.get_ready(&key, cancellation).ok_or(())
+            })
+            .ok()
+            .map(|entry| Arc::clone(&entry));
         self.verdicts.record(match ready {
             Some(_) => ArtifactVerdict::Retained(RetentionReason::InputsUnchanged {
                 artifact: key.artifact(),
@@ -372,6 +396,7 @@ impl SnapshotDerivedLayerCache {
 
     pub fn acquire(
         &self,
+        analyzer: &dyn IAnalyzer,
         request: DerivedLayerRequest,
         workspace_content: WorkspaceContentIdentity,
         cancellation: &CancellationToken,
@@ -382,150 +407,125 @@ impl SnapshotDerivedLayerCache {
             request,
             workspace_content,
         };
-        let values = &self.values;
-        let (acquisition, wait) = values.acquire(&key, cancellation);
-        match acquisition {
-            CompleteValueAcquisition::Cached { value } => {
-                if !content_is_current() {
-                    return DerivedLayerAcquisition::Unavailable {
-                        reason: "derived-layer workspace content changed before reuse".to_string(),
-                        over_budget: false,
-                        rejection_scope: None,
-                        wait,
-                        build: DerivedLayerBuildMetrics::default(),
+        let mut lifecycle = DerivedLayerLifecycle::Hit;
+        let mut wait_metrics = CompleteValueWait::default();
+        let mut build_metrics = DerivedLayerBuildMetrics::default();
+        let selected = self.values.read(&memo_attribution(analyzer), |values, capture| {
+            let (acquisition, wait) = values.acquire(&key, cancellation);
+            wait_metrics = wait;
+            match acquisition {
+                CompleteValueAcquisition::Cached { value } => {
+                    if !content_is_current() {
+                        return Err(DerivedLayerAcquisition::Unavailable {
+                            reason: "derived-layer workspace content changed before reuse".to_string(),
+                            over_budget: false, rejection_scope: None, wait,
+                            build: DerivedLayerBuildMetrics::default(),
+                        });
+                    }
+                    self.verdicts.record(ArtifactVerdict::Retained(RetentionReason::InputsUnchanged { artifact: key.artifact() }));
+                    Ok(value)
+                }
+                CompleteValueAcquisition::Leader { permit } => {
+                    self.verdicts.record(ArtifactVerdict::Invalidated(InvalidationReason::NoRetainedArtifact { artifact: key.artifact() }));
+                    let mut reject_followers = false;
+                    let entry = capture.try_build_weighted(|| {
+                        match build() {
+                            DerivedLayerBuildOutcome::Complete { layer, mut metrics } => {
+                                metrics.retained_bytes = layer.retained_bytes();
+                                build_metrics = metrics;
+                                if cancellation.is_cancelled() {
+                                    return Err(DerivedLayerAcquisition::Cancelled { wait, build: metrics });
+                                }
+                                if !content_is_current() {
+                                    reject_followers = true;
+                                    return Err(DerivedLayerAcquisition::Unavailable {
+                                        reason: "derived-layer workspace content changed during build".to_string(),
+                                        over_budget: false, rejection_scope: None, wait, build: metrics,
+                                    });
+                                }
+                                Ok((Arc::new(layer), usize::try_from(metrics.retained_bytes).unwrap_or(usize::MAX)))
+                            }
+                            DerivedLayerBuildOutcome::Cancelled { metrics } => Err(DerivedLayerAcquisition::Cancelled { wait, build: metrics }),
+                            DerivedLayerBuildOutcome::Unavailable { reason, over_budget, rejection_scope, metrics } => {
+                                reject_followers = rejection_scope.is_some();
+                                if content_is_current() {
+                                    Err(DerivedLayerAcquisition::Unavailable {
+                                        reason, over_budget, rejection_scope, wait, build: metrics,
+                                    })
+                                } else {
+                                    Err(DerivedLayerAcquisition::Unavailable {
+                                        reason: "derived-layer workspace content changed during failed build".to_string(),
+                                        over_budget: false, rejection_scope: None, wait, build: metrics,
+                                    })
+                                }
+                            }
+                        }
+                    });
+                    let entry = match entry {
+                        Ok(entry) => Arc::new(entry),
+                        Err(failure) => {
+                            if reject_followers {
+                                permit.publish_rejected();
+                            }
+                            return Err(failure);
+                        }
                     };
+                    let retained_bytes = entry_retained_bytes(&entry);
+                    if retained_bytes as u64 > self.max_retained_bytes {
+                        permit.publish_rejected();
+                        return Err(DerivedLayerAcquisition::Unavailable {
+                            reason: format!("derived layer retained-byte limit exceeded: {retained_bytes} > {}", self.max_retained_bytes),
+                            over_budget: true, rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget), wait, build: build_metrics,
+                        });
+                    }
+                    permit.publish_complete(Arc::clone(&entry));
+                    if !content_is_current() {
+                        return Err(DerivedLayerAcquisition::Unavailable {
+                            reason: "derived-layer workspace content changed during publication".to_string(),
+                            over_budget: false, rejection_scope: None, wait, build: build_metrics,
+                        });
+                    }
+                    lifecycle = DerivedLayerLifecycle::Built;
+                    Ok(entry)
                 }
-                self.verdicts.record(ArtifactVerdict::Retained(
-                    RetentionReason::InputsUnchanged {
-                        artifact: key.artifact(),
-                    },
-                ));
-                DerivedLayerAcquisition::Ready {
-                    layer: value,
-                    lifecycle: DerivedLayerLifecycle::Hit,
-                    wait,
-                    build: DerivedLayerBuildMetrics::default(),
-                }
+                CompleteValueAcquisition::Rejected => Err(DerivedLayerAcquisition::Unavailable {
+                    reason: "derived-layer construction rejected by same-key leader".to_string(),
+                    over_budget: false, rejection_scope: None, wait, build: DerivedLayerBuildMetrics::default(),
+                }),
+                CompleteValueAcquisition::Cancelled => Err(DerivedLayerAcquisition::Cancelled { wait, build: DerivedLayerBuildMetrics::default() }),
             }
-            CompleteValueAcquisition::Leader { permit } => {
-                self.verdicts.record(ArtifactVerdict::Invalidated(
-                    InvalidationReason::NoRetainedArtifact {
-                        artifact: key.artifact(),
-                    },
-                ));
-                match build() {
-                    DerivedLayerBuildOutcome::Complete { layer, mut metrics } => {
-                        metrics.retained_bytes = layer.retained_bytes();
-                        if cancellation.is_cancelled() {
-                            return DerivedLayerAcquisition::Cancelled {
-                                wait,
-                                build: metrics,
-                            };
-                        }
-                        if !content_is_current() {
-                            permit.publish_rejected();
-                            return DerivedLayerAcquisition::Unavailable {
-                                reason: "derived-layer workspace content changed during build"
-                                    .to_string(),
-                                over_budget: false,
-                                rejection_scope: None,
-                                wait,
-                                build: metrics,
-                            };
-                        }
-                        if metrics.retained_bytes > self.max_retained_bytes {
-                            permit.publish_rejected();
-                            return DerivedLayerAcquisition::Unavailable {
-                                reason: format!(
-                                    "derived layer retained-byte limit exceeded: {} > {}",
-                                    metrics.retained_bytes, self.max_retained_bytes
-                                ),
-                                over_budget: true,
-                                rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget),
-                                wait,
-                                build: metrics,
-                            };
-                        }
-                        let layer = Arc::new(layer);
-                        permit.publish_complete(Arc::clone(&layer));
-                        if !content_is_current() {
-                            return DerivedLayerAcquisition::Unavailable {
-                                reason:
-                                    "derived-layer workspace content changed during publication"
-                                        .to_string(),
-                                over_budget: false,
-                                rejection_scope: None,
-                                wait,
-                                build: metrics,
-                            };
-                        }
-                        DerivedLayerAcquisition::Ready {
-                            layer,
-                            lifecycle: DerivedLayerLifecycle::Built,
-                            wait,
-                            build: metrics,
-                        }
-                    }
-                    DerivedLayerBuildOutcome::Cancelled { metrics } => {
-                        DerivedLayerAcquisition::Cancelled {
-                            wait,
-                            build: metrics,
-                        }
-                    }
-                    DerivedLayerBuildOutcome::Unavailable {
-                        reason,
-                        over_budget,
-                        rejection_scope,
-                        metrics,
-                    } => {
-                        let content_is_current = content_is_current();
-                        if rejection_scope.is_some() {
-                            permit.publish_rejected();
-                        }
-                        if !content_is_current {
-                            DerivedLayerAcquisition::Unavailable {
-                                reason:
-                                    "derived-layer workspace content changed during failed build"
-                                        .to_string(),
-                                over_budget: false,
-                                rejection_scope: None,
-                                wait,
-                                build: metrics,
-                            }
-                        } else {
-                            DerivedLayerAcquisition::Unavailable {
-                                reason,
-                                over_budget,
-                                rejection_scope,
-                                wait,
-                                build: metrics,
-                            }
-                        }
-                    }
-                }
-            }
-            CompleteValueAcquisition::Rejected => DerivedLayerAcquisition::Unavailable {
-                reason: "derived-layer construction rejected by same-key leader".to_string(),
-                over_budget: false,
-                rejection_scope: None,
-                wait,
-                build: DerivedLayerBuildMetrics::default(),
+        });
+        match selected {
+            Ok(entry) => DerivedLayerAcquisition::Ready {
+                layer: Arc::clone(&entry),
+                lifecycle,
+                wait: wait_metrics,
+                build: build_metrics,
             },
-            CompleteValueAcquisition::Cancelled => DerivedLayerAcquisition::Cancelled {
-                wait,
-                build: DerivedLayerBuildMetrics::default(),
-            },
+            Err(failure) => failure,
         }
     }
 
     #[cfg(test)]
     pub fn len_for_test(&self) -> u64 {
-        self.values.len_for_test()
+        self.values
+            .read(
+                &memo_attribution(&crate::analyzer::MultiAnalyzer::default()),
+                |values, _| Err::<Arc<DerivedLayerEntry>, _>(values.len_for_test()),
+            )
+            .err()
+            .expect("test observation returns no retained answer")
     }
 
     #[cfg(test)]
     fn waiting_count_for_test(&self) -> usize {
-        self.values.waiting_count_for_test()
+        self.values
+            .read(
+                &memo_attribution(&crate::analyzer::MultiAnalyzer::default()),
+                |values, _| Err::<Arc<DerivedLayerEntry>, _>(values.waiting_count_for_test()),
+            )
+            .err()
+            .expect("test observation returns no retained answer")
     }
 }
 
@@ -1516,6 +1516,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn derived_layer_hits_replay_configuration_reads_from_uncaptured_builds() {
+        use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+        let analyzer = MultiAnalyzer::default();
+        let cache = SnapshotDerivedLayerCache::default();
+        let request = DerivedLayerRequest::complete_direct_import_topology();
+        let cancellation = CancellationToken::default();
+        let key = ReadKey::Configuration(StableDigest::sha256(b"topology configuration"));
+        let built = cache.acquire(
+            &analyzer,
+            request,
+            content(1),
+            &cancellation,
+            || {
+                analyzer.record_read(key.clone());
+                complete_layer(128)
+            },
+            || true,
+        );
+        assert!(matches!(
+            built,
+            DerivedLayerAcquisition::Ready {
+                lifecycle: DerivedLayerLifecycle::Built,
+                ..
+            }
+        ));
+        for _ in 0..2 {
+            let (_, reads) = capture_query_reads(&analyzer, || {
+                assert!(
+                    cache
+                        .get_ready(&analyzer, request, content(1), &cancellation)
+                        .is_some()
+                );
+                assert!(matches!(
+                    cache.acquire(
+                        &analyzer,
+                        request,
+                        content(1),
+                        &cancellation,
+                        || panic!("warm layer must not build"),
+                        || true
+                    ),
+                    DerivedLayerAcquisition::Ready {
+                        lifecycle: DerivedLayerLifecycle::Hit,
+                        ..
+                    }
+                ));
+            });
+            assert_eq!(reads.keys(), vec![key.clone()]);
+            assert_eq!(reads.unattributed_reads(), 0);
+        }
+    }
+
     #[cfg(test)]
     /// Milestone J (#2449): the cache is keyed by workspace content, so a
     /// second content builds beside the first instead of rotating it away, and
@@ -1809,6 +1862,7 @@ mod tests {
         let builds = AtomicUsize::new(0);
 
         let first = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -1826,6 +1880,7 @@ mod tests {
             }
         ));
         let second = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -1843,6 +1898,7 @@ mod tests {
             }
         ));
         let changed = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(2),
             &cancellation,
@@ -1863,6 +1919,7 @@ mod tests {
         assert_eq!(cache.len_for_test(), 2);
 
         let returned = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -1890,6 +1947,7 @@ mod tests {
         let builds = AtomicUsize::new(0);
 
         let current = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(2),
             &cancellation,
@@ -1908,6 +1966,7 @@ mod tests {
         ));
 
         let delayed = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -1929,6 +1988,7 @@ mod tests {
         );
 
         let hit = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(2),
             &cancellation,
@@ -1956,6 +2016,7 @@ mod tests {
         let cancelled = CancellationToken::default();
         cancelled.cancel();
         let acquisition = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancelled,
@@ -1970,6 +2031,7 @@ mod tests {
 
         let cancellation = CancellationToken::default();
         let stale = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -1991,6 +2053,7 @@ mod tests {
         let cancellation = CancellationToken::default();
 
         cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -1998,6 +2061,7 @@ mod tests {
             || true,
         );
         cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -2031,6 +2095,7 @@ mod tests {
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let cancellation = CancellationToken::default();
         let first = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -2044,6 +2109,7 @@ mod tests {
         );
         assert!(matches!(first, DerivedLayerAcquisition::Unavailable { .. }));
         let retry = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &cancellation,
@@ -2122,6 +2188,7 @@ mod tests {
         let leader_builds = Arc::clone(&builds);
         let leader = thread::spawn(move || {
             leader_cache.acquire(
+                &crate::analyzer::MultiAnalyzer::default(),
                 request,
                 content(1),
                 &CancellationToken::default(),
@@ -2142,6 +2209,7 @@ mod tests {
         let follower_builds = Arc::clone(&builds);
         let follower = thread::spawn(move || {
             follower_cache.acquire(
+                &crate::analyzer::MultiAnalyzer::default(),
                 request,
                 content(1),
                 &follower_token,
@@ -2172,6 +2240,7 @@ mod tests {
         assert_eq!(builds.load(Ordering::Relaxed), 1);
 
         let hit = cache.acquire(
+            &crate::analyzer::MultiAnalyzer::default(),
             request,
             content(1),
             &CancellationToken::default(),

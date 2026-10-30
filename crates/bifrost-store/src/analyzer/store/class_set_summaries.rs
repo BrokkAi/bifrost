@@ -870,7 +870,7 @@ pub(crate) const DEPENDENCY_SOURCES_SQL: &str =
      WHERE summary_id=?1 ORDER BY dependency_ordinal,source_ordinal";
 pub(crate) const READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,
-        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,read_ordinal
+        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,json(fact_names),read_ordinal
      FROM class_set_summary_reads WHERE summary_id=?1 ORDER BY read_ordinal";
 pub(crate) const CHARGES_SQL: &str = "SELECT charge_kind,amount
      FROM class_set_summary_charges WHERE summary_id=?1 ORDER BY charge_kind";
@@ -1459,8 +1459,8 @@ fn insert_summary(
         conn.execute(
             "INSERT INTO class_set_summary_reads(
                 summary_id,read_ordinal,key_digest,kind,family,languages,rel_path,name,
-                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,fact_names
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,jsonb(?20))",
             params![
                 id,
                 row.ordinal,
@@ -1479,6 +1479,9 @@ fn insert_summary(
                 columns.site_ordinal,
                 columns.decl_kind,
                 columns.decl_signature,
+                columns.workspace_fact_family,
+            columns.fact_member,
+            columns.fact_names,
             ],
         )?;
     }
@@ -1825,7 +1828,7 @@ fn load_reads(conn: &rusqlite::Connection, id: i64) -> Result<Vec<ClassSetSummar
     let mut reads = Vec::new();
     while let Some(row) = rows.next()? {
         reads.push(ClassSetSummaryReadRow {
-            ordinal: row.get(15)?,
+            ordinal: row.get(18)?,
             key: decode_read_key(row)?,
         });
     }
@@ -2551,7 +2554,24 @@ mod tests {
     #[test]
     fn a_complete_normalized_summary_round_trips_and_republishes_as_a_noop() {
         let store = store_with_blob();
-        let expected = row(1);
+        use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, WorkspaceFactFamily};
+        use crate::analyzer::semantic::ids::StableDigest;
+        let mut expected = row(1);
+        for subject in super::super::read_keys::workspace_fact_subjects() {
+            expected.reads.push(ClassSetSummaryReadRow {
+                ordinal: u32::try_from(expected.reads.len()).unwrap(),
+                key: ReadKey::lookup(
+                    LookupKind::WorkspaceFact,
+                    LookupQuestion::WorkspaceFact {
+                        family: WorkspaceFactFamily::FieldSlots,
+                        language: Language::Python,
+                        subject,
+                    },
+                    StableDigest::from_array(digest_byte(12)),
+                ),
+            });
+        }
+        expected.content_digest = expected.canonical_content_digest();
         assert!(
             store
                 .publish_class_set_summary(expected.clone(), &CancellationToken::new())

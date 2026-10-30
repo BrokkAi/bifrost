@@ -123,6 +123,7 @@ pub(crate) fn record_hierarchy_order_step() {
     }
 }
 
+use super::fact_resolution::GO_MODEL_CALLABLE_RESULT_UNTYPED;
 use std::path::PathBuf;
 
 use std::sync::atomic::AtomicBool;
@@ -323,6 +324,8 @@ seam_methods! {
     DeferredMemberParticipation => "deferred_member_participation", "SelectedTypedFactSource";
     DeferredMemberOwnerProofs => "deferred_member_owner_proofs", "SelectedTypedFactSource";
     GoMemberDeclarations => "go_member_declarations", "SelectedTypedFactSource";
+    GoModelOwnerDeclarations => "go_model_owner_declarations", "SelectedTypedFactSource";
+    UnindexedModelCallableResult => "unindexed_model_callable_result", "SelectedTypedFactSource";
     JavaInheritanceDeclarations => "java_inheritance_declarations", "SelectedTypedFactSource";
     RustSupertraitOwners => "rust_supertrait_owners", "SelectedTypedFactSource";
     RustExternalTypeIdentities => "rust_external_type_identities", "SelectedTypedFactSource";
@@ -406,8 +409,52 @@ impl MethodCounters {
     }
 }
 
+/// The remaining G1b gap allowed to retain the legacy Go receiver answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[doc(hidden)]
+pub enum GoModelLegacyReason {
+    CallableResultUntyped,
+}
+impl GoModelLegacyReason {
+    pub fn from_named_reason(reason: &str) -> Option<Self> {
+        match reason {
+            GO_MODEL_CALLABLE_RESULT_UNTYPED => Some(Self::CallableResultUntyped),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CallableResultUntyped => GO_MODEL_CALLABLE_RESULT_UNTYPED,
+        }
+    }
+}
+
+/// Count admissions where the remaining callable-result gap was present.
+#[doc(hidden)]
+pub fn record_go_model_legacy(
+    reason: GoModelLegacyReason,
+    site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+) {
+    let Some(profile) = profile() else {
+        return;
+    };
+    let counter = match reason {
+        GoModelLegacyReason::CallableResultUntyped => &profile.go_reverse.legacy_model_result_sites,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    profile.write_line(
+        &serde_json::json!({
+            "kind": "go_model_legacy_receiver", "reason": reason.label(),
+            "path": site.path, "start_byte": site.focus_start_byte, "end_byte": site.focus_end_byte,
+        })
+        .to_string(),
+    );
+    profile.dirty.store(true, Ordering::Relaxed);
+}
+
 #[derive(Default)]
 struct GoReverseCounters {
+    legacy_model_result_sites: AtomicU64,
     targets: AtomicU64,
     candidate_sites: AtomicU64,
     forward_candidate_sites: AtomicU64,
@@ -528,7 +575,7 @@ impl Drop for GoRenamePhaseScope {
 }
 
 impl GoReverseCounters {
-    fn snapshot(&self) -> [u64; 18] {
+    fn snapshot(&self) -> [u64; 19] {
         [
             self.targets.load(Ordering::Relaxed),
             self.candidate_sites.load(Ordering::Relaxed),
@@ -552,6 +599,7 @@ impl GoReverseCounters {
             self.candidate_not_name_reference.load(Ordering::Relaxed),
             self.member_access_sites.load(Ordering::Relaxed),
             self.member_access_unknown_sites.load(Ordering::Relaxed),
+            self.legacy_model_result_sites.load(Ordering::Relaxed),
         ]
     }
 }
@@ -626,7 +674,7 @@ impl Profile {
         })
     }
 
-    fn go_reverse_snapshot(&self) -> [u64; 18] {
+    fn go_reverse_snapshot(&self) -> [u64; 19] {
         self.go_reverse.snapshot()
     }
 
@@ -673,6 +721,20 @@ fn profile() -> Option<&'static Profile> {
 /// owns the keyed ledger and drops it with the query; the profile retains only
 /// the rendered diagnostic line.
 pub(crate) fn record_jvm_operation_reads(reads: serde_json::Value) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(reads) = reads.as_array() {
+        let builds: u64 = reads
+            .iter()
+            .filter(|read| read["kind"] == "derive_file_context")
+            .map(|read| {
+                read["calls"]
+                    .as_u64()
+                    .expect("a JVM profile call count is numeric")
+            })
+            .sum();
+        JVM_CONTEXT_BUILD_COUNT.with(|count| count.set(count.get() + builds));
+    }
+
     if let Some(profile) = profile() {
         profile.write_line(
             &serde_json::json!({
@@ -758,6 +820,9 @@ pub fn write_totals() {
         "candidate_admission": candidate_admission_object(profile.candidate_admission_snapshot()),
         "uptime_ms": profile.started.elapsed().as_millis(),
         "requests": profile.requests.load(Ordering::Relaxed),
+        "go_model_legacy_receiver_sites": {
+            (GO_MODEL_CALLABLE_RESULT_UNTYPED): profile.go_reverse_snapshot()[18],
+        },
         "methods": method_object(&counters, None),
     })
     .to_string();
@@ -982,7 +1047,7 @@ struct OpenRequest {
     sql_before: Option<(u64, u64, u128)>,
     root_source_before: [u64; 2],
     candidate_before: [[u64; 2]; 2],
-    go_reverse_before: [u64; 18],
+    go_reverse_before: [u64; 19],
     rename_phase_before: [[u64; 5]; 4],
     overlapped: bool,
 }
@@ -1040,8 +1105,11 @@ impl Drop for RequestScope {
             "bounded": profile.root_source_bounded.load(Ordering::Relaxed) - open.root_source_before[0],
             "universal": profile.root_source_universal.load(Ordering::Relaxed) - open.root_source_before[1],
         });
-        let go_reverse: [u64; 18] =
+        let go_reverse: [u64; 19] =
             std::array::from_fn(|index| go_reverse_now[index] - open.go_reverse_before[index]);
+        line["go_model_legacy_receiver_sites"] = serde_json::json!({
+            (GO_MODEL_CALLABLE_RESULT_UNTYPED): go_reverse[18],
+        });
         line["native_go_reverse"] = serde_json::json!({
             "targets": go_reverse[0],
             "candidate_sites": go_reverse[1],
@@ -2106,6 +2174,42 @@ where
         outcome
     }
 
+    fn unindexed_model_callable_result(
+        &self,
+        frontier: &super::UnindexedExternalFrontier,
+        cancellation: &CancellationToken,
+        session: Option<
+            &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+        >,
+    ) -> StoreResult<Option<Option<String>>> {
+        let _key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(1);
+        record_call(SeamMethod::UnindexedModelCallableResult, 1);
+        let outcome = self
+            .inner
+            .unindexed_model_callable_result(frontier, cancellation, session);
+        if let Ok(Some(Some(_))) = &outcome {
+            record_rows(SeamMethod::UnindexedModelCallableResult, 1);
+        }
+        outcome
+    }
+
+    fn go_model_owner_declarations(
+        &self,
+        definition: SemanticId,
+        owner: &super::ExternalOwnerIdentity,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<super::fact_source::GoModelOwnerDeclarations>>> {
+        let _key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(1);
+        record_call(SeamMethod::GoModelOwnerDeclarations, 1);
+        let outcome = self
+            .inner
+            .go_model_owner_declarations(definition, owner, cancellation);
+        if let Ok(Some(Some(_))) = &outcome {
+            record_rows(SeamMethod::GoModelOwnerDeclarations, 1);
+        }
+        outcome
+    }
+
     fn go_member_declarations(
         &self,
         definitions: &[SemanticId],
@@ -2570,7 +2674,7 @@ mod tests {
         );
         // #5671: the root-inventory admission session is forwarded and counted too.
         assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 93, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 95, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -2599,7 +2703,7 @@ mod tests {
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
         // #5671: profile the root-inventory session accessor with the other methods.
-        assert_eq!(METHOD_COUNT, 128);
+        assert_eq!(METHOD_COUNT, 130);
     }
 
     #[cfg(test)]
@@ -2618,4 +2722,18 @@ mod tests {
         record_candidate_admission(CandidateAdmissionArm::Node, true);
         assert!(PROFILE.get().expect("read once above").is_none());
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! { static JVM_CONTEXT_BUILD_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_jvm_context_build_count_for_test() {
+    JVM_CONTEXT_BUILD_COUNT.with(|count| count.set(0));
+}
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn jvm_context_build_count_for_test() -> usize {
+    JVM_CONTEXT_BUILD_COUNT
+        .with(|count| usize::try_from(count.get()).expect("context builds fit usize"))
 }

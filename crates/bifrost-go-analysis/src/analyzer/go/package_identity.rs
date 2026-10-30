@@ -109,6 +109,29 @@ fn go_declared_type_kind(kind: SemanticModelSymbolKind) -> bool {
     )
 }
 
+fn modeled_signature_result_count(signature: &Signature) -> usize {
+    match signature.returns.as_ref() {
+        None => 0,
+        Some(TypeRef::Tuple { elements }) => elements.len(),
+        Some(_) => 1,
+    }
+}
+
+fn public_instance_method_applies(
+    method: &SemanticModelSymbol,
+    owner_id: &str,
+    parameter_count: usize,
+) -> bool {
+    method.owner_id.as_deref() == Some(owner_id)
+        && method.kind == SemanticModelSymbolKind::Method
+        && method.visibility == Visibility::Public
+        && !method.is_static()
+        && method.structured_signature().is_some_and(|signature| {
+            go_signature_applicability(signature, parameter_count)
+                == GoSignatureApplicability::Applicable
+        })
+}
+
 fn go_signature_applicability(
     signature: &Signature,
     argument_count: usize,
@@ -248,9 +271,7 @@ impl<'a> GoOverlayPackages<'a> {
         self.overlay?.symbols_named(qualified_name).unique()
     }
 
-    /// The declaration-fact kind of one public, top-level Go receiver type.
-    /// Unknown or ambiguous symbols do not become either concrete or
-    /// interface evidence.
+    /// Unknown or ambiguous owners establish no receiver-kind evidence.
     pub(crate) fn receiver_type_kind(&self, owner_fqn: &str) -> Option<SemanticModelSymbolKind> {
         let owner = self.unique_symbol(owner_fqn)?;
         (owner.language == "go"
@@ -262,16 +283,6 @@ impl<'a> GoOverlayPackages<'a> {
                 SemanticModelSymbolKind::Struct | SemanticModelSymbolKind::Interface
             ))
         .then_some(owner.kind)
-    }
-
-    pub(crate) fn receiver_is_interface(&self, owner_fqn: &str) -> Option<bool> {
-        self.receiver_type_kind(owner_fqn)
-            .map(|kind| kind == SemanticModelSymbolKind::Interface)
-    }
-
-    pub(crate) fn receiver_is_struct(&self, owner_fqn: &str) -> Option<bool> {
-        self.receiver_type_kind(owner_fqn)
-            .map(|kind| kind == SemanticModelSymbolKind::Struct)
     }
 
     /// The sole active Go member with this exact direct owner and name.
@@ -474,11 +485,7 @@ impl<'a> GoOverlayPackages<'a> {
             .expect("package_function_symbol retains a structured signature");
         (go_signature_applicability(signature, parameter_count)
             == GoSignatureApplicability::Applicable)
-            .then_some(match signature.returns.as_ref() {
-                None => 0,
-                Some(TypeRef::Tuple { elements }) => elements.len(),
-                Some(_) => 1,
-            })
+            .then_some(modeled_signature_result_count(signature))
     }
 
     fn package_function_symbol(
@@ -548,14 +555,7 @@ impl<'a> GoOverlayPackages<'a> {
         let method = self.unique_symbol(&format!("{owner_fqn}.{member}"))?;
         let receiver = method.receiver?;
         (method.language == "go"
-            && method.owner_id.as_deref() == Some(owner.id.as_str())
-            && method.kind == SemanticModelSymbolKind::Method
-            && method.visibility == Visibility::Public
-            && !method.is_static()
-            && method.structured_signature().is_some_and(|signature| {
-                go_signature_applicability(signature, parameter_count)
-                    == GoSignatureApplicability::Applicable
-            })
+            && public_instance_method_applies(&method, &owner.id, parameter_count)
             && (!receiver.pointer || pointer_receivers))
             .then_some(method)
     }
@@ -578,15 +578,7 @@ impl<'a> GoOverlayPackages<'a> {
             return None;
         }
         let method = self.unique_go_owner_member(&owner, member)?;
-        (method.kind == SemanticModelSymbolKind::Method
-            && method.visibility == Visibility::Public
-            && method.owner_id.as_deref() == Some(owner.id.as_str())
-            && !method.is_static()
-            && method.structured_signature().is_some_and(|signature| {
-                go_signature_applicability(signature, parameter_count)
-                    == GoSignatureApplicability::Applicable
-            }))
-        .then_some(method)
+        public_instance_method_applies(&method, &owner.id, parameter_count).then_some(method)
     }
 
     /// The unique public field published directly on one concrete Go struct.
@@ -717,11 +709,9 @@ impl<'a> GoOverlayPackages<'a> {
     ) -> Option<usize> {
         let callable =
             self.applicable_callable(owner_fqn, member, has_receiver, parameter_count)?;
-        Some(match callable.structured_signature()?.returns.as_ref() {
-            None => 0,
-            Some(TypeRef::Tuple { elements }) => elements.len(),
-            Some(_) => 1,
-        })
+        Some(modeled_signature_result_count(
+            callable.structured_signature()?,
+        ))
     }
 
     fn applicable_callable(

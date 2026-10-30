@@ -30,7 +30,7 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvid
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::is_call_relation_unit;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::native_incoming_preflight;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSiteSyntax;
 
@@ -51,7 +51,7 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdgeRow;
 use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
     IncomingCallProjection, IncomingFile, IncomingFileBudget, IncomingProjectionIssue,
-    finish_incoming_sites, project_selected_incoming,
+    finish_incoming_sites, project_selected_incoming, structural_incoming_caller,
 };
 use tree_sitter::{Node, Tree};
 
@@ -71,34 +71,18 @@ impl CallRelationProvider for JavaNativeCallRelations {
         cancellation: Option<&CancellationToken>,
     ) -> CallRelationResult {
         let cancellation = cancellation.cloned().unwrap_or_default();
-        if cancellation.is_cancelled() {
-            return CallRelationResult {
-                cancelled: true,
-                proof_authority: UsageProofAuthority::Native,
-                ..CallRelationResult::default()
-            };
-        }
-        if !is_call_relation_unit(target) {
-            return CallRelationResult {
-                proof_authority: UsageProofAuthority::Native,
-                ..CallRelationResult::default()
-            };
-        }
-        if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
-            return CallRelationResult {
-                truncated: true,
-                proof_authority: UsageProofAuthority::Native,
-                diagnostics: vec![diagnostic(
-                    CallRelationDiagnosticCode::BudgetExhausted,
-                    format!(
-                        "native Java incoming-call budget omitted {}",
-                        target.fq_name()
-                    ),
-                    target.fq_name().to_string(),
-                    "native_call_budget_exhausted",
-                )],
-                ..CallRelationResult::default()
-            };
+        if let Some(result) = native_incoming_preflight(target, limits, &cancellation, || {
+            diagnostic(
+                CallRelationDiagnosticCode::BudgetExhausted,
+                format!(
+                    "native Java incoming-call budget omitted {}",
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
+                "native_call_budget_exhausted",
+            )
+        }) {
+            return result;
         }
         let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
             return unavailable("native Java analyzer is unavailable", target);
@@ -328,15 +312,7 @@ impl IncomingCallProjection for JavaIncomingProjection<'_> {
     }
 
     fn caller(&self, edge: &ReferenceEdgeRow, syntax: &CallSiteSyntax) -> Option<CodeUnit> {
-        self.java
-            .structural_fact_providers()
-            .into_iter()
-            .find_map(|provider| {
-                provider
-                    .structural_enclosing_code_units(&edge.site.file, &[syntax.range])
-                    .and_then(|mut owners| owners.pop().flatten())
-            })
-            .or(edge.site.enclosing.clone())
+        structural_incoming_caller(self.java.structural_fact_providers(), edge, syntax)
     }
 
     fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {

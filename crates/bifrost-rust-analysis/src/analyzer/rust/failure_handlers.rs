@@ -237,14 +237,7 @@ fn constructor_name<'a>(syntax: &'a PreparedSyntaxTree, constructor: Node<'_>) -
 }
 
 fn alternative_body(if_expression: Node<'_>) -> Option<Node<'_>> {
-    let alternative = if_expression.child_by_field_name("alternative")?;
-    if alternative.kind() == "else_clause" {
-        alternative
-            .child_by_field_name("body")
-            .or_else(|| alternative.named_child(0))
-    } else {
-        Some(alternative)
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::if_alternative_body(if_expression)
 }
 
 fn classify_body(body: Option<Node<'_>>) -> HandlerBodyShape {

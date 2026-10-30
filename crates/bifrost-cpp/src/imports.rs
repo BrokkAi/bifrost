@@ -106,6 +106,17 @@ impl IncludeTargetIndex {
         }
     }
 
+    /// Complete, sorted mount-free path membership of this generation's index.
+    pub fn workspace_relative_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .by_rel_path
+            .keys()
+            .map(|path| brokk_bifrost_core::path_utils::workspace_relative_slash_path(path))
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths
+    }
+
     pub fn resolve_indexed(&self, include: &str) -> Vec<ProjectFile> {
         let include_path = Path::new(include);
         let mut matched = HashSet::default();
@@ -564,7 +575,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: angle include comments fabricated quoted claim paths"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: angle include comments fabricated quoted claim paths"
     )]
     fn quoted_include_uses_the_directive_path_node() {
         assert_eq!(

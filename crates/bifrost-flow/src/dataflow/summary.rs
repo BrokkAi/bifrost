@@ -13,8 +13,9 @@ use crate::analyzer::semantic::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::ordering::{
-    compare_boundary_evidence, compare_call_sites, compare_completeness, compare_continuations,
-    compare_optional_call_sites, compare_points, compare_procedures, compare_proof,
+    compare_boundary_evidence, compare_call_contexts, compare_call_sites, compare_completeness,
+    compare_continuations, compare_optional_call_sites, compare_points, compare_procedures,
+    compare_proof,
 };
 
 use super::transfer::{TransferEvaluation, TransferScratch, evaluate_transfer};
@@ -3849,6 +3850,76 @@ fn compare_call_transfers(left: &CallTransfer, right: &CallTransfer) -> Ordering
         })
         .then_with(|| compare_proof(&left.proof, &right.proof))
         .then_with(|| compare_completeness(&left.completeness, &right.completeness))
+        .then_with(
+            || match (&left.argument_callable, &right.argument_callable) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(left), Some(right)) => compare_argument_callable(left, right),
+            },
+        )
+}
+
+fn compare_argument_callable(
+    left: &crate::analyzer::semantic::ArgumentCallableProvenance,
+    right: &crate::analyzer::semantic::ArgumentCallableProvenance,
+) -> Ordering {
+    use crate::analyzer::semantic::{
+        CaptureBinding, CaptureMode, CaptureSource, compare_relation_provenance,
+    };
+
+    // Canonical scalar coordinates retain every capture field, including the
+    // payload of language-defined modes. Handle fields use query-local identity.
+    fn capture_key(binding: &CaptureBinding) -> impl Ord + '_ {
+        (
+            binding.id,
+            binding.point,
+            binding.callable,
+            binding.target,
+            binding.environment,
+            match binding.captured {
+                CaptureSource::Value(id) => (0, id.index()),
+                CaptureSource::Location(id) => (1, id.index()),
+            },
+            binding.destination,
+            (
+                binding.mode.label(),
+                match &binding.mode {
+                    CaptureMode::LanguageDefined(detail) => Some(detail.as_ref()),
+                    _ => None,
+                },
+            ),
+            binding.source,
+            binding.evidence,
+        )
+    }
+    let producer_order = match (left.producer(), right.producer()) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => compare_call_sites(left.producer(), right.producer())
+            .then_with(|| compare_procedures(left.producer_callee(), right.producer_callee()))
+            .then_with(|| compare_procedures(left.closure(), right.closure()))
+            .then_with(|| left.captures().cmp(right.captures())),
+    };
+    producer_order
+        .then_with(|| compare_call_sites(left.entering_call(), right.entering_call()))
+        .then_with(|| compare_call_contexts(left.caller_context(), right.caller_context()))
+        .then_with(|| compare_procedures(left.callee(), right.callee()))
+        .then_with(|| left.formal_ordinal().cmp(&right.formal_ordinal()))
+        .then_with(|| compare_procedures(left.actual().procedure(), right.actual().procedure()))
+        .then_with(|| left.actual().id().cmp(&right.actual().id()))
+        .then_with(|| compare_procedures(left.creation().procedure(), right.creation().procedure()))
+        .then_with(|| left.creation().id().cmp(&right.creation().id()))
+        .then_with(|| compare_procedures(left.closure(), right.closure()))
+        .then_with(|| left.captures().cmp(right.captures()))
+        .then_with(|| {
+            left.capture_bindings()
+                .iter()
+                .map(capture_key)
+                .cmp(right.capture_bindings().iter().map(capture_key))
+        })
+        .then_with(|| compare_relation_provenance(left.binding(), right.binding()))
 }
 
 fn compare_call_boundaries(left: &CallBoundary, right: &CallBoundary) -> Ordering {

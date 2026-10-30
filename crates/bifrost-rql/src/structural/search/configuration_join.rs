@@ -102,7 +102,7 @@ fn property_name(value: &ConfigurationFactValue) -> Option<String> {
         {
             return Some(name);
         }
-        if let Some(section) = section_for_member(value)
+        if let Some(section) = section_for_member(&candidate)
             && let Some((_, name)) = member_value_in_section(value, section, "name")
         {
             return Some(name);

@@ -1,5 +1,6 @@
 use crate::analyzer::multi_analyzer::WorkspaceBuildContext;
 use crate::analyzer::multi_analyzer::build_language_delegate;
+use brokk_bifrost_core::analyzer::project::AsProject;
 
 use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
 use crate::analyzer::semantic_model::DependencyDiscoveryOutcome;
@@ -194,6 +195,7 @@ impl Drop for WorkspaceProjectionLease {
 /// configuration collection is retained in Rust, and a missing selected input
 /// never falls back to a file that happens to remain on disk.
 pub(crate) struct SelectedConfigurationProject {
+    project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
     project: Arc<dyn Project>,
     language: Language,
     store: Arc<crate::analyzer::store::AnalyzerStore>,
@@ -210,6 +212,7 @@ impl SelectedConfigurationProject {
         projection_lease: Option<Arc<WorkspaceProjectionLease>>,
     ) -> Self {
         Self {
+            project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
             project,
             language,
             store,
@@ -233,6 +236,25 @@ impl SelectedConfigurationProject {
 }
 
 impl Project for SelectedConfigurationProject {
+    fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        self.project.ignore_rules_digest()
+    }
+    fn project_read_slot(
+        &self,
+    ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(
+        &self,
+        capability: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
+    ) -> bool {
+        self.project.install_read_recorder(capability.clone());
+        self.project_reads.install(capability);
+        true
+    }
     fn selected_module_name(&self, file: &ProjectFile) -> std::io::Result<Option<String>> {
         if !crate::analyzer::store::store_language_support(self.language)
             .expect("selected language has store support")
@@ -254,18 +276,26 @@ impl Project for SelectedConfigurationProject {
         self.project.workspace_root_for_file(file)
     }
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.project.analyzer_languages()
+        self.project_reads
+            .languages(self.as_project(), || self.project.analyzer_languages())
     }
     fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.project.all_files()
     }
     fn all_files_shared(&self) -> std::io::Result<Arc<BTreeSet<ProjectFile>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.project.all_files_shared()
     }
     fn workspace_file_listing_count(&self) -> usize {
         self.project.workspace_file_listing_count()
     }
     fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = brokk_bifrost_core::analyzer::project_reads::listing_read(self);
         self.project.analyzable_files(language)
     }
     fn analyzable_files_from(
@@ -273,9 +303,13 @@ impl Project for SelectedConfigurationProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> std::io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = brokk_bifrost_core::analyzer::project_reads::listing_read(self);
         self.project.analyzable_files_from(files, language)
     }
     fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), path));
         if !self.is_configuration(path) {
             return self.project.file_by_rel_path(path);
         }
@@ -285,15 +319,24 @@ impl Project for SelectedConfigurationProject {
             .map(|_| file)
     }
     fn has_directory(&self, path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.directory(self.as_project(), path));
         self.project.has_directory(path)
     }
     fn persistence_root(&self) -> Option<&Path> {
         self.project.persistence_root()
     }
     fn is_gitignored(&self, path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.git_ignore(self.as_project(), path));
         self.project.is_gitignored(path)
     }
     fn is_bifrostignored(&self, path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
         self.project.is_bifrostignored(path)
     }
     fn invalidate_cached_file_listing(&self) {
@@ -303,94 +346,152 @@ impl Project for SelectedConfigurationProject {
         self.project.update_cached_listing_for_path(path)
     }
     fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
-        if !self.is_configuration(file.rel_path()) {
-            return self.project.read_source(file);
-        }
-        let source = self.configuration_source(file)?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "{} is absent from selected configuration",
-                    file.rel_path().display()
-                ),
-            )
-        })?;
-        brokk_bifrost_core::analyzer::project::decode_source_bytes(source)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                if !self.is_configuration(file.rel_path()) {
+                    return self.project.read_source(file);
+                }
+                let source = self.configuration_source(file)?.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "{} is absent from selected configuration",
+                            file.rel_path().display()
+                        ),
+                    )
+                })?;
+                brokk_bifrost_core::analyzer::project::decode_source_bytes(source)
+            },
+            |source| {
+                Some(
+                    git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                        .expect("hashing project source"),
+                )
+            },
+        )
     }
     fn read_source_limited(
         &self,
         file: &ProjectFile,
         max: usize,
     ) -> std::io::Result<Option<String>> {
-        if !self.is_configuration(file.rel_path()) {
-            return self.project.read_source_limited(file, max);
-        }
-        self.read_source(file)
-            .map(|source| (source.len() <= max).then_some(source))
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                if !self.is_configuration(file.rel_path()) {
+                    return self.project.read_source_limited(file, max);
+                }
+                self.read_source(file)
+                    .map(|source| (source.len() <= max).then_some(source))
+            },
+            |source| {
+                source.as_ref().map(|source| {
+                    git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                        .expect("hashing project source")
+                })
+            },
+        )
     }
     fn read_source_snapshot(
         &self,
         file: &ProjectFile,
     ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot> {
-        if !self.is_configuration(file.rel_path()) {
-            return self.project.read_source_snapshot(file);
-        }
-        self.read_source(file)
-            .map(brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                if !self.is_configuration(file.rel_path()) {
+                    return self.project.read_source_snapshot(file);
+                }
+                self.read_source(file)
+                    .map(brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk)
+            },
+            |source| Some(source.oid()),
+        )
     }
     fn read_source_snapshot_limited(
         &self,
         file: &ProjectFile,
         max: usize,
     ) -> std::io::Result<Option<brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot>> {
-        if !self.is_configuration(file.rel_path()) {
-            return self.project.read_source_snapshot_limited(file, max);
-        }
-        self.read_source_limited(file, max).map(|source| {
-            source.map(brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk)
-        })
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                if !self.is_configuration(file.rel_path()) {
+                    return self.project.read_source_snapshot_limited(file, max);
+                }
+                self.read_source_limited(file, max).map(|source| {
+                    source.map(brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk)
+                })
+            },
+            |source| source.as_ref().map(|source| source.oid()),
+        )
     }
     fn overlay_content(
         &self,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent>> {
-        self.project.overlay_content()
+        let _project_read = self.project_reads.overlays(self.as_project());
+        let answer = self.project.overlay_content();
+        brokk_bifrost_core::analyzer::project_reads::publish_overlays(&answer);
+        answer
     }
     fn has_overlay(&self, file: &ProjectFile) -> bool {
-        self.project.has_overlay(file)
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.overlay_membership(self.as_project(), file.rel_path()));
+        let answer = self.project.has_overlay(file);
+        brokk_bifrost_core::analyzer::project_reads::publish_overlay_membership(answer);
+        answer
     }
     fn analysis_generation(&self) -> u64 {
         self.project.analysis_generation()
     }
 }
 
-#[derive(Clone)]
 pub struct EmptyAnalyzer {
     project: Arc<dyn Project>,
     build_context: Option<Arc<WorkspaceBuildContext>>,
+    project_reads: super::tree_sitter_analyzer::ProjectReadRegistry,
 }
-
+impl Clone for EmptyAnalyzer {
+    fn clone(&self) -> Self {
+        let mut clone = Self::new(Arc::clone(&self.project));
+        clone.build_context = self.build_context.clone();
+        clone
+    }
+}
 impl EmptyAnalyzer {
     pub fn new(project: Arc<dyn Project>) -> Self {
+        let project = super::project_read_facade::with_project_read_slot(project);
+        let project_reads = super::tree_sitter_analyzer::ProjectReadRegistry::new(&project);
         Self {
             project,
+            project_reads,
             build_context: None,
         }
     }
-
     fn new_for_workspace(build_context: Arc<WorkspaceBuildContext>) -> Self {
-        Self {
-            project: Arc::clone(build_context.project()),
-            build_context: Some(build_context),
-        }
+        let mut analyzer = Self::new(Arc::clone(build_context.project()));
+        analyzer.build_context = Some(build_context);
+        analyzer
     }
-
     fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut analyzer = Self::new(Arc::clone(&project));
+        analyzer.build_context = self
+            .build_context
+            .as_ref()
+            .map(|context| Arc::new(context.clone_with_project(project)));
+        analyzer
+    }
+    pub(crate) fn clone_for_read_attribution(&self) -> Self {
         Self {
-            project: Arc::clone(&project),
-            build_context: self
-                .build_context
-                .as_ref()
-                .map(|context| Arc::new(context.clone_with_project(project))),
+            project: Arc::clone(&self.project),
+            build_context: self.build_context.clone(),
+            project_reads: self.project_reads.clone(),
         }
     }
 }
@@ -476,6 +577,39 @@ impl CodeUnitIndex for EmptyAnalyzer {
 }
 
 impl IAnalyzer for EmptyAnalyzer {
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.project_reads.begin_query(context);
+    }
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.project_reads.end_query(context);
+    }
+    fn record_read(&self, key: crate::analyzer::ReadKey) {
+        self.project_reads.record_read(key);
+    }
+    fn record_read_receipt(&self, keys: &Arc<[crate::analyzer::ReadKey]>) {
+        super::i_analyzer::record_receipt_on_active_ledgers(&self.project_reads.contexts(), keys);
+    }
+    fn record_read_capture(&self, reads: &crate::analyzer::ReadLedger) {
+        super::i_analyzer::record_capture_on_active_ledgers(&self.project_reads.contexts(), reads);
+    }
+    fn record_unattributed_reads(&self, count: usize) {
+        self.project_reads.record_unattributed_reads(count);
+    }
+    fn records_query_reads(&self) -> bool {
+        true
+    }
+
+    fn read_ledger_attached(&self) -> bool {
+        self.project_reads.read_ledger_attached()
+    }
+    fn read_ledger_contexts(&self) -> Vec<Arc<crate::analyzer::AnalyzerQueryContext>> {
+        self.project_reads.contexts()
+    }
+
+    fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::ReadLedger>> {
+        super::i_analyzer::current_thread_read_ledger()
+    }
+
     fn update(
         &self,
         _changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
@@ -944,37 +1078,10 @@ impl WorkspaceAnalyzer {
             });
         }
 
-        let jdk_artifacts = prepared_jdk_artifacts_for_source_bindings(
+        self.finalize_dependency_pack_activation(
             config,
-            self.analyzer().project().root(),
-            &outcomes,
-        );
-        let python_runtime = match python_runtime_publication(
-            self,
-            config,
-            &mut activation,
-            &context,
-        ) {
-            Ok(publication) => publication,
-            Err(error) => {
-                self.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Python]);
-                return DependencyPackActivationOutcome {
-                    ecosystems: outcomes,
-                    runtime: Some(SemanticModelRuntimeOutcome::Unavailable(crate::analyzer::semantic_model::SemanticModelActivationReport {
-                        explanations: vec![crate::analyzer::semantic_model::SemanticModelActivationExplanation { manifest_digest: String::new(), pack_id: None, shard_id: String::new(), source_kind: crate::analyzer::semantic_model::CatalogPackSourceKind::Embedded, source_id: String::new(), status: crate::analyzer::semantic_model::SemanticModelActivationStatus::Unavailable, reason: format!("Python runtime provider publication failed: {error}") }],
-                        ..Default::default()
-                    })),
-                    diagnostic_refresh_required: false,
-                };
-            }
-        };
-        self.publish_dependency_pack_activation(
             activation,
-            DependencyPackPublicationEvidence {
-                dependencies: publication_evidence,
-                jdk_artifacts,
-                python_runtime,
-            },
+            publication_evidence,
             outcomes,
             cancelled,
             ecosystems.is_empty(),
@@ -1076,6 +1183,30 @@ impl WorkspaceAnalyzer {
             });
         }
 
+        let outcome = self.finalize_dependency_pack_activation(
+            config,
+            activation,
+            publication_evidence,
+            outcomes,
+            cancelled,
+            ecosystems.is_empty(),
+            &context,
+        );
+        InstalledDependencyPackActivationOutcome { outcome, pending }
+    }
+
+    // These are the distinct values consumed directly by the shared finalization tail.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_dependency_pack_activation(
+        &self,
+        config: &AnalyzerConfig,
+        mut activation: SemanticModelActivationRequest,
+        dependencies: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
+        outcomes: Vec<DependencyPackEcosystemOutcome>,
+        cancelled: bool,
+        ecosystems_empty: bool,
+        context: &DependencyPackWorkspaceContext<'_>,
+    ) -> DependencyPackActivationOutcome {
         let jdk_artifacts = prepared_jdk_artifacts_for_source_bindings(
             config,
             self.analyzer().project().root(),
@@ -1085,36 +1216,43 @@ impl WorkspaceAnalyzer {
             self,
             config,
             &mut activation,
-            &context,
+            context,
         ) {
             Ok(publication) => publication,
             Err(error) => {
                 self.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Python]);
-                return InstalledDependencyPackActivationOutcome { pending, outcome: DependencyPackActivationOutcome {
+                return DependencyPackActivationOutcome {
                     ecosystems: outcomes,
-                    runtime: Some(SemanticModelRuntimeOutcome::Unavailable(crate::analyzer::semantic_model::SemanticModelActivationReport {
-                        explanations: vec![crate::analyzer::semantic_model::SemanticModelActivationExplanation {
-                            manifest_digest: String::new(), pack_id: None, shard_id: String::new(), source_kind: crate::analyzer::semantic_model::CatalogPackSourceKind::Embedded,
-                            source_id: String::new(), status: crate::analyzer::semantic_model::SemanticModelActivationStatus::Unavailable,
-                            reason: format!("Python runtime provider publication failed: {error}"),
-                        }], ..Default::default()
-                    })), diagnostic_refresh_required: false,
-                }};
+                    runtime: Some(SemanticModelRuntimeOutcome::Unavailable(
+                        crate::analyzer::semantic_model::SemanticModelActivationReport {
+                            explanations: vec![crate::analyzer::semantic_model::SemanticModelActivationExplanation {
+                                manifest_digest: String::new(),
+                                pack_id: None,
+                                shard_id: String::new(),
+                                source_kind: crate::analyzer::semantic_model::CatalogPackSourceKind::Embedded,
+                                source_id: String::new(),
+                                status: crate::analyzer::semantic_model::SemanticModelActivationStatus::Unavailable,
+                                reason: format!("Python runtime provider publication failed: {error}"),
+                            }],
+                            ..Default::default()
+                        },
+                    )),
+                    diagnostic_refresh_required: false,
+                };
             }
         };
-        let outcome = self.publish_dependency_pack_activation(
+        self.publish_dependency_pack_activation(
             activation,
             DependencyPackPublicationEvidence {
-                dependencies: publication_evidence,
+                dependencies,
                 jdk_artifacts,
                 python_runtime,
             },
             outcomes,
             cancelled,
-            ecosystems.is_empty(),
-            &context,
-        );
-        InstalledDependencyPackActivationOutcome { outcome, pending }
+            ecosystems_empty,
+            context,
+        )
     }
 
     /// Publish one assembled dependency activation into this analyzer's
@@ -1227,6 +1365,7 @@ impl WorkspaceAnalyzer {
         }
     }
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let project = super::project_read_facade::with_project_read_slot(project);
         match self {
             Self::Empty(analyzer) => Self::Empty(analyzer.clone_with_project(project)),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
@@ -1538,6 +1677,7 @@ impl WorkspaceAnalyzer {
         store_context: crate::analyzer::AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, StoreError> {
+        let project = super::project_read_facade::with_project_read_slot(project);
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
         for support in Language::ANALYZABLE
             .iter()
@@ -1619,6 +1759,7 @@ impl WorkspaceAnalyzer {
         // selection order -- rather than whichever thread the join order
         // happened to reach while another was still running. The payload is
         // re-raised verbatim, so the original message and location survive.
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         let mut panics: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
         let built: Vec<(Language, Result<AnalyzerDelegate, StoreError>)> =
             std::thread::scope(|scope| {
@@ -1630,18 +1771,21 @@ impl WorkspaceAnalyzer {
                         let cfg = config.clone();
                         let store_context = store_context.clone();
                         let progress = progress.as_ref().map(Arc::clone);
+                        let context = context.clone();
                         let handle = std::thread::Builder::new()
                             .name(format!("bifrost-build-{language:?}"))
                             .spawn_scoped(scope, move || {
                                 let abort = Arc::clone(&store_context.build_abort);
                                 let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                    build_language_delegate(
-                                        language,
-                                        project,
-                                        cfg,
-                                        store_context,
-                                        progress,
-                                    )
+                                    context.run(|| {
+                                        build_language_delegate(
+                                            language,
+                                            project,
+                                            cfg,
+                                            store_context,
+                                            progress,
+                                        )
+                                    })
                                 }));
                                 if built.is_err() {
                                     abort.abort();
@@ -1964,12 +2108,14 @@ impl WorkspaceAnalyzer {
     /// an unpublished live blob is exactly what makes a native graph report
     /// `unavailable_canonical_facts`.
     pub fn warm_rust_usage_facts(&self) {
-        for support in Language::ANALYZABLE
-            .iter()
-            .filter_map(|&language| crate::analyzer::languages::language_support(language))
-        {
-            support.warm_usage_facts(self.analyzer());
-        }
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            for support in Language::ANALYZABLE
+                .iter()
+                .filter_map(|&language| crate::analyzer::languages::language_support(language))
+            {
+                support.warm_usage_facts(self.analyzer());
+            }
+        })
     }
 
     /// Whether a Rust usage query would wait for a fact catch-up batch.
@@ -2275,8 +2421,10 @@ impl WorkspaceAnalyzer {
     /// ahead of demand (#1442). Idempotent; see
     /// `IAnalyzer::warm_query_indexes`.
     pub fn warm_query_indexes(&self) {
-        let _scope = profiling::scope("WorkspaceAnalyzer::warm_query_indexes");
-        self.with_query_context(|analyzer| analyzer.warm_query_indexes());
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let _scope = profiling::scope("WorkspaceAnalyzer::warm_query_indexes");
+            self.with_query_context(|analyzer| analyzer.warm_query_indexes());
+        })
     }
 
     /// Whether every index `warm_query_indexes` would build is already built.
@@ -2288,8 +2436,10 @@ impl WorkspaceAnalyzer {
     /// has already asked to reuse still owes. Idempotent; see
     /// `IAnalyzer::warm_structural_indexes`.
     pub fn warm_structural_indexes(&self) {
-        let _scope = profiling::scope("WorkspaceAnalyzer::warm_structural_indexes");
-        self.with_query_context(|analyzer| analyzer.warm_structural_indexes());
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let _scope = profiling::scope("WorkspaceAnalyzer::warm_structural_indexes");
+            self.with_query_context(|analyzer| analyzer.warm_structural_indexes());
+        })
     }
 
     /// Whether every posting index `warm_structural_indexes` would build is
@@ -2318,32 +2468,34 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
-        let _scope = profiling::scope("WorkspaceAnalyzer::update");
-        if profiling::enabled() {
-            profiling::note(format!("changed_files={}", changed_files.len()));
-        }
-        self.analyzer()
-            .invalidate_cached_file_identities_for(changed_files);
-        let next = match self {
-            Self::Empty(analyzer) => {
-                let Some(build_context) = analyzer.build_context.as_ref() else {
-                    return Self::Empty(analyzer.clone());
-                };
-                let languages = build_context.changed_languages(changed_files);
-                Self::updated_from_empty(analyzer, build_context, languages, |language| {
-                    build_context
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let _scope = profiling::scope("WorkspaceAnalyzer::update");
+            if profiling::enabled() {
+                profiling::note(format!("changed_files={}", changed_files.len()));
+            }
+            self.analyzer()
+                .invalidate_cached_file_identities_for(changed_files);
+            let next = match self {
+                Self::Empty(analyzer) => {
+                    let Some(build_context) = analyzer.build_context.as_ref() else {
+                        return Self::Empty(analyzer.clone());
+                    };
+                    let languages = build_context.changed_languages(changed_files);
+                    Self::updated_from_empty(analyzer, build_context, languages, |language| {
+                        build_context
                         .build_delegate(language)
                         .unwrap_or_else(|error| {
                             panic!(
                                 "failed to initialize {language:?} analyzer during update: {error}"
                             )
                         })
-                })
-            }
-            Self::Multi(analyzer) => Self::from_updated_multi(analyzer.update(changed_files)),
-        };
-        next.reconcile_updated_build_context(Some(changed_files));
-        next
+                    })
+                }
+                Self::Multi(analyzer) => Self::from_updated_multi(analyzer.update(changed_files)),
+            };
+            next.reconcile_updated_build_context(Some(changed_files));
+            next
+        })
     }
 
     /// Refresh external-tool contexts for this updated snapshot without
@@ -2355,19 +2507,21 @@ impl WorkspaceAnalyzer {
         limits: &DependencyPackLimits,
         cancellation: &crate::CancellationToken,
     ) -> Result<(), StoreError> {
-        let Some(config) = self.config() else {
-            return Ok(());
-        };
-        for support in crate::analyzer::languages::registered_language_supports() {
-            support.refresh_updated_workspace_context(
-                self,
-                changed_files,
-                config,
-                limits,
-                cancellation,
-            )?;
-        }
-        Ok(())
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let Some(config) = self.config() else {
+                return Ok(());
+            };
+            for support in crate::analyzer::languages::registered_language_supports() {
+                support.refresh_updated_workspace_context(
+                    self,
+                    changed_files,
+                    config,
+                    limits,
+                    cancellation,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn update_all(&self) -> Self {
@@ -2383,28 +2537,30 @@ impl WorkspaceAnalyzer {
     }
 
     fn update_all_reporting_progress(&self, progress: Option<BuildProgress>) -> Self {
-        let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
-        self.analyzer().invalidate_cached_file_identities();
-        let next = match self {
-            Self::Empty(analyzer) => {
-                let Some(build_context) = analyzer.build_context.as_ref() else {
-                    return Self::Empty(analyzer.clone());
-                };
-                let languages = build_context.project_languages();
-                Self::updated_from_empty(analyzer, build_context, languages, |language| {
-                    build_context.build_delegate_with_progress(language, progress.clone()).unwrap_or_else(|error| {
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
+            self.analyzer().invalidate_cached_file_identities();
+            let next = match self {
+                Self::Empty(analyzer) => {
+                    let Some(build_context) = analyzer.build_context.as_ref() else {
+                        return Self::Empty(analyzer.clone());
+                    };
+                    let languages = build_context.project_languages();
+                    Self::updated_from_empty(analyzer, build_context, languages, |language| {
+                        build_context.build_delegate_with_progress(language, progress.clone()).unwrap_or_else(|error| {
                             panic!(
                                 "failed to initialize {language:?} analyzer during full update: {error}"
                             )
                     })
-                })
-            }
-            Self::Multi(analyzer) => {
-                Self::from_updated_multi(analyzer.update_all_with_progress(progress))
-            }
-        };
-        next.reconcile_updated_build_context(None);
-        next
+                    })
+                }
+                Self::Multi(analyzer) => {
+                    Self::from_updated_multi(analyzer.update_all_with_progress(progress))
+                }
+            };
+            next.reconcile_updated_build_context(None);
+            next
+        })
     }
 
     fn reconcile_updated_build_context(

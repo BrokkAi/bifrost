@@ -1396,6 +1396,15 @@ impl SelectedResolutionOperation<'_, '_> {
             ));
             typed_slots.push((
                 declaration_slot,
+                // Go receiver addressability: Go selects the shallowest member
+                // whatever the receiver's addressability, and has no overloading,
+                // so addressability only decides whether a pointer-method call
+                // compiles. Treating a receiver as addressable can change an
+                // answer only for a call the compiler rejects. Today a FieldType
+                // anchor is also always `variable.field` (the point recognizer
+                // admits only an identifier owner), which Go makes addressable
+                // for a value or pointer variable. A BindingValue seed is an
+                // initializer's value, which is not addressable.
                 ResolutionSlotValue::runtime(
                     ResolutionTypeRef::new_with_reference_indirection(
                         type_identity,
@@ -1437,5 +1446,171 @@ impl SelectedResolutionOperation<'_, '_> {
             reference_bindings: reference_bindings.into_boxed_slice(),
             typed_slots: typed_slots.into_boxed_slice(),
         }))
+    }
+}
+
+/// A language decision, not an inventory or analysis gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum GoMemberRejectionCause {
+    ReceiverNotAddressable,
+}
+
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct GoStaticMemberRejection {
+    pub target: SemanticId,
+    pub kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind,
+    pub owners: Box<[SemanticId]>,
+    pub cause: GoMemberRejectionCause,
+}
+
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct GoStaticMemberCandidate {
+    pub definition: SemanticId,
+    pub kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind,
+    pub promotion_depth: usize,
+    pub signature: Option<crate::analyzer::resolution::LoweredCallableSignatureProperty>,
+    pub signature_types: Vec<crate::analyzer::resolution::TypedFrontierState>,
+    pub signature_types_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum GoStaticMembership {
+    Present,
+    Excluded,
+    Open,
+}
+
+/// Query-local source member evidence. Completion retains ordinary selector
+/// diagnostics; search_completion separates inventory from receiver eligibility.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct GoStaticTypeMember {
+    pub candidates: Vec<GoStaticMemberCandidate>,
+    pub rejected: Vec<GoStaticMemberRejection>,
+    pub completion: ResolutionCompletion,
+    pub search_completion: ResolutionCompletion,
+    pub intrinsic_types: Vec<crate::analyzer::resolution::FactIntrinsicTypeDescriptor>,
+    pub receiver_is_interface: bool,
+}
+
+/// A member decides method-set membership only after all shallower paths close.
+/// Both selector projection and interface satisfaction use this same decision.
+pub(crate) fn go_member_membership(
+    members: impl IntoIterator<
+        Item = brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind,
+    >,
+    rejected: impl IntoIterator<Item = GoMemberRejectionCause>,
+    search_completion: &ResolutionCompletion,
+) -> GoStaticMembership {
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
+    if search_completion != &ResolutionCompletion::Complete {
+        return GoStaticMembership::Open;
+    }
+    let mut members = members.into_iter();
+    match (members.next(), members.next()) {
+        (Some(ResolutionMemberKind::Method), None) => GoStaticMembership::Present,
+        (Some(ResolutionMemberKind::Field), None) => GoStaticMembership::Excluded,
+        (None, None)
+            if rejected.into_iter().all(|cause| match cause {
+                GoMemberRejectionCause::ReceiverNotAddressable => true,
+            }) =>
+        {
+            GoStaticMembership::Excluded
+        }
+        _ => GoStaticMembership::Open,
+    }
+}
+
+impl GoStaticTypeMember {
+    pub fn membership(&self) -> GoStaticMembership {
+        go_member_membership(
+            self.candidates.iter().map(|member| member.kind),
+            self.rejected.iter().map(|rejection| rejection.cause),
+            &self.search_completion,
+        )
+    }
+}
+
+impl SelectedResolutionOperation<'_, '_> {
+    /// Intern the callable lookup in the same selected identity table used by
+    /// DeferredMemberOwnerLookupName and MemberSelectionRequest.
+    pub fn go_static_member_lookup(&self, member_name: &str) -> SemanticId {
+        crate::analyzer::resolution::ResolutionLookupSemanticRecipe::new(
+            Language::Go,
+            ResolutionNamespace::Callable,
+            member_name,
+        )
+        .semantic(&self.ready.shared_names())
+    }
+
+    /// Select a member of an already completed native static type. Identities
+    /// belong to this selected operation; no names are rendered or re-resolved.
+    /// The request's budget and cancellation cover inventory, promotion and
+    /// signature reads, and remain distinct terminal outcomes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn go_static_type_member(
+        &mut self,
+        prepared: super::go_named::GoPreparedImportContext,
+        caller_path: &str,
+        receiver: ResolutionTypeRef,
+        lookup: SemanticId,
+        receiver_addressable: bool,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<BoundedResolution<SelectedResolutionOperationOutcome<GoStaticTypeMember>>> {
+        let context = match self.prepare_context(
+            prepared.context,
+            cancellation,
+            &SelectedResolutionContextMetrics,
+        )? {
+            SelectedResolutionContextValidationOutcome::Ready(context) => context,
+            SelectedResolutionContextValidationOutcome::Cancelled => {
+                return Ok(BoundedResolution::Cancelled {
+                    work: session.finish(()).work(),
+                });
+            }
+        };
+        let blueprint = match self.ready.collect_blueprint(context, cancellation)? {
+            SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
+            SelectedFactOperationBlueprintConstruction::Cancelled { .. } => {
+                return Ok(BoundedResolution::Cancelled {
+                    work: session.finish(()).work(),
+                });
+            }
+        };
+        if matches!(
+            self.ready.register_context(&blueprint, cancellation)?,
+            ContextRegistrationOutcome::Cancelled
+        ) {
+            return Ok(BoundedResolution::Cancelled {
+                work: session.finish(()).work(),
+            });
+        }
+        let result = {
+            let lexical = self.ready.lexical_source();
+            let typed = self.ready.typed_source();
+            let observed_lexical = SeamProfiled::observing(&lexical);
+            let observed_typed = SeamProfiled::observing(&typed);
+            self.with_go_forward_operation(
+                GoForwardOperationContext {
+                    blueprint: &blueprint,
+                    demand: prepared.demand,
+                    caller_path,
+                    lexical: &observed_lexical,
+                    typed: &observed_typed,
+                    cancellation,
+                    session,
+                },
+                None,
+                |operation| operation.go_static_type_member(receiver, lookup, receiver_addressable),
+            )?
+        };
+        let completion = result.completion.clone();
+        let result = self.finish_native(result, &completion, cancellation)?;
+        Ok(session.finish(result))
     }
 }

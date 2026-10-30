@@ -60,6 +60,7 @@ pub fn is_rust_declaration_name(node: Node<'_>) -> bool {
             | "struct_item"
             | "enum_item"
             | "trait_item"
+            | "trait_alias"
             | "type_item"
             | "const_item"
             | "static_item"

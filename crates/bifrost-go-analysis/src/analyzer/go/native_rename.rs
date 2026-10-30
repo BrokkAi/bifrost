@@ -7,7 +7,7 @@
 use crate::analyzer::go::GoAnalyzer;
 use brokk_bifrost_analysis::analyzer::rename::exact::{
     ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue, RenameAssemblyLimits,
-    RenameSourceIssue, assemble_exact_rename, check_rename_authority,
+    RenameSourceIssue, admit_selected_native_source, assemble_exact_rename, check_rename_authority,
 };
 
 use crate::analyzer::go::selected_reverse::GoSelectedReverseOutcome;
@@ -192,14 +192,7 @@ impl ExactRenameHooks for GoRenameHooks<'_> {
     type FileState = ();
 
     fn admit_source(&self, file: &ProjectFile, source: &str) -> Result<(), RenameSourceIssue> {
-        if !self
-            .0
-            .inner
-            .source_matches_selected_native_content(file, source)
-        {
-            return Err(RenameSourceIssue::ContentChanged);
-        }
-        Ok(())
+        admit_selected_native_source(&self.0.inner, file, source)
     }
 }
 

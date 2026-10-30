@@ -30,10 +30,11 @@ impl<'a> RowCompositionReads<'a> {
         let provider = ModelProvider::from(provenance);
         self.selection
             .is_none_or(|selection| selection.contains(&provider))
-            && self.defining_owner.is_none_or(|defining| {
-                (defining.extraction.is_some() && provenance.extraction.is_none())
-                    || ModelProvider::from(defining) == provider
-            })
+            && super::admits_defining_owner(
+                self.defining_owner,
+                &provider,
+                provenance.extraction.as_ref(),
+            )
     }
 
     pub fn new(
@@ -79,10 +80,11 @@ impl<'a> RowCompositionReads<'a> {
                     && self
                         .selection
                         .is_none_or(|selection| selection.contains(&provider))
-                    && self.defining_owner.is_none_or(|defining| {
-                        (defining.extraction.is_some() && shard.manifest.extraction.is_none())
-                            || ModelProvider::from(defining) == provider
-                    })
+                    && super::admits_defining_owner(
+                        self.defining_owner,
+                        &provider,
+                        shard.manifest.extraction.as_ref(),
+                    )
             })
             .map(|shard| {
                 shard
@@ -402,9 +404,6 @@ impl CompositionReads for RowCompositionReads<'_> {
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
         self.types(questions::TYPES_BY_ID, named_params! { ":id": id })
     }
-    fn types_with_id(&self, id: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(resolve_records(self.all_type_records_with_id(id)?).records)
-    }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
         Ok(resolve_records(self.types(
             questions::TYPES_BY_IDENTITY_NAME,
@@ -417,12 +416,6 @@ impl CompositionReads for RowCompositionReads<'_> {
         id: &str,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
         self.members(questions::MEMBERS_BY_ID, named_params! { ":id": id })
-    }
-    fn members_with_id(
-        &self,
-        id: &str,
-    ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
-        Ok(resolve_records(self.all_member_records_with_id(id)?).records)
     }
     fn procedure_summaries_for_member(
         &self,
@@ -580,6 +573,17 @@ impl<'query> GroupProjection<'query> {
     }
 
     pub(in crate::analyzer::semantic_model::overlay) fn new(reads: &'query dyn GroupInput) -> Self {
+        if let Some(ledger) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+            debug_assert!(
+                ledger.keys().contains(&crate::analyzer::ReadKey::Models(
+                    crate::analyzer::semantic::StableDigest::sha256(
+                        reads.active().active_model_set_hash()
+                    ),
+                )),
+                "composition memo hits require the selected model publication key"
+            );
+        }
+
         Self {
             reads,
             types_by_id: Default::default(),
@@ -630,9 +634,6 @@ impl CompositionReads for GroupProjection<'_> {
             .insert(id.to_owned(), records.clone());
         Ok(records)
     }
-    fn types_with_id(&self, id: &str) -> ReadResult<TypeRecords> {
-        Ok(resolve_records(self.all_type_records_with_id(id)?).records)
-    }
     fn types_named(&self, name: &str) -> ReadResult<TypeRecords> {
         if let Some(records) = self.types_by_name.borrow().get(name) {
             return Ok(resolve_records(records.clone()).records);
@@ -652,9 +653,6 @@ impl CompositionReads for GroupProjection<'_> {
             .borrow_mut()
             .insert(id.to_owned(), records.clone());
         Ok(records)
-    }
-    fn members_with_id(&self, id: &str) -> ReadResult<MemberRecords> {
-        Ok(resolve_records(self.all_member_records_with_id(id)?).records)
     }
     fn procedure_summaries_for_member(
         &self,

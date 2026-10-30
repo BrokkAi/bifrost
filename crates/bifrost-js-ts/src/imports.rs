@@ -493,6 +493,28 @@ pub fn resolve_js_ts_module_specifier(
     language: Language,
     aliases: Option<&AliasResolver>,
 ) -> Vec<ProjectFile> {
+    let files =
+        resolve_js_ts_module_specifier_files(source_file, module_specifier, language, aliases);
+    if files.is_empty()
+        && let Some(aliases) = aliases
+    {
+        let paths = js_ts_module_specifier_probed_paths(
+            source_file,
+            module_specifier,
+            language,
+            Some(aliases),
+        );
+        aliases.record_unresolved_module_paths(language, paths);
+    }
+    files
+}
+
+fn resolve_js_ts_module_specifier_files(
+    source_file: &ProjectFile,
+    module_specifier: &str,
+    language: Language,
+    aliases: Option<&AliasResolver>,
+) -> Vec<ProjectFile> {
     let exts = language.extensions();
     if !module_specifier.starts_with('.') {
         // Non-relative: try tsconfig path aliases, then workspace package names.
@@ -805,7 +827,8 @@ pub fn js_ts_module_specifier_probed_paths(
     aliases: Option<&AliasResolver>,
 ) -> Vec<ProjectFile> {
     debug_assert!(
-        resolve_js_ts_module_specifier(source_file, module_specifier, language, aliases).is_empty(),
+        resolve_js_ts_module_specifier_files(source_file, module_specifier, language, aliases)
+            .is_empty(),
         "the probed-path set is the stat list of a specifier that resolved to nothing"
     );
     let exts = language.extensions();

@@ -298,9 +298,12 @@ pub trait DistributiveDataflowProblem {
 
     /// Transfer along an ICFG-provided call-to-continuation edge.
     ///
-    /// In the current bounded ICFG these edges model explicit boundary arms,
-    /// such as deferred invocation; they are not an implicit bypass edge for
-    /// every materialized call.
+    /// These edges model explicit boundary arms, such as deferred invocation.
+    /// The bounded ICFG also carries caller-side continuations for every
+    /// resolved call. The kernel projects those continuations to this callback
+    /// only when the problem opts in through `resolved_call_to_return`; the
+    /// callback then models facts that flow past the call rather than through
+    /// its callee.
     fn call_to_return_flow(
         &self,
         edge: DataflowEdge<'_, Self::Fact>,

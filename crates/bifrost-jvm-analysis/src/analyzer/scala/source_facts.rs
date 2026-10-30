@@ -34,6 +34,7 @@ impl ScalaSourceFacts for TreeSitterAnalyzer<ScalaAdapter> {
     ) -> Option<Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>> {
         let reader = self.canonical_source_read(file, "scala")?;
         let cache_key = reader.cache_key();
+        reader.record_read_key();
         if let Some(facts) = cache.get(&cache_key) {
             return Some(facts);
         }

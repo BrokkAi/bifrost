@@ -131,6 +131,33 @@ impl KotlinFileDependencyIndex {
 }
 
 impl KotlinAnalyzer {
+    pub(super) fn reverse_import_index(
+        &self,
+    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        crate::analyzer::jvm::authority::source_read(
+            self,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinReverseImports,
+        );
+        brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
+            self,
+            &self.reverse_import_index,
+            || {
+                brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                    &(self.inner.all_files()),
+                    |candidate| self.imported_code_units_of(candidate),
+                    true,
+                )
+            },
+            || {
+                brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                    &(self.inner.all_files()),
+                    |candidate| self.imported_code_units_of(candidate),
+                    false,
+                )
+            },
+        )
+    }
+
     /// The declarations a Kotlin file imports, widened to the whole JVM source
     /// realm when a realm view is supplied.
     ///
@@ -147,44 +174,38 @@ impl KotlinAnalyzer {
             Some(_) => &self.realm_imported_code_units,
             None => &self.imported_code_units,
         };
-        if let Some(cached) = cache.get(file) {
-            return cached;
-        }
-        if file_language(file) != Language::Kotlin {
-            return Arc::new(HashSet::default());
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "kotlin.imported_code_units_in_realm",
-            );
-        let imports = self.inner.import_info_of(token, file);
-        let resolved = Arc::new(resolve_kotlin_import_infos(self, token, &imports, realm));
-        let cache_key = file.clone();
-        let cache_value = Arc::clone(&resolved);
-        persistent_fill_guard.installed("kotlin.imported_code_units_in_realm");
-        cache.insert(cache_key, cache_value);
-        resolved
+        crate::analyzer::jvm::hierarchy::derived_read(cache, self, file, || {
+            let resolved = {
+                if file_language(file) == Language::Kotlin {
+                    let imports = self.inner.import_info_of(token, file);
+                    resolve_kotlin_import_infos(self, token, &imports, realm)
+                } else {
+                    HashSet::default()
+                }
+            };
+            let resolved = Arc::new(resolved);
+            let bytes =
+                brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set(file, &resolved)
+                    as usize;
+            (resolved, bytes)
+        })
     }
 
     /// Files that can see one another without an import because they declare
     /// the same package and spell one another's names.
-    fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.same_package_reference_index.get_or_build(
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "kotlin.same_package_reference_index",
-                    || compute_kotlin_same_package_reference_index(self, true),
-                )
-            },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "kotlin.same_package_reference_index",
-                    || compute_kotlin_same_package_reference_index(self, false),
-                )
-            },
+    pub(super) fn same_package_reference_index(
+        &self,
+    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        crate::analyzer::jvm::authority::source_read(
+            self,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinSamePackageReferences,
+        );
+
+        brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
+            self,
+            &self.same_package_reference_index,
+            || compute_kotlin_same_package_reference_index(self, true),
+            || compute_kotlin_same_package_reference_index(self, false),
         )
     }
 }
@@ -243,6 +264,11 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<ProjectFile>> {
+        crate::analyzer::jvm::authority::source_read(
+            self,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinFileDependencies,
+        );
+
         self.file_dependency_index
             .get()
             .map(|index| index.resolve_imports(file, imports))
@@ -254,6 +280,10 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) {
+        crate::analyzer::jvm::authority::source_read(
+            self,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinFileDependencies,
+        );
         if self.file_dependency_index.get().is_none()
             && let Some(index) =
                 brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
@@ -343,35 +373,19 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
     /// reference to a Java type is found without this relation having an opinion
     /// about it (#1239 milestone 4).
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        crate::analyzer::jvm::authority::source_read(
+            self,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinReferencingFiles,
+        );
+
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-jvm-analysis/src/analyzer/kotlin/imports.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
         if file_language(file) != Language::Kotlin {
             return HashSet::default();
         }
-        let reverse_index =
-            brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
-                &self.reverse_import_index,
-                || {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "kotlin.reverse_file_index",
-                        || self.inner.all_files(),
-                    )
-                },
-                |candidate| {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "kotlin.reverse_file_index",
-                        || self.imported_code_units_of(candidate),
-                    )
-                },
-            );
+        let reverse_index = self.reverse_import_index();
         let mut result = reverse_index
             .get(file)
             .map(|files| (**files).clone())
@@ -383,8 +397,9 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         {
             let cache_key = file.clone();
             let cache_value = Arc::new(result.clone());
-            persistent_fill_guard.installed("referencing_files");
-            self.referencing_files.insert(cache_key, cache_value);
+            if cache_fill.is_complete() {
+                self.referencing_files.insert(cache_key, cache_value);
+            }
         };
         result
     }

@@ -1,5 +1,6 @@
 //! Hydration of one generation-selected C++ source-facts publication.
 
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
@@ -943,7 +944,9 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
     ) -> Option<Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>> {
         let generation = self.language_generation(lang)?;
         let oid = self.resolve_live_oid_for_file(file)?;
-        self.record_read_key(self.file_read_key(file, oid));
+        let key = self.file_read_key(file, oid);
+        debug_assert!(matches!(&key, ReadKey::File { .. }));
+        self.record_read_key(key);
         if self.record_structure_unavailable_if_unparseable(file, oid) {
             return None;
         }

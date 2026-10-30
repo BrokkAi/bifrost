@@ -4,11 +4,15 @@ use crate::graph::syntax::is_declaration_constant;
 use crate::graph_support::RubySource;
 use crate::imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
 use crate::mixins::{ruby_forward_mixin_specs, ruby_forward_superclass_targets};
+use brokk_bifrost_core::analyzer::memo_attribution::{
+    MemoAttribution, ReplayingMemo, ReplayingMemoEntry,
+};
 use brokk_bifrost_core::analyzer::model::RubyMethodDispatchMode;
 use brokk_bifrost_core::analyzer::type_relations::TypeRelationKind;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::cell::RefCell;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,8 +41,8 @@ pub struct RubyConstantReference {
 }
 
 impl RubyTargetSpec {
-    pub fn from_target(
-        graph: &RubyGraphSource<'_>,
+    pub fn from_target<A: MemoAttribution>(
+        graph: &RubyGraphSource<'_, A>,
         ruby: &dyn RubySource,
         target: &CodeUnit,
     ) -> Option<Self> {
@@ -133,12 +137,14 @@ pub struct ReceiverType {
     pub mode: ReceiverMode,
 }
 
-pub struct RubySemanticIndex<'a> {
-    pub graph: RubyGraphSource<'a>,
+type ResolutionMemo<K, V, R> = ReplayingMemo<RefCell<HashMap<K, Arc<ReplayingMemoEntry<V, R>>>>>;
+
+pub struct RubySemanticIndex<'a, A: MemoAttribution> {
+    pub graph: RubyGraphSource<'a, A>,
     pub ruby: &'a dyn RubySource,
     target: Option<CodeUnit>,
-    forward_owner_facts: RefCell<HashMap<String, RubyForwardOwnerFacts>>,
-    pub factory_return_cache: RefCell<HashMap<FactoryInferenceKey, Option<String>>>,
+    forward_owner_facts: ResolutionMemo<String, RubyForwardOwnerFacts, A::Key>,
+    pub factory_return_cache: ResolutionMemo<FactoryInferenceKey, Option<String>, A::Key>,
 }
 
 #[derive(Clone, Default)]
@@ -149,21 +155,21 @@ struct RubyForwardOwnerFacts {
     extended: Vec<String>,
 }
 
-impl<'a> RubySemanticIndex<'a> {
+impl<'a, A: MemoAttribution> RubySemanticIndex<'a, A> {
     pub fn build(
-        graph: RubyGraphSource<'a>,
+        graph: RubyGraphSource<'a, A>,
         ruby: &'a dyn RubySource,
         spec: &RubyTargetSpec,
     ) -> Self {
         Self::build_with_target(graph, ruby, Some(spec.target.clone()))
     }
 
-    pub fn build_for_lookup(graph: RubyGraphSource<'a>, ruby: &'a dyn RubySource) -> Self {
+    pub fn build_for_lookup(graph: RubyGraphSource<'a, A>, ruby: &'a dyn RubySource) -> Self {
         Self::build_with_target(graph, ruby, None)
     }
 
     fn build_with_target(
-        graph: RubyGraphSource<'a>,
+        graph: RubyGraphSource<'a, A>,
         ruby: &'a dyn RubySource,
         target: Option<CodeUnit>,
     ) -> Self {
@@ -171,8 +177,8 @@ impl<'a> RubySemanticIndex<'a> {
             graph,
             ruby,
             target,
-            forward_owner_facts: RefCell::new(HashMap::default()),
-            factory_return_cache: RefCell::new(HashMap::default()),
+            forward_owner_facts: ReplayingMemo::new(RefCell::new(HashMap::default())),
+            factory_return_cache: ReplayingMemo::new(RefCell::new(HashMap::default())),
         }
     }
 
@@ -669,59 +675,72 @@ impl<'a> RubySemanticIndex<'a> {
         visible_files: &[ProjectFile],
         owner: &str,
     ) -> RubyForwardOwnerFacts {
-        if let Some(cached) = self.forward_owner_facts.borrow().get(owner) {
-            return cached.clone();
-        }
-        let owner_units = support
-            .fqn(owner)
-            .into_iter()
-            .filter(|unit| {
-                (unit.is_class() || unit.is_module())
-                    && unit.fq_name() == owner
-                    && visible_files.contains(unit.source())
+        let facts = self
+            .forward_owner_facts
+            .read(self.graph.attribution, |cache, capture| {
+                if let Some(entry) = cache.borrow().get(owner) {
+                    return Ok::<_, std::convert::Infallible>(Arc::clone(entry));
+                }
+                let entry = Arc::new(capture.build(|| {
+                    let owner_units = support
+                        .fqn(owner)
+                        .into_iter()
+                        .filter(|unit| {
+                            (unit.is_class() || unit.is_module())
+                                && unit.fq_name() == owner
+                                && visible_files.contains(unit.source())
+                        })
+                        .collect::<Vec<_>>();
+                    let specs = owner_units
+                        .iter()
+                        .flat_map(|unit| ruby_forward_mixin_specs(self.ruby, unit))
+                        .collect::<Vec<_>>();
+                    let mixin_names: HashSet<String> =
+                        specs.iter().map(|spec| spec.raw_target.clone()).collect();
+                    let mut facts = RubyForwardOwnerFacts::default();
+                    for spec in specs {
+                        let Some(target) = self.resolve_forward_owner_name(
+                            support,
+                            visible_files,
+                            owner,
+                            &spec.raw_target,
+                        ) else {
+                            continue;
+                        };
+                        match spec.kind {
+                            TypeRelationKind::MixinInclude => facts.included.push(target),
+                            TypeRelationKind::MixinPrepend => facts.prepended.push(target),
+                            TypeRelationKind::MixinExtend => facts.extended.push(target),
+                            _ => {}
+                        }
+                    }
+                    for raw in owner_units
+                        .iter()
+                        .flat_map(|unit| ruby_forward_superclass_targets(self.ruby, unit))
+                    {
+                        if mixin_names.contains(&raw) {
+                            continue;
+                        }
+                        if let Some(target) =
+                            self.resolve_forward_owner_name(support, visible_files, owner, &raw)
+                        {
+                            facts.ancestors.push(target);
+                        }
+                    }
+                    facts.ancestors.dedup();
+                    facts.included.dedup();
+                    facts.prepended.dedup();
+                    facts.extended.dedup();
+
+                    facts
+                }));
+                cache
+                    .borrow_mut()
+                    .insert(owner.to_string(), Arc::clone(&entry));
+                Ok(entry)
             })
-            .collect::<Vec<_>>();
-        let specs = owner_units
-            .iter()
-            .flat_map(|unit| ruby_forward_mixin_specs(self.ruby, unit))
-            .collect::<Vec<_>>();
-        let mixin_names: HashSet<String> =
-            specs.iter().map(|spec| spec.raw_target.clone()).collect();
-        let mut facts = RubyForwardOwnerFacts::default();
-        for spec in specs {
-            let Some(target) =
-                self.resolve_forward_owner_name(support, visible_files, owner, &spec.raw_target)
-            else {
-                continue;
-            };
-            match spec.kind {
-                TypeRelationKind::MixinInclude => facts.included.push(target),
-                TypeRelationKind::MixinPrepend => facts.prepended.push(target),
-                TypeRelationKind::MixinExtend => facts.extended.push(target),
-                _ => {}
-            }
-        }
-        for raw in owner_units
-            .iter()
-            .flat_map(|unit| ruby_forward_superclass_targets(self.ruby, unit))
-        {
-            if mixin_names.contains(&raw) {
-                continue;
-            }
-            if let Some(target) =
-                self.resolve_forward_owner_name(support, visible_files, owner, &raw)
-            {
-                facts.ancestors.push(target);
-            }
-        }
-        facts.ancestors.dedup();
-        facts.included.dedup();
-        facts.prepended.dedup();
-        facts.extended.dedup();
-        self.forward_owner_facts
-            .borrow_mut()
-            .insert(owner.to_string(), facts.clone());
-        facts
+            .expect("owner fact build is infallible");
+        (*facts).clone()
     }
 
     /// The `include`/`prepend`/`extend` targets every visible declaration of
@@ -923,8 +942,8 @@ fn constant_lookup_candidates(
     Some(candidates)
 }
 
-pub fn resolve_constant_reference(
-    semantic: &RubySemanticIndex<'_>,
+pub fn resolve_constant_reference<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
     lexical_stack: &[String],
@@ -1098,32 +1117,37 @@ mod tests {
                 runtime_boundary: None,
             })
         }
-        fn autoload_constant_files(&self) -> Option<&HashMap<String, HashSet<ProjectFile>>> {
-            Some(&self.autoload)
+        fn autoload_constant_files(
+            &self,
+        ) -> Option<std::sync::Arc<HashMap<String, HashSet<ProjectFile>>>> {
+            Some(std::sync::Arc::new(self.autoload.clone()))
         }
         fn has_zeitwerk_autoload_conventions(&self) -> bool {
             false
         }
-        fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile> {
-            &self.empty
+        fn zeitwerk_autoload_files(&self) -> std::sync::Arc<HashSet<ProjectFile>> {
+            std::sync::Arc::new(self.empty.clone())
         }
-        fn zeitwerk_consumer_files(&self) -> &HashSet<ProjectFile> {
-            &self.empty
+        fn zeitwerk_consumer_files(&self) -> std::sync::Arc<HashSet<ProjectFile>> {
+            std::sync::Arc::new(self.empty.clone())
         }
-        fn zeitwerk_autoload_code_units(&self) -> &HashSet<CodeUnit> {
+        fn zeitwerk_autoload_code_units(&self) -> std::sync::Arc<HashSet<CodeUnit>> {
             unimplemented!()
         }
         fn reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
             unimplemented!()
         }
-        fn mixin_relations(&self) -> &[brokk_bifrost_core::analyzer::type_relations::TypeRelation] {
+        fn mixin_relations(
+            &self,
+        ) -> std::sync::Arc<Vec<brokk_bifrost_core::analyzer::type_relations::TypeRelation>>
+        {
             unimplemented!()
         }
-        fn semantic_facts(&self) -> &crate::graph_support::RubySemanticFacts {
+        fn semantic_facts(&self) -> std::sync::Arc<crate::graph_support::RubySemanticFacts> {
             unimplemented!()
         }
-        fn types_by_identifier(&self) -> &HashMap<String, Vec<CodeUnit>> {
-            &self.types
+        fn types_by_identifier(&self) -> std::sync::Arc<HashMap<String, Vec<CodeUnit>>> {
+            std::sync::Arc::new(self.types.clone())
         }
         fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
             self.parsed(unit.source())
@@ -1189,10 +1213,66 @@ mod tests {
     // bounds the lifetime of every graph view, like the production scope.
     impl QueryScope for Fixture {}
 
-    fn with_semantic(fixture: &Fixture, read: impl FnOnce(&RubySemanticIndex<'_>)) {
+    use brokk_bifrost_core::analyzer::memo_attribution::MemoCapability;
+
+    struct TestAttribution;
+    impl MemoAttribution for TestAttribution {
+        type Key = ();
+        fn is_capturing(&self) -> bool {
+            false
+        }
+        fn capture_identity(
+            &self,
+        ) -> Option<brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity> {
+            None
+        }
+        fn record_unattributed(&self) {
+            panic!("fixture has no captures")
+        }
+        fn capture<T>(
+            &self,
+            build: impl FnOnce() -> T,
+        ) -> (
+            T,
+            brokk_bifrost_core::analyzer::memo_attribution::CapturedMemoReads<()>,
+            Option<brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity>,
+        ) {
+            (
+                build(),
+                brokk_bifrost_core::analyzer::memo_attribution::CapturedMemoReads {
+                    keys: Arc::from([]),
+                    unattributed_reads: 0,
+                    execution_dependences: 0,
+                },
+                None,
+            )
+        }
+        fn capture_authority<T>(
+            &self,
+            build: impl FnOnce() -> T,
+        ) -> (
+            T,
+            brokk_bifrost_core::analyzer::memo_attribution::CapturedMemoReads<()>,
+        ) {
+            let (value, reads, _) = self.capture(build);
+            (value, reads)
+        }
+        fn replay(
+            &self,
+            _: &brokk_bifrost_core::analyzer::memo_attribution::CapturedMemoReads<()>,
+        ) {
+            panic!("fixture has no captures")
+        }
+    }
+    fn with_semantic(
+        fixture: &Fixture,
+        read: impl FnOnce(&RubySemanticIndex<'_, TestAttribution>),
+    ) {
         let definitions =
             |consumer: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| consumer(fixture);
+        let attribution = MemoCapability::new(TestAttribution);
         let graph = RubyGraphSource {
+            attribution: &attribution,
             token: fixture.token(),
             index: fixture,
             definitions: &definitions,

@@ -1718,7 +1718,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: range bindings, member const and numeric values used wrong syntax"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: range bindings, member const and numeric values used wrong syntax"
     )]
     fn source_fact_grammar_boundary() {
         let source = "void f() { for (char i : xs) { for (char item : xs) {} } }\nstruct C { void f(const int x); void g() const; };\nint n[] = {0X10, 0B10, 1uLL, 2Lu, 010};\n";
@@ -1826,7 +1826,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: base access leaked across commas"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: base access leaked across commas"
     )]
     fn source_fact_base_access_defaults() {
         // [class.access.base]: omitted access is decided independently per base.
@@ -1869,7 +1869,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: parameter indirection reused pointee size"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: parameter indirection reused pointee size"
     )]
     fn source_fact_parameter_sizes_respect_indirection() {
         let rows = parse_cpp_expression_source_facts(
@@ -1902,7 +1902,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: union sizes summed and later field declarators vanished"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: union sizes summed and later field declarators vanished"
     )]
     fn source_fact_record_sizes_follow_member_layout() {
         let rows = parse_cpp_expression_source_facts(

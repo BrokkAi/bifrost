@@ -376,24 +376,44 @@ mod tests {
         let analyzer = ScalaAnalyzer::new(Arc::new(TestProject::new(root, Language::Scala)));
         let callees = HashSet::from_iter(["app.Target".to_string()]);
 
-        let first =
-            brokk_bifrost_analysis::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
-                &analyzer,
-                &analyzer.dead_code_usage_edges,
-                &callees,
-                |token| {
-                    build_inbound_scala_usage_edges_with_completeness(&analyzer, token, &callees)
-                },
-            )
-            .expect("complete Scala graph should be cached");
-        let second =
-            brokk_bifrost_analysis::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
-                &analyzer,
-                &analyzer.dead_code_usage_edges,
-                &callees,
-                |_| panic!("canonical target set should hit the Scala dead-code cache"),
-            )
-            .expect("cached Scala graph should be returned");
+        let first = analyzer.dead_code_usage_edges.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(&analyzer),
+            |cache| {
+                brokk_bifrost_analysis::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
+                    &analyzer,
+                    cache,
+                    &callees,
+                    |token| {
+                        build_inbound_scala_usage_edges_with_completeness(
+                            &analyzer, token, &callees,
+                        )
+                    },
+                )
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+                    &[Language::Java, Language::Kotlin, Language::Scala],
+                )
+            },
+        )
+        .expect("complete Scala graph should be cached");
+        let second = analyzer.dead_code_usage_edges.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(&analyzer),
+            |cache| {
+                brokk_bifrost_analysis::analyzer::usages::inverted_edges::cached_dead_code_usage_edges(
+                    &analyzer,
+                    cache,
+                    &callees,
+                    |_| panic!("canonical target set should hit the Scala dead-code cache"),
+                )
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+                    &[Language::Java, Language::Kotlin, Language::Scala],
+                )
+            },
+        )
+        .expect("cached Scala graph should be returned");
 
         assert!(Arc::ptr_eq(&first, &second));
     }

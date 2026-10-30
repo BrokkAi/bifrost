@@ -3464,7 +3464,6 @@ enum GoChannelPayloadSource<'tree, T> {
 enum GoIndexValueExpressionSource<'tree, T> {
     Binding(T),
     Type(Node<'tree>),
-    Forward(Node<'tree>),
 }
 
 fn go_index_value_expression_source<'tree, T>(
@@ -3474,23 +3473,29 @@ fn go_index_value_expression_source<'tree, T>(
     mut make_type: impl FnMut(Node<'tree>, usize) -> Option<Node<'tree>>,
     mut append_source: impl FnMut(Node<'tree>) -> Option<Node<'tree>>,
 ) -> Option<GoIndexValueExpressionSource<'tree, T>> {
-    while let Some(child) = unwrap(node) {
-        node = child;
-    }
-    match node.kind() {
-        "identifier" | "true" | "false" | "nil" | "iota" => {
-            Some(GoIndexValueExpressionSource::Binding(binding(node)?))
+    loop {
+        while let Some(child) = unwrap(node) {
+            node = child;
         }
-        "composite_literal" | "type_assertion_expression" => Some(
-            GoIndexValueExpressionSource::Type(node.child_by_field_name("type")?),
-        ),
-        "slice_expression" => Some(GoIndexValueExpressionSource::Forward(
-            node.child_by_field_name("operand")?,
-        )),
-        "call_expression" => make_type(node, node.start_byte())
-            .map(GoIndexValueExpressionSource::Type)
-            .or_else(|| append_source(node).map(GoIndexValueExpressionSource::Forward)),
-        _ => None,
+        match node.kind() {
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                return Some(GoIndexValueExpressionSource::Binding(binding(node)?));
+            }
+            "composite_literal" | "type_assertion_expression" => {
+                return Some(GoIndexValueExpressionSource::Type(
+                    node.child_by_field_name("type")?,
+                ));
+            }
+            "slice_expression" => node = node.child_by_field_name("operand")?,
+            "call_expression" => {
+                if let Some(type_node) = make_type(node, node.start_byte()) {
+                    return Some(GoIndexValueExpressionSource::Type(type_node));
+                }
+                let next = append_source(node)?;
+                node = next;
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -3587,66 +3592,54 @@ fn go_prepass_channel_payload_type(
 }
 
 fn go_prepass_index_value_copy(
-    mut node: Node<'_>,
+    node: Node<'_>,
     bindings: &GoCallableLexicalBindings,
     source: &str,
     named_types: &GoNamedTypeDefinitions<'_>,
     byte: usize,
 ) -> MemoryValueCopy {
-    loop {
-        let source_node = go_index_value_expression_source(
-            node,
-            |node| {
-                matches!(node.kind(), "parenthesized_expression" | "literal_element")
-                    .then(|| transparent_runtime_wrapper_child(node))
-                    .flatten()
-            },
-            |node| node_text(source, node).and_then(|name| bindings.binding_at(name, byte)),
-            |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
-            |_| None,
-        );
-        match source_node {
-            Some(GoIndexValueExpressionSource::Binding(binding)) => {
-                return bindings
-                    .index_value_copy(binding)
-                    .unwrap_or(MemoryValueCopy::Unknown);
-            }
-            Some(GoIndexValueExpressionSource::Type(kind)) => {
-                return go_index_value_copy_from_type(kind, source, named_types, byte);
-            }
-            Some(GoIndexValueExpressionSource::Forward(next)) => node = next,
-            None => return MemoryValueCopy::Unknown,
+    match go_index_value_expression_source(
+        node,
+        |node| {
+            matches!(node.kind(), "parenthesized_expression" | "literal_element")
+                .then(|| transparent_runtime_wrapper_child(node))
+                .flatten()
+        },
+        |node| node_text(source, node).and_then(|name| bindings.binding_at(name, byte)),
+        |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
+        |_| None,
+    ) {
+        Some(GoIndexValueExpressionSource::Binding(binding)) => bindings
+            .index_value_copy(binding)
+            .unwrap_or(MemoryValueCopy::Unknown),
+        Some(GoIndexValueExpressionSource::Type(kind)) => {
+            go_index_value_copy_from_type(kind, source, named_types, byte)
         }
+        None => MemoryValueCopy::Unknown,
     }
 }
 
 fn go_prepass_index_value_type(
-    mut node: Node<'_>,
+    node: Node<'_>,
     bindings: &GoCallableLexicalBindings,
     source: &str,
     named_types: &GoNamedTypeDefinitions<'_>,
     byte: usize,
 ) -> Option<GoTypeIdentity> {
-    loop {
-        let source_node = go_index_value_expression_source(
-            node,
-            |node| {
-                matches!(node.kind(), "parenthesized_expression" | "literal_element")
-                    .then(|| transparent_runtime_wrapper_child(node))
-                    .flatten()
-            },
-            |node| node_text(source, node).and_then(|name| bindings.binding_at(name, byte)),
-            |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
-            |_| None,
-        )?;
-        match source_node {
-            GoIndexValueExpressionSource::Binding(binding) => {
-                return bindings.index_value_type(binding);
-            }
-            GoIndexValueExpressionSource::Type(kind) => {
-                return go_index_value_type_from_type(kind, source, named_types, byte);
-            }
-            GoIndexValueExpressionSource::Forward(next) => node = next,
+    match go_index_value_expression_source(
+        node,
+        |node| {
+            matches!(node.kind(), "parenthesized_expression" | "literal_element")
+                .then(|| transparent_runtime_wrapper_child(node))
+                .flatten()
+        },
+        |node| node_text(source, node).and_then(|name| bindings.binding_at(name, byte)),
+        |call, _use_byte| go_prepass_make_type_argument(call, bindings, source, byte),
+        |_| None,
+    )? {
+        GoIndexValueExpressionSource::Binding(binding) => bindings.index_value_type(binding),
+        GoIndexValueExpressionSource::Type(kind) => {
+            go_index_value_type_from_type(kind, source, named_types, byte)
         }
     }
 }
@@ -5941,10 +5934,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     }
 
     fn local_identity_value(&self, name: &str, declaration: usize) -> Option<ValueId> {
-        self.locals
-            .get(name)?
-            .iter()
-            .find_map(|binding| (binding.declaration == declaration).then_some(binding.value))
+        brokk_bifrost_analysis::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration, binding.value)),
+            declaration,
+        )
     }
 
     fn binding_value(&self, name: &str, byte: usize) -> Option<ValueId> {
@@ -6461,22 +6457,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         source: ValueId,
         target: ValueId,
     ) -> Result<(), GoLoweringError> {
-        self.append_effect(
+        self.session.append_assignment_value_flow(
             builder,
             point,
-            SemanticEffect::Assignment {
-                target,
-                value: source,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            point,
-            SemanticEffect::ValueFlow {
-                kind: GO_AGGREGATE_COPY_FLOW,
-                source,
-                target,
-            },
+            GO_AGGREGATE_COPY_FLOW,
+            source,
+            target,
         )
     }
 
@@ -6888,19 +6874,20 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let identity = self.expression_type_identity(operand, operand.start_byte())?;
         let definition = self.named_type_definition_for_declaration(identity.declaration?)?;
         let structure = self.file_underlying_type(definition.underlying, selector.start_byte())?;
-        named_children(structure)
+        let source = self.prepared.source();
+        let fields = named_children(structure)
             .into_iter()
             .filter(|child| child.kind() == "field_declaration_list")
             .flat_map(named_children)
             .filter(|declaration| declaration.kind() == "field_declaration")
-            .find(|declaration| {
-                children_by_field_name(*declaration, "name")
+            .flat_map(|declaration| {
+                let type_node = declaration.child_by_field_name("type");
+                children_by_field_name(declaration, "name")
                     .into_iter()
-                    .any(|name| {
-                        nonempty_node_text(self.prepared.source(), name) == Some(field_name)
-                    })
+                    .map(move |name| (name, type_node))
             })
-            .and_then(|declaration| declaration.child_by_field_name("type"))
+            .filter_map(|(name, type_node)| Some((nonempty_node_text(source, name)?, type_node)));
+        go_struct_field_type_node(fields, field_name)
     }
 
     fn place_has_exact_reference_type(&self, place: Node<'tree>, source_node: Node<'tree>) -> bool {
@@ -7380,10 +7367,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let declaration = self.expression_type_identity(operand, byte)?.declaration?;
         let definition = self.named_type_definition_for_declaration(declaration)?;
         let structure = self.file_underlying_type(definition.underlying, byte)?;
-        go_struct_literal_fields(structure, self.prepared.source())?
-            .into_iter()
-            .find(|field| field.name.as_ref() == field_name)?
-            .type_node
+        let fields = go_struct_literal_fields(structure, self.prepared.source())?;
+        go_struct_field_type_node(
+            fields
+                .iter()
+                .map(|field| (field.name.as_ref(), field.type_node)),
+            field_name,
+        )
     }
 
     fn expression_storage_kind(&self, node: Node<'tree>, byte: usize) -> Option<GoStorageKind> {
@@ -7451,54 +7441,47 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     }
 
     fn expression_index_value_copy(&self, node: Node<'tree>, byte: usize) -> MemoryValueCopy {
-        let mut node = node;
-        loop {
-            let source_node = go_index_value_expression_source(
-                node,
-                |node| {
-                    let unwrapped = transparent_parenthesized_expression(node);
-                    (unwrapped.id() != node.id()).then_some(unwrapped)
-                },
-                |node| {
-                    node_text(self.prepared.source(), node)
-                        .and_then(|name| self.binding_value(name, byte))
-                },
-                |call, _use_byte| {
-                    matches!(
-                        self.builtin_make_allocation_kind(call),
-                        Some(AllocationKind::Slice | AllocationKind::Array)
-                    )
-                    .then(|| all_call_arguments(call).first().copied())
-                    .flatten()
-                },
-                |call| self.builtin_append_source(call),
-            );
-            match source_node {
-                Some(GoIndexValueExpressionSource::Binding(value)) => {
-                    if let Some(copy) = self.index_value_copies.get(&value).copied() {
-                        return copy;
-                    }
-                    let Some(type_node) = self.value_type_nodes.get(&value).copied() else {
-                        return MemoryValueCopy::Unknown;
-                    };
-                    return go_index_value_copy_from_type(
-                        type_node,
-                        self.prepared.source(),
-                        self.named_type_definitions,
-                        byte,
-                    );
+        match go_index_value_expression_source(
+            node,
+            |node| {
+                let unwrapped = transparent_parenthesized_expression(node);
+                (unwrapped.id() != node.id()).then_some(unwrapped)
+            },
+            |node| {
+                node_text(self.prepared.source(), node)
+                    .and_then(|name| self.binding_value(name, byte))
+            },
+            |call, _use_byte| {
+                matches!(
+                    self.builtin_make_allocation_kind(call),
+                    Some(AllocationKind::Slice | AllocationKind::Array)
+                )
+                .then(|| all_call_arguments(call).first().copied())
+                .flatten()
+            },
+            |call| self.builtin_append_source(call),
+        ) {
+            Some(GoIndexValueExpressionSource::Binding(value)) => {
+                if let Some(copy) = self.index_value_copies.get(&value).copied() {
+                    return copy;
                 }
-                Some(GoIndexValueExpressionSource::Type(type_node)) => {
-                    return go_index_value_copy_from_type(
-                        type_node,
-                        self.prepared.source(),
-                        self.named_type_definitions,
-                        byte,
-                    );
-                }
-                Some(GoIndexValueExpressionSource::Forward(next)) => node = next,
-                None => return MemoryValueCopy::Unknown,
+                let Some(type_node) = self.value_type_nodes.get(&value).copied() else {
+                    return MemoryValueCopy::Unknown;
+                };
+                go_index_value_copy_from_type(
+                    type_node,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    byte,
+                )
             }
+            Some(GoIndexValueExpressionSource::Type(type_node)) => go_index_value_copy_from_type(
+                type_node,
+                self.prepared.source(),
+                self.named_type_definitions,
+                byte,
+            ),
+            None => MemoryValueCopy::Unknown,
         }
     }
 
@@ -7507,40 +7490,35 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         node: Node<'tree>,
         byte: usize,
     ) -> Option<GoTypeIdentity> {
-        let mut node = node;
-        loop {
-            let source_node = go_index_value_expression_source(
-                node,
-                |node| {
-                    let unwrapped = transparent_parenthesized_expression(node);
-                    (unwrapped.id() != node.id()).then_some(unwrapped)
-                },
-                |node| {
-                    node_text(self.prepared.source(), node)
-                        .and_then(|name| self.binding_value(name, byte))
-                },
-                |call, _use_byte| {
-                    matches!(
-                        self.builtin_make_allocation_kind(call),
-                        Some(AllocationKind::Slice | AllocationKind::Array)
-                    )
-                    .then(|| all_call_arguments(call).first().copied())
-                    .flatten()
-                },
-                |call| self.builtin_append_source(call),
-            )?;
-            match source_node {
-                GoIndexValueExpressionSource::Binding(value) => {
-                    if let Some(identity) = self.index_value_types.get(&value).cloned() {
-                        return Some(identity);
-                    }
-                    let type_node = self.value_type_nodes.get(&value).copied()?;
-                    return self.index_value_type_from_type(type_node);
+        match go_index_value_expression_source(
+            node,
+            |node| {
+                let unwrapped = transparent_parenthesized_expression(node);
+                (unwrapped.id() != node.id()).then_some(unwrapped)
+            },
+            |node| {
+                node_text(self.prepared.source(), node)
+                    .and_then(|name| self.binding_value(name, byte))
+            },
+            |call, _use_byte| {
+                matches!(
+                    self.builtin_make_allocation_kind(call),
+                    Some(AllocationKind::Slice | AllocationKind::Array)
+                )
+                .then(|| all_call_arguments(call).first().copied())
+                .flatten()
+            },
+            |call| self.builtin_append_source(call),
+        )? {
+            GoIndexValueExpressionSource::Binding(value) => {
+                if let Some(identity) = self.index_value_types.get(&value).cloned() {
+                    return Some(identity);
                 }
-                GoIndexValueExpressionSource::Type(type_node) => {
-                    return self.index_value_type_from_type(type_node);
-                }
-                GoIndexValueExpressionSource::Forward(next) => node = next,
+                let type_node = self.value_type_nodes.get(&value).copied()?;
+                self.index_value_type_from_type(type_node)
+            }
+            GoIndexValueExpressionSource::Type(type_node) => {
+                self.index_value_type_from_type(type_node)
             }
         }
     }
@@ -8048,7 +8026,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
             &self.constant_index_values,
             &mut self.expression_values,
-            index,
+            &index,
             node.id(),
         ) {
             return Ok(Some((value, index)));
@@ -8275,21 +8253,23 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         &self,
         target: Node<'tree>,
     ) -> Option<GoNamedTypeDefinition<'tree>> {
+        let name = self.conversion_target_identifier(target)?;
+        self.visible_named_type_definition(name, target.start_byte())
+    }
+
+    fn conversion_target_identifier(&self, target: Node<'tree>) -> Option<&str> {
         if target.kind() != "identifier" {
             return None;
         }
         let name = nonempty_node_text(self.prepared.source(), target)?;
-        if go_type_parameter_constraint(
+        go_type_parameter_constraint(
             target,
             name,
             self.prepared.source(),
             self.named_type_definitions,
         )
-        .is_some()
-        {
-            return None;
-        }
-        self.visible_named_type_definition(name, target.start_byte())
+        .is_none()
+        .then_some(name)
     }
 
     /// The type identity a conversion establishes for its result.
@@ -8297,22 +8277,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         if target.kind() != "identifier" {
             return self.type_identity(target);
         }
-        let name = nonempty_node_text(self.prepared.source(), target)?;
-        if go_type_parameter_constraint(
-            target,
-            name,
-            self.prepared.source(),
-            self.named_type_definitions,
-        )
-        .is_some()
-        {
-            return None;
-        }
+        let name = self.conversion_target_identifier(target)?;
         Some(GoTypeIdentity {
             pointer_depth: 0,
             name: name.into(),
             declaration: self
-                .conversion_target_definition(target)
+                .visible_named_type_definition(name, target.start_byte())
                 .map(|definition| definition.declaration),
         })
     }
@@ -16296,15 +16266,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             },
             |region| region.call,
         )? {
-            let call_next = if step.next.kind == ControlEdgeKind::Normal {
-                step.next
-            } else {
-                let relay = self
-                    .session
-                    .add_node_point(builder, step.region.call, Vec::new())?;
-                self.session.add_target_edge(builder, relay, step.next)?;
-                EdgeTarget::normal(relay)
-            };
+            let call_next =
+                self.session
+                    .cleanup_next_target(builder, step.region.call, step.next)?;
             stack.push(Work::DeferredCall {
                 node: step.region.call,
                 entry: step.entry,
@@ -16688,11 +16652,7 @@ fn is_direct_call_function(node: Node<'_>) -> bool {
 use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as direct_child_kind;
 
 fn go_boolean_operator_kind(node: Node<'_>) -> Option<&'static str> {
-    match node.child_by_field_name("operator")?.kind() {
-        "&&" => Some("&&"),
-        "||" => Some("||"),
-        _ => None,
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::short_circuit_operator(node)
 }
 
 /// Whether a Go `for` clause is known to enter its body before its first
@@ -17026,6 +16986,13 @@ struct GoStructLiteralField<'tree> {
     name: Box<str>,
     anchor: SourceAnchor,
     type_node: Option<Node<'tree>>,
+}
+
+fn go_struct_field_type_node<'name, 'tree>(
+    fields: impl IntoIterator<Item = (&'name str, Option<Node<'tree>>)>,
+    field_name: &str,
+) -> Option<Node<'tree>> {
+    fields.into_iter().find(|(name, _)| *name == field_name)?.1
 }
 
 fn go_struct_literal_fields<'tree>(
@@ -17400,33 +17367,16 @@ mod semantic_test_support;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use crate::analyzer::go::semantic::*;
 
-    use brokk_bifrost_core::analyzer::model::LanguageDialect;
-
     use brokk_bifrost_semantic::analyzer::semantic::service::ProgramSemanticsLowerer;
-
-    use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceOrigin;
-
-    use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
-
-    use brokk_bifrost_core::text_utils::compute_line_starts;
 
     fn prepared_fixture(source: &str) -> PreparedSyntaxTree {
         let tree = brokk_bifrost_analysis::test_support::parse_fixture_tree(
             source,
             tree_sitter_go::LANGUAGE.into(),
         );
-        PreparedSyntaxTree::new(
-            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
-            tree,
-            compute_line_starts(source),
-            LanguageDialect::Standard(Language::Go),
-            PreparedSourceOrigin::Disk,
-            None,
-        )
+        crate::analyzer::prepared_go_test_syntax(source, tree)
     }
 
     fn lower_fixture_with_budget(

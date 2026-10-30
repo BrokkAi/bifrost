@@ -49,7 +49,9 @@ use brokk_bifrost_core::analyzer::tree_walk::node_range;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 use brokk_bifrost_core::path_utils::rel_path_string;
-use brokk_bifrost_go::declarations::{go_embedded_type_nodes, go_structured_type_identity};
+use brokk_bifrost_go::declarations::{
+    go_embedded_type_nodes, go_structured_type_identity, is_predeclared_go_basic_type,
+};
 use brokk_bifrost_go::references::go_name_shadowed_at_with_scope;
 use tree_sitter::Node;
 
@@ -566,7 +568,10 @@ fn native_binding_static_type<'tree, 'go>(
         }
         _ => None,
     };
-    if let Some(type_node) = explicit {
+    if let Some(type_node) = explicit
+        && explicit_type_proof(analyzer, file, syntax.source(), root, type_node)
+            != BindingProof::Open
+    {
         return BoundedResolution::Complete {
             value: Some(SelectedBindingEvidence::Syntax(type_node)),
             work,
@@ -626,23 +631,109 @@ fn native_binding_static_type<'tree, 'go>(
         },
         ..query
     };
+    let mut receiver = None;
     let types = request.resolve_declared_type_with_evidence(remaining, identity, |answer| {
         selected = native_declared_type_proof(answer);
+        if selected == BindingProof::Open {
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeTypes;
+            if let Ok(Some(ty)) =
+                brokk_bifrost_analysis::analyzer::native_points::selected_value_type_for_barrier(
+                    &answer.answer,
+                    answer.query_result_slot,
+                )
+                && let SelectedNativeTypes::Ready {
+                    external_owners, ..
+                } = &answer.value_types
+                && !external_owners
+                    .iter()
+                    .any(|(identity, _)| *identity == ty.identity())
+            {
+                receiver = Some(ty);
+            }
+        }
     });
     match types {
         BoundedResolution::Complete {
             value,
             work: type_work,
         } => {
-            let proof = if value.status == TypeLookupStatus::Resolved {
+            let mut proof = if value.status == TypeLookupStatus::Resolved {
                 selected
             } else {
                 BindingProof::Open
             };
+            let mut total_work = super::native_points::go_add_resolution_work(work, type_work);
+            if proof == BindingProof::Open
+                && let Some(receiver) = receiver
+            {
+                let member_query = BoundedReceiverQuery {
+                    budget: ReceiverAnalysisBudget {
+                        max_scope_nodes: query
+                            .budget
+                            .max_scope_nodes
+                            .saturating_sub(total_work.scope_nodes),
+                        max_summary_expansions: query
+                            .budget
+                            .max_summary_expansions
+                            .saturating_sub(total_work.summary_expansions),
+                        max_resolution_rounds: query
+                            .budget
+                            .max_resolution_rounds
+                            .saturating_sub(total_work.resolution_rounds),
+                        ..query.budget
+                    },
+                    ..query
+                };
+                match super::model_receiver::go_selected_static_type_member(
+                    request,
+                    member_query,
+                    receiver,
+                    "Error",
+                    false,
+                ) {
+                    Ok(BoundedResolution::Complete {
+                        value: Some(member),
+                        work: member_work,
+                    }) => {
+                        proof = native_error_member_proof(&member);
+                        total_work =
+                            super::native_points::go_add_resolution_work(total_work, member_work);
+                    }
+                    Ok(BoundedResolution::Complete {
+                        work: member_work, ..
+                    }) => {
+                        total_work =
+                            super::native_points::go_add_resolution_work(total_work, member_work)
+                    }
+                    Ok(BoundedResolution::Exceeded {
+                        limit,
+                        work: member_work,
+                    }) => {
+                        return BoundedResolution::Exceeded {
+                            limit,
+                            work: super::native_points::go_add_resolution_work(
+                                total_work,
+                                member_work,
+                            ),
+                        };
+                    }
+                    Ok(BoundedResolution::Cancelled { work: member_work }) => {
+                        return BoundedResolution::Cancelled {
+                            work: super::native_points::go_add_resolution_work(
+                                total_work,
+                                member_work,
+                            ),
+                        };
+                    }
+                    Err(error) => {
+                        analyzer.record_query_failure(error);
+                    }
+                }
+            }
             evidence.types.insert(identity, proof);
             BoundedResolution::Complete {
                 value: Some(SelectedBindingEvidence::Native(proof)),
-                work: super::native_points::go_add_resolution_work(work, type_work),
+                work: total_work,
             }
         }
         BoundedResolution::Exceeded {
@@ -678,8 +769,8 @@ fn binding_proof<'go>(
     // supplies unnamed channel/function shapes and struct embedding: native
     // identities omit whether an anonymous struct embeds error. Inferred types
     // always use the selected declaration slot, never an assignment's value.
-    // Named types and interfaces need a method-set proof; missing or bounded
-    // type inference also cannot exclude an error value.
+    // Named types and interfaces use native static member selection. A bounded
+    // type or promotion frontier cannot exclude an error value.
     match native_binding_static_type(analyzer, go, file, syntax, use_node, evidence) {
         BoundedResolution::Complete {
             value: Some(SelectedBindingEvidence::Native(proof)),
@@ -806,28 +897,7 @@ fn predeclared_basic_type_name(identity: &StructuredTypeIdentity) -> Option<&str
 }
 
 fn is_predeclared_basic_name(name: &str) -> bool {
-    matches!(
-        name,
-        "string"
-            | "bool"
-            | "int"
-            | "int8"
-            | "int16"
-            | "int32"
-            | "int64"
-            | "uint"
-            | "uint8"
-            | "uint16"
-            | "uint32"
-            | "uint64"
-            | "uintptr"
-            | "byte"
-            | "rune"
-            | "float32"
-            | "float64"
-            | "complex64"
-            | "complex128"
-    )
+    is_predeclared_go_basic_type(name)
 }
 
 fn native_declared_type_proof(
@@ -857,6 +927,16 @@ fn native_declared_type_proof(
         // and basic/unnamed shapes prove their verdict without the fallback.
         return BindingProof::Error;
     }
+    // Carrier shape follows underlying types for value predicates. A named
+    // slice, function or scalar can still own Error, so its source nominal
+    // identity must reach static membership before any non-handler decision.
+    if let SelectedNativeTypes::Ready { nominal, .. } = &answer.value_types
+        && nominal
+            .iter()
+            .any(|(identity, _)| *identity == selected.identity())
+    {
+        return BindingProof::Open;
+    }
     match go_observed_value_type(answer) {
         ObservedCarrierType::Type(ObservedValueType::NonNamed(
             ValueShape::Array | ValueShape::Slice | ValueShape::Map | ValueShape::Function,
@@ -867,6 +947,52 @@ fn native_declared_type_proof(
             BindingProof::Other
         }
         _ => BindingProof::Open,
+    }
+}
+
+fn native_error_member_proof(
+    answer: &brokk_bifrost_analysis::analyzer::store::resolution_operation::go_receiver_anchor::GoStaticTypeMember,
+) -> BindingProof {
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_receiver_anchor::GoStaticMembership;
+    use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+    match answer.membership() {
+        GoStaticMembership::Open => BindingProof::Open,
+        // Native literal-alias and builtin-interface inventories remain open
+        // until #7990; absence in an interface cannot prove a non-handler.
+        GoStaticMembership::Excluded if answer.receiver_is_interface => BindingProof::Open,
+        GoStaticMembership::Excluded => BindingProof::Other,
+        GoStaticMembership::Present => {
+            let member = &answer.candidates[0];
+            let Some(signature) = &member.signature else {
+                return BindingProof::Open;
+            };
+            if !member.signature_types_complete {
+                return BindingProof::Open;
+            }
+            let matches = signature.parameters().is_empty()
+                && signature.result_types().len() == 1
+                && member
+                    .signature_types
+                    .iter()
+                    .find(|state| state.slot() == signature.result_types()[0].slot())
+                    .is_some_and(|state| match state.possible_values() {
+                        [value] if value.ty().indirection() == 0 => {
+                            answer.intrinsic_types.iter().any(|descriptor| {
+                                descriptor.identity() == value.ty().identity()
+                                    && descriptor.kind() == IntrinsicTypeKind::Primitive
+                                    && descriptor.spelling() == "string"
+                            })
+                        }
+                        _ => false,
+                    });
+            if matches {
+                BindingProof::Error
+            } else if answer.receiver_is_interface {
+                BindingProof::Open
+            } else {
+                BindingProof::Other
+            }
+        }
     }
 }
 
@@ -1301,14 +1427,7 @@ fn expression_at_ordinal(node: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
 }
 
 fn alternative_body(if_node: Node<'_>) -> Option<Node<'_>> {
-    let alternative = if_node.child_by_field_name("alternative")?;
-    if alternative.kind() == "else_clause" {
-        alternative
-            .child_by_field_name("body")
-            .or_else(|| alternative.named_child(0))
-    } else {
-        Some(alternative)
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::if_alternative_body(if_node)
 }
 
 fn bare_expression(mut node: Node<'_>) -> Node<'_> {
@@ -1357,22 +1476,12 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::model::Language;
 
-    use brokk_bifrost_core::analyzer::model::LanguageDialect;
-
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
-    use brokk_bifrost_core::analyzer::prepared_syntax::{
-        PreparedSourceOrigin, PreparedSyntaxSource,
-    };
-    use std::sync::Arc;
 
     fn prepared(source: &str) -> PreparedSyntaxTree {
-        PreparedSyntaxTree::new(
-            PreparedSyntaxSource::Exact(Arc::from(source)),
+        crate::analyzer::prepared_go_test_syntax(
+            source,
             brokk_bifrost_go::parse::parse_go(source).expect("Go source parses"),
-            brokk_bifrost_core::text_utils::compute_line_starts(source),
-            LanguageDialect::Standard(Language::Go),
-            PreparedSourceOrigin::Disk,
-            None,
         )
     }
 
@@ -1487,23 +1596,17 @@ func work(err error) {
 type error struct{}
 func work(err error) { if err != nil {} }
 "#;
-        assert_eq!(states(shadowed), vec![HandlerBodyState::Empty]);
-        assert!(
-            branches(shadowed)
-                .iter()
-                .all(|branch| branch.identity == HandlerIdentityProof::Open)
-        );
+        // The complete local method inventory proves this named type is not
+        // an error value; there is no handler candidate to leave open.
+        assert!(branches(shadowed).is_empty());
 
         let concrete = r#"package p
 type ConcreteError struct{}
 func work(err ConcreteError) { if err != nil {} }
 "#;
-        assert_eq!(states(concrete), vec![HandlerBodyState::Empty]);
-        assert!(
-            branches(concrete)
-                .iter()
-                .all(|branch| branch.identity == HandlerIdentityProof::Open)
-        );
+        // The complete local method inventory proves this named type is not
+        // an error value; there is no handler candidate to leave open.
+        assert!(branches(concrete).is_empty());
 
         let unresolved = r#"package p
 func work() { if err := missing(); err != nil {} }

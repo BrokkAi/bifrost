@@ -97,7 +97,9 @@ pub(crate) struct JavaResolutionSession<'a> {
     /// member lookup, keyed by its `type_parameter` declaration site. `None`
     /// marks an expansion still in progress, which is the cycle a bound that
     /// names its own parameter would otherwise re-enter forever (#2048).
-    type_parameter_bounds: RefCell<HashMap<JavaTypeSpelling, Option<Vec<JavaReceiverType>>>>,
+    type_parameter_bounds: brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo<
+        RefCell<HashMap<JavaTypeSpelling, Option<Vec<JavaReceiverType>>>>,
+    >,
     receiver_depth: Cell<usize>,
 }
 
@@ -112,7 +114,8 @@ impl<'a> JavaResolutionSession<'a> {
             budget,
             cancellation: cancellation.cloned(),
             state: RefCell::new(JavaResolutionState::default()),
-            type_parameter_bounds: RefCell::new(HashMap::default()),
+            type_parameter_bounds:
+                brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo::default(),
             receiver_depth: Cell::new(0),
         }
     }
@@ -1774,6 +1777,8 @@ fn resolve_java_constructor_call(
         let proof =
             ExactExternalCallProof::java_external_constructor(&owner, &member, parameter_count);
         let evidence = CallEvidence {
+            native_resolution: None,
+            model_member_selection: None,
             call_application: proof.call_application(),
             dispatch_extensibility: proof.dispatch_extensibility(),
             exact_external_call: Some(proof),
@@ -2552,6 +2557,8 @@ fn java_external_call_evidence(
         member.to_owned(),
     );
     CallEvidence {
+        native_resolution: None,
+        model_member_selection: None,
         call_application: proof.call_application(),
         dispatch_extensibility: proof.dispatch_extensibility(),
         exact_external_call: Some(proof),
@@ -3963,33 +3970,33 @@ fn java_type_parameter_types(
     source: &str,
     parameter: Node<'_>,
 ) -> Vec<JavaReceiverType> {
-    let key = JavaTypeSpelling::new(file, parameter);
-    let recorded = session
-        .type_parameter_bounds
-        .borrow()
-        .get(&key)
-        .cloned()
-        .map(|expanded| expanded.unwrap_or_default());
-    if let Some(expanded) = recorded {
-        return expanded;
-    }
-    session
-        .type_parameter_bounds
-        .borrow_mut()
-        .insert(key.clone(), None);
-    let mut expanded = Vec::new();
-    for bound in brokk_bifrost_jvm::java::graph_support::java_type_parameter_bounds(parameter) {
-        for candidate in
-            java_receiver_types_in_tree(analyzer, token, java, session, file, source, bound)
-        {
-            java_push_receiver_type(&mut expanded, candidate);
-        }
-    }
-    session
-        .type_parameter_bounds
-        .borrow_mut()
-        .insert(key, Some(expanded.clone()));
-    expanded
+    session.type_parameter_bounds.read(
+        &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer),
+        |cache| {
+            let key = JavaTypeSpelling::new(file, parameter);
+            let recorded = cache
+                .borrow()
+                .get(&key)
+                .cloned()
+                .map(|expanded| expanded.unwrap_or_default());
+            if let Some(expanded) = recorded {
+                return expanded;
+            }
+            cache.borrow_mut().insert(key.clone(), None);
+            let mut expanded = Vec::new();
+            for bound in
+                brokk_bifrost_jvm::java::graph_support::java_type_parameter_bounds(parameter)
+            {
+                for candidate in
+                    java_receiver_types_in_tree(analyzer, token, java, session, file, source, bound)
+                {
+                    java_push_receiver_type(&mut expanded, candidate);
+                }
+            }
+            cache.borrow_mut().insert(key, Some(expanded.clone()));
+            expanded
+        },
+    )
 }
 
 enum CapturedTypeFrame {
@@ -6879,11 +6886,20 @@ pub(crate) fn resolve_definition_dispatch<'a>(
 pub(crate) fn trial_definition(
     query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
 ) -> Option<DefinitionResolution> {
+    trial_definition_in_batch(query, None)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn trial_definition_in_batch(
+    query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    batch: Option<&brokk_bifrost_analysis::analyzer::native_points::NativePointBatch>,
+) -> Option<DefinitionResolution> {
     std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA")?;
     let language = Language::Java;
     Some(
-        match crate::analyzer::java::native_points::resolve_java_definition_with_evidence_bounded(
+        match crate::analyzer::java::native_points::resolve_java_definition_with_evidence_in_batch(
             query,
+            batch,
             || {},
         ) {
             BoundedResolution::Complete { value, .. } => DefinitionResolution {

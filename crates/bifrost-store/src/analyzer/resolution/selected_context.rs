@@ -929,6 +929,10 @@ pub struct SelectedContextIdentities {
     /// closed by complete selected package/type rows. This set is request-local
     /// and each entry names one exact source import site.
     java_import_route_gap_reasons: Arc<std::sync::Mutex<BTreeSet<SemanticId>>>,
+    /// Exact external-provider boundaries and the request-local type identity
+    /// they establish. The language tag keeps inventory classification separate.
+    jvm_external_type_identities:
+        Arc<std::sync::Mutex<HashMap<SemanticId, (ExternalOwnerLanguage, SemanticId)>>>,
     /// Bare TypeIdentity references whose unindexed implicit roots establish
     /// the same external type identity despite a complete-empty name answer.
     jvm_external_type_identities_by_reference:
@@ -971,10 +975,6 @@ enum JvmExternalTypeIdentityClaim {
 /// still copy their contents.
 #[derive(Clone, Debug, Default)]
 struct SelectedJvmContextIdentities {
-    /// Exact unindexed JVM implicit-provider boundaries and the external type
-    /// identity they establish for one spelling. These maps are bounded by the
-    /// implicit-root gaps compiled into this selected context.
-    jvm_external_type_identities: Arc<std::sync::Mutex<HashMap<SemanticId, SemanticId>>>,
     jvm_supertype_names: Arc<std::sync::Mutex<HashMap<SemanticId, Arc<str>>>>,
     jvm_external_members:
         Arc<std::sync::Mutex<HashMap<SemanticId, (super::ExternalOwnerIdentity, u32)>>>,
@@ -1072,7 +1072,6 @@ impl SelectedContextIdentities {
                 .expect("the selected context's Java import reason set is not poisoned")
                 .is_empty()
             && self
-                .jvm
                 .jvm_external_type_identities
                 .lock()
                 .expect("the selected context's JVM external type identities are not poisoned")
@@ -1147,6 +1146,12 @@ impl SelectedContextIdentities {
                     .expect("the selected context's Java import reason set is not poisoned")
                     .clone(),
             )),
+            jvm_external_type_identities: Arc::new(std::sync::Mutex::new(
+                self.jvm_external_type_identities
+                    .lock()
+                    .expect("the selected context's JVM external type identities are not poisoned")
+                    .clone(),
+            )),
             jvm_external_type_identities_by_reference: Arc::new(std::sync::Mutex::new(
                 self.jvm_external_type_identities_by_reference
                     .lock()
@@ -1174,15 +1179,6 @@ impl SelectedContextIdentities {
                     .clone(),
             )),
             jvm: Box::new(SelectedJvmContextIdentities {
-                jvm_external_type_identities: Arc::new(std::sync::Mutex::new(
-                    self.jvm
-                        .jvm_external_type_identities
-                        .lock()
-                        .expect(
-                            "the selected context's JVM external type identities are not poisoned",
-                        )
-                        .clone(),
-                )),
                 jvm_supertype_names: Arc::new(std::sync::Mutex::new(
                     self.jvm
                         .jvm_supertype_names
@@ -1266,11 +1262,9 @@ impl SelectedContextIdentities {
             .expect("the cached context's Java import reason set is not poisoned")
             .clone();
         *self
-            .jvm
             .jvm_external_type_identities
             .lock()
             .expect("the selected JVM external type identities are not poisoned") = other
-            .jvm
             .jvm_external_type_identities
             .lock()
             .expect("the cached JVM external type identities are not poisoned")
@@ -1338,8 +1332,8 @@ impl SelectedContextIdentities {
                 &other.java_import_route_gap_reasons,
             )
             && Arc::ptr_eq(
-                &self.jvm.jvm_external_type_identities,
-                &other.jvm.jvm_external_type_identities,
+                &self.jvm_external_type_identities,
+                &other.jvm_external_type_identities,
             )
             && Arc::ptr_eq(
                 &self.jvm_external_type_identities_by_reference,
@@ -1416,7 +1410,8 @@ impl SelectedContextIdentities {
 
     /// The stable name and evidence of a reason this context minted with
     /// [`Self::named_semantic`], or `None` for any other identity.
-    pub(crate) fn named_reason(&self, semantic: SemanticId) -> Option<NamedReason> {
+    #[doc(hidden)]
+    pub fn named_reason(&self, semantic: SemanticId) -> Option<(&'static str, Arc<str>)> {
         if let Some(name) = self.jvm_supertype_name(semantic) {
             return Some(("UnsupportedHierarchyTraversal", name));
         }
@@ -1612,6 +1607,17 @@ impl SelectedContextIdentities {
             .map(|(_, owner)| owner.clone())
     }
 
+    pub(crate) fn external_owner_language(
+        &self,
+        semantic: SemanticId,
+    ) -> Option<ExternalOwnerLanguage> {
+        self.jvm_external_owners
+            .lock()
+            .expect("external owner coordinates are not poisoned")
+            .get(&semantic)
+            .map(|(language, _)| *language)
+    }
+
     pub(crate) fn record_external_hierarchy_reference(
         &self,
         reference: SemanticId,
@@ -1695,18 +1701,15 @@ impl SelectedContextIdentities {
             identity.shared_name_id().is_some(),
             "an external provider type has one request-shared identity"
         );
-        if language == ExternalOwnerLanguage::Jvm {
-            let previous = self
-                .jvm
-                .jvm_external_type_identities
-                .lock()
-                .expect("the selected JVM external type identities are not poisoned")
-                .insert(source_boundary, identity);
-            assert!(
-                previous.is_none_or(|previous| previous == identity),
-                "one implicit-provider boundary names one external type identity"
-            );
-        }
+        let previous = self
+            .jvm_external_type_identities
+            .lock()
+            .expect("the selected external type identities are not poisoned")
+            .insert(source_boundary, (language, identity));
+        assert!(
+            previous.is_none_or(|previous| previous == (language, identity)),
+            "one provider boundary names one tagged external type identity"
+        );
         self.record_provider_type_reference(language, source_reference, identity);
         self.record_external_provider_type_boundary(language, identity, enumeration_boundary);
     }
@@ -1807,16 +1810,40 @@ impl SelectedContextIdentities {
         );
     }
 
+    pub(crate) fn external_provider_type_identity(
+        &self,
+        source_boundary: SemanticId,
+    ) -> Option<(ExternalOwnerLanguage, SemanticId)> {
+        self.jvm_external_type_identities
+            .lock()
+            .expect("the selected external type identities are not poisoned")
+            .get(&source_boundary)
+            .copied()
+    }
+
     pub(crate) fn jvm_external_provider_type_identity(
         &self,
         source_boundary: SemanticId,
     ) -> Option<SemanticId> {
-        self.jvm
-            .jvm_external_type_identities
+        self.external_provider_type_identity(source_boundary)
+            .filter(|(language, _)| *language == ExternalOwnerLanguage::Jvm)
+            .map(|(_, identity)| identity)
+    }
+
+    pub(crate) fn external_provider_type_identity_for_reference(
+        &self,
+        source_reference: SemanticId,
+    ) -> Option<(ExternalOwnerLanguage, SemanticId)> {
+        self.jvm_external_type_identities_by_reference
             .lock()
-            .expect("the selected JVM external type identities are not poisoned")
-            .get(&source_boundary)
-            .copied()
+            .expect("the selected external reference identities are not poisoned")
+            .get(&source_reference)
+            .and_then(|claim| match claim {
+                JvmExternalTypeIdentityClaim::Provider(language, identity) => {
+                    Some((*language, *identity))
+                }
+                JvmExternalTypeIdentityClaim::ImplicitFallback(_) => None,
+            })
     }
 
     pub(crate) fn jvm_external_provider_type_identity_for_reference(
@@ -1824,17 +1851,9 @@ impl SelectedContextIdentities {
         language: ExternalOwnerLanguage,
         source_reference: SemanticId,
     ) -> Option<SemanticId> {
-        self.jvm_external_type_identities_by_reference
-            .lock()
-            .expect("the selected JVM external reference identities are not poisoned")
-            .get(&source_reference)
-            .and_then(|claim| match claim {
-                JvmExternalTypeIdentityClaim::Provider(tag, identity) if *tag == language => {
-                    Some(*identity)
-                }
-                JvmExternalTypeIdentityClaim::Provider(_, _) => None,
-                JvmExternalTypeIdentityClaim::ImplicitFallback(_) => None,
-            })
+        self.external_provider_type_identity_for_reference(source_reference)
+            .filter(|(tag, _)| *tag == language)
+            .map(|(_, identity)| identity)
     }
 
     pub(crate) fn jvm_implicit_nominal_fallback(
@@ -1894,6 +1913,7 @@ impl SelectedContextIdentities {
             rust_prelude_references,
             external_type_import_paths,
             java_import_route_gap_reasons,
+            jvm_external_type_identities,
             jvm_external_type_identities_by_reference,
             jvm_external_type_boundaries,
             jvm_external_owners,
@@ -1901,7 +1921,6 @@ impl SelectedContextIdentities {
             jvm,
         } = self;
         let SelectedJvmContextIdentities {
-            jvm_external_type_identities,
             jvm_supertype_names,
             jvm_external_members,
         } = &**jvm;
@@ -1915,6 +1934,10 @@ impl SelectedContextIdentities {
                 );
             }};
         }
+        refuse_any!(
+            jvm_external_type_identities,
+            "external provider type identities"
+        );
         refuse_any!(rust_prelude_references, "Rust prelude references");
         refuse_any!(external_type_import_paths, "external type import paths");
         refuse_any!(java_import_route_gap_reasons, "Java import route reasons");
@@ -1925,7 +1948,6 @@ impl SelectedContextIdentities {
         refuse_any!(jvm_external_type_boundaries, "external type boundaries");
         refuse_any!(jvm_external_owners, "external owners");
         refuse_any!(model_members, "model member tokens");
-        refuse_any!(jvm_external_type_identities, "JVM external type identities");
         refuse_any!(jvm_supertype_names, "JVM supertype names");
         refuse_any!(jvm_external_members, "JVM external members");
     }
@@ -1942,6 +1964,16 @@ impl SelectedContextIdentities {
         hash.field("pack-digest", member.provider.pack_digest.as_bytes());
         hash.field("symbol-id", member.symbol_id.as_bytes());
         let semantic = SemanticId::shared_name(names.intern(hash.finish()));
+        self.record_model_member_identity(semantic, member);
+        semantic
+    }
+
+    /// Register an already-minted query token without changing its identity domain.
+    pub(crate) fn record_model_member_identity(
+        &self,
+        semantic: SemanticId,
+        member: &crate::analyzer::semantic_model::ModelSymbolRef,
+    ) {
         let old = self
             .model_members
             .lock()
@@ -1951,7 +1983,6 @@ impl SelectedContextIdentities {
             old.is_none_or(|old| old == *member),
             "one model member token has one provider coordinate"
         );
-        semantic
     }
 
     pub(crate) fn model_member_identity(
@@ -5608,7 +5639,7 @@ impl SelectedContextIdentities {
         });
         let jvm = &self.jvm;
         heap.add(std::mem::size_of_val(&**jvm));
-        heap.arc(&jvm.jvm_external_type_identities, |values, heap| {
+        heap.arc(&self.jvm_external_type_identities, |values, heap| {
             heap.map(&values.lock().expect("external types are not poisoned"))
         });
         heap.arc(

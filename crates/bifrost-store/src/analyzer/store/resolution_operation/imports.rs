@@ -1,13 +1,25 @@
 //! Indexed, blob-local import syntax. Results live only for the current request.
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
+use std::hash::Hash;
+use std::sync::Arc;
 
-use super::SelectedResolutionMountOrdinal;
+use super::super::selected_read_memo::ExactReadMemo;
+use super::{
+    FactPageVisitor, ReadySelectedResolution, SelectedResolutionMountOrdinal,
+    SelectedResolutionOperation,
+};
 use crate::CancellationToken;
+use crate::analyzer::resolution::ResolutionQuery;
 use crate::analyzer::resolution::SemanticId;
+use crate::analyzer::resolution::{
+    BatchResolutionFragmentSource, BindingFragmentId, BindingNodeId, CandidatePathIdentity,
+    ResolutionLookupSemanticRecipe, SelectedRootPathHalf, visit_selected_root_import_half_pages,
+};
 use crate::analyzer::store::{Result, StoreError};
+use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionImportSelectorKind, ResolutionSiteId,
+    ResolutionImportSelectorKind, ResolutionRootImportAnchor, ResolutionSiteId, ResolutionSiteKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +83,355 @@ pub struct ImportTokenMetadata {
     pub(super) selector: Option<SelectedImportSelector>,
     pub(super) route: Option<SelectedImportRoute>,
     pub(super) identity_digest: Option<[u8; 32]>,
+}
+
+// Scope and both stage epochs cover every mutable SQL input. The source mount
+// keeps language-specific rows apart; entries live only for this operation.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct ImportTokenKey {
+    source: SelectedResolutionMountOrdinal,
+    blob: i64,
+    token: SemanticId,
+    scope: [u8; 32],
+    stage_epoch: (u64, u64),
+}
+
+pub(super) type ImportTokenMemo = ExactReadMemo<ImportTokenKey, Arc<ImportTokenMetadata>>;
+
+impl SelectedResolutionOperation<'_, '_> {
+    #[doc(hidden)]
+    pub fn import_token_metadata(
+        &self,
+        blob: i64,
+        source: SelectedResolutionMountOrdinal,
+        token: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Arc<ImportTokenMetadata>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let key = ImportTokenKey {
+            source,
+            blob,
+            token,
+            scope: self.ready.inventory.scope_identity(),
+            stage_epoch: self.ready.inventory.staged_read_epoch(),
+        };
+        if let Some(metadata) = self.import_token_memo.borrow().get(&key) {
+            return Ok(Some(Arc::clone(metadata)));
+        }
+        let (runtime_key, shared_id) =
+            super::super::resolution_stage::lexical::semantic_cells(token);
+        let metadata = Arc::new(read_import_token_metadata(
+            self.ready.inventory.connection(),
+            blob,
+            token.local_key(),
+            source.get(),
+            runtime_key,
+            shared_id,
+        )?);
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        self.import_token_memo
+            .borrow_mut()
+            .insert(key, Arc::clone(&metadata));
+        Ok(Some(metadata))
+    }
+}
+
+pub(super) struct ImportBinder {
+    pub(super) identity: CandidatePathIdentity,
+    pub(super) scope: BindingNodeId,
+    pub(super) activation: Option<u32>,
+    pub(super) anchor: ResolutionRootImportAnchor,
+    pub(super) head: String,
+    pub(super) bound: Option<String>,
+    pub(super) imported: Option<String>,
+    pub(super) selector: Option<SelectedImportSelector>,
+    pub(super) route: Option<SelectedImportRoute>,
+    pub(super) recipes: Vec<ResolutionLookupSemanticRecipe>,
+    pub(super) half: SelectedRootPathHalf,
+}
+
+pub(super) struct ImportBinderClass {
+    pub(super) named: bool,
+    /// The route the language admits for later precedence reads. `None` means
+    /// the language has no legacy routes.
+    pub(super) route: Option<SelectedImportRoute>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ImportBinding<P> {
+    pub(super) reference: SemanticId,
+    pub(super) token: SemanticId,
+    pub(super) precedence: P,
+}
+
+/// Supplies import metadata and each language's total precedence order, for
+/// example origin rank before depth, or a level-first language's depth first.
+/// The shared join never imposes an order of its own.
+pub(super) trait ImportBindingRules {
+    type Precedence: Copy + Ord;
+
+    fn token_metadata(
+        &self,
+        blob: i64,
+        mount: SelectedResolutionMountOrdinal,
+        token: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<std::sync::Arc<ImportTokenMetadata>>>;
+
+    fn binder_rank(&self, language: Language, metadata: &ImportTokenMetadata) -> Option<u32>;
+
+    fn precedence(&self, depth: u32, rank: u32) -> Self::Precedence;
+}
+
+pub(super) fn sort_import_bindings<P: Copy + Ord>(bindings: &mut Vec<ImportBinding<P>>) {
+    bindings.sort_unstable_by_key(|binding| (binding.reference, binding.precedence, binding.token));
+    bindings.dedup_by_key(|binding| (binding.reference, binding.precedence, binding.token));
+}
+
+pub(super) fn authored_reference_local_path_evidence(
+    ready: &ReadySelectedResolution<'_, '_>,
+    reference: SemanticId,
+    cancellation: &CancellationToken,
+) -> Result<Option<crate::analyzer::resolution::ReferenceLocalPathEvidence>> {
+    let lexical = ready.lexical_source();
+    let Some(seed) = lexical.reference_seed(ResolutionQuery::new(reference), cancellation)? else {
+        return Ok(None);
+    };
+    if !seed
+        .site_metadata()
+        .is_some_and(|metadata| metadata.site_kind() != ResolutionSiteKind::SyntheticReference)
+    {
+        return Ok(None);
+    }
+    lexical.reference_local_path_evidence(reference, cancellation)
+}
+
+/// Pair lookup binders with authored references using producer-side position
+/// and lexical-scope evidence. Activation is a producer-side position: a
+/// reference that starts before it never binds. Scope membership means the
+/// binder scope equals one of the reference's lexical scopes, using the
+/// minimum matching depth. A language with a different activation or scope
+/// rule extends the rules hook rather than adding a mode flag.
+pub(super) fn import_bindings_for_lookup<R: ImportBindingRules>(
+    ready: &ReadySelectedResolution<'_, '_>,
+    rules: &R,
+    mount: SelectedResolutionMountOrdinal,
+    lookup: &ResolutionLookupSemanticRecipe,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<ImportBinding<R::Precedence>>>> {
+    let record = ready.inventory.mount_record_by_ordinal(mount)?;
+    let connection = ready.inventory.connection();
+    let lexical = ready.lexical_source();
+    let names = ready.shared_names();
+    let lookup_semantic = lookup.semantic(&names);
+    let mut binders = Vec::new();
+    let outcome = visit_selected_root_import_half_pages(
+        &ready.context_identities,
+        &lexical,
+        &lexical,
+        Some(&[mount]),
+        cancellation,
+        &mut FactPageVisitor::new(&mut |page| {
+            for half in page {
+                let SelectedRootPathHalf::Import {
+                    token,
+                    demand,
+                    source_scope_head,
+                    activation,
+                    ..
+                } = half
+                else {
+                    continue;
+                };
+                // The half's demand is the lookup bound in the importing
+                // scope, including for wildcard imports. The owner route is
+                // separate; another demand through that wildcard is not a
+                // competing binder for this name or namespace.
+                if *demand != lookup_semantic {
+                    continue;
+                }
+                let Some(metadata) =
+                    rules.token_metadata(record.blob_id(), mount, *token, cancellation)?
+                else {
+                    return Ok(false);
+                };
+                if let Some(rank) = rules.binder_rank(record.semantic_language(), &metadata) {
+                    binders.push((*token, *source_scope_head, *activation, rank));
+                }
+            }
+            Ok(true)
+        }),
+    )?;
+    if outcome.is_cancelled() || cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    binders.sort_unstable();
+    binders.dedup();
+    // SyntheticReference publishes no site kind or authored metadata.
+    // Only published, lowered sites can enter the lexical metadata reader.
+    let mut statement = connection.prepare_cached(
+        "SELECT DISTINCT semantic.semantic_key
+             FROM main.resolution_identities AS lookup
+             CROSS JOIN main.resolution_paths AS path
+               ON path.blob_id=?1 AND path.end_lead_identity=lookup.id
+             JOIN main.resolution_node_catalog AS node
+               ON node.blob_id=path.blob_id AND node.local_key=path.start_node
+             JOIN main.resolution_semantic_sites AS semantic
+               ON semantic.blob_id=node.blob_id AND semantic.semantic_key=node.semantic_local_key
+              AND semantic.semantic_role='reference'
+             JOIN main.resolution_sites AS authored
+               ON authored.blob_id=semantic.blob_id AND authored.site=semantic.source_site
+              AND authored.site_kind IS NOT NULL
+             WHERE lookup.identity_digest=?2",
+    )?;
+    let references = statement.query_map(
+        rusqlite::params![record.blob_id(), lookup.name_digest().as_slice()],
+        |row| row.get::<_, u32>(0),
+    )?;
+    let mut result = Vec::new();
+    for reference in references {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let reference = SemanticId::local(mount.get(), reference?);
+        let Some(evidence) =
+            authored_reference_local_path_evidence(ready, reference, cancellation)?
+        else {
+            continue;
+        };
+        if !evidence.metadata().unqualified()
+            || !evidence.local_bindings_certified()
+            || !evidence.local_definitions().is_empty()
+        {
+            continue;
+        }
+        for &(token, scope, activation, rank) in &binders {
+            if activation.is_some_and(|start| evidence.metadata().start_byte() < start as usize) {
+                continue;
+            }
+            if let Some(depth) = evidence
+                .lexical_scopes()
+                .iter()
+                .filter(|(node, _)| *node == scope)
+                .map(|(_, depth)| *depth)
+                .min()
+            {
+                result.push(ImportBinding {
+                    reference,
+                    token,
+                    precedence: rules.precedence(depth, rank),
+                });
+            }
+        }
+    }
+    sort_import_bindings(&mut result);
+    Ok(Some(result))
+}
+
+pub(super) trait ImportBinderRules {
+    fn lookup_recipes(
+        &self,
+        fragment: BindingFragmentId,
+        route: &[SemanticId],
+        demand: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<ResolutionLookupSemanticRecipe>>>;
+
+    fn token_metadata(
+        &self,
+        blob: i64,
+        token: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<std::sync::Arc<ImportTokenMetadata>>>;
+
+    fn classify(
+        &self,
+        selector: Option<&SelectedImportSelector>,
+        route: Option<&SelectedImportRoute>,
+    ) -> ImportBinderClass;
+}
+
+pub(super) fn hydrate_import_binders(
+    operation: &ReadySelectedResolution<'_, '_>,
+    rules: &impl ImportBinderRules,
+    blob: i64,
+    fragment: BindingFragmentId,
+    halves: Vec<SelectedRootPathHalf>,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<ImportBinder>>> {
+    let mut imports = Vec::new();
+    for half in halves {
+        let SelectedRootPathHalf::Import {
+            identity,
+            token,
+            route,
+            demand,
+            source_scope_head,
+            activation,
+            anchor,
+            ..
+        } = &half
+        else {
+            continue;
+        };
+        let Some(recipes) = rules.lookup_recipes(fragment, route, *demand, cancellation)? else {
+            return Ok(None);
+        };
+        let Some(metadata) = rules.token_metadata(blob, *token, cancellation)? else {
+            return Ok(None);
+        };
+        // Preparation already read this authored token's exact catalog or
+        // staged coordinate. Share its mounted content identity with the
+        // boundary compiler instead of reading its provenance again.
+        let digest = metadata
+            .identity_digest
+            .expect("an authored import token has a catalog or staged identity");
+        let fragment_digest = operation.identity_content_digest(fragment.into(), cancellation)?;
+        let digest = crate::analyzer::resolution::mounted_identity_digest(
+            b"semantic",
+            fragment_digest,
+            digest,
+        );
+        operation
+            .inventory
+            .authority_request_memo()
+            .borrow_mut()
+            .canonical_digests
+            .insert((*token).into(), digest);
+        let selector = metadata.selector.clone();
+        let class = rules.classify(selector.as_ref(), metadata.route.as_ref());
+        let demand_name = recipes.last().expect("an import has a demand").spelling();
+        let imported = selector
+            .as_ref()
+            .and_then(|selector| selector.source_name.as_deref())
+            .unwrap_or(demand_name);
+        let bound = selector
+            .as_ref()
+            .and_then(|selector| selector.local_name.as_deref())
+            .unwrap_or(imported);
+        imports.push(ImportBinder {
+            identity: *identity,
+            scope: *source_scope_head,
+            activation: *activation,
+            anchor: *anchor,
+            head: recipes
+                .first()
+                .expect("an import has a head")
+                .spelling()
+                .to_owned(),
+            bound: class.named.then(|| bound.to_owned()),
+            imported: class.named.then(|| imported.to_owned()),
+            selector,
+            route: class.route,
+            recipes,
+            half,
+        });
+    }
+    Ok(Some(imports))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -440,6 +801,51 @@ pub fn route_at_site(connection: &Connection, blob: i64, site: u32) -> Result<Op
         .prepare_cached(AT_SITE)?
         .query_row(params![blob, site], read_route)
         .optional()?)
+}
+
+impl super::SelectedResolutionOperation<'_, '_> {
+    pub(super) fn import_lookup_recipes(
+        &self,
+        fragment: BindingFragmentId,
+        semantics: &[SemanticId],
+        cancellation: &CancellationToken,
+        observe_read: impl Fn(&super::SelectedLookupRecipeRequest),
+    ) -> Result<Option<Vec<ResolutionLookupSemanticRecipe>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let requests = semantics
+            .iter()
+            .map(|&semantic| super::SelectedLookupRecipeRequest { fragment, semantic })
+            .collect::<Vec<_>>();
+        let Some(rows) = self.read_context_recipes(
+            &self.ready.lexical_source(),
+            &requests,
+            cancellation,
+            observe_read,
+        )?
+        else {
+            return Ok(None);
+        };
+        let recipes = rows
+            .into_iter()
+            .zip(&requests)
+            .map(|(row, request)| {
+                if let Some(recipe) = row {
+                    return Ok(recipe);
+                }
+                let mount = self
+                    .mount_table()
+                    .mount_for_fragment(request.fragment)?
+                    .expect("selected import fragment is mounted");
+                Err(StoreError::corrupt(format!(
+                    "selected import semantic lacks its lookup recipe: language={:?}",
+                    mount.semantic_language()
+                )))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((!cancellation.is_cancelled()).then_some(recipes))
+    }
 }
 
 #[cfg(test)]

@@ -99,10 +99,6 @@ impl BackwardCallIndex {
         self.by_callee.get(callee).map_or(&[], Box::as_ref)
     }
 
-    pub fn procedure_count(&self) -> usize {
-        self.by_callee.len()
-    }
-
     pub fn call_count(&self) -> usize {
         self.by_callee.values().map(|edges| edges.len()).sum()
     }

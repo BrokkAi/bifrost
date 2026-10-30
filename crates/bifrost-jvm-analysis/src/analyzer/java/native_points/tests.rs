@@ -40,18 +40,19 @@ fn fixture() -> (BuiltInlineTestProject, JavaAnalyzer) {
 
 fn site(source: &str) -> ResolvedReferenceSite {
     let start_byte = source.rfind("Target").unwrap();
-    ResolvedReferenceSite {
-        path: CALLER_PATH.into(),
-        text: "Target".into(),
-        range: Range {
-            start_byte,
-            end_byte: start_byte + 6,
-            start_line: 0,
-            end_line: 0,
-        },
-        focus_start_byte: start_byte,
-        focus_end_byte: start_byte + 6,
-    }
+    let range = Range {
+        start_byte,
+        end_byte: start_byte + 6,
+        start_line: 0,
+        end_line: 0,
+    };
+    brokk_bifrost_analysis::analyzer::usages::common::build_reference_site(
+        CALLER_PATH.into(),
+        "Target".into(),
+        range,
+        start_byte,
+        start_byte + 6,
+    )
 }
 
 fn complete(result: BoundedResolution<DefinitionLookupOutcome>) -> DefinitionLookupOutcome {
@@ -1824,7 +1825,8 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
         if let BoundedResolution::Complete { value, .. } = &stored {
             eprintln!("nested {method} stored argument: {:?}", value.value_types);
         }
-        let actual = java_native_argument_type(&analyzer, query, scope.token(), expression);
+        let actual = java_native_argument_type(&analyzer, query, scope.token(), expression, None)
+            .expect("conversion fixture finishes");
         let value_site = java_native_receiver_type_site_node(expression).expect("value site");
         let direct = java_native_expression_value_type_at_node(query, value_site)
             .expect("the expression query completes");
@@ -2346,4 +2348,285 @@ fn java_native_carrier_frontier_preserves_type_variables_and_arrays() {
         };
         assert_eq!(value, expected, "{name}: {evidence:#?}");
     }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7886: call-target batches repeatedly opened native operations for nested Java calls"
+)]
+fn java_native_batch_reuses_nested_points_and_keeps_sibling_contexts_separate() {
+    use brokk_bifrost_analysis::analyzer::native_points::{
+        native_point_operation_open_count_for_test,
+        reset_native_point_operation_open_count_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::resolution::seam_profile::{
+        jvm_context_build_count_for_test, reset_jvm_context_build_count_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_call_target_batch_with_source,
+    };
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+
+    // Exercise the production trial hook in an isolated process. Setting the
+    // trial flag in this test process would affect unrelated parallel tests.
+    const CHILD: &str = "BIFROST_TEST_NATIVE_BATCH_COUNT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let profile = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "analyzer::java::native_points::tests::java_native_batch_reuses_nested_points_and_keeps_sibling_contexts_separate", "--nocapture"])
+            .env("BIFROST_SQL_PROFILE", profile.path().join("sql.jsonl"))
+            .env("BIFROST_SEAM_PROFILE", profile.path().join("seams.jsonl"))
+            .env(CHILD, "1")
+            .env("BIFROST_TRIAL_NATIVE_JAVA", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for (expression, expected_operations) in [
+        ("f(f(f(f(f(f(0))))))", 11),
+        ("f(0); f(0); f(0); f(0); f(0); f(0)", 6),
+    ] {
+        let source = format!("package p; class A {{ void run(Missing a) {{ {expression}; }} }}");
+        let path = "src/main/java/p/A.java";
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file(path, &source)
+            .build();
+        let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+        let _inventory = analyzer.external_declaration_index();
+        let file = fixture.file(path);
+        let tree =
+            brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
+                &file,
+                Language::Java,
+                &source,
+            )
+            .unwrap();
+        let mut pending = vec![tree.root_node()];
+        let mut sites = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "method_invocation" {
+                sites.push(node.child_by_field_name("name").unwrap());
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        sites.sort_by_key(|node| node.start_byte());
+        let requests = sites
+            .iter()
+            .map(|node| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(node.start_byte()),
+                end_byte: Some(node.end_byte()),
+            })
+            .collect();
+        reset_native_point_operation_open_count_for_test();
+        reset_jvm_context_build_count_for_test();
+        let sql_before = brokk_bifrost_core::cache_db::sql_profile::totals()
+            .expect("the isolated regression child enables SQL profiling")
+            .0;
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let outcomes = resolve_call_target_batch_with_source(
+            &analyzer,
+            scope.token(),
+            requests,
+            file,
+            source.into(),
+            None,
+        );
+        let sql = brokk_bifrost_core::cache_db::sql_profile::totals()
+            .unwrap()
+            .0
+            - sql_before;
+        if expected_operations == 6 {
+            // 1,947 is the six-sibling total before the memo existed, measured in
+            // the measure profile. The dev profile adds debug_assert COUNT reads
+            // and still passed at this ceiling when #7886 landed, so a later
+            // dev-profile excess is a real change in per-point work, not a flake.
+            assert!(
+                sql <= 1_947,
+                "flat siblings must not exceed the no-memo baseline: {sql}"
+            );
+        }
+        assert_eq!(outcomes.len(), 6);
+        assert!(
+            outcomes
+                .iter()
+                .all(|value| value.outcome.status == DefinitionLookupStatus::NoDefinition)
+        );
+        assert_eq!(
+            native_point_operation_open_count_for_test(),
+            expected_operations,
+            "{expression}"
+        );
+        // Context reuse is deliberately deferred: every actual point keeps
+        // its own context identity registry and builds its file context once.
+        assert_eq!(
+            jvm_context_build_count_for_test(),
+            expected_operations,
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7886: a nested argument budget stop was hidden by the completed outer definition"
+)]
+fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
+    use brokk_bifrost_analysis::analyzer::native_points::{
+        native_point_operation_open_count_for_test,
+        reset_native_point_operation_open_count_for_test,
+    };
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+
+    let source = "class A { void run() { int x0 = 0; int x1 = x0 + 1; int x2 = x1 + 1; int x3 = x2 + 1; sink(x3); } }";
+    let path = "A.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let _inventory = analyzer.external_declaration_index();
+    let file = fixture.file(path);
+    let tree = brokk_bifrost_jvm::java::declarations::parse_tree(source).unwrap();
+    let start = source.find("sink(").unwrap();
+    let site = ResolvedReferenceSite {
+        path: path.into(),
+        text: "sink".into(),
+        range: Range {
+            start_byte: start,
+            end_byte: start + 4,
+            start_line: 1,
+            end_line: 1,
+        },
+        focus_start_byte: start,
+        focus_end_byte: start + 4,
+    };
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source,
+        tree: Some(&tree),
+        site: &site,
+        budget: Default::default(),
+        cancellation: None,
+    };
+    let BoundedResolution::Complete { work, .. } =
+        resolve_native_definition_bounded(&analyzer.inner, query, None, prepare_context, || {})
+    else {
+        panic!("the unconstrained outer definition must finish")
+    };
+    // The argument-value root requires more work than the binding root. Derive
+    // the narrow budget from the latter rather than pinning solver internals.
+    let constrained = BoundedReceiverQuery {
+        budget: ReceiverAnalysisBudget {
+            max_scope_nodes: work.scope_nodes + 1,
+            ..Default::default()
+        },
+        ..query
+    };
+    assert!(matches!(
+        resolve_native_definition_bounded(
+            &analyzer.inner,
+            constrained,
+            None,
+            prepare_context,
+            || {}
+        ),
+        BoundedResolution::Complete { .. }
+    ));
+    let batch = NativePointBatch::new(
+        &analyzer.inner,
+        &analyzer,
+        file.clone(),
+        source.into(),
+        None,
+    )
+    .unwrap()
+    .expect("selected batch inputs are ready");
+    reset_native_point_operation_open_count_for_test();
+    for _ in 0..2 {
+        let before = native_point_operation_open_count_for_test();
+        assert!(matches!(
+            resolve_java_definition_with_evidence_in_batch(constrained, Some(&batch), || {}),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+        assert!(
+            native_point_operation_open_count_for_test() > before,
+            "a stopped point must open fresh operations on its next lookup"
+        );
+    }
+    assert!(matches!(
+        resolve_java_definition_with_evidence_in_batch(query, Some(&batch), || {}),
+        BoundedResolution::Complete { .. }
+    ));
+}
+
+#[test]
+fn java_native_batch_hits_replay_captured_reads() {
+    use brokk_bifrost_analysis::analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::native_points::{
+        native_point_operation_open_count_for_test,
+        reset_native_point_operation_open_count_for_test,
+    };
+
+    let (fixture, analyzer) = fixture();
+    let _inventory = analyzer.external_declaration_index();
+    let file = fixture.file(CALLER_PATH);
+    let site = site(CALLER);
+    let tree = brokk_bifrost_jvm::java::declarations::parse_tree(CALLER).unwrap();
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source: CALLER,
+        tree: Some(&tree),
+        site: &site,
+        budget: Default::default(),
+        cancellation: None,
+    };
+    let batch = NativePointBatch::new(
+        &analyzer.inner,
+        &analyzer,
+        file.clone(),
+        CALLER.into(),
+        None,
+    )
+    .unwrap()
+    .expect("selected batch inputs are ready");
+    reset_native_point_operation_open_count_for_test();
+    let (first, reads) = capture_query_reads(&analyzer, || {
+        complete_with_evidence(resolve_java_definition_with_evidence_in_batch(
+            query,
+            Some(&batch),
+            || {},
+        ))
+    });
+    assert_eq!(first.outcome.status, DefinitionLookupStatus::Resolved);
+    let operations = native_point_operation_open_count_for_test();
+    assert!(operations > 0, "the cold point opens an operation");
+    assert!(!reads.keys().is_empty(), "the fill must record real reads");
+    let (second, later_reads) = capture_query_reads(&analyzer, || {
+        complete_with_evidence(resolve_java_definition_with_evidence_in_batch(
+            query,
+            Some(&batch),
+            || {},
+        ))
+    });
+    assert_eq!(second.outcome.status, first.outcome.status);
+    assert_eq!(later_reads.keys(), reads.keys());
+    assert_eq!(later_reads.unattributed_reads(), reads.unattributed_reads());
+    assert_eq!(
+        native_point_operation_open_count_for_test(),
+        operations,
+        "the repeated point must hit without opening another operation"
+    );
 }

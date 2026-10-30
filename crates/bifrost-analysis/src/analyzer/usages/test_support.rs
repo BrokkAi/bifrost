@@ -106,26 +106,10 @@ pub fn activate_semantic_pack(
     request: &crate::analyzer::semantic_model::SemanticModelActivationRequest,
 ) {
     use crate::analyzer::semantic_model::{
-        CatalogOptions, CompilerOptions, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-        SessionPackSource, SessionPackSourceKind, SourceFormat, acquire_active_semantic_models,
-        compile_source,
+        SemanticModelRuntimeOutcome, acquire_active_semantic_models,
     };
 
-    let pack = compile_source(SourceFormat::Json, source, &CompilerOptions::default())
-        .unwrap_or_else(|diagnostics| {
-            panic!("semantic-pack fixture must compile: {diagnostics:#?}")
-        });
-    let catalog =
-        SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).expect("ephemeral catalog");
-    catalog
-        .register_session_pack(
-            &pack,
-            &SessionPackSource {
-                kind: SessionPackSourceKind::Embedded,
-                source_id: source_id.to_owned(),
-            },
-        )
-        .expect("register semantic-pack fixture");
+    let catalog = crate::test_support::embedded_session_semantic_pack_fixture(source_id, source);
     let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
         analyzer,
         &catalog,

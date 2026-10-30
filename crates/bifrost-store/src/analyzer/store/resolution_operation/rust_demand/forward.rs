@@ -33,6 +33,94 @@ pub(crate) struct RustDemandPreparation {
     pub(crate) topologies: Box<[i64]>,
 }
 
+struct RustDemandInstaller;
+
+/// Rust point construction; other consumers retain their own provider lifetimes.
+pub const RUST_DEMAND_INSTALLER: NativeDemandInstaller =
+    NativeDemandInstaller(&RustDemandInstaller);
+
+impl DemandInstall for RustDemandInstaller {
+    fn prepare_caller(
+        &self,
+        operation: &SelectedResolutionOperation<'_, '_>,
+        caller: &Path,
+        cancellation: &CancellationToken,
+        session: Option<&ResolutionSession>,
+    ) -> Result<NativeDemandPreparationOutcome> {
+        Ok(
+            match operation.rust_demand_preparation_for_caller_in_session(
+                caller,
+                cancellation,
+                session,
+            )? {
+                SelectedRustCallerDemandOutcome::Ready(prepared) => {
+                    NativeDemandPreparationOutcome::Ready(prepared)
+                }
+                SelectedRustCallerDemandOutcome::Unavailable => {
+                    NativeDemandPreparationOutcome::Unavailable
+                }
+                SelectedRustCallerDemandOutcome::Cancelled => {
+                    NativeDemandPreparationOutcome::Cancelled
+                }
+            },
+        )
+    }
+
+    fn run_point(
+        &self,
+        preparation: &dyn std::any::Any,
+        request: NativeDemandPointRequest<'_, '_, '_>,
+        run: &mut NativeDemandCallback<'_>,
+    ) -> Result<()> {
+        let prepared = preparation
+            .downcast_ref::<RustCallerDemand>()
+            .expect("Rust installer owns the caller preparation");
+        let NativeDemandPointRequest {
+            ready,
+            blueprint,
+            lexical,
+            paths,
+            typed,
+            cancellation,
+            session,
+            artifacts,
+        } = request;
+        assert!(
+            artifacts.is_none(),
+            "Rust points do not install forward artifacts"
+        );
+        let arena = RefCell::new(ClosedRelations::default());
+        let source = ClosedForwardSource::new(
+            lexical,
+            paths,
+            &arena,
+            session,
+            crate::analyzer::resolution::CALLER_ENVIRONMENT,
+        );
+        let forward = PreparedForwardSource::new(ready, &prepared.demand, lexical, paths);
+        let mut provider = DemandProvider::new(ForwardProvider::new(
+            &forward,
+            &arena,
+            session,
+            cancellation,
+        ));
+        blueprint.with_forward_operation_in_session(
+            &source,
+            paths,
+            typed,
+            cancellation,
+            session,
+            |operation| {
+                operation.enable_completed_root_reuse(
+                    &ready.operation_demand_state,
+                    RustDeclarationAccessKind::Caller as u64,
+                );
+                run(operation, &mut provider)
+            },
+        )
+    }
+}
+
 impl RustDemandPreparation {
     pub(crate) fn new(topologies: Box<[i64]>) -> Self {
         Self {
@@ -409,14 +497,11 @@ impl<'a, 'store, 'input> DemandRules for RustRules<'a, 'store, 'input> {
     fn admit_endpoint(
         &mut self,
         endpoint: &EndpointSignature,
-        _already_published: bool,
+        _retained_completion: Option<&ResolutionCompletion>,
     ) -> Result<Read<EndpointAdmission>> {
         {
             let arena = self.arena.borrow();
-            if let Some(retained) = arena
-                .registrations
-                .get(&DemandRelationKey::caller(endpoint.clone()))
-            {
+            if let Some(retained) = arena.registered_endpoint(endpoint) {
                 assert!(
                     arena
                         .endpoints

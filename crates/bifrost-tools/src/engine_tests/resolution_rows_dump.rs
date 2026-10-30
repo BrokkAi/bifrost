@@ -4,7 +4,7 @@
 //! BIFROST_RESOLUTION_DUMP_ROOT (an absolute, identical input tree in both runs),
 //! BIFROST_RESOLUTION_DUMP_LANGUAGE, BIFROST_RESOLUTION_DUMP_INPUTS (newline
 //! separated relative subtrees), and BIFROST_RESOLUTION_DUMP_OUTPUT. No expected
-//! digest is checked in. Compare dumps with cmp; they include every family,
+//! digest is checked in. Compare dumps with cmp; they include every populated family,
 //! the complete-content digest, and the path bodies' $[8] precedence arrays.
 //! Files are lowered and written one at a time; no artifacts survive a file.
 
@@ -32,6 +32,7 @@ fn dump_prepared_resolution_rows() -> std::result::Result<(), Box<dyn std::error
         "kotlin" => (Language::Kotlin, "kt"),
         "scala" => (Language::Scala, "scala"),
         "python" => (Language::Python, "py"),
+        "csharp" => (Language::CSharp, "cs"),
         _ => panic!("unsupported dump language: {label}"),
     };
     let grammar = brokk_bifrost_analysis::analyzer::parser_language_for(language)
@@ -73,6 +74,11 @@ fn dump_prepared_resolution_rows() -> std::result::Result<(), Box<dyn std::error
             }
             Language::Scala => {
                 brokk_bifrost_jvm::scala::declarations::parse_scala_file(&file, &source, &tree)
+            }
+            Language::CSharp => {
+                brokk_bifrost_csharp::declarations::parse_csharp_file_with_native_facts(
+                    &file, &source, &tree,
+                )
             }
             Language::Python => {
                 brokk_bifrost_python::declarations::parse_python_file_with_native_facts(

@@ -59,9 +59,14 @@ fn python_module_components(project: &dyn Project, file: &ProjectFile) -> Vec<St
 /// Match whole path components so a hidden directory's leading dot stays inside
 /// its segment. The stored rendered name is a value, not source syntax.
 pub fn python_module_components_from_name(file: &ProjectFile, name: &str) -> Option<Vec<String>> {
-    let components = python_project_module_components(file);
-    (0..components.len()).find_map(|start| {
-        (components[start..].join(".") == name).then(|| components[start..].to_vec())
+    // A package initializer drops its file stem unless its selected import
+    // root is its own directory. In that case the module is named __init__.
+    // Reuse the producer's rule at each possible root instead of taking only
+    // suffixes of the project-root name, which has already dropped that stem.
+    let roots = file.rel_path().parent()?.ancestors().collect::<Vec<_>>();
+    roots.into_iter().rev().find_map(|root| {
+        let components = python_module_components_from_root(file, root);
+        (components.join(".") == name).then_some(components)
     })
 }
 
@@ -72,7 +77,8 @@ pub fn python_module_components_from_name(file: &ProjectFile, name: &str) -> Opt
 ///
 /// A Python module name is relative to the `sys.path` entry an import of it
 /// resolves against, so one file has one valid absolute name per ancestor
-/// directory on that path, and each of them is a suffix of this one.
+/// directory on that path. Each is a suffix of this one, except an initializer
+/// directly at the import root, which is named `__init__`.
 /// [`python_import_root`] picks the single name that becomes the module's
 /// identity; this is what an import written against any deeper root has to be
 /// matched against (#3506).

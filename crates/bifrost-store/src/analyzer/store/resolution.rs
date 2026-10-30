@@ -236,12 +236,12 @@ struct ResolutionFamilySpec {
 /// so renumbering a variant changes every interior digest and rotates the
 /// bundle epochs with the rest of the family.
 macro_rules! typed_fact_relations {
-    ($($variant:ident = $code:literal,)*) => {
+    ($($(#[$meta:meta])* $variant:ident = $code:literal,)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[repr(i64)]
         #[doc(hidden)]
         pub enum TypedFactRelation {
-            $($variant = $code,)*
+            $($(#[$meta])* $variant = $code,)*
         }
 
         impl TypedFactRelation {
@@ -305,6 +305,18 @@ typed_fact_relations! {
     GenericFormalOwner = 38,
     GenericFormalDefaultOwner = 39,
     TypeProductionOutput = 40,
+    /// Enumerates candidate blobs embedding this terminal type name. Every
+    /// embedded name has a row when parsing is complete; consumers confirm
+    /// ownership from the candidate blob's own rows.
+    EmbeddedTypeLookup = 41,
+    /// Enumerates candidate blobs declaring this interface method name. Every
+    /// declared interface method name has a row when parsing is complete;
+    /// consumers confirm ownership from the candidate blob's own rows.
+    InterfaceMethodLookup = 42,
+    /// Enumerates candidate blobs naming this supertype. Every written supertype
+    /// name has a row when parsing is complete; consumers confirm ownership from
+    /// the candidate blob's own rows. Implicit roots have no row.
+    SupertypeNameLookup = 43,
 }
 
 impl TypedFactRelation {
@@ -361,6 +373,7 @@ macro_rules! resolution_bundle_families {
             package_routes => ("package_routes", "resolution_package_routes", "expected_package_route_count", "package_scope_node_key, declaration_site, placement_gap_site", 3, 1),
             package_route_segments => ("package_route_segments", "resolution_package_route_segments", "expected_package_route_segment_count", "package_scope_node_key, ordinal, spelling", 3, 2),
             singleton_relations => ("singleton_relations", "resolution_singleton_relations", "expected_singleton_relation_count", "declaration_site, enclosing_type_site, kind", 3, 1),
+            compilation_imports => ("compilation_imports", "resolution_compilation_imports", "expected_compilation_import_count", "import_site", 1, 1),
         }
     };
 }
@@ -726,6 +739,7 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_reference_lookup_identities",
     "resolution_root_route_segments",
     "resolution_root_imports",
+    "resolution_compilation_imports",
     "resolution_root_import_segments",
     "resolution_root_import_demands",
     "resolution_rust_reverse_gap_candidates",
@@ -779,12 +793,13 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // warm bundles from v46 lack those facts for casts and qualified
         // assignments.
         Language::Java => {
-            "resolution-bundle-java-v52-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v53-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
+        // v69 (#7509): publish embedding and interface method candidate names.
         // v68 (#7509): an initialized type-switch clause binder no longer
         // carries an InferredType gap row.
         Language::Go => {
-            "resolution-bundle-go-v68-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
+            "resolution-bundle-go-v69-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
         }
         Language::Cpp => "resolution-bundle-cpp-v26-opaque-guard-implication-6902-2026-10",
         Language::JavaScript => {
@@ -826,16 +841,14 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // A qualified parent's type-constructor path is looked up in the scope enclosing
         // its template, not the template's own member scope (#5104).
         Language::Scala => {
-            "resolution-bundle-scala-v82-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
+            "resolution-bundle-scala-v83-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
         }
-        Language::CSharp => {
-            "resolution-bundle-csharp-v25-lexical-producer-7314-review-boundaries-2026-10"
-        }
+        Language::CSharp => "resolution-bundle-csharp-v28-scope-choice-7314-c1-0b-2026-10",
         Language::Ruby => {
             "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         Language::Kotlin => {
-            "resolution-bundle-kotlin-v61-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
+            "resolution-bundle-kotlin-v62-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
         }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }

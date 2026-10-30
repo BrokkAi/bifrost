@@ -24,7 +24,7 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvid
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::is_call_relation_unit;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::native_incoming_preflight;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSiteSyntax;
 
@@ -41,7 +41,7 @@ use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdgeRow;
 use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
     IncomingCallProjection, IncomingFile, IncomingFileBudget, IncomingProjectionIssue,
-    finish_incoming_sites, project_selected_incoming,
+    finish_incoming_sites, project_selected_incoming, structural_incoming_caller,
 };
 
 /// Native Go call-relation projection used by Go production dispatch.
@@ -60,34 +60,18 @@ impl CallRelationProvider for GoNativeCallRelations {
         cancellation: Option<&CancellationToken>,
     ) -> CallRelationResult {
         let cancellation = cancellation.cloned().unwrap_or_default();
-        if cancellation.is_cancelled() {
-            return CallRelationResult {
-                cancelled: true,
-                proof_authority: UsageProofAuthority::Native,
-                ..CallRelationResult::default()
-            };
-        }
-        if !is_call_relation_unit(target) {
-            return CallRelationResult {
-                proof_authority: UsageProofAuthority::Native,
-                ..CallRelationResult::default()
-            };
-        }
-        if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
-            return CallRelationResult {
-                truncated: true,
-                proof_authority: UsageProofAuthority::Native,
-                diagnostics: vec![CallRelationDiagnostic {
-                    code: CallRelationDiagnosticCode::BudgetExhausted,
-                    message: format!(
-                        "native Go incoming-call budget omitted {}",
-                        target.fq_name()
-                    ),
-                    context: target.fq_name().to_string(),
-                    reason_kind: None,
-                }],
-                ..CallRelationResult::default()
-            };
+        if let Some(result) =
+            native_incoming_preflight(target, limits, &cancellation, || CallRelationDiagnostic {
+                code: CallRelationDiagnosticCode::BudgetExhausted,
+                message: format!(
+                    "native Go incoming-call budget omitted {}",
+                    target.fq_name()
+                ),
+                context: target.fq_name().to_string(),
+                reason_kind: None,
+            })
+        {
+            return result;
         }
         let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
             return unavailable("native Go analyzer is unavailable", target);
@@ -261,15 +245,7 @@ impl IncomingCallProjection for GoIncomingProjection<'_> {
     }
 
     fn caller(&self, edge: &ReferenceEdgeRow, syntax: &CallSiteSyntax) -> Option<CodeUnit> {
-        self.go
-            .structural_fact_providers()
-            .into_iter()
-            .find_map(|provider| {
-                provider
-                    .structural_enclosing_code_units(&edge.site.file, &[syntax.range])
-                    .and_then(|mut owners| owners.pop().flatten())
-            })
-            .or(edge.site.enclosing.clone())
+        structural_incoming_caller(self.go.structural_fact_providers(), edge, syntax)
     }
 
     fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {

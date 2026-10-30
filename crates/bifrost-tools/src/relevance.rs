@@ -963,9 +963,10 @@ fn acquire_usage_ranking_graph_from_builder<E>(
                 selected_ecosystems.iter().copied(),
                 workspace_content,
             );
-            let acquisition = cache.acquire_fallible(key, cancellation, &mut build, || {
-                ecosystem_content(analyzer) == Some(workspace_content)
-            })?;
+            let acquisition =
+                cache.acquire_fallible(analyzer, key, cancellation, &mut build, || {
+                    ecosystem_content(analyzer) == Some(workspace_content)
+                })?;
             match acquisition {
                 WorkspaceUsageGraphCacheAcquisition::Ready {
                     graph,

@@ -21,7 +21,7 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::model::ProjectFile;
 
-    use brokk_bifrost_core::analyzer::project::TestProject;
+    use crate::test_support::rust_analyzer;
     use brokk_bifrost_rust::usage::RustReferenceResolution;
     use brokk_bifrost_rust::usage::{Domain, ModuleKey, RustSymbolIdentity, RustSymbolNamespace};
     use brokk_bifrost_rust::usage_queries::RustUsageQueries;
@@ -64,10 +64,6 @@ mod tests {
         );
     }
 
-    fn analyzer_for(root: &std::path::Path) -> RustAnalyzer {
-        RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
-    }
-
     /// The store-backed name lookup must offer every declaring file for a
     /// shared short name, with each identity's own visibility domain.
     ///
@@ -108,7 +104,7 @@ mod tests {
                  }\n",
             )
             .expect("write util.rs");
-        let analyzer = analyzer_for(&root);
+        let analyzer = rust_analyzer(&root);
         let queries = RustUsageQueries::new(&analyzer);
 
         let mut rendered: Vec<String> = ["Shared", "helper", "worker", "util", "inner"]

@@ -101,7 +101,7 @@ impl IcfgBarrierSession {
         let (result, recorded) = solve_ide_with_recorded_relations(
             input,
             provider,
-            &TaintFlowProblem::new(plan),
+            &TaintFlowProblem::new(plan).with_cancellation(request.cancellation),
             &mut NoReusableSummaries,
             plan.value_flow()
                 .has_contextual_bindings()
@@ -700,7 +700,10 @@ impl Classification {
         let row = &trace.records[record];
         if cfg!(debug_assertions) && self.verified.insert(record) {
             let mut reconstructed: HashMap<_, TaintEdgeFunction> = HashMap::default();
-            for (fact, function) in reconstruct(&TaintFlowProblem::new(plan), &row.key) {
+            for (fact, function) in reconstruct(
+                &TaintFlowProblem::new(plan).with_cancellation(request.cancellation),
+                &row.key,
+            ) {
                 reconstructed
                     .entry(fact)
                     .and_modify(|old| *old = old.meet(&function))
@@ -732,7 +735,8 @@ impl Classification {
             emitted: RefCell::new(Vec::new()),
             work: Cell::new(0),
         };
-        let problem = TaintFlowProblem::with_observations(plan, &hook);
+        let problem = TaintFlowProblem::with_observations(plan, &hook)
+            .with_cancellation(request.cancellation);
         reconstruct(&problem, &row.key);
         reserve(
             request,
@@ -1203,6 +1207,7 @@ impl Replay {
                         .max_witness_steps
                         .min(session.witness_limits.max_steps())
             {
+                limits.max_witness_expansions -= expansions;
                 return Ok(None);
             }
             expansions += 1;
@@ -1266,12 +1271,12 @@ impl Replay {
         }
         let retained = std::mem::size_of::<SummaryWitness>()
             .saturating_add(std::mem::size_of_val(steps.as_slice()));
+        limits.max_witness_expansions -= expansions;
         if limits.max_witnesses == 0 || retained > limits.max_retained_witness_bytes {
             return Ok(None);
         }
         limits.max_witnesses -= 1;
         limits.max_witness_steps -= steps.len();
-        limits.max_witness_expansions -= expansions;
         limits.max_retained_witness_bytes -= retained;
         let count = steps.len();
         let quality = self.states[state]

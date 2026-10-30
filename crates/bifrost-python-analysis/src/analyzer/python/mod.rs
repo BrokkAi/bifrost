@@ -28,6 +28,7 @@ mod guard_summary;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
+mod mutation_facts;
 #[cfg(any(test, feature = "test-support"))]
 mod native_dead_code;
 #[cfg(any(test, feature = "test-support"))]
@@ -275,16 +276,31 @@ pub use crate::analyzer::python::exception_identity::python_builtin_exception_na
 
 pub use brokk_bifrost_python::imports::PythonImportBinding;
 
+use brokk_bifrost_analysis::analyzer::read_ledger::{FactSubject, ReadKey, WorkspaceFactFamily};
+use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    AuthorityInputs, ReplayingMemo, ReplayingMemoEntry, WorkspaceAuthorityMemo, memo_attribution,
+};
+use cache::{PythonMemo, read_memo, replaying_cache};
+
+type PythonWholeAuthority<M> = Arc<
+    WorkspaceAuthorityMemo<(
+        M,
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<StableDigest>,
+    )>,
+>;
+
 const FILE_STATE_BATCH_SIZE: usize = 256;
 
 #[derive(Clone)]
 pub struct PythonAnalyzer {
     inner: TreeSitterAnalyzer<PythonAdapter>,
     #[cfg(any(test, feature = "test-support"))]
-    native_environment_reconcile:
-        Arc<std::sync::RwLock<native_request::PythonEnvironmentReconcileState>>,
+    native_environment_reconcile: Arc<
+        WorkspaceAuthorityMemo<std::sync::RwLock<native_request::PythonEnvironmentReconcileState>>,
+    >,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    imported_code_units: Arc<PythonMemo<ProjectFile, HashSet<CodeUnit>>>,
     source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
@@ -306,25 +322,32 @@ pub struct PythonAnalyzer {
     // import whose binding name collides with another's). `could_import_file` needs the undeduped
     // set to answer "does ANY import here resolve into `target`" without re-resolving every import
     // on every call (previously uncached, called once per (candidate file, target) pair).
-    imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    imported_target_files: Arc<PythonMemo<ProjectFile, HashSet<ProjectFile>>>,
+    referencing_files: Arc<PythonMemo<ProjectFile, HashSet<ProjectFile>>>,
     // Re-export resolution memoizes the source-owned import/order projection
     // once per file and analyzer generation, including unsaved overlays.
-    export_index: Cache<ProjectFile, Arc<ExportIndex>>,
+    export_index: Arc<PythonMemo<ProjectFile, ExportIndex>>,
     // Uncached, this rebuilt the whole per-file binding map -- including a store lookup per
     // from-import through `resolve_module_code_unit` -- for every single `.bindings.get(name)` the
     // receiver-type and annotation resolvers do. One binder per file serves all of them.
-    import_binder: Cache<ProjectFile, Arc<ImportBinder>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    import_binder: Arc<PythonMemo<ProjectFile, ImportBinder>>,
+    direct_ancestors: Arc<PythonMemo<CodeUnit, Vec<CodeUnit>>>,
     // Dead-code analysis scans the stable caller domain but resolves a bounded
     // callee target set. Cache that exact pair for warm requests so repeated
     // queries do not reparse the entire Python workspace.
-    usage_edges: Cache<
-        PythonUsageEdgesKey,
-        Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges>,
+    usage_edges: Arc<
+        PythonMemo<
+            PythonUsageEdgesKey,
+            brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges,
+        >,
     >,
-    class_member_mutation_free: Cache<PythonClassMutationKey, bool>,
-    module_member_mutation_free: Cache<PythonModuleMemberMutationKey, bool>,
+    class_member_mutation_free: Arc<
+        brokk_bifrost_analysis::analyzer::workspace_authority::ReplayingMemo<
+            cache::PythonClassMutationCache,
+        >,
+    >,
+    module_member_mutation_free:
+        Arc<WorkspaceAuthorityMemo<Cache<PythonModuleMemberMutationKey, bool>>>,
     // PoolSafeMemo, not OnceLock: same constraint as `usage_index` below. The
     // build walks every workspace class and is reached from rayon workers, so a
     // blocking get_or_init parks each arriving worker behind one initializer.
@@ -332,34 +355,94 @@ pub struct PythonAnalyzer {
     /// gets an index that was never built over them (issue #1748). Two cells at
     /// most, because the exclusion verdict is a pure function of the analyzer
     /// and the file.
-    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
-    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    direct_descendant_index:
+        PythonWholeAuthority<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+    reverse_import_index:
+        PythonWholeAuthority<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     // PoolSafeMemo, not OnceLock: this cell is reached from inside rayon workers -- the graph
     // extractor's per-file fan-out resolves module bindings through it. The builder is serial, so
     // the same closure serves both memo arms; what the memo buys is the non-blocking claim
     // protocol, which stops a cold whole-workspace build from parking every worker that arrives
     // behind the one thread running the initializer.
-    usage_index: Arc<PoolSafeMemo<PythonUsageIndex>>,
+    usage_index: PythonWholeAuthority<PoolSafeMemo<PythonUsageIndex>>,
+    module_binding_timelines:
+        Arc<PythonMemo<ProjectFile, brokk_bifrost_python::usage_index::ModuleBindingTimeline>>,
+    scope_facts_by_file:
+        Arc<PythonMemo<ProjectFile, brokk_bifrost_python::usage_index::PythonScopeFacts>>,
     // PoolSafeMemo for the same reason as `usage_index`: the import resolver
     // reaches this from rayon workers. The build is path math over the
     // workspace listing, but every import that names no indexed module asks
     // for it, so it must not be recomputed per import.
-    module_spellings: Arc<PoolSafeMemo<PythonModuleSpellings>>,
+    module_spellings: PythonWholeAuthority<PoolSafeMemo<PythonModuleSpellings>>,
     // Share capped per-kind evidence across oracles in this generation (#5112).
-    saved_default_arguments: Arc<PoolSafeMemo<SavedDefaultArgumentSafety>>,
+    saved_default_arguments: Arc<WorkspaceAuthorityMemo<PoolSafeMemo<SavedDefaultArgumentSafety>>>,
 }
 
 impl_forward_query_provider!(PythonAnalyzer);
+
+fn read_complete_memo<K, V>(
+    analyzer: &PythonAnalyzer,
+    memo: &PythonMemo<K, V>,
+    key: K,
+    build: impl FnOnce() -> Result<Arc<V>, Arc<V>>,
+    weight: impl Fn(&K, &Arc<V>) -> u32,
+) -> Arc<V>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    let value = memo
+        .read(&memo_attribution(analyzer), |memo, capture| {
+            let entry = brokk_bifrost_analysis::analyzer::common::query_cache_moka(
+                analyzer,
+                memo,
+                &key,
+                || {
+                    capture
+                        .try_build_weighted(|| {
+                            build().map(|value| {
+                                let bytes = weight(&key, &value) as usize;
+                                (value, bytes)
+                            })
+                        })
+                        .map(Arc::new)
+                },
+            )
+            .unwrap_or_else(|value| {
+                Arc::new(capture.build_weighted(|| {
+                    let value = Arc::clone(value.as_ref());
+                    let bytes = weight(&key, &value) as usize;
+                    (value, bytes)
+                }))
+            });
+            Ok::<_, std::convert::Infallible>(entry)
+        })
+        .expect("infallible complete memo read");
+    Arc::clone(&value)
+}
+
+// A digest and the value it certifies are published together semantically:
+// failed local values never initialize the shared certificate cell.
+fn complete_whole_fact<T>(
+    memo: &PoolSafeMemo<T>,
+    digest: &brokk_bifrost_analysis::analyzer::common::QueryCacheCell<StableDigest>,
+    compute: impl FnOnce(&T) -> StableDigest,
+) -> Option<StableDigest> {
+    let value = memo.get()?;
+    Some(*digest.get_or_init(|| compute(&value)))
+}
 
 impl PythonAnalyzer {
     pub(crate) fn update_all_with_progress(
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        Self::from_inner(
-            self.inner.update_all_with_progress(progress),
-            self.memo_budget,
-        )
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::from_inner(
+                self.inner.update_all_with_progress(progress),
+                self.memo_budget,
+            )
+        })
     }
 
     pub(crate) fn install_python_runtime_snapshot(
@@ -503,12 +586,36 @@ impl PythonAnalyzer {
         // (#3506). Content-keyed cells stay: a re-projection is a same-root
         // overlay operation, so the files a caller resolves against are the
         // files these were built from.
-        clone.module_spellings = Arc::new(PoolSafeMemo::new());
-        clone.usage_index = Arc::new(PoolSafeMemo::new());
-        clone.usage_edges = build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges);
-        clone.class_member_mutation_free = build_python_class_mutation_cache();
-        clone.module_member_mutation_free = build_python_module_member_mutation_cache();
-        clone.saved_default_arguments = Arc::new(PoolSafeMemo::new());
+        clone.module_spellings = Arc::new(WorkspaceAuthorityMemo::new(
+            WorkspaceFactFamily::PythonModuleSpellings,
+            (
+                PoolSafeMemo::new(),
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            ),
+        ));
+        clone.usage_index = Arc::new(WorkspaceAuthorityMemo::new(
+            WorkspaceFactFamily::PythonUsageIndex,
+            (
+                PoolSafeMemo::new(),
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            ),
+        ));
+        clone.module_binding_timelines = Arc::new(cache::syntax_memo());
+        clone.scope_facts_by_file = Arc::new(cache::syntax_memo());
+        clone.usage_edges = Arc::new(replaying_cache(self.memo_budget / 8));
+        clone.class_member_mutation_free = Arc::new(
+            brokk_bifrost_analysis::analyzer::workspace_authority::ReplayingMemo::new(
+                build_python_class_mutation_cache(),
+            ),
+        );
+        clone.module_member_mutation_free = Arc::new(WorkspaceAuthorityMemo::new(
+            WorkspaceFactFamily::PythonModuleMemberMutation,
+            build_python_module_member_mutation_cache(),
+        ));
+        clone.saved_default_arguments = Arc::new(WorkspaceAuthorityMemo::new(
+            WorkspaceFactFamily::PythonSavedDefaults,
+            PoolSafeMemo::new(),
+        ));
         clone
     }
 
@@ -556,9 +663,12 @@ impl PythonAnalyzer {
         Self {
             inner,
             #[cfg(any(test, feature = "test-support"))]
-            native_environment_reconcile: Arc::new(std::sync::RwLock::new(None)),
+            native_environment_reconcile: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PythonEnvironmentBinding,
+                std::sync::RwLock::new(None),
+            )),
             memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
+            imported_code_units: Arc::new(replaying_cache(memo_budget / 4)),
             source_facts: build_weighted_cache(
                 memo_budget / 8,
                 |_, value: &Arc<brokk_bifrost_python::source_facts::PythonFileSourceFacts>| {
@@ -569,19 +679,55 @@ impl PythonAnalyzer {
                 memo_budget / 16,
                 weight_module_global_source_facts,
             ),
-            imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
-            import_binder: build_weighted_cache(memo_budget / 8, weight_import_binder),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
-            class_member_mutation_free: build_python_class_mutation_cache(),
-            module_member_mutation_free: build_python_module_member_mutation_cache(),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(PoolSafeMemo::new()),
-            module_spellings: Arc::new(PoolSafeMemo::new()),
-            saved_default_arguments: Arc::new(PoolSafeMemo::new()),
+            imported_target_files: Arc::new(replaying_cache(memo_budget / 8)),
+            referencing_files: Arc::new(replaying_cache(memo_budget / 8)),
+            export_index: Arc::new(replaying_cache(memo_budget / 8)),
+            import_binder: Arc::new(replaying_cache(memo_budget / 8)),
+            direct_ancestors: Arc::new(replaying_cache(memo_budget / 8)),
+            usage_edges: Arc::new(replaying_cache(memo_budget / 8)),
+            class_member_mutation_free: Arc::new(
+                brokk_bifrost_analysis::analyzer::workspace_authority::ReplayingMemo::new(
+                    build_python_class_mutation_cache(),
+                ),
+            ),
+            module_member_mutation_free: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PythonModuleMemberMutation,
+                build_python_module_member_mutation_cache(),
+            )),
+            direct_descendant_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PythonDescendants,
+                (
+                    KeyedPoolSafeMemo::new(),
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                ),
+            )),
+            reverse_import_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PythonReverseImports,
+                (
+                    PoolSafeMemo::new(),
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                ),
+            )),
+            usage_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PythonUsageIndex,
+                (
+                    PoolSafeMemo::new(),
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                ),
+            )),
+            module_spellings: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PythonModuleSpellings,
+                (
+                    PoolSafeMemo::new(),
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                ),
+            )),
+            module_binding_timelines: Arc::new(cache::syntax_memo()),
+            scope_facts_by_file: Arc::new(cache::syntax_memo()),
+            saved_default_arguments: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::PythonSavedDefaults,
+                PoolSafeMemo::new(),
+            )),
         }
     }
 
@@ -589,14 +735,21 @@ impl PythonAnalyzer {
     /// `update` constructs a fresh analyzer with fresh memo cells, so edits
     /// invalidate this evidence without a separate invalidation protocol (#5112).
     pub(crate) fn saved_default_argument_safety(&self) -> Arc<SavedDefaultArgumentSafety> {
-        self.saved_default_arguments
-            .get_or_build_pool_independent(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.saved_default_arguments.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool_independent(
                     self,
-                    "python.saved_default_arguments",
+                    memo,
                     || default_arguments::saved_default_argument_safety(self),
                 )
-            })
+            },
+            |safety| AuthorityInputs::Fact {
+                language: Language::Python,
+                subject: FactSubject::Whole,
+                answer: safety.fact_fingerprint(),
+            },
+        )
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -613,8 +766,13 @@ impl PythonAnalyzer {
         build: impl FnOnce() -> Option<brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges>,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges>> {
         let key = PythonUsageEdgesKey::new(nodes, targets);
-        self.usage_edges
-            .optionally_get_with(key, || build().map(Arc::new))
+        cache::read_optional_memo(
+            self,
+            &self.usage_edges,
+            key,
+            || build().map(Arc::new),
+            weight_python_usage_edges,
+        )
     }
 
     pub(crate) fn cached_class_member_mutation_free(
@@ -623,11 +781,27 @@ impl PythonAnalyzer {
         member: &str,
         scan: impl FnOnce() -> bool,
     ) -> bool {
-        self.class_member_mutation_free
-            .try_get_with(PythonClassMutationKey::new(identity_groups, member), || {
-                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, scan)
+        let answer = self
+            .class_member_mutation_free
+            .read(&memo_attribution(self), |memo, capture| {
+                let key = PythonClassMutationKey::new(identity_groups, member);
+                let entry = memo
+                    .try_get_with(key, || {
+                        let (attempt, receipt) = brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(
+                            self, || capture.try_build(|| {
+                                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, scan)
+                            }).map(Arc::new),
+                        );
+                        attempt.map_err(|value| (value, receipt))
+                    })
+                    .unwrap_or_else(|failure| {
+                        failure.1.replay();
+                        Arc::new(capture.build(|| failure.0))
+                    });
+                Ok::<_, std::convert::Infallible>(entry)
             })
-            .unwrap_or_else(|value| *value)
+            .expect("infallible class-mutation memo");
+        *answer
     }
 
     pub(crate) fn cached_module_member_mutation_free(
@@ -636,9 +810,14 @@ impl PythonAnalyzer {
         member: &str,
         scan: impl FnOnce() -> Option<bool>,
     ) -> bool {
-        self.module_member_mutation_free
-            .optionally_get_with(PythonModuleMemberMutationKey::new(module, member), scan)
-            .unwrap_or(false)
+        self.module_member_mutation_free.read(
+            &memo_attribution(self),
+            |memo| {
+                memo.optionally_get_with(PythonModuleMemberMutationKey::new(module, member), scan)
+                    .unwrap_or(false)
+            },
+            |answer| mutation_facts::module_inputs(module, member, *answer),
+        )
     }
 
     pub(crate) fn module_global_source_facts(
@@ -647,6 +826,10 @@ impl PythonAnalyzer {
         prepared: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
         keep_going: &dyn Fn() -> bool,
     ) -> Option<Arc<brokk_bifrost_python::source_facts::PythonModuleGlobalSourceFacts>> {
+        let oid = self.inner.resolve_live_oid_for_file(file)?;
+        let keys = self.inner.file_read_key(file, oid);
+        debug_assert!(matches!(keys, ReadKey::File { .. }));
+        self.record_read(keys);
         self.inner.cached_python_module_global_source_facts(
             file,
             prepared,
@@ -666,43 +849,53 @@ impl PythonAnalyzer {
         token: QueryToken<'_>,
         keep_going: &impl Fn() -> bool,
     ) -> Option<Arc<PythonUsageIndex>> {
-        // The attribution wrapper does not store the value. A cancelled build
-        // returns None, so the memo never publishes a partial index.
-        self.usage_index.get_or_build_while(
-            keep_going,
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "python.usage_index",
-                    || PythonUsageIndex::build(self, token, keep_going),
-                )
-            },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "python.usage_index",
-                    || PythonUsageIndex::build(self, token, keep_going),
-                )
-            },
-        )
+        self.usage_index
+            .read(
+                &memo_attribution(self),
+                |(memo, digest)| {
+                    // Cancelled builds never publish a partial value or digest.
+                    let value =
+                        brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool_while(
+                            self,
+                            memo,
+                            keep_going,
+                            || PythonUsageIndex::build(self, token, keep_going),
+                            || PythonUsageIndex::build(self, token, keep_going),
+                        )?;
+                    let answer = *digest.get_or_init(|| authority_digest(value.authority_rows()));
+                    Some((value, answer))
+                },
+                |value| match value {
+                    Some((_, answer)) => whole_fact(*answer),
+                    None => AuthorityInputs::Unnamed,
+                },
+            )
+            .map(|(value, _)| value)
     }
 
     /// Coalesce concurrent first lookups of the same source-owned export facts.
     pub fn export_index_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Arc<ExportIndex> {
-        self.export_index
-            .try_get_with(file.clone(), || {
+        read_complete_memo(
+            self,
+            &self.export_index,
+            file.clone(),
+            || {
                 brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
                     Arc::new(compute_export_index_of(self, token, file))
                 })
-            })
-            .unwrap_or_else(|value| Arc::clone(value.as_ref()))
+            },
+            weight_export_index,
+        )
     }
 
     /// `get_with` for the same reason as `export_index_of`: the receiver-type and annotation
     /// resolvers ask for this from the parallelized candidate walk.
     pub fn import_binder_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Arc<ImportBinder> {
-        self.import_binder
-            .try_get_with(file.clone(), || {
+        read_complete_memo(
+            self,
+            &self.import_binder,
+            file.clone(),
+            || {
                 brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
                     Arc::new(import_binder_from_imports(
                         self,
@@ -710,8 +903,9 @@ impl PythonAnalyzer {
                         &self.inner.import_info_of(token, file),
                     ))
                 })
-            })
-            .unwrap_or_else(|value| Arc::clone(value.as_ref()))
+            },
+            weight_import_binder,
+        )
     }
 
     /// The set of files any of `file`'s imports resolve into, cached per file. Unlike
@@ -727,39 +921,41 @@ impl PythonAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<HashSet<ProjectFile>> {
-        brokk_bifrost_analysis::analyzer::common::import_target_files_from_cache(
+        read_memo(
             self,
             &self.imported_target_files,
-            file,
+            file.clone(),
             || {
                 let imports = self.inner.import_info_of(token, file);
-                let targets: HashSet<ProjectFile> = resolve_imports_batched(self, file, &imports)
-                    .into_iter()
-                    .flatten()
-                    .map(|(_, code_unit)| code_unit.source().clone())
-                    .collect();
-                targets
+                Arc::new(
+                    resolve_imports_batched(self, file, &imports)
+                        .into_iter()
+                        .flatten()
+                        .map(|(_, unit)| unit.source().clone())
+                        .collect(),
+                )
             },
+            weight_project_file_set,
         )
     }
 
     fn build_reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.reverse_import_index.get_or_build(
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "python.reverse_import_index",
-                    || self.compute_reverse_import_index(true),
-                )
-            },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "python.reverse_import_index",
-                    || self.compute_reverse_import_index(false),
-                )
-            },
-        )
+        self.reverse_import_index
+            .read(
+                &memo_attribution(self),
+                |(memo, digest)| {
+                    let value = brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
+                        self,
+                        memo,
+                        || self.compute_reverse_import_index(true),
+                        || self.compute_reverse_import_index(false),
+                    );
+                    let answer = complete_whole_fact(memo, digest, reverse_import_digest);
+                    (value, answer)
+                },
+                |(_, answer)| answer.map_or(AuthorityInputs::Unnamed, whole_fact),
+            )
+            .0
     }
 
     fn compute_reverse_import_index(
@@ -798,6 +994,30 @@ impl PythonSourceFactProvider for PythonAnalyzer {
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
 impl PythonSource for PythonAnalyzer {
+    fn record_memo_inputs(&self) -> [u8; 32] {
+        let keys = self.workspace_scope_read_key(&[Language::Python]);
+        debug_assert!(matches!(keys, ReadKey::Scope { .. }));
+        self.record_read(keys.clone());
+        // Package roots are not source files. Their complete authority is separately certified.
+        let answer = self
+            .workspace_authority_answer(WorkspaceFactFamily::PythonModuleSpellings)
+            .expect("Python owns its module spelling authority");
+        let spellings = ReadKey::lookup(
+            brokk_bifrost_analysis::analyzer::read_ledger::LookupKind::WorkspaceFact,
+            brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::PythonModuleSpellings,
+                language: Language::Python,
+                subject: FactSubject::Whole,
+            },
+            answer,
+        );
+        // The operation memo keys the certificate too: reusing the scan under a
+        // different source snapshot cannot return an old namespace candidate.
+        *brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest(&[keys, spellings])
+            .digest()
+            .as_bytes()
+    }
+
     fn path_module_fqn(&self, module_fq: &str) -> Option<Vec<CodeUnit>> {
         self.inner.forward_path_module_fqn(module_fq)
     }
@@ -816,32 +1036,34 @@ impl PythonSource for PythonAnalyzer {
         // parsed yet still has a path-derived module name. The markers are read
         // through the project, so an overlay's unsaved `__path__` statement is
         // the evidence this snapshot's roots rest on (#3506).
-        self.module_spellings.get_or_build(
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "python.module_spellings",
-                    || {
-                        PythonModuleSpellings::build(
-                            self.inner.workspace_language_files(),
-                            self.inner.adapter().shared_project(),
-                        )
-                    },
-                )
-            },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "python.module_spellings",
-                    || {
-                        PythonModuleSpellings::build(
-                            self.inner.workspace_language_files(),
-                            self.inner.adapter().shared_project(),
-                        )
-                    },
-                )
-            },
-        )
+        self.module_spellings
+            .read(
+                &memo_attribution(self),
+                |(memo, digest)| {
+                    let value = brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
+                        self,
+                        memo,
+                        || {
+                            PythonModuleSpellings::build(
+                                self.inner.workspace_language_files(),
+                                self.inner.adapter().shared_project(),
+                            )
+                        },
+                        || {
+                            PythonModuleSpellings::build(
+                                self.inner.workspace_language_files(),
+                                self.inner.adapter().shared_project(),
+                            )
+                        },
+                    );
+                    let answer = complete_whole_fact(memo, digest, |value| {
+                        authority_digest(value.authority_rows())
+                    });
+                    (value, answer)
+                },
+                |(_, answer)| answer.map_or(AuthorityInputs::Unnamed, whole_fact),
+            )
+            .0
     }
 
     fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
@@ -893,6 +1115,43 @@ impl PythonSource for PythonAnalyzer {
 }
 
 impl PythonUsageSource for PythonAnalyzer {
+    fn module_binding_timeline(
+        &self,
+        file: &ProjectFile,
+        build: &mut dyn FnMut() -> brokk_bifrost_python::usage_index::ModuleBindingTimeline,
+    ) -> Arc<brokk_bifrost_python::usage_index::ModuleBindingTimeline> {
+        read_memo(
+            self,
+            &self.module_binding_timelines,
+            file.clone(),
+            || {
+                // The syntax builder itself reads nodes already selected by its caller.
+                // Retain that source obligation even when this memo was filled uncaptured.
+                if let Some(oid) = self.inner.resolve_live_oid_for_file(file) {
+                    self.record_read(self.inner.file_read_key(file, oid));
+                } else {
+                    self.record_unattributed_read();
+                }
+                Arc::new(build())
+            },
+            |_, _| 1,
+        )
+    }
+
+    fn scope_facts(
+        &self,
+        file: &ProjectFile,
+        build: &mut dyn FnMut() -> Option<brokk_bifrost_python::usage_index::PythonScopeFacts>,
+    ) -> Option<Arc<brokk_bifrost_python::usage_index::PythonScopeFacts>> {
+        cache::read_optional_memo(
+            self,
+            &self.scope_facts_by_file,
+            file.clone(),
+            || build().map(Arc::new),
+            |_, _| 1,
+        )
+    }
+
     fn usage_index(&self) -> Arc<PythonUsageIndex> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -1118,6 +1377,7 @@ impl CodeUnitIndex for PythonAnalyzer {
 }
 
 impl IAnalyzer for PythonAnalyzer {
+    brokk_bifrost_analysis::forward_query_read_ledger!();
     delegate_inner_procedure_fact_methods!();
 
     forward_relational_definition_batch!();
@@ -1176,7 +1436,9 @@ impl IAnalyzer for PythonAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -2014,49 +2276,67 @@ impl LanguageSupport for PythonSupport {
         max_nodes: usize,
         keep_going: &dyn Fn() -> bool,
     ) -> Option<bool> {
-        let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
-        let Ok(files) = python.project().all_files_shared() else {
-            return Some(false);
-        };
-        for file in files.iter() {
-            if !keep_going() {
-                return None;
-            }
-            if brokk_bifrost_core::analyzer::common::language_for_file(file) != Language::Python {
-                continue;
-            }
-            let Ok(source) = file.read_to_string() else {
-                return Some(false);
-            };
-            let mut parser = tree_sitter::Parser::new();
-            if parser
-                .set_language(&tree_sitter_python::LANGUAGE.into())
-                .is_err()
-            {
-                return Some(false);
-            }
-            let Some(tree) = parser.parse(&source, None) else {
-                return Some(false);
-            };
-            if tree.root_node().has_error() {
-                return Some(false);
-            }
-            let source_module =
-                brokk_bifrost_python::declarations::python_module_name(python.project(), file);
-            if brokk_bifrost_python::runtime_values::python_module_member_mutation(
-                tree.root_node(),
-                &source,
-                &source_module,
-                module,
-                member,
-                max_nodes,
-            )
-            .is_some()
-            {
-                return Some(false);
-            }
+        mutation_facts::module_member_mutation_free(analyzer, module, member, max_nodes, keep_going)
+    }
+
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: WorkspaceFactFamily,
+        language: Language,
+        subject: &FactSubject,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest> {
+        if language != Language::Python {
+            return None;
         }
-        keep_going().then_some(true)
+        let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+        match (family, subject) {
+            (
+                WorkspaceFactFamily::PythonModuleSpellings
+                | WorkspaceFactFamily::PythonDescendants
+                | WorkspaceFactFamily::PythonReverseImports
+                | WorkspaceFactFamily::PythonUsageIndex,
+                FactSubject::Whole,
+            ) => python.workspace_authority_answer(family),
+            (WorkspaceFactFamily::PythonSavedDefaults, FactSubject::Whole) => {
+                Some(python.saved_default_argument_safety().fact_fingerprint())
+            }
+            (
+                WorkspaceFactFamily::PythonModuleMemberMutation,
+                FactSubject::NamedMember { owner, member },
+            ) => Some(mutation_facts::answer_digest(
+                mutation_facts::module_member_mutation_free(
+                    analyzer,
+                    owner,
+                    member,
+                    200_000,
+                    &|| true,
+                )
+                .unwrap_or(false),
+            )),
+            (
+                WorkspaceFactFamily::PythonClassMemberMutation,
+                FactSubject::NameGroupMember { names, member },
+            ) => Some(mutation_facts::answer_digest(
+                mutation_facts::class_member_mutation_free(analyzer, names, member),
+            )),
+            (
+                WorkspaceFactFamily::PythonEnvironmentBinding,
+                FactSubject::FileNamedMember {
+                    rel_path,
+                    owner,
+                    member,
+                    environment,
+                },
+            ) => external_authority::environment_binding_answer(
+                analyzer,
+                rel_path,
+                owner,
+                member,
+                *environment,
+            ),
+            _ => None,
+        }
     }
 
     fn external_field_read_discharges_gap(
@@ -3178,6 +3458,101 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSup
     }
 }
 
+fn authority_digest(mut rows: Vec<String>) -> StableDigest {
+    use sha2::{Digest, Sha256};
+    rows.sort();
+    let mut digest = Sha256::new();
+    for row in rows {
+        digest.update((row.len() as u64).to_le_bytes());
+        digest.update(row.as_bytes());
+    }
+    StableDigest::from_array(digest.finalize().into())
+}
+
+fn whole_fact(answer: StableDigest) -> AuthorityInputs<'static> {
+    AuthorityInputs::Fact {
+        language: Language::Python,
+        subject: FactSubject::Whole,
+        answer,
+    }
+}
+
+fn reverse_import_digest(index: &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>) -> StableDigest {
+    authority_digest(
+        index
+            .iter()
+            .flat_map(|(target, files)| {
+                files.iter().map(move |file| {
+                    format!(
+                        "{:?}:{:?}",
+                        brokk_bifrost_core::path_utils::rel_path_string(target),
+                        brokk_bifrost_core::path_utils::rel_path_string(file)
+                    )
+                })
+            })
+            .collect(),
+    )
+}
+
+impl PythonAnalyzer {
+    fn descendants_authority_digest(&self) -> Option<StableDigest> {
+        // Whole covers both variant cells. Always force the complete unfiltered value,
+        // then project its edges without recording a recursive authority read.
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let scope =
+            brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope::whole_workspace(
+                &cancellation,
+            );
+        let query_scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
+        let answer = self.direct_descendant_index.read(&memo_attribution(self), |(memo, digest)| {
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(self, digest, || {
+                let mut classes: Vec<_> = self.all_declarations().filter(CodeUnit::is_class).collect();
+                classes.sort();
+                let index = brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool_independent(self, &memo.cell(&scope.variant()), || {
+                    brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index(self, self, &scope).expect("uncancelled hierarchy completes")
+                });
+                authority_digest(classes.iter().map(|class| {
+                    let mut children: Vec<_> = index.descendants(class).into_iter().map(|child| child.declaration_id()).collect(); children.sort();
+                    format!("{}:{children:?}", class.declaration_id())
+                }).collect())
+            })
+        }, |answer| whole_fact(*answer));
+        query_scope.read_completion().is_ok().then_some(answer)
+    }
+
+    pub fn workspace_authority_answer(&self, family: WorkspaceFactFamily) -> Option<StableDigest> {
+        Some(match family {
+            WorkspaceFactFamily::PythonModuleSpellings => {
+                PythonSource::module_spellings(self);
+                self.module_spellings.read(
+                    &memo_attribution(self),
+                    |(_, digest)| digest.get().copied(),
+                    |answer| answer.map_or(AuthorityInputs::Unnamed, whole_fact),
+                )?
+            }
+            WorkspaceFactFamily::PythonUsageIndex => {
+                let scope = AnalyzerQueryScope::new(self);
+                self.usage_index(scope.token(), &|| true)?;
+                self.usage_index.read(
+                    &memo_attribution(self),
+                    |(_, digest)| digest.get().copied(),
+                    |answer| answer.map_or(AuthorityInputs::Unnamed, whole_fact),
+                )?
+            }
+            WorkspaceFactFamily::PythonReverseImports => {
+                self.build_reverse_import_index();
+                self.reverse_import_index.read(
+                    &memo_attribution(self),
+                    |(_, digest)| digest.get().copied(),
+                    |answer| answer.map_or(AuthorityInputs::Unnamed, whole_fact),
+                )?
+            }
+            WorkspaceFactFamily::PythonDescendants => self.descendants_authority_digest()?,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
@@ -3205,7 +3580,11 @@ mod cancellation_tests {
             polls.get() >= 6,
             "the build reached the cancellation cutoff"
         );
-        assert!(!analyzer.usage_index.is_ready());
+        assert!(!analyzer.usage_index.read(
+            &memo_attribution(&analyzer),
+            |(memo, _)| memo.is_ready(),
+            |_| AuthorityInputs::Unnamed,
+        ));
 
         let index = analyzer
             .usage_index(scope.token(), &|| true)

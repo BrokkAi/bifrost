@@ -139,7 +139,11 @@ pub struct Observation {
 #[doc(hidden)]
 pub struct Report {
     pub observation: Observation,
-    pub published: bool,
+    pub registered_completion: Option<ResolutionCompletion>,
+    pub endpoint_completion: Option<ResolutionCompletion>,
+    pub candidate_path_count: usize,
+    pub candidate_targets: Vec<SemanticId>,
+    pub excludes_base: bool,
     pub dependencies: usize,
 }
 
@@ -160,7 +164,8 @@ impl<P: DemandRootProvider> DemandRootProvider for Observed<'_, P> {
         member_completion: &ResolutionCompletion,
         provenance: crate::analyzer::resolution::HierarchyProvenanceView<'_>,
         resume: crate::analyzer::resolution::CloseResume<'_>,
-    ) -> Result<crate::analyzer::resolution::CloseProgress<ResolutionCompletion>> {
+    ) -> Result<crate::analyzer::resolution::CloseProgress<crate::analyzer::resolution::RootClosure>>
+    {
         if let Some(selection) = initial_members {
             self.selections.borrow_mut().push(Observation {
                 owners: selection.owners.clone(),
@@ -194,7 +199,7 @@ impl<P: DemandRootProvider> DemandRootProvider for Observed<'_, P> {
         &mut self,
         endpoint: &DemandRelationKey,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> Result<ResolutionCompletion> {
+    ) -> Result<crate::analyzer::resolution::RootClosure> {
         self.inner.close(endpoint, inputs)
     }
     fn close_with_member_completion(
@@ -202,7 +207,7 @@ impl<P: DemandRootProvider> DemandRootProvider for Observed<'_, P> {
         endpoint: &DemandRelationKey,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         member_completion: &ResolutionCompletion,
-    ) -> Result<ResolutionCompletion> {
+    ) -> Result<crate::analyzer::resolution::RootClosure> {
         self.inner
             .close_with_member_completion(endpoint, inputs, member_completion)
     }
@@ -218,7 +223,7 @@ impl<P: DemandRootProvider> DemandRootProvider for Observed<'_, P> {
         endpoint: &DemandRelationKey,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         selection: &DemandMemberSelection,
-    ) -> Result<ResolutionCompletion> {
+    ) -> Result<crate::analyzer::resolution::RootClosure> {
         self.selections.borrow_mut().push(Observation {
             owners: selection.owners.clone(),
             completion: selection.completion.clone(),
@@ -830,11 +835,6 @@ pub fn run(
             "positive memo does not register again"
         );
     }
-    let published = trial_arena
-        .borrow()
-        .registrations
-        .contains_key(&DemandRelationKey::caller(endpoint.clone()));
-
     let mut trials = observed_trial.borrow_mut();
 
     assert_eq!(trials.len(), 1, "shared member phase executes once");
@@ -859,9 +859,55 @@ pub fn run(
         &trial_arena,
         operation,
     );
+    let key = DemandRelationKey::caller(endpoint.clone());
+    let arena = trial_arena.borrow();
+    let registered_completion = arena
+        .registered_endpoint(&endpoint)
+        .map(|registered| registered.completion.clone());
+    let candidate_paths = arena
+        .endpoints
+        .get(&key)
+        .map(|relation| {
+            relation
+                .added_candidate_paths(&lexical, cancellation)
+                .unwrap()
+                .unwrap()
+        })
+        .unwrap_or_default();
+    let endpoint_completion = arena.endpoint_completions.get(&key).cloned();
+    let excludes_base = arena.excluded_base.contains(&key);
+    drop(arena);
+    let requests = [crate::analyzer::resolution::BatchCandidateRequest::new(
+        0,
+        endpoint.clone(),
+    )];
+    let candidates = closed
+        .match_forward_candidates(&requests, cancellation)
+        .unwrap();
+    let candidate_ids = candidates
+        .matches()
+        .iter()
+        .map(|row| row.candidate())
+        .collect::<Vec<_>>();
+    let candidate_nodes = closed
+        .hydrate_candidate_paths(&candidate_ids, cancellation)
+        .unwrap()
+        .into_iter()
+        .map(|(_, path)| path.end().node())
+        .collect::<Vec<_>>();
+    let candidate_targets = closed
+        .classify_endpoint_nodes(&candidate_nodes, cancellation)
+        .unwrap()
+        .into_iter()
+        .filter_map(|node| node.definition())
+        .collect();
     Report {
         observation: trials.pop().unwrap(),
-        published,
+        registered_completion,
+        endpoint_completion,
+        candidate_path_count: candidate_paths.len(),
+        candidate_targets,
+        excludes_base,
         dependencies: dependencies.get(),
     }
 }
@@ -1156,6 +1202,16 @@ struct OrderLanguage<'a, 'store, 'input> {
     at_resume: fn() -> Result<()>,
 }
 impl DemandLanguage for OrderLanguage<'_, '_, '_> {
+    fn root_has_receipt(&self, endpoint: &EndpointSignature) -> bool {
+        self.inner.root_has_receipt(endpoint)
+    }
+    fn finalize_closure(
+        &mut self,
+        endpoint: &EndpointSignature,
+        closure: LanguageClosure,
+    ) -> Result<LanguageClosure> {
+        self.inner.finalize_closure(endpoint, closure)
+    }
     type RootQuestion = RootFrame;
     type ContextKey = ContextId;
     type ContextData = Option<SelectedResolutionContextSet>;

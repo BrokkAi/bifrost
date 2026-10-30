@@ -250,6 +250,7 @@ struct Derivations<D> {
     first: D,
     proven: Option<D>,
     complete: Option<D>,
+    certain: Option<D>,
 }
 
 /// Which derivations a path reconstruction follows.
@@ -258,6 +259,7 @@ enum Chain {
     First,
     Proven,
     Complete,
+    Certain,
 }
 
 impl<D: Clone> Derivations<D> {
@@ -265,6 +267,7 @@ impl<D: Clone> Derivations<D> {
         Self {
             proven: quality.proven.then(|| derivation.clone()),
             complete: quality.complete.then(|| derivation.clone()),
+            certain: quality.is_certain().then(|| derivation.clone()),
             first: derivation,
         }
     }
@@ -274,18 +277,26 @@ impl<D: Clone> Derivations<D> {
     fn improve(&mut self, held: HopQuality, quality: HopQuality, derivation: D) -> bool {
         let proven = quality.proven && !held.proven;
         let complete = quality.complete && !held.complete;
+        let certain = quality.is_certain() && !held.is_certain();
         if proven {
             self.proven = Some(derivation.clone());
         }
         if complete {
-            self.complete = Some(derivation);
+            self.complete = Some(derivation.clone());
         }
-        proven || complete
+        if certain {
+            self.certain = Some(derivation);
+        }
+        proven || complete || certain
     }
 
     fn get(&self, chain: Chain) -> &D {
         match chain {
             Chain::First => &self.first,
+            Chain::Certain => self
+                .certain
+                .as_ref()
+                .expect("a certain path's items are certain"),
             Chain::Proven => self
                 .proven
                 .as_ref()
@@ -1095,9 +1106,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
     /// composition dispatches do not depend on the order it finds paths in.
     ///
     /// Also returns one path class for the hop to name: the first whose
-    /// quality is best, counting proof and completeness alike. A witness
-    /// names the calls of one path, and this is the class a path of the
-    /// flow's best quality takes when one class gives both axes.
+    /// quality is best, preferring a certain class and otherwise counting
+    /// proof and completeness alike. A witness names the calls of one path,
+    /// and a certain flow must retain a class that supplies both axes.
     fn flow_quality(
         &mut self,
         procedure: &DurableProcedureKey,
@@ -1106,7 +1117,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<(HopQuality, Box<[CallSiteId]>), ComposeError> {
         assert!(!crossed.is_empty(), "a flow has at least one path class");
-        let score = |quality: HopQuality| u8::from(quality.proven) + u8::from(quality.complete);
+        let score = |quality: HopQuality| {
+            u8::from(quality.proven) + u8::from(quality.complete) + u8::from(quality.is_certain())
+        };
         let mut best = HopQuality::UNCERTAIN;
         let mut named: Option<(HopQuality, &Box<[CallSiteId]>)> = None;
         for class in crossed {
@@ -2011,8 +2024,8 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
         }
     }
 
-    /// The hops of one reach's path, from its source to its root: a proven
-    /// path when the reach has one, else a complete path, else its first.
+    /// The hops of one reach's path, from its source to its root: a certain
+    /// path when present, else a proven path, else a complete path, else its first.
     fn reach_path(&self, reach: usize) -> Vec<Hop> {
         enum Piece<'p> {
             Reach(usize),
@@ -2021,7 +2034,9 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
             Hop(&'p Hop),
         }
         let quality = self.reaches[reach].quality;
-        let chain = if quality.proven {
+        let chain = if quality.is_certain() {
+            Chain::Certain
+        } else if quality.proven {
             Chain::Proven
         } else if quality.complete {
             Chain::Complete
@@ -2113,10 +2128,10 @@ impl<'a, Provider: CompositionProvider> Search<'a, Provider> {
 
 /// The quality of an endpoint's selector evidence, axis by axis.
 fn evidence_quality(proof: &ProofStatus, completeness: &EvidenceCompleteness) -> HopQuality {
-    HopQuality {
-        proven: matches!(proof, ProofStatus::Proven),
-        complete: matches!(completeness, EvidenceCompleteness::Complete),
-    }
+    HopQuality::new(
+        matches!(proof, ProofStatus::Proven),
+        matches!(completeness, EvidenceCompleteness::Complete),
+    )
 }
 
 /// The call of a call input port.

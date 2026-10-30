@@ -18,6 +18,8 @@
 //!
 //! [`PolicyUnitKey`]: https://docs.rs/  (crates/bifrost-policy/src/units.rs)
 
+#[cfg(test)]
+use brokk_bifrost_semantic::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
 use git2::Oid;
 use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
 use std::collections::HashMap;
@@ -894,8 +896,8 @@ fn write_unit(
     let mut intern = conn.prepare_cached(
         "INSERT INTO policy_read_keys(
            key_digest, kind, family, languages, rel_path, name, index_key,
-           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18))
          ON CONFLICT(key_digest) DO NOTHING",
     )?;
     let mut find =
@@ -922,6 +924,9 @@ fn write_unit(
             columns.site_ordinal,
             columns.decl_kind,
             columns.decl_signature,
+            columns.workspace_fact_family,
+            columns.fact_member,
+            columns.fact_names,
         ])?;
         let read_id = find.query_row(params![columns.key_digest.as_slice()], |row| {
             row.get::<_, i64>(0)
@@ -1111,7 +1116,7 @@ fn load_unit_reads(conn: &rusqlite::Connection, unit_id: i64) -> Result<Vec<Read
     let mut statement = conn.prepare_cached(
         "SELECT keys.key_digest, keys.kind, keys.family, keys.languages, keys.rel_path,
                 keys.name, keys.index_key, keys.blob_oid, keys.subject,
-                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature
+                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature, keys.workspace_fact_family, keys.fact_member, json(keys.fact_names)
          FROM policy_unit_reads AS membership
          JOIN policy_read_keys AS keys ON keys.read_id = membership.read_id
          WHERE membership.unit_id = ?1",
@@ -1320,6 +1325,26 @@ mod tests {
                 digest,
             ),
             ReadKey::lookup(
+                LookupKind::WorkspaceFact,
+                LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::JsTsUsageIndex,
+                    language: Language::TypeScript,
+                    subject: FactSubject::Whole,
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::WorkspaceFact,
+                LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::FieldSlots,
+                    language: Language::Python,
+                    subject: FactSubject::Class {
+                        class: StableDigest::sha256(b"class"),
+                    },
+                },
+                digest,
+            ),
+            ReadKey::lookup(
                 LookupKind::ProcedureSummary,
                 LookupQuestion::Summary {
                     identity: StableDigest::sha256(b"summary"),
@@ -1462,7 +1487,24 @@ mod tests {
     #[test]
     fn a_published_unit_round_trips_with_every_read_key_shape() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
-        let reads = every_read_key_shape();
+        let mut reads = every_read_key_shape();
+        reads.extend(
+            super::super::read_keys::workspace_fact_subjects()
+                .into_iter()
+                .map(|subject| {
+                    ReadKey::lookup(
+                        LookupKind::WorkspaceFact,
+                        LookupQuestion::WorkspaceFact {
+                            family: WorkspaceFactFamily::FieldSlots,
+                            language: Language::Python,
+                            subject,
+                        },
+                        StableDigest::sha256(b"answer"),
+                    )
+                }),
+        );
+        reads.sort();
+        reads.dedup();
         store
             .publish_policy_units(vec![unit_row("src/Main.java", reads.clone())])
             .unwrap();
@@ -1479,6 +1521,62 @@ mod tests {
         assert_eq!(loaded.reads, expected);
         assert_eq!(loaded.key, seed_key("src/Main.java"));
         assert_eq!(loaded.product, "{\"rows\":[]}");
+        let conn = store.conn.lock().unwrap();
+        let text_name_group = ReadKey::lookup(
+            LookupKind::WorkspaceFact,
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::FieldSlots,
+                language: Language::Python,
+                subject: FactSubject::name_group_member(
+                    vec!["pkg.A".into(), "pkg.B".into()],
+                    "method".into(),
+                ),
+            },
+            StableDigest::sha256(b"answer"),
+        );
+        let text_columns = ReadKeyColumns::of(&text_name_group);
+        let text_error = conn
+            .execute(
+                "INSERT INTO policy_read_keys(
+                    key_digest,kind,family,languages,rel_path,name,index_key,blob_oid,subject,
+                    start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,
+                    workspace_fact_family,fact_member,fact_names
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                params![
+                    [0u8; 32].as_slice(),
+                    text_columns.kind,
+                    text_columns.family,
+                    text_columns.languages,
+                    text_columns.rel_path,
+                    text_columns.name,
+                    text_columns.index_key,
+                    text_columns.blob_oid,
+                    text_columns.subject,
+                    text_columns.start_byte,
+                    text_columns.end_byte,
+                    text_columns.digest,
+                    text_columns.site_ordinal,
+                    text_columns.decl_kind,
+                    text_columns.decl_signature,
+                    text_columns.workspace_fact_family,
+                    text_columns.fact_member,
+                    text_columns.fact_names,
+                ],
+            )
+            .expect_err("the STRICT BLOB column rejects TEXT fact_names");
+        assert!(
+            text_error
+                .to_string()
+                .contains("cannot store TEXT value in BLOB column"),
+            "{text_error}"
+        );
+        conn.execute("UPDATE policy_read_keys SET workspace_fact_family = 'unregistered' WHERE family = 'workspace_fact'", []).unwrap();
+        let unit_id = conn
+            .query_row("SELECT unit_id FROM policy_units", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert!(load_unit_reads(&conn, unit_id).unwrap_err().is_corrupt());
     }
 
     #[test]

@@ -3,9 +3,15 @@
 //! This is one caller's query. Package membership stays in SQLite; the source
 //! halves, candidate export halves and compiled bridges die with the query.
 
+/// Registered native incompleteness label; readers share this value.
+pub const GO_IMPORT_INCOMPLETE: &str = "go-import-incomplete";
+
 use super::file_context::RootHalfRequest;
 use super::placement_access::read_placement_rows;
-use super::root_bridges::{RootBridgePair, RootBridgeRules, assemble_root_bridges};
+use super::root_bridges::{
+    RootBridgePair, RootBridgeRules, RootBridgeStep, RootImportRules, RootTargetRules,
+    drive_root_imports,
+};
 use super::*;
 use crate::analyzer::resolution::{
     ResolutionLookupSemanticRecipe, SelectedResolutionMountContext, SelectedRootPathHalf,
@@ -252,7 +258,7 @@ pub(super) struct GoSelectedPackageInventory {
 #[derive(Clone)]
 pub(crate) struct GoContextSelection {
     pub(crate) identity: super::super::GoContextIdentity,
-    evidence: String,
+    pub(super) evidence: String,
     global_gap_count: i64,
 }
 
@@ -605,105 +611,23 @@ impl SelectedResolutionOperation<'_, '_> {
         {
             return Ok(GoDotImportContext::Cancelled);
         }
-        // Only dot imports publish root import paths, and this reader uses
-        // import halves alone, so a file without a dot import skips the
-        // inventory of every root path it owns.
-        let mut imports = Vec::new();
-        if self.go_mount_has_dot_import(source.ordinal()) {
-            let (halves, outcome) = self
-                .read_root_inventory(RootHalfRequest::Imports(&[source.ordinal()]), cancellation)?;
-            imports = halves;
-            if outcome.is_cancelled() {
-                return Ok(GoDotImportContext::Cancelled);
-            }
-        }
-        let mut bridges = Vec::new();
-        for import in imports {
-            let SelectedRootPathHalf::Import { route, demand, .. } = &import else {
-                continue;
-            };
-            let mut semantics = route.to_vec();
-            semantics.push(*demand);
-            let requests = semantics
-                .iter()
-                .map(|&semantic| SelectedLookupRecipeRequest {
-                    fragment: source.fragment(),
-                    semantic,
-                })
-                .collect::<Vec<_>>();
-            let Some(rows) =
-                self.read_context_recipes(&lexical, &requests, cancellation, |_| {})?
-            else {
-                return Ok(GoDotImportContext::Cancelled);
-            };
-            let mut recipes = rows
-                .into_iter()
-                .map(|row| {
-                    row.ok_or_else(|| {
-                        StoreError::corrupt("selected Go root lookup has no shared recipe")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let demand_recipe = recipes.pop().expect("one import demand");
-            let spelling = recipes
-                .iter()
-                .map(ResolutionLookupSemanticRecipe::spelling)
-                .collect::<Vec<_>>()
-                .join("/");
-            let Some(import_completion) = self.go_import_completion(
+        let bridges = match drive_root_imports(
+            &self.ready,
+            &GoDotImportRules {
+                operation: self,
+                source: &source,
+                lexical: &lexical,
                 context_id,
-                source.ordinal(),
                 file_version,
                 source_role,
-                &spelling,
-                &completion,
-                cancellation,
-            )?
-            else {
-                return Ok(GoDotImportContext::Cancelled);
-            };
-            let mut statement = connection.prepare_cached(&DOT_IMPORT_TARGET_MOUNTS)?;
-            let rows = statement.query_map(
-                rusqlite::params![context_id, file_version, source_role, spelling],
-                |row| row.get::<_, u32>(0),
-            )?;
-            let targets = rows.collect::<rusqlite::Result<BTreeSet<_>>>()?;
-            for target in targets {
-                if cancellation.is_cancelled() {
-                    return Ok(GoDotImportContext::Cancelled);
-                }
-                let ordinal = SelectedResolutionMountOrdinal::new(target);
-                let (exports, outcome) =
-                    self.read_root_inventory(RootHalfRequest::Exports(&[ordinal]), cancellation)?;
-                if outcome.is_cancelled() {
-                    return Ok(GoDotImportContext::Cancelled);
-                }
-                let names = self.ready.shared_names();
-                let assembly = assemble_root_bridges(
-                    &self.ready,
-                    exports.iter().map(|export_half| RootBridgePair {
-                        import_half: &import,
-                        export_half,
-                        extra: (),
-                    }),
-                    &GoDotRootBridgeRules {
-                        names: &names,
-                        target: ordinal,
-                        route: &recipes,
-                        demand: &demand_recipe,
-                        completion: &import_completion,
-                    },
-                    cancellation,
-                )?;
-                if assembly
-                    .completion
-                    .contains_reason(ResolutionIncompleteReason::Cancelled)
-                {
-                    return Ok(GoDotImportContext::Cancelled);
-                }
-                bridges.extend(assembly.descriptors);
-            }
-        }
+                completion: &completion,
+            },
+            cancellation,
+        )? {
+            RootBridgeStep::Ready(bridges) => bridges,
+            RootBridgeStep::Unavailable => return Ok(GoDotImportContext::Unavailable),
+            RootBridgeStep::Cancelled => return Ok(GoDotImportContext::Cancelled),
+        };
         let mount = SelectedResolutionMountContext::new(
             source.ordinal(),
             source.fragment(),
@@ -895,7 +819,7 @@ impl SelectedResolutionOperation<'_, '_> {
         hash.field("evidence", evidence.as_bytes());
         let reason = self.ready.context_identities.named_semantic(
             hash.finish(),
-            "go-import-incomplete",
+            GO_IMPORT_INCOMPLETE,
             &evidence,
         );
         base_completion.combine(&ResolutionCompletion::incomplete([
@@ -1070,10 +994,151 @@ impl super::super::resolution_typed::GoDefinitionContextBinder
     }
 }
 
+/// Source authority is loaded by the caller before the shared precheck.
+struct GoDotImportRules<'a, 'store, 'input> {
+    operation: &'a SelectedResolutionOperation<'store, 'input>,
+    source: &'a SelectedResolutionOperationMount,
+    lexical: &'a SelectedResolutionLexicalSource<'a, 'store>,
+    context_id: i64,
+    file_version: i64,
+    source_role: &'a str,
+    completion: &'a ResolutionCompletion,
+}
+
+struct GoDotImportPreparation {
+    recipes: Vec<ResolutionLookupSemanticRecipe>,
+    demand_recipe: ResolutionLookupSemanticRecipe,
+    spelling: String,
+    import_completion: ResolutionCompletion,
+}
+
+impl<'store, 'input> RootImportRules for GoDotImportRules<'_, 'store, 'input> {
+    type Prepared = GoDotImportPreparation;
+    type Target = SelectedResolutionMountOrdinal;
+    type TargetRules<'a>
+        = GoDotTargetRules<'a, 'store, 'input>
+    where
+        Self: 'a;
+
+    fn has_imports(&self) -> bool {
+        // Only dot imports publish root import paths. Skip the root inventory
+        // entirely for the common file without a dot import.
+        self.operation
+            .go_mount_has_dot_import(self.source.ordinal())
+    }
+
+    fn read_imports(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<RootBridgeStep<Vec<SelectedRootPathHalf>>> {
+        let (halves, outcome) = self.operation.read_root_inventory(
+            RootHalfRequest::Imports(&[self.source.ordinal()]),
+            cancellation,
+        )?;
+        Ok(if outcome.is_cancelled() {
+            RootBridgeStep::Cancelled
+        } else {
+            RootBridgeStep::Ready(halves)
+        })
+    }
+
+    fn prepare(
+        &self,
+        import: &SelectedRootPathHalf,
+        cancellation: &CancellationToken,
+    ) -> Result<RootBridgeStep<Self::Prepared>> {
+        let SelectedRootPathHalf::Import { route, demand, .. } = import else {
+            unreachable!("import-only driver");
+        };
+        let mut semantics = route.to_vec();
+        semantics.push(*demand);
+        let requests = semantics
+            .iter()
+            .map(|&semantic| SelectedLookupRecipeRequest {
+                fragment: self.source.fragment(),
+                semantic,
+            })
+            .collect::<Vec<_>>();
+        let Some(rows) =
+            self.operation
+                .read_context_recipes(self.lexical, &requests, cancellation, |_| {})?
+        else {
+            return Ok(RootBridgeStep::Cancelled);
+        };
+        let mut recipes = rows
+            .into_iter()
+            .map(|row| {
+                row.ok_or_else(|| {
+                    StoreError::corrupt("selected Go root lookup has no shared recipe")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let demand_recipe = recipes.pop().expect("one import demand");
+        let spelling = recipes
+            .iter()
+            .map(ResolutionLookupSemanticRecipe::spelling)
+            .collect::<Vec<_>>()
+            .join("/");
+        let Some(import_completion) = self.operation.go_import_completion(
+            self.context_id,
+            self.source.ordinal(),
+            self.file_version,
+            self.source_role,
+            &spelling,
+            self.completion,
+            cancellation,
+        )?
+        else {
+            return Ok(RootBridgeStep::Cancelled);
+        };
+        Ok(RootBridgeStep::Ready(GoDotImportPreparation {
+            recipes,
+            demand_recipe,
+            spelling,
+            import_completion,
+        }))
+    }
+
+    fn targets(&self, prepared: &Self::Prepared) -> Result<impl Iterator<Item = Self::Target>> {
+        let connection = self.operation.ready.inventory.connection();
+        let mut statement = connection.prepare_cached(&DOT_IMPORT_TARGET_MOUNTS)?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                self.context_id,
+                self.file_version,
+                self.source_role,
+                prepared.spelling
+            ],
+            |row| row.get::<_, u32>(0),
+        )?;
+        let targets = rows.collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        // Source mounts only; preserve the SQL reader's BTreeSet order.
+        Ok(targets.into_iter().map(SelectedResolutionMountOrdinal::new))
+    }
+
+    fn target_rules<'a>(
+        &'a self,
+        prepared: &'a Self::Prepared,
+        target: Self::Target,
+    ) -> Self::TargetRules<'a> {
+        GoDotTargetRules {
+            operation: self.operation,
+            prepared,
+            target,
+        }
+    }
+}
+
+struct GoDotTargetRules<'a, 'store, 'input> {
+    operation: &'a SelectedResolutionOperation<'store, 'input>,
+    prepared: &'a GoDotImportPreparation,
+    target: SelectedResolutionMountOrdinal,
+}
+
 /// The target inventory has already proved exact package and source-role
 /// authority. Admission compares the canonical import and export lookups.
 struct GoDotRootBridgeRules<'a> {
-    names: &'a dyn SharedNameInterner,
+    names: super::super::resolution::StoreSharedNames<'a>,
     target: SelectedResolutionMountOrdinal,
     route: &'a [ResolutionLookupSemanticRecipe],
     demand: &'a ResolutionLookupSemanticRecipe,
@@ -1143,7 +1208,7 @@ impl RootBridgeRules for GoDotRootBridgeRules<'_> {
             self.demand.clone(),
             self.completion.clone(),
         )
-        .with_selected_export(self.names, pair.export_half)
+        .with_selected_export(&self.names, pair.export_half)
     }
 
     fn fold_completion(
@@ -1152,5 +1217,48 @@ impl RootBridgeRules for GoDotRootBridgeRules<'_> {
         _descriptor: &SelectedRootBridgeDescriptor,
     ) {
         // Import evidence remains on its bridge, as before assembly.
+    }
+}
+
+impl<'a> RootTargetRules for GoDotTargetRules<'a, '_, '_> {
+    type Exports = Vec<SelectedRootPathHalf>;
+    type Bridges = GoDotRootBridgeRules<'a>;
+
+    fn read_exports(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<RootBridgeStep<Self::Exports>> {
+        let (exports, outcome) = self
+            .operation
+            .read_root_inventory(RootHalfRequest::Exports(&[self.target]), cancellation)?;
+        Ok(if outcome.is_cancelled() {
+            RootBridgeStep::Cancelled
+        } else {
+            RootBridgeStep::Ready(exports)
+        })
+    }
+
+    fn bridge_rules(&mut self, _exports: &Self::Exports) -> Self::Bridges {
+        GoDotRootBridgeRules {
+            names: self.operation.ready.shared_names(),
+            target: self.target,
+            route: &self.prepared.recipes,
+            demand: &self.prepared.demand_recipe,
+            completion: &self.prepared.import_completion,
+        }
+    }
+
+    fn pairs<'b>(
+        &'b self,
+        import: &'b SelectedRootPathHalf,
+        exports: &'b Self::Exports,
+        _rules: &'b Self::Bridges,
+    ) -> impl Iterator<Item = RootBridgePair<'b, ()>> {
+        // Demand equality deliberately stays in GoDotRootBridgeRules::admit.
+        exports.iter().map(move |export_half| RootBridgePair {
+            import_half: import,
+            export_half,
+            extra: (),
+        })
     }
 }

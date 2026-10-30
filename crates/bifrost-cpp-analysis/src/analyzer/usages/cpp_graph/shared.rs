@@ -1,3 +1,8 @@
+use brokk_bifrost_analysis::analyzer::common::QueryCacheCell;
+use brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    AuthorityInputs, CaptureScopedMemo, WorkspaceAuthorityMemo, memo_attribution,
+};
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
 use brokk_bifrost_cpp::declarations::cpp_sentinel_recovered_classes;
@@ -70,13 +75,13 @@ use brokk_bifrost_cpp::graph::resolver::{
     RecoveredCReferenceRanges, TargetSpec, TypeScanKey, VisibilityIndex,
 };
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 struct PreparedCppFile {
     prepared: Arc<PreparedSyntaxTree>,
     recovered_sentinel_classes: Vec<CppSentinelRecoveredClass>,
-    class_ranges: OnceLock<Arc<ClassRangeIndex>>,
+    class_ranges: WorkspaceAuthorityMemo<QueryCacheCell<Arc<ClassRangeIndex>>>,
 }
 
 #[cfg(test)]
@@ -119,7 +124,7 @@ fn retain_scan_spec(seen_type_specs: &mut HashSet<TypeScanKey>, spec: &TargetSpe
 
 pub(crate) struct CppQueryResolver<'a> {
     cpp: &'a CppAnalyzer,
-    class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
+    class_ranges: CaptureScopedMemo<HashMap<ProjectFile, Arc<ClassRangeIndex>>>,
 }
 
 /// One authoritative inverse batch over a fixed union of caller roots.
@@ -157,21 +162,32 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         resolver
             .cpp
             .bulk_file_states_for_query(roots.iter().cloned());
-        resolver.class_ranges = roots
-            .iter()
-            .map(|file| {
-                (
-                    file.clone(),
-                    Arc::new(ClassRangeIndex::build(analyzer, file)),
-                )
-            })
-            .collect();
+        resolver
+            .class_ranges
+            .read_mut(&memo_attribution(analyzer), |cache| {
+                *cache = roots
+                    .iter()
+                    .map(|file| {
+                        (
+                            file.clone(),
+                            Arc::new(ClassRangeIndex::build(analyzer, file)),
+                        )
+                    })
+                    .collect();
+            });
+
         #[cfg(any(test, feature = "test-support"))]
         resolver
             .cpp
             .record_authoritative_visibility_build_for_test();
         let dispatch = CppDispatch::new(analyzer, token);
-        let visibility = VisibilityIndex::build(resolver.cpp, token, &dispatch.source(), roots);
+        let visibility = VisibilityIndex::build(
+            resolver.cpp.read_capability(),
+            resolver.cpp,
+            token,
+            &dispatch.source(),
+            roots,
+        );
         Some(Self {
             analyzer,
             resolver,
@@ -229,7 +245,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
             cpp: resolve_analyzer::<CppAnalyzer>(analyzer)?,
-            class_ranges: HashMap::default(),
+            class_ranges: CaptureScopedMemo::default(),
         })
     }
 
@@ -256,6 +272,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         self.cpp.record_authoritative_visibility_build_for_test();
         let dispatch = CppDispatch::new(analyzer, token);
         let visibility = VisibilityIndex::build_with_cancellation(
+            self.cpp.read_capability(),
             self.cpp,
             token,
             &dispatch.source(),
@@ -451,8 +468,13 @@ impl CppQueryResolver<'_> {
                     sentinel_started.elapsed().as_millis(),
                 );
             }
-            let class_range_cell = OnceLock::new();
-            if let Some(class_ranges) = self.class_ranges.get(&file).cloned() {
+            let class_range_cell = QueryCacheCell::new();
+            if let Some(class_ranges) = self
+                .class_ranges
+                .read(&memo_attribution(self.cpp), |cache| {
+                    cache.get(&file).cloned()
+                })
+            {
                 assert!(
                     class_range_cell.set(class_ranges).is_ok(),
                     "class range cache is initialized once"
@@ -461,7 +483,10 @@ impl CppQueryResolver<'_> {
             let prepared_file = PreparedCppFile {
                 prepared,
                 recovered_sentinel_classes,
-                class_ranges: class_range_cell,
+                class_ranges: WorkspaceAuthorityMemo::new(
+                    WorkspaceFactFamily::CppClassRanges,
+                    class_range_cell,
+                ),
             };
             let effective_specs =
                 match brokk_bifrost_analysis::analyzer::relational_frontier::resolve_relational_frontier(
@@ -516,18 +541,27 @@ impl CppQueryResolver<'_> {
                     // The authoritative batch already built this index. Use it
                     // for every type scan, including malformed class bodies
                     // that do not produce a sentinel recovery record.
-                    if let Some(class_ranges) = prepared_file.class_ranges.get() {
-                        return Some(class_ranges.as_ref());
+                    if let Some(class_ranges) = prepared_file.class_ranges.read(
+                        &memo_attribution(self.cpp),
+                        |memo| memo.get().cloned(),
+                        |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+                    ) {
+                        return Some(class_ranges);
                     }
                     if prepared_file.recovered_sentinel_classes.is_empty() {
                         return None;
                     }
-                    Some(
-                        prepared_file
-                            .class_ranges
-                            .get_or_init(|| Arc::new(ClassRangeIndex::build(analyzer, &file)))
-                            .as_ref(),
-                    )
+                    Some(prepared_file.class_ranges.read(
+                        &memo_attribution(self.cpp),
+                        |memo| {
+                            brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                                analyzer,
+                                memo,
+                                || ClassRangeIndex::build(analyzer, &file),
+                            )
+                        },
+                        |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+                    ))
                 });
                 scan_prepared_file(
                     &source,
@@ -535,7 +569,7 @@ impl CppQueryResolver<'_> {
                     &file,
                     prepared_file.prepared.as_ref(),
                     &prepared_file.recovered_sentinel_classes,
-                    class_ranges,
+                    class_ranges.as_deref(),
                     spec,
                     &target_group,
                     &mut state,
@@ -673,7 +707,13 @@ impl<'a> CppEdgeResolver<'a> {
             .cloned()
             .collect();
         let dispatch = CppDispatch::new(analyzer, token);
-        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
+        let visibility = VisibilityIndex::build(
+            self.cpp.read_capability(),
+            self.cpp,
+            token,
+            &dispatch.source(),
+            &roots,
+        );
         build_cpp_edges(analyzer, token, &self.files, &visibility, domain, keep_file)
     }
 

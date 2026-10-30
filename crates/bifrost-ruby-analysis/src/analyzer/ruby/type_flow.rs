@@ -204,8 +204,12 @@ fn workspace_member_lookup(
         consume(&lookup);
     };
     let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let attribution = brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(
+        workspace.analyzer(),
+    );
     let semantic = RubySemanticIndex::build_for_lookup(
         RubyGraphSource {
+            attribution: &attribution,
             token: scope.token(),
             index: workspace.analyzer(),
             definitions: &definitions,

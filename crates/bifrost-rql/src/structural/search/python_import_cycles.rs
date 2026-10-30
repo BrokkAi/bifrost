@@ -3,6 +3,7 @@
 use super::*;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::{PersistedImportAdjacency, PersistedImportDirection};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::path::Path;
 
 pub(super) struct PythonImportCycleContext<'a> {
@@ -16,11 +17,11 @@ pub(super) struct PythonImportCycleContext<'a> {
 
 #[derive(Default)]
 pub(super) struct PythonImportCycleCache {
-    content_identity: Option<WorkspaceContentIdentity>,
-    identity_checked: bool,
-    graph_ready: bool,
-    refresh_attempted: bool,
-    read_scope_recorded: bool,
+    content_identity: CaptureScopedMemo<Option<WorkspaceContentIdentity>>,
+    identity_checked: CaptureScopedMemo<bool>,
+    graph_ready: CaptureScopedMemo<bool>,
+    refresh_attempted: CaptureScopedMemo<bool>,
+    read_scope_recorded: CaptureScopedMemo<bool>,
 }
 
 pub(super) struct PythonReverseImportReachability {
@@ -287,35 +288,45 @@ pub(super) fn cycle_content_identity(
     cache: &mut PythonImportCycleCache,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Option<WorkspaceContentIdentity> {
-    if !context.access_mode.permits_persisted_import_graph() {
-        report_incomplete(
-            diagnostics,
-            "Python import graph access is unavailable in this query mode.",
-        );
-        return None;
-    }
-    if !cache.identity_checked {
-        cache.content_identity = context.analyzer.workspace_content_identity();
-        cache.identity_checked = true;
-    }
-    let Some(identity) = cache.content_identity else {
-        report_incomplete(
-            diagnostics,
-            "Python import graph has no workspace content identity.",
-        );
-        return None;
-    };
-    context
-        .analyzer
-        .workspace_content_matches(identity)
-        .then_some(identity)
-        .or_else(|| {
-            report_incomplete(
-                diagnostics,
-                "workspace content changed before Python import cycle traversal.",
-            );
-            None
+    let PythonImportCycleCache {
+        identity_checked,
+        content_identity,
+        ..
+    } = cache;
+    let attribution = memo_attribution(context.analyzer);
+    identity_checked.read_mut(&attribution, |identity_checked| {
+        content_identity.read_mut(&attribution, |content_identity| {
+            if !context.access_mode.permits_persisted_import_graph() {
+                report_incomplete(
+                    diagnostics,
+                    "Python import graph access is unavailable in this query mode.",
+                );
+                return None;
+            }
+            if !*identity_checked {
+                *content_identity = context.analyzer.workspace_content_identity();
+                *identity_checked = true;
+            }
+            let Some(identity) = *content_identity else {
+                report_incomplete(
+                    diagnostics,
+                    "Python import graph has no workspace content identity.",
+                );
+                return None;
+            };
+            context
+                .analyzer
+                .workspace_content_matches(identity)
+                .then_some(identity)
+                .or_else(|| {
+                    report_incomplete(
+                        diagnostics,
+                        "workspace content changed before Python import cycle traversal.",
+                    );
+                    None
+                })
         })
+    })
 }
 
 pub(super) fn read_reverse_adjacency(
@@ -325,7 +336,17 @@ pub(super) fn read_reverse_adjacency(
     cache: &mut PythonImportCycleCache,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Option<PersistedImportAdjacency> {
-    if !cache.read_scope_recorded
+    let PythonImportCycleCache {
+        read_scope_recorded,
+        graph_ready,
+        refresh_attempted,
+        ..
+    } = cache;
+    let attribution = memo_attribution(context.analyzer);
+    read_scope_recorded.read_mut(&attribution, |read_scope_recorded| {
+        graph_ready.read_mut(&attribution, |graph_ready| {
+            refresh_attempted.read_mut(&attribution, |refresh_attempted| {
+    if !*read_scope_recorded
         && (brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
             context.analyzer.read_ledger_attached()
         }))
@@ -334,7 +355,7 @@ pub(super) fn read_reverse_adjacency(
         context
             .analyzer
             .record_read(context.analyzer.workspace_scope_read_key(&languages));
-        cache.read_scope_recorded = true;
+        *read_scope_recorded = true;
     }
 
     let edge_limit = context
@@ -349,7 +370,7 @@ pub(super) fn read_reverse_adjacency(
     );
     match read {
         Ok(Some(adjacency)) if context.analyzer.workspace_content_matches(identity) => {
-            cache.graph_ready = true;
+            *graph_ready = true;
             Some(adjacency)
         }
         Ok(Some(_)) => {
@@ -359,8 +380,8 @@ pub(super) fn read_reverse_adjacency(
             );
             None
         }
-        Ok(None) if !cache.graph_ready && !cache.refresh_attempted => {
-            cache.refresh_attempted = true;
+        Ok(None) if !*graph_ready && !*refresh_attempted => {
+            *refresh_attempted = true;
             let max_files = context
                 .limits
                 .max_scanned_files
@@ -408,7 +429,7 @@ pub(super) fn read_reverse_adjacency(
                         Ok(Some(adjacency))
                             if context.analyzer.workspace_content_matches(identity) =>
                         {
-                            cache.graph_ready = true;
+                            *graph_ready = true;
                             Some(adjacency)
                         }
                         Ok(Some(_)) => {
@@ -456,6 +477,9 @@ pub(super) fn read_reverse_adjacency(
             None
         }
     }
+    })
+        })
+    })
 }
 
 pub(super) fn charge_import_file(context: &mut PythonImportCycleContext<'_>) -> Option<()> {

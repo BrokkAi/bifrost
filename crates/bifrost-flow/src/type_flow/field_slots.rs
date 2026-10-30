@@ -1,5 +1,6 @@
 //! Class-owned field values and receiver-scoped workspace store evidence.
 
+use crate::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,12 +20,13 @@ use crate::analyzer::semantic::{MemberAccessKind, MemberReceiverQuery};
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::store::class_set_field_slots::{
+    CLASS_SET_FIELD_SLOT_SOURCE_KINDS, CLASS_SET_FIELD_SLOT_UNKNOWN_REASONS,
     ClassSetFieldSlotArtifactRow, ClassSetFieldSlotAtomRow, ClassSetFieldSlotAtomValueRow,
     ClassSetFieldSlotClassRow, ClassSetFieldSlotIndexKey, ClassSetFieldSlotIndexRow,
     ClassSetFieldSlotRow, ClassSetFieldSlotSourceRow, ClassSetFieldStoreRow,
     ClassSetFieldStoreSurveyRow,
 };
-use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, Language, ProjectFile, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
 use crate::value_flow::ValueFlowCache;
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
@@ -1040,7 +1042,13 @@ impl FieldSlotIndex {
                                         ClassSetFieldSlotAtomValueRow::Class(persist_class(class)?)
                                     }
                                     ClassAtom::Unknown(reason) => {
-                                        ClassSetFieldSlotAtomValueRow::Unknown(reason.to_string())
+                                        let label = reason.to_string();
+                                        debug_assert!(
+                                            CLASS_SET_FIELD_SLOT_UNKNOWN_REASONS
+                                                .contains(&label.as_str()),
+                                            "unsupported field-slot unknown reason: {reason:?}"
+                                        );
+                                        ClassSetFieldSlotAtomValueRow::Unknown(label)
                                     }
                                 },
                                 source: persist_source(source)?,
@@ -1243,6 +1251,7 @@ impl FieldSlotIndex {
         class: &ClassIdentity,
         member: &str,
     ) -> MemberStoreEvidence {
+        self.record_class_read(workspace, adapter.language(), class);
         if adapter.member_surface_is_closed(workspace, class) {
             return MemberStoreEvidence::NoStore;
         }
@@ -1256,6 +1265,9 @@ impl FieldSlotIndex {
             return MemberStoreEvidence::Stored;
         }
         let hierarchy = adapter.class_hierarchy(workspace, class);
+        for ancestor in &hierarchy.ancestors {
+            self.record_class_read(workspace, adapter.language(), ancestor);
+        }
         if hierarchy.ancestors.iter().any(has_store) {
             return MemberStoreEvidence::Stored;
         }
@@ -1285,6 +1297,7 @@ impl FieldSlotIndex {
         class: &ClassIdentity,
         member: &str,
     ) -> Option<Vec<DynamicWriteEvidence>> {
+        self.record_class_read(workspace, adapter.language(), class);
         let closed = adapter.member_surface_is_closed(workspace, class);
         let hierarchy = adapter.class_hierarchy(workspace, class);
         let mut evidence = Vec::new();
@@ -1317,6 +1330,7 @@ impl FieldSlotIndex {
         class: &ClassIdentity,
         member: &str,
     ) -> Option<Vec<DynamicWriteEvidence>> {
+        self.record_class_read(workspace, adapter.language(), class);
         let evidence =
             self.unbounded_any_dynamic_write_evidence(workspace, adapter, class, member)?;
         let hierarchy = adapter.class_hierarchy(workspace, class);
@@ -1337,6 +1351,7 @@ impl FieldSlotIndex {
         class: &ClassIdentity,
         member: &str,
     ) -> impl Iterator<Item = &DynamicWriteEvidence> {
+        self.record_class_read(workspace, adapter.language(), class);
         let closed = adapter.member_surface_is_closed(workspace, class);
         let hierarchy = adapter.class_hierarchy(workspace, class);
         self.store_survey
@@ -1346,14 +1361,28 @@ impl FieldSlotIndex {
             .map(|write| &write.evidence)
     }
 
-    pub fn slot(&self, class: &ClassIdentity, member: &str) -> Option<&FieldSlot> {
+    pub fn slot(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        class: &ClassIdentity,
+        member: &str,
+    ) -> Option<&FieldSlot> {
+        self.record_class_read(workspace, adapter.language(), class);
         self.lookup
             .get(class)?
             .get(member)
             .map(|index| &self.slots[*index])
     }
 
-    pub(super) fn atom_is_open_bound(&self, slot: &FieldSlot, atom_index: usize) -> bool {
+    pub(super) fn atom_is_open_bound(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        slot: &FieldSlot,
+        atom_index: usize,
+    ) -> bool {
+        self.record_class_read(workspace, adapter.language(), &slot.class);
         let slot_index = *self
             .lookup
             .get(&slot.class)
@@ -1365,6 +1394,92 @@ impl FieldSlotIndex {
         );
         self.open_bound_class_sources
             .contains(&(slot_index, atom_index))
+    }
+
+    fn record_class_read(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        language: Language,
+        class: &ClassIdentity,
+    ) {
+        let identity = field_slot_class_identity(class);
+        crate::analyzer::workspace_authority::record_workspace_authority_read(
+            workspace.analyzer(),
+            WorkspaceFactFamily::FieldSlots,
+            crate::analyzer::workspace_authority::AuthorityInputs::Fact {
+                language,
+                subject: FactSubject::Class { class: identity },
+                answer: self.content_for_class(class),
+            },
+        );
+    }
+
+    /// Answer a mount-free per-class read from this bounded snapshot's index.
+    /// Absence is recorded too, so a later first slot invalidates the read.
+    pub fn class_content(&self, identity: StableDigest) -> StableDigest {
+        let class = self
+            .lookup
+            .keys()
+            .chain(self.store_survey.stores.keys())
+            .find(|class| field_slot_class_identity(class) == identity);
+        self.project_class_content(class)
+    }
+
+    fn content_for_class(&self, class: &ClassIdentity) -> StableDigest {
+        self.project_class_content(Some(class))
+    }
+
+    fn project_class_content(&self, class: Option<&ClassIdentity>) -> StableDigest {
+        let slots = class.and_then(|class| self.lookup.get(class));
+        let stores = class.and_then(|class| self.store_survey.stores.get(class));
+        if slots.is_none()
+            && stores.is_none()
+            && self.store_survey.unowned_members.is_empty()
+            && !self.store_survey.unknown_members
+            && self.store_survey.dynamic_effects.is_empty()
+        {
+            return crate::analyzer::read_ledger::absent_summary_digest();
+        }
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-field-slot-class-content-v2");
+        if let Some(slots) = slots {
+            let mut indices = slots.values().copied().collect::<Vec<_>>();
+            indices.sort_unstable();
+            for index in indices {
+                push_slot(
+                    &mut digest,
+                    &self.slots[index],
+                    index,
+                    &self.open_bound_class_sources,
+                );
+            }
+        }
+        // Global unknown names and bounded effects can affect a class with no
+        // slots at all. Include every effect: applicability also depends on the
+        // separately recorded hierarchy, which this mount-free question lacks.
+        push_survey_effects(&mut digest, &self.store_survey);
+        for (label, members) in [
+            (b"owned".as_slice(), stores),
+            (
+                b"unowned".as_slice(),
+                Some(&self.store_survey.unowned_members),
+            ),
+        ] {
+            if let Some(members) = members {
+                let mut names = members.iter().collect::<Vec<_>>();
+                names.sort_unstable();
+                for name in names {
+                    digest.push(label);
+                    digest.push(name.as_bytes());
+                }
+            }
+        }
+        digest.finish()
+    }
+
+    /// Whether this complete snapshot can answer reads outside its build.
+    /// Budget-dependent gaps and source refusals must never verify a unit.
+    pub const fn is_shareable(&self) -> bool {
+        self.memory_shareable
     }
 
     pub const fn digest(&self) -> StableDigest {
@@ -2356,6 +2471,27 @@ fn digest_dynamic_field_names(digest: &mut LengthDelimitedDigest, names: &Dynami
     }
 }
 
+fn push_survey_effects(digest: &mut LengthDelimitedDigest, survey: &FieldStoreSurvey) {
+    digest.push(&[u8::from(survey.unknown_members)]);
+    for write in &survey.dynamic_effects {
+        digest.push(write.evidence.origin().as_bytes());
+        digest.push(&write.evidence.site.span.start_byte().to_le_bytes());
+        digest.push(&write.evidence.site.span.end_byte().to_le_bytes());
+        digest.push(source_kind_label(write.evidence.site.kind).as_bytes());
+        digest.push(&[u8::from(write.evidence.reason.is_some())]);
+        digest.push(&[u8::from(write.global)]);
+        digest_dynamic_field_names(digest, &write.names);
+        for class in &write.classes {
+            digest.push(b"exact");
+            push_class(digest, class);
+        }
+        for bound in &write.bounds {
+            digest.push(b"bound");
+            push_class(digest, bound);
+        }
+    }
+}
+
 fn digest_index(
     slots: &[FieldSlot],
     open_bound_class_sources: &HashSet<(usize, usize)>,
@@ -2364,20 +2500,7 @@ fn digest_index(
 ) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-field-index-v2");
     digest.push(digest_slots(slots, open_bound_class_sources, semantics).as_bytes());
-    digest.push(&[u8::from(survey.unknown_members)]);
-    for write in &survey.dynamic_effects {
-        digest.push(write.evidence.origin().as_bytes());
-        digest.push(&[u8::from(write.global)]);
-        digest_dynamic_field_names(&mut digest, &write.names);
-        for class in &write.classes {
-            digest.push(b"exact");
-            push_class(&mut digest, class);
-        }
-        for bound in &write.bounds {
-            digest.push(b"bound");
-            push_class(&mut digest, bound);
-        }
-    }
+    push_survey_effects(&mut digest, survey);
     for (owner, member) in survey.ordered_stores() {
         match owner {
             Some(owner) => {
@@ -2399,28 +2522,44 @@ fn digest_slots(
     let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-field-slots-v1");
     digest.push(semantics.as_bytes());
     for (slot_index, slot) in slots.iter().enumerate() {
-        push_class(&mut digest, &slot.class);
-        digest.push(slot.member.as_bytes());
-        for (atom_index, (atom, site)) in slot.atoms.iter().enumerate() {
-            match atom {
-                ClassAtom::Class(class) => {
-                    digest.push(b"class");
-                    push_class(&mut digest, class);
-                }
-                ClassAtom::Unknown(reason) => {
-                    digest.push(b"unknown");
-                    digest.push(reason.to_string().as_bytes());
-                }
-            }
-            digest.push(site.file.rel_path().to_string_lossy().as_bytes());
-            digest.push(&site.span.start_byte().to_le_bytes());
-            digest.push(&site.span.end_byte().to_le_bytes());
-            digest.push(source_kind_label(site.kind).as_bytes());
-            digest.push(&[u8::from(
-                open_bound_class_sources.contains(&(slot_index, atom_index)),
-            )]);
-        }
+        push_slot(&mut digest, slot, slot_index, open_bound_class_sources);
     }
+    digest.finish()
+}
+
+fn push_slot(
+    digest: &mut LengthDelimitedDigest,
+    slot: &FieldSlot,
+    slot_index: usize,
+    open_bound_class_sources: &HashSet<(usize, usize)>,
+) {
+    push_class(digest, &slot.class);
+    digest.push(slot.member.as_bytes());
+    for (atom_index, (atom, site)) in slot.atoms.iter().enumerate() {
+        match atom {
+            ClassAtom::Class(class) => {
+                digest.push(b"class");
+                push_class(digest, class);
+            }
+            ClassAtom::Unknown(reason) => {
+                digest.push(b"unknown");
+                digest.push(reason.to_string().as_bytes());
+            }
+        }
+        digest.push(site.file.rel_path().to_string_lossy().as_bytes());
+        digest.push(&site.span.start_byte().to_le_bytes());
+        digest.push(&site.span.end_byte().to_le_bytes());
+        digest.push(source_kind_label(site.kind).as_bytes());
+        digest.push(&[u8::from(
+            open_bound_class_sources.contains(&(slot_index, atom_index)),
+        )]);
+    }
+}
+
+/// Stable identity used by per-class field-slot reads and their replay.
+pub fn field_slot_class_identity(class: &ClassIdentity) -> StableDigest {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-field-slot-class-identity-v1");
+    push_class(&mut digest, class);
     digest.finish()
 }
 
@@ -2451,8 +2590,8 @@ fn push_class(digest: &mut LengthDelimitedDigest, class: &ClassIdentity) {
 /// from declarations and stores. A guard arm proves a class inside one root's
 /// plan and never seeds a slot, which is why the persisted vocabulary does not
 /// name it.
-const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
-    match kind {
+fn source_kind_label(kind: SourceSiteKind) -> &'static str {
+    let label = match kind {
         SourceSiteKind::ConstructorCall => "constructor_call",
         SourceSiteKind::ExactAccessResult => "exact_access_result",
         SourceSiteKind::ExactCallResult => "exact_call_result",
@@ -2464,7 +2603,9 @@ const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
         SourceSiteKind::NarrowingGuard | SourceSiteKind::ConditionalNarrowingGuard => {
             panic!("a field-slot source is never a guard-proved class")
         }
-    }
+    };
+    debug_assert!(CLASS_SET_FIELD_SLOT_SOURCE_KINDS.contains(&label));
+    label
 }
 
 #[cfg(test)]

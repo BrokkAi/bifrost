@@ -89,6 +89,22 @@ pub fn unique_class_from_candidates<'a>(
 }
 
 pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
+    /// Completeness of the import-split inventory. Analyzer implementations
+    /// certify the inventory even when an import proof performs no name seek.
+    fn import_inventory_is_complete(&self) -> bool {
+        self.has_complete_symbol_lookup_index()
+    }
+
+    /// Resolve one written type name through this file's imports and package.
+    /// The analyzer certifies the candidate answer, including absence and
+    /// on-demand import ambiguity, without reading the whole class inventory.
+    fn resolve_imported_type_name(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit>;
+
     fn declaration_source_facts(
         &self,
         token: QueryToken<'_>,
@@ -893,7 +909,7 @@ fn java_import_inventory<'a>(
     source: &dyn JavaSource,
     classes_at: &'a dyn Fn(&str) -> Vec<CodeUnit>,
 ) -> JavaImportInventory<'a> {
-    if source.has_complete_symbol_lookup_index() {
+    if source.import_inventory_is_complete() {
         JavaImportInventory::exhaustive(classes_at)
     } else {
         JavaImportInventory::partial(classes_at)
@@ -1098,7 +1114,7 @@ pub fn java_type_name_candidate_fqns(
 /// (`same_source_hierarchy_identity`, #2045). It leads the list; the rest stay
 /// behind it for the import-split proof, which needs every reading of a name
 /// rather than the tier's one pick.
-fn forward_source_classes_by_fqn(
+pub fn forward_source_classes_by_fqn(
     source: &dyn JavaSource,
     file: &ProjectFile,
     fqn: &str,
@@ -1121,7 +1137,7 @@ fn forward_source_classes_by_fqn(
 
 /// The single answer of a candidate set, or `None` when the set is empty or
 /// holds ambiguous peers no tier could prove unique.
-fn unique_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
+pub fn unique_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 

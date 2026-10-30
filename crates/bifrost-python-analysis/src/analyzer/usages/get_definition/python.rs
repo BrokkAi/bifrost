@@ -374,6 +374,7 @@ pub(crate) fn request_definition_context(
                     analyzer,
                     token,
                     file,
+                    *key.source.as_bytes(),
                     #[cfg(test)]
                     Arc::clone(&memo.build_counters),
                 )
@@ -385,6 +386,11 @@ pub(crate) fn request_definition_context(
     });
     if !built_here.get() {
         brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(analyzer, &entry.reads);
+        debug_assert!(entry.reads.keys_satisfy(|key| {
+            brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers(
+                analyzer, key,
+            )
+        }));
     }
     Arc::clone(&entry.value)
 }
@@ -5312,6 +5318,7 @@ pub(crate) struct PythonDefinitionContext {
     module_bindings: OnceLock<Arc<ModuleBindingTimeline>>,
     scoped_import_bindings: OnceLock<Arc<Vec<PythonImportBinding>>>,
     imports: Vec<brokk_bifrost_core::analyzer::model::ImportInfo>,
+    source_sha256: [u8; 32],
     receiver_types: Mutex<PythonReceiverTypeCache>,
     #[cfg(test)]
     build_counters: Arc<PythonDefinitionBuildCounters>,
@@ -5333,6 +5340,10 @@ impl PythonReceiverTypeCache {
 
 impl PythonDefinitionContext {
     fn name_shadowed_at(&self, name: &str, reference: Node<'_>, source: &str) -> bool {
+        debug_assert!({
+            let keys = brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(source);
+            keys.as_bytes() == &self.source_sha256
+        });
         // The context key already names the exact source. Cached inventories
         // contain owned binding facts, never nodes borrowed from another tree.
         let mut scopes = self
@@ -5347,6 +5358,7 @@ impl PythonDefinitionContext {
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         file: &ProjectFile,
+        source_sha256: [u8; 32],
         #[cfg(test)] build_counters: Arc<PythonDefinitionBuildCounters>,
     ) -> Self {
         let binder = py.import_binder_of(token, file);
@@ -5380,6 +5392,7 @@ impl PythonDefinitionContext {
         }
         Self {
             file: file.clone(),
+            source_sha256,
             named,
             namespace,
             same_file,
@@ -5461,6 +5474,12 @@ impl PythonDefinitionContext {
             .values
             .get(&key)
         {
+            debug_assert_eq!(
+                cached.reads.digest(),
+                brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest(
+                    &cached.reads.keys()
+                )
+            );
             brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(
                 analyzer,
                 &cached.reads,
@@ -5542,6 +5561,10 @@ impl PythonDefinitionContext {
         root: Node<'_>,
     ) -> Option<Arc<PythonScopeFacts>> {
         if let Some(entry) = self.scope_facts.get() {
+            debug_assert_eq!(
+                entry.reads.digest(),
+                brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest(&entry.reads.keys())
+            );
             brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(
                 analyzer,
                 &entry.reads,
@@ -5576,6 +5599,10 @@ impl PythonDefinitionContext {
     }
 
     fn module_bindings(&self, source: &str, root: Node<'_>) -> Arc<ModuleBindingTimeline> {
+        debug_assert!({
+            let keys = brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(source);
+            keys.as_bytes() == &self.source_sha256
+        });
         self.module_bindings
             .get_or_init(|| Arc::new(collect_module_binding_timeline(root, source, &self.imports)))
             .clone()
@@ -5586,6 +5613,10 @@ impl PythonDefinitionContext {
         source: &str,
         root: Node<'_>,
     ) -> Arc<Vec<PythonImportBinding>> {
+        debug_assert!({
+            let keys = brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(source);
+            keys.as_bytes() == &self.source_sha256
+        });
         self.scoped_import_bindings
             .get_or_init(|| {
                 Arc::new(python_import_bindings_from_imports(

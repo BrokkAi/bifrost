@@ -307,8 +307,20 @@ pub(super) fn declaration_at_locator(
     file: &ProjectFile,
 ) -> Option<CodeUnit> {
     let span = locator.anchor().span();
-    let start = span.start_byte() as usize;
-    let end = span.end_byte() as usize;
+    declaration_at_byte_range(
+        analyzer,
+        span.start_byte() as usize..span.end_byte() as usize,
+        file,
+    )
+}
+
+pub(super) fn declaration_at_byte_range(
+    analyzer: &dyn IAnalyzer,
+    range: std::ops::Range<usize>,
+    file: &ProjectFile,
+) -> Option<CodeUnit> {
+    let start = range.start;
+    let end = range.end;
     let mut enclosing: Option<(usize, CodeUnit)> = None;
     for unit in analyzer.get_declarations(file) {
         if unit.is_synthetic() || unit.is_file_scope() {

@@ -87,7 +87,13 @@ use crate::text_utils::compute_line_starts;
 
 use rayon::prelude::*;
 
-use std::sync::{Arc, OnceLock};
+use crate::analyzer::read_ledger::ReadKey;
+use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry, memo_attribution};
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex, OnceLock};
+
+type RelationMemo<K, V> = ReplayingMemo<Mutex<HashMap<K, Arc<ReplayingMemoEntry<V, ReadKey>>>>>;
+type ReplayingCell<V> = ReplayingMemo<OnceLock<Arc<ReplayingMemoEntry<V, ReadKey>>>>;
 
 /// The file a scan unit reads: a bare file scans whole, a file with demanded
 /// lines scans only those lines' reference rows. Declared for
@@ -406,7 +412,9 @@ pub struct ReferenceSiteClassifier<'analyzer> {
     nearest_declarations: Box<[Option<NearestDeclaration>]>,
     nearest_assignments: Box<[Option<u32>]>,
     site_identities: SiteIdentityIndex,
-    import_bindings: OnceLock<Option<HashSet<u32>>>,
+    // The fill can read other files to prove import declarations, so a hit
+    // replays the fill's reads into whichever capture asks.
+    import_bindings: ReplayingCell<Option<HashSet<u32>>>,
 }
 
 /// Source-derived state shared by selected reference file wrappers.
@@ -566,13 +574,14 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             nearest_declarations: nearest_declarations.into_boxed_slice(),
             nearest_assignments: nearest_assignments.into_boxed_slice(),
             site_identities,
-            import_bindings: OnceLock::new(),
+            import_bindings: ReplayingMemo::new(OnceLock::new()),
         })
     }
 
     /// Native demand inputs may also read an import's local binding. Its
     /// structured occurrence is still an import, not another runtime use.
-    pub(crate) fn is_import_binding_reference(
+    #[doc(hidden)]
+    pub fn is_import_binding_reference(
         &self,
         file: &ProjectFile,
         start_byte: usize,
@@ -591,7 +600,12 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             return false;
         }
         self.import_bindings
-            .get_or_init(|| import_binding_nodes_for_file(self.analyzer, file))
+            .read(&memo_attribution(self.analyzer), |cell, capture| {
+                Ok::<_, Infallible>(Arc::clone(cell.get_or_init(|| {
+                    Arc::new(capture.build(|| import_binding_nodes_for_file(self.analyzer, file)))
+                })))
+            })
+            .unwrap()
             .as_ref()
             .is_some_and(|bindings| bindings.contains(&node))
     }
@@ -1262,9 +1276,16 @@ pub fn classify_owner_relation(
 /// ancestors again, canonicalising each type on the way. A type's ancestors do
 /// not change within a request. The owner holds one memo per stage and drops
 /// it with the stage, so no memo outlives the stage that filled it.
-#[derive(Default)]
 pub struct OwnerRelationMemo {
-    ancestors: HashMap<CodeUnit, Vec<CodeUnit>>,
+    ancestors: RelationMemo<CodeUnit, Vec<CodeUnit>>,
+}
+
+impl Default for OwnerRelationMemo {
+    fn default() -> Self {
+        Self {
+            ancestors: ReplayingMemo::new(Mutex::default()),
+        }
+    }
 }
 
 impl OwnerRelationMemo {
@@ -1283,8 +1304,23 @@ impl OwnerRelationMemo {
             target,
             |hierarchy, site, target| {
                 ancestors
-                    .entry(site.clone())
-                    .or_insert_with(|| hierarchy.get_ancestors(site))
+                    .read(&memo_attribution(analyzer), |cache, capture| {
+                        if let Some(entry) = cache
+                            .lock()
+                            .expect("owner relation memo poisoned")
+                            .get(site)
+                            .cloned()
+                        {
+                            return Ok::<_, Infallible>(entry);
+                        }
+                        let entry = Arc::new(capture.build(|| hierarchy.get_ancestors(site)));
+                        cache
+                            .lock()
+                            .expect("owner relation memo poisoned")
+                            .insert(site.clone(), Arc::clone(&entry));
+                        Ok(entry)
+                    })
+                    .unwrap()
                     .contains(target)
             },
         )
@@ -1690,9 +1726,16 @@ enum SelectedInverseLanguage {
 /// One handle per language per request shares admission and generation binding
 /// across the subjects an `edges_of` query or an edge assert names. Each target
 /// query owns its candidates and results; the handle retains no workspace map.
-#[derive(Default)]
 pub struct SelectedInverseEdgeCache {
-    languages: HashMap<crate::analyzer::Language, SelectedInverseLanguage>,
+    languages: RelationMemo<crate::analyzer::Language, SelectedInverseLanguage>,
+}
+
+impl Default for SelectedInverseEdgeCache {
+    fn default() -> Self {
+        Self {
+            languages: ReplayingMemo::new(Mutex::default()),
+        }
+    }
 }
 
 impl SelectedInverseEdgeCache {
@@ -1711,37 +1754,59 @@ impl SelectedInverseEdgeCache {
             "selected_inverse_reference_provider",
         )?
         .selected_inverse_reference_provider()?;
-        let state = self.languages.entry(language).or_insert_with(|| {
-            match provider.build_selected_inverse_index(analyzer, cancellation) {
-                SelectedInverseIndexOutcome::Ready(index) => SelectedInverseLanguage::Ready(index),
-                SelectedInverseIndexOutcome::Cancelled => {
-                    SelectedInverseLanguage::Refused(EdgeIncompleteReason::Cancelled)
+        let state = self
+            .languages
+            .read(&memo_attribution(analyzer), |cache, capture| {
+                if let Some(entry) = cache
+                    .lock()
+                    .expect("selected inverse memo poisoned")
+                    .get(&language)
+                    .cloned()
+                {
+                    return Ok::<_, Infallible>(entry);
                 }
-                SelectedInverseIndexOutcome::Unavailable(reason) => {
-                    SelectedInverseLanguage::Refused(
-                        EdgeIncompleteReason::SelectedInverseIndexUnavailable {
-                            reason_kind: "unavailable".to_string(),
-                            reason,
-                        },
-                    )
-                }
-                SelectedInverseIndexOutcome::Stale(reason) => SelectedInverseLanguage::Refused(
-                    EdgeIncompleteReason::SelectedInverseIndexUnavailable {
-                        reason_kind: "stale".to_string(),
-                        reason,
-                    },
-                ),
-                SelectedInverseIndexOutcome::StoreError(reason) => {
-                    SelectedInverseLanguage::Refused(
-                        EdgeIncompleteReason::SelectedInverseIndexUnavailable {
-                            reason_kind: "store_error".to_string(),
-                            reason,
-                        },
-                    )
-                }
-            }
-        });
-        Some(match state {
+                let entry = Arc::new(capture.build(|| {
+                    match provider.build_selected_inverse_index(analyzer, cancellation) {
+                        SelectedInverseIndexOutcome::Ready(index) => {
+                            SelectedInverseLanguage::Ready(index)
+                        }
+                        SelectedInverseIndexOutcome::Cancelled => {
+                            SelectedInverseLanguage::Refused(EdgeIncompleteReason::Cancelled)
+                        }
+                        SelectedInverseIndexOutcome::Unavailable(reason) => {
+                            SelectedInverseLanguage::Refused(
+                                EdgeIncompleteReason::SelectedInverseIndexUnavailable {
+                                    reason_kind: "unavailable".to_string(),
+                                    reason,
+                                },
+                            )
+                        }
+                        SelectedInverseIndexOutcome::Stale(reason) => {
+                            SelectedInverseLanguage::Refused(
+                                EdgeIncompleteReason::SelectedInverseIndexUnavailable {
+                                    reason_kind: "stale".to_string(),
+                                    reason,
+                                },
+                            )
+                        }
+                        SelectedInverseIndexOutcome::StoreError(reason) => {
+                            SelectedInverseLanguage::Refused(
+                                EdgeIncompleteReason::SelectedInverseIndexUnavailable {
+                                    reason_kind: "store_error".to_string(),
+                                    reason,
+                                },
+                            )
+                        }
+                    }
+                }));
+                cache
+                    .lock()
+                    .expect("selected inverse memo poisoned")
+                    .insert(language, Arc::clone(&entry));
+                Ok(entry)
+            })
+            .unwrap();
+        Some(match &*state {
             SelectedInverseLanguage::Ready(index) => index.inverse_for(declaration),
             SelectedInverseLanguage::Refused(reason) => EdgeDerivationResult::incomplete(
                 vec![reason.clone()],

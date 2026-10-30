@@ -8,6 +8,7 @@ use brokk_bifrost_core::analyzer::structural::regex::{
 #[derive(Default)]
 pub(super) struct JavaRegexSyntax {
     pub refusal: std::cell::Cell<Option<&'static str>>,
+    // One parser traversal owns these names; none survive to another literal.
     named_groups: std::cell::RefCell<std::collections::HashSet<Vec<char>>>,
 }
 const UNIX_LINES: u32 = 1;

@@ -22,10 +22,6 @@ use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOver
 
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
-use crate::analyzer::go::go_graph_source;
-
-use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
-
 use crate::analyzer::GoAnalyzer;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
@@ -36,17 +32,21 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::analyzer::model::SemanticDiagnosticIncompleteReason;
 
+use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
+use brokk_bifrost_core::analyzer::model::SemanticDiagnosticDomain;
 use brokk_bifrost_core::analyzer::model::SemanticDiagnosticReport;
 
+use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_go::diagnostics::{GoExternalEvidence, GoPackageSurface};
-use brokk_bifrost_go::graph::resolver::resolve_go_import_bindings;
+use brokk_bifrost_go::graph::resolver::GoImportBindings;
 use std::sync::Arc;
 
 pub(crate) fn collect_go_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> SemanticDiagnosticReport {
@@ -57,24 +57,89 @@ pub(crate) fn collect_go_semantic_diagnostics(
         overlay: analyzer.semantic_model_overlay(),
         discovery: analyzer.dependency_discovery_evidence(Language::Go),
     };
-    let binding_scope = AnalyzerQueryScope::new(go);
-    let bindings = resolve_go_import_bindings(
-        go_graph_source(go, token),
-        file,
-        |target| go.package_clause_of(target),
-        |import_path| external.packages().declared_package_name(import_path),
-    )
-    .map_err(|error| {
-        format!(
-            "Go package clauses unavailable for {:?}",
-            error.unavailable_files
-        )
-    })
-    .and_then(|bindings| match binding_scope.store_error() {
-        Some(error) => Err(format!("Go canonical import binding read failed: {error}")),
-        None => Ok(bindings),
-    });
-    let bindings = match bindings {
+    let cancellation = CancellationToken::new();
+    // One file's partial imports, alive only while rendering its report.
+    struct IncompleteImport {
+        owner: String,
+        is_dot: bool,
+        detail: String,
+    }
+    let bindings = (|| -> Result<(GoImportBindings, Vec<IncompleteImport>), String> {
+        let opened = GoNativePointRequest::open(go, external.overlay.clone(), &cancellation)
+            .map_err(|error| format!("Go canonical import binding read failed: {error}"))?;
+        let request = match opened {
+            GoNativePointRequestOpen::Ready(request) => request,
+            GoNativePointRequestOpen::Unavailable { message, .. } => return Err(message),
+            GoNativePointRequestOpen::Cancelled => {
+                return Err("Go import preparation cancelled".into());
+            }
+        };
+        let view = request
+            .import_diagnostic_view(file, &cancellation)
+            .map_err(|error| format!("Go canonical import binding read failed: {error}"))?
+            .ok_or_else(|| "Go selected import context unavailable".to_string())?;
+        if !view.source_authority_gaps.is_empty() {
+            return Err(format!(
+                "Go package clauses unavailable: {:?}",
+                view.source_authority_gaps
+            ));
+        }
+        let mut bindings = GoImportBindings::default();
+        let mut incomplete = Vec::new();
+        for binding in &view.bindings {
+            if binding.local_name == "_" {
+                continue;
+            }
+            // Workspace declarations use their selected canonical source
+            // anchor. External evidence is keyed by the import spelling,
+            // independent of GoTool's opaque provider instance identity.
+            let path = if binding.has_source_declarations {
+                binding.provider_path.as_deref().ok_or_else(|| {
+                    "selected Go source provider has no canonical package anchor".to_string()
+                })?
+            } else {
+                &binding.source_spelling
+            };
+            if let ResolutionCompletion::Incomplete(_) = &binding.completion {
+                incomplete.push(IncompleteImport {
+                    owner: path.into(),
+                    is_dot: binding.local_name == ".",
+                    detail: format!(
+                        "Go import {:?} is incomplete: {:?}; named reasons: {:?}",
+                        binding.source_spelling, binding.completion, binding.named_reasons
+                    ),
+                });
+            }
+            match (binding.has_source_declarations, binding.local_name.as_str()) {
+                (true, ".") => bindings.dot_workspace.push(path.into()),
+                (false, ".") => bindings.dot_external.push(path.into()),
+                (true, name) => bindings
+                    .workspace
+                    .entry(name.into())
+                    .or_default()
+                    .push(path.into()),
+                (false, name) => bindings
+                    .external
+                    .entry(name.into())
+                    .or_default()
+                    .push(path.into()),
+            }
+        }
+        for paths in bindings
+            .workspace
+            .values_mut()
+            .chain(bindings.external.values_mut())
+        {
+            paths.sort();
+            paths.dedup();
+        }
+        bindings.dot_workspace.sort();
+        bindings.dot_workspace.dedup();
+        bindings.dot_external.sort();
+        bindings.dot_external.dedup();
+        Ok((bindings, incomplete))
+    })();
+    let (bindings, incomplete) = match bindings {
         Ok(bindings) => bindings,
         Err(detail) => {
             let mut report = SemanticDiagnosticReport::new();
@@ -90,9 +155,36 @@ pub(crate) fn collect_go_semantic_diagnostics(
             analyzer,
             Language::None,
         );
-    let report = brokk_bifrost_go::diagnostics::collect_go_semantic_diagnostics(
+    let mut report = brokk_bifrost_go::diagnostics::collect_go_semantic_diagnostics(
         &bindings, &support, &external, file, source,
     );
+    report.degrade_absences(|domain| {
+        incomplete
+            .iter()
+            .find(|import| match domain {
+                SemanticDiagnosticDomain::MemberSurface { owner, .. } => owner == &import.owner,
+                SemanticDiagnosticDomain::LexicalScope { .. } => import.is_dot,
+                _ => false,
+            })
+            .map(
+                |import| SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                    detail: import.detail.clone(),
+                },
+            )
+    });
+    if !incomplete.is_empty() {
+        report.push_incomplete(
+            None,
+            incomplete
+                .into_iter()
+                .map(
+                    |import| SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                        detail: import.detail,
+                    },
+                )
+                .collect(),
+        );
+    }
     brokk_bifrost_analysis::analyzer::semantic_model::runtime::degrade_pack_gap_absences(
         analyzer, report,
     )
@@ -476,6 +568,16 @@ func Present() {}
 "#,
             ),
             (
+                "external_test.go",
+                r#"package main_test
+import "example.com/app/store"
+func Check() {
+    store.Present()
+    store.Missing.Nested()
+}
+"#,
+            ),
+            (
                 "main.go",
                 r#"
 package main
@@ -491,6 +593,77 @@ func Run() {
 
         let diagnostics = fixture.diagnostics_for("main.go");
         assert_single_unknown_package_member(&diagnostics);
+
+        // A test provider's opaque GoTool path is not the canonical FQN
+        // prefix. Exercise real selected publication and diagnostic lookup.
+        use brokk_bifrost_analysis::analyzer::store::go_package_context::{
+            GoContextPublicationOutcome, GoInputObservationOutcome, profile_digest,
+        };
+        use brokk_bifrost_core::cancellation::CancellationToken;
+        use brokk_bifrost_go::package_discovery::{
+            GoDiscoveryDomain, GoPackageDiscovery, host_build_configuration,
+        };
+        use serde_json::json;
+
+        let analyzer = &fixture.analyzer;
+        let snapshot = analyzer.selected_snapshot_for_test().unwrap();
+        let store = analyzer.inner.analyzer_store();
+        let cancellation = CancellationToken::new();
+        let GoInputObservationOutcome::Ready(observation) = store
+            .observe_go_context_inputs(&snapshot, analyzer.inner.project(), &cancellation)
+            .unwrap()
+        else {
+            panic!("fixture inputs must be selected")
+        };
+        let config =
+            host_build_configuration(&analyzer.inner.analyzer_config().go.dependency_discovery);
+        let module = json!({"Path":"example.com/app", "Main":true, "Dir":fixture.root});
+        let variant = "example.com/app/store [example.com/app.test]";
+        let discovery = GoPackageDiscovery {
+            domain: GoDiscoveryDomain {
+                directory: String::new(), gowork_path: String::new(),
+                modules: vec![(String::new(), "example.com/app".into())],
+            },
+            input_digest: None, failure: None,
+            packages: [
+                json!({"ImportPath":"example.com/app", "Name":"main", "Dir":fixture.root,
+                    "GoFiles":["main.go"], "Imports":["example.com/app/store"], "Module":module}),
+                json!({"ImportPath":"example.com/app/store", "Name":"store", "Dir":fixture.root.join("store"),
+                    "GoFiles":["store.go"], "Module":module}),
+                json!({"ImportPath":variant, "ForTest":"example.com/app", "Name":"store", "Dir":fixture.root.join("store"),
+                    "GoFiles":["store.go"], "Module":module}),
+                json!({"ImportPath":"example.com/app_test [example.com/app.test]", "ForTest":"example.com/app",
+                    "Name":"main_test", "Dir":fixture.root, "GoFiles":["external_test.go"],
+                    "Imports":[variant], "ImportMap":{"example.com/app/store":variant}, "Module":module}),
+            ].into_iter().map(|record| serde_json::from_value(record).unwrap()).collect(),
+            environment: serde_json::from_value(json!({
+                "GOROOT":fixture.root, "GOPATH":fixture.root, "GOMODCACHE":fixture.root,
+                "GOVERSION":"go1.22", "GOWORK":"off", "GOOS":config.goos, "GOARCH":config.goarch,
+            })).unwrap(),
+            build_configuration: config, workspace_patterns: vec!["./...".into()], vendor: false,
+        };
+        let profile = profile_digest(&discovery);
+        let GoContextPublicationOutcome::Published(_) = store
+            .publish_go_package_context(
+                snapshot.clone(),
+                fixture.root.clone(),
+                None,
+                &observation,
+                &observation,
+                discovery,
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("test-variant publication must succeed")
+        };
+        assert!(analyzer.activate_native_context_profile(&snapshot, profile));
+        let diagnostics = fixture.diagnostics_for("external_test.go");
+        assert_single_unknown_package_member(&diagnostics);
+        assert_eq!(
+            "Go package `example.com/app/store` has no indexed member `Missing`",
+            diagnostics[0].message
+        );
     }
 
     #[test]

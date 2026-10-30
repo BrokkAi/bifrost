@@ -299,6 +299,63 @@ fn python_hierarchy_modules_have_one_fact_per_file() {
     let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
     assert!(!updated.state.dirty_snapshot().is_empty());
     check(&updated);
+    {
+        use brokk_bifrost_analysis::analyzer::read_verification::WorkspaceFactIndex;
+        use brokk_bifrost_analysis::analyzer::{
+            FactSubject, LookupQuestion, ReadKey, WorkspaceFactFamily, capture_query_reads,
+        };
+        let whole = |key: &ReadKey| {
+            matches!(
+                key,
+                ReadKey::Lookup {
+                    question: LookupQuestion::WorkspaceFact {
+                        family: WorkspaceFactFamily::PathSyntheticModules,
+                        subject: FactSubject::Whole,
+                        ..
+                    },
+                    ..
+                }
+            )
+        };
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&updated);
+        let (_, reads) = capture_query_reads(&updated, || {
+            let before = updated.test_hooks().workspace_path_scan_count_for_test();
+            for _ in 0..2 {
+                assert_eq!(updated.path_synthetic_modules_for_test().unwrap().len(), 3);
+            }
+            assert_eq!(
+                updated.test_hooks().workspace_path_scan_count_for_test(),
+                before + 2,
+                "dirty sets must not fill the request memo"
+            );
+        });
+        assert!(reads.execution_dependences() > 0);
+        assert!(!reads.keys().iter().any(whole), "{:?}", reads.keys());
+        assert!(
+            scope.captured_read_incompleteness().is_empty(),
+            "{:?}",
+            scope.captured_read_incompleteness()
+        );
+        assert!(scope.store_error().is_none(), "{:?}", scope.store_error());
+        assert!(updated.path_synthetic_modules_answer_digest().is_none());
+        drop(scope);
+        updated.analyzer_store().conn.execute(|connection| {
+            connection
+                .execute_batch("DROP TRIGGER refuse_publication")
+                .unwrap()
+        });
+        drop(updated);
+        drop(analyzer);
+        let published = persisted(Arc::clone(&project), PythonAdapter::default());
+        let (_, reads) = capture_query_reads(&published, || {
+            assert_eq!(
+                published.path_synthetic_modules_for_test().unwrap().len(),
+                3
+            );
+        });
+        assert!(reads.keys().iter().any(whole), "{:?}", reads.keys());
+        assert!(published.path_synthetic_modules_answer_digest().is_some());
+    }
 }
 
 #[test]

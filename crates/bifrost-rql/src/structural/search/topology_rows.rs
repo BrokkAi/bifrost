@@ -48,6 +48,7 @@ use crate::analyzer::topology::{
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use crate::path_utils::rel_path_string;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::sync::Arc;
 
 /// Per-request memo of the workspace's declared topology plus the diagnostics
@@ -59,21 +60,28 @@ use std::sync::Arc;
 /// one derivation.
 #[derive(Default)]
 pub(super) struct TopologyTraversalCache {
-    topology: Option<Arc<WorkspaceTopology>>,
+    topology: CaptureScopedMemo<Option<Arc<WorkspaceTopology>>>,
     reported: HashSet<(String, &'static str)>,
 }
 
 impl TopologyTraversalCache {
     /// Read (or replay) the workspace's declared topology.
     pub(super) fn workspace(&mut self, analyzer: &dyn IAnalyzer) -> Arc<WorkspaceTopology> {
-        if let Some(cached) = &self.topology {
-            if cached.provider_failed() {
-                analyzer.mark_execution_dependent();
-            }
-            return Arc::clone(cached);
+        if let Some(cached) = self.topology.read(&memo_attribution(analyzer), |topology| {
+            topology.as_ref().map(|cached| {
+                if cached.provider_failed() {
+                    analyzer.mark_execution_dependent();
+                }
+                Arc::clone(cached)
+            })
+        }) {
+            return cached;
         }
         let derived = Arc::new(workspace_topology(analyzer.project()));
-        self.topology = Some(Arc::clone(&derived));
+        self.topology
+            .read_mut(&memo_attribution(analyzer), |topology| {
+                *topology = Some(Arc::clone(&derived))
+            });
         derived
     }
 

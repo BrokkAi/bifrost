@@ -10,15 +10,11 @@ use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::configuration::ConfigurationFormat as CoreConfigurationFormat;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt;
 
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;
-const MAX_PACK_REQUIREMENTS: usize = 128;
-const MAX_CAPABILITY_REQUIREMENTS: usize = 128;
 const MAX_OPERATOR_INPUTS: usize = 8;
 const MAX_DOMAIN_SELECTIONS: usize = 64;
 
@@ -216,38 +212,6 @@ impl fmt::Display for Version {
     }
 }
 
-/// A provider-defined version requirement retained as a typed value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub enum VersionRequirement {
-    Any,
-    Exact(Version),
-    AtLeast(Version),
-}
-
-impl VersionRequirement {
-    pub const fn any() -> Self {
-        Self::Any
-    }
-
-    pub fn exact(version: Version) -> Self {
-        Self::Exact(version)
-    }
-
-    pub fn at_least(version: Version) -> Self {
-        Self::AtLeast(version)
-    }
-}
-
-impl fmt::Display for VersionRequirement {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Any => formatter.write_str("*"),
-            Self::Exact(version) => version.fmt(formatter),
-            Self::AtLeast(version) => write!(formatter, ">={version}"),
-        }
-    }
-}
-
 /// A code or configuration selection.  The inner sets are always non-empty
 /// and canonicalized by their constructors.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -286,13 +250,6 @@ impl QueryDomain {
         match self {
             Self::Code { languages } => Some(languages),
             Self::Configuration { .. } => None,
-        }
-    }
-
-    pub fn formats(&self) -> Option<&[ConfigurationFormat]> {
-        match self {
-            Self::Code { .. } => None,
-            Self::Configuration { formats } => Some(formats),
         }
     }
 
@@ -364,14 +321,6 @@ impl RowDomain {
     ) -> Result<Self, DomainCompositionError> {
         HeterogeneousRowDomain::new(alternatives, discriminator, retains_provenance)
             .map(Self::Heterogeneous)
-    }
-
-    pub fn kind(&self) -> RowDomainKind {
-        match self {
-            Self::Code { .. } => RowDomainKind::Code,
-            Self::Configuration { .. } => RowDomainKind::Configuration,
-            Self::Heterogeneous(_) => RowDomainKind::Heterogeneous,
-        }
     }
 
     pub fn as_query_domain(&self) -> Option<QueryDomain> {
@@ -473,10 +422,6 @@ impl HeterogeneousRowDomain {
         })
     }
 
-    pub fn alternatives(&self) -> &[QueryDomain] {
-        &self.alternatives
-    }
-
     pub const fn discriminator(&self) -> DomainDiscriminator {
         self.discriminator
     }
@@ -507,37 +452,6 @@ impl DomainKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub enum RowDomainKind {
-    Code,
-    Configuration,
-    Heterogeneous,
-}
-
-/// A versioned capability required by a query.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct CapabilityRequirement {
-    capability: CapabilityId,
-    version: VersionRequirement,
-}
-
-impl CapabilityRequirement {
-    pub fn new(capability: CapabilityId, version: VersionRequirement) -> Self {
-        Self {
-            capability,
-            version,
-        }
-    }
-
-    pub fn capability(&self) -> &CapabilityId {
-        &self.capability
-    }
-
-    pub fn version(&self) -> &VersionRequirement {
-        &self.version
-    }
-}
-
 /// A stable semantic or policy pack namespace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct PackIdentity {
@@ -553,19 +467,8 @@ impl PackIdentity {
         }
     }
 
-    pub fn policy(id: PackId) -> Self {
-        Self {
-            kind: PackKind::Policy,
-            id,
-        }
-    }
-
     pub const fn kind(&self) -> PackKind {
         self.kind
-    }
-
-    pub fn id(&self) -> &PackId {
-        &self.id
     }
 }
 
@@ -573,137 +476,6 @@ impl PackIdentity {
 pub enum PackKind {
     Semantic,
     Policy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub enum RequirementStrength {
-    Optional,
-    Mandatory,
-}
-
-impl RequirementStrength {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Optional => 0,
-            Self::Mandatory => 1,
-        }
-    }
-}
-
-impl Ord for RequirementStrength {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.rank().cmp(&other.rank())
-    }
-}
-
-impl PartialOrd for RequirementStrength {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// One pack requirement.  Mandatory dominates optional when requirements are
-/// unioned for the same pack identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub struct PackRequirement {
-    identity: PackIdentity,
-    version: VersionRequirement,
-    strength: RequirementStrength,
-}
-
-impl PackRequirement {
-    pub fn mandatory(identity: PackIdentity) -> Self {
-        Self {
-            identity,
-            version: VersionRequirement::any(),
-            strength: RequirementStrength::Mandatory,
-        }
-    }
-
-    pub fn optional(identity: PackIdentity) -> Self {
-        Self {
-            identity,
-            version: VersionRequirement::any(),
-            strength: RequirementStrength::Optional,
-        }
-    }
-
-    pub fn with_version(mut self, version: VersionRequirement) -> Self {
-        self.version = version;
-        self
-    }
-
-    pub fn identity(&self) -> &PackIdentity {
-        &self.identity
-    }
-
-    pub fn version(&self) -> &VersionRequirement {
-        &self.version
-    }
-
-    pub const fn strength(&self) -> RequirementStrength {
-        self.strength
-    }
-}
-
-/// Canonical sorted pack requirements with mandatory-union dominance.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct PackRequirementSet(Vec<PackRequirement>);
-
-impl PackRequirementSet {
-    pub fn new(
-        requirements: impl IntoIterator<Item = PackRequirement>,
-    ) -> Result<Self, DomainValidationError> {
-        let mut by_requirement =
-            BTreeMap::<(PackIdentity, VersionRequirement), PackRequirement>::new();
-        for requirement in requirements {
-            let key = (requirement.identity.clone(), requirement.version.clone());
-            if by_requirement.len() >= MAX_PACK_REQUIREMENTS && !by_requirement.contains_key(&key) {
-                return Err(DomainValidationError::TooManyRequirements);
-            }
-            match by_requirement.get_mut(&key) {
-                Some(existing) => {
-                    if requirement.strength > existing.strength {
-                        *existing = requirement;
-                    }
-                }
-                None => {
-                    by_requirement.insert(key, requirement);
-                }
-            }
-        }
-        Ok(Self(by_requirement.into_values().collect()))
-    }
-
-    pub fn union(&self, other: &Self) -> Result<Self, DomainValidationError> {
-        Self::new(self.0.iter().cloned().chain(other.0.iter().cloned()))
-    }
-
-    pub fn as_slice(&self) -> &[PackRequirement] {
-        &self.0
-    }
-}
-
-/// Canonical capability requirements.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct CapabilityRequirementSet(Vec<CapabilityRequirement>);
-
-impl CapabilityRequirementSet {
-    pub fn new(
-        requirements: impl IntoIterator<Item = CapabilityRequirement>,
-    ) -> Result<Self, DomainValidationError> {
-        let mut requirements = requirements.into_iter().collect::<Vec<_>>();
-        requirements.sort_unstable();
-        requirements.dedup();
-        if requirements.len() > MAX_CAPABILITY_REQUIREMENTS {
-            return Err(DomainValidationError::TooManyRequirements);
-        }
-        Ok(Self(requirements))
-    }
-
-    pub fn as_slice(&self) -> &[CapabilityRequirement] {
-        &self.0
-    }
 }
 
 /// A typed relation that explicitly consumes more than one domain.
@@ -741,14 +513,6 @@ impl CrossDomainOperator {
     ) -> Result<Self, DomainCompositionError> {
         let inputs = canonical_cross_domain_inputs(inputs)?;
         Ok(Self { id, inputs, output })
-    }
-
-    pub fn id(&self) -> &OperatorId {
-        &self.id
-    }
-
-    pub fn inputs(&self) -> &[QueryDomain] {
-        &self.inputs
     }
 
     pub const fn output(&self) -> &RowDomain {
@@ -886,39 +650,18 @@ impl CrossDomainOperatorKind {
 pub struct QueryRequirement {
     input: QueryInputDomain,
     row: RowDomain,
-    capabilities: CapabilityRequirementSet,
-    packs: PackRequirementSet,
 }
 
 impl QueryRequirement {
-    pub fn new(
-        input: QueryDomain,
-        row: RowDomain,
-        capabilities: CapabilityRequirementSet,
-        packs: PackRequirementSet,
-    ) -> Self {
+    pub fn new(input: QueryDomain, row: RowDomain) -> Self {
         Self {
             input: QueryInputDomain::single(input),
             row,
-            capabilities,
-            packs,
         }
     }
 
     pub fn input(&self) -> &QueryInputDomain {
         &self.input
-    }
-
-    pub fn row(&self) -> &RowDomain {
-        &self.row
-    }
-
-    pub fn capabilities(&self) -> &CapabilityRequirementSet {
-        &self.capabilities
-    }
-
-    pub fn packs(&self) -> &PackRequirementSet {
-        &self.packs
     }
 
     /// Ordinary composition is conjunctive.  It intersects only like domains
@@ -931,15 +674,7 @@ impl QueryRequirement {
         };
         let input = left.intersect(right)?;
         let row = self.row.intersect(&other.row)?;
-        let packs = self
-            .packs
-            .union(&other.packs)
-            .map_err(DomainCompositionError::Validation)?;
-        let mut capabilities = self.capabilities.0.clone();
-        capabilities.extend(other.capabilities.0.iter().cloned());
-        let capabilities = CapabilityRequirementSet::new(capabilities)
-            .map_err(DomainCompositionError::Validation)?;
-        Ok(Self::new(input, row, capabilities, packs))
+        Ok(Self::new(input, row))
     }
 
     /// Compose heterogeneous inputs only through the operator's declared,
@@ -960,16 +695,8 @@ impl QueryRequirement {
         if left.kind() == right.kind() {
             return Err(DomainCompositionError::OperatorNeedsHeterogeneousInputs);
         }
-        let packs = self
-            .packs
-            .union(&other.packs)
-            .map_err(DomainCompositionError::Validation)?;
-        let mut capabilities = self.capabilities.0.clone();
-        capabilities.extend(other.capabilities.0.iter().cloned());
-        let capabilities = CapabilityRequirementSet::new(capabilities)
-            .map_err(DomainCompositionError::Validation)?;
         Ok(
-            Self::new(left.clone(), operator.output().clone(), capabilities, packs).with_input(
+            Self::new(left.clone(), operator.output().clone()).with_input(
                 QueryInputDomain::cross_domain(operator.id.clone(), [left.clone(), right.clone()])?,
             ),
         )
@@ -1003,13 +730,6 @@ impl QueryInputDomain {
     ) -> Result<Self, DomainCompositionError> {
         let inputs = canonical_cross_domain_inputs(inputs)?;
         Ok(Self::CrossDomain { operator, inputs })
-    }
-
-    pub fn domains(&self) -> &[QueryDomain] {
-        match self {
-            Self::Single(domain) => std::slice::from_ref(domain),
-            Self::CrossDomain { inputs, .. } => inputs,
-        }
     }
 
     pub fn operator(&self) -> Option<&OperatorId> {
@@ -1138,18 +858,6 @@ impl PackActivationEvidence {
         }
     }
 
-    pub fn pack(&self) -> &PackIdentity {
-        &self.pack
-    }
-
-    pub fn provider(&self) -> &ProviderId {
-        &self.provider
-    }
-
-    pub fn version(&self) -> &Version {
-        &self.version
-    }
-
     pub const fn state(&self) -> PackActivationState {
         self.state
     }
@@ -1249,7 +957,6 @@ pub enum DomainValidationError {
     InvalidLanguage,
     InvalidIdentifier,
     InvalidVersion,
-    InvalidVersionRequirement,
     InvalidAuthoredPath,
     MissingEvaluationEvidence,
     TooManyRequirements,
@@ -1262,7 +969,6 @@ impl fmt::Display for DomainValidationError {
             Self::InvalidLanguage => "language is not an analyzable programming language",
             Self::InvalidIdentifier => "identifier is invalid",
             Self::InvalidVersion => "version is invalid",
-            Self::InvalidVersionRequirement => "version requirement is invalid",
             Self::InvalidAuthoredPath => "authored path is invalid",
             Self::MissingEvaluationEvidence => {
                 "supported evaluation requires provider and capability observations"
@@ -1287,7 +993,6 @@ pub enum DomainCompositionError {
     OperatorIsNotCrossDomain,
     OperatorInputMismatch,
     OperatorNeedsHeterogeneousInputs,
-    Validation(DomainValidationError),
 }
 
 impl fmt::Display for DomainCompositionError {
@@ -1312,7 +1017,6 @@ impl fmt::Display for DomainCompositionError {
             Self::OperatorNeedsHeterogeneousInputs => {
                 "cross-domain operator requires unlike input domains"
             }
-            Self::Validation(error) => return error.fmt(formatter),
         })
     }
 }
@@ -1475,19 +1179,11 @@ mod tests {
             row,
         )
         .expect("operator");
-        let empty_capabilities = CapabilityRequirementSet::default();
-        let empty_packs = PackRequirementSet::default();
-        let code_requirement = QueryRequirement::new(
-            code,
-            RowDomain::code([Language::Rust]).expect("row"),
-            empty_capabilities.clone(),
-            empty_packs.clone(),
-        );
+        let code_requirement =
+            QueryRequirement::new(code, RowDomain::code([Language::Rust]).expect("row"));
         let config_requirement = QueryRequirement::new(
             config,
             RowDomain::configuration([ConfigurationFormat::Toml]).expect("row"),
-            empty_capabilities,
-            empty_packs,
         );
         assert!(code_requirement.conjoin(&config_requirement).is_err());
         assert!(
@@ -1611,3 +1307,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod boundary_contracts;

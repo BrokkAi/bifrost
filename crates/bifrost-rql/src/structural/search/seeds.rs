@@ -3,6 +3,8 @@ use super::*;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::structural::resolution::EnvironmentAxis;
 use crate::query::{LanguageRule, QueryPathScope};
+#[cfg(debug_assertions)]
+use brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers;
 
 pub(super) enum SeedFileScanStatus {
     Scanned,
@@ -398,26 +400,40 @@ pub(super) fn prepare_seed_access(
             }
             if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
                 state.analyzer.read_ledger_attached()
-            }) && state.scope.seed_files().is_none()
-            {
-                // Recorded here and nowhere earlier for a whole-workspace
-                // execution: this is the one point at which the answer is
-                // drawn from the language's complete posting index. A
-                // narrowed execution asks the same index only about its exact
-                // seed files, whose hydration records `File` keys; charging
-                // that unit the language scope would make unrelated edits
-                // invalidate it.
-                //
-                // The identity is the analyzer's own scope fold rather than
-                // the index's raw key, because that is the value verification
-                // recomputes on the head; an analyzer that states none has
-                // nothing this read can be named by, and the unattested
-                // identity says so instead of claiming a match.
-                state.analyzer.record_read(
-                    state
+            }) {
+                if let Some(seed_files) = state.scope.seed_files() {
+                    // Negative postings can skip hydration entirely. Name all
+                    // selected files before asking the warmed index, too.
+                    for file in files.unwrap_or(seed_files) {
+                        if let Some(key) = provider.structural_file_read_key(file) {
+                            state.analyzer.record_read(key.clone());
+                            #[cfg(debug_assertions)]
+                            debug_assert!(
+                                read_key_recorded_on_active_ledgers(state.analyzer, &key),
+                                "narrowed posting hits record selected files"
+                            );
+                        } else {
+                            state.analyzer.record_unattributed_read();
+                        }
+                    }
+                } else {
+                    // This is the value-consumption point. Merely reading the
+                    // provider's scalar content identity names no dependency.
+                    #[cfg(debug_assertions)]
+                    let key = state
                         .analyzer
-                        .workspace_scope_read_key(&[provider.structural_language()]),
-                );
+                        .workspace_scope_read_key(&[provider.structural_language()]);
+                    brokk_bifrost_analysis::analyzer::workspace_authority::record_workspace_authority_read(
+                        state.analyzer,
+                        brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily::StructuralPostingIndex,
+                        brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[provider.structural_language()]),
+                    );
+                    #[cfg(debug_assertions)]
+                    debug_assert!(
+                        read_key_recorded_on_active_ledgers(state.analyzer, &key),
+                        "whole posting hits record their language scope"
+                    );
+                }
             }
             let selection = index.select(
                 plan.structural_access(),
@@ -783,7 +799,7 @@ pub(super) fn execute_environment_seed(
         state
             .environment_cache
             .report_completeness(&file, &result, required_axes, diagnostics);
-        let joined_scopes = state.environment_cache.joined_scopes(&file);
+        let joined_scopes = state.environment_cache.joined_scopes(state.analyzer, &file);
         let values: Vec<(PipelineValue, bool)> = match kind {
             EnvironmentSeedKind::Scopes(filter) => environment::select_scopes(&result, filter)
                 .map(|index| {
@@ -1412,7 +1428,9 @@ pub(super) fn execute_seed(
     let parallel_budget = state.parallel_seed_budget.clone();
     if parallel_budget.is_some() {
         debug_assert!(
-            state.seed_cache.is_empty(),
+            state
+                .seed_cache
+                .read(&memo_attribution(state.analyzer), |cache| cache.is_empty()),
             "parallel seed branches start with disjoint empty request caches"
         );
     }
@@ -1424,7 +1442,12 @@ pub(super) fn execute_seed(
     let budget_cap = pipeline_limit.saturating_sub(state.budget.pipeline_rows);
     let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
     let capped_by_budget = terminal_cap.is_none_or(|cap| budget_cap <= cap);
-    if let Some(cached) = state.seed_cache.get(&cache_key).cloned() {
+    if let Some(cached) = state
+        .seed_cache
+        .read(&memo_attribution(state.analyzer), |cache| {
+            cache.get(&cache_key).cloned()
+        })
+    {
         if let Some(profile) = &mut state.cache_profile {
             profile
                 .seed_result
@@ -2080,6 +2103,7 @@ pub(super) fn execute_seed(
             state
                 .environment_cache
                 .python_variable_index_for(
+                    state.analyzer,
                     &file,
                     facts.source_identity(),
                     facts.source(),
@@ -2343,15 +2367,19 @@ pub(super) fn execute_seed(
     if parallel_budget.is_none() {
         state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
     }
-    state.seed_cache.insert(
-        cache_key,
-        CachedSeedExecution {
-            rows: rows.clone(),
-            diagnostics: diagnostics[diagnostic_start..].to_vec(),
-            truncated,
-            complete: cache_complete,
-        },
-    );
+    state
+        .seed_cache
+        .read_mut(&memo_attribution(state.analyzer), |cache| {
+            cache.insert(
+                cache_key,
+                CachedSeedExecution {
+                    rows: rows.clone(),
+                    diagnostics: diagnostics[diagnostic_start..].to_vec(),
+                    truncated,
+                    complete: cache_complete,
+                },
+            )
+        });
     if let Some(profile) = &mut state.cache_profile {
         profile.seed_result.record_build(cache_complete);
     }

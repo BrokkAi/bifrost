@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: string and comment braces truncated test bodies"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: string and comment braces truncated test bodies"
     )]
     fn braces_in_literals_and_comments_do_not_hide_assertions() {
         let file = ProjectFile::new(std::env::current_dir().unwrap(), "braces.cpp");

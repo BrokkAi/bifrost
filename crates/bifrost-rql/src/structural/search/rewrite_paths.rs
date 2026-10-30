@@ -26,6 +26,7 @@ use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::structural::rewrite_path::RewriteDomainKind;
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
@@ -41,7 +42,7 @@ const REWRITE_PATH_ID_DOMAIN: &[u8] = b"bifrost.code_query.rewrite_path.v1";
 /// reported, so one file is derived once and one reason is reported once.
 #[derive(Default)]
 pub(super) struct RewritePathTraversalCache {
-    files: HashMap<ProjectFile, Arc<FileRewritePaths>>,
+    files: CaptureScopedMemo<HashMap<ProjectFile, Arc<FileRewritePaths>>>,
     reported: HashSet<(String, &'static str)>,
 }
 
@@ -53,14 +54,18 @@ impl RewritePathTraversalCache {
         file: &ProjectFile,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<FileRewritePaths> {
-        if let Some(cached) = self.files.get(file) {
-            return Arc::clone(cached);
+        if let Some(cached) = self.files.read(&memo_attribution(analyzer), |files| {
+            files.get(file).cloned()
+        }) {
+            return cached;
         }
         let derived = Arc::new(
             brokk_bifrost_analysis::analyzer::structural::rewrite_paths::
                 rewrite_paths_for_file_with_cancellation(analyzer, file, cancellation),
         );
-        self.files.insert(file.clone(), Arc::clone(&derived));
+        self.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(file.clone(), Arc::clone(&derived))
+        });
         derived
     }
 

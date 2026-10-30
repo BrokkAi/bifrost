@@ -471,3 +471,82 @@ fn cancelled_fact_mount_collection_is_unavailable_and_retryable() {
         .expect("uncancelled mount snapshot");
     assert_eq!(complete.len(), 2);
 }
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7876: a failed package-class index build was cached and served without its failure"
+)]
+fn failed_package_class_build_is_not_published_to_a_later_request() {
+    use crate::analyzer::AnalyzerQueryScope;
+
+    let _language_hooks =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let (_temp, analyzer) = analyzer(&[("model.py", "class Model: pass\n")]);
+    let keeper = AnalyzerQueryScope::new(&analyzer);
+    analyzer
+        .store_context
+        .store
+        .execute_selection_publication(|conn| {
+            conn.execute(
+                "UPDATE analysis_epochs SET generation = generation + 1 WHERE lang = 'python'",
+                [],
+            )
+            .expect("make captured generation stale");
+        });
+    let failed = AnalyzerQueryScope::new(&analyzer);
+    assert!(
+        analyzer
+            .persisted_top_level_classes_in_package("")
+            .is_empty()
+    );
+    assert!(
+        failed.read_completion().is_err(),
+        "the failed store query ran"
+    );
+    assert!(
+        analyzer
+            .query_read_cache_lock()
+            .top_level_class_units_by_package
+            .get()
+            .is_none()
+    );
+    drop(failed);
+    analyzer
+        .store_context
+        .store
+        .execute_selection_publication(|conn| {
+            conn.execute(
+                "UPDATE analysis_epochs SET generation = generation - 1 WHERE lang = 'python'",
+                [],
+            )
+            .expect("restore captured generation");
+        });
+    // A new request has no enclosing context, while keeper keeps the same
+    // request memo alive. It must rebuild rather than consume the failed fill.
+    {
+        let _independent = brokk_bifrost_core::analyzer::carried_context::push(None);
+        let _independent_request =
+            brokk_bifrost_core::analyzer::carried_context::push_request_state(None);
+        let later = AnalyzerQueryScope::new(&analyzer);
+        analyzer.persisted_top_level_classes_in_package("");
+        assert!(
+            later.read_completion().is_ok(),
+            "{:?}",
+            later.read_completion()
+        );
+        assert!(
+            analyzer
+                .query_read_cache_lock()
+                .top_level_class_units_by_package
+                .get()
+                .is_some()
+        );
+    }
+    assert_eq!(analyzer.package_declaration_scan_count_for_test(), 2);
+    assert!(
+        keeper.read_completion().is_err(),
+        "nested failure stays with its parent"
+    );
+}

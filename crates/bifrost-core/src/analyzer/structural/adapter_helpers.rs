@@ -118,6 +118,29 @@ pub fn first_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     node.named_child(0)
 }
 
+/// The short-circuit boolean operator selected by a binary expression's
+/// `operator` field.
+pub fn short_circuit_operator(node: Node<'_>) -> Option<&'static str> {
+    match node.child_by_field_name("operator")?.kind() {
+        "&&" => Some("&&"),
+        "||" => Some("||"),
+        _ => None,
+    }
+}
+
+/// Return an if-expression's alternative body, unwrapping an `else_clause`.
+/// Else-if nodes are returned unchanged.
+pub fn if_alternative_body<'tree>(if_node: Node<'tree>) -> Option<Node<'tree>> {
+    let alternative = if_node.child_by_field_name("alternative")?;
+    if alternative.kind() == "else_clause" {
+        alternative
+            .child_by_field_name("body")
+            .or_else(|| alternative.named_child(0))
+    } else {
+        Some(alternative)
+    }
+}
+
 /// Return the expression assigned by a declarator's initializer clause.
 ///
 /// C#'s grammar has used both named `value`/`initializer` fields and an

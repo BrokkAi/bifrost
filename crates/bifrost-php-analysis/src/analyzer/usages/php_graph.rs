@@ -7,7 +7,12 @@
 
 mod shared;
 
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    ReplayingMemo, ReplayingMemoEntry, memo_attribution,
+};
 use brokk_bifrost_core::analyzer::fq_name::SegmentKind;
+use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 
@@ -72,14 +77,17 @@ use brokk_bifrost_php::graph::resolver::{TargetKind, TargetSpec};
 use brokk_bifrost_php::graph::{PhpCallableFacts, PhpGraphSource};
 use std::sync::Mutex;
 
+type ReturnMemo<K> =
+    ReplayingMemo<Mutex<HashMap<K, Arc<ReplayingMemoEntry<Option<String>, ReadKey>>>>>;
+
 /// Request-local PHP callable facts. Signature rows and return-type definition
 /// candidates are fetched only for declarations the scan reaches; the bounded
 /// lookup memoizes repeated names for the life of this facts source.
 pub(crate) struct PhpAnalyzerFacts<'a> {
     analyzer: &'a dyn IAnalyzer,
     definitions: AnalyzerDefinitionLookup<'a>,
-    declaration_returns: Mutex<HashMap<CodeUnit, Option<String>>>,
-    callable_returns: Mutex<HashMap<String, Option<String>>>,
+    declaration_returns: ReturnMemo<CodeUnit>,
+    callable_returns: ReturnMemo<String>,
 }
 
 impl<'a> PhpAnalyzerFacts<'a> {
@@ -87,8 +95,8 @@ impl<'a> PhpAnalyzerFacts<'a> {
         Self {
             analyzer,
             definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
-            declaration_returns: Mutex::new(HashMap::default()),
-            callable_returns: Mutex::new(HashMap::default()),
+            declaration_returns: ReplayingMemo::new(Mutex::new(HashMap::default())),
+            callable_returns: ReplayingMemo::new(Mutex::new(HashMap::default())),
         }
     }
 
@@ -191,51 +199,64 @@ impl<'a> PhpAnalyzerFacts<'a> {
 
 impl PhpCallableFacts for PhpAnalyzerFacts<'_> {
     fn declaration_return_type_fqn(&self, unit: &CodeUnit) -> Option<String> {
-        if let Some(cached) = self
-            .declaration_returns
-            .lock()
-            .expect("PHP declaration return cache poisoned")
-            .get(unit)
-        {
-            return cached.clone();
-        }
-        let facts = self
-            .callable_facts(std::slice::from_ref(unit))?
-            .into_iter()
-            .filter(|fact| fact.declaration == *unit)
-            .collect::<Vec<_>>();
-        let resolved = self.resolved_return_type(&facts);
         self.declaration_returns
-            .lock()
-            .expect("PHP declaration return cache poisoned")
-            .insert(unit.clone(), resolved.clone());
-        resolved
+            .read(&memo_attribution(self.analyzer), |cache, capture| {
+                if let Some(entry) = cache.lock().expect("PHP return cache poisoned").get(unit) {
+                    return Ok::<_, ()>(Arc::clone(entry));
+                }
+                let entry = Arc::new(capture.try_build(|| {
+                    let facts = self
+                        .callable_facts(std::slice::from_ref(unit))
+                        .ok_or(())?
+                        .into_iter()
+                        .filter(|fact| fact.declaration == *unit)
+                        .collect::<Vec<_>>();
+                    let resolved = self.resolved_return_type(&facts);
+
+                    Ok::<_, ()>(resolved)
+                })?);
+                cache
+                    .lock()
+                    .expect("PHP return cache poisoned")
+                    .insert(unit.clone(), Arc::clone(&entry));
+                Ok(entry)
+            })
+            .ok()
+            .and_then(|value| (*value).clone())
     }
 
     fn callable_return_type_fqn(&self, callable_fqn: &str) -> Option<String> {
-        if let Some(cached) = self
-            .callable_returns
-            .lock()
-            .expect("PHP callable return cache poisoned")
-            .get(callable_fqn)
-        {
-            return cached.clone();
-        }
-        let mut declarations = self
-            .definitions
-            .fqn(callable_fqn)
-            .into_iter()
-            .filter(CodeUnit::is_function)
-            .collect::<Vec<_>>();
-        declarations.sort();
-        declarations.dedup();
-        let facts = self.callable_facts(&declarations)?;
-        let resolved = self.resolved_return_type(&facts);
         self.callable_returns
-            .lock()
-            .expect("PHP callable return cache poisoned")
-            .insert(callable_fqn.to_string(), resolved.clone());
-        resolved
+            .read(&memo_attribution(self.analyzer), |cache, capture| {
+                if let Some(entry) = cache
+                    .lock()
+                    .expect("PHP return cache poisoned")
+                    .get(callable_fqn)
+                {
+                    return Ok::<_, ()>(Arc::clone(entry));
+                }
+                let entry = Arc::new(capture.try_build(|| {
+                    let mut declarations = self
+                        .definitions
+                        .fqn(callable_fqn)
+                        .into_iter()
+                        .filter(CodeUnit::is_function)
+                        .collect::<Vec<_>>();
+                    declarations.sort();
+                    declarations.dedup();
+                    let facts = self.callable_facts(&declarations).ok_or(())?;
+                    let resolved = self.resolved_return_type(&facts);
+
+                    Ok::<_, ()>(resolved)
+                })?);
+                cache
+                    .lock()
+                    .expect("PHP return cache poisoned")
+                    .insert(callable_fqn.to_string(), Arc::clone(&entry));
+                Ok(entry)
+            })
+            .ok()
+            .and_then(|value| (*value).clone())
     }
 }
 

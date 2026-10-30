@@ -4,6 +4,7 @@ use brokk_bifrost_go::declarations::determine_go_package_name;
 
 use brokk_bifrost_go::declarations::go_identifier_is_exported;
 
+use brokk_bifrost_core::analyzer::tree_walk::named_children_iter;
 use brokk_bifrost_go::declarations::go_node_text;
 
 use brokk_bifrost_go::declarations::go_structured_type_identity;
@@ -1854,10 +1855,7 @@ fn type_parameters(
         let Some(constraint_node) = type_parameter_constraint_node(declaration) else {
             continue;
         };
-        let mut cursor = declaration.walk();
-        let parameter_names = declaration
-            .named_children(&mut cursor)
-            .filter(|child| child.kind() == "identifier" && child.id() != constraint_node.id())
+        let parameter_names = type_parameter_identifier_nodes(declaration, Some(constraint_node))
             .map(|child| go_node_text(child, source).trim().to_owned())
             .collect::<Vec<_>>();
         let Some(constraint) =
@@ -1888,19 +1886,23 @@ fn type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
         .filter(|child| child.kind() == "type_parameter_declaration")
     {
         let constraint = type_parameter_constraint_node(declaration);
-        let mut cursor = declaration.walk();
         names.extend(
-            declaration
-                .named_children(&mut cursor)
-                .filter(|child| {
-                    child.kind() == "identifier"
-                        && constraint.is_none_or(|constraint| child.id() != constraint.id())
-                })
+            type_parameter_identifier_nodes(declaration, constraint)
                 .map(|child| go_node_text(child, source).trim().to_owned())
                 .filter(|name| !name.is_empty()),
         );
     }
     names
+}
+
+fn type_parameter_identifier_nodes<'tree>(
+    declaration: Node<'tree>,
+    constraint: Option<Node<'tree>>,
+) -> impl Iterator<Item = Node<'tree>> {
+    named_children_iter(declaration).filter(move |child| {
+        child.kind() == "identifier"
+            && constraint.is_none_or(|constraint| child.id() != constraint.id())
+    })
 }
 
 fn type_parameter_constraint_node(declaration: Node<'_>) -> Option<Node<'_>> {

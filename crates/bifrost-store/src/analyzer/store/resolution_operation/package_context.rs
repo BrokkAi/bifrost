@@ -375,18 +375,19 @@ impl SelectedResolutionOperation<'_, '_> {
         memo.borrow_mut().insert(key, present);
         Ok(SelectedPackageRows::Ready(present))
     }
+}
 
+impl ReadySelectedResolution<'_, '_> {
     #[doc(hidden)]
     pub fn selected_package_references(
         &self,
         mount: SelectedResolutionMountOrdinal,
         cancellation: &CancellationToken,
     ) -> Result<SelectedPackageRows<Vec<LoweredPackageReference>>> {
-        let connection = self.ready.inventory.connection();
-        let names = self.ready.shared_names();
+        let connection = self.inventory.connection();
+        let names = self.shared_names();
         let mut result = BTreeMap::new();
         if !self
-            .ready
             .inventory
             .stage_family_is_empty(StageFamily::PackageReferences)?
         {
@@ -476,11 +477,10 @@ impl SelectedResolutionOperation<'_, '_> {
             .filter(|_| reference.ordinal() == Some(mount.get()));
         let staged_key = codec::encode_semantic(reference);
         let local_base = codec::encode_semantic(SemanticId::local(mount.get(), 0));
-        let connection = self.ready.inventory.connection();
-        let names = self.ready.shared_names();
+        let connection = self.inventory.connection();
+        let names = self.shared_names();
         let mut result = BTreeMap::new();
         if !self
-            .ready
             .inventory
             .stage_family_is_empty(StageFamily::PackageReferences)?
         {
@@ -528,11 +528,10 @@ impl SelectedResolutionOperation<'_, '_> {
         let shared = lookup
             .shared_name_id()
             .expect("package lookup is a shared name");
-        let connection = self.ready.inventory.connection();
-        let names = self.ready.shared_names();
+        let connection = self.inventory.connection();
+        let names = self.shared_names();
         let mut result = BTreeMap::new();
         if !self
-            .ready
             .inventory
             .stage_family_is_empty(StageFamily::PackageMembers)?
         {
@@ -564,7 +563,6 @@ impl SelectedResolutionOperation<'_, '_> {
                 // lookup name and therefore was absent from the lookup query.
                 let mut authority = None;
                 if !self
-                    .ready
                     .inventory
                     .stage_family_is_globally_empty(StageFamily::PackageMembers)?
                 {
@@ -616,11 +614,10 @@ impl SelectedResolutionOperation<'_, '_> {
         mount: SelectedResolutionMountOrdinal,
         cancellation: &CancellationToken,
     ) -> Result<SelectedPackageRows<HashMap<SemanticId, Vec<LoweredPackageMember>>>> {
-        let connection = self.ready.inventory.connection();
-        let names = self.ready.shared_names();
+        let connection = self.inventory.connection();
+        let names = self.shared_names();
         let mut by_identity = BTreeMap::new();
         if !self
-            .ready
             .inventory
             .stage_family_is_empty(StageFamily::PackageMembers)?
         {

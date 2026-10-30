@@ -26,6 +26,7 @@ use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
 #[cfg(any(test, feature = "test-support"))]
 use serde::Serialize;
@@ -176,11 +177,11 @@ impl SelectedEdgesOfTelemetry {
 /// reported, so one subject is derived once and one axis gap is reported once.
 #[derive(Default)]
 pub(super) struct EdgeTraversalCache {
-    inverse: HashMap<CodeUnit, Arc<EdgeDerivationResult>>,
-    forward: HashMap<ProjectFile, Arc<EdgeDerivationResult>>,
+    inverse: CaptureScopedMemo<HashMap<CodeUnit, Arc<EdgeDerivationResult>>>,
+    forward: CaptureScopedMemo<HashMap<ProjectFile, Arc<EdgeDerivationResult>>>,
     /// The selected inverse index of every language that registers one, built
     /// at most once per language per request.
-    selected: SelectedInverseEdgeCache,
+    selected: CaptureScopedMemo<SelectedInverseEdgeCache>,
     reported: HashSet<(String, CodeQueryDiagnosticCode)>,
     reported_axes: HashSet<(Language, EdgeAxis)>,
     #[cfg(any(test, feature = "test-support"))]
@@ -191,6 +192,15 @@ pub(super) struct EdgeTraversalCache {
     selected_inverse: Option<Arc<SelectedReferenceInverseIndex>>,
     #[cfg(any(test, feature = "test-support"))]
     selected_java_telemetry: Option<SelectedEdgesOfTelemetry>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn assert_selected_inverse_outside_capture() {
+    use brokk_bifrost_analysis::analyzer::read_attribution_records_reads as read_ledger_attached;
+    debug_assert!(
+        !read_ledger_attached(|| false),
+        "the injected measurement index cannot answer a captured query"
+    );
 }
 
 impl EdgeTraversalCache {
@@ -213,15 +223,18 @@ impl EdgeTraversalCache {
         declaration: &CodeUnit,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<EdgeDerivationResult> {
-        if let Some(cached) = self.inverse.get(declaration) {
+        if let Some(cached) = self.inverse.read(&memo_attribution(analyzer), |inverse| {
+            inverse.get(declaration).cloned()
+        }) {
             #[cfg(any(test, feature = "test-support"))]
             if let Some(telemetry) = &self.selected_java_telemetry {
                 telemetry.inner.cache_hits.fetch_add(1, Ordering::Relaxed);
             }
-            return Arc::clone(cached);
+            return cached;
         }
         #[cfg(any(test, feature = "test-support"))]
         if let Some(index) = &self.selected_inverse {
+            assert_selected_inverse_outside_capture();
             let telemetry = self
                 .selected_java_telemetry
                 .as_ref()
@@ -238,7 +251,9 @@ impl EdgeTraversalCache {
             }
             let derived = index.inverse_for(declaration);
             self.inverse
-                .insert(declaration.clone(), Arc::clone(&derived));
+                .read_mut(&memo_attribution(analyzer), |inverse| {
+                    inverse.insert(declaration.clone(), Arc::clone(&derived))
+                });
             return derived;
         }
         // A language that registers a selected inverse provider answers from
@@ -247,11 +262,15 @@ impl EdgeTraversalCache {
         // refusal as an answer.
         if let Some(selected) = self
             .selected
-            .inverse_for(analyzer, declaration, cancellation)
+            .read_mut(&memo_attribution(analyzer), |selected| {
+                selected.inverse_for(analyzer, declaration, cancellation)
+            })
         {
             let derived = Arc::new(selected);
             self.inverse
-                .insert(declaration.clone(), Arc::clone(&derived));
+                .read_mut(&memo_attribution(analyzer), |inverse| {
+                    inverse.insert(declaration.clone(), Arc::clone(&derived))
+                });
             return derived;
         }
         let derived = Arc::new(inverse_edges_for_declaration(
@@ -260,7 +279,9 @@ impl EdgeTraversalCache {
             cancellation,
         ));
         self.inverse
-            .insert(declaration.clone(), Arc::clone(&derived));
+            .read_mut(&memo_attribution(analyzer), |inverse| {
+                inverse.insert(declaration.clone(), Arc::clone(&derived))
+            });
         derived
     }
 
@@ -272,12 +293,17 @@ impl EdgeTraversalCache {
         file: &ProjectFile,
         cancellation: Option<&CancellationToken>,
     ) -> Option<Arc<EdgeDerivationResult>> {
-        if let Some(cached) = self.forward.get(file) {
-            return Some(Arc::clone(cached));
+        if let Some(cached) = self.forward.read(&memo_attribution(analyzer), |forward| {
+            forward.get(file).cloned()
+        }) {
+            return Some(cached);
         }
         let token = cancellation.cloned().unwrap_or_default();
         let derived = Arc::new(forward_edges_for_file(analyzer, file, &token).ok()?);
-        self.forward.insert(file.clone(), Arc::clone(&derived));
+        self.forward
+            .read_mut(&memo_attribution(analyzer), |forward| {
+                forward.insert(file.clone(), Arc::clone(&derived))
+            });
         Some(derived)
     }
 
@@ -337,6 +363,7 @@ impl EdgeTraversalCache {
         };
         #[cfg(any(test, feature = "test-support"))]
         if self.selected_inverse.as_ref().is_some_and(|index| {
+            assert_selected_inverse_outside_capture();
             result.provenance == super::super::edges::EdgeProvenance::Inverse
                 && result.generation == index.generation()
         }) {

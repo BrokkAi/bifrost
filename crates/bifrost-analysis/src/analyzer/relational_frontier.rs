@@ -11,6 +11,39 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 
+/// Owned read capability for graph builders whose frontier handles are static.
+/// Constructed only in analysis; each invocation records at the actual ask.
+pub type FrontierReadRecorder = Arc<dyn Fn(&RelationalDefinitionQuestion) + Send + Sync>;
+
+pub(crate) fn unbound_frontier_read_recorder() -> FrontierReadRecorder {
+    Arc::new(|_| {
+        if let Some(ledger) = super::i_analyzer::innermost_read_ledger() {
+            ledger.record_unattributed();
+        }
+    })
+}
+
+pub(crate) fn frontier_read_recorder(analyzer: Arc<dyn IAnalyzer>) -> FrontierReadRecorder {
+    Arc::new(move |question| {
+        if !super::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
+            return;
+        }
+        let languages = match question.language_scope {
+            super::DefinitionLanguageScope::Language(language) => vec![language],
+            super::DefinitionLanguageScope::Workspace => analyzer.languages().into_iter().collect(),
+        };
+        super::workspace_authority::record_workspace_authority_read(
+            analyzer.as_ref(),
+            super::read_ledger::WorkspaceFactFamily::RelationalFrontierAnswers,
+            super::workspace_authority::AuthorityInputs::SourceOf(&languages),
+        );
+        #[cfg(debug_assertions)]
+        if let Some(ledger) = super::i_analyzer::innermost_read_ledger() {
+            debug_assert!(ledger.contains_read_key(&analyzer.workspace_scope_read_key(&languages)));
+        }
+    })
+}
+
 const QUERY_SHAPE_COUNT: usize = 16;
 const QUERY_SHAPE_NAMES: [&str; QUERY_SHAPE_COUNT] = [
     "exact_name",
@@ -130,16 +163,24 @@ impl FrontierMetrics {
 
 /// Request-local recording lookup used by [`resolve_relational_frontier_with`].
 ///
-/// It deliberately has no analyzer or store handle. The graph computation may
-/// run in a language crate, while the runner alone crosses back into analysis
-/// to execute each newly discovered layer as one relational batch.
-#[derive(Default)]
+/// The owned recorder attributes each ask; only the runner executes SQL batches.
 struct RecordingRelationalFrontier {
     state: Mutex<FrontierState>,
+    record_read: FrontierReadRecorder,
+}
+
+impl Default for RecordingRelationalFrontier {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            record_read: unbound_frontier_read_recorder(),
+        }
+    }
 }
 
 impl RelationalDefinitionFrontier for RecordingRelationalFrontier {
     fn ask(&self, question: &RelationalDefinitionQuestion) -> RelationalDefinitionValue {
+        (self.record_read)(question);
         let mut state = self.state.lock().expect("relational frontier poisoned");
         state.ask_count += 1;
         if let Some(value) = state.answers.get(question).cloned() {
@@ -251,16 +292,19 @@ struct PendingQuestions {
 struct ImmutableRecordingFrontier {
     answers: Arc<HashMap<RelationalDefinitionQuestion, Arc<RelationalDefinitionValue>>>,
     pending: Mutex<PendingQuestions>,
+    record_read: FrontierReadRecorder,
     query_shape_counts: Option<Box<[AtomicUsize; QUERY_SHAPE_COUNT]>>,
 }
 
 impl ImmutableRecordingFrontier {
     fn new(
         answers: Arc<HashMap<RelationalDefinitionQuestion, Arc<RelationalDefinitionValue>>>,
+        record_read: FrontierReadRecorder,
     ) -> Self {
         Self {
             answers,
             pending: Mutex::new(PendingQuestions::default()),
+            record_read,
             query_shape_counts: crate::profiling::enabled()
                 .then(|| Box::new(std::array::from_fn(|_| AtomicUsize::new(0)))),
         }
@@ -281,6 +325,7 @@ impl ImmutableRecordingFrontier {
 
 impl RelationalDefinitionFrontier for ImmutableRecordingFrontier {
     fn ask(&self, question: &RelationalDefinitionQuestion) -> RelationalDefinitionValue {
+        (self.record_read)(question);
         if let Some(counts) = &self.query_shape_counts {
             counts[query_shape(&question.query).1].fetch_add(1, Ordering::Relaxed);
         }
@@ -362,6 +407,7 @@ fn execute_and_install_frontier_batch(
 /// earlier layers. Newly asked questions are deduplicated and executed in one
 /// batch; complete empty answers are installed and therefore converge too.
 /// The frontier and all hydrated rows are dropped when this function returns.
+#[cfg(test)]
 pub(crate) fn resolve_relational_frontier_with<T>(
     cancellation: &CancellationToken,
     execute: impl FnMut(&[RelationalDefinitionRequest]) -> RelationalBatchOutcome,
@@ -375,10 +421,11 @@ pub(crate) fn resolve_relational_frontier_with<T>(
 /// [`resolve_relational_frontier_with`] with an owned frontier handle.
 ///
 /// Language-crate adapters stored behind `Arc<dyn Trait>` cannot borrow the
-/// recorder, but they may own this handle for one replay pass. The handle has
-/// no store or analyzer reference and remains request-local; the returned
+/// recorder, but they may own this handle for one replay pass. The handle
+/// carries an owned read recorder and remains request-local; the returned
 /// computation must still be owned and side-effect free for the same reason as
 /// the borrowed form.
+#[cfg(test)]
 pub(crate) fn resolve_relational_frontier_with_owned<T>(
     cancellation: &CancellationToken,
     execute: impl FnMut(&[RelationalDefinitionRequest]) -> RelationalBatchOutcome,
@@ -500,7 +547,12 @@ where
                 groups.iter().flat_map(|indices| {
                     let frontiers: Vec<_> = indices
                         .iter()
-                        .map(|_| Arc::new(ImmutableRecordingFrontier::new(Arc::clone(&answers))))
+                        .map(|_| {
+                            Arc::new(ImmutableRecordingFrontier::new(
+                                Arc::clone(&answers),
+                                Arc::clone(&frontier.record_read),
+                            ))
+                        })
                         .collect();
                     let inputs: Vec<_> = indices
                         .iter()
@@ -662,7 +714,10 @@ impl<'a> RelationalFrontierSession<'a> {
         Self {
             analyzer,
             cancellation,
-            frontier: Arc::new(RecordingRelationalFrontier::default()),
+            frontier: Arc::new(RecordingRelationalFrontier {
+                record_read: analyzer.relational_frontier_read_recorder(),
+                ..RecordingRelationalFrontier::default()
+            }),
         }
     }
 
@@ -773,11 +828,9 @@ pub fn resolve_relational_frontier<T>(
     cancellation: &CancellationToken,
     evaluate: impl FnMut(&dyn RelationalDefinitionFrontier) -> T,
 ) -> RelationalFrontierOutcome<T> {
-    resolve_relational_frontier_with(
-        cancellation,
-        |requests| analyzer.relational_definition_batch(requests, cancellation),
-        evaluate,
-    )
+    let mut evaluate = evaluate;
+    RelationalFrontierSession::new(analyzer, cancellation)
+        .resolve_owned("borrowed", |frontier| evaluate(frontier.as_ref()))
 }
 
 #[cfg(test)]
@@ -811,6 +864,47 @@ mod tests {
             }
             _ => panic!("package existence question returned the wrong shape"),
         }
+    }
+
+    #[test]
+    fn frontier_hits_record_the_question_scope_in_each_capture() {
+        use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+        let analyzer = MultiAnalyzer::default();
+        let frontier = RecordingRelationalFrontier {
+            record_read: analyzer.relational_frontier_read_recorder(),
+            ..RecordingRelationalFrontier::default()
+        };
+        let question = package_question("absent");
+        frontier.install(
+            vec![question.clone()],
+            vec![RelationalDefinitionValue::PackageRelation(
+                PackageRelationValue::Exists(false),
+            )],
+        );
+        let immutable = ImmutableRecordingFrontier::new(
+            frontier.answer_snapshot(),
+            Arc::clone(&frontier.record_read),
+        );
+        let expected = analyzer.workspace_scope_read_key(&[Language::Java]);
+        for _ in 0..2 {
+            let (_, reads) = capture_query_reads(&analyzer, || {
+                assert!(!exists(&frontier, &question));
+                assert!(!exists(&immutable, &question));
+            });
+            assert_eq!(reads.keys(), vec![expected.clone()]);
+            assert_eq!(reads.unattributed_reads(), 0);
+        }
+        assert_eq!(frontier.metrics().answer_hits, 2);
+        assert!(immutable.take_pending().is_empty());
+        // The capability was created before this capture. Broadcast must see
+        // the original live registry, rather than a clone's empty registry.
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            let _broadcast = crate::analyzer::ReadAttribution::broadcast().install();
+            assert!(!exists(&frontier, &question));
+            assert!(!exists(&immutable, &question));
+        });
+        assert_eq!(reads.keys(), vec![expected]);
+        assert_eq!(reads.unattributed_reads(), 0);
     }
 
     #[test]

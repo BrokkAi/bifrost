@@ -279,6 +279,13 @@ pub trait StructuralFactProvider: Send + Sync {
         None
     }
 
+    /// The selected file input used by a narrowed posting-index read, even
+    /// when a negative posting answer avoids hydrating that file's facts.
+    /// A provider unable to name it makes that consumer refuse reuse.
+    fn structural_file_read_key(&self, _file: &ProjectFile) -> Option<crate::analyzer::ReadKey> {
+        None
+    }
+
     /// Snapshot-owned immutable posting cache. Third-party providers may keep
     /// the default and use scan-only execution.
     fn snapshot_structural_index_cache(&self) -> Option<&StructuralFactSnapshotCache> {
@@ -1346,6 +1353,16 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         Some(WorkspaceContentIdentity::from_digest(
             self.language_content_identity(),
         ))
+    }
+
+    fn structural_file_read_key(&self, file: &ProjectFile) -> Option<crate::analyzer::ReadKey> {
+        Some(match self.resolve_live_oid_for_file(file) {
+            Some(oid) => self.file_read_key(file, oid),
+            None => crate::analyzer::ReadKey::path_absent(
+                self.adapter().language(),
+                crate::path_utils::rel_path_string(file),
+            ),
+        })
     }
 
     fn snapshot_structural_index_cache(&self) -> Option<&StructuralFactSnapshotCache> {

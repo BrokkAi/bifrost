@@ -4,15 +4,12 @@ use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 use git2::Oid;
 use rusqlite::params;
 use std::sync::Arc;
-use tree_sitter::Parser;
 
 use crate::analyzer::store::resolution::PreparedResolutionBundle;
 use crate::analyzer::store::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS;
 
 use crate::analyzer::store::file_state::FileState;
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
-use crate::analyzer::tree_sitter_analyzer::ParsedFile;
-use crate::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
 
 use crate::analyzer::ProjectFile;
 
@@ -62,22 +59,8 @@ pub fn parsed_fixture_state<A: LanguageAdapter>(
             .join("resolution-producer-fixture-does-not-touch-disk"),
         relative_path,
     );
-    let mut parser = Parser::new();
-    parser
-        .set_language(&adapter.parser_language_for_file(&file))
-        .expect("configure producer fixture grammar");
-    let tree = parser
-        .parse(source, None)
-        .expect("parse producer fixture source");
-    let mut parsed: ParsedFile = adapter.parse_file(&file, source, &tree);
-    parsed.add_file_scope(&file, source);
-    let contains_tests = adapter.contains_tests(&file, source, &tree, &parsed);
-    Arc::new(TreeSitterAnalyzer::<A>::file_state_from_parsed(
-        source.to_owned(),
-        parsed,
-        contains_tests,
-        Some(Vec::new()),
-        true,
+    Arc::new(super::test_support::file_state_from_source(
+        adapter, &file, source,
     ))
 }
 #[doc(hidden)]

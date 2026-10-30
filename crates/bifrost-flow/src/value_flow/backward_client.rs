@@ -143,6 +143,7 @@ pub struct BackwardValueFlowResult {
     result: BackwardSnapshotDataflowResult<BackwardValueFlowFact>,
     meetings: Box<[BackwardValueFlowMeeting]>,
     work: SolverWork,
+    discovery_complete: bool,
 }
 
 impl BackwardValueFlowResult {
@@ -193,6 +194,7 @@ impl BackwardValueFlowResult {
             result,
             meetings: meetings.into_boxed_slice(),
             work,
+            discovery_complete: plan.discovery_complete(),
         })
     }
 
@@ -209,20 +211,8 @@ impl BackwardValueFlowResult {
         &self.meetings
     }
 
-    pub fn sink_outcome(&self, sink: ValueFlowSinkId) -> BackwardValueFlowSinkOutcome<'_> {
-        match super::sink_meeting_outcome(&self.meetings, sink, self.is_complete(), |meeting| {
-            meeting.sink
-        }) {
-            super::SinkMeetingOutcome::Reached(meetings) => {
-                BackwardValueFlowSinkOutcome::Reached(meetings)
-            }
-            super::SinkMeetingOutcome::NotReached => BackwardValueFlowSinkOutcome::NotReached,
-            super::SinkMeetingOutcome::Inconclusive => BackwardValueFlowSinkOutcome::Inconclusive,
-        }
-    }
-
     pub fn is_complete(&self) -> bool {
-        self.result.is_complete()
+        self.discovery_complete && self.result.is_complete()
     }
 
     pub const fn termination(&self) -> SolverTermination {
@@ -435,7 +425,6 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
             let Some(input) = ValueFlowCarrierId::try_from_index(index).ok() else {
                 continue;
             };
-            let mut matched = false;
             let application = self.plan.visit_boundary_transfers(
                 call,
                 edge.boundary(),
@@ -443,22 +432,19 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
                 input,
                 |transfer| {
                     if transfer.target == demand.carrier {
-                        matched = true;
+                        out.push(Demand {
+                            carrier: input,
+                            uncertainty: if transfer.proven_complete {
+                                demand.uncertainty
+                            } else {
+                                demand.uncertainty.with_semantic()
+                            },
+                            ..demand
+                        });
                     }
                     true
                 },
             );
-            if matched {
-                out.push(Demand {
-                    carrier: input,
-                    uncertainty: if application.modeled {
-                        demand.uncertainty
-                    } else {
-                        demand.uncertainty.with_semantic()
-                    },
-                    ..demand
-                });
-            }
             // The caller-side continuation always preserves the incoming
             // carrier unless RequireModel abstains, in which case that
             // preserved fact is retained but marked uncertain.

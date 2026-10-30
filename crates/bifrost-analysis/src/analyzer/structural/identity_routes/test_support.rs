@@ -3,11 +3,11 @@ use super::*;
 use crate::analyzer::Language;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::structural::test_support::workspace_fixture;
-use tempfile::TempDir;
+use crate::inline_project::BuiltInlineTestProject;
 
 #[doc(hidden)]
 pub struct Fixture {
-    pub(super) _temp: TempDir,
+    pub(super) _project: BuiltInlineTestProject,
     pub(super) workspace: WorkspaceAnalyzer,
     #[doc(hidden)]
     pub files: Vec<ProjectFile>,
@@ -16,9 +16,9 @@ pub struct Fixture {
 impl Fixture {
     #[doc(hidden)]
     pub fn new(language: Language, files: &[(&str, &str)]) -> Self {
-        let (temp, workspace, project_files, sources) = workspace_fixture(language, files);
+        let (project, workspace, project_files, sources) = workspace_fixture(language, files);
         Self {
-            _temp: temp,
+            _project: project,
             workspace,
             files: project_files,
             sources,

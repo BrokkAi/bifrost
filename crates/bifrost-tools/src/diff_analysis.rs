@@ -1,4 +1,5 @@
 use brokk_bifrost_analysis::analyzer::correspondence::declarations::DeclarationCorrespondence;
+use brokk_bifrost_core::analyzer::project::AsProject;
 
 use brokk_bifrost_analysis::analyzer::correspondence::declarations::DeclarationCorrespondenceBuilder;
 
@@ -1959,6 +1960,8 @@ impl RevisionImage {
                 ..
             } => (
                 Arc::new(RevisionImageProject {
+                    project_reads:
+                        brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
                     files,
                     objects: Arc::clone(objects),
                     blobs: Arc::clone(blobs),
@@ -2981,6 +2984,7 @@ impl RevisionObjectDatabase {
 /// the object database if their private copy disappears; files represented only
 /// by placeholders are read directly from the object database.
 struct RevisionImageProject {
+    project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
     files: FileSetProject,
     objects: Arc<RevisionObjectDatabase>,
     blobs: Arc<RevisionBlobIdentities>,
@@ -2993,21 +2997,47 @@ struct RevisionImageProject {
 }
 
 impl Project for RevisionImageProject {
+    fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        Ok(self.bifrost_ignore()?.rules_digest())
+    }
+    fn project_read_slot(
+        &self,
+    ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(
+        &self,
+        capability: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
+    ) -> bool {
+        self.files.install_read_recorder(capability.clone());
+        self.project_reads.install(capability);
+        true
+    }
     fn root(&self) -> &Path {
         self.files.root()
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.files.analyzer_languages()
+        self.project_reads
+            .languages(self.as_project(), || self.files.analyzer_languages())
     }
 
     fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
-        self.files.all_files()
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        let files = self.files.all_files()?;
+        self.bifrost_ignore()?;
+        Ok(files)
     }
 
     /// The revision's analyzable files, less what its own `.bifrostignore`
     /// excludes, exactly as the working tree's project answers.
     fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = brokk_bifrost_core::analyzer::project_reads::listing_read(self);
         let files = self.files.analyzable_files(language)?;
         let ignore = self.bifrost_ignore()?;
         Ok(files
@@ -3021,6 +3051,7 @@ impl Project for RevisionImageProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> std::io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = brokk_bifrost_core::analyzer::project_reads::listing_read(self);
         let files = self.files.analyzable_files_from(files, language)?;
         let ignore = self.bifrost_ignore()?;
         Ok(files
@@ -3030,11 +3061,17 @@ impl Project for RevisionImageProject {
     }
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
         self.bifrost_ignore()
             .is_ok_and(|ignore| ignore.is_ignored_path(rel_path))
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), rel_path));
         self.files.file_by_rel_path(rel_path)
     }
 
@@ -3043,18 +3080,30 @@ impl Project for RevisionImageProject {
     }
 
     fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
-        match self.revision_bytes(file) {
-            Some(bytes) => {
-                bytes.and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
-            }
-            None => self.files.read_source(file).or_else(|error| {
-                self.fallback_revision_bytes(file)
-                    .map(|bytes| {
-                        bytes.and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
-                    })
-                    .unwrap_or(Err(error))
-            }),
-        }
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || match self.revision_bytes(file) {
+                Some(bytes) => {
+                    bytes.and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
+                }
+                None => self.files.read_source(file).or_else(|error| {
+                    self.fallback_revision_bytes(file)
+                        .map(|bytes| {
+                            bytes.and_then(
+                                brokk_bifrost_core::analyzer::project::decode_source_bytes,
+                            )
+                        })
+                        .unwrap_or(Err(error))
+                }),
+            },
+            |source| {
+                Some(
+                    git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                        .expect("hashing project source"),
+                )
+            },
+        )
     }
 
     fn read_source_limited(
@@ -3062,41 +3111,57 @@ impl Project for RevisionImageProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> std::io::Result<Option<String>> {
-        match self.revision_bytes(file) {
-            Some(bytes) => {
-                let bytes = bytes?;
-                if bytes.len() > max_bytes {
-                    return Ok(None);
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || match self.revision_bytes(file) {
+                Some(bytes) => {
+                    let bytes = bytes?;
+                    if bytes.len() > max_bytes {
+                        return Ok(None);
+                    }
+                    brokk_bifrost_core::analyzer::project::decode_source_bytes(bytes).map(Some)
                 }
-                brokk_bifrost_core::analyzer::project::decode_source_bytes(bytes).map(Some)
-            }
-            None => self
-                .files
-                .read_source_limited(file, max_bytes)
-                .or_else(|error| {
-                    self.fallback_revision_bytes(file)
-                        .map(|bytes| {
-                            let bytes = bytes?;
-                            if bytes.len() > max_bytes {
-                                return Ok(None);
-                            }
-                            brokk_bifrost_core::analyzer::project::decode_source_bytes(bytes)
-                                .map(Some)
-                        })
-                        .unwrap_or(Err(error))
-                }),
-        }
+                None => self
+                    .files
+                    .read_source_limited(file, max_bytes)
+                    .or_else(|error| {
+                        self.fallback_revision_bytes(file)
+                            .map(|bytes| {
+                                let bytes = bytes?;
+                                if bytes.len() > max_bytes {
+                                    return Ok(None);
+                                }
+                                brokk_bifrost_core::analyzer::project::decode_source_bytes(bytes)
+                                    .map(Some)
+                            })
+                            .unwrap_or(Err(error))
+                    }),
+            },
+            |source| {
+                source.as_ref().map(|source| {
+                    git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                        .expect("hashing project source")
+                })
+            },
+        )
     }
 
     fn read_source_snapshot(
         &self,
         file: &ProjectFile,
     ) -> std::io::Result<brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot> {
-        match self.revision_bytes(file) {
-            Some(bytes) => bytes
-                .and_then(brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk_bytes),
-            None => self.files.read_source_snapshot(file),
-        }
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || match self.revision_bytes(file) {
+                Some(bytes) => bytes.and_then(
+                    brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk_bytes,
+                ),
+                None => self.files.read_source_snapshot(file),
+            },
+            |source| Some(source.oid()),
+        )
     }
 
     fn read_source_snapshot_limited(
@@ -3104,6 +3169,7 @@ impl Project for RevisionImageProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> std::io::Result<Option<brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot>> {
+        self.project_reads.source(self.as_project(), file, || {
         match self.revision_bytes(file) {
             Some(bytes) => {
                 brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk_bytes_limited(
@@ -3112,6 +3178,7 @@ impl Project for RevisionImageProject {
             }
             None => self.files.read_source_snapshot_limited(file, max_bytes),
         }
+        }, |source| source.as_ref().map(|source| source.oid()))
     }
 }
 
@@ -3127,6 +3194,7 @@ impl RevisionImageProject {
     /// through the object database like any other.
     fn bifrost_ignore(&self) -> std::io::Result<&BifrostIgnoreMatcher> {
         if let Some(ignore) = self.bifrost_ignore.get() {
+            brokk_bifrost_core::analyzer::project_reads::publish_receipt(ignore.listing_receipt());
             return Ok(ignore);
         }
         let files = self.files.all_files()?;
@@ -3142,7 +3210,9 @@ impl RevisionImageProject {
                 Ok(None)
             }
         })?;
-        Ok(self.bifrost_ignore.get_or_init(|| ignore))
+        let ignore = self.bifrost_ignore.get_or_init(|| ignore);
+        brokk_bifrost_core::analyzer::project_reads::publish_receipt(ignore.listing_receipt());
+        Ok(ignore)
     }
 
     /// `file`'s bytes as the revision holds them, or `None` for a file this

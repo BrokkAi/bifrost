@@ -783,9 +783,13 @@ pub fn collect_summary_findings_with_limits(
                 }
             }
             TypestateFindingCertainty::Inconclusive => {
+                debug_assert!(
+                    failing > 0,
+                    "terminal_finding_certainty rejects zero failures"
+                );
                 for (state_index, state) in actual_states.iter().copied().enumerate() {
                     check_cancellation(cancellation, state_index)?;
-                    if failing != 0 && terminal.expected_states().binary_search(&state).is_ok() {
+                    if terminal.expected_states().binary_search(&state).is_ok() {
                         continue;
                     }
                     let Some(targets) = targets_for_state(state) else {
@@ -794,11 +798,7 @@ pub fn collect_summary_findings_with_limits(
                     let Some(observation) = observations.states.get(&state) else {
                         continue;
                     };
-                    let target = if failing == 0 {
-                        targets
-                            .uncertainty_witness()
-                            .or_else(|| targets.preferred())
-                    } else if !observation.uncertainty.is_empty() || observation.abstained {
+                    let target = if !observation.uncertainty.is_empty() || observation.abstained {
                         targets
                             .uncertainty_witness()
                             .or_else(|| targets.preferred())

@@ -335,7 +335,12 @@ fn insert_hit_range(
 
 pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {
     let key = (node.start_byte(), node.end_byte());
-    if let Some(cached) = ctx.enclosing_cache.borrow().get(&key).cloned() {
+    if let Some(cached) = ctx
+        .enclosing_cache
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells.borrow().get(&key).cloned()
+        })
+    {
         return cached;
     }
     let range = Range {
@@ -346,21 +351,29 @@ pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext 
     };
     let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
     let owner = enclosing.as_ref().and_then(|enclosing| {
-        let cached = ctx.enclosing_owner_cache.borrow().get(enclosing).cloned();
+        let cached = ctx
+            .enclosing_owner_cache
+            .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+                cells.borrow().get(enclosing).cloned()
+            });
         if let Some(cached) = cached {
             return cached;
         }
         let resolved = precise_parent_of(&ctx.analyzer, ctx.visibility, enclosing)
             .or_else(|| visible_owner_from_member_name(ctx, enclosing));
         ctx.enclosing_owner_cache
-            .borrow_mut()
-            .insert(enclosing.clone(), resolved.clone());
+            .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+                cells
+                    .borrow_mut()
+                    .insert(enclosing.clone(), resolved.clone())
+            });
         resolved
     });
     let context = EnclosingContext { enclosing, owner };
     ctx.enclosing_cache
-        .borrow_mut()
-        .insert(key, context.clone());
+        .read(&ctx.visibility.reads.memo_attribution(), |cells| {
+            cells.borrow_mut().insert(key, context.clone())
+        });
     context
 }
 

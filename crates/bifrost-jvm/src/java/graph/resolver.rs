@@ -219,6 +219,10 @@ pub fn seed_class_binding(
 }
 
 impl JavaReturnTypeContext for ScanCtx<'_> {
+    fn read_capability(&self) -> &brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        self.reads
+    }
+
     fn java(&self) -> &dyn JavaSource {
         self.java
     }
@@ -541,19 +545,16 @@ pub fn receiver_type_matches_target(
     token: QueryToken<'_>,
     ctx: &ScanCtx<'_>,
 ) -> ReceiverTargetMatch {
-    let receiver_fq_name = receiver_type.fq_name();
-    if let Some(cached) = ctx
-        .receiver_target_match_cache
-        .borrow()
-        .get(&receiver_fq_name)
-    {
-        return *cached;
-    }
-    let resolved = receiver_type_matches_target_uncached(receiver_type, token, ctx);
     ctx.receiver_target_match_cache
-        .borrow_mut()
-        .insert(receiver_fq_name, resolved);
-    resolved
+        .read(&ctx.reads.memo_attribution(), |cache| {
+            let receiver_fq_name = receiver_type.fq_name();
+            if let Some(cached) = cache.borrow().get(&receiver_fq_name) {
+                return *cached;
+            }
+            let resolved = receiver_type_matches_target_uncached(receiver_type, token, ctx);
+            cache.borrow_mut().insert(receiver_fq_name, resolved);
+            resolved
+        })
 }
 
 fn receiver_type_matches_target_uncached(
@@ -1365,77 +1366,71 @@ fn method_return_type_for_call(
     arity: usize,
     ctx: &ScanCtx<'_>,
 ) -> Option<CodeUnit> {
-    let cache_key = MethodCallReturnCacheKey {
-        owner_fqn: owner.fq_name(),
-        method_name: method_name.to_string(),
-        arity,
-    };
-    if let Some(cached) = ctx
-        .method_call_return_cache
-        .borrow()
-        .get(&cache_key)
-        .cloned()
-    {
-        return single_return_class(ctx, cached);
-    }
-
-    // A method call binds to one declaration: the receiver's own type answers
-    // it when it declares the method, and otherwise the nearest level of the
-    // hierarchy that declares it does (JLS 15.12.2). The ancestor chain is a
-    // lookup order, not a set of branches. Merging a return type across every
-    // ancestor made each ancestor that declares nothing contribute `Unknown`,
-    // which downgraded the one real answer to `Ambiguous` and left the call
-    // untyped -- so a switch selector such as `field.getRoundingMode()` typed
-    // only while the receiver's class had no supertype at all (#2181).
-    let declaring_owners =
-        if !java_call_answering_units(&cache_key.owner_fqn, token, method_name, arity, ctx)
-            .is_empty()
-        {
-            vec![cache_key.owner_fqn.clone()]
-        } else {
-            match ctx.graph.hierarchy {
-                None => Vec::new(),
-                Some(provider) => {
-                    let declaring = match java_nearest_declaring_ancestors(
-                        ctx.java,
-                        provider,
-                        owner,
-                        |ancestor| {
-                            Ok(!java_call_answering_units(
-                                &ancestor.fq_name(),
-                                token,
-                                method_name,
-                                arity,
-                                ctx,
-                            )
-                            .is_empty())
-                        },
-                    ) {
-                        Ok(Some(declaring)) => declaring,
-                        Ok(None) => Vec::new(),
-                        Err(JavaHierarchyFactError::MetadataUnavailable) => {
-                            let outcome = ReceiverAnalysisOutcome::Unknown;
-                            ctx.method_call_return_cache
-                                .borrow_mut()
-                                .insert(cache_key, outcome);
-                            return None;
-                        }
-                    };
-                    declaring.iter().map(CodeUnit::fq_name).collect()
-                }
-            }
-        };
-    let outcome = method_return_type_for_owner_fqns(
-        declaring_owners.iter().map(String::as_str),
-        token,
-        method_name,
-        arity,
-        ctx,
-    );
     ctx.method_call_return_cache
-        .borrow_mut()
-        .insert(cache_key, outcome.clone());
-    single_return_class(ctx, outcome)
+        .read(&ctx.reads.memo_attribution(), |cache| {
+            let cache_key = MethodCallReturnCacheKey {
+                owner_fqn: owner.fq_name(),
+                method_name: method_name.to_string(),
+                arity,
+            };
+            if let Some(cached) = cache.borrow().get(&cache_key).cloned() {
+                return single_return_class(ctx, cached);
+            }
+
+            // A method call binds to one declaration: the receiver's own type answers
+            // it when it declares the method, and otherwise the nearest level of the
+            // hierarchy that declares it does (JLS 15.12.2). The ancestor chain is a
+            // lookup order, not a set of branches. Merging a return type across every
+            // ancestor made each ancestor that declares nothing contribute `Unknown`,
+            // which downgraded the one real answer to `Ambiguous` and left the call
+            // untyped -- so a switch selector such as `field.getRoundingMode()` typed
+            // only while the receiver's class had no supertype at all (#2181).
+            let declaring_owners =
+                if !java_call_answering_units(&cache_key.owner_fqn, token, method_name, arity, ctx)
+                    .is_empty()
+                {
+                    vec![cache_key.owner_fqn.clone()]
+                } else {
+                    match ctx.graph.hierarchy {
+                        None => Vec::new(),
+                        Some(provider) => {
+                            let declaring = match java_nearest_declaring_ancestors(
+                                ctx.java,
+                                provider,
+                                owner,
+                                |ancestor| {
+                                    Ok(!java_call_answering_units(
+                                        &ancestor.fq_name(),
+                                        token,
+                                        method_name,
+                                        arity,
+                                        ctx,
+                                    )
+                                    .is_empty())
+                                },
+                            ) {
+                                Ok(Some(declaring)) => declaring,
+                                Ok(None) => Vec::new(),
+                                Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                                    let outcome = ReceiverAnalysisOutcome::Unknown;
+                                    cache.borrow_mut().insert(cache_key, outcome);
+                                    return None;
+                                }
+                            };
+                            declaring.iter().map(CodeUnit::fq_name).collect()
+                        }
+                    }
+                };
+            let outcome = method_return_type_for_owner_fqns(
+                declaring_owners.iter().map(String::as_str),
+                token,
+                method_name,
+                arity,
+                ctx,
+            );
+            cache.borrow_mut().insert(cache_key, outcome.clone());
+            single_return_class(ctx, outcome)
+        })
 }
 
 fn single_return_class(

@@ -28,7 +28,8 @@
 
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, DenseBidirectionalGraph,
-    Dominators, GenKillFacts, ReachingSets, dominators, forward_reachability, reaching_definitions,
+    Dominators, GenKillFacts, Reachability, ReachingSets, dominators, forward_reachability,
+    reaching_definitions, reverse_reachability,
 };
 use crate::analyzer::semantic::derive_property_reaching_over_graph;
 use crate::analyzer::semantic::{
@@ -926,9 +927,10 @@ impl FlowStateDerivation {
         &self,
         procedure: &ProcedureHandle,
         read_event: usize,
+        request: &mut FlowStateRequest<'_>,
     ) -> BindingInitializationAnswer {
         assert_eq!(self.event(read_event).event_class, StateEventClass::Read);
-        self.binding_initialization_before_event(procedure, read_event)
+        self.binding_initialization_before_event(procedure, read_event, request)
     }
 
     /// Whether a modeled exceptional continuation from this local read goes
@@ -977,18 +979,20 @@ impl FlowStateDerivation {
         &self,
         procedure: &ProcedureHandle,
         establishment_event: usize,
+        request: &mut FlowStateRequest<'_>,
     ) -> BindingInitializationAnswer {
         assert_eq!(
             self.event(establishment_event).event_class,
             StateEventClass::Establish
         );
-        self.binding_initialization_before_event(procedure, establishment_event)
+        self.binding_initialization_before_event(procedure, establishment_event, request)
     }
 
     fn binding_initialization_before_event(
         &self,
         procedure: &ProcedureHandle,
         event: usize,
+        request: &mut FlowStateRequest<'_>,
     ) -> BindingInitializationAnswer {
         assert_eq!(self.procedure, procedure.id());
         assert!(
@@ -1048,6 +1052,68 @@ impl FlowStateDerivation {
                 push_gap_reason(&mut omitted_control, gap);
             }
         }
+        let mut cfg_request =
+            CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
+        let localized = locate_gap_reasons(
+            semantics,
+            reasons,
+            |gap| initialization_gap_retains_topology(gap) || initialization_gap_retains_order(gap),
+            &mut cfg_request,
+        )
+        .and_then(|located| {
+            let mut reasons = located.unlocated;
+            let mut topology_reasons = Vec::new();
+            if reasons.is_empty() {
+                with_control_graph!(semantics, &self.control_edge_mask, |graph| {
+                    let mut reaching_read = None;
+                    for ids in located.by_point.values() {
+                        for id in ids {
+                            cfg_request.visit_pair()?;
+                            let gap = semantics.gap(*id).expect("attributed gap exists");
+                            if initialization_gap_retains_topology(gap) {
+                                // #7536: Go retains every parent normal successor;
+                                // Python exception dispatch retains every handler
+                                // and unmatched propagation without selection code.
+                                // Unknown feasibility or progress cannot invalidate
+                                // a positive all-path initialization proof on this
+                                // over-approximating graph. Child lifetime/effects
+                                // (ConcurrentSpawn) are not covered by this claim.
+                                push_gap_reason(&mut topology_reasons, gap);
+                                continue;
+                            }
+                            if reaching_read.is_none() {
+                                reaching_read = Some(reverse_reachability(
+                                    graph,
+                                    self.event(event).point,
+                                    &mut cfg_request,
+                                )?);
+                            }
+                            if !initialization_order_region_is_off_path(
+                                graph,
+                                semantics,
+                                gap,
+                                reaching_read
+                                    .as_ref()
+                                    .expect("read reachability was solved"),
+                                &mut cfg_request,
+                            )? {
+                                push_gap_reason(&mut reasons, gap);
+                            }
+                        }
+                    }
+                    Ok::<_, CfgAlgorithmError<ProgramPointId>>(())
+                })?;
+            }
+            Ok((reasons, topology_reasons))
+        });
+        let (reasons, topology_reasons) = match localized {
+            Ok(localized) => localized,
+            Err(error) => {
+                let mut reasons = Vec::new();
+                push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                return BindingInitializationAnswer::Open { reasons };
+            }
+        };
         if !reasons.is_empty() {
             return BindingInitializationAnswer::Open { reasons };
         }
@@ -1056,16 +1122,26 @@ impl FlowStateDerivation {
             // completeness and would have returned above.
             unreachable!("covered binding reaching has initialization facts");
         };
-        if let Some(answer) = facts.correlated_before_event.get(&event) {
-            return answer.clone();
-        }
-        match facts.uninitialized_before_event.get(&event) {
-            Some(false) => BindingInitializationAnswer::Proven,
-            Some(true) => BindingInitializationAnswer::MayBeUninitialized,
-            None if omitted_control.is_empty() => BindingInitializationAnswer::Unreachable,
-            None => BindingInitializationAnswer::Open {
-                reasons: omitted_control,
-            },
+        let answer = if let Some(answer) = facts.correlated_before_event.get(&event) {
+            answer.clone()
+        } else {
+            match facts.uninitialized_before_event.get(&event) {
+                Some(false) => BindingInitializationAnswer::Proven,
+                Some(true) => BindingInitializationAnswer::MayBeUninitialized,
+                None if omitted_control.is_empty() => BindingInitializationAnswer::Unreachable,
+                None => BindingInitializationAnswer::Open {
+                    reasons: omitted_control,
+                },
+            }
+        };
+        if matches!(answer, BindingInitializationAnswer::Proven) || topology_reasons.is_empty() {
+            answer
+        } else {
+            // Retained alternatives over-approximate feasible executions. A
+            // path without an establishment does not certify a negative answer.
+            BindingInitializationAnswer::Open {
+                reasons: topology_reasons,
+            }
         }
     }
 
@@ -1475,32 +1551,34 @@ impl FlowStateDerivation {
             })
             .cloned()
             .collect::<Vec<_>>();
-        // #7340: location alone does not prove locality. Only audited kinds
-        // can leave the procedure-wide veto; unknown and future kinds fail closed.
-        let (located, reasons): (Vec<_>, Vec<_>) = reasons.into_iter().partition(|reason| {
-            matches!(reason, FlowStateIncompleteReason::LoweringGap { gaps, .. }
-                if !gaps.is_empty() && gaps.iter().all(|id| semantics.gap(*id)
-                    .is_some_and(overwrite_gap_is_point_local)))
-        });
-        if !reasons.is_empty() {
-            return OverwrittenUnreadAnswer::Open { reasons };
-        }
-
         let mut cfg_request =
             CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
-        let result = with_control_graph!(semantics, &self.control_edge_mask, |graph| {
-            overwritten_unread_over_graph(
-                graph,
-                OverwrittenUnreadWalkInputs {
-                    semantics,
-                    events: &self.events,
-                    event_keys: &self.event_keys,
-                    establishment_event,
-                    binding,
-                    located_reasons: &located,
-                },
-                &mut cfg_request,
-            )
+        let result = locate_gap_reasons(
+            semantics,
+            reasons,
+            overwrite_gap_is_point_local,
+            &mut cfg_request,
+        )
+        .and_then(|located| {
+            if !located.unlocated.is_empty() {
+                return Ok(OverwrittenUnreadAnswer::Open {
+                    reasons: located.unlocated,
+                });
+            }
+            with_control_graph!(semantics, &self.control_edge_mask, |graph| {
+                overwritten_unread_over_graph(
+                    graph,
+                    OverwrittenUnreadWalkInputs {
+                        semantics,
+                        events: &self.events,
+                        event_keys: &self.event_keys,
+                        establishment_event,
+                        binding,
+                        gaps_by_point: &located.by_point,
+                    },
+                    &mut cfg_request,
+                )
+            })
         });
         match result {
             Ok(answer) => answer,
@@ -4474,9 +4552,8 @@ fn normal_continuation_absence_may_name(
     models: &ResolvedActiveSemanticModels,
     shape: &CallShapeReport,
 ) -> bool {
-    [false, true]
-        .into_iter()
-        .any(|has_receiver| normal_continuation_absence_accepts(models, shape, has_receiver))
+    normal_continuation_absence_accepts(models, shape, false)
+        || normal_continuation_absence_accepts_written_or_implicit_receiver(models, shape, true)
 }
 
 fn normal_continuation_absence_may_apply(
@@ -5415,10 +5492,6 @@ pub struct ProcedureContinuationProjection {
 impl ProcedureContinuationProjection {
     pub fn procedure(&self) -> &ProcedureHandle {
         &self.procedure
-    }
-
-    pub fn reasons(&self) -> &[FlowStateIncompleteReason] {
-        &self.reasons
     }
 
     /// Positive whole-procedure proof for this source or specialized invocation.
@@ -8379,6 +8452,109 @@ fn push_algorithm_reason(
     }
 }
 
+// #7340: location alone does not prove locality. Every attributed gap in a
+// reason must satisfy the consumer's audited predicate; future kinds fail closed.
+struct LocatedGapReasons {
+    by_point: BTreeMap<ProgramPointId, Vec<SemanticGapId>>,
+    unlocated: Vec<FlowStateIncompleteReason>,
+}
+
+fn locate_gap_reasons(
+    semantics: &ProcedureSemantics,
+    reasons: Vec<FlowStateIncompleteReason>,
+    is_local: impl Fn(&SemanticGap) -> bool,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<LocatedGapReasons, CfgAlgorithmError<ProgramPointId>> {
+    let (located, unlocated): (Vec<_>, Vec<_>) = reasons.into_iter().partition(|reason| {
+        matches!(reason, FlowStateIncompleteReason::LoweringGap { gaps, .. }
+            if !gaps.is_empty() && gaps.iter().all(|id| semantics.gap(*id)
+                .is_some_and(&is_local)))
+    });
+    let mut by_point = BTreeMap::<_, Vec<_>>::new();
+    if unlocated.is_empty() {
+        // Index once per query, charging each gap once. Ordered points and the
+        // retained gap order within each point keep reported reasons deterministic.
+        for reason in located {
+            let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
+                unreachable!("only attributed lowering gaps are scoped");
+            };
+            for id in gaps {
+                request.visit_pair()?;
+                let gap = semantics.gap(id).expect("attributed gap exists");
+                by_point.entry(gap.point).or_default().push(id);
+            }
+        }
+    }
+    Ok(LocatedGapReasons {
+        by_point,
+        unlocated,
+    })
+}
+
+fn initialization_gap_retains_topology(gap: &SemanticGap) -> bool {
+    // ConcurrentSpawn retains parent successors but not the child's later
+    // effects, so it intentionally does not match this positive-proof contract.
+    matches!(
+        (gap.capability, gap.kind, gap.subject, gap.discharge),
+        (
+            SemanticCapability::NormalControlFlow | SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+            SemanticGapSubject::Point,
+            SemanticGapDischarge::RetainedControlTopology
+        )
+    )
+}
+
+fn initialization_gap_retains_order(gap: &SemanticGap) -> bool {
+    matches!(
+        (gap.capability, gap.kind, gap.subject, gap.discharge),
+        (
+            SemanticCapability::NormalControlFlow,
+            SemanticGapKind::Unknown,
+            SemanticGapSubject::Point,
+            SemanticGapDischarge::RetainedEvaluationOrder
+        )
+    )
+}
+
+fn initialization_order_region_is_off_path<G>(
+    graph: &G,
+    semantics: &ProcedureSemantics,
+    gap: &SemanticGap,
+    reaching_read: &Reachability<ProgramPointId>,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<bool, CfgAlgorithmError<ProgramPointId>>
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
+{
+    request.visit_pair()?;
+    let Some(mapping) = semantics.source_mapping(gap.source) else {
+        return Ok(false);
+    };
+    // Go's assignment, spawn/defer registration, and range-target producers
+    // can attach the gap after the operands. Its point alone is not its scope:
+    // include every point mapped within the enclosing evaluation's syntax range.
+    // Reverse reachability includes the read itself and all loop back edges.
+    if reaching_read.contains(graph, gap.point) {
+        return Ok(false);
+    }
+    let span = mapping.locator.anchor().span();
+    for point in semantics.points() {
+        request.visit_node::<ProgramPointId>()?;
+        let Some(mapping) = semantics.source_mapping(point.source) else {
+            return Ok(false);
+        };
+        let point_span = mapping.locator.anchor().span();
+        if point_span.start_byte() >= span.start_byte()
+            && point_span.end_byte() <= span.end_byte()
+            && reaching_read.contains(graph, point.id)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 // #7340 lowerer audit: this allow-list intentionally excludes assignment/storage,
 // capture, deferred execution, resource lifetime and region/order obligations
 // (D1-D10). A point on those gaps need not be their complete execution scope.
@@ -8419,7 +8595,7 @@ struct OverwrittenUnreadWalkInputs<'a> {
     event_keys: &'a [SemanticEventKey],
     establishment_event: usize,
     binding: ValueId,
-    located_reasons: &'a [FlowStateIncompleteReason],
+    gaps_by_point: &'a BTreeMap<ProgramPointId, Vec<SemanticGapId>>,
 }
 
 fn overwritten_unread_over_graph<G>(
@@ -8436,21 +8612,8 @@ where
         event_keys,
         establishment_event,
         binding,
-        located_reasons,
+        gaps_by_point,
     } = inputs;
-    // Index once per query, charging each gap once. Ordered points and the
-    // retained gap order within each point keep reported reasons deterministic.
-    let mut gaps_by_point = BTreeMap::<_, Vec<_>>::new();
-    for reason in located_reasons {
-        let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
-            unreachable!("only attributed lowering gaps are scoped");
-        };
-        for id in gaps {
-            request.visit_pair()?;
-            let gap = semantics.gap(*id).expect("attributed gap exists");
-            gaps_by_point.entry(gap.point).or_default().push(*id);
-        }
-    }
     let origin = &events[establishment_event];
     let reachable = forward_reachability(graph, semantics.entry_point(), request)?;
     if !reachable.contains(graph, origin.point) {
@@ -8458,7 +8621,7 @@ where
         // reachable gap leaves this entry proof open, independently of the
         // capability axes table and the establishment-to-kill walk.
         let mut reasons = Vec::new();
-        for (&point, gaps) in &gaps_by_point {
+        for (&point, gaps) in gaps_by_point {
             if reachable.contains(graph, point) {
                 for id in gaps {
                     push_gap_reason(
@@ -11361,6 +11524,110 @@ def deleted():
         );
     }
 
+    #[test]
+    fn initialization_order_regions_fail_closed_on_missing_mappings_and_work_limits() {
+        const SOURCE: &str = "package sample\nfunc next() int { return 0 }\nfunc sink2(a, b int) {}\nfunc f(items []int) { for range items {}; value := 1; value = value; sink2(next(), items[0]) }\n";
+        let fixture = Fixture::new(Language::Go, &[("main.go", SOURCE)]);
+        let state = fixture.state(0);
+        let offset = SOURCE.find("value = value").unwrap() + 8;
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Read && event.site.range.start_byte == offset
+        });
+        let read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read && event.site.range.start_byte == offset
+            })
+            .unwrap();
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let semantics = procedure.semantics();
+        let gap = semantics
+            .gaps()
+            .iter()
+            .find(|gap| initialization_gap_retains_order(gap))
+            .expect("the competing index read and call retain an order region");
+        let cancellation = CancellationToken::default();
+        let mut request = FlowStateRequest::new(&cancellation);
+        assert_eq!(
+            derivation.binding_initialization_at_read(&procedure, read.event, &mut request),
+            BindingInitializationAnswer::Proven
+        );
+        let mut request = FlowStateRequest::new(&cancellation);
+        request.cfg_budget = CfgAlgorithmBudget::uniform(1);
+        let exhausted =
+            derivation.binding_initialization_at_read(&procedure, read.event, &mut request);
+        assert!(
+            matches!(exhausted, BindingInitializationAnswer::Open { reasons }
+            if reasons.iter().any(|reason| matches!(reason, FlowStateIncompleteReason::BudgetExhausted { .. })))
+        );
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let cancelled_answer = derivation.binding_initialization_at_read(
+            &procedure,
+            read.event,
+            &mut FlowStateRequest::new(&cancelled),
+        );
+        assert!(
+            matches!(cancelled_answer, BindingInitializationAnswer::Open { reasons }
+            if reasons.contains(&FlowStateIncompleteReason::Cancelled))
+        );
+
+        let mut budget = CfgAlgorithmBudget::default();
+        let mut request = CfgAlgorithmRequest::new(&mut budget, &cancellation);
+        with_control_graph!(semantics, &derivation.control_edge_mask, |graph| {
+            let reaching_read = reverse_reachability(graph, read.point, &mut request).unwrap();
+            assert!(
+                initialization_order_region_is_off_path(
+                    graph,
+                    semantics,
+                    gap,
+                    &reaching_read,
+                    &mut request
+                )
+                .unwrap()
+            );
+            // Artifact validation disallows absent mappings. Exercise the helper's
+            // fail-closed boundary with a detached gap carrying an invalid ID.
+            let mut missing = gap.clone();
+            missing.source = SourceMappingId::new(u32::MAX);
+            assert!(
+                !initialization_order_region_is_off_path(
+                    graph,
+                    semantics,
+                    &missing,
+                    &reaching_read,
+                    &mut request
+                )
+                .unwrap()
+            );
+        });
+
+        let other = semantics
+            .gaps()
+            .iter()
+            .find(|other| initialization_gap_retains_topology(other))
+            .expect("the prior loop retains a topology gap with the same capability and kind");
+        let mut reasons = Vec::new();
+        push_gap_reason(&mut reasons, gap);
+        let FlowStateIncompleteReason::LoweringGap { gaps, .. } = &mut reasons[0] else {
+            unreachable!()
+        };
+        gaps.push(other.id);
+        let located = locate_gap_reasons(
+            semantics,
+            reasons.clone(),
+            initialization_gap_retains_order,
+            &mut request,
+        )
+        .unwrap();
+        assert_eq!(
+            located.unlocated, reasons,
+            "one unaudited member retains the entire reason"
+        );
+        assert!(located.by_point.is_empty());
+    }
+
     const RUST_INITIALIZATION_GAP_REACHABILITY: &str = r#"
 fn back_edge(mut low: usize) {
     loop {
@@ -11447,7 +11714,11 @@ fn add_scalar(mut low: usize) -> (usize, usize) {
                     semantics.gaps()
                 );
             }
-            let answer = derivation.binding_initialization_at_read(&procedure, read.event);
+            let answer = derivation.binding_initialization_at_read(
+                &procedure,
+                read.event,
+                &mut FlowStateRequest::new(&CancellationToken::default()),
+            );
             if expected_open {
                 let BindingInitializationAnswer::Open { reasons } = answer else {
                     panic!("{name}: expected an open proof, got {answer:?}");
@@ -11511,7 +11782,11 @@ fn add_scalar(mut low: usize) -> (usize, usize) {
             .expect("the implicit return still publishes its Values gap");
         assert!(matches!(gap.subject, SemanticGapSubject::Value(_)));
         assert_eq!(
-            derivation.binding_initialization_at_read(&procedure, read.event),
+            derivation.binding_initialization_at_read(
+                &procedure,
+                read.event,
+                &mut FlowStateRequest::new(&CancellationToken::default())
+            ),
             BindingInitializationAnswer::Proven
         );
     }
@@ -11557,7 +11832,11 @@ fn add_scalar(mut low: usize) -> (usize, usize) {
                 .expect("self-assignment RHS has a binding read");
             let procedure = fixture.procedure(0, derivation.procedure);
             assert_eq!(
-                derivation.binding_initialization_at_read(&procedure, read),
+                derivation.binding_initialization_at_read(
+                    &procedure,
+                    read,
+                    &mut FlowStateRequest::new(&CancellationToken::default())
+                ),
                 expected,
                 "{method}: {:?}",
                 derivation.completeness
@@ -11592,7 +11871,11 @@ function beforeVar() { c = 1; var c; c = 2; }
                 .expect("plain assignment projects a binding establishment");
             let procedure = fixture.procedure(0, derivation.procedure);
             assert_eq!(
-                derivation.binding_initialization_before_establishment(&procedure, event),
+                derivation.binding_initialization_before_establishment(
+                    &procedure,
+                    event,
+                    &mut FlowStateRequest::new(&CancellationToken::default())
+                ),
                 expected,
                 "{spelling}: {:?}",
                 derivation.completeness
@@ -11613,7 +11896,7 @@ function beforeVar() { c = 1; var c; c = 2; }
                 .expect("plain assignment projects a binding establishment");
             let procedure = fixture.procedure(0, derivation.procedure);
             assert!(matches!(
-                derivation.binding_initialization_before_establishment(&procedure, event),
+                derivation.binding_initialization_before_establishment(&procedure, event, &mut FlowStateRequest::new(&CancellationToken::default())),
                 BindingInitializationAnswer::Open { reasons }
                     if reasons.iter().any(|reason| matches!(
                         reason,
@@ -11651,7 +11934,11 @@ def deleted():
             .expect("the self-assignment RHS is a projected binding read");
         let procedure = fixture.procedure(0, derivation.procedure);
         assert!(matches!(
-            derivation.binding_initialization_at_read(&procedure, read),
+            derivation.binding_initialization_at_read(
+                &procedure,
+                read,
+                &mut FlowStateRequest::new(&CancellationToken::default())
+            ),
             BindingInitializationAnswer::MayBeUninitialized
         ));
     }
@@ -11689,7 +11976,11 @@ def caller(flag):
             .expect("return expression projects a local binding read");
         let procedure = fixture.procedure(0, derivation.procedure);
         assert_eq!(
-            derivation.binding_initialization_at_read(&procedure, read),
+            derivation.binding_initialization_at_read(
+                &procedure,
+                read,
+                &mut FlowStateRequest::new(&CancellationToken::default())
+            ),
             BindingInitializationAnswer::Proven,
             "the constructor's exceptional-only body removes the caller's else continuation: {:?}",
             derivation.completeness
@@ -11851,7 +12142,7 @@ class Sample {
                 event_keys: &keys,
                 establishment_event: 1,
                 binding: write.subject.value(),
-                located_reasons: &[],
+                gaps_by_point: &BTreeMap::new(),
             },
             &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
         )
@@ -11987,6 +12278,117 @@ func read(ch chan int, value *item) int {
     return value.value
 }
 "#;
+
+    const GO_RETAINED_INITIALIZATION_CASES: &str = r#"
+package sample
+
+func next() int { return 1 }
+func sink2(left, right int) {}
+func itemsFromCall(left, right int) []int { return nil }
+
+func deferOrder(items []int) {
+    value := 1
+    value = value
+    defer sink2(next(), items[0])
+}
+
+func rangeOrder(items []int) {
+    value := 1
+    value = value
+    for k, v := range itemsFromCall(next(), items[0]) { _ = k + v }
+    _ = value
+}
+
+func selectTopology(ch chan int) {
+    value := 1
+    select { case <-ch: value = value }
+    _ = value
+}
+
+func receiveTopology(ch chan int) {
+    value := 1
+    <-ch
+    value = value
+    _ = value
+}
+"#;
+
+    #[test]
+    fn retained_initialization_fixture_shapes_publish_the_expected_gap_tuples() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[("main.go", GO_RETAINED_INITIALIZATION_CASES)],
+        );
+        let outcome = fixture.materialized(0);
+        let artifact = outcome
+            .available_value()
+            .expect("Go semantics are available");
+        let source = GO_RETAINED_INITIALIZATION_CASES;
+        let mut found = HashSet::default();
+        for procedure in artifact.procedures() {
+            for gap in procedure.gaps() {
+                let expected = match gap.discharge {
+                    SemanticGapDischarge::RetainedEvaluationOrder => None,
+                    SemanticGapDischarge::RetainedControlTopology
+                        if gap.detail.contains("select may block") =>
+                    {
+                        Some((
+                            "select { case <-ch: value = value }",
+                            SemanticCapability::NormalControlFlow,
+                        ))
+                    }
+                    SemanticGapDischarge::RetainedControlTopology
+                        if gap.detail.contains("channel receive may block") =>
+                    {
+                        Some(("<-ch", SemanticCapability::NormalControlFlow))
+                    }
+                    _ => None,
+                };
+                let mapping = procedure
+                    .source_mapping(gap.source)
+                    .expect("each retained gap has a source mapping");
+                let span = mapping.locator.anchor().span();
+                let mapped = &source[span.start_byte() as usize..span.end_byte() as usize];
+                let order_syntax = if gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder
+                {
+                    if mapped.contains("defer sink2(next(), items[0])") {
+                        Some("defer sink2(next(), items[0])")
+                    } else if mapped.contains("range itemsFromCall(next(), items[0])") {
+                        Some("range itemsFromCall(next(), items[0])")
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let expected = expected.or_else(|| {
+                    order_syntax.map(|syntax| (syntax, SemanticCapability::NormalControlFlow))
+                });
+                if let Some((syntax, capability)) = expected {
+                    assert!(
+                        mapped.contains(syntax),
+                        "gap mapping {mapped:?} should cover {syntax:?}"
+                    );
+                    assert_eq!(gap.capability, capability);
+                    assert_eq!(gap.kind, SemanticGapKind::Unknown);
+                    assert_eq!(gap.subject, SemanticGapSubject::Point);
+                    found.insert(syntax);
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            [
+                "defer sink2(next(), items[0])",
+                "range itemsFromCall(next(), items[0])",
+                "select { case <-ch: value = value }",
+                "<-ch",
+            ]
+            .into_iter()
+            .collect(),
+            "the defer, select, and receive cases each publish their intended tuple"
+        );
+    }
 
     #[test]
     fn channel_blocking_stays_global_incomplete_but_preserves_structured_result_dominance() {
@@ -16986,6 +17388,10 @@ func second(input int) int {
         let cancellation = CancellationToken::default();
         let mut budget = CfgAlgorithmBudget::default();
         let mut run = |located_reasons: &[FlowStateIncompleteReason]| {
+            let mut request = CfgAlgorithmRequest::new(&mut budget, &cancellation);
+            let located =
+                locate_gap_reasons(semantics, located_reasons.to_vec(), |_| true, &mut request)
+                    .expect("synthetic located reasons are indexed");
             overwritten_unread_over_graph(
                 semantics,
                 OverwrittenUnreadWalkInputs {
@@ -16994,9 +17400,9 @@ func second(input int) int {
                     event_keys: &derivation.event_keys,
                     establishment_event: first.event,
                     binding: first.subject.value(),
-                    located_reasons,
+                    gaps_by_point: &located.by_point,
                 },
-                &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+                &mut request,
             )
             .expect("the live-value walk completes")
         };
@@ -17054,6 +17460,10 @@ func second(input int) int {
         push_gap_reason(&mut reasons, semantics.gap(id).unwrap());
         let mut budget = CfgAlgorithmBudget::default();
         let mut run = |located_reasons: &[FlowStateIncompleteReason]| {
+            let mut request = CfgAlgorithmRequest::new(&mut budget, &cancellation);
+            let located =
+                locate_gap_reasons(semantics, located_reasons.to_vec(), |_| true, &mut request)
+                    .expect("synthetic located reasons are indexed");
             overwritten_unread_over_graph(
                 semantics,
                 OverwrittenUnreadWalkInputs {
@@ -17062,9 +17472,9 @@ func second(input int) int {
                     event_keys: &derivation.event_keys,
                     establishment_event: first.event,
                     binding: first.subject.value(),
-                    located_reasons,
+                    gaps_by_point: &located.by_point,
                 },
-                &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+                &mut request,
             )
             .expect("the independent entry walk completes")
         };
@@ -17188,7 +17598,7 @@ def outer():
             .expect("the self-assignment RHS is a projected binding read");
         let procedure = fixture.procedure(0, derivation.procedure);
         assert!(matches!(
-            derivation.binding_initialization_at_read(&procedure, read),
+            derivation.binding_initialization_at_read(&procedure, read, &mut FlowStateRequest::new(&CancellationToken::default())),
             BindingInitializationAnswer::Open { reasons }
                 if reasons.iter().any(|reason| matches!(
                     reason,

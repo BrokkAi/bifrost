@@ -259,10 +259,12 @@ mod python_extraction_tests {
         let context =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
 
+        let context_attribution = context.enter();
         analyzer.begin_query(&context);
         assert!(analyzer.definitions("Missing").next().is_none());
         assert!(context.store_error().is_none());
         analyzer.end_query(&context);
+        drop(context_attribution);
     }
     /// Activate the Python ecosystem against a fabricated environment whose
     /// standard-library root contains exactly `files`, with no intrinsic

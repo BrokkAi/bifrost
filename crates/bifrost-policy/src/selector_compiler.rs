@@ -1229,6 +1229,7 @@ impl<'a> PolicySelectorSession<'a> {
             incremental,
             budget,
             self.workspace,
+            &self.flow_state,
         ));
     }
 
@@ -2830,6 +2831,7 @@ impl<'a> SelectorUnits<'a> {
         incremental: &'a PolicyIncrementalContext<'a>,
         budget: &'a crate::budget::PolicyBudget,
         workspace: &WorkspaceAnalyzer,
+        flow: &brokk_bifrost_flow::FlowWorkspaceState,
     ) -> Self {
         let workspace_files = workspace.analyzer().analyzed_files();
         let files_by_rel = workspace_files
@@ -2837,7 +2839,7 @@ impl<'a> SelectorUnits<'a> {
             .map(|file| (rel_path_string(file), file.clone()))
             .collect();
         Self {
-            reuse: UnitReuse::new(policy, incremental, budget),
+            reuse: UnitReuse::new(policy, incremental, budget, flow),
             policy,
             incremental,
             workspace_files,
@@ -2911,7 +2913,7 @@ impl<'a> SelectorUnits<'a> {
             ));
         }
         self.reuse
-            .prefetch(&self.current)
+            .prefetch(&self.current, None)
             .map_err(PolicySelectorSessionError::Widen)?;
         self.keys.extend(self.current.iter().cloned());
         Ok(seed_files)

@@ -2599,19 +2599,18 @@ impl crate::analyzer::semantic::workspace_oracle::IncomingActualCache {
     #[doc(hidden)]
     pub fn artifact_bytes(&self) -> u64 {
         let mut census = crate::analyzer::semantic::service::ArtifactRetentionCensus::default();
-        for (key, actuals) in self
-            .actuals
-            .lock()
-            .expect("incoming actual cache lock")
-            .iter()
-        {
-            census.context(&key.2);
-            for candidate in &actuals.candidates {
-                census.context(candidate.observation.context());
-                census.context(&candidate.identity_context);
-                census.procedure(candidate.observation.point().procedure());
+        self.actuals.account(|actuals| {
+            let actuals = actuals.lock().expect("incoming actual cache lock");
+            for (key, actuals) in actuals.iter() {
+                census.context(&key.2);
+                for candidate in &actuals.accounted.candidates {
+                    census.context(candidate.observation.context());
+                    census.context(&candidate.identity_context);
+                    census.procedure(candidate.observation.point().procedure());
+                }
             }
-        }
+            0
+        });
         census.artifact_bytes()
     }
 }

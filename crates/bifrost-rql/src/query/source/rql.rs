@@ -1,4 +1,5 @@
 use super::super::ir::DeclarationModifier;
+use super::super::schema::call_traversal_completeness_from_label;
 use super::super::{child_path, index_path};
 use super::*;
 
@@ -1828,6 +1829,19 @@ fn validate_call_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
                     );
                 }
             }
+            ":completeness" if permits_depth => {
+                analysis.add_help(
+                    pair[0].range.clone(),
+                    ":completeness exhaustive|proven-subset",
+                    QueryStepField::Completeness.description(),
+                );
+                validate_rql_reference_scalar(
+                    &pair[1],
+                    "completeness",
+                    call_traversal_completeness_from_label,
+                    analysis,
+                );
+            }
             ":proof" => {
                 analysis.add_help(
                     pair[0].range.clone(),
@@ -1840,7 +1854,7 @@ fn validate_call_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
                 pair[0].range.clone(),
                 "unknown-property",
                 if permits_depth {
-                    "call traversal accepts only :depth and :proof"
+                    "call traversal accepts only :depth, :proof, and :completeness"
                 } else {
                     "call-site traversal accepts only :proof"
                 },

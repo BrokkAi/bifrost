@@ -1,3 +1,7 @@
+use brokk_bifrost_semantic::analyzer::semantic::inventory::{
+    ProcedureTreeWalkOutcome, ProcedureWalkScopes, ProcedureWalkStep, walk_procedure_tree,
+};
+
 use crate::analyzer::java::semantic::syntax::*;
 
 use crate::analyzer::java::semantic::*;
@@ -51,12 +55,6 @@ pub(in crate::analyzer::java::semantic) struct NestedProcedureTarget<'tree> {
 pub(in crate::analyzer::java::semantic) type ProcedureEnumeration<'tree> =
     ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
 
-struct ProcedureEnumerationFrame<'tree> {
-    node: Node<'tree>,
-    lexical_parent: Option<ProcedureId>,
-    declaration_path: usize,
-}
-
 pub(in crate::analyzer::java::semantic) fn enumerate_procedures<'tree>(
     file: &ProjectFile,
     prepared: &'tree PreparedSyntaxTree,
@@ -66,81 +64,87 @@ pub(in crate::analyzer::java::semantic) fn enumerate_procedures<'tree>(
     let root = prepared.tree().root_node();
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "java-source", budget)?;
-    let mut specs = Vec::new();
-    let mut stack = vec![ProcedureEnumerationFrame {
-        node: root,
-        lexical_parent: None,
-        declaration_path: inventory.root_path(),
-    }];
+    let root_path = inventory.root_path();
+    let mut specs = match walk_procedure_tree(
+        root,
+        root_path,
+        &mut inventory,
+        cancellation,
+        |node| {
+            // Inventory also visits named comments, unlike syntax::named_children.
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).collect()
+        },
+        |frame, inventory| {
+            let mut child_path = frame.declaration_path;
+            if let Some(segment_kind) = declaration_container_kind(frame.node) {
+                let name = declaration_container_name(prepared.source(), frame.node);
+                let anchor = source_anchor(frame.node, 0)
+                    .map_err(SemanticProviderError::invalid_identity)?;
+                child_path = inventory.push_container(
+                    frame.declaration_path,
+                    segment_kind,
+                    name.as_deref(),
+                    anchor,
+                )?;
+            }
 
-    while let Some(frame) = stack.pop() {
-        if cancellation.is_cancelled() {
-            return Ok(inventory.cancelled());
-        }
-        if let Err(stop) = inventory.charge_traversal_entry() {
-            return Ok(stop.into_outcome());
-        }
-        let mut child_path = frame.declaration_path;
-        if let Some(segment_kind) = declaration_container_kind(frame.node) {
-            let name = declaration_container_name(prepared.source(), frame.node);
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            child_path = inventory.push_container(
-                frame.declaration_path,
-                segment_kind,
-                name.as_deref(),
-                anchor,
-            )?;
-        }
+            let mut child_parent = frame.lexical_parent;
+            let mut value = None;
+            if let Some((kind, segment_kind, body, properties)) = callable_shape(frame.node) {
+                let name = callable_name(prepared.source(), frame.node);
+                let anchor = source_anchor(frame.node, 0)
+                    .map_err(SemanticProviderError::invalid_identity)?;
+                let identity = match inventory.allocate_procedure(
+                    child_path,
+                    segment_kind,
+                    name.as_deref(),
+                    anchor,
+                )? {
+                    Ok(identity) => identity,
+                    Err(stop) => return Ok(ProcedureWalkStep::ExceededBudget(stop)),
+                };
+                let captures_receiver = if kind == ProcedureKind::Lambda {
+                    match body_contains_free_this(body, cancellation) {
+                        Ok(captures_receiver) => captures_receiver,
+                        Err(LoweringCancelled) => return Ok(ProcedureWalkStep::Cancelled),
+                    }
+                } else {
+                    false
+                };
+                value = Some(ProcedureSpec {
+                    id: identity.id,
+                    callable: frame.node,
+                    body,
+                    locator: identity.locator,
+                    lexical_parent: frame.lexical_parent,
+                    kind,
+                    properties,
+                    captures_receiver,
+                    captures: Vec::new(),
+                    captures_incomplete: false,
+                });
+                child_parent = Some(identity.id);
+                child_path = identity.declaration_path;
+            }
 
-        let mut child_parent = frame.lexical_parent;
-        if let Some((kind, segment_kind, body, properties)) = callable_shape(frame.node) {
-            let name = callable_name(prepared.source(), frame.node);
-            let anchor =
-                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
-            let identity = match inventory.allocate_procedure(
-                child_path,
-                segment_kind,
-                name.as_deref(),
-                anchor,
-            )? {
-                Ok(identity) => identity,
-                Err(stop) => return Ok(stop.into_outcome()),
-            };
-            let captures_receiver = if kind == ProcedureKind::Lambda {
-                match body_contains_free_this(body, cancellation) {
-                    Ok(captures_receiver) => captures_receiver,
-                    Err(LoweringCancelled) => return Ok(inventory.cancelled()),
-                }
-            } else {
-                false
-            };
-            specs.push(ProcedureSpec {
-                id: identity.id,
-                callable: frame.node,
-                body,
-                locator: identity.locator,
-                lexical_parent: frame.lexical_parent,
-                kind,
-                properties,
-                captures_receiver,
-                captures: Vec::new(),
-                captures_incomplete: false,
-            });
-            child_parent = Some(identity.id);
-            child_path = identity.declaration_path;
-        }
-
-        let mut cursor = frame.node.walk();
-        let children = frame.node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
-            stack.push(ProcedureEnumerationFrame {
-                node: child,
-                lexical_parent: child_parent,
-                declaration_path: child_path,
-            });
-        }
-    }
+            // JVM declarations pass their scope to every named child.
+            // Body-ID overrides remain available to the other adapters.
+            Ok(ProcedureWalkStep::Continue {
+                value,
+                scopes: ProcedureWalkScopes {
+                    child_lexical_parent: child_parent,
+                    child_declaration_path: child_path,
+                    container_body: None,
+                    callable_body: None,
+                },
+            })
+        },
+    )? {
+        ProcedureTreeWalkOutcome::Complete(specs) => specs,
+        ProcedureTreeWalkOutcome::ExceededBudget(stop) => return Ok(stop.into_outcome()),
+        ProcedureTreeWalkOutcome::Cancelled => return Ok(inventory.cancelled()),
+    };
 
     match populate_lexical_captures(&mut specs, prepared.source(), &mut inventory, cancellation) {
         Ok(()) => {}

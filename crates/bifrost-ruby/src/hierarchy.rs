@@ -33,7 +33,8 @@ pub fn ruby_resolve_supertype(ruby: &dyn RubySource, raw: &str) -> Option<CodeUn
     if cleaned.contains('$') {
         return None;
     }
-    let types = ruby.types_by_identifier().get(cleaned)?;
+    let index = ruby.types_by_identifier();
+    let types = index.get(cleaned)?;
     let first = types.first()?;
     types
         .iter()

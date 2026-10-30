@@ -3,13 +3,13 @@ use super::*;
 use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
 use crate::analyzer::structural::occurrences::OccurrenceRole;
 use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
-use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use crate::analyzer::{AnalyzerConfig, Language, WorkspaceAnalyzer};
+use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
+use std::path::Path;
 
 #[doc(hidden)]
 pub struct BoundaryFixture {
-    pub(super) _temp: tempfile::TempDir,
+    pub(super) _project: BuiltInlineTestProject,
     #[doc(hidden)]
     pub workspace: WorkspaceAnalyzer,
     #[doc(hidden)]
@@ -36,19 +36,14 @@ impl BoundaryFixture {
         source: &str,
         config: impl FnOnce(&Path) -> AnalyzerConfig,
     ) -> Self {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root.clone(), relative_path);
-        file.write(source).expect("write fixture source");
-        let config = config(&root);
-        let project = TestProject::new(root, language);
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(project) as Arc<dyn Project>,
-            config,
-        )
-        .expect("ephemeral workspace should build");
+        let project = InlineTestProject::with_language(language)
+            .file(relative_path, source)
+            .build();
+        let config = config(project.root());
+        let file = project.file(relative_path);
+        let workspace = project.workspace_analyzer(config);
         Self {
-            _temp: temp,
+            _project: project,
             workspace,
             file,
             source: source.to_owned(),
@@ -234,6 +229,7 @@ pub fn assert_no_boundary_was_drawn(needle: &str, fixture: &BoundaryFixture) {
 /// fixture's analyzer, retaining `discovery` beside it when given.
 /// Everything is a session pack in an ephemeral catalog; nothing is
 /// installed and nothing is downloaded.
+#[track_caller]
 #[doc(hidden)]
 pub fn activate_fixture_pack(
     fixture: &BoundaryFixture,
@@ -241,31 +237,14 @@ pub fn activate_fixture_pack(
     pack_json: &serde_json::Value,
     evidence: SemanticModelActivationEvidence,
 ) {
-    use crate::analyzer::semantic_model::{
-        CatalogOptions, CompilerOptions, SemanticPackCatalog, SessionPackSource,
-        SessionPackSourceKind, SourceFormat, compile_source,
-    };
-
-    let pack = compile_source(
-        SourceFormat::Json,
-        &serde_json::to_vec(pack_json).expect("serialize fixture pack"),
-        &CompilerOptions::default(),
-    )
-    .unwrap_or_else(|diagnostics| panic!("fixture pack must compile: {diagnostics:#?}"));
-    let catalog =
-        SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).expect("ephemeral catalog");
-    catalog
-        .register_session_pack(
-            &pack,
-            &SessionPackSource {
-                kind: SessionPackSourceKind::Embedded,
-                source_id: pack_id.to_owned(),
-            },
-        )
-        .expect("register session pack");
+    let catalog = crate::test_support::embedded_session_semantic_pack_fixture(
+        pack_id,
+        serde_json::to_vec(pack_json).expect("serialize fixture pack"),
+    );
     activate_fixture_catalog(fixture, &catalog, pack_id, evidence);
 }
 
+#[track_caller]
 #[doc(hidden)]
 pub fn activate_fixture_catalog(
     fixture: &BoundaryFixture,
@@ -273,34 +252,14 @@ pub fn activate_fixture_catalog(
     pack_id: &str,
     evidence: SemanticModelActivationEvidence,
 ) {
-    use crate::analyzer::semantic_model::{
-        SemanticModelActivationControl, SemanticModelActivationRequest, SemanticModelControlAction,
-        SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
-        SemanticModelRuntimeOutcome, acquire_active_semantic_models_with_evidence,
-    };
-    let request = SemanticModelActivationRequest {
-        approximate_standard_libraries: Vec::new(),
-        bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
-        evidence: vec![evidence],
-        controls: vec![SemanticModelActivationControl {
-            scope: SemanticModelControlScope::Workspace,
-            action: SemanticModelControlAction::Enable,
-            selector: SemanticModelPackSelector {
-                pack_id: pack_id.to_owned(),
-                version: None,
-                manifest_digest: None,
-            },
-        }],
-        limits: SemanticModelRuntimeLimits::default(),
-    };
-    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models_with_evidence(
-        fixture.workspace.analyzer(),
-        catalog,
-        None,
-        &request,
-        None,
-        &CancellationToken::new(),
-    ) else {
+    let crate::analyzer::semantic_model::SemanticModelRuntimeOutcome::Ready { .. } =
+        crate::test_support::activate_semantic_model_fixture(
+            fixture.workspace.analyzer(),
+            catalog,
+            pack_id,
+            evidence,
+        )
+    else {
         panic!("fixture pack must activate");
     };
     assert!(

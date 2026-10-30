@@ -5,6 +5,7 @@
 use super::super::provider::StructuralSyntaxLimitedOutcome;
 use super::results::{CodeQueryPythonImportLeaf, CodeQueryPythonImportSite};
 use super::*;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -17,8 +18,8 @@ const MAX_IMPORT_SITE_SOURCE_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct PythonImportSiteCache {
-    files: HashMap<ProjectFile, PythonImportFileFacts>,
-    export_surfaces: HashMap<ProjectFile, ExportSurfaceFacts>,
+    files: CaptureScopedMemo<HashMap<ProjectFile, PythonImportFileFacts>>,
+    export_surfaces: CaptureScopedMemo<HashMap<ProjectFile, ExportSurfaceFacts>>,
 }
 
 enum PythonImportFileFacts {
@@ -64,36 +65,43 @@ impl PythonImportSiteCache {
         seed: &SeedMatch,
         cancellation: Option<&CancellationToken>,
     ) -> Option<CodeQueryPythonImportSite> {
-        if seed.language != Language::Python
-            || seed.facts.node(seed.fact_match.node).kind != NormalizedKind::Import
-        {
-            return None;
-        }
+        let Self {
+            files,
+            export_surfaces,
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        files.read_mut(&attribution, |files| {
+            export_surfaces.read_mut(&attribution, |export_surfaces| {
+                if seed.language != Language::Python
+                    || seed.facts.node(seed.fact_match.node).kind != NormalizedKind::Import
+                {
+                    return None;
+                }
 
-        let start_byte = seed.facts.node(seed.fact_match.node).range.start_byte;
-        if !self.files.contains_key(&seed.file) {
-            let facts = build_file_import_facts(
-                analyzer,
-                token,
-                &seed.file,
-                &seed.facts,
-                environment_cache,
-                cancellation,
-                &mut self.export_surfaces,
-            );
-            self.files.insert(seed.file.clone(), facts);
-        }
-        match self
-            .files
-            .get(&seed.file)
-            .expect("Python import facts cached")
-        {
-            PythonImportFileFacts::Available(sites) => sites
-                .get(&start_byte)
-                .cloned()
-                .or_else(|| Some(incomplete_site(start_byte, "unavailable"))),
-            PythonImportFileFacts::Unavailable => Some(incomplete_site(start_byte, "unavailable")),
-        }
+                let start_byte = seed.facts.node(seed.fact_match.node).range.start_byte;
+                if !files.contains_key(&seed.file) {
+                    let facts = build_file_import_facts(
+                        analyzer,
+                        token,
+                        &seed.file,
+                        &seed.facts,
+                        environment_cache,
+                        cancellation,
+                        export_surfaces,
+                    );
+                    files.insert(seed.file.clone(), facts);
+                }
+                match files.get(&seed.file).expect("Python import facts cached") {
+                    PythonImportFileFacts::Available(sites) => sites
+                        .get(&start_byte)
+                        .cloned()
+                        .or_else(|| Some(incomplete_site(start_byte, "unavailable"))),
+                    PythonImportFileFacts::Unavailable => {
+                        Some(incomplete_site(start_byte, "unavailable"))
+                    }
+                }
+            })
+        })
     }
 
     pub(super) fn sites_for_file(
@@ -105,27 +113,36 @@ impl PythonImportSiteCache {
         environment_cache: &mut super::environment::EnvironmentTraversalCache,
         cancellation: Option<&CancellationToken>,
     ) -> Option<Vec<(usize, CodeQueryPythonImportSite)>> {
-        if !self.files.contains_key(file) {
-            let file_facts = build_file_import_facts(
-                analyzer,
-                token,
-                file,
-                facts,
-                environment_cache,
-                cancellation,
-                &mut self.export_surfaces,
-            );
-            self.files.insert(file.clone(), file_facts);
-        }
-        match self.files.get(file).expect("Python import facts cached") {
-            PythonImportFileFacts::Available(sites) => Some(
-                sites
-                    .iter()
-                    .map(|(&start, site)| (start, site.clone()))
-                    .collect(),
-            ),
-            PythonImportFileFacts::Unavailable => None,
-        }
+        let Self {
+            files,
+            export_surfaces,
+        } = self;
+        let attribution = memo_attribution(analyzer);
+        files.read_mut(&attribution, |files| {
+            export_surfaces.read_mut(&attribution, |export_surfaces| {
+                if !files.contains_key(file) {
+                    let file_facts = build_file_import_facts(
+                        analyzer,
+                        token,
+                        file,
+                        facts,
+                        environment_cache,
+                        cancellation,
+                        export_surfaces,
+                    );
+                    files.insert(file.clone(), file_facts);
+                }
+                match files.get(file).expect("Python import facts cached") {
+                    PythonImportFileFacts::Available(sites) => Some(
+                        sites
+                            .iter()
+                            .map(|(&start, site)| (start, site.clone()))
+                            .collect(),
+                    ),
+                    PythonImportFileFacts::Unavailable => None,
+                }
+            })
+        })
     }
 }
 
@@ -316,7 +333,7 @@ fn import_contexts(
 ) -> Option<HashMap<usize, ImportContexts>> {
     let source = facts.source();
     let tree = environment_cache
-        .python_syntax_tree_for(file, facts.source_identity(), source)
+        .python_syntax_tree_for(analyzer, file, facts.source_identity(), source)
         .ok()?;
     let mut contexts = HashMap::default();
     let mut pending = vec![(tree.root_node(), Some(false), false)];

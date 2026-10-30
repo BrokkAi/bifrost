@@ -1675,3 +1675,6 @@ pub(crate) fn dependency_evidence_seed_to_json(
     );
     object
 }
+
+#[cfg(test)]
+mod identity_contracts;

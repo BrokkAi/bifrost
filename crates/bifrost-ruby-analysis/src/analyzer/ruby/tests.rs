@@ -224,7 +224,13 @@ mod canonical_source_tests {
                 .is_none()
         );
         assert!(analyzer.import_info_of(scope.token(), &file).is_empty());
-        assert!(analyzer.autoload_constant_files.get().is_none());
+        assert!(analyzer.autoload_constant_files.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(&analyzer),
+            |(memo, _)| memo.get().is_none(),
+            |_| brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+                &[Language::Ruby]
+            ),
+        ));
         assert_eq!(analyzer.inner.full_hydration_count_for_test(), 0);
         analyzer
             .inner
@@ -359,3 +365,66 @@ use brokk_bifrost_ruby::declarations::parse_ruby_tree;
 
 #[cfg(test)]
 use brokk_bifrost_ruby::syntax::ruby_semantic_identifier_range;
+
+#[cfg(test)]
+mod load_certificate_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::{capture_query_reads, i_analyzer::AnalyzerQueryScope};
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+    use brokk_bifrost_ruby::graph_support::RubySource;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: Ruby wrapper dropped path-probe and authority reads"
+    )]
+    fn evicted_load_certificates_rebuild_absent_path_inputs() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Ruby,
+            &[(
+                "main.rb",
+                "require_relative 'later'\nautoload :Later, 'later'\n",
+            )],
+        );
+        let analyzer = RubyAnalyzer::from_project(fixture.test_project().clone());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let autoload = || {
+            assert!(
+                analyzer
+                    .autoload_constant_files()
+                    .unwrap()
+                    .contains_key("Later")
+            );
+        };
+        let reverse = || {
+            analyzer.build_reverse_import_index(scope.token());
+        };
+        let assert_reads = |read: &dyn Fn()| {
+            let (_, reads) = capture_query_reads(&analyzer, read);
+            assert!(reads.keys().iter().any(|key| matches!(key, ReadKey::PathAbsent { rel_path, .. } if rel_path.as_ref() == "later.rb")));
+            assert_eq!(reads.unattributed_reads(), 0);
+        };
+        autoload();
+        reverse();
+        assert_reads(&autoload);
+        assert_reads(&reverse);
+        analyzer.autoload_constant_files.read(
+            &memo_attribution(&analyzer),
+            |(_, inputs)| {
+                inputs.invalidate_all();
+                inputs.run_pending_tasks();
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Ruby]),
+        );
+        analyzer.reverse_import_index.read(
+            &memo_attribution(&analyzer),
+            |(_, inputs)| {
+                inputs.invalidate_all();
+                inputs.run_pending_tasks();
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Ruby]),
+        );
+        assert_reads(&autoload);
+        assert_reads(&reverse);
+    }
+}

@@ -7,7 +7,8 @@
 use crate::analyzer::rust::RustAnalyzer;
 use brokk_bifrost_analysis::analyzer::rename::exact::{
     ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue, RenameAssemblyLimits,
-    RenameSourceIssue, assemble_exact_rename, check_exact_rename_edits, check_rename_authority,
+    RenameEditCoordinateSegments, RenameSourceIssue, admit_selected_native_source,
+    assemble_exact_rename, check_exact_rename_edits, check_rename_authority,
 };
 
 use crate::analyzer::rust::selected_projection::rust_selected_workspace_identity_gap;
@@ -159,24 +160,22 @@ impl RustCounterfactualFile {
         end_byte: usize,
     ) -> Option<(usize, usize)> {
         let mut delta = 0_i128;
-        for edit in &self.edits {
-            let hypothetical_start = usize::try_from(edit.start_byte as i128 + delta).ok()?;
-            let hypothetical_end = hypothetical_start.checked_add(edit.new_text.len())?;
-            if start_byte == hypothetical_start && end_byte == hypothetical_end {
-                return Some((edit.start_byte, edit.end_byte));
+        for segment in RenameEditCoordinateSegments::new(&self.edits) {
+            let segment = segment.ok()?;
+            if start_byte == segment.hypothetical_start && end_byte == segment.hypothetical_end {
+                return Some((segment.original_start, segment.original_end));
             }
-            if end_byte <= hypothetical_start {
+            if end_byte <= segment.hypothetical_start {
                 break;
             }
-            if start_byte < hypothetical_end {
+            if start_byte < segment.hypothetical_end {
                 return None;
             }
-            delta +=
-                edit.new_text.len() as i128 - edit.end_byte.checked_sub(edit.start_byte)? as i128;
+            delta = segment.delta_after;
         }
         Some((
-            usize::try_from(start_byte as i128 - delta).ok()?,
-            usize::try_from(end_byte as i128 - delta).ok()?,
+            usize::try_from(i128::try_from(start_byte).ok()?.checked_sub(delta)?).ok()?,
+            usize::try_from(i128::try_from(end_byte).ok()?.checked_sub(delta)?).ok()?,
         ))
     }
 }
@@ -931,14 +930,7 @@ impl ExactRenameHooks for RustRenameHooks<'_> {
     type FileState = ();
 
     fn admit_source(&self, file: &ProjectFile, source: &str) -> Result<(), RenameSourceIssue> {
-        if !self
-            .0
-            .inner
-            .source_matches_selected_native_content(file, source)
-        {
-            return Err(RenameSourceIssue::ContentChanged);
-        }
-        Ok(())
+        admit_selected_native_source(&self.0.inner, file, source)
     }
 }
 

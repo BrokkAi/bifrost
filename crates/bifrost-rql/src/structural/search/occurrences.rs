@@ -22,29 +22,44 @@ use super::super::occurrences::{OccurrenceClass, OccurrenceRole};
 use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryRange,
 };
+use super::traversal_memo::{self, TraversalMemo};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_analysis::analyzer::capture_query_reads;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_rql::OccurrenceFilter;
 use std::sync::{Arc, Mutex};
+
+type OccurrenceFileKey = (ProjectFile, Vec<OccurrenceRole>);
 
 /// Complete occurrence products retained by an explicitly scoped row-family
 /// session. Diagnostic suppression stays query-local in
 /// [`OccurrenceTraversalCache`]; only immutable producer output crosses query
 /// boundaries.
-#[derive(Default)]
 pub(super) struct OccurrenceTraversalStore {
-    files: HashMap<(ProjectFile, Vec<OccurrenceRole>), Arc<OccurrenceFileResult>>,
+    files: TraversalMemo<OccurrenceFileKey, Arc<OccurrenceFileResult>>,
     /// Demand-resolved target outcomes reused only inside the surrounding
     /// row-family session. The session pins the workspace and model snapshot;
     /// keys retain the exact occurrence role.
-    targets: HashMap<OccurrenceKey, OccurrenceTarget>,
-    target_roles: HashMap<ProjectFile, HashSet<OccurrenceRole>>,
+    targets: TraversalMemo<OccurrenceKey, OccurrenceTarget>,
     derivations: usize,
     reuses: usize,
 }
 
+impl Default for OccurrenceTraversalStore {
+    fn default() -> Self {
+        Self {
+            files: traversal_memo::new(),
+            targets: traversal_memo::new(),
+            derivations: 0,
+            reuses: 0,
+        }
+    }
+}
+
 impl OccurrenceTraversalStore {
+    #[cfg(test)]
     pub(super) fn stats(&self) -> (usize, usize) {
         (self.derivations, self.reuses)
     }
@@ -55,9 +70,9 @@ impl OccurrenceTraversalStore {
 /// once no matter how many pipeline rows touch it.
 #[derive(Default)]
 pub(super) struct OccurrenceTraversalCache {
-    files: HashMap<(ProjectFile, Vec<OccurrenceRole>), Arc<OccurrenceFileResult>>,
-    targets: HashMap<OccurrenceKey, OccurrenceTarget>,
-    complete_families: HashMap<ProjectFile, HashSet<OccurrenceRole>>,
+    files: CaptureScopedMemo<HashMap<OccurrenceFileKey, Arc<OccurrenceFileResult>>>,
+    targets: CaptureScopedMemo<HashMap<OccurrenceKey, OccurrenceTarget>>,
+    complete_families: CaptureScopedMemo<HashMap<ProjectFile, HashSet<OccurrenceRole>>>,
     shared: Option<Arc<Mutex<OccurrenceTraversalStore>>>,
     selected_ast_ids: Option<Arc<std::collections::HashSet<String>>>,
     reported: HashSet<(Language, OccurrenceRole, CodeQueryDiagnosticCode)>,
@@ -126,62 +141,55 @@ impl OccurrenceTraversalCache {
         roles.sort_unstable();
         roles.dedup();
         let key = (file.clone(), roles);
-        if let Some(cached) = self.files.get(&key).cloned() {
-            self.record_complete_family(file, &key.1, &cached);
+        if let Some(cached) = self.files.read(&memo_attribution(analyzer), |files| {
+            files.get(&key).cloned()
+        }) {
+            self.record_complete_family(analyzer, file, &key.1, &cached);
             return Some(cached);
         }
-        if let Some(shared_store) = self.shared.clone() {
-            let cached = {
-                let mut shared = shared_store
-                    .lock()
-                    .expect("a row-family occurrence cache lock is not poisoned");
-                let cached = shared.files.get(&key).cloned();
-                if cached.is_some() {
-                    shared.reuses = shared.reuses.saturating_add(1);
-                }
-                cached
-            };
-            if let Some(cached) = cached {
-                self.record_complete_family(file, &key.1, &cached);
-                self.files.insert(key, Arc::clone(&cached));
-                return Some(cached);
-            }
-        }
         let token = cancellation.cloned().unwrap_or_default();
-        let derived = match &self.selected_ast_ids {
-            Some(ast_ids) => occurrences_for_file_with_options_roles_and_ast_ids(
-                analyzer,
-                file,
-                self.options,
-                &key.1,
-                ast_ids,
-                &token,
-            ),
-            None => occurrences_for_file_with_options_and_roles(
-                analyzer,
-                file,
-                self.options,
-                Some(&key.1),
-                &token,
-            ),
-        }
-        .ok()?;
-        let mut derived = Arc::new(derived);
-        self.record_complete_family(file, &key.1, &derived);
-        if let Some(shared) = &self.shared {
+        let build = || {
+            match &self.selected_ast_ids {
+                Some(ast_ids) => occurrences_for_file_with_options_roles_and_ast_ids(
+                    analyzer,
+                    file,
+                    self.options,
+                    &key.1,
+                    ast_ids,
+                    &token,
+                ),
+                None => occurrences_for_file_with_options_and_roles(
+                    analyzer,
+                    file,
+                    self.options,
+                    Some(&key.1),
+                    &token,
+                ),
+            }
+            .map(Arc::new)
+        };
+        let derived = if let Some(shared) = &self.shared {
             let mut shared = shared
                 .lock()
                 .expect("a row-family occurrence cache lock is not poisoned");
-            shared.derivations = shared.derivations.saturating_add(1);
-            if key.1.iter().all(|role| derived.completeness.covers(*role)) {
-                if let Some(cached) = shared.files.get(&key).cloned() {
-                    derived = cached;
-                } else {
-                    shared.files.insert(key.clone(), Arc::clone(&derived));
-                }
+            let (value, built) =
+                traversal_memo::derive(&shared.files, analyzer, key.clone(), build, |value| {
+                    key.1.iter().all(|role| value.completeness.covers(*role))
+                })
+                .ok()?;
+            if built {
+                shared.derivations = shared.derivations.saturating_add(1);
+            } else {
+                shared.reuses = shared.reuses.saturating_add(1);
             }
-        }
-        self.files.insert(key, Arc::clone(&derived));
+            value
+        } else {
+            build().ok()?
+        };
+        self.record_complete_family(analyzer, file, &key.1, &derived);
+        self.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(key, Arc::clone(&derived))
+        });
         Some(derived)
     }
 
@@ -215,9 +223,6 @@ impl OccurrenceTraversalCache {
                 .lock()
                 .expect("a row-family occurrence cache lock is not poisoned")
         });
-        let shared_target_roles = shared
-            .as_ref()
-            .and_then(|shared| shared.target_roles.get(file));
         let mut pending_keys = Vec::new();
         let mut pending_rows = Vec::new();
         let mut pending_indices = HashMap::default();
@@ -229,15 +234,21 @@ impl OccurrenceTraversalCache {
                 continue;
             }
             let key = OccurrenceKey::from_row(row);
-            let shareable = self.has_complete_occurrence_family(file, row.role);
-            if let Some(target) = self.targets.get(&key) {
+            let shareable = self.has_complete_occurrence_family(analyzer, file, row.role);
+            if let Some(target) = self.targets.read(&memo_attribution(analyzer), |targets| {
+                targets.get(&key).cloned()
+            }) {
                 row.target = target.clone();
             } else if shareable
-                && shared_target_roles.is_some_and(|roles| roles.contains(&row.role))
-                && let Some(target) = shared.as_ref().and_then(|shared| shared.targets.get(&key))
+                && let Some(target) = shared
+                    .as_ref()
+                    .and_then(|shared| traversal_memo::cached(&shared.targets, analyzer, &key))
             {
                 row.target = target.clone();
-                self.targets.insert(key, target.clone());
+                self.targets
+                    .read_mut(&memo_attribution(analyzer), |targets| {
+                        targets.insert(key, target.clone())
+                    });
             } else if let Some(index) = pending_indices.get(&key).copied() {
                 pending_shareable[index] |= shareable;
             } else {
@@ -251,7 +262,10 @@ impl OccurrenceTraversalCache {
 
         if !pending_rows.is_empty() {
             let token = cancellation.cloned().unwrap_or_default();
-            if derive_targets_for_rows(analyzer, file, &mut pending_rows, &token).is_err() {
+            let (outcome, reads) = capture_query_reads(analyzer, || {
+                derive_targets_for_rows(analyzer, file, &mut pending_rows, &token)
+            });
+            if outcome.is_err() {
                 return false;
             }
             let mut shared = shared_store.as_ref().map(|shared_store| {
@@ -259,7 +273,6 @@ impl OccurrenceTraversalCache {
                     .lock()
                     .expect("a row-family occurrence cache lock is not poisoned")
             });
-            let mut shared_roles = HashSet::default();
             for ((key, row), shareable) in pending_keys
                 .into_iter()
                 .zip(pending_rows)
@@ -269,20 +282,28 @@ impl OccurrenceTraversalCache {
                     !matches!(&row.target, OccurrenceTarget::NotDerived),
                     "the target batch derives every selected reference row"
                 );
-                self.targets.insert(key.clone(), row.target.clone());
+                self.targets
+                    .read_mut(&memo_attribution(analyzer), |targets| {
+                        targets.insert(key.clone(), row.target.clone())
+                    });
                 if shareable && let Some(shared) = shared.as_deref_mut() {
-                    shared_roles.insert(key.role);
-                    shared.targets.entry(key).or_insert(row.target);
+                    let _chosen = traversal_memo::derive(
+                        &shared.targets,
+                        analyzer,
+                        key,
+                        || {
+                            brokk_bifrost_analysis::analyzer::replay_query_read_receipt(
+                                analyzer,
+                                reads.keys(),
+                                reads.unattributed_reads(),
+                                reads.execution_dependences(),
+                            );
+                            Ok::<_, std::convert::Infallible>(row.target)
+                        },
+                        |_| true,
+                    )
+                    .expect("retaining a derived target is infallible");
                 }
-            }
-            if !shared_roles.is_empty()
-                && let Some(shared) = shared.as_deref_mut()
-            {
-                shared
-                    .target_roles
-                    .entry(file.clone())
-                    .or_default()
-                    .extend(shared_roles);
             }
         }
 
@@ -292,7 +313,9 @@ impl OccurrenceTraversalCache {
             {
                 row.target = self
                     .targets
-                    .get(&OccurrenceKey::from_row(row))
+                    .read(&memo_attribution(analyzer), |targets| {
+                        targets.get(&OccurrenceKey::from_row(row)).cloned()
+                    })
                     .expect("a requested occurrence target was derived in this query")
                     .clone();
             }
@@ -300,23 +323,35 @@ impl OccurrenceTraversalCache {
         true
     }
 
-    fn has_complete_occurrence_family(&self, file: &ProjectFile, role: OccurrenceRole) -> bool {
+    fn has_complete_occurrence_family(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        role: OccurrenceRole,
+    ) -> bool {
         self.complete_families
-            .get(file)
-            .is_some_and(|roles| roles.contains(&role))
+            .read(&memo_attribution(analyzer), |families| {
+                families
+                    .get(file)
+                    .is_some_and(|roles| roles.contains(&role))
+            })
     }
 
     fn record_complete_family(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         roles: &[OccurrenceRole],
         result: &OccurrenceFileResult,
     ) {
         if roles.iter().all(|role| result.completeness.covers(*role)) {
             self.complete_families
-                .entry(file.clone())
-                .or_default()
-                .extend(roles.iter().copied());
+                .read_mut(&memo_attribution(analyzer), |families| {
+                    families
+                        .entry(file.clone())
+                        .or_default()
+                        .extend(roles.iter().copied())
+                });
         }
     }
 

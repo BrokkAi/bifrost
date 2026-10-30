@@ -9,6 +9,7 @@
 
 pub(super) mod external_owners;
 pub(super) mod go_members;
+mod go_model;
 pub(super) mod java_access;
 pub(super) mod java_inheritance;
 
@@ -1903,6 +1904,28 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         go_members::owner_proofs(self, owners, candidates, cancellation)
     }
 
+    fn unindexed_model_callable_result(
+        &self,
+        frontier: &crate::analyzer::resolution::UnindexedExternalFrontier,
+        cancellation: &CancellationToken,
+        session: Option<
+            &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+        >,
+    ) -> StoreResult<Option<Option<String>>> {
+        self.read_unindexed_model_callable_result(frontier, cancellation, session)
+    }
+
+    fn go_model_owner_declarations(
+        &self,
+        definition: SemanticId,
+        owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<Option<crate::analyzer::resolution::fact_source::GoModelOwnerDeclarations>>,
+    > {
+        self.read_go_model_owner_declarations(definition, owner, cancellation)
+    }
+
     fn go_member_declarations(
         &self,
         definitions: &[SemanticId],
@@ -3236,7 +3259,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -3256,7 +3279,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        self.visit_external_declaration_types(definitions.as_slice(), cancellation, visitor)
     }
 
     fn visit_declaration_type_pages_for_slots(
@@ -3265,7 +3292,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -3285,7 +3312,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        self.visit_external_declaration_types_for_slots(slots.as_slice(), cancellation, visitor)
     }
 
     /// Question 45 keeps the view it already has over the source declaration

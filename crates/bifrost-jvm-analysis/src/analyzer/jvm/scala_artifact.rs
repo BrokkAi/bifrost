@@ -17,64 +17,13 @@ use brokk_bifrost_jvm::scala::declarations::parse_scala_file;
 use crate::analyzer::scala::language;
 
 use brokk_bifrost_jvm::scala::scala_normalize_full_name;
+
+use crate::analyzer::jvm::scala_collection_contracts::{
+    ScalaArtifactTypeScope, publishes_collection_receiver, scala_artifact_type_scope,
+    scala_standard_collection_contracts,
+};
 #[cfg(test)]
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowBoundaryRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowEntryComponent;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowInvocation;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowKind;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowPayload;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowShape;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowSubstitution;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowTiming;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowTransfer;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputBoundaryRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputLocation;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputParameterRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputPhase;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputReceiverRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiIntrinsicType;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiIntrinsicTypeKind;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputBoundaryRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputLocation;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputPhase;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputReceiverRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputResultRoot;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiParameterRootRole;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiProjection;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiProjectionStep;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiReceiverRootRole;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiResultRootRole;
-
-use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiTypeExpression;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::AmbientUseRole;
 
@@ -93,8 +42,6 @@ use brokk_bifrost_semantic::analyzer::semantic_model::producer::BoundedProducerD
 use brokk_bifrost_analysis::analyzer::semantic_model::CollectionFlowFact;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::CollectionFlowsPayload;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact;
 
@@ -246,7 +193,7 @@ impl ScalaSourceJarPackProducer {
         let mut types = Vec::new();
         let mut members = Vec::new();
         let mut extension_surfaces = Vec::new();
-        let mut collection_flows = Vec::new();
+        let mut type_scopes = Vec::new();
         let mut constructor_names_by_owner = HashMap::default();
         let standard_library_artifact = is_scala_standard_library_artifact(request);
         let mut remaining_records = limits.max_records;
@@ -278,7 +225,7 @@ impl ScalaSourceJarPackProducer {
             types.append(&mut entry_facts.types);
             members.append(&mut entry_facts.members);
             extension_surfaces.append(&mut entry_facts.extension_surfaces);
-            collection_flows.append(&mut entry_facts.collection_flows);
+            type_scopes.append(&mut entry_facts.type_scopes);
             for (owner, name) in entry_facts.constructor_names_by_owner {
                 if let Some(previous) = constructor_names_by_owner.insert(owner, name.clone()) {
                     debug_assert_eq!(previous, name);
@@ -302,6 +249,27 @@ impl ScalaSourceJarPackProducer {
                 .find(|fact| fact.id == owner)
                 .expect("constructor owner was produced with its source type");
             members.push(empty_constructor_fact(fact, name));
+        }
+        let mut collection_flows = Vec::new();
+        if standard_library_artifact {
+            let products = scala_standard_collection_contracts(
+                &types,
+                &members,
+                &type_scopes,
+                &mut diagnostics,
+            );
+            for member in &mut members {
+                if products.complete_families.contains(&member.id) {
+                    member.callable_family_complete = true;
+                }
+            }
+            for member in products.members {
+                if !take_record(&mut remaining_records, &mut record_limit_hit) {
+                    break;
+                }
+                members.push(member);
+            }
+            collection_flows = products.flows;
         }
         if record_limit_hit {
             diagnostics.warning(
@@ -371,7 +339,7 @@ struct ScalaEntryFacts {
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
     extension_surfaces: Vec<(Vec<String>, String)>,
-    collection_flows: Vec<CollectionFlowFact>,
+    type_scopes: Vec<ScalaArtifactTypeScope>,
     constructor_names_by_owner: HashMap<String, String>,
 }
 
@@ -415,6 +383,26 @@ fn scala_entry_facts(
     let mut type_kinds = HashMap::default();
     let mut type_parameters_by_declaration = HashMap::default();
     let mut constructor_names_by_owner = HashMap::default();
+    // Only the standard library publishes collection contracts, so only it
+    // pays for the name scopes their inheritance proof reads.
+    let mut type_scopes = Vec::new();
+    let is_top_level = |declaration: &CodeUnit| {
+        parent_by_child
+            .get(declaration)
+            .is_none_or(|parent| !parent.is_class())
+    };
+    let same_unit = declarations
+        .iter()
+        .filter(|declaration| {
+            standard_library_artifact && declaration.is_class() && is_top_level(declaration)
+        })
+        .map(|declaration| {
+            (
+                declaration.identifier().to_owned(),
+                scala_normalize_full_name(&declaration.fq_name()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     for declaration in declarations
         .iter()
         .copied()
@@ -472,6 +460,23 @@ fn scala_entry_facts(
             constructor_names_by_owner.insert(type_id.clone(), declaration.identifier().to_owned());
         }
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
+        if standard_library_artifact
+            && is_top_level(declaration)
+            && !parsed.type_aliases.contains(declaration)
+        {
+            type_scopes.push(scala_artifact_type_scope(
+                name.clone(),
+                declaration,
+                node,
+                source,
+                parsed,
+                type_kind == TypeKind::Module,
+                generic_facts
+                    .map(|facts| facts.supertypes.clone())
+                    .unwrap_or_default(),
+                &same_unit,
+            ));
+        }
         let fact = TypeFact {
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
@@ -644,7 +649,7 @@ fn scala_entry_facts(
             extension_surfaces.push((receiver, scala_normalize_full_name(&owner.fq_name())));
         }
         let is_map_member = standard_library_artifact
-            && owner.fq_name() == "scala.collection.mutable.Map"
+            && publishes_collection_receiver(&owner.fq_name())
             && !is_static
             && matches!(member_kind, MemberKind::Method);
         members.push(MemberFact {
@@ -680,16 +685,11 @@ fn scala_entry_facts(
             },
         });
     }
-    let collection_flows = if standard_library_artifact {
-        collection_flow_facts(&types, &members)
-    } else {
-        Vec::new()
-    };
     ScalaEntryFacts {
         types,
         members,
         extension_surfaces,
-        collection_flows,
+        type_scopes,
         constructor_names_by_owner,
     }
 }
@@ -745,7 +745,6 @@ const SCALA_LIBRARY_COORDINATES: [&str; 2] = [
     "org.scala-lang:scala-library",
     "org.scala-lang:scala3-library_3",
 ];
-const SCALA_MUTABLE_MAP: &str = "scala.collection.mutable.Map";
 
 /// Collection-flow facts are restricted to an exact Scala standard-library
 /// artifact selector. A source declaration named Map in an application or
@@ -757,308 +756,6 @@ fn is_scala_standard_library_artifact(request: &ArtifactProductionRequest) -> bo
             SCALA_LIBRARY_COORDINATES.contains(&package.name.as_str()) && package.version.is_some()
         })
     })
-}
-
-fn collection_flow_facts(types: &[TypeFact], members: &[MemberFact]) -> Vec<CollectionFlowFact> {
-    let Some(map) = types.iter().find(|fact| {
-        fact.name == SCALA_MUTABLE_MAP
-            && fact.type_kind == TypeKind::Trait
-            && fact.type_parameters.len() == 2
-    }) else {
-        return Vec::new();
-    };
-    let [key_parameter, value_parameter] = map.type_parameters.as_slice() else {
-        unreachable!("Map type parameter count was checked above");
-    };
-    let keyed_shape = || CsmiCollectionFlowShape::Keyed {
-        key: Box::new(collection_value_shape(key_parameter)),
-        value: Box::new(collection_value_shape(value_parameter)),
-        entry_components: Some(vec![
-            CsmiCollectionFlowEntryComponent::Key,
-            CsmiCollectionFlowEntryComponent::Value,
-        ]),
-    };
-    let substitution = || CsmiCollectionFlowSubstitution::ReceiverArguments {
-        declaration: map.id.clone(),
-    };
-    let mut flows = Vec::new();
-    for member in members.iter().filter(|member| {
-        member.owner == map.id
-            && member.member_kind == MemberKind::Method
-            && !member.is_static
-            && member.signature.is_some()
-    }) {
-        let Some(signature) = member.signature.as_ref() else {
-            continue;
-        };
-        let payload = match member.name.as_str() {
-            "apply" if is_map_apply_signature(signature, key_parameter, value_parameter) => Some(
-                map_apply_flow(member, substitution(), keyed_shape(), value_parameter),
-            ),
-            "update" if is_map_update_signature(signature, key_parameter, value_parameter) => Some(
-                map_update_flow(member, substitution(), keyed_shape(), value_parameter),
-            ),
-            "foreach" if is_map_foreach_signature(signature, key_parameter, value_parameter) => {
-                Some(map_foreach_flow(
-                    member,
-                    substitution(),
-                    keyed_shape(),
-                    key_parameter,
-                    value_parameter,
-                ))
-            }
-            _ => None,
-        };
-        if let Some(payload) = payload {
-            flows.push(CollectionFlowFact {
-                callable: member.id.clone(),
-                payload,
-                coverage: Some(Completeness::Complete),
-                provenance: Vec::new(),
-            });
-        }
-    }
-    flows.sort_unstable_by(|left, right| left.callable.cmp(&right.callable));
-    flows
-}
-
-fn collection_value_shape(parameter: &str) -> CsmiCollectionFlowShape {
-    brokk_bifrost_semantic::analyzer::semantic_model::csmi::collection_value_shape(&format!(
-        "type-parameter.{parameter}"
-    ))
-}
-
-fn is_map_apply_signature(signature: &Signature, key: &str, value: &str) -> bool {
-    signature.parameters.len() == 1
-        && signature.parameters[0].r#type.is_type_parameter(key)
-        && signature
-            .returns
-            .as_ref()
-            .is_some_and(|result| result.is_type_parameter(value))
-}
-
-fn is_map_update_signature(signature: &Signature, key: &str, value: &str) -> bool {
-    signature.parameters.len() == 2
-        && signature.parameters[0].r#type.is_type_parameter(key)
-        && signature.parameters[1].r#type.is_type_parameter(value)
-}
-
-fn is_map_foreach_signature(signature: &Signature, key: &str, value: &str) -> bool {
-    let Some(Parameter { r#type, .. }) = signature.parameters.first() else {
-        return false;
-    };
-    let TypeRef::Named {
-        name, arguments, ..
-    } = r#type
-    else {
-        return false;
-    };
-    let Some(TypeRef::Named {
-        name: tuple_name,
-        arguments: tuple_arguments,
-        ..
-    }) = arguments.first()
-    else {
-        return false;
-    };
-    name == "scala.Function1"
-        && tuple_name == "scala.Tuple2"
-        && tuple_arguments.len() == 2
-        && tuple_arguments[0].is_type_parameter(key)
-        && tuple_arguments[1].is_type_parameter(value)
-}
-
-fn map_apply_flow(
-    member: &MemberFact,
-    substitution: CsmiCollectionFlowSubstitution,
-    receiver_shape: CsmiCollectionFlowShape,
-    value_parameter: &str,
-) -> CsmiCollectionFlowPayload {
-    let mut source_projection =
-        brokk_bifrost_semantic::analyzer::semantic_model::csmi::entry_parameter_projection(0);
-    source_projection.steps.push(CsmiProjectionStep {
-        kind: "entry-value".to_owned(),
-        args: None,
-    });
-    CsmiCollectionFlowPayload {
-        kind: CsmiCollectionFlowKind::CollectionFlow,
-        callable: member.id.clone(),
-        receiver_substitution: Some(substitution),
-        roots: vec![
-            CsmiCollectionFlowRoot {
-                root: CsmiCollectionFlowBoundaryRoot::Input(input_receiver_root()),
-                shape: receiver_shape,
-            },
-            CsmiCollectionFlowRoot {
-                root: CsmiCollectionFlowBoundaryRoot::Output(CsmiOutputBoundaryRoot::Result(
-                    CsmiOutputResultRoot {
-                        phase: CsmiOutputPhase::Output,
-                        role: CsmiResultRootRole::Result,
-                        position: 0,
-                    },
-                )),
-                shape: collection_value_shape(value_parameter),
-            },
-        ],
-        transfers: vec![CsmiCollectionFlowTransfer {
-            source: CsmiInputLocation {
-                root: input_receiver_root(),
-                projection: Some(source_projection),
-            },
-            destination: CsmiOutputLocation {
-                root: CsmiOutputBoundaryRoot::Result(CsmiOutputResultRoot {
-                    phase: CsmiOutputPhase::Output,
-                    role: CsmiResultRootRole::Result,
-                    position: 0,
-                }),
-                projection: None,
-            },
-        }],
-        invocations: Vec::new(),
-    }
-}
-
-fn map_update_flow(
-    member: &MemberFact,
-    substitution: CsmiCollectionFlowSubstitution,
-    receiver_shape: CsmiCollectionFlowShape,
-    value_parameter: &str,
-) -> CsmiCollectionFlowPayload {
-    let mut destination_projection =
-        brokk_bifrost_semantic::analyzer::semantic_model::csmi::entry_parameter_projection(0);
-    destination_projection.steps.push(CsmiProjectionStep {
-        kind: "entry-value".to_owned(),
-        args: None,
-    });
-    CsmiCollectionFlowPayload {
-        kind: CsmiCollectionFlowKind::CollectionFlow,
-        callable: member.id.clone(),
-        receiver_substitution: Some(substitution),
-        roots: vec![
-            CsmiCollectionFlowRoot {
-                root: CsmiCollectionFlowBoundaryRoot::Input(input_receiver_root()),
-                shape: receiver_shape.clone(),
-            },
-            CsmiCollectionFlowRoot {
-                root: CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Parameter(
-                    CsmiInputParameterRoot {
-                        phase: CsmiInputPhase::Input,
-                        role: CsmiParameterRootRole::Parameter,
-                        position: 1,
-                    },
-                )),
-                shape: collection_value_shape(value_parameter),
-            },
-            CsmiCollectionFlowRoot {
-                root: CsmiCollectionFlowBoundaryRoot::Output(output_receiver_root()),
-                shape: receiver_shape,
-            },
-        ],
-        transfers: vec![CsmiCollectionFlowTransfer {
-            source: CsmiInputLocation {
-                root: CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
-                    phase: CsmiInputPhase::Input,
-                    role: CsmiParameterRootRole::Parameter,
-                    position: 1,
-                }),
-                projection: None,
-            },
-            destination: CsmiOutputLocation {
-                root: output_receiver_root(),
-                projection: Some(destination_projection),
-            },
-        }],
-        invocations: Vec::new(),
-    }
-}
-
-fn map_foreach_flow(
-    member: &MemberFact,
-    substitution: CsmiCollectionFlowSubstitution,
-    receiver_shape: CsmiCollectionFlowShape,
-    key_parameter: &str,
-    value_parameter: &str,
-) -> CsmiCollectionFlowPayload {
-    CsmiCollectionFlowPayload {
-        kind: CsmiCollectionFlowKind::CollectionFlow,
-        callable: member.id.clone(),
-        receiver_substitution: Some(substitution),
-        roots: vec![
-            CsmiCollectionFlowRoot {
-                root: CsmiCollectionFlowBoundaryRoot::Input(input_receiver_root()),
-                shape: receiver_shape,
-            },
-            CsmiCollectionFlowRoot {
-                root: CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Parameter(
-                    CsmiInputParameterRoot {
-                        phase: CsmiInputPhase::Input,
-                        role: CsmiParameterRootRole::Parameter,
-                        position: 0,
-                    },
-                )),
-                shape: CsmiCollectionFlowShape::Value {
-                    r#type: CsmiTypeExpression::Intrinsic(CsmiIntrinsicType {
-                        kind: CsmiIntrinsicTypeKind::Intrinsic,
-                        vocabulary: "ai.brokk.csmi.jvm-symbol".to_owned(),
-                        version: "0.1".to_owned(),
-                        identifier: "scala.Function1".to_owned(),
-                    }),
-                },
-            },
-        ],
-        transfers: Vec::new(),
-        invocations: vec![CsmiCollectionFlowInvocation {
-            callback: CsmiInputLocation {
-                root: CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
-                    phase: CsmiInputPhase::Input,
-                    role: CsmiParameterRootRole::Parameter,
-                    position: 0,
-                }),
-                projection: None,
-            },
-            parameters: vec![CsmiCollectionFlowShape::Product {
-                components: vec![
-                    collection_value_shape(key_parameter),
-                    collection_value_shape(value_parameter),
-                ],
-            }],
-            arguments: vec![
-                brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowArgument {
-                    source: CsmiInputLocation {
-                        root: input_receiver_root(),
-                        projection: Some(entry_all_projection()),
-                    },
-                    parameter: 0,
-                },
-            ],
-            timing: CsmiCollectionFlowTiming::DuringCall,
-        }],
-    }
-}
-
-fn input_receiver_root() -> CsmiInputBoundaryRoot {
-    CsmiInputBoundaryRoot::Receiver(CsmiInputReceiverRoot {
-        phase: CsmiInputPhase::Input,
-        role: CsmiReceiverRootRole::Receiver,
-    })
-}
-
-fn output_receiver_root() -> CsmiOutputBoundaryRoot {
-    CsmiOutputBoundaryRoot::Receiver(CsmiOutputReceiverRoot {
-        phase: CsmiOutputPhase::Output,
-        role: CsmiReceiverRootRole::Receiver,
-    })
-}
-
-fn entry_all_projection() -> CsmiProjection {
-    CsmiProjection {
-        scheme: "csmi.collection-flow".to_owned(),
-        scheme_version: "0.1.0".to_owned(),
-        steps: vec![CsmiProjectionStep {
-            kind: "entry".to_owned(),
-            args: Some(serde_json::json!({"key": {"kind": "all"}})),
-        }],
-    }
 }
 
 fn effective_visibility(
@@ -1194,7 +891,10 @@ fn scala_signature_has_unrepresentable_parameter_lists(
         })
 }
 
-fn scala_type_ref(path: &ScalaTypeExpressionPath, type_parameters: &[String]) -> TypeRef {
+pub(super) fn scala_type_ref(
+    path: &ScalaTypeExpressionPath,
+    type_parameters: &[String],
+) -> TypeRef {
     if path.segments.len() == 1 && type_parameters.contains(&path.segments[0]) {
         return TypeRef::TypeParameter {
             name: path.segments[0].clone(),
@@ -1279,34 +979,30 @@ fn finish_production(
             None,
             "JAR contains no externally visible Scala declarations",
         );
-        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        return ArtifactProduction {
-            artifact_sha256: Some(artifact_sha256.to_owned()),
-            pack: None,
-            completeness: Completeness::Partial,
-            diagnostics,
-            suppressed_diagnostics,
-        };
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    let shard = AuthoredShard {
-        id: "declarations.scala.external".to_owned(),
-        activation: request.activation.clone(),
-        payload: AuthoredPayload::DeclarationFacts {
-            assembly_identity: None,
-            type_forwards: Vec::new(),
-            types,
-            members,
-            relations: Vec::new(),
-        },
-        runtime_values: None,
-        runtime_contracts: None,
-        collection_flows: (!collection_flows.is_empty()).then_some(CollectionFlowsPayload {
-            flows: collection_flows,
-        }),
-        deferred_yields: None,
-        conditional_type_refinements: None,
-        callable_values: None,
+    let shards = if types.is_empty() {
+        Vec::new()
+    } else {
+        vec![AuthoredShard {
+            id: "declarations.scala.external".to_owned(),
+            activation: request.activation.clone(),
+            payload: AuthoredPayload::DeclarationFacts {
+                assembly_identity: None,
+                type_forwards: Vec::new(),
+                types,
+                members,
+                relations: Vec::new(),
+            },
+            runtime_values: None,
+            runtime_contracts: None,
+            collection_flows: (!collection_flows.is_empty()).then_some(CollectionFlowsPayload {
+                flows: collection_flows,
+            }),
+            deferred_yields: None,
+            conditional_type_refinements: None,
+            callable_values: None,
+        }]
     };
     brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
         request,
@@ -1315,7 +1011,7 @@ fn finish_production(
         "scala",
         diagnostics,
         suppressed_diagnostics,
-        vec![shard],
+        shards,
     )
 }
 
@@ -1323,6 +1019,18 @@ fn finish_production(
 mod tests {
 
     use crate::analyzer::jvm::scala_artifact::*;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
+
+    use crate::analyzer::jvm::scala_collection_contracts::{
+        SCALA_MUTABLE_HASH_MAP, SCALA_MUTABLE_MAP,
+    };
+
+    use brokk_bifrost_semantic::analyzer::semantic_model::csmi::{
+        CsmiCollectionFlowShape, CsmiCollectionFlowSubstitution, CsmiInputBoundaryRoot,
+        CsmiInputParameterRoot, CsmiOutputBoundaryRoot, CsmiOutputPhase, CsmiOutputResultRoot,
+        CsmiResultRootRole,
+    };
 
     use brokk_bifrost_semantic::analyzer::semantic_model::compiler::CompilerOptions;
 
@@ -1884,6 +1592,15 @@ trait Map[K, V] {
             .as_ref()
             .expect("standard Map gets collection-flow facts");
         assert_eq!(flows.flows.len(), 3, "flows={flows:#?}");
+        // `Map` is the declared receiver type, which an implementation may
+        // override, so its contracts never select a dispatch target.
+        assert!(
+            flows
+                .flows
+                .iter()
+                .all(|flow| flow.coverage == Some(Completeness::Partial)),
+            "flows={flows:#?}"
+        );
         let flow = |name: &str| {
             let member = map_members
                 .iter()
@@ -1984,6 +1701,112 @@ trait Map[K, V] {
             .pack
             .unwrap();
         assert!(pack.shards[0].collection_flows.is_none());
+    }
+
+    /// The released scala-library sources, not a reduced fixture: the
+    /// protocol `mutable.Map` inherits, the `HashMap` overrides its factory
+    /// dispatches to, and the factory result are all read from the archive.
+    #[test]
+    #[ignore = "requires BIFROST_SCALA_STDLIB_SOURCE_JAR pointing to scala-library-2.13.16-sources.jar"]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#3130: the real scala-library inherits the Map protocol, so the producer published no contracts"
+    )]
+    fn scala_library_sources_publish_hash_map_dispatch_contracts() {
+        let path = std::env::var_os("BIFROST_SCALA_STDLIB_SOURCE_JAR")
+            .map(std::path::PathBuf::from)
+            .expect("set BIFROST_SCALA_STDLIB_SOURCE_JAR");
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request_for_version(path, "2.13.16"),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.expect("scala-library pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        let type_id = |name: &str| {
+            types
+                .iter()
+                .find(|fact| fact.name == name)
+                .map(|fact| fact.id.clone())
+                .unwrap_or_else(|| panic!("{name} declaration"))
+        };
+        let (map, hash_map) = (type_id(SCALA_MUTABLE_MAP), type_id(SCALA_MUTABLE_HASH_MAP));
+        let flows = &pack.shards[0]
+            .collection_flows
+            .as_ref()
+            .expect("scala-library publishes collection flows")
+            .flows;
+        let mut published = flows
+            .iter()
+            .map(|flow| {
+                let member = members
+                    .iter()
+                    .find(|member| member.id == flow.callable)
+                    .expect("flow callable is a published member");
+                let owner = if member.owner == map {
+                    "Map"
+                } else if member.owner == hash_map {
+                    "HashMap"
+                } else {
+                    "other"
+                };
+                (owner, member.name.as_str(), flow.coverage)
+            })
+            .collect::<Vec<_>>();
+        published.sort_unstable_by_key(|(owner, name, _)| (*owner, *name));
+        // `update` is declared by `mutable.MapOps`, ahead of every parent the
+        // artifact cannot read. `apply` and `foreach` come after
+        // `scala.Cloneable`, an alias of `java.lang.Cloneable`, so the
+        // projection withholds them rather than assume that parent is empty.
+        assert_eq!(
+            published,
+            [
+                ("HashMap", "apply", Some(Completeness::Complete)),
+                ("HashMap", "foreach", Some(Completeness::Complete)),
+                ("HashMap", "update", Some(Completeness::Complete)),
+                ("Map", "update", Some(Completeness::Partial)),
+            ]
+        );
+        let withheld = production
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "scala.collection_flow.unproven")
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(withheld.as_slice(), [message]
+                if message.contains("scala.collection.mutable.Map.apply")
+                    && message.contains("scala.collection.mutable.Map.foreach")
+                    && !message.contains("Map.update")),
+            "{withheld:?}"
+        );
+        let factory = members
+            .iter()
+            .find(|member| member.owner == map && member.is_static && member.name == "apply")
+            .expect("the mutable.Map factory apply");
+        assert_eq!(
+            factory.exact_return_classes,
+            [TypeRef::Declared {
+                id: hash_map.clone(),
+                arguments: Vec::new(),
+                nullable: false,
+            }]
+        );
+        // The real pack is partial, so a call binds only through a complete
+        // callable family: the factory and each HashMap protocol member.
+        assert!(factory.callable_family_complete);
+        for name in ["apply", "update", "foreach"] {
+            assert!(
+                members
+                    .iter()
+                    .filter(|member| member.owner == hash_map && member.name == name)
+                    .any(|member| member.callable_family_complete),
+                "HashMap.{name} is a complete callable family"
+            );
+        }
+        assert_eq!(production.completeness, Completeness::Partial);
+        compile_pack(&pack, &Default::default()).unwrap();
     }
 
     #[test]

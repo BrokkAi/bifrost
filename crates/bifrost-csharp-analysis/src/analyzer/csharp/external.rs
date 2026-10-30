@@ -748,7 +748,8 @@ impl CSharpExternalDeclarationIndex {
 /// boundary it already had, so a type whose pack declares no members and a type
 /// no assembly indexed are both exactly as unknown as they were before.
 pub(crate) struct CSharpExternalDeclarations<'a> {
-    artifacts: &'a CSharpExternalDeclarationIndex,
+    artifacts:
+        brokk_bifrost_analysis::analyzer::common::IndexOwner<'a, CSharpExternalDeclarationIndex>,
     packs: Option<
         Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
     >,
@@ -780,12 +781,20 @@ enum ConstructorLookup {
 
 impl<'a> CSharpExternalDeclarations<'a> {
     pub(crate) fn new(
-        artifacts: &'a CSharpExternalDeclarationIndex,
+        artifacts: impl Into<
+            brokk_bifrost_analysis::analyzer::common::IndexOwner<
+                'a,
+                CSharpExternalDeclarationIndex,
+            >,
+        >,
         packs: Option<
             Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
         >,
     ) -> Self {
-        Self { artifacts, packs }
+        Self {
+            artifacts: artifacts.into(),
+            packs,
+        }
     }
 
     pub(crate) fn forward_boundary_in_file(
@@ -1630,44 +1639,21 @@ impl CSharpAssemblyPackProducer {
                 limits,
             );
         }
-        let Some((external_types, omitted_signatures)) = parse_assembly_bounded(
+        let decoded = parse_assembly_bounded(
             artifact.path(),
             artifact.bytes(),
             limits.max_signature_depth.min(MAX_SIGNATURE_DEPTH),
             cancellation,
-        ) else {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return ArtifactProduction::failed(
-                    ProducerDiagnostic {
-                        severity: ProducerDiagnosticSeverity::Error,
-                        source_entry: None,
-                        code: "artifact.cancelled".to_owned(),
-                        location: None,
-                        declaration: None,
-                        message: ".NET assembly production was cancelled".to_owned(),
-                    },
-                    limits,
-                );
+        )
+        .and_then(|(types, omitted)| {
+            parse_assembly_exports(artifact.bytes(), cancellation)
+                .map(|exports| (types, omitted, exports))
+        });
+        let (external_types, omitted_signatures, mut exports) = match decoded {
+            Ok(decoded) => decoded,
+            Err(failure) => {
+                return ArtifactProduction::failed(failure.diagnostic(), limits);
             }
-            return ArtifactProduction::failed(
-                ProducerDiagnostic {
-                    severity: ProducerDiagnosticSeverity::Error,
-                    source_entry: None,
-                    code: "csharp.metadata.invalid".to_owned(),
-                    location: None,
-                    declaration: None,
-                    message: "artifact does not contain supported bounded CLI metadata".to_owned(),
-                },
-                limits,
-            );
-        };
-        let Some(mut exports) = parse_assembly_exports(artifact.bytes(), cancellation) else {
-            let cancelled = cancellation.is_some_and(CancellationToken::is_cancelled);
-            return ArtifactProduction::failed(ProducerDiagnostic {
-                severity: ProducerDiagnosticSeverity::Error, source_entry: None,
-                code: if cancelled {"artifact.cancelled"} else {"csharp.metadata.invalid"}.to_owned(), location: None, declaration: None,
-                message: if cancelled {".NET assembly export production was cancelled"} else {"artifact does not contain supported bounded assembly identity/export metadata"}.to_owned(),
-            },limits);
         };
         let Some(locator_path) = artifact
             .path()
@@ -2880,7 +2866,11 @@ fn assembly_identity_mismatch(
     artifact: &ExactArtifact,
     declared: &str,
 ) -> Option<ProducerDiagnostic> {
-    let name = assembly_definition_identity(artifact.bytes()).map(|identity| identity.name);
+    let name = match assembly_definition_identity(artifact.bytes()) {
+        Ok(identity) => Some(identity.name),
+        Err(MetadataDecodeFailure::Invalid) => None,
+        Err(failure) => return Some(failure.diagnostic()),
+    };
     (name.as_deref() != Some(declared)).then(|| ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Error,
         source_entry: None,
@@ -2894,7 +2884,16 @@ fn assembly_identity_mismatch(
 }
 
 /// The strong identity in the single Assembly (0x20) metadata row.
-fn assembly_definition_identity(bytes: &[u8]) -> Option<AssemblyReference> {
+fn assembly_definition_identity(bytes: &[u8]) -> Result<AssemblyReference, MetadataDecodeFailure> {
+    let mut budget = MetadataDecodeBudget::default();
+    let decoded = assembly_definition_identity_bounded(bytes, &mut budget);
+    budget.finish(decoded, None)
+}
+
+fn assembly_definition_identity_bounded(
+    bytes: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<AssemblyReference> {
     let pe = PE::parse(bytes).ok()?;
     let streams = Streams::parse(metadata_bytes(&pe, bytes)?)?;
     let layout = TableLayout::parse(streams.tables?)?;
@@ -2908,7 +2907,7 @@ fn assembly_definition_identity(bytes: &[u8]) -> Option<AssemblyReference> {
         &layout,
         streams.strings?,
         streams.blobs?,
-        &mut MetadataDecodeBudget::default(),
+        budget,
     )
 }
 
@@ -2966,8 +2965,24 @@ struct AssemblyExports {
 fn parse_assembly_exports(
     bytes: &[u8],
     cancellation: Option<&CancellationToken>,
+) -> Result<AssemblyExports, MetadataDecodeFailure> {
+    let mut budget = MetadataDecodeBudget::default();
+    let decoded = parse_assembly_exports_rows(bytes, cancellation, &mut budget);
+    budget.finish(decoded, cancellation)
+}
+
+fn parse_assembly_exports_rows(
+    bytes: &[u8],
+    cancellation: Option<&CancellationToken>,
+    budget: &mut MetadataDecodeBudget,
 ) -> Option<AssemblyExports> {
-    let identity = assembly_definition_identity(bytes)?;
+    let identity = match assembly_definition_identity(bytes) {
+        Ok(identity) => identity,
+        Err(failure) => {
+            budget.failure = Some(failure);
+            return None;
+        }
+    };
     let pe = PE::parse(bytes).ok()?;
     let streams = Streams::parse(metadata_bytes(&pe, bytes)?)?;
     let layout = TableLayout::parse(streams.tables?)?;
@@ -2982,9 +2997,9 @@ fn parse_assembly_exports(
         || strings.len() > MAX_ASSETS_BYTES as usize
         || blobs.len() > MAX_ASSETS_BYTES as usize
     {
+        budget.failure = Some(MetadataDecodeFailure::BudgetExhausted);
         return None;
     }
-    let mut budget = MetadataDecodeBudget::default();
     let references = collect_metadata_rows(layout.rows(35), cancellation, |i| {
         let mut p = 0;
         Some(read_assembly_identity_fields(
@@ -2993,7 +3008,7 @@ fn parse_assembly_exports(
             &layout,
             strings,
             blobs,
-            &mut budget,
+            budget,
         ))
     })?;
     struct ExportRow {
@@ -3008,8 +3023,8 @@ fn parse_assembly_exports(
             let mut p = 0;
             let flags = u32at(row, &mut p)?;
             u32at(row, &mut p)?; // TypeDefId is a hint, never an identity.
-            let name = str_index(row, &mut p, layout.heap, strings, &mut budget)?;
-            let namespace = str_index(row, &mut p, layout.heap, strings, &mut budget)?;
+            let name = str_index(row, &mut p, layout.heap, strings, budget)?;
+            let namespace = str_index(row, &mut p, layout.heap, strings, budget)?;
             let implementation = index(row, &mut p, coded_size(&layout.rows, &[38, 35, 39], 2))?;
             Some(ExportRow {
                 flags,
@@ -3100,6 +3115,24 @@ fn parse_assembly_bounded(
     bytes: &[u8],
     max_signature_depth: usize,
     cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<CSharpExternalType>, usize), MetadataDecodeFailure> {
+    let mut decode_budget = MetadataDecodeBudget::default();
+    let decoded = parse_assembly_bounded_rows(
+        path,
+        bytes,
+        max_signature_depth,
+        cancellation,
+        &mut decode_budget,
+    );
+    decode_budget.finish(decoded, cancellation)
+}
+
+fn parse_assembly_bounded_rows(
+    path: &Path,
+    bytes: &[u8],
+    max_signature_depth: usize,
+    cancellation: Option<&CancellationToken>,
+    decode_budget: &mut MetadataDecodeBudget,
 ) -> Option<(Vec<CSharpExternalType>, usize)> {
     let pe = PE::parse(bytes).ok()?;
     let metadata = metadata_bytes(&pe, bytes)?;
@@ -3117,36 +3150,36 @@ fn parse_assembly_bounded(
         || strings.len() > MAX_ASSETS_BYTES as usize
         || blobs.len() > MAX_ASSETS_BYTES as usize
     {
+        decode_budget.failure = Some(MetadataDecodeFailure::BudgetExhausted);
         return None;
     }
-    let mut decode_budget = MetadataDecodeBudget::default();
     let types = collect_metadata_rows(layout.rows(2), cancellation, |i| {
-        read_typedef(&layout, i, strings, &mut decode_budget)
+        read_typedef(&layout, i, strings, decode_budget)
     })?;
     let type_refs = collect_metadata_rows(layout.rows(1), cancellation, |i| {
-        read_typeref(&layout, i, strings, &mut decode_budget)
+        read_typeref(&layout, i, strings, decode_budget)
     })?;
     let type_specs = collect_metadata_rows(layout.rows(27), cancellation, |i| {
-        read_typespec(&layout, i, blobs, &mut decode_budget)
+        read_typespec(&layout, i, blobs, decode_budget)
     })?;
     let fields = collect_metadata_rows(layout.rows(4), cancellation, |i| {
-        read_field(&layout, i, strings, blobs, &mut decode_budget)
+        read_field(&layout, i, strings, blobs, decode_budget)
     })?;
     let methods = collect_metadata_rows(layout.rows(6), cancellation, |i| {
-        read_method(&layout, i, strings, blobs, &mut decode_budget)
+        read_method(&layout, i, strings, blobs, decode_budget)
     })?;
     let properties = collect_metadata_rows(layout.rows(23), cancellation, |i| {
-        read_property(&layout, i, strings, blobs, &mut decode_budget)
+        read_property(&layout, i, strings, blobs, decode_budget)
     })?;
     let events = collect_metadata_rows(layout.rows(20), cancellation, |i| {
-        read_event(&layout, i, strings, &mut decode_budget)
+        read_event(&layout, i, strings, decode_budget)
     })?;
     let nested = nested_map(&layout);
     let property_owners = property_owners(&layout, types.len() as u32, properties.len() as u32);
     let property_accessors = property_accessors(&layout, &methods);
     let event_owners = event_owners(&layout, types.len() as u32, events.len() as u32);
     let event_accessors = association_accessors(&layout, &methods, 0);
-    let generic = generic_parameters(&layout, strings, &mut decode_budget);
+    let generic = generic_parameters(&layout, strings, decode_budget);
     let (interfaces, incomplete_interfaces) =
         interfaces_for(&layout, &types, &type_refs, &type_specs);
     let mut names = Vec::new();
@@ -4399,22 +4432,78 @@ fn index(b: &[u8], p: &mut usize, size: usize) -> Option<u32> {
         u32at(b, p)
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataDecodeFailure {
+    Invalid,
+    BudgetExhausted,
+    Cancelled,
+}
+
+impl MetadataDecodeFailure {
+    fn diagnostic(self) -> ProducerDiagnostic {
+        let (code, message) = match self {
+            Self::Invalid => (
+                "csharp.metadata.invalid",
+                "artifact does not contain supported bounded CLI metadata",
+            ),
+            Self::BudgetExhausted => (
+                "csharp.metadata.budget",
+                ".NET assembly metadata decoding exceeded its row or heap budget",
+            ),
+            Self::Cancelled => (
+                "artifact.cancelled",
+                ".NET assembly production was cancelled",
+            ),
+        };
+        ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            source_entry: None,
+            code: code.to_owned(),
+            location: None,
+            declaration: None,
+            message: message.to_owned(),
+        }
+    }
+}
+
 struct MetadataDecodeBudget {
     remaining_bytes: usize,
+    failure: Option<MetadataDecodeFailure>,
 }
 
 impl Default for MetadataDecodeBudget {
     fn default() -> Self {
         Self {
             remaining_bytes: MAX_DECODED_METADATA_BYTES,
+            failure: None,
         }
     }
 }
 
 impl MetadataDecodeBudget {
     fn consume(&mut self, bytes: usize) -> Option<()> {
-        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes)?;
+        let Some(remaining) = self.remaining_bytes.checked_sub(bytes) else {
+            self.failure = Some(MetadataDecodeFailure::BudgetExhausted);
+            return None;
+        };
+        self.remaining_bytes = remaining;
         Some(())
+    }
+
+    fn finish<T>(
+        self,
+        decoded: Option<T>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<T, MetadataDecodeFailure> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(MetadataDecodeFailure::Cancelled);
+        }
+        // Optional malformed rows may be omitted, but a resource failure must
+        // survive even when the surrounding decoder otherwise succeeds.
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+        decoded.ok_or(MetadataDecodeFailure::Invalid)
     }
 }
 
@@ -4452,4 +4541,65 @@ fn blob_index(
     blobs
         .get(start..start.checked_add(len)?)
         .map(ToOwned::to_owned)
+}
+
+/// Owns the index while handing out the selected type borrows.
+pub struct CSharpTypeCandidates {
+    index: Arc<CSharpExternalDeclarationIndex>,
+    reference: String,
+    namespace: String,
+    usings: Vec<String>,
+    aliases: Arc<HashMap<String, String>>,
+}
+impl CSharpTypeCandidates {
+    pub(crate) fn index(&self) -> &CSharpExternalDeclarationIndex {
+        &self.index
+    }
+
+    pub(crate) fn new(
+        index: Arc<CSharpExternalDeclarationIndex>,
+        reference: String,
+        namespace: String,
+        usings: Vec<String>,
+        aliases: Arc<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            index,
+            reference,
+            namespace,
+            usings,
+            aliases,
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &CSharpExternalType> {
+        self.index
+            .resolve_in_file(
+                &self.reference,
+                &self.namespace,
+                &self.usings,
+                &self.aliases,
+            )
+            .into_iter()
+    }
+}
+
+/// Owns the index while handing out the selected member borrows.
+pub struct CSharpMemberCandidates {
+    index: Arc<CSharpExternalDeclarationIndex>,
+    owner: String,
+    name: String,
+}
+impl CSharpMemberCandidates {
+    pub(crate) fn new(
+        index: Arc<CSharpExternalDeclarationIndex>,
+        owner: String,
+        name: String,
+    ) -> Self {
+        Self { index, owner, name }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &CSharpExternalMember> {
+        self.index
+            .members_named(&self.owner, &self.name)
+            .into_iter()
+    }
 }

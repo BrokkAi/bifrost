@@ -132,20 +132,8 @@ impl RustAnalyzer {
     /// Repeated preparation retains and reports a prior publication failure.
     pub(crate) fn ensure_rust_facts_caught_up(&self) {
         self.fact_catch_up.settled.get_or_build(
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "rust.settled",
-                    || self.run_rust_fact_catch_up(),
-                )
-            },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "rust.settled",
-                    || self.run_rust_fact_catch_up(),
-                )
-            },
+            || self.run_rust_fact_catch_up(),
+            || self.run_rust_fact_catch_up(),
         );
         if let RustFactReadiness::Unavailable(error) = &*self
             .fact_catch_up
@@ -198,8 +186,10 @@ impl RustAnalyzer {
     /// nothing to build: analysis already wrote the rows, so a warm start's
     /// only job is to notice the files it did not write.
     pub fn warm_usage_facts(&self) {
-        let _scope = brokk_bifrost_core::profiling::scope("RustAnalyzer::warm_usage_facts");
-        self.ensure_rust_facts_caught_up();
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let _scope = brokk_bifrost_core::profiling::scope("RustAnalyzer::warm_usage_facts");
+            self.ensure_rust_facts_caught_up();
+        })
     }
 
     /// Scan for live blobs without fact rows and apply the threshold policy.
@@ -232,20 +222,22 @@ impl RustAnalyzer {
         }
         let analyzer = self.clone();
         spawn_on_dedicated_build_pool(move || {
-            #[cfg(test)]
-            {
-                let gate = analyzer
-                    .fact_catch_up
-                    .gate
-                    .lock()
-                    .expect("catch-up gate poisoned")
-                    .clone();
-                if let Some(gate) = gate {
-                    gate.wait();
+            brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                #[cfg(test)]
+                {
+                    let gate = analyzer
+                        .fact_catch_up
+                        .gate
+                        .lock()
+                        .expect("catch-up gate poisoned")
+                        .clone();
+                    if let Some(gate) = gate {
+                        gate.wait();
+                    }
                 }
-            }
-            analyzer.inner.persist_live_blobs(&stale);
-            analyzer.verify_rust_fact_catch_up();
+                analyzer.inner.persist_live_blobs(&stale);
+                analyzer.verify_rust_fact_catch_up();
+            })
         });
     }
 
@@ -572,15 +564,12 @@ mod tests {
             "a failed probe must not answer with an empty stale set"
         );
 
-        let context = std::sync::Arc::new(
-            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default(),
-        );
-        analyzer.begin_query(&context);
+        let scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(&analyzer);
         analyzer.warm_usage_facts();
-        let error = context
+        let error = scope
             .store_error()
             .expect("a failed catch-up probe must reach the request boundary");
-        analyzer.end_query(&context);
+        drop(scope);
         assert!(
             error
                 .to_string()
@@ -598,13 +587,9 @@ mod tests {
         let file = ProjectFile::new(analyzer.project().root(), "src/part0.rs");
         file.write("pub fn changed_after_indexing() {}\n")
             .expect("change bytes without changing the live snapshot");
-        let context = std::sync::Arc::new(
-            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default(),
-        );
-        analyzer.begin_query(&context);
+        let scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(&analyzer);
         analyzer.warm_usage_facts();
-        analyzer.end_query(&context);
-        let error = context
+        let error = scope
             .store_error()
             .expect("unpublished content must be reported");
         assert!(

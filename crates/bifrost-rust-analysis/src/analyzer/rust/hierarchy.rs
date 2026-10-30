@@ -58,18 +58,13 @@ impl TypeHierarchyProvider for RustAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        if !self.supports_type_hierarchy(code_unit) {
-            return HashSet::default();
-        }
-        let is_trait = match is_rust_trait_declaration(self, code_unit) {
-            Ok(value) => value,
+        match self.descendant_eligible(code_unit) {
+            Ok(true) => {}
+            Ok(false) => return HashSet::default(),
             Err(error) => {
                 self.record_hierarchy_error(error);
                 return HashSet::default();
             }
-        };
-        if !is_trait {
-            return HashSet::default();
         }
 
         let scope = AnalyzerQueryScope::new(self);
@@ -126,18 +121,13 @@ impl TypeHierarchyProvider for RustAnalyzer {
         if scope.cancellation().is_cancelled() {
             return None;
         }
-        if !self.supports_type_hierarchy(code_unit) {
-            return Some(HashSet::default());
-        }
-        let is_trait = match is_rust_trait_declaration(self, code_unit) {
-            Ok(value) => value,
+        match self.descendant_eligible(code_unit) {
+            Ok(true) => {}
+            Ok(false) => return Some(HashSet::default()),
             Err(error) => {
                 self.record_hierarchy_error(error);
                 return None;
             }
-        };
-        if !is_trait {
-            return Some(HashSet::default());
         }
         let cancellation = scope.cancellation();
         let query = AnalyzerQueryScope::new(self);
@@ -307,6 +297,13 @@ fn rust_member_family(
 }
 
 impl RustAnalyzer {
+    fn descendant_eligible(&self, code_unit: &CodeUnit) -> Result<bool, RustCargoRouteError> {
+        if !self.supports_type_hierarchy(code_unit) {
+            return Ok(false);
+        }
+        is_rust_trait_declaration(self, code_unit)
+    }
+
     pub(crate) fn direct_ancestors(
         &self,
         code_unit: &CodeUnit,
@@ -412,7 +409,15 @@ mod tests {
             .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
     }
 
-    fn workspace_hierarchy(
+    /// The whole workspace's hierarchy facts, for fixtures that assert about
+    /// the relation itself rather than about one question's answer.
+    ///
+    /// Production never reads the workspace this way any more: every question
+    /// is answered from the rows and a bounded file set. These fixtures are
+    /// small enough that reading every file is the clearest way to state what
+    /// they are checking.
+    #[track_caller]
+    pub(in crate::analyzer::rust::hierarchy) fn workspace_hierarchy(
         analyzer: &RustAnalyzer,
     ) -> brokk_bifrost_rust::hierarchy::RustHierarchyIndex {
         let scope = AnalyzerQueryScope::new(analyzer);
@@ -2358,28 +2363,10 @@ mod cross_crate_tests {
 
     use crate::analyzer::rust::hierarchy::tests::definition;
 
+    use crate::analyzer::rust::hierarchy::tests::workspace_hierarchy;
+
     use crate::analyzer::rust::hierarchy::*;
     use brokk_bifrost_test_macros::hardwon;
-
-    /// The whole workspace's hierarchy facts, for fixtures that assert about
-    /// the relation itself rather than about one question's answer.
-    ///
-    /// Production never reads the workspace this way any more: every question
-    /// is answered from the rows and a bounded file set. These fixtures are
-    /// small enough that reading every file is the clearest way to state what
-    /// they are checking.
-    fn workspace_hierarchy(
-        analyzer: &RustAnalyzer,
-    ) -> brokk_bifrost_rust::hierarchy::RustHierarchyIndex {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let files: Vec<_> = analyzer.get_analyzed_files().into_iter().collect();
-        brokk_bifrost_rust::hierarchy::RustHierarchyIndex::read_over(
-            analyzer,
-            scope.token(),
-            &files,
-        )
-        .expect("published fixture hierarchy")
-    }
 
     const CORE_MANIFEST: &str =
         "[package]\nname = \"core-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";

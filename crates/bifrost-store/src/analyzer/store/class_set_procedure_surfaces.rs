@@ -533,7 +533,7 @@ pub(crate) const SURFACE_LEXICAL_CHILDREN_SQL: &str =
      WHERE surface_id=?1 ORDER BY child_ordinal LIMIT ?2";
 pub(crate) const SURFACE_READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,blob_oid,subject,
-            start_byte,end_byte,digest,site_ordinal,NULL AS decl_kind,NULL AS decl_signature,read_ordinal
+            start_byte,end_byte,digest,site_ordinal,NULL AS decl_kind,NULL AS decl_signature,NULL AS workspace_fact_family,NULL AS fact_member,NULL AS fact_names,read_ordinal
      FROM class_set_procedure_surface_reads WHERE surface_id=?1 ORDER BY read_ordinal LIMIT ?2";
 
 impl AnalyzerStore {
@@ -1220,7 +1220,7 @@ fn load_reads(conn: &rusqlite::Connection, id: i64, expected: usize) -> Result<V
     let mut rows = statement.query(params![id, sql_limit(expected)?])?;
     let mut reads = Vec::new();
     while let Some(row) = rows.next()? {
-        let ordinal = row.get::<_, u32>(15)?;
+        let ordinal = row.get::<_, u32>(18)?;
         if ordinal as usize != reads.len() {
             return Err(StoreError::new(
                 "class-set procedure surface read ordinals are not dense",

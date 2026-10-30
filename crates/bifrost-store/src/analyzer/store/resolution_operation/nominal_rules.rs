@@ -1160,7 +1160,7 @@ pub(in crate::analyzer) struct ExternalOwnerRelations {
     pub languages: &'static [Language],
     pub member_by_definition: &'static str,
     pub owner_indexed: &'static str,
-    pub callable_signatures: &'static str,
+    pub declaration_signatures: &'static str,
     pub signature_type_owners: &'static str,
     pub inheritance_declarations: &'static str,
     pub supertypes: &'static str,
@@ -1185,8 +1185,8 @@ static JVM_EXTERNAL_OWNERS: ExternalOwnerRelations = ExternalOwnerRelations {
         super::super::resolution_typed::external_owners::EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL,
     owner_indexed:
         super::super::resolution_typed::external_owners::INTRINSIC_MEMBER_OWNER_INDEXED_SQL,
-    callable_signatures:
-        super::super::resolution_typed::external_owners::EXTERNAL_CALLABLE_SIGNATURES_SQL,
+    declaration_signatures:
+        super::super::resolution_typed::external_owners::EXTERNAL_DECLARATION_SIGNATURES_SQL,
     signature_type_owners:
         super::super::resolution_typed::external_owners::EXTERNAL_SIGNATURE_TYPE_OWNERS_SQL,
     inheritance_declarations:

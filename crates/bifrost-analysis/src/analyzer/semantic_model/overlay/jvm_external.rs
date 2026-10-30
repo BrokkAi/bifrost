@@ -3,6 +3,10 @@
 impl crate::analyzer::store::resolution_operation::SelectedModelAuthority
     for crate::analyzer::semantic_model::SemanticModelOverlay
 {
+    fn active_models(&self) -> Option<std::sync::Arc<super::ResolvedActiveSemanticModels>> {
+        self.active_models.clone()
+    }
+
     fn model_selected_groups(
         &self,
         language: &str,

@@ -356,3 +356,7 @@ impl fmt::Display for TaintModelError {
 }
 
 impl Error for TaintModelError {}
+
+#[cfg(test)]
+#[path = "class_set_contracts.rs"]
+mod class_set_contracts;

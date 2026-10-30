@@ -72,6 +72,279 @@ pub struct CandidateState<T> {
     pub reason: Option<&'static str>,
 }
 
+/// A completed cell with a transient coordinator for concurrent cold fills.
+/// Failed attempts live only as long as their wave's callers; the OnceLock
+/// itself contains completed values exclusively.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct QueryCacheCell<T> {
+    value: std::sync::OnceLock<T>,
+    attempts: crate::analyzer::pool_memo::PoolSafeMemo<T>,
+}
+
+impl<T> QueryCacheCell<T> {
+    pub fn new() -> Self {
+        Self {
+            value: std::sync::OnceLock::new(),
+            attempts: crate::analyzer::pool_memo::PoolSafeMemo::new(),
+        }
+    }
+}
+
+impl<T> Default for QueryCacheCell<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> std::ops::Deref for QueryCacheCell<T> {
+    type Target = std::sync::OnceLock<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+/// Read a complete shared cell, or return this invocation's unretained answer.
+/// Values are cheap owned handles (usually Arc), so a failed build need not be
+/// stored on the analyzer merely to satisfy a borrowed result's lifetime.
+#[doc(hidden)]
+pub fn complete_query_cache_cell<T: Clone + Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
+    cell: &QueryCacheCell<T>,
+    build: impl FnOnce() -> T,
+) -> T {
+    if let Some(value) = cell.get() {
+        return value.clone();
+    }
+    match cell
+        .attempts
+        .get_or_try_build_wave_inline(|| shared_query_cache_fill(analyzer, build))
+    {
+        Ok(value) => cell.value.get_or_init(|| value.as_ref().clone()).clone(),
+        Err(failure) => replay_failed_query_cache_build(failure).as_ref().clone(),
+    }
+}
+
+/// Complete-only publication for an immutable owned cache result.
+#[doc(hidden)]
+pub fn complete_query_cache_arc_cell<T: Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
+    cell: &QueryCacheCell<Arc<T>>,
+    build: impl FnOnce() -> T,
+) -> Arc<T> {
+    complete_query_cache_cell(analyzer, cell, || Arc::new(build()))
+}
+
+/// A retained answer with the typed evidence of its exact build. Stable
+/// artifact gaps are values of the snapshot; transient attempts are not.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ReplayableQueryCacheValue<T> {
+    value: T,
+    receipt: Arc<QueryCacheBuildReceipt>,
+}
+
+impl<T> ReplayableQueryCacheValue<T> {
+    pub fn replay(&self) -> &T {
+        self.receipt.replay();
+        &self.value
+    }
+}
+
+impl<T> std::ops::Deref for ReplayableQueryCacheValue<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.replay()
+    }
+}
+
+/// Retain snapshot-deterministic incompleteness with its typed receipt. The
+/// failed-wave path still shares transient attempts only with their consumers.
+/// Named input keys remain in the caller's bounded authority memo; this cell
+/// retains completion evidence rather than a second workspace-sized read set.
+#[doc(hidden)]
+pub fn replayable_query_cache_cell<T: Clone + Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
+    cell: &QueryCacheCell<ReplayableQueryCacheValue<T>>,
+    build: impl FnOnce() -> T,
+) -> T {
+    if let Some(value) = cell.get() {
+        return value.replay().clone();
+    }
+    let result = cell.attempts.get_or_try_build_wave_inline(|| {
+        let (attempt, mut receipt) =
+            capture_query_cache_build(analyzer, || replayable_query_cache_fill(analyzer, build));
+        let attempt = attempt.inspect(|_| receipt.keys = Arc::default());
+        let receipt = Arc::new(receipt);
+        let entry = |value| ReplayableQueryCacheValue {
+            value,
+            receipt: Arc::clone(&receipt),
+        };
+        attempt.map(entry).map_err(entry)
+    });
+    match result {
+        Ok(value) => cell
+            .value
+            .get_or_init(|| value.as_ref().clone())
+            .replay()
+            .clone(),
+        Err(failure) => failure.replay().clone(),
+    }
+}
+
+/// Typed completion and read evidence of one cache build. Transient failures
+/// live only with their wave; replayable entries retain stable completion gaps.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct QueryCacheBuildReceipt {
+    keys: Arc<[crate::analyzer::ReadKey]>,
+    reasons: Vec<crate::analyzer::QueryReadIncomplete>,
+    unattributed_reads: usize,
+    execution_dependences: usize,
+}
+
+impl QueryCacheBuildReceipt {
+    pub fn is_complete(&self) -> bool {
+        self.reasons.is_empty() && self.execution_dependences == 0
+    }
+
+    pub fn unattributed_reads(&self) -> usize {
+        self.unattributed_reads
+    }
+
+    pub fn replay(&self) {
+        for reason in &self.reasons {
+            match reason {
+                crate::analyzer::QueryReadIncomplete::StoreFailure(error) => {
+                    crate::analyzer::i_analyzer::record_store_error_on_current_contexts(
+                        error.clone(),
+                    );
+                }
+                reason => crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
+                    reason.clone(),
+                ),
+            }
+        }
+        crate::analyzer::i_analyzer::replay_query_read_receipt_on_current_contexts(
+            &self.keys,
+            self.unattributed_reads,
+            self.execution_dependences,
+        );
+    }
+}
+
+#[doc(hidden)]
+pub fn capture_query_cache_build<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> T,
+) -> (T, QueryCacheBuildReceipt) {
+    let ((value, reasons), reads) = crate::analyzer::capture_query_reads(analyzer, || {
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+        let value = build();
+        (value, scope.captured_read_incompleteness())
+    });
+    (
+        value,
+        QueryCacheBuildReceipt {
+            keys: Arc::from(reads.keys()),
+            reasons,
+            unattributed_reads: reads.unattributed_reads(),
+            execution_dependences: reads.execution_dependences(),
+        },
+    )
+}
+
+struct FailedQueryCacheBuild<T> {
+    value: Arc<T>,
+    receipt: QueryCacheBuildReceipt,
+}
+
+fn shared_query_cache_fill<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> T,
+) -> Result<T, FailedQueryCacheBuild<T>> {
+    let (attempt, receipt) =
+        capture_query_cache_build(analyzer, || complete_query_cache_fill(analyzer, build));
+    attempt.map_err(|value| FailedQueryCacheBuild {
+        value: Arc::new(value),
+        receipt,
+    })
+}
+
+fn replay_failed_query_cache_build<T>(failure: Arc<FailedQueryCacheBuild<T>>) -> Arc<T> {
+    failure.receipt.replay();
+    Arc::clone(&failure.value)
+}
+
+/// Completed values stay cached; waiters share only their current failed wave.
+#[doc(hidden)]
+pub fn complete_query_cache_pool<T: Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
+    memo: &crate::analyzer::pool_memo::PoolSafeMemo<T>,
+    build_parallel: impl FnOnce() -> T,
+    build_serial: impl FnOnce() -> T,
+) -> Arc<T> {
+    memo.get_or_try_build_wave(
+        || shared_query_cache_fill(analyzer, build_parallel),
+        || shared_query_cache_fill(analyzer, build_serial),
+    )
+    .unwrap_or_else(|failure| replay_failed_query_cache_build(failure))
+}
+
+fn shared_optional_query_cache_fill<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> Option<T>,
+) -> Result<T, QueryCacheBuildReceipt> {
+    let (attempt, receipt) =
+        capture_query_cache_build(analyzer, || complete_query_cache_fill(analyzer, build));
+    match attempt {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) | Err(_) => Err(receipt),
+    }
+}
+
+/// Share failed attempts without keeping a cancelled waiter parked.
+#[doc(hidden)]
+pub fn complete_query_cache_pool_while<T: Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
+    memo: &crate::analyzer::pool_memo::PoolSafeMemo<T>,
+    keep_going: &impl Fn() -> bool,
+    parallel: impl FnOnce() -> Option<T>,
+    serial: impl FnOnce() -> Option<T>,
+) -> Option<Arc<T>> {
+    memo.get_or_try_build_wave_while(
+        keep_going,
+        || shared_optional_query_cache_fill(analyzer, parallel),
+        || shared_optional_query_cache_fill(analyzer, serial),
+    )
+    .unwrap_or_else(|failure| {
+        failure.replay();
+        None
+    })
+}
+
+/// Preserve a store-only memo's pool-independent wait policy.
+#[doc(hidden)]
+pub fn complete_query_cache_pool_independent<T: Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
+    memo: &crate::analyzer::pool_memo::PoolSafeMemo<T>,
+    build: impl FnOnce() -> T,
+) -> Arc<T> {
+    memo.get_or_try_build_pool_independent_wave(|| shared_query_cache_fill(analyzer, build))
+        .unwrap_or_else(|failure| replay_failed_query_cache_build(failure))
+}
+
+/// The dedicated-pool variant preserves the caller's existing execution seam.
+#[doc(hidden)]
+pub fn complete_query_cache_on_dedicated_pool<T: Send + Sync + 'static>(
+    analyzer: &dyn IAnalyzer,
+    memo: &crate::analyzer::pool_memo::PoolSafeMemo<T>,
+    build: impl FnOnce() -> T + Send,
+) -> Arc<T> {
+    memo.get_or_try_build_on_dedicated_pool_wave(|| shared_query_cache_fill(analyzer, build))
+        .unwrap_or_else(|failure| replay_failed_query_cache_build(failure))
+}
+
 /// Values without retained failure evidence cannot replay an incomplete read
 /// on a warm hit. Refuse those fills, including deterministic content gaps,
 /// without mistaking a content gap for execution dependence.
@@ -80,14 +353,13 @@ pub fn complete_query_cache_fill<T>(
     analyzer: &dyn IAnalyzer,
     build: impl FnOnce() -> T,
 ) -> Result<T, T> {
-    let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
-    replayable_query_cache_fill(analyzer, build).and_then(|value| {
-        if scope.captured_read_incompleteness().is_empty() {
-            Ok(value)
-        } else {
-            Err(value)
-        }
-    })
+    let fill = QueryCacheFill::new(analyzer);
+    let value = build();
+    if fill.is_complete() {
+        Ok(value)
+    } else {
+        Err(value)
+    }
 }
 
 /// For cache values that retain every deterministic incomplete-read reason
@@ -133,22 +405,19 @@ pub fn replayable_query_cache_fill<T>(
     }
 }
 
-/// Temporary #7311 guard: remove once persistent accessors are fallible and
-/// owned, so a failed build is never installed. This scope observes actual
-/// fills, including marks from worker threads. Its capture/replay preserves the
-/// enclosing resolver's read narrowing.
+/// A scoped complete-only fill for accessors that compute before publishing.
+/// Its private ledger observes worker marks without losing enclosing reads.
 #[doc(hidden)]
-pub struct PersistentCacheFill<'a> {
+pub struct QueryCacheFill<'a> {
     analyzer: &'a dyn IAnalyzer,
-    cache: &'static str,
     generation_before: u64,
     scope: Option<crate::analyzer::AnalyzerQueryScope<'a>>,
     enclosing: Option<Arc<crate::analyzer::ReadLedger>>,
     reads: Arc<crate::analyzer::ReadLedger>,
 }
 
-impl<'a> PersistentCacheFill<'a> {
-    pub fn new(analyzer: &'a dyn IAnalyzer, cache: &'static str) -> Self {
+impl<'a> QueryCacheFill<'a> {
+    pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         let reads = Arc::new(crate::analyzer::ReadLedger::new());
         let enclosing = analyzer.current_thread_read_ledger();
         let scope = match &enclosing {
@@ -163,7 +432,6 @@ impl<'a> PersistentCacheFill<'a> {
         };
         Self {
             analyzer,
-            cache,
             generation_before: analyzer.project().analysis_generation(),
             scope: Some(scope),
             enclosing,
@@ -171,32 +439,38 @@ impl<'a> PersistentCacheFill<'a> {
         }
     }
 
-    #[track_caller]
-    pub fn installed(&self, cache: &str) {
+    pub fn is_complete(&self) -> bool {
+        let snapshot_changed =
+            self.analyzer.project().analysis_generation() != self.generation_before;
+        let cancelled = self
+            .analyzer
+            .active_query_cancellation()
+            .is_some_and(|token| token.is_cancelled());
+        if snapshot_changed || cancelled {
+            self.analyzer.mark_execution_dependent();
+        }
         let completion = self
             .scope
             .as_ref()
             .expect("fill scope stays open until drop")
             .read_completion();
-        // Observe an actual failed/cut computation. Merely polling an already
-        // cancelled token after a pure completed fill would poison clean data.
-        let snapshot_changed =
-            self.analyzer.project().analysis_generation() != self.generation_before;
-        // A persistent fill that cannot replay its reason degrades on any
-        // completion error, including deterministic content incompleteness.
-        if completion.is_err() || snapshot_changed || self.reads.execution_dependences() > 0 {
-            self.analyzer.record_degraded_persistent_fill(
-                &format!("{}::{cache}", self.cache),
-                &format!(
-                    "completion={completion:?} marks={} snapshot={snapshot_changed}",
-                    self.reads.execution_dependences()
-                ),
-            );
+        if completion
+            .as_ref()
+            .is_err_and(|reason| !reason.is_execution_dependent())
+        {
+            // No completed cache fact licenses this best-effort answer for a
+            // policy unit. Refuse the consumer without classifying a stable
+            // content gap as transient execution state.
+            self.analyzer.record_unattributed_read();
         }
+        completion.is_ok()
+            && !snapshot_changed
+            && !cancelled
+            && self.reads.execution_dependences() == 0
     }
 }
 
-impl Drop for PersistentCacheFill<'_> {
+impl Drop for QueryCacheFill<'_> {
     fn drop(&mut self) {
         drop(self.scope.take());
         if let Some(enclosing) = &self.enclosing {
@@ -205,17 +479,32 @@ impl Drop for PersistentCacheFill<'_> {
     }
 }
 
+/// Share a fallible Moka build together with its typed read receipt.
+/// Every failed-wave consumer replays that receipt into its own request chain;
+/// Moka does not retain the Err for a later wave. The builder decides admission
+/// (normally through complete_query_cache_fill), so success and failure may
+/// have different payload types, including weighted replay entries.
 #[doc(hidden)]
-#[track_caller]
-pub fn persistent_cache_fill<T>(
+pub fn query_cache_moka<K, V, E>(
     analyzer: &dyn IAnalyzer,
-    cache: &'static str,
-    build: impl FnOnce() -> T,
-) -> T {
-    let guard = PersistentCacheFill::new(analyzer, cache);
-    let value = build();
-    guard.installed(cache);
-    value
+    cache: &moka::sync::Cache<K, V>,
+    key: &K,
+    build: impl FnOnce() -> Result<V, E>,
+) -> Result<V, Arc<E>>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    cache
+        .try_get_with_by_ref(key, || {
+            let (attempt, receipt) = capture_query_cache_build(analyzer, build);
+            attempt.map_err(|value| (Arc::new(value), receipt))
+        })
+        .map_err(|failure| {
+            failure.1.replay();
+            Arc::clone(&failure.0)
+        })
 }
 
 #[doc(hidden)]
@@ -225,12 +514,10 @@ pub fn import_target_files_from_cache(
     file: &ProjectFile,
     resolve: impl FnOnce() -> HashSet<ProjectFile>,
 ) -> Arc<HashSet<ProjectFile>> {
-    match cache.try_get_with(file.clone(), || {
+    query_cache_moka(analyzer, cache, file, || {
         complete_query_cache_fill(analyzer, || Arc::new(resolve()))
-    }) {
-        Ok(value) => value,
-        Err(value) => Arc::clone(value.as_ref()),
-    }
+    })
+    .unwrap_or_else(|value| Arc::clone(value.as_ref()))
 }
 
 impl<T> CandidateState<T> {
@@ -263,18 +550,19 @@ pub fn find_by_label<T: Copy>(
 }
 
 #[doc(hidden)]
-pub fn reuse_cached_expression_value<K, V, N>(
+pub fn reuse_cached_expression_value<K, Q, V, N>(
     values: &HashMap<K, V>,
     expression_values: &mut HashMap<N, V>,
-    key: K,
+    key: &Q,
     expression: N,
 ) -> Option<V>
 where
-    K: Eq + std::hash::Hash,
+    K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
+    Q: Eq + std::hash::Hash + ?Sized,
     V: Copy,
     N: Eq + std::hash::Hash,
 {
-    let value = values.get(&key).copied()?;
+    let value = values.get(key).copied()?;
     expression_values.insert(expression, value);
     Some(value)
 }
@@ -917,6 +1205,58 @@ pub use crate::analyzer::resolution::file_paths::{
 };
 
 pub use crate::analyzer::store::xml_name::local_xml_name;
+
+/// An index pinned for a request, or borrowed from an already retained value.
+#[doc(hidden)]
+pub enum IndexOwner<'a, T> {
+    Borrowed(&'a T),
+    Shared(Arc<T>),
+}
+impl<'a, T> From<&'a T> for IndexOwner<'a, T> {
+    fn from(value: &'a T) -> Self {
+        Self::Borrowed(value)
+    }
+}
+impl<T> From<Arc<T>> for IndexOwner<'_, T> {
+    fn from(value: Arc<T>) -> Self {
+        Self::Shared(value)
+    }
+}
+impl<T> std::ops::Deref for IndexOwner<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+/// Producer codes identify the source of a diagnostic. Only enumerated
+/// content/configuration failures are stable; unknown codes, I/O and limits
+/// remain transient until their producer supplies a stronger contract.
+#[doc(hidden)]
+pub fn external_index_incompleteness(
+    diagnostic: &crate::analyzer::semantic_model::ProducerDiagnostic,
+) -> crate::analyzer::QueryReadIncomplete {
+    use crate::analyzer::QueryReadIncomplete;
+    let detail = format!("{}: {}", diagnostic.code, diagnostic.message).into_boxed_str();
+    match diagnostic.code.as_str() {
+        "artifact.kind"
+        | "artifact.role"
+        | "artifact.count"
+        | "csharp.metadata.invalid"
+        | "csharp.assembly_identity"
+        | "csharp.metadata.export_omitted"
+        | "java.archive.invalid"
+        | "java.class.invalid"
+        | "java.source_binary_conflict"
+        | "jvm.dependency_unresolved"
+        | "jdk.home.unavailable" => QueryReadIncomplete::ArtifactUnavailable(detail),
+        "artifact.cancelled" => QueryReadIncomplete::Cancelled,
+        _ => QueryReadIncomplete::SemanticEvidenceUnavailable(detail),
+    }
+}
 
 #[cfg(test)]
 mod tests {

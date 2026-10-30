@@ -39,6 +39,9 @@ pub(crate) fn property_source_query(
         );
     }
     let workspace = WorkspaceAnalyzer::Multi(Box::new(analyzer.clone()));
+    // A property query owns its allotment. Its answer must not depend on the
+    // consuming policy's remaining continuation budget; typed exhaustion is
+    // retained below and refuses execution-independent reuse.
     let mut semantic_budget = SemanticBudget::default();
     let mut semantic_request = SemanticRequest::new(&mut semantic_budget, cancellation);
     let artifact_outcome =
@@ -139,6 +142,15 @@ pub(crate) fn property_source_query(
         );
         evaluation_incomplete_reasons
             .extend(projected.evaluation_incomplete_reasons().iter().cloned());
+        incomplete_reasons.extend(
+            projected
+                .incomplete_reasons()
+                .iter()
+                .cloned()
+                .map(|reason| {
+                    PropertySourceQueryIncompleteReason::PropertyProjection(Box::new(reason))
+                }),
+        );
         if !projected.is_complete() {
             incomplete_reasons
                 .push(PropertySourceQueryIncompleteReason::PropertyProjectionIncomplete);

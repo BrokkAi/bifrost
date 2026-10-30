@@ -6,6 +6,8 @@
 //! `build_direct_descendant_index` is generic over `IAnalyzer`, so the impl
 //! stays here.
 
+use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
+
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
@@ -32,25 +34,25 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-csharp-analysis/src/analyzer/csharp/hierarchy_provider.rs",
-            );
-
-        let ancestors = logical_direct_ancestors(self, token, code_unit, false);
-        {
-            let cache_key = code_unit.clone();
-            let cache_value = Arc::new(ancestors.clone());
-            persistent_fill_guard.installed("direct_ancestors");
-            self.memo_caches
-                .direct_ancestors
-                .insert(cache_key, cache_value);
-        };
-        ancestors
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+        let ancestors = self
+            .memo_caches
+            .direct_ancestors
+            .read(&memo_attribution(self), |cache, capture| {
+                Ok::<_, std::convert::Infallible>(cache.get(code_unit).unwrap_or_else(|| {
+                    let entry = Arc::new(capture.build_weighted(|| {
+                        let ancestors = logical_direct_ancestors(self, token, code_unit, false);
+                        let bytes = super::cache::estimate_code_unit_vec(&ancestors) as usize;
+                        (Arc::new(ancestors), bytes)
+                    }));
+                    if cache_fill.is_complete() {
+                        cache.insert(code_unit.clone(), Arc::clone(&entry));
+                    }
+                    entry
+                }))
+            })
+            .expect("ancestor memo build is infallible");
+        (**ancestors).clone()
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
@@ -66,17 +68,24 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
-        descendants_from_variant_index(
-            &self.memo_caches.direct_descendant_index,
-            scope,
-            code_unit,
-            || {
-                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                    build_direct_descendant_index(self, self, scope)
-                })
-                .ok()
-                .flatten()
+        self.memo_caches.direct_descendant_index.read(
+            &memo_attribution(self),
+            |direct_descendant_index_memo| {
+                descendants_from_variant_index(
+                    direct_descendant_index_memo,
+                    scope,
+                    code_unit,
+                    || {
+                        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                            self,
+                            || build_direct_descendant_index(self, self, scope),
+                        )
+                        .ok()
+                        .flatten()
+                    },
+                )
             },
+            |_| AuthorityInputs::SourceOf(&[brokk_bifrost_core::analyzer::model::Language::CSharp]),
         )
     }
 }

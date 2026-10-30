@@ -97,35 +97,7 @@ impl CallApplicabilityAdapter for ScalaCallApplicabilityAdapter {
         source: IntrinsicCallType,
         target: IntrinsicCallType,
     ) -> bool {
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Boolean as Boolean;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Byte as Byte;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Char as Char;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Double as Double;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Float as Float;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Int as Int;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Long as Long;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::Short as Short;
-
-        use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::IntrinsicCallType::String as String;
-        matches!(
-            (source, target),
-            (Boolean, Boolean)
-                | (String, String)
-                | (Byte, Byte | Short | Int | Long | Float | Double)
-                | (Short, Short | Int | Long | Float | Double)
-                | (Char, Char | Int | Long | Float | Double)
-                | (Int, Int | Long | Float | Double)
-                | (Long, Long | Float | Double)
-                | (Float, Float | Double)
-                | (Double, Double)
-        )
+        crate::analyzer::jvm::intrinsic_call_type_converts(source, target)
     }
 
     fn type_in_call_position(&self) -> TypeInCallPosition {

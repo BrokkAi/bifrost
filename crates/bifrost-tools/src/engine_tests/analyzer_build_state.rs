@@ -100,7 +100,7 @@ fn c_and_cpp_refusals_are_both_reported_for_their_storage_languages() {
         .expect("both source refusals are recorded");
     let paths = refusals
         .into_iter()
-        .map(|(file, _)| file.rel_path().to_path_buf())
+        .map(|row| row.file.rel_path().to_path_buf())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         paths,

@@ -3919,8 +3919,12 @@ pub(super) fn builtin_identity_expansions(
         name,
         resolution,
     );
-    let call_callee =
-        environment_cache.python_syntax_tree_for(&row.file, row.content_identity, &source);
+    let call_callee = environment_cache.python_syntax_tree_for(
+        analyzer,
+        &row.file,
+        row.content_identity,
+        &source,
+    );
     if call_callee.is_ok_and(|tree| {
         python_call_callee_at(&tree, &(row.range.start_byte..row.range.end_byte)) == Some(true)
     }) {
@@ -4224,7 +4228,11 @@ pub(super) fn uninitialized_variable_expansions(
 
     let read_failure_is_handled =
         derivation.binding_read_failure_is_handled(&procedure.handle, read.event);
-    let initialization = derivation.binding_initialization_at_read(&procedure.handle, read.event);
+    let uncancelled = CancellationToken::new();
+    let mut request =
+        brokk_bifrost_flow::flow_state::FlowStateRequest::new(cancellation.unwrap_or(&uncancelled));
+    let initialization =
+        derivation.binding_initialization_at_read(&procedure.handle, read.event, &mut request);
     if read_failure_is_handled {
         return Vec::new();
     }

@@ -16,7 +16,7 @@
 //! which of them exists, exactly as it does for a relative specifier.
 
 use brokk_bifrost_core::analyzer::ProjectFile;
-use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -98,9 +98,22 @@ fn condition_rank(name: &str) -> EntryRank {
 
 /// Every workspace package name, mapped to the entry paths a bare specifier
 /// naming it may address, in the order they are tried.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkspacePackageIndex {
     entries: HashMap<String, Vec<PathBuf>>,
+    answer: [u8; 32],
+}
+
+impl Default for WorkspacePackageIndex {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+            answer: brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                b"js-ts-workspace-packages-v1",
+                b"inventory-unavailable",
+            ),
+        }
+    }
 }
 
 impl WorkspacePackageIndex {
@@ -112,8 +125,17 @@ impl WorkspacePackageIndex {
     /// an external package that happens to be checked in, not a member of the
     /// workspace, and admitting it would resolve external imports into vendored
     /// copies.
-    pub fn build(root: &Path, files: &BTreeSet<ProjectFile>) -> Self {
+    pub(crate) fn build_with_reads(
+        root: &Path,
+        files: &BTreeSet<ProjectFile>,
+        reads: &mut HashSet<PathBuf>,
+    ) -> Self {
         let mut entries: HashMap<String, Vec<PathBuf>> = HashMap::default();
+        let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+            b"js-ts-workspace-packages-v1",
+        );
+        hash.value(b"complete");
+
         for file in files {
             let rel = file.rel_path();
             if rel.file_name() != Some(std::ffi::OsStr::new("package.json")) {
@@ -128,7 +150,12 @@ impl WorkspacePackageIndex {
             let Some(package_dir) = rel.parent() else {
                 continue;
             };
+            reads.insert(root.join(rel).normalize());
             let Some((name, targets)) = read_manifest(&root.join(rel)) else {
+                hash.field(
+                    "unusable-manifest",
+                    brokk_bifrost_core::path_utils::workspace_relative_slash_path(rel).as_bytes(),
+                );
                 continue;
             };
             let bases = entries.entry(name).or_default();
@@ -147,8 +174,23 @@ impl WorkspacePackageIndex {
                 }
             }
         }
+        let mut names = entries.keys().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            hash.field("name", name.as_bytes());
+            hash.sequence("entry-targets", &entries[name], |hash, path| {
+                hash.value(
+                    brokk_bifrost_core::path_utils::workspace_relative_slash_path(path).as_bytes(),
+                )
+            });
+        }
+        let answer = hash.finish();
         entries.retain(|_, bases| !bases.is_empty());
-        Self { entries }
+        Self { entries, answer }
+    }
+
+    pub fn answer(&self) -> [u8; 32] {
+        self.answer
     }
 
     /// Candidate entry paths (relative to the repo root, extension included as

@@ -107,6 +107,18 @@ pub struct SemanticModelOverlay {
     deferred_yields_by_scope: HashMap<(String, String, String), Vec<usize>>,
 }
 
+fn deferred_yield_factory_ids(factory: &str, symbols: &[Arc<SemanticModelSymbol>]) -> Vec<String> {
+    let mut ids = symbols
+        .iter()
+        .flat_map(|symbol| &symbol.semantic_contributors)
+        .map(|contributor| contributor.record_id.clone())
+        .collect::<Vec<_>>();
+    ids.push(factory.to_owned());
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Preserve ranked curated selection, but include every active extraction
 /// contributor before structural composition (#6542). An installed or embedded
 /// artifact does not lose authority to an ephemeral curated stub's source rank.
@@ -172,6 +184,17 @@ impl SemanticModelOverlay {
         symbol: &ModelSymbolRef,
         selection: &ModelProviderSelection,
     ) -> ModelDeclarationRequest {
+        // Both model caches answer from this overlay alone, so a hit is covered
+        // by the Models key that semantic_model_overlay() records when it hands
+        // the overlay to a capture.
+        if let Some(ledger) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+            debug_assert!(
+                ledger.keys().contains(&crate::analyzer::ReadKey::Models(
+                    crate::analyzer::semantic::StableDigest::sha256(&self.active_model_set_hash),
+                )),
+                "model declaration cache hits require the selected model publication key"
+            );
+        }
         ModelDeclarationRequest {
             active_model_set_hash: self.active_model_set_hash.clone(),
             schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
@@ -1146,6 +1169,28 @@ impl SemanticModelOverlay {
         })
     }
 
+    fn contributed_or_direct_deferred_yields(
+        &self,
+        factory: &str,
+        facts: Vec<Arc<DeferredYieldContract>>,
+    ) -> Vec<Arc<DeferredYieldContract>> {
+        let contributed = facts
+            .iter()
+            .filter(|contract| {
+                self.has_semantic_contributor(factory, &contract.factory, &contract.provenance)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if contributed.is_empty() {
+            facts
+                .into_iter()
+                .filter(|contract| contract.factory == factory)
+                .collect()
+        } else {
+            contributed
+        }
+    }
+
     pub fn deferred_yield_contracts(&self) -> Vec<Arc<DeferredYieldContract>> {
         match &self.row_source {
             Some(rows) => rows.merge_contracts(self.deferred_yields.clone(),rows.deferred_yields("ALL_DEFERRED_YIELDS",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::ALL_DEFERRED_YIELDS,[]),|r|&r.provenance),
@@ -1161,26 +1206,9 @@ impl SemanticModelOverlay {
     ) -> SemanticModelOverlayMatch<DeferredYieldContract> {
         if let Some(rows) = &self.row_source {
             let symbols = self.symbols_with_id(factory);
-            let mut ids = symbols
-                .records
-                .iter()
-                .flat_map(|s| &s.semantic_contributors)
-                .map(|c| c.record_id.clone())
-                .collect::<Vec<_>>();
-            ids.push(factory.to_owned());
-            ids.sort_unstable();
-            ids.dedup();
+            let ids = deferred_yield_factory_ids(factory, &symbols.records);
             let facts = rows.merge_contracts(self.deferred_yields.iter().filter(|f|ids.contains(&f.factory) && f.resume==resume && f.handle_type==handle_type).cloned().collect(),rows.deferred_yields("DEFERRED_YIELDS",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::DEFERRED_YIELDS,rusqlite::named_params!{ ":factory_ids":serde_json::to_string(&ids).expect("IDs serialize"),":resume":resume,":handle_type":handle_type }),|r|&r.provenance);
-            let contributed = facts
-                .iter()
-                .filter(|f| self.has_semantic_contributor(factory, &f.factory, &f.provenance))
-                .cloned()
-                .collect::<Vec<_>>();
-            let records = if contributed.is_empty() {
-                facts.into_iter().filter(|f| f.factory == factory).collect()
-            } else {
-                contributed
-            };
+            let records = self.contributed_or_direct_deferred_yields(factory, facts);
             return Self::deferred_records_match(records);
         }
         let contributed = self
@@ -1216,35 +1244,12 @@ impl SemanticModelOverlay {
         let facts = match &self.row_source {
             Some(rows) => {
                 let symbols = self.symbols_with_id(factory);
-                let mut ids = symbols
-                    .records
-                    .iter()
-                    .flat_map(|s| &s.semantic_contributors)
-                    .map(|c| c.record_id.clone())
-                    .collect::<Vec<_>>();
-                ids.push(factory.to_owned());
-                ids.sort_unstable();
-                ids.dedup();
+                let ids = deferred_yield_factory_ids(factory, &symbols.records);
                 rows.merge_contracts(self.deferred_yields.iter().filter(|f|ids.contains(&f.factory)).cloned().collect(), rows.deferred_yields("DEFERRED_YIELDS_BY_FACTORY",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::DEFERRED_YIELDS_BY_FACTORY,rusqlite::named_params! { ":factory_ids":serde_json::to_string(&ids).expect("IDs serialize") }),|r|&r.provenance)
             }
             None => self.deferred_yields.clone(),
         };
-        let contributed = facts
-            .iter()
-            .filter(|contract| {
-                self.has_semantic_contributor(factory, &contract.factory, &contract.provenance)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut records = if contributed.is_empty() {
-            facts
-                .iter()
-                .filter(|contract| contract.factory == factory)
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            contributed
-        };
+        let mut records = self.contributed_or_direct_deferred_yields(factory, facts);
         records.sort_by(|left, right| {
             (&left.resume, &left.handle_type).cmp(&(&right.resume, &right.handle_type))
         });

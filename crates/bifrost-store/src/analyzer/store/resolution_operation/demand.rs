@@ -19,7 +19,9 @@ use crate::analyzer::resolution::{
     TypeTransferRule,
 };
 use crate::analyzer::resolution::{CALLER_ENVIRONMENT, DemandReferenceKey, DemandRelationKey};
-use crate::analyzer::resolution::{CloseProgress, CloseResume, HierarchyProvenanceView};
+use crate::analyzer::resolution::{
+    CloseProgress, CloseResume, HierarchyProvenanceView, RootClosure,
+};
 use std::hash::Hash;
 
 /// A root question selected by one language adapter. The generic provider
@@ -60,16 +62,44 @@ pub(crate) struct LanguagePrefixInputs {
 /// Completion and any placeholder reasons discharged by one closed root.
 #[doc(hidden)]
 pub struct LanguageClosure {
-    #[doc(hidden)]
-    pub completion: ResolutionCompletion,
-    #[doc(hidden)]
-    pub closed: bool,
+    pub(crate) outcome: RootClosure,
     pub(crate) discharges: Option<DemandClosureDischarges>,
+}
+impl LanguageClosure {
+    #[doc(hidden)]
+    pub fn completion(&self) -> &ResolutionCompletion {
+        self.outcome.completion()
+    }
+
+    pub(crate) fn cancelled(completion: ResolutionCompletion) -> Self {
+        Self {
+            outcome: RootClosure::Cancelled(completion),
+            discharges: None,
+        }
+    }
+    pub(crate) fn settled(completion: ResolutionCompletion) -> Self {
+        if completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
+            return Self::cancelled(completion);
+        }
+        Self {
+            outcome: RootClosure::settled(completion),
+            discharges: None,
+        }
+    }
 }
 
 /// Language-specific root selection and context preparation used by the
 /// shared request-scoped demand provider.
 pub(crate) trait DemandLanguage {
+    fn root_has_receipt(&self, endpoint: &EndpointSignature) -> bool;
+    fn finalize_closure(
+        &mut self,
+        _endpoint: &EndpointSignature,
+        closure: LanguageClosure,
+    ) -> Result<LanguageClosure> {
+        Ok(closure)
+    }
+
     fn qualified_members(
         &mut self,
     ) -> Option<&mut dyn crate::analyzer::resolution::QualifiedMemberProvider> {
@@ -165,7 +195,7 @@ pub(crate) trait DemandLanguage {
         member_completion: &ResolutionCompletion,
     ) -> Result<LanguageClosure> {
         let mut closure = self.close_root(endpoint, question, context, inputs)?;
-        closure.completion = closure.completion.combine(member_completion);
+        closure.outcome = closure.outcome.combine(member_completion);
         Ok(closure)
     }
 
@@ -241,19 +271,21 @@ impl<L: DemandLanguage> DemandProvider<L> {
         &mut self,
         endpoint: &DemandRelationKey,
         closure: LanguageClosure,
-    ) -> ResolutionCompletion {
+    ) -> Result<RootClosure> {
+        let closure = self.language.finalize_closure(endpoint, closure)?;
         let root = self
             .pending
             .get_mut(endpoint)
             .expect("only discovered roots may close");
-        root.closed = closure.closed;
-        if closure.closed {
-            root.closed_completion = Some(closure.completion.clone());
+        root.closed = !matches!(closure.outcome, RootClosure::Cancelled(_));
+        if root.closed {
+            debug_assert!(self.language.root_has_receipt(endpoint));
+            root.closed_completion = Some(closure.outcome.completion().clone());
             if let Some(discharges) = closure.discharges {
                 self.discharges.insert(endpoint.clone(), discharges);
             }
         }
-        closure.completion
+        Ok(closure.outcome)
     }
 
     fn plan(root: &PendingRoot<L::RootQuestion, L::ContextKey>) -> RootPlan {
@@ -283,7 +315,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         member_completion: &ResolutionCompletion,
         provenance: HierarchyProvenanceView<'_>,
         resume: CloseResume<'_>,
-    ) -> Result<CloseProgress<ResolutionCompletion>> {
+    ) -> Result<CloseProgress<RootClosure>> {
         let root = self
             .pending
             .get(endpoint)
@@ -305,7 +337,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
                 resume,
             )? {
                 CloseProgress::Ready(closure) => {
-                    CloseProgress::Ready(self.finish_closure(endpoint, closure))
+                    CloseProgress::Ready(self.finish_closure(endpoint, closure)?)
                 }
                 CloseProgress::Reference {
                     continuation,
@@ -470,7 +502,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         &mut self,
         endpoint: &DemandRelationKey,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> Result<ResolutionCompletion> {
+    ) -> Result<RootClosure> {
         self.close_with_member_completion(endpoint, inputs, &ResolutionCompletion::Complete)
     }
 
@@ -479,7 +511,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         endpoint: &DemandRelationKey,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         member_completion: &ResolutionCompletion,
-    ) -> Result<ResolutionCompletion> {
+    ) -> Result<RootClosure> {
         let root = self
             .pending
             .get_mut(endpoint)
@@ -496,7 +528,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
             inputs,
             member_completion,
         )?;
-        Ok(self.finish_closure(endpoint, closure))
+        self.finish_closure(endpoint, closure)
     }
 
     fn member_selection(
@@ -522,7 +554,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         endpoint: &DemandRelationKey,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         selection: &DemandMemberSelection,
-    ) -> Result<ResolutionCompletion> {
+    ) -> Result<RootClosure> {
         let root = self
             .pending
             .get(endpoint)
@@ -539,7 +571,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
             inputs,
             selection,
         )?;
-        Ok(self.finish_closure(endpoint, closure))
+        self.finish_closure(endpoint, closure)
     }
 
     fn retain_member_provider_reasons(
@@ -587,6 +619,9 @@ mod tests {
     }
 
     impl DemandLanguage for RepeatedRootLanguage {
+        fn root_has_receipt(&self, _: &EndpointSignature) -> bool {
+            true
+        }
         type RootQuestion = ();
         type ContextKey = ();
         type ContextData = ();
@@ -633,8 +668,7 @@ mod tests {
             _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         ) -> Result<LanguageClosure> {
             Ok(LanguageClosure {
-                completion: self.closure_completion.clone(),
-                closed: true,
+                outcome: RootClosure::Published(self.closure_completion.clone()),
                 discharges: Some(DemandClosureDischarges::exact([self.discharged])),
             })
         }
@@ -668,8 +702,9 @@ mod tests {
         assert_eq!(
             provider
                 .close_with_member_completion(&endpoint, &[], &gap)
-                .unwrap(),
-            gap
+                .unwrap()
+                .completion(),
+            &gap
         );
         let RootDiscovery::AlreadyReady { completion } = provider.discover(&endpoint).unwrap()
         else {
@@ -785,6 +820,14 @@ pub struct ClosedRelations {
 }
 
 impl ClosedRelations {
+    pub(super) fn registered_endpoint(
+        &self,
+        endpoint: &EndpointSignature,
+    ) -> Option<&super::demand_closure::ClosedEndpointRegistration> {
+        self.registrations
+            .get(&DemandRelationKey::caller(endpoint.clone()))
+    }
+
     pub(crate) fn publish(
         &mut self,
         endpoint: DemandRelationKey,
@@ -821,12 +864,31 @@ impl ClosedRelations {
         completion: ResolutionCompletion,
     ) {
         self.publish(endpoint.clone(), relation, paths);
+        self.reverse_endpoints.insert(endpoint.clone());
         assert!(self.excluded_base.insert(endpoint.clone()));
         assert!(
             self.endpoint_completions
                 .insert(endpoint, completion)
                 .is_none()
         );
+    }
+
+    /// Keyed evidence is scoped to the requested relation in either direction.
+    fn branch_completion(
+        &self,
+        key: &DemandRelationKey,
+        base: &ResolutionCompletion,
+    ) -> ResolutionCompletion {
+        self.endpoint_completions.get(key).map_or_else(
+            || base.clone(),
+            |completion| {
+                if self.excluded_base.contains(key) && self.endpoints.contains_key(key) {
+                    completion.clone()
+                } else {
+                    base.combine(completion)
+                }
+            },
+        )
     }
 
     pub(crate) fn observe_coverage(&mut self, completion: &ResolutionCompletion) {
@@ -949,6 +1011,7 @@ impl ClosedForwardSource<'_> {
                 "selected reverse candidate read before its target was materialized".to_owned(),
             ));
         }
+        let mut suppressed = vec![ResolutionCompletion::Complete; requests.len()];
         let mut stopped = false;
         let mut cancellation_observed = false;
         let mut coverage =
@@ -965,6 +1028,7 @@ impl ClosedForwardSource<'_> {
                             .into_iter()
                             .collect::<Vec<_>>();
                         let mut excluded = BTreeSet::new();
+                        let mut excluded_evidence = HashMap::default();
                         if arena.endpoints.keys().any(|endpoint| endpoint.environment == self.environment && arena.excluded_base.contains(endpoint)) {
                             let hydrated = self.base.hydrate_candidate_paths(&candidates, cancellation)?;
                             if cancellation.is_cancelled() {
@@ -977,9 +1041,15 @@ impl ClosedForwardSource<'_> {
                             if returned != requested {
                                 return Err(StoreError::new(format!("closed reverse base candidates lack cells: requested={requested:?}, returned={returned:?}")));
                             }
-                            excluded.extend(hydrated.into_iter().filter_map(|(id, path)| {
-                                arena.excluded_base.contains(&self.relation_key(path.start())).then_some(id)
-                            }));
+                            for (id, path) in hydrated {
+                                let key = self.relation_key(path.start());
+                                if arena.excluded_base.contains(&key) {
+                                    excluded.insert(id);
+                                    if let Some(completion) = arena.endpoint_completions.get(&key) {
+                                        excluded_evidence.insert(id, completion);
+                                    }
+                                }
+                            }
                         }
                         for (endpoint, relation) in &arena.endpoints {
                             if endpoint.environment != self.environment { continue; }
@@ -1003,6 +1073,9 @@ impl ClosedForwardSource<'_> {
                             }
                             if !excluded.contains(&row.candidate()) {
                                 retained.push(*row);
+                            } else if let Some(completion) = excluded_evidence.get(&row.candidate()) {
+                                let branch = &mut suppressed[row.request_ordinal()];
+                                *branch = branch.combine(completion);
                             }
                         }
                     }
@@ -1040,6 +1113,21 @@ impl ClosedForwardSource<'_> {
         }
         let mut unconditional = ResolutionCompletionAccumulator::default();
         unconditional.include(coverage.unconditional_completion());
+        let branches = {
+            let arena = self.arena.borrow();
+            requests
+                .iter()
+                .enumerate()
+                .map(|(ordinal, request)| {
+                    arena
+                        .branch_completion(
+                            &self.relation_key(request.endpoint()),
+                            &coverage.branch_completions()[ordinal],
+                        )
+                        .combine(&suppressed[ordinal])
+                })
+                .collect::<Vec<_>>()
+        };
         'requests: for (ordinal, request) in requests.iter().enumerate() {
             let arena = self.arena.borrow();
             for (endpoint, relation) in &arena.endpoints {
@@ -1050,7 +1138,7 @@ impl ClosedForwardSource<'_> {
                 let local_coverage = BatchCandidateCompletionOutcome::new(
                     1,
                     ResolutionCompletion::Complete,
-                    [coverage.branch_completions()[ordinal].clone()],
+                    [branches[ordinal].clone()],
                 );
                 let added = relation.visit_reverse_additions(
                     self.paths,
@@ -1075,10 +1163,7 @@ impl ClosedForwardSource<'_> {
                     },
                 )?;
                 unconditional.include(added.unconditional_completion());
-                assert_eq!(
-                    added.branch_completions(),
-                    &coverage.branch_completions()[ordinal..=ordinal]
-                );
+                assert_eq!(added.branch_completions(), &branches[ordinal..=ordinal]);
                 if stopped
                     || added
                         .unconditional_completion()
@@ -1091,7 +1176,7 @@ impl ClosedForwardSource<'_> {
         Ok(BatchCandidateCompletionOutcome::new(
             requests.len(),
             unconditional.finish(),
-            coverage.branch_completions().iter().cloned(),
+            branches,
         ))
     }
 }
@@ -1483,25 +1568,10 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                 .iter()
                 .enumerate()
                 .map(|(ordinal, request)| {
-                    arena
-                        .endpoint_completions
-                        .get(&self.relation_key(request.endpoint()))
-                        .map_or_else(
-                            || coverage.branch_completions()[ordinal].clone(),
-                            |completion| {
-                                if arena
-                                    .excluded_base
-                                    .contains(&self.relation_key(request.endpoint()))
-                                    && arena
-                                        .endpoints
-                                        .contains_key(&self.relation_key(request.endpoint()))
-                                {
-                                    completion.clone()
-                                } else {
-                                    coverage.branch_completions()[ordinal].combine(completion)
-                                }
-                            },
-                        )
+                    arena.branch_completion(
+                        &self.relation_key(request.endpoint()),
+                        &coverage.branch_completions()[ordinal],
+                    )
                 })
                 .collect::<Vec<_>>()
         };

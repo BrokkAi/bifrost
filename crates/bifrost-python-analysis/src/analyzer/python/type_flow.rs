@@ -3534,6 +3534,8 @@ impl PythonBuiltinShadowRequestMemo {
             .get(&key)
             .cloned()
         {
+            let keys = prepared.source_sha256();
+            debug_assert_eq!(key.0, keys);
             return session.scope_step().then_some(answer);
         }
         #[cfg(test)]
@@ -3879,6 +3881,8 @@ impl PythonModuleBindingRequestMemo {
             .and_then(|bindings| bindings.get(name))
             .cloned()
         {
+            let keys = prepared.source_sha256();
+            debug_assert_eq!(source, keys);
             return Some(binding);
         }
         let binding = resolve_module_binding(prepared, name, session)?;
@@ -4641,6 +4645,12 @@ fn resolve_class_at_span(
             workspace.analyzer(),
             &reads,
         );
+        debug_assert!(reads.keys_satisfy(|key| {
+            brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers(
+                workspace.analyzer(),
+                key,
+            )
+        }));
         return answer;
     }
     #[cfg(test)]
@@ -5662,7 +5672,7 @@ fn external_class_member_mutation_free(
         }
         class_records.push(Arc::clone(class_record));
     }
-    let identity_groups = class_records
+    let mut identity_groups = class_records
         .iter()
         .map(|class| {
             std::iter::once(class.qualified_name.as_str())
@@ -5670,45 +5680,18 @@ fn external_class_member_mutation_free(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    for identities in &mut identity_groups {
+        identities.sort_unstable();
+        identities.dedup();
+    }
+    identity_groups.sort_unstable();
+    identity_groups.dedup();
     python_analyzer(workspace).cached_class_member_mutation_free(&identity_groups, member, || {
-        let Ok(files) = workspace.analyzer().project().all_files_shared() else {
-            return false;
-        };
-        for file in files.iter() {
-            if brokk_bifrost_core::analyzer::common::language_for_file(file) != Language::Python {
-                continue;
-            }
-            let Ok(source) = file.read_to_string() else {
-                return false;
-            };
-            let mut parser = tree_sitter::Parser::new();
-            if parser
-                .set_language(&tree_sitter_python::LANGUAGE.into())
-                .is_err()
-            {
-                return false;
-            }
-            let Some(tree) = parser.parse(&source, None) else {
-                return false;
-            };
-            if tree.root_node().has_error() {
-                return false;
-            }
-            for identities in &identity_groups {
-                if brokk_bifrost_python::runtime_values::python_external_class_member_mutation(
-                    tree.root_node(),
-                    &source,
-                    identities,
-                    member,
-                    65_536,
-                )
-                .is_some()
-                {
-                    return false;
-                }
-            }
-        }
-        true
+        super::mutation_facts::class_groups_mutation_free(
+            workspace.analyzer(),
+            &identity_groups,
+            member,
+        )
     })
 }
 

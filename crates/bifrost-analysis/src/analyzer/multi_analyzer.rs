@@ -1,5 +1,6 @@
 use crate::analyzer::common::{language_for_file, workspace_language_for_file};
 use crate::analyzer::store::StoreError;
+use crate::analyzer::without_project_reads;
 use crate::analyzer::{
     AdditionalFileDependencies, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell,
     CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo, DefinitionLanguageScope,
@@ -549,12 +550,11 @@ pub struct MultiAnalyzer {
     #[doc(hidden)]
     pub snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
     derived_layer_budget_bytes: u64,
-    query_contexts: Mutex<Vec<Arc<crate::analyzer::AnalyzerQueryContext>>>,
+    query_contexts: Arc<Mutex<Vec<Arc<crate::analyzer::AnalyzerQueryContext>>>>,
     /// How many of the open query contexts carry a read ledger. Tracks
     /// `query_contexts`, which a clone starts empty, so it is minted fresh per
     /// clone rather than shared.
-    attached_read_ledgers: AtomicUsize,
-    degraded_persistent_fills: Arc<AtomicUsize>,
+    attached_read_ledgers: Arc<AtomicUsize>,
     /// One delegate's own file list is already sorted and single-language;
     /// `analyzed_files_for_language`'s override only has to look it up, but
     /// still re-sorted it on every call until this memoized it (bifrost#15).
@@ -586,9 +586,8 @@ impl Clone for MultiAnalyzer {
             build_context: self.build_context.clone(),
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
-            query_contexts: Mutex::new(Vec::new()),
-            attached_read_ledgers: AtomicUsize::new(0),
-            degraded_persistent_fills: Arc::clone(&self.degraded_persistent_fills),
+            query_contexts: Arc::new(Mutex::new(Vec::new())),
+            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
             analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
             resolve_definition_batch_with_source_call_count: Arc::clone(
                 &self.resolve_definition_batch_with_source_call_count,
@@ -598,40 +597,64 @@ impl Clone for MultiAnalyzer {
 }
 
 impl MultiAnalyzer {
+    #[track_caller]
+    fn fallback_read_contexts(&self) -> Vec<Arc<crate::analyzer::AnalyzerQueryContext>> {
+        if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
+            Vec::new()
+        } else {
+            self.query_contexts
+                .lock()
+                .expect("multi-analyzer query context mutex poisoned")
+                .clone()
+        }
+    }
+
+    pub(crate) fn clone_for_read_attribution(&self) -> Self {
+        let mut observer = self.clone();
+        observer.query_contexts = Arc::clone(&self.query_contexts);
+        observer.attached_read_ledgers = Arc::clone(&self.attached_read_ledgers);
+        observer
+    }
+
     pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
-        let mut delegates = self.delegates.clone();
-        if let Some(context) = &self.build_context {
-            let active_languages = context.project_languages();
-            delegates.retain(|language, _| active_languages.contains(language));
-            for language in active_languages {
-                if let std::collections::btree_map::Entry::Vacant(entry) = delegates.entry(language)
-                {
-                    let delegate = context.build_delegate_with_progress(language, progress.clone()).unwrap_or_else(|error| {
+        without_project_reads(|| {
+            let mut delegates = self.delegates.clone();
+            if let Some(context) = &self.build_context {
+                let active_languages = context.project_languages();
+                delegates.retain(|language, _| active_languages.contains(language));
+                for language in active_languages {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        delegates.entry(language)
+                    {
+                        let delegate = context.build_delegate_with_progress(language, progress.clone()).unwrap_or_else(|error| {
                         panic!(
                             "failed to initialize {language:?} analyzer during full update: {error}"
                         )
                     });
-                    entry.insert(delegate);
+                        entry.insert(delegate);
+                    }
                 }
             }
-        }
-        let delegates = delegates
-            .iter()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|(language, delegate)| {
-                (
-                    *language,
-                    delegate.update_all_with_progress(progress.clone()),
-                )
-            })
-            .collect();
-        Self::new_with_build_context(
-            delegates,
-            self.derived_layer_budget_bytes,
-            self.build_context.clone(),
-        )
-        .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward())
+            let delegates = delegates
+                .iter()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(language, delegate)| {
+                    without_project_reads(|| {
+                        (
+                            *language,
+                            delegate.update_all_with_progress(progress.clone()),
+                        )
+                    })
+                })
+                .collect();
+            Self::new_with_build_context(
+                delegates,
+                self.derived_layer_budget_bytes,
+                self.build_context.clone(),
+            )
+            .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward())
+        })
     }
 
     fn prefetch_delegates(&self, fq_names: &[String]) {
@@ -691,9 +714,8 @@ impl MultiAnalyzer {
                 derived_layer_budget_bytes,
             )),
             derived_layer_budget_bytes,
-            query_contexts: Mutex::new(Vec::new()),
-            attached_read_ledgers: AtomicUsize::new(0),
-            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
+            query_contexts: Arc::new(Mutex::new(Vec::new())),
+            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
             analyzed_files_by_language: Arc::new(
                 brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
             ),
@@ -736,9 +758,8 @@ impl MultiAnalyzer {
                 self.derived_layer_budget_bytes,
             )),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
-            query_contexts: Mutex::new(Vec::new()),
-            attached_read_ledgers: AtomicUsize::new(0),
-            degraded_persistent_fills: Arc::new(AtomicUsize::new(0)),
+            query_contexts: Arc::new(Mutex::new(Vec::new())),
+            attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
             analyzed_files_by_language: Arc::new(
                 brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
             ),
@@ -1496,26 +1517,31 @@ impl CodeUnitIndex for MultiAnalyzer {
     /// every call. `analyzed_files_by_language` shares `snapshot_caches`'s
     /// lifetime: valid as long as this snapshot is (bifrost#15).
     fn analyzed_files_for_language(&self, language: Language) -> Vec<ProjectFile> {
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+            let key = self.workspace_scope_read_key(&[language]);
+            self.record_read(key.clone());
+            #[cfg(debug_assertions)]
+            if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+                debug_assert!(
+                    keys.contains_read_key(&key),
+                    "language listing hits retain their scope"
+                );
+            }
+        }
         if !self.delegates.contains_key(&language) {
             return Vec::new();
         }
         let cell = self.analyzed_files_by_language.cell(&language);
         let build = || {
-            crate::analyzer::common::persistent_cache_fill(
-                self,
-                "multi.analyzed_files_by_language",
-                || {
-                    let mut files = self
-                        .delegates
-                        .get(&language)
-                        .map(|delegate| delegate.analyzer().analyzed_files())
-                        .unwrap_or_default();
-                    files.sort();
-                    files
-                },
-            )
+            let mut files = self
+                .delegates
+                .get(&language)
+                .map(|delegate| delegate.analyzer().analyzed_files())
+                .unwrap_or_default();
+            files.sort();
+            files
         };
-        (*cell.get_or_build(build, build)).clone()
+        (*crate::analyzer::common::complete_query_cache_pool(self, &cell, build, build)).clone()
     }
 
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
@@ -2107,11 +2133,7 @@ impl IAnalyzer for MultiAnalyzer {
             .lock()
             .expect("multi-analyzer query context mutex poisoned");
         if !contexts.iter().any(|active| Arc::ptr_eq(active, context)) {
-            for active in contexts.iter() {
-                if let Err(reason) = active.read_completion() {
-                    context.record_read_incomplete(reason);
-                }
-            }
+            crate::analyzer::i_analyzer::inherit_query_incompleteness(context, &contexts);
             contexts.push(Arc::clone(context));
             if context.read_ledger().is_some() {
                 self.attached_read_ledgers.fetch_add(1, Ordering::Relaxed);
@@ -2151,84 +2173,74 @@ impl IAnalyzer for MultiAnalyzer {
     /// as well would only re-record the same key, which a set-valued ledger
     /// would drop anyway.
     fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
-        if !crate::analyzer::read_attribution_records_reads(|| {
-            IAnalyzer::read_ledger_attached(self)
-        }) {
+        if crate::analyzer::i_analyzer::record_read_on_attribution_frame(&key)
+            || !IAnalyzer::read_ledger_attached(self)
+        {
             return;
         }
-        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
-            Vec::new()
-        } else {
-            self.query_contexts
-                .lock()
-                .expect("multi-analyzer query context mutex poisoned")
-                .clone()
-        };
+        let contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .clone();
         crate::analyzer::i_analyzer::record_read_on_active_ledgers(&contexts, key);
     }
 
-    fn record_unattributed_read(&self) {
-        if !crate::analyzer::read_attribution_records_reads(|| {
-            IAnalyzer::read_ledger_attached(self)
-        }) {
-            return;
-        }
-        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
-            Vec::new()
-        } else {
-            self.query_contexts
-                .lock()
-                .expect("multi-analyzer query context mutex poisoned")
-                .clone()
-        };
-        crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts);
+    fn record_read_receipt(&self, keys: &Arc<[crate::analyzer::ReadKey]>) {
+        let contexts = self.fallback_read_contexts();
+        crate::analyzer::i_analyzer::record_receipt_on_active_ledgers(&contexts, keys);
     }
 
-    #[track_caller]
-    fn record_degraded_persistent_fill(&self, cache: &str, cause: &str) {
-        let count = self
-            .degraded_persistent_fills
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        let origin = std::panic::Location::caller();
-        crate::profiling::note_with(|| {
-            format!(
-                "policy.units degraded_persistent_fill origin={}:{} cache={cache} cause={cause} count={count}",
-                origin.file(),
-                origin.line()
-            )
-        });
-        self.mark_execution_dependent();
+    fn record_read_capture(&self, reads: &crate::analyzer::ReadLedger) {
+        let contexts = self.fallback_read_contexts();
+        crate::analyzer::i_analyzer::record_capture_on_active_ledgers(&contexts, reads);
     }
 
-    fn degraded_persistent_fills(&self) -> usize {
-        self.degraded_persistent_fills.load(Ordering::Relaxed)
-            + self
-                .delegates()
-                .values()
-                .map(|delegate| delegate.analyzer().degraded_persistent_fills())
-                .sum::<usize>()
+    fn relational_frontier_read_recorder(
+        &self,
+    ) -> crate::analyzer::relational_frontier::FrontierReadRecorder {
+        // An ordinary analyzer clone starts a fresh registry. This read-only
+        // capability must keep the original registry for explicit broadcast.
+        let mut recorder = self.clone();
+        recorder.query_contexts = Arc::clone(&self.query_contexts);
+        recorder.attached_read_ledgers = Arc::clone(&self.attached_read_ledgers);
+        crate::analyzer::relational_frontier::frontier_read_recorder(Arc::new(recorder))
     }
 
-    fn mark_execution_dependent(&self) {
-        if !crate::analyzer::read_attribution_records_reads(|| {
-            IAnalyzer::read_ledger_attached(self)
-        }) {
-            return;
-        }
-        let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
-            Vec::new()
-        } else {
-            self.query_contexts
-                .lock()
-                .expect("multi-analyzer query context mutex poisoned")
-                .clone()
-        };
-        crate::analyzer::i_analyzer::record_execution_dependence_on_active_ledgers(&contexts);
+    fn record_unattributed_reads(&self, count: usize) {
+        crate::analyzer::i_analyzer::record_unattributed_reads(
+            count,
+            || IAnalyzer::read_ledger_attached(self),
+            || self.fallback_read_contexts(),
+        );
+    }
+
+    fn mark_execution_dependent_reads(&self, count: usize) {
+        crate::analyzer::i_analyzer::record_execution_dependence(
+            count,
+            || IAnalyzer::read_ledger_attached(self),
+            || {
+                self.query_contexts
+                    .lock()
+                    .expect("multi-analyzer query context mutex poisoned")
+                    .clone()
+            },
+        );
+    }
+
+    fn records_query_reads(&self) -> bool {
+        true
     }
 
     fn read_ledger_attached(&self) -> bool {
         self.attached_read_ledgers.load(Ordering::Relaxed) > 0
+    }
+
+    fn read_ledger_contexts(&self) -> Vec<Arc<crate::analyzer::AnalyzerQueryContext>> {
+        self.query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .clone()
     }
 
     fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
@@ -2240,12 +2252,13 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
-        self.query_contexts
+        let contexts = self
+            .query_contexts
             .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .iter()
-            .rev()
-            .find_map(|context| context.cancellation().cloned())
+            .expect("multi-analyzer query context mutex poisoned");
+        crate::analyzer::i_analyzer::current_query_context_value(&contexts, |context| {
+            context.cancellation().cloned()
+        })
     }
 
     fn active_query_semantic_model_overlay(
@@ -2380,37 +2393,27 @@ impl IAnalyzer for MultiAnalyzer {
             .definition_lookup_memo()
     }
 
-    /// Recorded on this analyzer's own active contexts rather than forwarded to
-    /// a delegate: `begin_query` shares one context object with every delegate,
-    /// so one recording is enough, and a workspace with no delegate at all
-    /// would otherwise have nowhere to report the failure.
+    /// Record once on the current scope and its enclosing chain. Delegates
+    /// share those contexts, and an empty workspace needs the same recording
+    /// path even though it has no delegate.
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        let contexts = self
-            .query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .clone();
-        for context in contexts {
-            context.record_store_error(error.clone());
-        }
+        crate::analyzer::i_analyzer::record_store_error_on_current_contexts(error);
     }
 
     fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
-        let contexts = self
-            .query_contexts
-            .lock()
-            .expect("multi-analyzer query context mutex poisoned")
-            .clone();
-        crate::analyzer::i_analyzer::record_query_incomplete_on_active_contexts(&contexts, reason);
+        crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(reason);
     }
 
     fn warm_query_indexes(&self) {
-        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .for_each(|delegate| context.run(|| delegate.analyzer().warm_query_indexes()));
+        without_project_reads(|| {
+            self.delegates
+                .values()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .for_each(|delegate| {
+                    without_project_reads(|| delegate.analyzer().warm_query_indexes())
+                });
+        })
     }
 
     fn query_indexes_warm(&self) -> bool {
@@ -2447,96 +2450,101 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let mut delegates = self.delegates.clone();
-        let active_languages = self
-            .build_context
-            .as_ref()
-            .map(|context| context.project_languages());
-        let missing_languages = self
-            .build_context
-            .as_ref()
-            .map(|context| context.changed_languages(changed_files))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|language| !delegates.contains_key(language))
-            .collect::<BTreeSet<_>>();
-        for language in missing_languages.iter().copied() {
-            let delegate = self
+        // Refresh inputs belong to no product, even when a query triggered it.
+        // The outer scope covers serial discovery; each worker enters its own.
+        without_project_reads(|| {
+            let mut delegates = self.delegates.clone();
+            let active_languages = self
                 .build_context
                 .as_ref()
-                .expect("missing languages require a workspace build context")
-                .build_delegate(language)
-                .unwrap_or_else(|error| {
-                    panic!("failed to initialize {language:?} analyzer during update: {error}")
-                });
-            delegates.insert(language, delegate);
-        }
-
-        let updated: Vec<(Language, AnalyzerDelegate, bool)> = delegates
-            .iter()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|(language, delegate)| {
-                if missing_languages.contains(language) {
-                    // Construction indexed the complete current language
-                    // file set, including this delta. Applying it again is
-                    // redundant and can schedule avoidable store GC work.
-                    return (*language, delegate.clone(), false);
-                }
-                let relevant: BTreeSet<ProjectFile> = changed_files
-                    .iter()
-                    .filter(|file| delegate.should_receive_changed_file(*language, file))
-                    .cloned()
-                    .collect();
-                if relevant.is_empty() {
-                    (*language, delegate.clone(), false)
-                } else {
-                    (*language, delegate.update(&relevant), true)
-                }
-            })
-            .collect();
-        let any_delegate_changed =
-            !missing_languages.is_empty() || updated.iter().any(|(_, _, changed)| *changed);
-        let delegates = updated
-            .into_iter()
-            .map(|(language, delegate, _)| (language, delegate))
-            .filter(|(language, _)| {
-                active_languages
+                .map(|context| context.project_languages());
+            let missing_languages = self
+                .build_context
+                .as_ref()
+                .map(|context| context.changed_languages(changed_files))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|language| !delegates.contains_key(language))
+                .collect::<BTreeSet<_>>();
+            for language in missing_languages.iter().copied() {
+                let delegate = self
+                    .build_context
                     .as_ref()
-                    .is_none_or(|active| active.contains(language))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let retired_delegate = delegates.len() < self.delegates.len() + missing_languages.len();
-        if any_delegate_changed || retired_delegate {
-            return Self::new_with_build_context(
+                    .expect("missing languages require a workspace build context")
+                    .build_delegate(language)
+                    .unwrap_or_else(|error| {
+                        panic!("failed to initialize {language:?} analyzer during update: {error}")
+                    });
+                delegates.insert(language, delegate);
+            }
+
+            let updated: Vec<(Language, AnalyzerDelegate, bool)> = delegates
+                .iter()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(language, delegate)| {
+                    without_project_reads(|| {
+                        if missing_languages.contains(language) {
+                            // Construction indexed the complete current language
+                            // file set, including this delta. Applying it again is
+                            // redundant and can schedule avoidable store GC work.
+                            return (*language, delegate.clone(), false);
+                        }
+                        let relevant: BTreeSet<ProjectFile> = changed_files
+                            .iter()
+                            .filter(|file| delegate.should_receive_changed_file(*language, file))
+                            .cloned()
+                            .collect();
+                        if relevant.is_empty() {
+                            (*language, delegate.clone(), false)
+                        } else {
+                            (*language, delegate.update(&relevant), true)
+                        }
+                    })
+                })
+                .collect();
+            let any_delegate_changed =
+                !missing_languages.is_empty() || updated.iter().any(|(_, _, changed)| *changed);
+            let delegates = updated
+                .into_iter()
+                .map(|(language, delegate, _)| (language, delegate))
+                .filter(|(language, _)| {
+                    active_languages
+                        .as_ref()
+                        .is_none_or(|active| active.contains(language))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let retired_delegate = delegates.len() < self.delegates.len() + missing_languages.len();
+            if any_delegate_changed || retired_delegate {
+                return Self::new_with_build_context(
+                    delegates,
+                    self.derived_layer_budget_bytes,
+                    self.build_context.clone(),
+                )
+                // The derived layers and usage graphs are keyed by workspace
+                // content (#2449), so a delegate change cannot make one of them
+                // wrong. Carrying them across is what lets a Rust edit keep the JVM
+                // usage graph and a no-op update keep everything.
+                .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward());
+            }
+            // No delegate saw a relevant change, so every one of them was cloned
+            // and kept everything it had built.  Keeping the workspace-level
+            // derived-layer caches too matches that, and matches what a delegate's
+            // own no-op update does.  The caches are generation-guarded, so nothing
+            // stale can be served through them either way.
+            Self {
                 delegates,
-                self.derived_layer_budget_bytes,
-                self.build_context.clone(),
-            )
-            // The derived layers and usage graphs are keyed by workspace
-            // content (#2449), so a delegate change cannot make one of them
-            // wrong. Carrying them across is what lets a Rust edit keep the JVM
-            // usage graph and a no-op update keep everything.
-            .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward());
-        }
-        // No delegate saw a relevant change, so every one of them was cloned
-        // and kept everything it had built.  Keeping the workspace-level
-        // derived-layer caches too matches that, and matches what a delegate's
-        // own no-op update does.  The caches are generation-guarded, so nothing
-        // stale can be served through them either way.
-        Self {
-            delegates,
-            build_context: self.build_context.clone(),
-            snapshot_caches: Arc::clone(&self.snapshot_caches),
-            derived_layer_budget_bytes: self.derived_layer_budget_bytes,
-            query_contexts: Mutex::new(Vec::new()),
-            attached_read_ledgers: AtomicUsize::new(0),
-            degraded_persistent_fills: Arc::clone(&self.degraded_persistent_fills),
-            analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
-            resolve_definition_batch_with_source_call_count: Arc::clone(
-                &self.resolve_definition_batch_with_source_call_count,
-            ),
-        }
+                build_context: self.build_context.clone(),
+                snapshot_caches: Arc::clone(&self.snapshot_caches),
+                derived_layer_budget_bytes: self.derived_layer_budget_bytes,
+                query_contexts: Arc::new(Mutex::new(Vec::new())),
+                attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
+                analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
+                resolve_definition_batch_with_source_call_count: Arc::clone(
+                    &self.resolve_definition_batch_with_source_call_count,
+                ),
+            }
+        })
     }
 
     fn update_all(&self) -> Self {

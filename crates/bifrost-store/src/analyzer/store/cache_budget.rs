@@ -488,6 +488,94 @@ impl RetainedHeap {
     }
 }
 
+/// Census one read key's owned allocations. The enclosing collection charges
+/// the key's inline storage and the collection's own capacity separately.
+pub fn retained_read_key(heap: &mut RetainedHeap, key: &crate::analyzer::read_ledger::ReadKey) {
+    use crate::analyzer::read_ledger::{FactSubject, LookupQuestion, ReadKey};
+    match key {
+        ReadKey::File { rel_path, .. } | ReadKey::PathAbsent { rel_path, .. } => {
+            heap.add(rel_path.len());
+            heap.add_entries(1);
+        }
+        ReadKey::Index { key, .. } => {
+            heap.add(key.len());
+            heap.add_entries(1);
+        }
+        ReadKey::Lookup { question, .. } => match question {
+            LookupQuestion::Name { name, .. } => {
+                heap.add(name.len());
+                heap.add_entries(1);
+            }
+            LookupQuestion::Declaration {
+                rel_path,
+                fq_name,
+                signature,
+                ..
+            } => {
+                heap.add(rel_path.len().saturating_add(fq_name.len()));
+                heap.add_entries(2);
+                if let Some(signature) = signature {
+                    heap.add(signature.capacity());
+                    heap.add_entries(1);
+                }
+            }
+            LookupQuestion::File { rel_path }
+            | LookupQuestion::CallSite { rel_path, .. }
+            | LookupQuestion::ProcedureCallSite { rel_path, .. } => {
+                heap.add(rel_path.len());
+                heap.add_entries(1);
+            }
+            LookupQuestion::Summary { .. } => {}
+            LookupQuestion::WorkspaceFact { subject, .. } => {
+                let mut string = |value: &str| {
+                    heap.add(value.len());
+                    heap.add_entries(1);
+                };
+                match subject {
+                    FactSubject::Whole | FactSubject::Class { .. } => {}
+                    FactSubject::File { rel_path } => string(rel_path),
+                    FactSubject::Named { name } => string(name),
+                    FactSubject::NamedMember { owner, member } => {
+                        string(owner);
+                        string(member);
+                    }
+                    FactSubject::ClassMember { member, .. } => string(member),
+                    FactSubject::NameGroupMember { names, member } => {
+                        string(member);
+                        for name in names {
+                            string(name);
+                        }
+                        heap.vec(names);
+                    }
+                    FactSubject::FileNamedMember {
+                        rel_path,
+                        owner,
+                        member,
+                        ..
+                    } => {
+                        string(rel_path);
+                        string(owner);
+                        string(member);
+                    }
+                }
+            }
+        },
+        ReadKey::Artifact { rel_path, .. } => {
+            if let Some(path) = rel_path {
+                heap.add(path.len());
+                heap.add_entries(1);
+            }
+        }
+        ReadKey::Scope { languages, .. } => {
+            heap.slice(languages);
+        }
+        ReadKey::Models(_)
+        | ReadKey::Policy { .. }
+        | ReadKey::Configuration(_)
+        | ReadKey::Epoch(_) => {}
+    }
+}
+
 #[derive(Default)]
 struct CompositionCacheCounters {
     search: [std::sync::atomic::AtomicU64; 2],

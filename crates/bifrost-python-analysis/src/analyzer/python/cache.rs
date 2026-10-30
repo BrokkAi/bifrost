@@ -56,8 +56,52 @@ impl PythonClassMutationKey {
     }
 }
 
-pub(crate) fn build_python_class_mutation_cache() -> Cache<PythonClassMutationKey, bool> {
-    Cache::builder().max_capacity(4_096).build()
+pub(crate) type PythonClassMutationCache = Cache<
+    PythonClassMutationKey,
+    Arc<
+        brokk_bifrost_analysis::analyzer::workspace_authority::ReplayingMemoEntry<
+            bool,
+            brokk_bifrost_analysis::analyzer::ReadKey,
+        >,
+    >,
+>;
+
+pub(crate) fn build_python_class_mutation_cache() -> PythonClassMutationCache {
+    Cache::builder()
+        .max_capacity(4 * 1024 * 1024)
+        .weigher(
+            |key: &PythonClassMutationKey,
+             entry: &Arc<
+                brokk_bifrost_analysis::analyzer::workspace_authority::ReplayingMemoEntry<
+                    bool,
+                    brokk_bifrost_analysis::analyzer::ReadKey,
+                >,
+            >| {
+                use brokk_bifrost_analysis::analyzer::store::cache_budget::{
+                    RetainedHeap, retained_read_key,
+                };
+                let bytes = entry.retained_bytes(|key| {
+                    let mut heap = RetainedHeap::default();
+                    retained_read_key(&mut heap, key);
+                    heap.total()
+                }) + std::mem::size_of::<PythonClassMutationKey>()
+                    + std::mem::size_of_val(key.identity_groups.as_ref())
+                    + 2 * std::mem::size_of::<usize>()
+                    + key.member.capacity()
+                    + key
+                        .identity_groups
+                        .iter()
+                        .map(|group| {
+                            std::mem::size_of_val(group.as_ref())
+                                + 2 * std::mem::size_of::<usize>()
+                                + group.iter().map(String::capacity).sum::<usize>()
+                        })
+                        .sum::<usize>();
+                // A minimum charge also preserves the original 4,096-entry cap.
+                u32::try_from(bytes.max(1024)).unwrap_or(u32::MAX)
+            },
+        )
+        .build()
 }
 
 pub(crate) fn build_python_module_member_mutation_cache()
@@ -125,6 +169,126 @@ fn names_weight(names: &Arc<[String]>) -> usize {
             .iter()
             .map(|item| size_of::<String>() + item.len())
             .sum::<usize>()
+}
+
+/// A bounded derived value retains its complete input receipt on every hit.
+pub(crate) type PythonMemo<K, V> =
+    ReplayingMemo<Cache<K, Arc<ReplayingMemoEntry<Arc<V>, ReadKey>>>>;
+
+fn read_key_heap(key: &ReadKey) -> usize {
+    use brokk_bifrost_analysis::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+    let mut heap = RetainedHeap::default();
+    retained_read_key(&mut heap, key);
+    heap.total()
+}
+
+pub(crate) fn replaying_cache<K, V>(budget: u64) -> PythonMemo<K, V>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    ReplayingMemo::new(build_weighted_cache(
+        budget,
+        |_, value: &Arc<ReplayingMemoEntry<Arc<V>, ReadKey>>| {
+            u32::try_from(value.retained_bytes(read_key_heap)).unwrap_or(u32::MAX)
+        },
+    ))
+}
+
+pub(crate) fn read_memo<K, V>(
+    analyzer: &PythonAnalyzer,
+    memo: &PythonMemo<K, V>,
+    key: K,
+    build: impl FnOnce() -> Arc<V>,
+    weight: impl Fn(&K, &Arc<V>) -> u32,
+) -> Arc<V>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    let value = memo
+        .read(&memo_attribution(analyzer), |memo, capture| {
+            let entry = memo
+                .try_get_with(key.clone(), || {
+                    let (attempt, receipt) =
+                        brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(
+                            analyzer,
+                            || {
+                                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                                    analyzer,
+                                    || {
+                                        Arc::new(capture.build_weighted(|| {
+                                            let value = build();
+                                            let bytes = weight(&key, &value) as usize;
+                                            (value, bytes)
+                                        }))
+                                    },
+                                )
+                            },
+                        );
+                    attempt.map_err(|value| (value, receipt))
+                })
+                .unwrap_or_else(|failure| {
+                    failure.1.replay();
+                    Arc::clone(&failure.0)
+                });
+            Ok::<_, std::convert::Infallible>(entry)
+        })
+        .unwrap();
+    Arc::clone(&value)
+}
+
+/// File-local syntax values have an explicit entry cap. Keeping ownership here
+/// lets the same replay wrapper retain language-independent read receipts.
+pub(crate) fn syntax_memo<V: Send + Sync + 'static>() -> PythonMemo<ProjectFile, V> {
+    ReplayingMemo::new(Cache::builder().max_capacity(128).build())
+}
+
+pub(crate) fn read_optional_memo<K, V>(
+    analyzer: &PythonAnalyzer,
+    memo: &PythonMemo<K, V>,
+    key: K,
+    build: impl FnOnce() -> Option<Arc<V>>,
+    weight: impl Fn(&K, &Arc<V>) -> u32,
+) -> Option<Arc<V>>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    let value = memo
+        .read(&memo_attribution(analyzer), |memo, capture| {
+            memo.try_get_with(key.clone(), || {
+                let (attempt, receipt) =
+                    brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(
+                        analyzer,
+                        || {
+                            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                                analyzer,
+                                || {
+                                    capture
+                                        .try_build_weighted(|| {
+                                            let value = build().ok_or(())?;
+                                            let bytes = weight(&key, &value) as usize;
+                                            Ok::<_, ()>((value, bytes))
+                                        })
+                                        .map(Arc::new)
+                                },
+                            )
+                        },
+                    );
+                match attempt {
+                    Ok(Ok(entry)) => Ok(entry),
+                    Err(Ok(entry)) => Err((Some(entry), receipt)),
+                    Ok(Err(())) | Err(Err(())) => Err((None, receipt)),
+                }
+            })
+            .or_else(|failure| {
+                failure.1.replay();
+                failure.0.clone().ok_or(())
+            })
+        })
+        .ok()?;
+    Some(Arc::clone(&value))
 }
 
 #[cfg(test)]
@@ -357,5 +521,46 @@ mod tests {
             })
         );
         assert_eq!(4, scans.load(Ordering::Relaxed));
+    }
+    #[test]
+    #[hardwon(
+        "ddf65ec23b34: repeated graph queries rebuilt generation-stable Python binding facts"
+    )]
+    fn module_binding_timeline_is_reused_within_index_generation() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let file = ProjectFile::new(root.path(), "consumer.py");
+        file.write("value = 0\n")
+            .expect("write syntax memo fixture");
+        let index = PythonAnalyzer::new(Arc::new(TestProject::new(
+            root.path().to_path_buf(),
+            Language::Python,
+        )));
+        let first = index.module_binding_timeline(&file, &mut || {
+            brokk_bifrost_python::usage_index::ModuleBindingTimeline::from_iter([(
+                "target".to_string(),
+                vec![brokk_bifrost_python::usage_index::ModuleBindingEvent {
+                    visible_from: 12,
+                    conditional: false,
+                    kind: brokk_bifrost_python::usage_index::ModuleBindingEventKind::Other,
+                }],
+            )])
+        });
+        let second = index.module_binding_timeline(&file, &mut || {
+            panic!("cached timeline should avoid rebuilding the file")
+        });
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let first_facts = index
+            .scope_facts(&file, &mut || {
+                Some(brokk_bifrost_python::usage_index::PythonScopeFacts::default())
+            })
+            .unwrap();
+        let second_facts = index
+            .scope_facts(&file, &mut || {
+                panic!("cached scope facts should avoid rebuilding the file")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&first_facts, &second_facts));
     }
 }

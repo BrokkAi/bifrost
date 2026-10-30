@@ -949,6 +949,21 @@ incompatible, or partial models produce open boundaries. See
 [Source and model precedence](../semantic-models/#source-and-model-precedence)
 for the activation rules.
 
+Taint propagation lazily computes backward may liveness within one solve,
+including exceptional edges and reads introduced by the query's transfers and
+observations. It prunes only dead procedure-local value carriers at edge
+targets. Formal ports, locations, captures, returned and thrown values, and
+exceptional-exit facts remain available. The procedure receiver is also exempt
+from pruning so callee effects remain visible to callers. Refinable snapshots
+are eligible because their only remaining gaps concern call targets, whose
+receiver and argument operands are already lowered as uses.
+Missing operand semantics, exhausted
+liveness budgets, or cancellation disable pruning; unresolved call targets do
+not hide already-lowered receiver and argument operands. Reusable taint
+transfers include the query's local-value read points in propagation validity,
+while sink identities, accepted labels, and presentation remain observer
+overlays. These liveness results are never persisted or retained across queries.
+
 ## Maturity and limits
 
 **Implemented scope:** validated semantic IR, demand ICFG construction,

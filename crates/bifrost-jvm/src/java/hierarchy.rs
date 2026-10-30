@@ -19,9 +19,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
-use crate::java::graph_support::{
-    JavaSource, resolve_java_forward_type_name, resolve_java_lexical_type_name,
-};
+use crate::java::graph_support::{JavaSource, resolve_java_lexical_type_name};
 use crate::java::imports::non_static_import_path;
 
 const HIERARCHY_FACT_BATCH_SIZE: usize = 4_096;
@@ -198,9 +196,8 @@ pub fn java_direct_ancestors(
         .raw_supertypes_of(code_unit)
         .iter()
         .filter_map(|raw_name| {
-            resolve_java_lexical_type_name(source, code_unit, raw_name).or_else(|| {
-                resolve_java_forward_type_name(source, token, code_unit.source(), raw_name)
-            })
+            resolve_java_lexical_type_name(source, code_unit, raw_name)
+                .or_else(|| source.resolve_imported_type_name(token, code_unit.source(), raw_name))
         })
         .collect()
 }

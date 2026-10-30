@@ -46,7 +46,8 @@ pub enum BindingOrigin {
 /// Lower is stronger. Language-specific order is supplied here; path
 /// comparison remains shared and independent of language.
 pub(crate) fn binding_origin_rank(language: Language, origin: BindingOrigin) -> Option<u32> {
-    super::precedence::precedence_rules(language).origin_rank(origin)
+    crate::analyzer::store::store_language_support_for_hook(language, "precedence_rules")
+        .and_then(|support| support.precedence_rules().origin_rank(origin))
 }
 
 /// Which of the four spaces one runtime identity's payload lives in, read

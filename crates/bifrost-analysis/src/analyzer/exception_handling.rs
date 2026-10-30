@@ -1025,17 +1025,7 @@ fn is_logging_method(name: &str) -> bool {
 }
 
 fn contains_call_named(root: Node<'_>, source: &str, target: &str) -> bool {
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        if node.kind() == "call_expression"
-            && let Some(function) = node.child_by_field_name("function")
-            && contains_identifier(function, source, target)
-        {
-            return true;
-        }
-        pending.extend(children_iter(node));
-    }
-    false
+    contains_call_named_before(root, source, target, usize::MAX)
 }
 
 fn contains_call_named_before(
@@ -1150,9 +1140,7 @@ mod tests {
 
     fn parse(path: &str, language: Language, source: &str) -> tree_sitter::Tree {
         let grammar = parser_language_for_path(language, std::path::Path::new(path)).unwrap();
-        let mut parser = Parser::new();
-        parser.set_language(&grammar).unwrap();
-        parser.parse(source, None).unwrap()
+        crate::test_support::parse_fixture_tree(source, grammar)
     }
 
     #[test]

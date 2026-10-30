@@ -27,6 +27,7 @@ use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::model::Range;
 
 use crate::analyzer::RustAnalyzer;
+use crate::analyzer::rust::test_support::inline_source_project;
 use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverBudgetLimit,
@@ -70,16 +71,9 @@ fn incomplete_binding_diagnostics_do_not_depend_on_operation_ordinals() {
     );
 }
 
+#[track_caller]
 fn rust_source_project(source: &str) -> (BuiltInlineTestProject, RustAnalyzer) {
-    let fixture = InlineTestProject::with_language(Language::Rust)
-        .file(
-            "Cargo.toml",
-            "[package]\nname = \"native_points\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .file("src/lib.rs", source)
-        .build();
-    let analyzer = RustAnalyzer::new(fixture.project_dyn());
-    (fixture, analyzer)
+    inline_source_project("native_points", source)
 }
 
 fn rust_tree(source: &str) -> tree_sitter::Tree {
@@ -89,27 +83,21 @@ fn rust_tree(source: &str) -> tree_sitter::Tree {
     )
 }
 
+#[track_caller]
 fn reference_site_from_range(
     source: &str,
     start_byte: usize,
     end_byte: usize,
 ) -> ResolvedReferenceSite {
-    let start_line = source[..start_byte]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    brokk_bifrost_analysis::test_support::resolved_reference_site(
-        "src/lib.rs".to_owned(),
-        source[start_byte..end_byte].to_owned(),
-        Range {
-            start_byte,
-            end_byte,
-            start_line,
-            end_line: start_line,
-        },
+    brokk_bifrost_analysis::test_support::resolved_reference_site_from_range(
+        "src/lib.rs",
+        source,
+        start_byte,
+        end_byte,
     )
 }
 
+#[track_caller]
 fn reference_site(source: &str, spelling: &str) -> ResolvedReferenceSite {
     let start_byte = source
         .rfind(spelling)

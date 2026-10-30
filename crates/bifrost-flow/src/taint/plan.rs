@@ -1011,6 +1011,24 @@ impl TaintAnalysisPlan {
             .saturating_add(size_of_val(&*self.local_transforms))
             .saturating_add(size_of_val(&*self.store_writes))
             .saturating_add(size_of_val(&*self.store_reads))
+            .saturating_add(
+                self.store_writes
+                    .iter()
+                    .map(TaintStoreWriteBinding::channel)
+                    .chain(self.store_reads.iter().map(TaintStoreReadBinding::channel))
+                    .map(|channel| {
+                        [&channel.instance, &channel.key]
+                            .into_iter()
+                            .map(|dimension| match dimension {
+                                TaintStoreDimension::ProvenSet(identities) => {
+                                    size_of_val(identities.digests())
+                                }
+                                _ => 0,
+                            })
+                            .fold(channel.store.len(), usize::saturating_add)
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
             .saturating_add(size_of_val(&*self.phase_transfers))
             .saturating_add(size_of_val(&*self.value_type_barriers))
             .saturating_add(
@@ -1950,3 +1968,6 @@ mod tests {
         assert!(!channel(TaintStoreDimension::Proven(c)).may_alias(&channel(first)));
     }
 }
+
+#[cfg(test)]
+mod store_identity_contract;

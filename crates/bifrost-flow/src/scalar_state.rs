@@ -3935,3 +3935,7 @@ func run() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scalar_join_properties.rs"]
+mod scalar_join_properties;

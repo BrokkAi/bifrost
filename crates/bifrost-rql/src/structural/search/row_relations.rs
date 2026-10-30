@@ -281,7 +281,11 @@ pub(super) fn binding_of_expansions(
     // joins on this rather than guessing which returned binding is theirs.
     let reached_from = row.ast_id();
     let mut binding = |index: usize, shadowed: bool| {
-        environment_cache.record_joined_scope(&row.file, result.bindings[index].declaring_scope);
+        environment_cache.record_joined_scope(
+            analyzer,
+            &row.file,
+            result.bindings[index].declaring_scope,
+        );
         pipeline_expansion(PipelineValue::Binding(BindingValue {
             file: row.file.clone(),
             result: Arc::clone(&result),
@@ -529,7 +533,7 @@ pub(super) fn binding_uses_expansions(
             .all(|role| result.completeness.covers(*role))
         && !contains_dynamic_call
         && !contains_unresolved_reference;
-    environment_cache.record_binding_use_completeness(value, scope_complete);
+    environment_cache.record_binding_use_completeness(analyzer, value, scope_complete);
     if contains_dynamic_call || contains_unresolved_reference {
         let message = format!(
             "{} lexical scope {} has unresolved or dynamic references; binding uses are incomplete",
@@ -1439,7 +1443,8 @@ pub(super) fn control_relation_expansions(
 ) -> Vec<PipelineExpansion> {
     let file = procedure.file().clone();
     let language = crate::analyzer::common::language_for_file(&file);
-    let relations = control_relation_cache.for_procedure(procedure, generation, cancellation);
+    let relations =
+        control_relation_cache.for_procedure(analyzer, procedure, generation, cancellation);
     control_relation_cache.report_completeness(
         analyzer,
         &procedure.wire_id(),

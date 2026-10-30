@@ -11,12 +11,27 @@ impl PreparedResolutionBundle {
     /// without needing a database or storing expected digests in the repository.
     #[doc(hidden)]
     pub fn write_prepared_rows(&self, output: &mut impl Write) -> std::io::Result<()> {
+        let headers = self
+            .rows
+            .canonical_digest(
+                self.semantic_language,
+                self.producer_epoch,
+                &self.family_counts,
+                &CancellationToken::default(),
+            )
+            .expect("uncancelled header dump");
+        writeln!(output, "header_digest {headers:?}")?;
+        writeln!(output, "producer_epoch {}", self.producer_epoch)?;
         writeln!(output, "complete_content_digest {:?}", self.interior_digest)?;
         for (spec, rows) in PreparedResolutionBundleRows::family_specs()
             .iter()
             .zip(self.rows.families())
         {
-            writeln!(output, "{} {rows:?}", spec.table)?;
+            // Print actual rows. Empty-family framing remains visible through
+            // header_digest, so adding an empty family adds no synthetic row line.
+            if !rows.is_empty() {
+                writeln!(output, "{} {rows:?}", spec.table)?;
+            }
         }
         // Debug retains all columns and shared-name digest registrations.
         writeln!(output, "paths {:?}", self.path_rows)?;

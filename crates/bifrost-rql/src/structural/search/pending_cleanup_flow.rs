@@ -494,13 +494,31 @@ pub(super) fn pending_cleanup_flow_expansions(
     let semantics = procedure.handle.semantics();
     let mut rows = Vec::new();
     let mut semantic_cleanup_spans = Vec::new();
-    let procedure_span = procedure.byte_span();
+    let procedure_span = super::semantic::procedure_callable_span(&procedure.handle);
     let syntax_cleanup_spans = root.map(|root| {
+        let artifact = procedure.handle.artifact();
+        let child_spans = artifact
+            .lexical_children(procedure.handle.id())
+            .iter()
+            .map(|&id| {
+                let child = artifact
+                    .procedure_handle(id)
+                    .expect("a live artifact owns each lexical child procedure");
+                super::semantic::procedure_callable_span(&child)
+            })
+            .collect::<Vec<_>>();
         let mut spans = Vec::new();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if node.start_byte() >= procedure_span.start
-                && node.end_byte() <= procedure_span.end
+            // Child bodies own their cleanup, including any further descendants.
+            if child_spans.iter().any(|span| {
+                node.start_byte() >= span.start_byte() as usize
+                    && node.end_byte() <= span.end_byte() as usize
+            }) {
+                continue;
+            }
+            if node.start_byte() >= procedure_span.start_byte() as usize
+                && node.end_byte() <= procedure_span.end_byte() as usize
                 && let Some(kind) = cleanup_kind_direct(node)
             {
                 spans.push((kind, node.start_byte(), node.end_byte()));

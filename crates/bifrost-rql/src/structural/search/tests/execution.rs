@@ -245,6 +245,9 @@ fn native_go_result_obligation_projects_per_port_result_use() {
 }
 
 #[test]
+#[hardwon(
+    "#8036: native Go dropped the pre-#7954 stdlib callee identities, losing never-error exclusions"
+)]
 fn native_go_error_obligation_handles_signature_shapes_and_open_boundaries() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -1043,6 +1046,11 @@ fn where_globs_match_slash_normalized_paths() {
 
 #[test]
 fn retained_execution_snapshot_wins_over_a_later_changed_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let analyzer = JavascriptAnalyzer::from_project(TestProject::new(
+        directory.path().to_path_buf(),
+        Language::JavaScript,
+    ));
     let file = ProjectFile::new(
         std::env::temp_dir().join("bifrost-retained-query-snapshot"),
         PathBuf::from("src/app.rs"),
@@ -1053,7 +1061,7 @@ fn retained_execution_snapshot_wins_over_a_later_changed_source() {
     let mut cache = PipelineRenderCache::default();
 
     let coordinates = cache
-        .coordinates_for(&file, || {
+        .coordinates_for(&analyzer, &file, || {
             loads.set(loads.get() + 1);
             Some(if loads.get() == 1 { original } else { changed }.to_string())
         })
@@ -1062,7 +1070,7 @@ fn retained_execution_snapshot_wins_over_a_later_changed_source() {
     assert_eq!(coordinates.source, original);
     let digest = source_slice_sha256(coordinates.source.as_str(), &(0..2));
     let coordinates = cache
-        .coordinates_for(&file, || {
+        .coordinates_for(&analyzer, &file, || {
             loads.set(loads.get() + 1);
             Some(changed.to_string())
         })
@@ -1081,12 +1089,7 @@ fn retained_execution_snapshot_wins_over_a_later_changed_source() {
 
 #[test]
 fn conflicting_held_snapshots_are_negative_cached_and_typed_incomplete() {
-    let directory = tempfile::tempdir().unwrap();
-    let analyzer = JavascriptAnalyzer::from_project(TestProject::new(
-        directory.path().to_path_buf(),
-        Language::JavaScript,
-    ));
-
+    let analyzer = crate::analyzer::MultiAnalyzer::default();
     let file = ProjectFile::new(
         std::env::temp_dir().join("bifrost-conflicting-query-snapshot"),
         PathBuf::from("src/app.ts"),
@@ -1112,7 +1115,7 @@ fn conflicting_held_snapshots_are_negative_cached_and_typed_incomplete() {
         vec![1],
         &mut diagnostics,
     ));
-    assert!(cache.source_snapshot(&file).is_none());
+    assert!(cache.source_snapshot(&analyzer, &file).is_none());
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(
         diagnostics[0].code,

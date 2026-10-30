@@ -9,6 +9,7 @@ use brokk_bifrost_analysis::analyzer::usages::get_definition::{
     DefinitionLookupOutcome, DefinitionLookupRequest,
     resolve_definition_batch_with_source_and_cancellation,
 };
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_rust_analysis::analyzer::rust::rust_path_segments;
 use tree_sitter::Node;
 
@@ -33,9 +34,9 @@ type SyntaxMemo = HashMap<FileRevision, Result<Option<Arc<StructuralPreparedSynt
 // This memo belongs to QueryExecutionState and is dropped with that query.
 #[derive(Default)]
 pub(super) struct RustMarkerImplsCache {
-    syntax: SyntaxMemo,
-    files: HashMap<FileRevision, Result<MarkerImplFile, String>>,
-    methods: HashMap<CodeUnit, MethodInventory>,
+    syntax: CaptureScopedMemo<SyntaxMemo>,
+    files: CaptureScopedMemo<HashMap<FileRevision, Result<MarkerImplFile, String>>>,
+    methods: CaptureScopedMemo<HashMap<CodeUnit, MethodInventory>>,
 }
 
 struct MarkerImplFile {
@@ -1000,280 +1001,294 @@ pub(super) fn rust_marker_impls(
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> Result<RustMarkerImplsResult, String> {
-    let revision = analyzer.workspace_content_identity();
-    let mut ctx = Context {
-        analyzer,
-        syntax_memo: &mut cache.syntax,
-        revision,
-        budget,
-        limits,
-        cancellation,
-    };
-    let file = declaration.source();
-    let mut result = RustMarkerImplsResult {
-        rows: Vec::new(),
-        reasons: Vec::new(),
-    };
-    if crate::analyzer::common::language_for_file(file) != Language::Rust {
-        return Ok(result);
-    }
-    let key = (file.clone(), revision);
-    let prepared = cache
-        .files
-        .entry(key)
-        .or_insert_with(|| MarkerImplFile::read(&mut ctx, file))
-        .as_ref()
-        .map_err(Clone::clone)?;
-    let syntax = &prepared.syntax;
-    let source = syntax.prepared().source();
-    let bindings = &prepared.bindings;
-    let mut matching = Vec::new();
-    for candidate in &prepared.candidates {
-        ctx.charge()?;
-        let self_outcome = &candidate.self_outcome;
-        let self_proof = if self_outcome.definitions.as_slice() == std::slice::from_ref(declaration)
-        {
-            "resolved"
-        } else if self_outcome.definitions.is_empty()
-            && self_outcome.modeled_definitions.is_empty()
-            && candidate.self_name.as_deref() == Some(declaration.terminal_name())
-            && bindings.types.get(declaration.terminal_name()) == Some(&1)
-        {
-            "name_in_file"
-        } else {
-            continue;
-        };
-        matching.push((candidate, self_proof));
-    }
-    if matching.is_empty() {
-        return Ok(result);
-    }
-    let Some(item) = type_node_for_unit(
-        &mut ctx,
-        declaration,
+    let RustMarkerImplsCache {
         syntax,
-        &["struct_item", "enum_item", "union_item"],
-    )?
-    else {
-        return Ok(result);
-    };
-    let declaration_parameters = item
-        .child_by_field_name("type_parameters")
-        .map(children)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|n| n.kind() != "lifetime_parameter")
-        .collect::<Vec<_>>();
-    for (candidate, self_proof) in matching {
-        let node = syntax
-            .prepared()
-            .tree()
-            .root_node()
-            .descendant_for_byte_range(candidate.span.start, candidate.span.end)
-            .expect("candidate impl belongs to retained syntax");
-        assert_eq!(node.kind(), "impl_item");
-        let marker_name = candidate.marker_name;
-        let trait_proof = candidate.trait_proof;
-        let self_type = node.child_by_field_name("type").expect("impl self type");
-        let impl_parameters = node
-            .child_by_field_name("type_parameters")
-            .map(children)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| n.kind() == "type_parameter")
-            .collect::<Vec<_>>();
-        let arguments = self_type
-            .child_by_field_name("type_arguments")
-            .map(children)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| n.kind() != "lifetime")
-            .collect::<Vec<_>>();
-        let impl_keyword = {
-            let mut cursor = node.walk();
-            node.children(&mut cursor)
-                .find(|n| n.kind() == "impl")
-                .expect("impl keyword")
-        };
-        let span = impl_keyword.start_byte()..self_type.end_byte();
-        let range = super::render::range_for_offsets(
-            source,
-            syntax.prepared().line_starts(),
-            span.start,
-            span.end,
-        );
-        let parameters = if impl_parameters.is_empty() {
-            vec![None]
-        } else {
-            impl_parameters.into_iter().map(Some).collect()
-        };
-        for parameter in parameters {
-            let name = parameter.map(|n| {
-                text(
-                    n.child_by_field_name("name").expect("type parameter name"),
-                    source,
-                )
-            });
-            let positions = arguments
-                .iter()
-                .enumerate()
-                .filter(|(_, arg)| {
-                    arg.kind() == "type_identifier" && name == Some(text(**arg, source))
-                })
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>();
-            let mapping_open = name.is_some()
-                && (positions.len() != 1
-                    || positions.iter().any(|&i| {
-                        declaration_parameters
-                            .get(i)
-                            .is_none_or(|n| n.kind() != "type_parameter")
-                    }));
-            let ordinal = positions.first().copied().filter(|_| !mapping_open);
-            let mapped_name = ordinal
-                .and_then(|i| declaration_parameters[i].child_by_field_name("name"))
-                .map(|n| text(n, source));
-            let (uses, uses_open) = field_uses(
-                &mut ctx,
-                file,
-                item,
-                source,
-                bindings,
-                mapped_name.unwrap_or(""),
-            )?;
-            let stored_uses = uses
-                .iter()
-                .filter(|u| !u.wrappers.iter().any(|w| w == "phantom" || w == "fn"))
-                .collect::<Vec<_>>();
-            let stored = !stored_uses.is_empty();
-            let shared_ref_only = stored_uses
-                .iter()
-                .all(|u| u.wrappers.first().is_some_and(|w| w == "ref"));
-            let mut bounds = parameter
-                .and_then(|n| n.child_by_field_name("bounds"))
-                .map(children)
-                .unwrap_or_default();
-            let mut where_open = false;
-            if let Some(name) = name {
-                for clause in children(node)
-                    .into_iter()
-                    .filter(|n| n.kind() == "where_clause")
-                {
-                    for predicate in children(clause)
-                        .into_iter()
-                        .filter(|n| n.kind() == "where_predicate")
+        files,
+        methods,
+    } = cache;
+    let attribution = memo_attribution(analyzer);
+    syntax.read_mut(&attribution, |syntax| {
+        files.read_mut(&attribution, |files| {
+            methods.read_mut(&attribution, |methods| {
+                let revision = analyzer.workspace_content_identity();
+                let mut ctx = Context {
+                    analyzer,
+                    syntax_memo: syntax,
+                    revision,
+                    budget,
+                    limits,
+                    cancellation,
+                };
+                let file = declaration.source();
+                let mut result = RustMarkerImplsResult {
+                    rows: Vec::new(),
+                    reasons: Vec::new(),
+                };
+                if crate::analyzer::common::language_for_file(file) != Language::Rust {
+                    return Ok(result);
+                }
+                let key = (file.clone(), revision);
+                let prepared = files
+                    .entry(key)
+                    .or_insert_with(|| MarkerImplFile::read(&mut ctx, file))
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                let syntax = &prepared.syntax;
+                let source = syntax.prepared().source();
+                let bindings = &prepared.bindings;
+                let mut matching = Vec::new();
+                for candidate in &prepared.candidates {
+                    ctx.charge()?;
+                    let self_outcome = &candidate.self_outcome;
+                    let self_proof = if self_outcome.definitions.as_slice()
+                        == std::slice::from_ref(declaration)
                     {
-                        let left = predicate.child_by_field_name("left").expect("where left");
-                        if left.kind() == "type_identifier" && text(left, source) == name {
-                            bounds.extend(children(
-                                predicate
-                                    .child_by_field_name("bounds")
-                                    .expect("where bounds"),
+                        "resolved"
+                    } else if self_outcome.definitions.is_empty()
+                        && self_outcome.modeled_definitions.is_empty()
+                        && candidate.self_name.as_deref() == Some(declaration.terminal_name())
+                        && bindings.types.get(declaration.terminal_name()) == Some(&1)
+                    {
+                        "name_in_file"
+                    } else {
+                        continue;
+                    };
+                    matching.push((candidate, self_proof));
+                }
+                if matching.is_empty() {
+                    return Ok(result);
+                }
+                let Some(item) = type_node_for_unit(
+                    &mut ctx,
+                    declaration,
+                    syntax,
+                    &["struct_item", "enum_item", "union_item"],
+                )?
+                else {
+                    return Ok(result);
+                };
+                let declaration_parameters = item
+                    .child_by_field_name("type_parameters")
+                    .map(children)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|n| n.kind() != "lifetime_parameter")
+                    .collect::<Vec<_>>();
+                for (candidate, self_proof) in matching {
+                    let node = syntax
+                        .prepared()
+                        .tree()
+                        .root_node()
+                        .descendant_for_byte_range(candidate.span.start, candidate.span.end)
+                        .expect("candidate impl belongs to retained syntax");
+                    assert_eq!(node.kind(), "impl_item");
+                    let marker_name = candidate.marker_name;
+                    let trait_proof = candidate.trait_proof;
+                    let self_type = node.child_by_field_name("type").expect("impl self type");
+                    let impl_parameters = node
+                        .child_by_field_name("type_parameters")
+                        .map(children)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|n| n.kind() == "type_parameter")
+                        .collect::<Vec<_>>();
+                    let arguments = self_type
+                        .child_by_field_name("type_arguments")
+                        .map(children)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|n| n.kind() != "lifetime")
+                        .collect::<Vec<_>>();
+                    let impl_keyword = {
+                        let mut cursor = node.walk();
+                        node.children(&mut cursor)
+                            .find(|n| n.kind() == "impl")
+                            .expect("impl keyword")
+                    };
+                    let span = impl_keyword.start_byte()..self_type.end_byte();
+                    let range = super::render::range_for_offsets(
+                        source,
+                        syntax.prepared().line_starts(),
+                        span.start,
+                        span.end,
+                    );
+                    let parameters = if impl_parameters.is_empty() {
+                        vec![None]
+                    } else {
+                        impl_parameters.into_iter().map(Some).collect()
+                    };
+                    for parameter in parameters {
+                        let name = parameter.map(|n| {
+                            text(
+                                n.child_by_field_name("name").expect("type parameter name"),
+                                source,
+                            )
+                        });
+                        let positions = arguments
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, arg)| {
+                                arg.kind() == "type_identifier" && name == Some(text(**arg, source))
+                            })
+                            .map(|(i, _)| i)
+                            .collect::<Vec<_>>();
+                        let mapping_open = name.is_some()
+                            && (positions.len() != 1
+                                || positions.iter().any(|&i| {
+                                    declaration_parameters
+                                        .get(i)
+                                        .is_none_or(|n| n.kind() != "type_parameter")
+                                }));
+                        let ordinal = positions.first().copied().filter(|_| !mapping_open);
+                        let mapped_name = ordinal
+                            .and_then(|i| declaration_parameters[i].child_by_field_name("name"))
+                            .map(|n| text(n, source));
+                        let (uses, uses_open) = field_uses(
+                            &mut ctx,
+                            file,
+                            item,
+                            source,
+                            bindings,
+                            mapped_name.unwrap_or(""),
+                        )?;
+                        let stored_uses = uses
+                            .iter()
+                            .filter(|u| !u.wrappers.iter().any(|w| w == "phantom" || w == "fn"))
+                            .collect::<Vec<_>>();
+                        let stored = !stored_uses.is_empty();
+                        let shared_ref_only = stored_uses
+                            .iter()
+                            .all(|u| u.wrappers.first().is_some_and(|w| w == "ref"));
+                        let mut bounds = parameter
+                            .and_then(|n| n.child_by_field_name("bounds"))
+                            .map(children)
+                            .unwrap_or_default();
+                        let mut where_open = false;
+                        if let Some(name) = name {
+                            for clause in children(node)
+                                .into_iter()
+                                .filter(|n| n.kind() == "where_clause")
+                            {
+                                for predicate in children(clause)
+                                    .into_iter()
+                                    .filter(|n| n.kind() == "where_predicate")
+                                {
+                                    let left =
+                                        predicate.child_by_field_name("left").expect("where left");
+                                    if left.kind() == "type_identifier"
+                                        && text(left, source) == name
+                                    {
+                                        bounds.extend(children(
+                                            predicate
+                                                .child_by_field_name("bounds")
+                                                .expect("where bounds"),
+                                        ));
+                                    } else if contains_parameter(&mut ctx, left, source, name)? {
+                                        where_open = true;
+                                    }
+                                }
+                            }
+                        }
+                        let (has_send_bound, has_sync_bound, bounds_open) =
+                            marker_bounds(&mut ctx, file, source, bindings, &bounds)?;
+                        let shared_access = if marker_name == "Send" {
+                            "not_applicable"
+                        } else if mapping_open || uses_open || stored {
+                            "unknown"
+                        } else {
+                            "none"
+                        };
+                        let complete = !mapping_open && !uses_open && !where_open && !bounds_open;
+                        if !complete {
+                            result.reasons.push(format!(
+                                "incomplete Rust marker impl {} at {} parameter {name:?}",
+                                declaration.fq_name_str(),
+                                span.start
                             ));
-                        } else if contains_parameter(&mut ctx, left, source, name)? {
-                            where_open = true;
+                        }
+                        let id = format!(
+                            "rust-marker-impl:{}:{}:{}:{name:?}",
+                            file.rel_path().display(),
+                            syntax
+                                .prepared()
+                                .source_sha256()
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>(),
+                            span.start
+                        );
+                        result.rows.push(RustMarkerImplValue {
+                            file: file.clone(),
+                            byte_span: span.clone(),
+                            row: CodeQueryRustMarkerImpl {
+                                id,
+                                path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                                language: "rust",
+                                range,
+                                impl_range: range,
+                                trait_kind: if marker_name == "Send" {
+                                    "send"
+                                } else {
+                                    "sync"
+                                },
+                                trait_proof,
+                                self_proof,
+                                impl_coverage: "same_file",
+                                parameter: name.map(str::to_owned),
+                                declaration_parameter_ordinal: ordinal.map(|i| i as u64),
+                                mapping_proof: if mapping_open { "open" } else { "position" },
+                                has_send_bound,
+                                has_sync_bound,
+                                bounds: bounds
+                                    .into_iter()
+                                    .map(|n| text(n, source).to_owned())
+                                    .collect(),
+                                bounds_proof: if bounds_open || where_open {
+                                    "open"
+                                } else {
+                                    "closed"
+                                },
+                                stored,
+                                shared_ref_only,
+                                shared_access,
+                                uses,
+                                uses_proof: if uses_open { "open" } else { "closed" },
+                                completeness: if complete { "complete" } else { "incomplete" },
+                            },
+                        });
+                    }
+                }
+                // Assemble base facts first: exhausting method syntax work must leave
+                // these rows available with unknown access, including multi-parameter impls.
+                if result
+                    .rows
+                    .iter()
+                    .any(|value| value.row.trait_kind == "sync" && value.row.stored)
+                {
+                    let methods = methods
+                        .entry(declaration.clone())
+                        .or_insert_with(|| method_inventory(&mut ctx, declaration));
+                    result.reasons.extend(methods.reasons.iter().cloned());
+                    for value in &mut result.rows {
+                        let row = &mut value.row;
+                        if row.trait_kind == "sync"
+                            && row.stored
+                            && row.mapping_proof != "open"
+                            && row.uses_proof != "open"
+                        {
+                            let uses = row
+                                .uses
+                                .iter()
+                                .filter(|u| !u.wrappers.iter().any(|w| w == "phantom" || w == "fn"))
+                                .collect::<Vec<_>>();
+                            row.shared_access = methods.shared_access(&uses);
                         }
                     }
                 }
-            }
-            let (has_send_bound, has_sync_bound, bounds_open) =
-                marker_bounds(&mut ctx, file, source, bindings, &bounds)?;
-            let shared_access = if marker_name == "Send" {
-                "not_applicable"
-            } else if mapping_open || uses_open || stored {
-                "unknown"
-            } else {
-                "none"
-            };
-            let complete = !mapping_open && !uses_open && !where_open && !bounds_open;
-            if !complete {
-                result.reasons.push(format!(
-                    "incomplete Rust marker impl {} at {} parameter {name:?}",
-                    declaration.fq_name_str(),
-                    span.start
-                ));
-            }
-            let id = format!(
-                "rust-marker-impl:{}:{}:{}:{name:?}",
-                file.rel_path().display(),
-                syntax
-                    .prepared()
-                    .source_sha256()
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>(),
-                span.start
-            );
-            result.rows.push(RustMarkerImplValue {
-                file: file.clone(),
-                byte_span: span.clone(),
-                row: CodeQueryRustMarkerImpl {
-                    id,
-                    path: file.rel_path().to_string_lossy().replace('\\', "/"),
-                    language: "rust",
-                    range,
-                    impl_range: range,
-                    trait_kind: if marker_name == "Send" {
-                        "send"
-                    } else {
-                        "sync"
-                    },
-                    trait_proof,
-                    self_proof,
-                    impl_coverage: "same_file",
-                    parameter: name.map(str::to_owned),
-                    declaration_parameter_ordinal: ordinal.map(|i| i as u64),
-                    mapping_proof: if mapping_open { "open" } else { "position" },
-                    has_send_bound,
-                    has_sync_bound,
-                    bounds: bounds
-                        .into_iter()
-                        .map(|n| text(n, source).to_owned())
-                        .collect(),
-                    bounds_proof: if bounds_open || where_open {
-                        "open"
-                    } else {
-                        "closed"
-                    },
-                    stored,
-                    shared_ref_only,
-                    shared_access,
-                    uses,
-                    uses_proof: if uses_open { "open" } else { "closed" },
-                    completeness: if complete { "complete" } else { "incomplete" },
-                },
-            });
-        }
-    }
-    // Assemble base facts first: exhausting method syntax work must leave
-    // these rows available with unknown access, including multi-parameter impls.
-    if result
-        .rows
-        .iter()
-        .any(|value| value.row.trait_kind == "sync" && value.row.stored)
-    {
-        let methods = cache
-            .methods
-            .entry(declaration.clone())
-            .or_insert_with(|| method_inventory(&mut ctx, declaration));
-        result.reasons.extend(methods.reasons.iter().cloned());
-        for value in &mut result.rows {
-            let row = &mut value.row;
-            if row.trait_kind == "sync"
-                && row.stored
-                && row.mapping_proof != "open"
-                && row.uses_proof != "open"
-            {
-                let uses = row
-                    .uses
-                    .iter()
-                    .filter(|u| !u.wrappers.iter().any(|w| w == "phantom" || w == "fn"))
-                    .collect::<Vec<_>>();
-                row.shared_access = methods.shared_access(&uses);
-            }
-        }
-    }
-    Ok(result)
+                Ok(result)
+            })
+        })
+    })
 }
 
 pub(super) fn expansions(

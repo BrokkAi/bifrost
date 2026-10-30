@@ -3,6 +3,7 @@
 //! Every answer below comes from [`brokk_bifrost_go`]; this file exists only
 //! because `LanguageAdapter` is an analysis-owned trait the Go crate cannot name.
 
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::cognitive_complexity;
 
 use brokk_bifrost_core::analyzer::model::Language;
@@ -26,6 +27,59 @@ use tree_sitter::Tree;
 pub struct GoAdapter;
 
 impl LanguageAdapter for GoAdapter {
+    fn record_file_identity_inputs(
+        &self,
+        analyzer: &brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer<Self>,
+        file: &ProjectFile,
+    ) {
+        use brokk_bifrost_analysis::analyzer::ReadKey;
+        use brokk_bifrost_go::packages::{GoModuleInput, nearest_go_module_inputs};
+        if file
+            .rel_path()
+            .extension()
+            .is_none_or(|extension| extension != "go")
+        {
+            return;
+        }
+        let attribution =
+            brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer);
+        if !attribution.is_capturing() {
+            return;
+        }
+        for input in nearest_go_module_inputs(file).iter() {
+            match input {
+                GoModuleInput::File {
+                    rel_path,
+                    blob,
+                    content_digest,
+                } => {
+                    let input = ProjectFile::new(analyzer.project().root(), rel_path);
+                    if analyzer.workspace_package_identity_input_content_digest(&input)
+                        != Some(*content_digest)
+                    {
+                        analyzer.record_unattributed_read();
+                    }
+                    analyzer.record_read(ReadKey::file(
+                        Language::Go,
+                        rel_path.as_str(),
+                        git2::Oid::from_bytes(blob).expect("Go module blob width"),
+                    ));
+                }
+                GoModuleInput::PathAbsent { rel_path } => {
+                    let input = ProjectFile::new(analyzer.project().root(), rel_path);
+                    if analyzer
+                        .workspace_package_identity_input_content_digest(&input)
+                        .is_some()
+                    {
+                        analyzer.record_unattributed_read();
+                    }
+                    analyzer.record_read(ReadKey::path_absent(Language::Go, rel_path.as_str()));
+                }
+                GoModuleInput::Unavailable => analyzer.record_unattributed_read(),
+            }
+        }
+    }
+
     /// Relative to `brokk-bifrost-go`'s crate root: the `.scm` assets moved with
     /// the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {

@@ -127,8 +127,13 @@ mod tests {
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
         let token = query_scope.token();
         let graph = CppGraphSource::from_source(&cpp, token);
-        let visibility =
-            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
+            &cpp,
+            token,
+            &graph,
+            &HashSet::from_iter([file.clone()]),
+        );
         let prepared = cpp
             .prepared_syntax(token, &file)
             .expect("prepared temporal source");
@@ -168,8 +173,13 @@ mod tests {
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
         let token = query_scope.token();
         let graph = CppGraphSource::from_source(&cpp, token);
-        let visibility =
-            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
+            &cpp,
+            token,
+            &graph,
+            &HashSet::from_iter([file.clone()]),
+        );
         let frontiers = [
             source.find("S(1)").expect("first macro use"),
             source.find("S(2)").expect("second macro use"),
@@ -218,8 +228,13 @@ mod tests {
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
         let token = query_scope.token();
         let graph = CppGraphSource::from_source(&cpp, token);
-        let visibility =
-            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
+            &cpp,
+            token,
+            &graph,
+            &HashSet::from_iter([file.clone()]),
+        );
         let prepared = cpp
             .prepared_syntax(token, &file)
             .expect("prepared integer source");
@@ -263,8 +278,13 @@ mod tests {
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
         let token = query_scope.token();
         let graph = CppGraphSource::from_source(&cpp, token);
-        let visibility =
-            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
+            &cpp,
+            token,
+            &graph,
+            &HashSet::from_iter([file.clone()]),
+        );
         let prepared = cpp
             .prepared_syntax(token, &file)
             .expect("prepared include source");
@@ -297,8 +317,13 @@ mod tests {
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
         let token = query_scope.token();
         let graph = CppGraphSource::from_source(&cpp, token);
-        let visibility =
-            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
+            &cpp,
+            token,
+            &graph,
+            &HashSet::from_iter([file.clone()]),
+        );
         let prepared = cpp
             .prepared_syntax(token, &file)
             .expect("prepared include source");
@@ -537,6 +562,7 @@ ABSL_NAMESPACE_END
             .expect("standard-library alias declaration");
         let roots = HashSet::from_iter([consumer.clone()]);
         let visibility = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             query_token,
             &CppGraphSource::from_source(&analyzer, query_token),
@@ -642,6 +668,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
         let visibility = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             query_token,
             &CppGraphSource::from_source(&analyzer, query_token),
@@ -741,7 +768,8 @@ ABSL_NAMESPACE_END
 
         reset_bounded_visibility_dependency_ast_node_count_for_test();
         let one_root = HashSet::from_iter([roots.iter().next().expect("one root").clone()]);
-        let one_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &one_root);
+        let one_visibility =
+            VisibilityIndex::build(cpp.read_capability(), &cpp, query_token, &graph, &one_root);
         let one_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
         assert_eq!(
             one_visibility
@@ -756,7 +784,8 @@ ABSL_NAMESPACE_END
 
         reset_bounded_visibility_dependency_ast_node_count_for_test();
         reset_bounded_visibility_declaration_read_count_for_test();
-        let all_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &roots);
+        let all_visibility =
+            VisibilityIndex::build(cpp.read_capability(), &cpp, query_token, &graph, &roots);
         let all_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
         for file in &roots {
             assert_eq!(
@@ -869,7 +898,12 @@ ABSL_NAMESPACE_END
         token: QueryToken<'a>,
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     ) -> VisibilityIndex<'a> {
-        VisibilityIndex::from_visible_files_for_test(cpp, token, visible_by_file)
+        VisibilityIndex::from_visible_files_for_test(
+            cpp.read_capability(),
+            cpp,
+            token,
+            visible_by_file,
+        )
     }
 
     #[test]
@@ -1003,6 +1037,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let roots = HashSet::from_iter([file.clone()]);
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             cpp,
             query_token,
             &CppDispatch::new(workspace.analyzer(), query_token).source(),
@@ -1127,6 +1162,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let roots = HashSet::from_iter([file.clone()]);
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             cpp,
             query_token,
             &CppDispatch::new(workspace.analyzer(), query_token).source(),
@@ -1193,6 +1229,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let roots = HashSet::from_iter([consumer.clone()]);
         let first = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             query_token,
             &CppGraphSource::from_source(&analyzer, query_token),
@@ -1209,6 +1246,7 @@ ABSL_NAMESPACE_END
         );
 
         let second = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             query_token,
             &CppGraphSource::from_source(&analyzer, query_token),
@@ -1229,7 +1267,7 @@ ABSL_NAMESPACE_END
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: include antichain lost the admissible complete-family path"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: include antichain lost the admissible complete-family path"
     )]
     fn conditional_include_projection_is_invariant_under_include_order() {
         for reverse in [false, true] {
@@ -1266,6 +1304,7 @@ ABSL_NAMESPACE_END
                 brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
             let token = scope.token();
             let visibility = VisibilityIndex::build(
+                analyzer.read_capability(),
                 &analyzer,
                 token,
                 &CppGraphSource::from_source(&analyzer, token),
@@ -1353,6 +1392,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let roots = HashSet::from_iter([consumer.clone()]);
         let visibility = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             query_token,
             &CppGraphSource::from_source(&analyzer, query_token),
@@ -1433,6 +1473,7 @@ ABSL_NAMESPACE_END
         for (consumer, reaches) in [(c_consumer, false), (cpp_consumer, true)] {
             let roots = HashSet::from_iter([consumer.clone()]);
             let visibility = VisibilityIndex::build(
+                analyzer.read_capability(),
                 &analyzer,
                 query_token,
                 &CppGraphSource::from_source(&analyzer, query_token),
@@ -1457,6 +1498,7 @@ ABSL_NAMESPACE_END
         for (consumer, reaches) in [(&mutated_consumer, false), (&immutable_consumer, true)] {
             let roots = HashSet::from_iter([consumer.clone()]);
             let visibility = VisibilityIndex::build(
+                analyzer.read_capability(),
                 &analyzer,
                 query_token,
                 &CppGraphSource::from_source(&analyzer, query_token),
@@ -1551,6 +1593,7 @@ ABSL_NAMESPACE_END
         );
         let roots = HashSet::from_iter([consumer_file.clone()]);
         let visibility = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             query_token,
             &CppGraphSource::from_source(&analyzer, query_token),
@@ -1694,6 +1737,7 @@ ABSL_NAMESPACE_END
         let consumer = ProjectFile::new(root, "consumer.cpp");
         cpp.reset_full_hydration_count_for_test();
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -1738,6 +1782,7 @@ ABSL_NAMESPACE_END
         let consumer = ProjectFile::new(root, "consumer.cpp");
         reset_bounded_visibility_declaration_read_count_for_test();
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -1783,6 +1828,7 @@ ABSL_NAMESPACE_END
         let consumer = ProjectFile::new(root, "consumer.cpp");
         reset_bounded_visibility_declaration_read_count_for_test();
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -1829,6 +1875,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let consumer = ProjectFile::new(root, "consumer.cpp");
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -1882,6 +1929,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let consumer = ProjectFile::new(root, "consumer.cpp");
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -1908,6 +1956,7 @@ ABSL_NAMESPACE_END
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
         let query_token = query_scope.token();
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -2002,6 +2051,7 @@ ABSL_NAMESPACE_END
                 brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
             let query_token = query_scope.token();
             let visibility = VisibilityIndex::build(
+                cpp.read_capability(),
                 &cpp,
                 query_token,
                 &CppGraphSource::from_source(&cpp, query_token),
@@ -2083,6 +2133,7 @@ ABSL_NAMESPACE_END
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
         let query_token = query_scope.token();
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -2165,6 +2216,7 @@ ABSL_NAMESPACE_END
                 brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
             let query_token = query_scope.token();
             let visibility = VisibilityIndex::build(
+                cpp.read_capability(),
                 &cpp,
                 query_token,
                 &CppGraphSource::from_source(&cpp, query_token),
@@ -2301,6 +2353,7 @@ ABSL_NAMESPACE_END
         );
 
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             &cpp,
             query_token,
             &CppGraphSource::from_source(&cpp, query_token),
@@ -2773,6 +2826,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let roots = [file.clone()].into_iter().collect();
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             cpp,
             query_token,
             &CppDispatch::new(workspace.analyzer(), query_token).source(),
@@ -2894,6 +2948,7 @@ ABSL_NAMESPACE_END
         .into_iter()
         .collect();
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             cpp,
             query_token,
             &CppDispatch::new(workspace.analyzer(), query_token).source(),
@@ -2923,11 +2978,12 @@ ABSL_NAMESPACE_END
             );
         }
         assert_eq!(
-            visibility
-                .macro_include_protection_cells
-                .lock()
-                .expect("C++ include protection cache poisoned")
-                .len(),
+            visibility.macro_include_protection_cells.account(|cells| {
+                cells
+                    .lock()
+                    .expect("C++ include protection cache poisoned")
+                    .len()
+            }),
             5,
             "include protection classification must be cached once per file"
         );
@@ -2965,6 +3021,7 @@ ABSL_NAMESPACE_END
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let roots = HashSet::from_iter([consumer.clone()]);
         let visibility = VisibilityIndex::build(
+            cpp.read_capability(),
             cpp,
             query_token,
             &CppDispatch::new(analyzer, query_token).source(),
@@ -3040,6 +3097,7 @@ ABSL_NAMESPACE_END
         let query_token = query_scope.token();
         let roots = HashSet::from_iter([consumer.clone()]);
         let visibility = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             query_token,
             &CppGraphSource::from_source(&analyzer, query_token),
@@ -3220,6 +3278,7 @@ ABSL_NAMESPACE_END
         let token = query_scope.token();
         let graph = CppGraphSource::from_source(&analyzer, token);
         let visibility = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             token,
             &graph,
@@ -3264,6 +3323,7 @@ ABSL_NAMESPACE_END
         let first_file = ProjectFile::new(root.clone(), "first.cpp");
         let second_file = ProjectFile::new(root, "second.cpp");
         let visibility = VisibilityIndex::build(
+            analyzer.read_capability(),
             &analyzer,
             token,
             &graph,

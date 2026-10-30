@@ -243,7 +243,29 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 // #7509 M3a: Go type answers at declaration names come from the declaration value slot.
 // #3494: closed Ruby member selections discharge their dispatch gaps.
 // #7509 M3a part 2: Go failure-handler binding proofs come from native evidence.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof-7186-compact-constructor-bindings-7289-field-initializer-reads-7150-go-call-result-counts-7219-rust-concrete-receiver-closed-7183-unproven-family-dispatch-7179-incomplete-family-edges-and-coverage-2445-root-allotment-4365-javadoc-tag-anchors-7379-dereference-store-operations-7344-7345-csharp-compound-writes-5658-single-writer-identity-5658-structural-module-mutations-7373-csharp-contextual-keyword-binders-5658-python-attribute-space-owners-5658-python-argument-independent-calls-7371-nonlocal-branch-distinction-7372-initializer-body-relations-7179-java-unread-ancestors-4365-shared-statement-facts-7107-content-diagnostic-units-7220-php-terminal-case-fold-rust-deref-receiver-steps-7226-7464-csharp-incoming-overload-partition-7368-7369-csharp-equals-argument-identity-7150-open-member-calls-7340-live-region-overwrite-veto-7520-go-interface-dispatch-references-5658-python-global-writer-identity-5658-python-native-member-targets-7548-configuration-skips-bifrost-dir-analysis-quicksilver-round12-boolean-contexts-binder-spans-7202-classified-summary-identity-7547-java-string-literal-values-analysis-quicksilver-round12-fact-analyzers-7471-go-short-var-redeclaration-7386-conditional-compilation-regions-7341-7342-go-remainder-comma-ok-7617-go-direct-type-shapes-7343-go-static-type-failure-branches-7393-unproven-nonempty-failure-branches-7470-go-visible-binding-shapes-7616-go-modeled-package-result-unknown-analysis-quicksilver-round12-config-lookup-7518-go-undecided-receiver-candidates-7578-branch-conditioned-sanitizers-7618-java-creation-receiver-site-7560-csharp-row-backed-models-7348-7349-7369-java-compound-static-patterns-4379-m3b-csharp-statement-facts-7642-witness-budget-incomplete-5658-python-unplaced-file-references-7516-go-constructor-shadow-7673-python-qualified-module-members-7619-java-implicit-external-inherited-calls-7620-java-wildcard-sibling-applicability-7578-java-observed-value-type-7578-guard-writer-reachability-7735-binder-declaration-sites-5658-python-import-occurrence-kinds-7781-synthetic-members-completeness-7509-go-declaration-value-types-7755-refused-alternative-before-budget-3494-ruby-member-closure-7789-indexed-import-destinations-7817-external-supertype-kind-7849-java-external-owner-observed-type-7509-go-native-binding-proofs";
+// Quicksilver round 13: Go non-return discovery admits receiver-as-argument method expressions.
+// #7350: a resolved static or constant right-hand side is decided not a self-assignment.
+// Quicksilver round 13: reusable summary and curated-model byte accounting charges owned payloads.
+// Quicksilver round 13: typestate byte accounting moves registration and summary cap boundaries.
+// #7918: Go field selections derive addressability from their receiver.
+// #7536: initialization proofs discharge audited retained topology and evaluation-order gaps.
+// #7915: value-flow plans no longer refuse a slot held both plain and substituted.
+// #7508: C# conditional-expression branches model unproven conversions on both arms.
+// #2445 M4b: deterministic property-reaching gaps no longer make units unbounded.
+// Quicksilver round 13: type-flow summary store errors keep their kind in query diagnostics.
+// Quicksilver round 13: composed taint certainty needs one proven-and-complete path; witnesses keep exceptional exits.
+// Quicksilver round 13: canonical call-transfer sets compare callback provenance, so duplicates collapse.
+// #7972: same-package cross-file static declarations close local self-assignment proofs.
+// #7509 PR B: recompute Go model-authority member and receiver answers.
+// #7509: source contexts resolve module-less relative Go imports.
+// #7351: Go failure handlers prove error implementers and complete non-implementers by method set.
+// #8036: native Go declared external receivers retain canonical callee identity.
+// #7968: open Go member searches no longer decide interface mismatches.
+// #8108: Java import inventory publishes fills with only stable incompleteness,
+// so units previously unbounded by its refused fills now publish.
+// #7509 G1b-1: Go owners behind incomplete imports lose the legacy G1b completion reason.
+// #8097: assignment-relation flow gaps scope their withheld rows to the procedure's file.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:5113-returned-refinement-census-v4-5495-branch-work-budget-5496-branch-reference-proofs-5498-permitted-handler-raises-5506-explicit-tuple-return-shapes-5310-set-projections-5338-builtin-shapes-5246-endpoint-closure-4811-python-rule-fact-diagnostics-4321-external-iterator-anchors-5339-assignment-binder-origins-5339-binder-activation-5339-read-relative-initializers-5385-loop-read-diagnostics-5227-icfg-barriers-5510-python-hierarchy-diagnostic-locations-5534-python-tuple-property-proof-5532-python-generator-headers-5543-python-none-only-tuple-proof-5559-python-local-function-return-proof-5598-python-module-initializers-5511-python-modeled-runtime-ancestry-5721-python-local-import-bases-5738-intrinsic-root-evidence-5745-python-runtime-class-binding-5751-python-class-object-aliases-5812-iteration-value-origins-5113-reference-inventory-ownership-5920-performed-source-lane-5964-comparison-chain-demand-proof-7186-compact-constructor-bindings-7289-field-initializer-reads-7150-go-call-result-counts-7219-rust-concrete-receiver-closed-7183-unproven-family-dispatch-7179-incomplete-family-edges-and-coverage-2445-root-allotment-4365-javadoc-tag-anchors-7379-dereference-store-operations-7344-7345-csharp-compound-writes-5658-single-writer-identity-5658-structural-module-mutations-7373-csharp-contextual-keyword-binders-5658-python-attribute-space-owners-5658-python-argument-independent-calls-7371-nonlocal-branch-distinction-7372-initializer-body-relations-7179-java-unread-ancestors-4365-shared-statement-facts-7107-content-diagnostic-units-7220-php-terminal-case-fold-rust-deref-receiver-steps-7226-7464-csharp-incoming-overload-partition-7368-7369-csharp-equals-argument-identity-7150-open-member-calls-7340-live-region-overwrite-veto-7520-go-interface-dispatch-references-5658-python-global-writer-identity-5658-python-native-member-targets-7548-configuration-skips-bifrost-dir-analysis-quicksilver-round12-boolean-contexts-binder-spans-7202-classified-summary-identity-7547-java-string-literal-values-analysis-quicksilver-round12-fact-analyzers-7471-go-short-var-redeclaration-7386-conditional-compilation-regions-7341-7342-go-remainder-comma-ok-7617-go-direct-type-shapes-7343-go-static-type-failure-branches-7393-unproven-nonempty-failure-branches-7470-go-visible-binding-shapes-7616-go-modeled-package-result-unknown-analysis-quicksilver-round12-config-lookup-7518-go-undecided-receiver-candidates-7578-branch-conditioned-sanitizers-7618-java-creation-receiver-site-7560-csharp-row-backed-models-7348-7349-7369-java-compound-static-patterns-4379-m3b-csharp-statement-facts-7642-witness-budget-incomplete-5658-python-unplaced-file-references-7516-go-constructor-shadow-7673-python-qualified-module-members-7619-java-implicit-external-inherited-calls-7620-java-wildcard-sibling-applicability-7578-java-observed-value-type-7578-guard-writer-reachability-7735-binder-declaration-sites-5658-python-import-occurrence-kinds-7781-synthetic-members-completeness-7509-go-declaration-value-types-7755-refused-alternative-before-budget-3494-ruby-member-closure-7789-indexed-import-destinations-7817-external-supertype-kind-7849-java-external-owner-observed-type-7509-go-native-binding-proofs-2445-m4a-workspace-facts-qs13-flow-go-no-return-method-expressions-7350-nonbinding-rhs-distinct-qs13-flow-summary-payload-accounting-qs13-flow-typestate-byte-accounting-7918-go-field-selector-addressability-7536-initialization-retained-gaps-7915-flow-slot-identity-7508-csharp-conditional-branch-conversions-7803-external-field-value-types-2445-m4b-property-gaps-qs13-flow-store-error-kind-context-qs13-flow-taint-composition-quality-7779-exact-selection-owner-inventory-qs13-flow-call-transfer-canonical-order-7972-go-cross-file-global-self-assignment-7509-go-model-authority-7755-dead-value-liveness-7868-closure-open-relations-7876-query-incompleteness-scope-7509-go-relative-source-imports-qs13-flow-value-flow-survivors-7351-go-error-method-set-proof-7886-nested-budget-stop-propagation-qs13-flow-field-slot-source-kinds-8036-go-native-external-callee-identity-qs13-rql-pending-cleanup-nested-scope-qs13-rql-python-loop-exit-and-docstring-blocks-7968-go-satisfaction-membership-8108-java-inventory-stable-replay-qs13-rql-configuration-property-ancestor-7509-g1b-incomplete-import-owner-8097-assignment-flow-gap-scope";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {
@@ -943,6 +965,7 @@ pub trait PolicyUnitStore: Send {
         &mut self,
         _keys: &[PolicyUnitKey],
         _budget: &PolicyBudget,
+        _row_node_count: Option<usize>,
     ) -> Result<(), PolicyUnitStoreError> {
         Ok(())
     }
@@ -1113,6 +1136,7 @@ impl PolicyUnitStore for PersistedPolicyUnitStore {
         &mut self,
         keys: &[PolicyUnitKey],
         budget: &PolicyBudget,
+        row_node_count: Option<usize>,
     ) -> Result<(), PolicyUnitStoreError> {
         let wanted = keys
             .iter()
@@ -1132,7 +1156,7 @@ impl PolicyUnitStore for PersistedPolicyUnitStore {
                 continue;
             };
             self.loaded
-                .insert(key.clone(), unit_of_row(key, row, budget)?);
+                .insert(key.clone(), unit_of_row(key, row, budget, row_node_count)?);
         }
         Ok(())
     }
@@ -1339,8 +1363,18 @@ pub fn unit_of_row(
     key: PolicyUnitKey,
     row: PolicyUnitRow,
     budget: &PolicyBudget,
+    row_node_count: Option<usize>,
 ) -> Result<PolicyUnit, PolicyUnitStoreError> {
     let product = product_of_row(&row, budget)?;
+    if let PolicyUnitProduct::Rows(rows) = &product
+        && !rows.budgeted_work.step_outputs.is_empty()
+        && Some(rows.budgeted_work.step_outputs.len()) != row_node_count
+    {
+        return Err(PolicyUnitStoreError::new(
+            "a published unit's step output counters do not match its physical plan".to_string(),
+        ));
+    }
+
     let unit = PolicyUnit::new(
         key,
         product,
@@ -1916,7 +1950,7 @@ pub struct PolicyIncrementalRun {
     /// observed on the head.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widen_reason: Option<WidenReason>,
-    /// The structural reason query-unit slicing widened. Taint selector
+    /// The plan eligibility or merged-limit detail of query-unit widening. Taint selector
     /// fallback details are not currently copied here; only their widening
     /// reason is retained in range diagnostics.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2122,6 +2156,7 @@ mod tests {
         );
         let policy = registry.policies().next().unwrap();
         for component in [
+            "-7886-nested-budget-stop-propagation",
             "-5511-python-modeled-runtime-ancestry",
             "-5721-python-local-import-bases",
             "-5738-intrinsic-root-evidence",
@@ -2171,6 +2206,7 @@ mod tests {
             "-7516-go-constructor-shadow",
             "-7673-python-qualified-module-members",
             "-7817-external-supertype-kind",
+            "-7868-closure-open-relations",
             "-7619-java-implicit-external-inherited-calls",
             "-7620-java-wildcard-sibling-applicability",
             "-7578-java-observed-value-type",
@@ -2178,12 +2214,43 @@ mod tests {
             "-7735-binder-declaration-sites",
             "-5658-python-import-occurrence-kinds",
             "-7781-synthetic-members-completeness",
+            "-7779-exact-selection-owner-inventory",
             "-7509-go-declaration-value-types",
             "-7755-refused-alternative-before-budget",
             "-3494-ruby-member-closure",
             "-7789-indexed-import-destinations",
             "-7849-java-external-owner-observed-type",
             "-7509-go-native-binding-proofs",
+            "-2445-m4a-workspace-facts",
+            "-qs13-flow-go-no-return-method-expressions",
+            "-7350-nonbinding-rhs-distinct",
+            "-qs13-flow-summary-payload-accounting",
+            "-qs13-flow-typestate-byte-accounting",
+            "-7918-go-field-selector-addressability",
+            "-7536-initialization-retained-gaps",
+            "-7915-flow-slot-identity",
+            "-7508-csharp-conditional-branch-conversions",
+            "-7803-external-field-value-types",
+            "-2445-m4b-property-gaps",
+            "-qs13-flow-store-error-kind-context",
+            "-qs13-flow-taint-composition-quality",
+            "-qs13-flow-call-transfer-canonical-order",
+            "-7972-go-cross-file-global-self-assignment",
+            "-7509-go-model-authority",
+            "-7755-dead-value-liveness",
+            "-7876-query-incompleteness-scope",
+            "-7509-go-relative-source-imports",
+            "-qs13-flow-value-flow-survivors",
+            "-7351-go-error-method-set-proof",
+            "-qs13-flow-field-slot-source-kinds",
+            "-8036-go-native-external-callee-identity",
+            "-qs13-rql-pending-cleanup-nested-scope",
+            "-qs13-rql-python-loop-exit-and-docstring-blocks",
+            "-7968-go-satisfaction-membership",
+            "-8108-java-inventory-stable-replay",
+            "-qs13-rql-configuration-property-ancestor",
+            "-7509-g1b-incomplete-import-owner",
+            "-8097-assignment-flow-gap-scope",
         ] {
             assert_eq!(POLICY_SUBSTRATE_EPOCH.matches(component).count(), 1);
             let old_substrate = POLICY_SUBSTRATE_EPOCH.replacen(component, "", 1);

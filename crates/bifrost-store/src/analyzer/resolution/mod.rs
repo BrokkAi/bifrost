@@ -31,7 +31,8 @@ pub mod local_writes;
 pub mod model;
 #[doc(hidden)]
 pub mod mounted;
-pub(crate) mod precedence;
+#[doc(hidden)]
+pub mod precedence;
 #[doc(hidden)]
 pub mod remount;
 mod saturation;
@@ -667,7 +668,7 @@ pub(crate) use fact_resolution::{
     HierarchyProvenanceView, HierarchyProviderAuthority, HierarchyProviderKey,
     HierarchyProviderObservation, HierarchyProviderOperand, HierarchyProviderVisit,
     HierarchySelectionProvenance, HierarchySequenceId, HierarchySequenceRole,
-    HierarchyTailMembership, ProviderObservationStore,
+    HierarchyTailMembership, ProviderObservationStore, RootClosure,
 };
 
 #[cfg(test)]
@@ -748,6 +749,7 @@ pub use fact_source::TypedFactPageVisitor;
 pub use fact_source::TypedFactReadOutcome;
 pub use fact_source::TypedFactReadTerminal;
 pub use fact_source::TypedFactRequest;
+pub use fact_source::{FactModelMember, FactModelMemberSelection};
 
 pub(crate) use local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE;
 

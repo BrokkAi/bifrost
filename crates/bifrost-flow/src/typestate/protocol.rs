@@ -1834,3 +1834,7 @@ fn compare_transition_parts<From: Ord, Event: Ord, Guard: Ord, To: Ord>(
 ) -> Ordering {
     left.cmp(&right)
 }
+
+#[cfg(test)]
+#[path = "protocol_boundaries.rs"]
+mod protocol_boundaries;

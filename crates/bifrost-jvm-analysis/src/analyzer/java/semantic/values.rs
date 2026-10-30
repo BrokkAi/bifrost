@@ -539,9 +539,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(text) = node_text(self.prepared.source(), node) else {
             return self.expression_value(builder, node, SemanticValueKind::Constant);
         };
-        if let Some(value) = self.constant_index_values.get(text) {
-            self.expression_values.insert(node.id(), *value);
-            return Ok(*value);
+        if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
+            &self.constant_index_values,
+            &mut self.expression_values,
+            text,
+            node.id(),
+        ) {
+            return Ok(value);
         }
         let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
         self.constant_index_values.insert(text.into(), value);

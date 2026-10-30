@@ -35,12 +35,12 @@
 //! memoised per request. Nothing is added to the semantic IR, so no language
 //! adapter version moves and no cached artifact rotates.
 
+use super::DerivationExecutionCause;
 use super::results::{
     CodeQueryControlRelation, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryResultRef, DetailedCodeQueryKey,
 };
 use super::semantic::SemanticProcedureValue;
-use super::{DerivationExecutionCause, IAnalyzer};
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, CfgAlgorithmWork,
@@ -48,9 +48,10 @@ use crate::analyzer::semantic::cfg_algorithms::{
     postdominators,
 };
 use crate::analyzer::semantic::{ControlEdgeId, ProcedureHandle, ProgramPointId};
-use crate::analyzer::{Language, ProjectFile, Range};
+use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_core::analyzer::structural::control_relation::{
     ALL_CONTROL_RELATION_KINDS, ControlExitPartition, ControlRelationKind,
 };
@@ -482,7 +483,7 @@ fn push_algorithm_reason(
 /// twenty procedures spends one allowance across all of them, which is what
 /// keeps a broad query bounded instead of bounded twenty times over.
 pub(super) struct ControlRelationTraversalCache {
-    procedures: HashMap<ProcedureHandle, Arc<ProcedureControlRelations>>,
+    procedures: CaptureScopedMemo<HashMap<ProcedureHandle, Arc<ProcedureControlRelations>>>,
     reported: HashSet<(String, &'static str)>,
     budget: CfgAlgorithmBudget,
 }
@@ -490,7 +491,7 @@ pub(super) struct ControlRelationTraversalCache {
 impl Default for ControlRelationTraversalCache {
     fn default() -> Self {
         Self {
-            procedures: HashMap::default(),
+            procedures: CaptureScopedMemo::default(),
             reported: HashSet::default(),
             budget: CfgAlgorithmBudget::new(CONTROL_RELATION_WORK_LIMIT),
         }
@@ -506,27 +507,34 @@ impl ControlRelationTraversalCache {
     /// window. The request-wide algorithm budget and diagnostic deduplication
     /// remain cumulative.
     pub(super) fn release_file_window(&mut self) {
-        self.procedures.clear();
+        self.procedures = CaptureScopedMemo::default();
     }
 
     /// Derive (or replay) the control relations of one procedure.
     pub(super) fn for_procedure(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         procedure: &SemanticProcedureValue,
         generation: u64,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<ProcedureControlRelations> {
-        self.for_handle(&procedure.handle, generation, cancellation)
+        self.for_handle(analyzer, &procedure.handle, generation, cancellation)
     }
 
     pub(super) fn for_handle(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         procedure: &ProcedureHandle,
         generation: u64,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<ProcedureControlRelations> {
-        if let Some(cached) = self.procedures.get(procedure) {
-            return Arc::clone(cached);
+        if let Some(cached) = self
+            .procedures
+            .read(&memo_attribution(analyzer), |procedures| {
+                procedures.get(procedure).cloned()
+            })
+        {
+            return cached;
         }
         let token = cancellation.cloned().unwrap_or_default();
         let derived = Arc::new(control_relations_for_procedure(
@@ -536,7 +544,9 @@ impl ControlRelationTraversalCache {
             &mut self.budget,
         ));
         self.procedures
-            .insert(procedure.clone(), Arc::clone(&derived));
+            .read_mut(&memo_attribution(analyzer), |procedures| {
+                procedures.insert(procedure.clone(), Arc::clone(&derived))
+            });
         derived
     }
 

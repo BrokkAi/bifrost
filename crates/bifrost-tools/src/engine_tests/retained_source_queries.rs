@@ -275,9 +275,9 @@ fn refusal_inventory_keeps_multiple_sources_per_storage_language() {
         .selected_source_admission_refusals()
         .unwrap()
         .into_iter()
-        .map(|(file, reason)| {
-            assert!(!reason.is_empty());
-            file.rel_path().to_string_lossy().into_owned()
+        .map(|row| {
+            assert!(!row.reason.is_empty());
+            row.file.rel_path().to_string_lossy().into_owned()
         })
         .collect::<Vec<_>>();
     paths.sort();

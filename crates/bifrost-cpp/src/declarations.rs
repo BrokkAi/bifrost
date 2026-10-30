@@ -22209,7 +22209,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: comment-only enums invented fields"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: comment-only enums invented fields"
     )]
     fn comment_only_enums_have_no_enumerators() {
         let parsed =
@@ -22224,7 +22224,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: GNU must-use attribute order lost obligations"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: GNU must-use attribute order lost obligations"
     )]
     fn quicksilver_gnu_attribute_orders() {
         for attributes in [
@@ -22249,7 +22249,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: raw strings disabled fragmented brace matching"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: raw strings disabled fragmented brace matching"
     )]
     fn fragmented_brace_matching_ignores_literal_tokens() {
         // Isolate the brace proof from export-head recognition: the damaged
@@ -22280,7 +22280,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: uppercase class names became attribute names"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: uppercase class names became attribute names"
     )]
     fn quicksilver_uppercase_attributed_classes() {
         for (name, body) in [
@@ -22302,7 +22302,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: positional export recovery rejected uppercase class names"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: positional export recovery rejected uppercase class names"
     )]
     fn quicksilver_fragmented_export_uppercase_classes() {
         for name in ["Box", "BOX"] {
@@ -22372,7 +22372,7 @@ class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: unrelated labels aborted constructor search"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: unrelated labels aborted constructor search"
     )]
     fn quicksilver_constructor_search_skips_other_labels() {
         let source = "public:\n explicit Lookup_Error(std::string_view err) : Exception(err) {}\n Lookup_Error(std::string_view type, std::string_view algo);\nprivate: do_work();\n";
@@ -22389,7 +22389,7 @@ class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: recovery admitted expression-only access labels"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: recovery admitted expression-only access labels"
     )]
     fn quicksilver_member_gate_checks_label_payload() {
         for (source, expected) in [
@@ -22414,7 +22414,7 @@ class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: sentinel recovery rejected uppercase classes"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: sentinel recovery rejected uppercase classes"
     )]
     fn quicksilver_sentinel_uppercase_classes() {
         for name in ["Box", "BOX"] {

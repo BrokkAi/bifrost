@@ -61,7 +61,6 @@ use brokk_bifrost_jvm::java::graph::resolver::{TargetKind, TargetSpec};
 use brokk_bifrost_jvm::java::graph::return_type::{
     FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
 };
-use std::sync::Mutex;
 
 /// Run `visit` with the [`JavaGraphSource`] built from the *dispatching*
 /// analyzer.
@@ -336,7 +335,7 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
         .cloned()
         .collect();
     java_files.sort();
-    let return_caches = OwnedReturnTypeCaches::default();
+    let return_caches = OwnedReturnTypeCaches::new(java.read_capability());
     for file in &java_files {
         match build_java_file_usage_evidence(
             &relational_session,
@@ -622,13 +621,12 @@ where
     use brokk_bifrost_analysis::analyzer::usages::inverted_edges::parse_and_collect_with_declarations_and_domain;
 
     let language = tree_sitter_java::LANGUAGE.into();
-    let method_return_cache: MethodReturnCache =
-        Mutex::new(brokk_bifrost_core::hash::HashMap::default());
-    let method_anonymous_return_cache: MethodAnonymousReturnCache =
-        Mutex::new(brokk_bifrost_core::hash::HashMap::default());
-    let file_return_cache: FileReturnCache =
-        Mutex::new(brokk_bifrost_core::hash::HashMap::default());
+    let method_return_cache: MethodReturnCache = Default::default();
+    let method_anonymous_return_cache: MethodAnonymousReturnCache = Default::default();
+    let file_return_cache: FileReturnCache = Default::default();
+    let reads = java.read_capability();
     let caches = JavaEdgeScanCaches {
+        reads: &reads,
         method_return: &method_return_cache,
         method_anonymous_return: &method_anonymous_return_cache,
         file_return: &file_return_cache,
@@ -734,7 +732,7 @@ mod relational_inverted_tests {
                 .stack_size(128 * 1024)
                 .spawn_scoped(scope, || {
                     with_java_graph_source(&analyzer, |graph| {
-                        let caches = OwnedReturnTypeCaches::default();
+                        let caches = OwnedReturnTypeCaches::new(analyzer.read_capability());
                         let outcome = extractor::scan_file_evidence(
                             &analyzer,
                             graph.token,
@@ -930,5 +928,140 @@ mod relational_inverted_tests {
             "one path-scoped query must skip ASTs without the target terminal and reuse converged answers for relevant files: {reader_checkouts} reader checkouts for {} candidates",
             CANDIDATE_COUNT + UNRELATED_COUNT,
         );
+    }
+}
+
+#[cfg(test)]
+mod return_cache_read_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
+    use brokk_bifrost_core::analyzer::CodeUnitIndex;
+    use brokk_bifrost_core::analyzer::project_reads::ReadCapability;
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+    use brokk_bifrost_jvm::java::graph::extractor::ReturnTypeCaches;
+    use brokk_bifrost_jvm::java::graph::return_type::{
+        JavaReturnTypeContext, method_return_type_for_owner_fqn,
+    };
+    use brokk_bifrost_jvm::java::graph_support::JavaSource;
+
+    // The selector already owns its method declaration, as a converged
+    // relational frontier does. Selecting it must not incidentally record the
+    // return-facts file and mask a missing memo replay.
+    struct SelectedMethod<'a> {
+        java: &'a JavaAnalyzer,
+        frontier: &'a dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier,
+        method: CodeUnit,
+        file: &'a ProjectFile,
+        root: tree_sitter::Node<'a>,
+        caches: ReturnTypeCaches<'a>,
+    }
+    impl JavaReturnTypeContext for SelectedMethod<'_> {
+        fn read_capability(&self) -> &ReadCapability {
+            self.caches.reads
+        }
+        fn java(&self) -> &dyn JavaSource {
+            self.java
+        }
+        fn relational_definitions(
+            &self,
+        ) -> &dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier {
+            self.frontier
+        }
+        fn call_answering_units(&self, owner: &str, name: &str, arity: usize) -> Vec<CodeUnit> {
+            assert_eq!((owner, name, arity), ("lib.Factory", "make", 0));
+            vec![self.method.clone()]
+        }
+        fn file(&self) -> &ProjectFile {
+            self.file
+        }
+        fn source(&self) -> &str {
+            "package app; class Caller {}"
+        }
+        fn root(&self) -> tree_sitter::Node<'_> {
+            self.root
+        }
+        fn method_return_cache(&self) -> &MethodReturnCache {
+            self.caches.method_return
+        }
+        fn method_anonymous_return_cache(&self) -> &MethodAnonymousReturnCache {
+            self.caches.method_anonymous_return
+        }
+        fn file_return_cache(&self) -> &FileReturnCache {
+            self.caches.file_return
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7496: Java return-type hits lost the other file's source-fact reads"
+    )]
+    fn return_type_hits_replay_cross_file_inputs() {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file(
+                "lib/Factory.java",
+                "package lib; class Factory { static class Product {} static Product make() { return null; } }",
+            )
+            .file("app/Caller.java", "package app; class Caller {}")
+            .build();
+        let java = JavaAnalyzer::new(project.project_arc());
+        let method = java
+            .all_declarations()
+            .find(|unit| unit.is_function() && unit.identifier() == "make")
+            .unwrap();
+        let file = project.file("app/Caller.java");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("package app; class Caller {}", None).unwrap();
+        let owner = OwnedReturnTypeCaches::new(java.read_capability());
+        with_java_graph_source(&java, |graph| {
+            let context = SelectedMethod {
+                java: &java,
+                frontier: graph.relational_definitions,
+                method: method.clone(),
+                file: &file,
+                root: tree.root_node(),
+                caches: owner.caches(),
+            };
+            let read = |context: &SelectedMethod<'_>| {
+                let result = method_return_type_for_owner_fqn(
+                    "lib.Factory",
+                    graph.token,
+                    "make",
+                    0,
+                    context,
+                );
+                assert_eq!(
+                    result,
+                    ReceiverAnalysisOutcome::Precise(vec!["lib.Factory.Product".to_owned()])
+                );
+            };
+            read(&context);
+            let (_, method_reads) = capture_query_reads(&java, || read(&context));
+            // A fresh method memo forces the independently warm file-facts
+            // memo to supply its own receipt in the next capture.
+            let method_cache = MethodReturnCache::default();
+            let anonymous_cache = MethodAnonymousReturnCache::default();
+            let context = SelectedMethod {
+                caches: ReturnTypeCaches {
+                    reads: context.caches.reads,
+                    method_return: &method_cache,
+                    method_anonymous_return: &anonymous_cache,
+                    file_return: context.caches.file_return,
+                },
+                ..context
+            };
+            let (_, file_reads) = capture_query_reads(&java, || read(&context));
+            for reads in [method_reads, file_reads] {
+                assert_eq!(reads.unattributed_reads(), 0, "{reads:?}");
+                assert!(
+                    reads.keys().iter().any(|key| matches!(key,
+                        ReadKey::File { rel_path, .. } if rel_path.as_ref() == "lib/Factory.java"
+                    )),
+                    "each warm return projection must replay its file: {reads:?}"
+                );
+            }
+        });
     }
 }

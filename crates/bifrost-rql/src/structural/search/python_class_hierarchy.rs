@@ -619,15 +619,21 @@ fn python_total_ordering_decorator(
     (!uncertain).then_some(false)
 }
 
-fn python_expression_path(node: tree_sitter::Node<'_>, source: &str) -> Option<Vec<String>> {
-    match node.kind() {
-        "identifier" => Some(vec![node_text(source, node)?.to_owned()]),
-        "attribute" => {
-            let mut path = python_expression_path(node.child_by_field_name("object")?, source)?;
-            path.push(node_text(source, node.child_by_field_name("attribute")?)?.to_owned());
-            Some(path)
+fn python_expression_path(mut node: tree_sitter::Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    loop {
+        match node.kind() {
+            "identifier" => {
+                path.push(node_text(source, node)?.to_owned());
+                path.reverse();
+                return Some(path);
+            }
+            "attribute" => {
+                path.push(node_text(source, node.child_by_field_name("attribute")?)?.to_owned());
+                node = node.child_by_field_name("object")?;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 

@@ -7,6 +7,8 @@
 //! lookup from those names to the declarations other workspace files publish,
 //! the cache over it, and the reverse index built from it.
 
+use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
+use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set;
 use std::sync::Arc;
 
 use crate::analyzer::php::PhpAnalyzer;
@@ -168,42 +170,48 @@ impl ImportAnalysisProvider for PhpAnalyzer {
     }
 
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        if let Some(cached) = self.imported_code_units.get(file) {
-            return cached;
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-php-analysis/src/analyzer/php/imports.rs",
-            );
+        let value = self
+            .imported_code_units
+            .read(&memo_attribution(self), |cache, capture| {
+                Ok::<_, std::convert::Infallible>(cache.get(file).unwrap_or_else(|| {
+                    let cache_fill =
+                        brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                    let entry = Arc::new(capture.build_weighted(|| {
+                        let value = {
+                            let names: Vec<String> = self
+                                .inner
+                                .type_identifiers_of(file)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .collect();
+                            // One batched read for the whole file rather than one store round trip
+                            // per imported name (#1748's shape).
+                            let scope = AnalyzerQueryScope::new(self);
+                            let _token = scope.token();
+                            self.inner.prefetch_definitions(&names);
 
-        let names: Vec<String> = self
-            .inner
-            .type_identifiers_of(file)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        // One batched read for the whole file rather than one store round trip
-        // per imported name (#1748's shape).
-        let scope = AnalyzerQueryScope::new(self);
-        let _token = scope.token();
-        self.inner.prefetch_definitions(&names);
+                            let mut imported: HashSet<CodeUnit> = HashSet::default();
+                            for name in &names {
+                                // A file's own declarations are not imports: PHP reaches them
+                                // because they are declared here, not because a name was bound.
+                                imported.extend(
+                                    self.definitions(name).filter(|unit| unit.source() != file),
+                                );
+                            }
 
-        let mut imported: HashSet<CodeUnit> = HashSet::default();
-        for name in &names {
-            // A file's own declarations are not imports: PHP reaches them
-            // because they are declared here, not because a name was bound.
-            imported.extend(self.definitions(name).filter(|unit| unit.source() != file));
-        }
-
-        let imported = Arc::new(imported);
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::clone(&imported);
-            persistent_fill_guard.installed("imported_code_units");
-            self.imported_code_units.insert(cache_key, cache_value);
-        };
-        imported
+                            Arc::new(imported)
+                        };
+                        let bytes = weight_code_unit_set(file, &value) as usize;
+                        (value, bytes)
+                    }));
+                    if cache_fill.is_complete() {
+                        cache.insert(file.clone(), Arc::clone(&entry));
+                    }
+                    entry
+                }))
+            })
+            .expect("import memo build is infallible");
+        Arc::clone(&value)
     }
 
     /// The `use` declarations the parser recorded for this file, one row per
@@ -216,26 +224,37 @@ impl ImportAnalysisProvider for PhpAnalyzer {
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
-            &self.reverse_import_index,
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.reverse_import_index.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
                     self,
-                    "php.reverse_file_index",
-                    || self.inner.all_files(),
+                    memo,
+                    || {
+                        brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                            &(self.inner.all_files()),
+                            |candidate| self.imported_code_units_of(candidate),
+                            true,
+                        )
+                    },
+                    || {
+                        brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                            &(self.inner.all_files()),
+                            |candidate| self.imported_code_units_of(candidate),
+                            false,
+                        )
+                    },
                 )
+                .get(file)
+                .map(|files| (**files).clone())
+                .unwrap_or_default()
             },
-            |candidate| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "php.reverse_file_index",
-                    || self.imported_code_units_of(candidate),
-                )
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    brokk_bifrost_core::analyzer::model::Language::Php,
+                ])
             },
         )
-        .get(file)
-        .map(|files| (**files).clone())
-        .unwrap_or_default()
     }
 }
 

@@ -574,11 +574,7 @@ pub(in crate::analyzer::java::semantic) fn expression_value_kind(
 }
 
 pub(in crate::analyzer::java::semantic) fn binary_operator(node: Node<'_>) -> Option<&'static str> {
-    match node.child_by_field_name("operator")?.kind() {
-        "&&" => Some("&&"),
-        "||" => Some("||"),
-        _ => None,
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::short_circuit_operator(node)
 }
 
 pub(in crate::analyzer::java::semantic) fn operation_can_throw_implicitly(node: Node<'_>) -> bool {

@@ -194,18 +194,25 @@ impl CppAnalyzer {
         if imports::is_cpp_translation_unit(file) {
             return None;
         }
-        match self.c_readings_by_file.try_get_with_by_ref(file, || {
-            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                let c_state = self
-                    .inner
-                    .projection_file_state(file, CPP_C_STORAGE_LANGUAGE_KEY)?;
-                let cpp_state = self.inner.fetch_file_state(file)?;
-                Some(Arc::new(CppCReading::build(&c_state, &cpp_state)))
-            })
-        }) {
-            Ok(value) => value,
-            Err(value) => (*value).clone(),
-        }
+        self.c_readings_by_file.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::query_cache_moka(self, memo, file, || {
+                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                        self,
+                        || {
+                            let c_state = self
+                                .inner
+                                .projection_file_state(file, CPP_C_STORAGE_LANGUAGE_KEY)?;
+                            let cpp_state = self.inner.fetch_file_state(file)?;
+                            Some(Arc::new(CppCReading::build(&c_state, &cpp_state)))
+                        },
+                    )
+                })
+                .unwrap_or_else(|value| (*value).clone())
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        )
     }
 
     /// Whether a reference written in the header `file` reads its visible

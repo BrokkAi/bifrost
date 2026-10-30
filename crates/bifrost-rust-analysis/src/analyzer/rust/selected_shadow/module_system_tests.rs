@@ -22,23 +22,16 @@ fn rust_tree(source: &str) -> tree_sitter::Tree {
     )
 }
 
+#[track_caller]
 fn reference_site(path: &str, source: &str, spelling: &str) -> ResolvedReferenceSite {
     let start_byte = source
         .rfind(spelling)
         .unwrap_or_else(|| panic!("{spelling:?} reference in {path}"));
-    let start_line = source[..start_byte]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    brokk_bifrost_analysis::test_support::resolved_reference_site(
-        path.to_string(),
-        spelling.to_string(),
-        Range {
-            start_byte,
-            end_byte: start_byte + spelling.len(),
-            start_line,
-            end_line: start_line,
-        },
+    brokk_bifrost_analysis::test_support::resolved_reference_site_from_range(
+        path,
+        source,
+        start_byte,
+        start_byte + spelling.len(),
     )
 }
 

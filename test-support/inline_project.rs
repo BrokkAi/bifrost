@@ -84,6 +84,7 @@ impl InlineTestProject {
         self
     }
 
+    #[track_caller]
     pub fn build(self) -> BuiltInlineTestProject {
         let temp = tempfile::tempdir().expect("failed to create temp dir");
         let root = temp
@@ -167,6 +168,11 @@ impl BuiltInlineTestProject {
 
     pub fn languages(&self) -> BTreeSet<Language> {
         self.project.analyzer_languages()
+    }
+
+    /// Transfer ownership of the fixture root while dropping its project value.
+    pub fn into_temp_dir(self) -> tempfile::TempDir {
+        self.temp
     }
 
     /// Stage every file under the root and commit them.

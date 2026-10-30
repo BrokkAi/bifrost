@@ -12,6 +12,7 @@ use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::structural::reference_edges::{
     EdgeCompleteness, EdgeDerivationResult, EdgeSite,
 };
+use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
@@ -38,6 +39,106 @@ pub enum ExactRenameEditIssue {
 pub enum RenameSourceIssue {
     ContentChanged,
     ParseFailed,
+}
+
+/// A checked coordinate segment for one edit in a counterfactual source.
+/// Deltas are signed because replacements can grow or shrink the source.
+pub struct RenameEditCoordinateSegment {
+    /// Start of the replaced span in the original source.
+    pub original_start: usize,
+    /// End of the replaced span in the original source.
+    pub original_end: usize,
+    /// Start of the replacement span in the hypothetical source.
+    pub hypothetical_start: usize,
+    /// End of the replacement span in the hypothetical source.
+    pub hypothetical_end: usize,
+    /// Cumulative byte-length change before this edit.
+    pub delta_before: i128,
+    /// Cumulative byte-length change after this edit.
+    pub delta_after: i128,
+}
+
+#[derive(Debug)]
+pub struct RenameEditCoordinateError;
+
+/// Lazily map sorted, non-overlapping original edits into hypothetical spans.
+/// An arithmetic failure is yielded once and terminates the iterator.
+pub struct RenameEditCoordinateSegments<'a> {
+    edits: std::slice::Iter<'a, RenameEdit>,
+    delta: i128,
+    failed: bool,
+}
+
+impl<'a> RenameEditCoordinateSegments<'a> {
+    #[track_caller]
+    pub fn new(edits: &'a [RenameEdit]) -> Self {
+        debug_assert!(
+            edits.iter().all(|edit| edit.start_byte <= edit.end_byte),
+            "rename edits have reversed ranges: {edits:?}"
+        );
+        Self {
+            edits: edits.iter(),
+            delta: 0,
+            failed: false,
+        }
+    }
+}
+
+impl Iterator for RenameEditCoordinateSegments<'_> {
+    type Item = Result<RenameEditCoordinateSegment, RenameEditCoordinateError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let edit = self.edits.next()?;
+        let delta_before = self.delta;
+        let checked = (|| {
+            let original_start = edit.start_byte;
+            let original_end = edit.end_byte;
+            let hypothetical_start = usize::try_from(
+                i128::try_from(original_start)
+                    .ok()?
+                    .checked_add(delta_before)?,
+            )
+            .ok()?;
+            let hypothetical_end = hypothetical_start.checked_add(edit.new_text.len())?;
+            let removed = i128::try_from(original_end.checked_sub(original_start)?).ok()?;
+            let inserted = i128::try_from(edit.new_text.len()).ok()?;
+            let delta_after = delta_before.checked_add(inserted.checked_sub(removed)?)?;
+            Some(RenameEditCoordinateSegment {
+                original_start,
+                original_end,
+                hypothetical_start,
+                hypothetical_end,
+                delta_before,
+                delta_after,
+            })
+        })();
+        match checked {
+            Some(segment) => {
+                self.delta = segment.delta_after;
+                Some(Ok(segment))
+            }
+            None => {
+                self.failed = true;
+                Some(Err(RenameEditCoordinateError))
+            }
+        }
+    }
+}
+
+/// Require the supplied source to match the selected native identity.
+pub fn admit_selected_native_source<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    file: &ProjectFile,
+    source: &str,
+) -> Result<(), RenameSourceIssue> {
+    if analyzer.source_matches_selected_native_content(file, source) {
+        Ok(())
+    } else {
+        Err(RenameSourceIssue::ContentChanged)
+    }
 }
 
 #[derive(Debug)]

@@ -134,12 +134,14 @@ fn event_handler(
 ) -> impl FnMut(notify::Result<Event>) + Send + 'static {
     let pending_for_callback = Arc::clone(pending);
     let project_for_callback = Arc::clone(project);
-    move |result: notify::Result<Event>| match result {
-        Ok(event) => handle_event(&project_for_callback, &pending_for_callback, event),
-        Err(_) => {
-            project_for_callback.invalidate_cached_file_listing();
-            mark_full_refresh(&pending_for_callback);
-        }
+    move |result: notify::Result<Event>| {
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| match result {
+            Ok(event) => handle_event(&project_for_callback, &pending_for_callback, event),
+            Err(_) => {
+                project_for_callback.invalidate_cached_file_listing();
+                mark_full_refresh(&pending_for_callback);
+            }
+        })
     }
 }
 

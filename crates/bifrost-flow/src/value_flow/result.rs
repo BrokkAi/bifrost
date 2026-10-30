@@ -19,6 +19,17 @@ pub enum ValueFlowMayStatus {
     Unproven,
 }
 
+pub(super) fn meeting_may_status(
+    uncertain: bool,
+    path_qualities: PathQualityFrontier,
+) -> ValueFlowMayStatus {
+    if !uncertain && path_qualities.has_proven_path() {
+        ValueFlowMayStatus::Proven
+    } else {
+        ValueFlowMayStatus::Unproven
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueFlowMeeting {
     source: ValueFlowSourceId,
@@ -95,13 +106,8 @@ impl ValueFlowSummaryResult {
             if plan.source(source).is_none() || plan.sink(sink).is_none() {
                 return Err(ValueFlowSolveError::InvalidResult);
             }
-            let may = if fact.uncertainty().is_empty()
-                && reached.path_qualities().iter().any(PathQuality::is_proven)
-            {
-                ValueFlowMayStatus::Proven
-            } else {
-                ValueFlowMayStatus::Unproven
-            };
+            let may =
+                meeting_may_status(fact.uncertainty().is_uncertain(), reached.path_qualities());
             meetings.push(ValueFlowMeeting {
                 source,
                 sink,

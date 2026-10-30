@@ -1559,10 +1559,7 @@ fn a_frontier_source_with_unknown_evidence_is_judged_when_it_reaches_a_sink() {
     source.evidence = EndpointEvidence::Unknown;
     let call = CallSiteId::new(40);
     let mut graph = FakeGraph::new(&fixture);
-    graph.judgment = Some(HopQuality {
-        proven: true,
-        complete: false,
-    });
+    graph.judgment = Some(HopQuality::new(true, false));
     graph.stored(target, &[result(call)], &[]);
     graph.interior(
         target,

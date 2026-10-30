@@ -1554,17 +1554,13 @@ mod tests {
         }
     }
 
+    #[track_caller]
     fn parse(source: &str) -> tree_sitter::Tree {
-        let tree = brokk_bifrost_analysis::test_support::parse_fixture_tree(
+        brokk_bifrost_analysis::test_support::parse_valid_fixture_tree(
             source,
             brokk_bifrost_jvm::scala::language::LANGUAGE.into(),
-        );
-        assert!(
-            !tree.root_node().has_error(),
-            "Scala fixture must parse:\n{}",
-            tree.root_node().to_sexp()
-        );
-        tree
+            "Scala fixture must parse:\n",
+        )
     }
 
     fn catalog<'tree>(

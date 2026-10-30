@@ -221,22 +221,27 @@ impl ProductionTaintAnalysisResult {
         self.report.retained_bytes()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn finding_count(&self) -> usize {
         self.report.findings().len()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn retained_witnesses(&self) -> usize {
         self.report.retained_witnesses()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn retained_witness_steps(&self) -> usize {
         self.report.retained_witness_steps()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn retained_witness_bytes(&self) -> usize {
         self.report.retained_witness_bytes()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bound_summary_count(&self) -> usize {
         self.plan.value_flow().external_summaries().entries().len()
     }

@@ -184,6 +184,39 @@ pub(crate) enum PythonRuntimeBindingAttempt {
     Failed(PythonRuntimeBindingFailure),
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonRuntimeBindingTestResult {
+    Unavailable,
+    Cancelled,
+    Resolved,
+    Failed,
+}
+
+/// Test-support entry point for one production Python runtime binding call site.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn resolve_python_runtime_binding_for_test(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    module: &[String],
+    member: &str,
+) -> PythonRuntimeBindingTestResult {
+    match resolve_python_runtime_binding(
+        analyzer,
+        file,
+        PythonImportedMember { module, member },
+        None,
+        crate::analyzer::python::runtime_binding::resolve_python_defining_binding,
+    ) {
+        PythonRuntimeBindingAttempt::Unavailable => PythonRuntimeBindingTestResult::Unavailable,
+        PythonRuntimeBindingAttempt::Cancelled => PythonRuntimeBindingTestResult::Cancelled,
+        PythonRuntimeBindingAttempt::Resolved(_) => PythonRuntimeBindingTestResult::Resolved,
+        PythonRuntimeBindingAttempt::Failed(_) => PythonRuntimeBindingTestResult::Failed,
+    }
+}
+
 // Keep staged import evidence behind the runtime attempt's terminal outcome.
 // The same boundary is exercised by the imported-call cancellation regression.
 pub(crate) fn finish_python_imported_call_binding(
@@ -246,17 +279,203 @@ pub(crate) fn resolve_python_runtime_binding(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return PythonRuntimeBindingAttempt::Cancelled;
     }
-    let Some(active_snapshot) = analyzer.active_semantic_model_snapshot() else {
-        return PythonRuntimeBindingAttempt::Unavailable;
+    let resolve = || match analyzer.active_semantic_model_snapshot() {
+        Some(active_snapshot) => resolve_python_runtime_binding_in_snapshot(
+            analyzer,
+            file,
+            PythonImportedMember {
+                module: imported.module,
+                member: imported.member,
+            },
+            cancellation,
+            resolve_binding,
+            &active_snapshot,
+        ),
+        None => PythonRuntimeBindingAttempt::Unavailable,
     };
-    resolve_python_runtime_binding_in_snapshot(
-        analyzer,
-        file,
-        imported,
-        cancellation,
-        resolve_binding,
-        &active_snapshot,
-    )
+    let (answer, fact) = if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        analyzer.read_ledger_attached()
+    }) {
+        let ((answer, fact), _) =
+            brokk_bifrost_analysis::analyzer::capture_subsumed_query_reads(analyzer, || {
+                let answer = resolve();
+                let fact = (!matches!(answer, PythonRuntimeBindingAttempt::Cancelled)).then(|| {
+                    environment_binding_fact(analyzer, file, imported.module, imported.member)
+                });
+                (answer, fact)
+            });
+        (answer, fact)
+    } else {
+        (resolve(), None)
+    };
+    if let Some(fact) = fact {
+        brokk_bifrost_analysis::analyzer::workspace_authority::record_workspace_authority_read(
+            analyzer,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::PythonEnvironmentBinding,
+            fact.inputs(),
+        );
+    }
+    answer
+}
+
+#[derive(Clone)]
+struct EnvironmentBindingFact {
+    subject: brokk_bifrost_analysis::analyzer::FactSubject,
+    answer: brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest,
+    complete: bool,
+}
+
+impl EnvironmentBindingFact {
+    fn inputs(&self) -> brokk_bifrost_analysis::analyzer::AuthorityInputs<'static> {
+        if !self.complete {
+            // Installed provider or launch evidence could not be verified. A
+            // Models key alone does not cover these non-source inputs.
+            return brokk_bifrost_analysis::analyzer::AuthorityInputs::Unnamed;
+        }
+        brokk_bifrost_analysis::analyzer::AuthorityInputs::Fact {
+            language: brokk_bifrost_analysis::analyzer::Language::Python,
+            subject: self.subject.clone(),
+            answer: self.answer,
+        }
+    }
+}
+
+/// A complete question covers both callable and class/value interpretations.
+/// Callers can ask either without assigning two answers to the same Fact key.
+fn environment_binding_fact(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    module: &[String],
+    member: &str,
+) -> EnvironmentBindingFact {
+    use brokk_bifrost_analysis::analyzer::FactSubject;
+    use brokk_bifrost_analysis::analyzer::canonical_hash::CanonicalHasher;
+    use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
+    let mut digest = CanonicalHasher::new(b"bifrost-python-environment-binding/v1");
+    let mut environment = StableDigest::sha256(b"no-selected-python-environment");
+    let mut complete = true;
+    let snapshot = analyzer.active_semantic_model_snapshot();
+    if let Some(snapshot) = snapshot.as_ref() {
+        digest.value(snapshot.active_models().active_model_set_hash().as_bytes());
+        if let Some(publication) = snapshot.python_runtime() {
+            let python = resolve_analyzer::<crate::analyzer::PythonAnalyzer>(analyzer);
+            for resolver in [
+                crate::analyzer::python::runtime_binding::resolve_python_defining_binding
+                    as PythonDefiningBindingResolver,
+                crate::analyzer::python::runtime_binding::resolve_python_defining_class_binding,
+            ] {
+                match resolve_python_runtime_binding_in_snapshot(
+                    analyzer,
+                    file,
+                    PythonImportedMember { module, member },
+                    None,
+                    resolver,
+                    snapshot,
+                ) {
+                    PythonRuntimeBindingAttempt::Resolved(checked) => {
+                        digest.value(b"checked");
+                        let binding = &checked.binding;
+                        digest.sequence("canonical", binding.canonical(), |hash, part| {
+                            hash.value(part.as_bytes())
+                        });
+                        digest.value(binding.artifact().purl().as_bytes());
+                        digest.value(binding.artifact().archive_sha256().as_bytes());
+                        digest.value(binding.model_manifest_sha256().as_bytes());
+                        if let Some(class) = binding.class_identity() {
+                            digest.value(b"class");
+                            digest.value(class.portable_symbol().as_bytes());
+                        } else if let Some(value) = binding.value_identity() {
+                            digest.value(b"value");
+                            digest.value(value.portable_symbol().as_bytes());
+                        } else {
+                            digest.value(b"callable");
+                            digest.sequence(
+                                "formal_slots",
+                                binding.formal_slots(),
+                                |hash, slot| {
+                                    hash.sequence("names", &slot.names, |hash, name| {
+                                        hash.value(name.as_bytes())
+                                    });
+                                    hash.value(&[
+                                        u8::from(slot.receiver),
+                                        u8::from(slot.default_range.is_some()),
+                                    ]);
+                                    hash.value(format!("{:?}", slot.variadic).as_bytes());
+                                    hash.value(format!("{:?}", slot.passing_mode).as_bytes());
+                                },
+                            );
+                        }
+                        // This portable digest covers checked launch inputs,
+                        // ordered roots and inventory. It contains no mount path
+                        // or transient acquisition/environment row IDs.
+                        let selected = python.and_then(|python| python.python_runtime_store_snapshot()).and_then(|(store, _)| {
+                            let cancellation = CancellationToken::default();
+                            let limits = brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default();
+                            crate::analyzer::python::runtime_provider::PythonRuntimeProviderContext {
+                                store: &store, publication, workspace_root: analyzer.project().root(), limits: &limits, cancellation: &cancellation,
+                            }.checked_environment(checked.provider.environment_id()).ok()
+                        });
+                        if let Some(selected) = selected {
+                            environment =
+                                StableDigest::sha256(selected.project_config().value.as_bytes());
+                            digest.value(environment.as_bytes());
+                        } else {
+                            complete = false;
+                        }
+                    }
+                    PythonRuntimeBindingAttempt::Unavailable => digest.value(b"unavailable"),
+                    PythonRuntimeBindingAttempt::Cancelled => {
+                        digest.value(b"cancelled");
+                        complete = false;
+                    }
+                    PythonRuntimeBindingAttempt::Failed(_) => {
+                        // No portable checked provider/environment proof was
+                        // produced. Refuse reuse instead of hashing diagnostics
+                        // that can contain positions or local filesystem paths.
+                        digest.value(b"unproven");
+                        complete = false;
+                    }
+                }
+            }
+        } else {
+            digest.value(b"no-runtime-publication");
+        }
+    } else {
+        digest.value(b"no-model-snapshot");
+    }
+    let path = brokk_bifrost_core::path_utils::rel_path_string(file);
+    EnvironmentBindingFact {
+        subject: FactSubject::FileNamedMember {
+            rel_path: path.into(),
+            owner: module.join(".").into(),
+            member: member.into(),
+            environment: Some(environment),
+        },
+        answer: StableDigest::from_array(digest.finish()),
+        complete,
+    }
+}
+
+pub(super) fn environment_binding_answer(
+    analyzer: &dyn IAnalyzer,
+    rel_path: &str,
+    owner: &str,
+    member: &str,
+    environment: Option<brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest>,
+) -> Option<brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest> {
+    let file = ProjectFile::new(analyzer.project().root(), rel_path);
+    // The question already contains a semantic module identity, not source
+    // syntax. Components here are values supplied by the structured binder.
+    let module = owner.split('.').map(str::to_owned).collect::<Vec<_>>();
+    let fact = environment_binding_fact(analyzer, &file, &module, member);
+    let brokk_bifrost_analysis::analyzer::FactSubject::FileNamedMember {
+        environment: selected,
+        ..
+    } = fact.subject
+    else {
+        unreachable!("binding fact subject");
+    };
+    (fact.complete && selected == environment).then_some(fact.answer)
 }
 
 fn resolve_python_runtime_binding_in_snapshot(
@@ -857,6 +1076,9 @@ pub mod native {
         Cancelled,
     }
 
+    type PythonExternalAnswers =
+        HashMap<Vec<String>, (Arc<PythonExternalAuthorityResult>, EnvironmentBindingFact)>;
+
     /// One caller file, active model snapshot and publication per request.
     /// Only demanded identities survive verification, not provider inventories.
     pub struct PythonExternalAuthority<'a> {
@@ -865,7 +1087,9 @@ pub mod native {
         snapshot: &'a ActiveSemanticModelSnapshot,
         publication: Option<&'a PythonRuntimeProviderPublication>,
         cancellation: &'a CancellationToken,
-        answers: HashMap<Vec<String>, Arc<PythonExternalAuthorityResult>>,
+        answers: brokk_bifrost_analysis::analyzer::WorkspaceAuthorityMemo<
+            std::sync::Mutex<PythonExternalAnswers>,
+        >,
     }
 
     impl<'a> PythonExternalAuthority<'a> {
@@ -882,7 +1106,10 @@ pub mod native {
                 snapshot,
                 publication,
                 cancellation,
-                answers: HashMap::default(),
+                answers: brokk_bifrost_analysis::analyzer::WorkspaceAuthorityMemo::new(
+                    brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::PythonEnvironmentBinding,
+                    std::sync::Mutex::new(HashMap::default()),
+                ),
             }
         }
 
@@ -919,12 +1146,47 @@ pub mod native {
             } else {
                 canonical.extend_from_slice(&path[1..]);
             }
-            if let Some(answer) = self.answers.get(&canonical) {
-                return Arc::clone(answer);
-            }
-            let answer = Arc::new(self.resolve(&canonical));
-            self.answers.insert(canonical, Arc::clone(&answer));
-            answer
+            self.answers
+                .read(
+                    &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(
+                        self.analyzer,
+                    ),
+                    |memo| {
+                        if let Some(answer) = memo
+                            .lock()
+                            .expect("external authority lock poisoned")
+                            .get(&canonical)
+                            .cloned()
+                        {
+                            return answer;
+                        }
+                        let answer = Arc::new(self.resolve(&canonical));
+                        let (member, module) =
+                            canonical.split_last().expect("nonempty canonical import");
+                        let mut fact =
+                            environment_binding_fact(self.analyzer, self.file, module, member);
+                        let active = self.analyzer.active_semantic_model_snapshot();
+                        if active
+                            .as_ref()
+                            .map(|snapshot| snapshot.active_models().active_model_set_hash())
+                            != Some(self.snapshot.active_models().active_model_set_hash())
+                            || self.snapshot.python_runtime() != self.publication
+                            || active
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.python_runtime())
+                                != self.publication
+                        {
+                            fact.complete = false;
+                        }
+                        let entry = (answer, fact);
+                        memo.lock()
+                            .expect("external authority lock poisoned")
+                            .insert(canonical, entry.clone());
+                        entry
+                    },
+                    |entry| entry.1.inputs(),
+                )
+                .0
         }
 
         fn resolve(&self, canonical: &[String]) -> PythonExternalAuthorityResult {

@@ -349,7 +349,9 @@ explicitly, for example `git merge-base HEAD origin/main` or the base SHA that
 GitHub provides. If the root is not in a Git repository or the revision does
 not resolve, the run exits 2. If the base revision resolves but its evaluation
 is unreliable, the run falls back to full gating with a `diff-base-unreliable`
-diagnostic, so a broken base cannot hide new findings. See
+diagnostic, so a broken base cannot hide new findings. A policy whose base run
+was only `inconclusive` falls back to full gating alone, with a
+`diff-base-policy-unqualified` warning. See
 [Static-Analysis Policies](/static-analysis-policies/) for the join rules and
 [CI Gating with GitHub Actions](/ci-github-actions/) for the pull-request
 recipe.

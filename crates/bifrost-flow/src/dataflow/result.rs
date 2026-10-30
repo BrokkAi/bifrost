@@ -165,10 +165,4 @@ impl<Fact> DataflowResult<Fact> {
     pub fn is_complete(&self) -> bool {
         self.termination.is_fixed_point() && self.coverage.is_complete()
     }
-
-    pub fn reached_at(&self, node: IcfgNodeId) -> impl Iterator<Item = &ReachedFact> {
-        self.reached
-            .iter()
-            .filter(move |reached| reached.node == node)
-    }
 }

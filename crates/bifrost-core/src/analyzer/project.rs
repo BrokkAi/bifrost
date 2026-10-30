@@ -1,3 +1,7 @@
+use super::project_reads::{
+    ProjectReadReceipt, ProjectReadSlot, ReadCapability, listing_read, publish_directory,
+    publish_file_set, publish_git_ignore_presence_only, publish_ignore_rules, publish_receipt,
+};
 use crate::analyzer::common::{language_for_file, workspace_language_for_file};
 use crate::analyzer::{Language, ProjectFile};
 use crate::gitblob;
@@ -79,6 +83,8 @@ fn relative_path_under_root(abs_path: &Path, root: &Path) -> Option<PathBuf> {
 pub struct BifrostIgnoreMatcher {
     root: PathBuf,
     by_directory: HashMap<PathBuf, Gitignore>,
+    rules_digest: [u8; 32],
+    listing_receipt: ProjectReadReceipt,
 }
 
 /// Git ignores a byte-order mark at the start of an ignore file, and so does
@@ -114,18 +120,31 @@ impl BifrostIgnoreMatcher {
         }
 
         let mut by_directory = HashMap::new();
+        let mut rule_sets = Vec::new();
         for directory in directories {
             let ignore_file = directory.join(BIFROST_IGNORE_FILE_NAME);
             let Some(rules) = read_ignore_file(&ignore_file)? else {
                 continue;
             };
             let mut builder = GitignoreBuilder::new(&directory);
+            let mut normalized_rules = Vec::<String>::new();
             for (index, line) in rules.lines().enumerate() {
                 let line = if index == 0 {
                     line.trim_start_matches(UTF8_BOM)
                 } else {
                     line
                 };
+                // Match GitignoreBuilder's normalization of rule VALUES:
+                // comments/empty lines add no glob; escaped trailing spaces
+                // remain part of the pattern. Preserve precedence order.
+                let normalized = if line.ends_with("\\ ") {
+                    line
+                } else {
+                    line.trim_end()
+                };
+                if !normalized.is_empty() && !normalized.starts_with('#') {
+                    normalized_rules.push(normalized.to_owned());
+                }
                 builder
                     .add_line(Some(ignore_file.clone()), line)
                     .map_err(|error| {
@@ -148,13 +167,39 @@ impl BifrostIgnoreMatcher {
                     ),
                 )
             })?;
+            if !normalized_rules.is_empty() {
+                let relative = directory
+                    .strip_prefix(root)
+                    .expect("ignore directory belongs to root");
+                rule_sets.push((
+                    crate::path_utils::workspace_relative_slash_path(relative),
+                    normalized_rules,
+                ));
+            }
             by_directory.insert(directory, matcher);
         }
 
-        Ok(Self {
+        rule_sets.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut hash = crate::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-workspace-ignore-rules:v1",
+        );
+        // Bifrost has no implicit .bifrostignore patterns. Name that default
+        // explicitly so a future built-in rule change must rotate it.
+        hash.field("builtin_rules", b"none:v1");
+        hash.sequence("directories", &rule_sets, |hash, (directory, rules)| {
+            hash.field("directory", directory.as_bytes());
+            hash.sequence("rules", rules, |hash, rule| {
+                hash.field("rule", rule.as_bytes())
+            });
+        });
+        let mut matcher = Self {
             root: root.to_path_buf(),
             by_directory,
-        })
+            rules_digest: hash.finish(),
+            listing_receipt: ProjectReadReceipt::default(),
+        };
+        matcher.listing_receipt = matcher.receipt_for(files);
+        Ok(matcher)
     }
 
     /// Compile the ignore files the filesystem holds beneath `root`. A
@@ -165,8 +210,51 @@ impl BifrostIgnoreMatcher {
             if !path.is_file() {
                 return Ok(None);
             }
+            #[cfg(any(test, feature = "test-support"))]
+            super::project_reads::count_project_io(super::project_reads::ProjectIo::Rule);
             std::fs::read_to_string(path).map(Some)
         })
+    }
+
+    /// The complete listing certificate built beside these same rule inputs.
+    pub fn listing_receipt(&self) -> ProjectReadReceipt {
+        self.listing_receipt.clone()
+    }
+
+    fn receipt_for(&self, files: &BTreeSet<ProjectFile>) -> ProjectReadReceipt {
+        let paths = files
+            .iter()
+            .map(|file| {
+                (
+                    crate::path_utils::rel_path_string(file),
+                    self.is_ignored(file),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let selected = files
+            .iter()
+            .filter(|file| {
+                Language::ANALYZABLE.contains(&file.language()) && !self.is_ignored(file)
+            })
+            .map(|file| (crate::path_utils::rel_path_string(file), false))
+            .collect::<Vec<_>>();
+        super::project_reads::file_set_receipt_from_entries(
+            paths,
+            selected,
+            Vec::new(),
+            self.rules_digest,
+        )
+    }
+
+    pub const fn rules_digest(&self) -> [u8; 32] {
+        self.rules_digest
+    }
+
+    pub fn empty_rules_digest() -> [u8; 32] {
+        Self::build_with(Path::new(""), &BTreeSet::new(), |_| Ok(None))
+            .expect("empty ignore rules build")
+            .rules_digest()
     }
 
     /// Whether the rules exclude `file` from code intelligence, honoring
@@ -336,7 +424,34 @@ impl ProjectCoverage {
     }
 }
 
-pub trait Project: Send + Sync {
+/// Object-safe access to the concrete Project view receiving a raw getter.
+pub trait AsProject {
+    fn as_project(&self) -> &dyn Project;
+}
+impl<T: Project> AsProject for T {
+    fn as_project(&self) -> &dyn Project {
+        self
+    }
+}
+
+pub trait Project: AsProject + Send + Sync {
+    fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+        None
+    }
+    fn install_read_recorder(&self, _capability: ReadCapability) -> bool {
+        false
+    }
+
+    fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "custom Project must name its effective ignore rules",
+        ))
+    }
+
     fn root(&self) -> &Path;
 
     /// Published module identity for this project's exact selected revision.
@@ -363,6 +478,9 @@ pub trait Project: Send + Sync {
     /// Share one immutable whole-workspace listing when the project owns a
     /// listing cache. The default preserves custom project implementations.
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.all_files().map(Arc::new)
     }
     /// Whole-workspace file listings this project instance has performed --
@@ -380,14 +498,16 @@ pub trait Project: Send + Sync {
     ///
     /// Workspace construction uses this hook to let every language delegate
     /// share one build-scoped listing. Projects with additional membership
-    /// rules override it; the default keeps custom projects on their existing
-    /// behavior rather than guessing those rules.
+    /// rules override it; the default selects files by their recognized
+    /// language from the supplied set without enumerating the workspace.
     fn analyzable_files_from(
         &self,
-        _files: &BTreeSet<ProjectFile>,
+        files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
-        self.analyzable_files(language)
+        let _project_read = listing_read(self);
+        publish_file_set(self.as_project(), files)?;
+        Ok(files_for_language(files, language, ProjectFile::language))
     }
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile>;
 
@@ -406,21 +526,32 @@ pub trait Project: Send + Sync {
     /// every caller had before the pre-check existed; filesystem-backed
     /// projects override it with a single `stat` (#1325).
     fn has_directory(&self, rel_path: &Path) -> bool {
-        self.all_files().is_ok_and(|files| {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.directory(self.as_project(), rel_path));
+        let exists = self.all_files().is_ok_and(|files| {
             files.iter().any(|file| {
                 file.rel_path()
                     .strip_prefix(rel_path)
                     .is_ok_and(|remainder| remainder.components().next().is_some())
             })
-        })
+        });
+        publish_directory(exists);
+        exists
     }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.absolute_path(self.as_project(), abs_path));
         let rel_path = relative_path_under_root(abs_path, self.root())?;
         self.file_by_rel_path(&rel_path)
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.absolute_path(self.as_project(), abs_path));
         let rel_path = relative_path_under_root(abs_path, self.root())?;
         Some(ProjectFile::new(self.root().to_path_buf(), rel_path))
     }
@@ -430,6 +561,10 @@ pub trait Project: Send + Sync {
     }
 
     fn is_gitignored(&self, _rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.git_ignore(self.as_project(), _rel_path));
+        publish_git_ignore_presence_only();
         false
     }
 
@@ -437,6 +572,10 @@ pub trait Project: Send + Sync {
     /// Unlike [`Project::is_gitignored`], this does not describe membership in
     /// [`Project::all_files`]: matching paths remain in the file-tool view.
     fn is_bifrostignored(&self, _rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        publish_ignore_rules(BifrostIgnoreMatcher::empty_rules_digest());
         false
     }
 
@@ -460,7 +599,17 @@ pub trait Project: Send + Sync {
     /// buffer content pushed in by `textDocument/did{Open,Change}`
     /// notifications.
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
-        decode_source_bytes(std::fs::read(file.abs_path())?)
+        match self.project_read_slot() {
+            Some(slot) => slot
+                .source(
+                    self.as_project(),
+                    file,
+                    || read_disk_source_snapshot(file),
+                    |source| Some(source.oid()),
+                )
+                .map(|snapshot| snapshot.source().to_owned()),
+            None => decode_source_bytes(std::fs::read(file.abs_path())?),
+        }
     }
 
     /// Read source only when it fits in `max_bytes`, without allocating the
@@ -471,9 +620,19 @@ pub trait Project: Send + Sync {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<String>> {
-        read_disk_source_bytes_limited(file, max_bytes)?
-            .map(decode_source_bytes)
-            .transpose()
+        match self.project_read_slot() {
+            Some(slot) => slot
+                .source(
+                    self.as_project(),
+                    file,
+                    || read_disk_source_snapshot_limited(file, max_bytes),
+                    |source| source.as_ref().map(ProjectSourceSnapshot::oid),
+                )
+                .map(|snapshot| snapshot.map(|snapshot| snapshot.source().to_owned())),
+            None => read_disk_source_bytes_limited(file, max_bytes)?
+                .map(decode_source_bytes)
+                .transpose(),
+        }
     }
 
     /// Capture source text and its disk/overlay identity in one read.
@@ -512,11 +671,21 @@ pub trait Project: Send + Sync {
     /// content-keyed cache must ask the project rather than the analyzer's
     /// live path map.
     fn overlay_content(&self) -> Option<Arc<WorkspaceOverlayContent>> {
-        None
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.overlays(self.as_project()));
+        let answer = None;
+        super::project_reads::publish_overlays(&answer);
+        answer
     }
 
-    fn has_overlay(&self, _file: &ProjectFile) -> bool {
-        false
+    fn has_overlay(&self, file: &ProjectFile) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.overlay_membership(self.as_project(), file.rel_path()));
+        let answer = false;
+        super::project_reads::publish_overlay_membership(answer);
+        answer
     }
 
     /// Monotonic process-local generation for source that can change behind
@@ -528,6 +697,8 @@ pub trait Project: Send + Sync {
 }
 
 fn read_disk_source_snapshot(file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::project_reads::count_project_io(super::project_reads::ProjectIo::Source);
     ProjectSourceSnapshot::disk_bytes(std::fs::read(file.abs_path())?)
 }
 
@@ -545,6 +716,8 @@ fn read_disk_source_bytes_limited(
     file: &ProjectFile,
     max_bytes: usize,
 ) -> io::Result<Option<Vec<u8>>> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::project_reads::count_project_io(super::project_reads::ProjectIo::Source);
     let mut source = Vec::new();
     let read_limit = u64::try_from(max_bytes)
         .unwrap_or(u64::MAX)
@@ -592,6 +765,7 @@ pub fn decode_source_bytes(bytes: Vec<u8>) -> io::Result<String> {
 
 #[derive(Debug, Clone)]
 pub struct TestProject {
+    project_reads: ProjectReadSlot,
     root: PathBuf,
     languages: BTreeSet<Language>,
     listing_count: Arc<AtomicUsize>,
@@ -631,6 +805,7 @@ impl TestProject {
 
     fn with_validated_root_and_languages(root: PathBuf, languages: BTreeSet<Language>) -> Self {
         Self {
+            project_reads: ProjectReadSlot::default(),
             root,
             languages,
             listing_count: Arc::new(AtomicUsize::new(0)),
@@ -654,8 +829,28 @@ fn filesystem_has_directory(root: &Path, rel_path: &Path) -> bool {
 }
 
 impl Project for TestProject {
+    fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        let digest = BifrostIgnoreMatcher::empty_rules_digest();
+        publish_ignore_rules(digest);
+        Ok(digest)
+    }
+    fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(&self, capability: ReadCapability) -> bool {
+        self.project_reads.install(capability);
+        true
+    }
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
-        read_disk_source_snapshot(file)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot(file),
+            |source| Some(source.oid()),
+        )
     }
 
     fn read_source_snapshot_limited(
@@ -663,7 +858,12 @@ impl Project for TestProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<ProjectSourceSnapshot>> {
-        read_disk_source_snapshot_limited(file, max_bytes)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot_limited(file, max_bytes),
+            |source| source.as_ref().map(ProjectSourceSnapshot::oid),
+        )
     }
 
     fn root(&self) -> &Path {
@@ -671,7 +871,8 @@ impl Project for TestProject {
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.languages.clone()
+        self.project_reads
+            .languages(self.as_project(), || self.languages.clone())
     }
 
     fn workspace_file_listing_count(&self) -> usize {
@@ -679,6 +880,9 @@ impl Project for TestProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.listing_count.fetch_add(1, Ordering::Relaxed);
         let mut files = BTreeSet::new();
 
@@ -695,16 +899,24 @@ impl Project for TestProject {
             files.insert(ProjectFile::new(self.root.clone(), rel.to_path_buf()));
         }
 
+        publish_file_set(self, &files)?;
         Ok(files)
     }
 
     fn has_directory(&self, rel_path: &Path) -> bool {
-        filesystem_has_directory(&self.root, rel_path)
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.directory(self.as_project(), rel_path));
+        let exists = filesystem_has_directory(&self.root, rel_path);
+        publish_directory(exists);
+        exists
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
         let extensions = language.extensions();
         if extensions.is_empty() {
+            self.all_files_shared()?;
             return Ok(BTreeSet::new());
         }
 
@@ -726,12 +938,19 @@ impl Project for TestProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
+        publish_file_set(self, files)?;
         Ok(files_for_language(files, language, ProjectFile::language))
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), rel_path));
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
-        file.abs_path().is_file().then_some(file)
+        (super::project_reads::observed_path_kind(&file.abs_path())
+            == super::project_reads::WorkspacePathKind::File)
+            .then_some(file)
     }
 }
 
@@ -750,16 +969,19 @@ impl Project for TestProject {
 /// patterns stay listed after invalidation.
 #[derive(Debug)]
 pub struct WorkspaceFileListingCache {
+    project_reads: ProjectReadSlot,
     root: PathBuf,
     generation: AtomicU64,
     walks: AtomicUsize,
     cached: Mutex<Option<CachedFileListing>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CachedFileListing {
     generation: u64,
     files: Arc<BTreeSet<ProjectFile>>,
+    matcher: Arc<BifrostIgnoreMatcher>,
+    receipt: ProjectReadReceipt,
 }
 
 impl WorkspaceFileListingCache {
@@ -770,6 +992,7 @@ impl WorkspaceFileListingCache {
             root.display()
         );
         Self {
+            project_reads: ProjectReadSlot::default(),
             root,
             generation: AtomicU64::new(0),
             walks: AtomicUsize::new(0),
@@ -795,23 +1018,47 @@ impl WorkspaceFileListingCache {
     /// stale-marked, so the next call re-walks instead of serving a listing
     /// that may predate the change.
     pub fn files(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
-        let mut slot = self
-            .cached
-            .lock()
-            .expect("workspace file listing cache poisoned");
-        let generation = self.generation.load(Ordering::Acquire);
-        if let Some(cached) = slot.as_ref()
-            && cached.generation == generation
-        {
-            return Ok(Arc::clone(&cached.files));
+        self.project_reads.cached_inventory(&self.root, || {
+            let mut slot = self
+                .cached
+                .lock()
+                .expect("workspace file listing cache poisoned");
+            let generation = self.generation.load(Ordering::Acquire);
+            if let Some(cached) = slot.as_ref()
+                && cached.generation == generation
+            {
+                publish_receipt(cached.receipt.clone());
+                return Ok(Arc::clone(&cached.files));
+            }
+            self.walks.fetch_add(1, Ordering::Relaxed);
+            let files = Arc::new(collect_workspace_files(&self.root)?);
+            let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, &files)?);
+            let receipt = matcher.listing_receipt();
+            *slot = Some(CachedFileListing {
+                generation,
+                files: Arc::clone(&files),
+                matcher,
+                receipt: receipt.clone(),
+            });
+            publish_receipt(receipt);
+            Ok(files)
+        })
+    }
+
+    fn matcher(&self) -> io::Result<Arc<BifrostIgnoreMatcher>> {
+        // Recheck the generation while holding the same lock as the listing.
+        loop {
+            self.files()?;
+            let slot = self
+                .cached
+                .lock()
+                .expect("workspace file listing cache poisoned");
+            if let Some(cached) = slot.as_ref()
+                && cached.generation == self.generation.load(Ordering::Acquire)
+            {
+                return Ok(Arc::clone(&cached.matcher));
+            }
         }
-        self.walks.fetch_add(1, Ordering::Relaxed);
-        let files = Arc::new(collect_workspace_files(&self.root)?);
-        *slot = Some(CachedFileListing {
-            generation,
-            files: Arc::clone(&files),
-        });
-        Ok(files)
     }
 
     /// Record one path's membership in the cached listing without walking.
@@ -826,6 +1073,13 @@ impl WorkspaceFileListingCache {
             .cached
             .lock()
             .expect("workspace file listing cache poisoned");
+        if file
+            .rel_path()
+            .file_name()
+            .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME)
+        {
+            return false;
+        }
         let generation = self.generation.load(Ordering::Acquire);
         let Some(cached) = slot
             .as_mut()
@@ -850,7 +1104,18 @@ impl WorkspaceFileListingCache {
         } else {
             files.remove(file);
         }
-        cached.files = Arc::new(files);
+        if listed
+            && !cached
+                .files
+                .iter()
+                .any(|existing| existing.rel_path().parent() == file.rel_path().parent())
+        {
+            return false;
+        }
+        let files = Arc::new(files);
+        let receipt = cached.matcher.receipt_for(&files);
+        cached.files = files;
+        cached.receipt = receipt;
         true
     }
 
@@ -862,8 +1127,15 @@ impl WorkspaceFileListingCache {
     }
 }
 
+#[derive(Debug)]
+struct IgnoreRulesSnapshot {
+    matcher: Arc<BifrostIgnoreMatcher>,
+    receipt: ProjectReadReceipt,
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemProject {
+    project_reads: ProjectReadSlot,
     root: PathBuf,
     languages: BTreeSet<Language>,
     listing_count: Arc<AtomicUsize>,
@@ -872,10 +1144,39 @@ pub struct FilesystemProject {
     /// the first consumer. Manual sessions deliberately return to fresh walks
     /// after that one use rather than retaining a stale cache.
     initial_listing: Arc<Mutex<Option<Arc<BTreeSet<ProjectFile>>>>>,
-    bifrost_ignore: Arc<Mutex<Option<Arc<BifrostIgnoreMatcher>>>>,
+    bifrost_ignore: Arc<Mutex<Option<IgnoreRulesSnapshot>>>,
 }
 
 impl FilesystemProject {
+    pub(super) fn from_listing(root: &Path, files: Arc<BTreeSet<ProjectFile>>) -> Self {
+        // Used only as the attribution source for an already completed cache call.
+        Self::from_listing_and_matcher(
+            root,
+            files,
+            Arc::new(
+                BifrostIgnoreMatcher::build_with(root, &BTreeSet::new(), |_| Ok(None))
+                    .expect("empty rules"),
+            ),
+        )
+    }
+
+    fn from_listing_and_matcher(
+        root: &Path,
+        files: Arc<BTreeSet<ProjectFile>>,
+        matcher: Arc<BifrostIgnoreMatcher>,
+    ) -> Self {
+        let receipt = matcher.listing_receipt();
+        Self {
+            project_reads: ProjectReadSlot::default(),
+            root: root.to_path_buf(),
+            languages: detect_languages_in_files(&files),
+            listing_count: Arc::new(AtomicUsize::new(0)),
+            cached_listing: None,
+            initial_listing: Arc::new(Mutex::new(Some(files))),
+            bifrost_ignore: Arc::new(Mutex::new(Some(IgnoreRulesSnapshot { matcher, receipt }))),
+        }
+    }
+
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into().canonicalize()?.normalize();
         if !root.is_dir() {
@@ -886,15 +1187,9 @@ impl FilesystemProject {
         }
 
         let files = Arc::new(collect_workspace_files(&root)?);
-        let languages = detect_languages_in_files(&files);
-        Ok(Self {
-            root,
-            languages,
-            listing_count: Arc::new(AtomicUsize::new(0)),
-            cached_listing: None,
-            initial_listing: Arc::new(Mutex::new(Some(files))),
-            bifrost_ignore: Arc::new(Mutex::new(None)),
-        })
+        let matcher = Arc::new(BifrostIgnoreMatcher::build(&root, &files)?);
+        let project = Self::from_listing_and_matcher(&root, Arc::clone(&files), matcher);
+        Ok(project)
     }
 
     /// Construct a project whose `all_files` listing is served from `listing`
@@ -918,14 +1213,10 @@ impl FilesystemProject {
             "cached listing root must match the canonical project root"
         );
         let files = listing.files()?;
-        Ok(Self {
-            root,
-            languages: detect_languages_in_files(&files),
-            listing_count: Arc::new(AtomicUsize::new(0)),
-            cached_listing: Some(listing),
-            initial_listing: Arc::new(Mutex::new(None)),
-            bifrost_ignore: Arc::new(Mutex::new(None)),
-        })
+        let matcher = listing.matcher()?;
+        let mut project = Self::from_listing_and_matcher(&root, files, matcher);
+        project.cached_listing = Some(listing);
+        Ok(project)
     }
 
     pub fn root_path(&self) -> &Path {
@@ -936,15 +1227,25 @@ impl FilesystemProject {
         &self,
         files: &BTreeSet<ProjectFile>,
     ) -> io::Result<Arc<BifrostIgnoreMatcher>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        if let Some(cache) = &self.cached_listing {
+            let matcher = cache.matcher()?;
+            publish_ignore_rules(matcher.rules_digest());
+            return Ok(matcher);
+        }
         let mut slot = self
             .bifrost_ignore
             .lock()
             .expect("Bifrost ignore matcher lock poisoned");
-        if let Some(matcher) = slot.as_ref() {
-            return Ok(Arc::clone(matcher));
+        if slot.is_none() {
+            let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, files)?);
+            let receipt = matcher.listing_receipt();
+            *slot = Some(IgnoreRulesSnapshot { matcher, receipt });
         }
-        let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, files)?);
-        *slot = Some(Arc::clone(&matcher));
+        let matcher = Arc::clone(&slot.as_ref().expect("built matcher").matcher);
+        publish_ignore_rules(matcher.rules_digest());
         Ok(matcher)
     }
 
@@ -959,15 +1260,31 @@ impl FilesystemProject {
     /// is called once per path in loops over a whole revision, so a warm
     /// `--diff-base` policy run spawned one repository-wide `git status` per
     /// committed blob (#2769).
-    fn cached_bifrost_ignore_matcher(&self) -> Option<Arc<BifrostIgnoreMatcher>> {
-        self.bifrost_ignore
+    fn cached_bifrost_ignore_matcher(&self) -> io::Result<Option<Arc<BifrostIgnoreMatcher>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        if let Some(cache) = &self.cached_listing {
+            let matcher = cache.matcher()?;
+            publish_ignore_rules(matcher.rules_digest());
+            return Ok(Some(matcher));
+        }
+        let slot = self
+            .bifrost_ignore
             .lock()
-            .expect("Bifrost ignore matcher lock poisoned")
-            .as_ref()
-            .map(Arc::clone)
+            .expect("Bifrost ignore matcher lock poisoned");
+        let Some(snapshot) = slot.as_ref() else {
+            return Ok(None);
+        };
+        publish_receipt(snapshot.receipt.clone());
+        publish_ignore_rules(snapshot.matcher.rules_digest());
+        Ok(Some(Arc::clone(&snapshot.matcher)))
     }
 
     fn take_initial_listing(&self) -> Option<Arc<BTreeSet<ProjectFile>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.initial_listing
             .lock()
             .expect("initial workspace listing mutex poisoned")
@@ -976,8 +1293,33 @@ impl FilesystemProject {
 }
 
 impl Project for FilesystemProject {
+    fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        if let Some(matcher) = self.cached_bifrost_ignore_matcher()? {
+            return Ok(matcher.rules_digest());
+        }
+        let files = self.all_files_shared()?;
+        Ok(self.bifrost_ignore_matcher(&files)?.rules_digest())
+    }
+    fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(&self, capability: ReadCapability) -> bool {
+        if let Some(cache) = &self.cached_listing {
+            cache.project_reads.install(capability.clone());
+        }
+        self.project_reads.install(capability);
+        true
+    }
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
-        read_disk_source_snapshot(file)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot(file),
+            |source| Some(source.oid()),
+        )
     }
 
     fn read_source_snapshot_limited(
@@ -985,7 +1327,12 @@ impl Project for FilesystemProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<ProjectSourceSnapshot>> {
-        read_disk_source_snapshot_limited(file, max_bytes)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot_limited(file, max_bytes),
+            |source| source.as_ref().map(ProjectSourceSnapshot::oid),
+        )
     }
 
     fn root(&self) -> &Path {
@@ -993,7 +1340,8 @@ impl Project for FilesystemProject {
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.languages.clone()
+        self.project_reads
+            .languages(self.as_project(), || self.languages.clone())
     }
 
     fn workspace_file_listing_count(&self) -> usize {
@@ -1001,17 +1349,50 @@ impl Project for FilesystemProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.all_files_shared().map(|files| (*files).clone())
     }
 
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.listing_count.fetch_add(1, Ordering::Relaxed);
-        match &self.cached_listing {
-            Some(cache) => cache.files(),
-            None => self
-                .take_initial_listing()
-                .map_or_else(|| collect_workspace_files(&self.root).map(Arc::new), Ok),
+        if let Some(cache) = &self.cached_listing {
+            return cache.files();
         }
+        let files = if let Some(files) = self.take_initial_listing() {
+            files
+        } else {
+            let files = Arc::new(collect_workspace_files(&self.root)?);
+            let mut slot = self
+                .bifrost_ignore
+                .lock()
+                .expect("Bifrost ignore matcher lock poisoned");
+            if let Some(snapshot) = slot.as_mut() {
+                // Fresh file discovery does not invalidate ignore rules. Keep
+                // the matcher until explicit invalidation, but certify this
+                // walk's files using the rules that will filter them.
+                snapshot.receipt = snapshot.matcher.receipt_for(&files);
+            } else {
+                let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, &files)?);
+                let receipt = matcher.listing_receipt();
+                *slot = Some(IgnoreRulesSnapshot { matcher, receipt });
+            }
+            files
+        };
+        let receipt = self
+            .bifrost_ignore
+            .lock()
+            .expect("Bifrost ignore matcher lock poisoned")
+            .as_ref()
+            .expect("listing filled matcher")
+            .receipt
+            .clone();
+        publish_receipt(receipt);
+        Ok(files)
     }
 
     fn update_cached_listing_for_path(&self, rel_path: &Path) -> bool {
@@ -1064,12 +1445,19 @@ impl Project for FilesystemProject {
     /// only for directories whose contents are entirely ignored, which the
     /// caller's listing then filters out exactly as before.
     fn has_directory(&self, rel_path: &Path) -> bool {
-        filesystem_has_directory(&self.root, rel_path)
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.directory(self.as_project(), rel_path));
+        let exists = filesystem_has_directory(&self.root, rel_path);
+        publish_directory(exists);
+        exists
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
         let extensions = language.extensions();
         if extensions.is_empty() {
+            self.all_files_shared()?;
             return Ok(BTreeSet::new());
         }
 
@@ -1086,7 +1474,9 @@ impl Project for FilesystemProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
         let bifrost_ignore = self.bifrost_ignore_matcher(files)?;
+        publish_file_set(self, files)?;
         Ok(files_for_language(files, language, ProjectFile::language)
             .into_iter()
             .filter(|file| !bifrost_ignore.is_ignored(file))
@@ -1094,33 +1484,50 @@ impl Project for FilesystemProject {
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), rel_path));
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
-        file.abs_path().is_file().then_some(file)
+        (super::project_reads::observed_path_kind(&file.abs_path())
+            == super::project_reads::WorkspacePathKind::File)
+            .then_some(file)
     }
 
     /// Both ignore probes read the listing and never keep it, so they take the
     /// shared handle: a per-probe `all_files` clone copies the whole workspace
     /// listing to answer one path.
     fn is_gitignored(&self, rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.git_ignore(self.as_project(), rel_path));
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
-        file.exists()
-            && self
-                .all_files_shared()
-                .map(|files| !files.contains(&file))
-                .unwrap_or(false)
+        if super::project_reads::observed_path_kind(&file.abs_path())
+            == super::project_reads::WorkspacePathKind::Absent
+        {
+            publish_git_ignore_presence_only();
+            return false;
+        }
+        self.all_files_shared()
+            .map(|files| !files.contains(&file))
+            .unwrap_or(false)
     }
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
         // The listing is taken only to build the matcher, so ask for it only
         // when there is no matcher yet. `invalidate_cached_file_listing` clears
         // the matcher and the listing together, so reading the matcher first
         // can never answer from rules older than the listing would have been.
-        let matcher = match self.cached_bifrost_ignore_matcher() {
-            Some(matcher) => Ok(matcher),
-            None => self
-                .all_files_shared()
-                .and_then(|files| self.bifrost_ignore_matcher(&files)),
-        };
+        let matcher = self
+            .cached_bifrost_ignore_matcher()
+            .and_then(|cached| match cached {
+                Some(matcher) => Ok(matcher),
+                None => self
+                    .all_files_shared()
+                    .and_then(|files| self.bifrost_ignore_matcher(&files)),
+            });
         matcher
             .map(|matcher| matcher.is_ignored_path(rel_path))
             .unwrap_or(false)
@@ -1134,8 +1541,10 @@ impl Project for FilesystemProject {
 /// these files and nothing else.
 #[derive(Debug, Clone)]
 pub struct FileSetProject {
+    project_reads: ProjectReadSlot,
     root: PathBuf,
     files: BTreeSet<ProjectFile>,
+    receipt: ProjectReadReceipt,
     languages: BTreeSet<Language>,
 }
 
@@ -1151,17 +1560,42 @@ impl FileSetProject {
             .map(|rel| ProjectFile::new(root.clone(), rel))
             .collect();
         let languages = detect_languages_in_files(&files);
+        let receipt = BifrostIgnoreMatcher::build_with(&root, &files, |_| Ok(None))
+            .expect("explicit file set has no ignore-rule inputs")
+            .listing_receipt();
         Self {
+            project_reads: ProjectReadSlot::default(),
             root,
             files,
+            receipt,
             languages,
         }
     }
 }
 
 impl Project for FileSetProject {
+    fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        let digest = BifrostIgnoreMatcher::empty_rules_digest();
+        publish_ignore_rules(digest);
+        Ok(digest)
+    }
+    fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(&self, capability: ReadCapability) -> bool {
+        self.project_reads.install(capability);
+        true
+    }
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
-        read_disk_source_snapshot(file)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot(file),
+            |source| Some(source.oid()),
+        )
     }
 
     fn read_source_snapshot_limited(
@@ -1169,7 +1603,12 @@ impl Project for FileSetProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<ProjectSourceSnapshot>> {
-        read_disk_source_snapshot_limited(file, max_bytes)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot_limited(file, max_bytes),
+            |source| source.as_ref().map(ProjectSourceSnapshot::oid),
+        )
     }
 
     fn root(&self) -> &Path {
@@ -1183,14 +1622,21 @@ impl Project for FileSetProject {
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.languages.clone()
+        self.project_reads
+            .languages(self.as_project(), || self.languages.clone())
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        publish_receipt(self.receipt.clone());
         Ok(self.files.clone())
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
+        publish_receipt(self.receipt.clone());
         Ok(files_for_language(&self.files, language, language_for_file))
     }
 
@@ -1199,11 +1645,17 @@ impl Project for FileSetProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
+        publish_file_set(self, files)?;
         Ok(files_for_language(files, language, language_for_file))
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), rel_path));
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
+        publish_receipt(self.receipt.clone());
         self.files.contains(&file).then_some(file)
     }
 
@@ -1217,6 +1669,7 @@ impl Project for FileSetProject {
 /// still decide what belongs to the analyzer.
 #[derive(Debug, Clone)]
 pub struct MultiRootProject {
+    project_reads: ProjectReadSlot,
     root: PathBuf,
     roots: Vec<FilesystemProject>,
     languages: BTreeSet<Language>,
@@ -1284,6 +1737,7 @@ impl MultiRootProject {
             .flat_map(|root| root.languages.iter().copied())
             .collect();
         Ok(Self {
+            project_reads: ProjectReadSlot::default(),
             root,
             roots,
             languages,
@@ -1302,8 +1756,46 @@ impl MultiRootProject {
 }
 
 impl Project for MultiRootProject {
+    fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        let mut hash = crate::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-multiroot-ignore-rules:v1",
+        );
+        for root in &self.roots {
+            hash.field(
+                "root",
+                crate::path_utils::workspace_relative_slash_path(
+                    root.root()
+                        .strip_prefix(&self.root)
+                        .expect("child root belongs to common root"),
+                )
+                .as_bytes(),
+            );
+            hash.field("rules", &root.ignore_rules_digest()?);
+        }
+        let digest = hash.finish();
+        publish_ignore_rules(digest);
+        Ok(digest)
+    }
+    fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(&self, capability: ReadCapability) -> bool {
+        for root in &self.roots {
+            root.install_read_recorder(capability.clone());
+        }
+        self.project_reads.install(capability);
+        true
+    }
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
-        read_disk_source_snapshot(file)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot(file),
+            |source| Some(source.oid()),
+        )
     }
 
     fn read_source_snapshot_limited(
@@ -1311,7 +1803,12 @@ impl Project for MultiRootProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<ProjectSourceSnapshot>> {
-        read_disk_source_snapshot_limited(file, max_bytes)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || read_disk_source_snapshot_limited(file, max_bytes),
+            |source| source.as_ref().map(ProjectSourceSnapshot::oid),
+        )
     }
 
     fn root(&self) -> &Path {
@@ -1329,16 +1826,21 @@ impl Project for MultiRootProject {
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.languages.clone()
+        self.project_reads
+            .languages(self.as_project(), || self.languages.clone())
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         let mut files = BTreeSet::new();
         for root in &self.roots {
             for file in root.all_files()? {
                 files.insert(self.common_file_for_root_file(file));
             }
         }
+        publish_file_set(self, &files)?;
         Ok(files)
     }
 
@@ -1350,13 +1852,9 @@ impl Project for MultiRootProject {
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
-        let mut files = BTreeSet::new();
-        for root in &self.roots {
-            for file in root.analyzable_files(language)? {
-                files.insert(self.common_file_for_root_file(file));
-            }
-        }
-        Ok(files)
+        let _project_read = listing_read(self);
+        let files = self.all_files_shared()?;
+        self.analyzable_files_from(&files, language)
     }
 
     fn analyzable_files_from(
@@ -1364,6 +1862,7 @@ impl Project for MultiRootProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
         let mut analyzable = BTreeSet::new();
         for root in &self.roots {
             let root_files = files
@@ -1381,14 +1880,21 @@ impl Project for MultiRootProject {
                 analyzable.insert(self.common_file_for_root_file(file));
             }
         }
+        publish_file_set(self, files)?;
         Ok(analyzable)
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), rel_path));
         self.file_by_abs_path(&self.root.join(rel_path))
     }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.absolute_path(self.as_project(), abs_path));
         let abs_path = abs_path.to_path_buf().normalize();
         for root in &self.roots {
             let Some(root_rel_path) = relative_path_from_normalized_root(&abs_path, root.root())
@@ -1403,6 +1909,9 @@ impl Project for MultiRootProject {
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.absolute_path(self.as_project(), abs_path));
         let abs_path = abs_path.to_path_buf().normalize();
         let rel_path = relative_path_from_normalized_root(&abs_path, &self.root)?;
         for root in &self.roots {
@@ -1420,12 +1929,18 @@ impl Project for MultiRootProject {
     }
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
         let abs_path = self.root.join(rel_path);
-        self.roots.iter().any(|root| {
+        let ignored = self.roots.iter().any(|root| {
             abs_path
                 .strip_prefix(root.root())
                 .is_ok_and(|root_rel_path| root.is_bifrostignored(root_rel_path))
-        })
+        });
+        self.ignore_rules_digest()
+            .expect("workspace roots have readable rule inputs");
+        ignored
     }
 
     fn persistence_root(&self) -> Option<&Path> {
@@ -1449,6 +1964,8 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
 /// workspace. The walk is ignore-aware, skips `.git/`, and keeps other dotted
 /// directories in scope.
 pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::project_reads::count_project_io(super::project_reads::ProjectIo::Walk);
     let _scope = crate::profiling::scope("project::collect_workspace_files");
     let mut apply_parent_ignores = true;
     if let Some(repo) = crate::gitblob::discover(root) {
@@ -1579,24 +2096,32 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceOverlayContent {
     entries: Arc<[(ProjectFile, [u8; 32])]>,
+    blob_ids: Arc<[Oid]>,
     digest: [u8; 32],
 }
 
 impl WorkspaceOverlayContent {
     const DOMAIN: &[u8] = b"bifrost-workspace-overlay-content:v1";
 
-    pub fn new(entries: impl IntoIterator<Item = (ProjectFile, [u8; 32])>) -> Self {
+    pub fn new(entries: impl IntoIterator<Item = (ProjectFile, [u8; 32], Oid)>) -> Self {
         let mut entries = entries.into_iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| {
             crate::path_utils::rel_path_string(&left.0)
                 .cmp(&crate::path_utils::rel_path_string(&right.0))
         });
         let mut hasher = crate::analyzer::canonical_hash::CanonicalHasher::new(Self::DOMAIN);
-        for (file, digest) in &entries {
+        for (file, digest, _) in &entries {
             hasher.field(&crate::path_utils::rel_path_string(file), digest);
         }
+        // Split only after canonical ordering; the immutable arrays share the
+        // same entry order for their entire lifetime.
+        let (entries, blob_ids): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .map(|(file, digest, blob)| ((file, digest), blob))
+            .unzip();
         Self {
             entries: entries.into(),
+            blob_ids: blob_ids.into(),
             digest: hasher.finish(),
         }
     }
@@ -1605,6 +2130,16 @@ impl WorkspaceOverlayContent {
     /// order.
     pub fn entries(&self) -> &[(ProjectFile, [u8; 32])] {
         &self.entries
+    }
+
+    /// The same ordered entries with their exact write-side Git blob identity.
+    pub fn entries_with_blob_ids(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&ProjectFile, &[u8; 32], Oid)> {
+        self.entries
+            .iter()
+            .zip(self.blob_ids.iter())
+            .map(|((file, digest), blob)| (file, digest, *blob))
     }
 
     /// Whether `file` is currently overlaid, so a caller must take its content
@@ -1642,6 +2177,7 @@ impl WorkspaceOverlayContent {
 /// on disk -- ignored, out of scope -- stays excluded when an editor opens it,
 /// exactly as it was before the buffer existed.
 pub struct OverlayProject {
+    project_reads: ProjectReadSlot,
     /// The overlay content identity published for the map's current revision.
     /// Recomputing it hashes every open buffer, so it is derived once per
     /// accepted edit rather than once per query. The revision is a memo key
@@ -1668,6 +2204,18 @@ pub struct OverlayProject {
 struct OverlayEntry {
     source: Arc<str>,
     revision: OverlayRevision,
+    content_digest: [u8; 32],
+    blob_id: Oid,
+}
+
+impl OverlayEntry {
+    fn snapshot(&self) -> ProjectSourceSnapshot {
+        ProjectSourceSnapshot {
+            source: Arc::clone(&self.source),
+            oid: self.blob_id,
+            origin: ProjectSourceOrigin::Overlay(self.revision),
+        }
+    }
 }
 
 impl OverlayProject {
@@ -1679,6 +2227,7 @@ impl OverlayProject {
     /// future tuning; production LSP wiring uses [`Self::new`].
     pub fn with_max_bytes(delegate: Arc<dyn Project>, max_overlay_bytes: usize) -> Self {
         Self {
+            project_reads: ProjectReadSlot::default(),
             overlay_content: Mutex::new(None),
             delegate,
             overlays: Arc::new(RwLock::new(HashMap::new())),
@@ -1711,10 +2260,23 @@ impl OverlayProject {
     /// Subsequent editor changes mutate the live project's map without changing this
     /// snapshot, allowing background requests to use one coherent source generation.
     pub fn snapshot(&self) -> Self {
+        let _project_read = self.project_reads.overlays(self.as_project());
         let overlays = self.overlays.read().expect("overlay lock poisoned");
         let frozen_overlays = overlays.clone();
         let frozen_generation = self.published_generation.load(Ordering::Acquire);
+        let content = Arc::new(WorkspaceOverlayContent::new(
+            frozen_overlays.iter().filter_map(|(path, entry)| {
+                let rel_path = path.strip_prefix(self.delegate.root()).ok()?;
+                Some((
+                    ProjectFile::new(self.delegate.root().to_path_buf(), rel_path),
+                    entry.content_digest,
+                    entry.blob_id,
+                ))
+            }),
+        ));
+        super::project_reads::publish_overlays(&Some(content));
         Self {
+            project_reads: ProjectReadSlot::default(),
             overlay_content: Mutex::new(None),
             delegate: Arc::clone(&self.delegate),
             overlays: Arc::new(RwLock::new(frozen_overlays)),
@@ -1747,6 +2309,9 @@ impl OverlayProject {
         overlays.insert(
             abs_path,
             Arc::new(OverlayEntry {
+                content_digest: crate::analyzer::canonical_hash::sha256_bytes(content.as_bytes()),
+                blob_id: Oid::hash_object(ObjectType::Blob, content.as_bytes())
+                    .expect("hashing installed overlay"),
                 source: Arc::from(content),
                 revision,
             }),
@@ -1802,6 +2367,9 @@ impl OverlayProject {
     /// root; a key that is not belongs to no workspace-relative path and is
     /// dropped rather than guessed at.
     fn overlay_project_files(&self) -> Vec<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         let root = self.delegate.root();
         self.overlays
             .read()
@@ -1831,11 +2399,18 @@ impl OverlayProject {
     }
 
     fn overlay_entry(&self, file: &ProjectFile) -> Option<Arc<OverlayEntry>> {
-        self.overlays
-            .read()
-            .expect("overlay lock poisoned")
-            .get(&file.abs_path())
-            .cloned()
+        self.project_reads.overlay(
+            self.as_project(),
+            file,
+            || {
+                self.overlays
+                    .read()
+                    .expect("overlay lock poisoned")
+                    .get(&file.abs_path())
+                    .cloned()
+            },
+            |entry| entry.blob_id,
+        )
     }
 
     /// Add the buffers among `candidates` that belong in a `language` listing
@@ -1884,6 +2459,20 @@ impl OverlayProject {
 }
 
 impl Project for OverlayProject {
+    fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        self.delegate.ignore_rules_digest()
+    }
+    fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(&self, capability: ReadCapability) -> bool {
+        self.delegate.install_read_recorder(capability.clone());
+        self.project_reads.install(capability);
+        true
+    }
     fn workspace_file_listing_count(&self) -> usize {
         self.delegate.workspace_file_listing_count()
     }
@@ -1903,14 +2492,21 @@ impl Project for OverlayProject {
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.delegate.analyzer_languages()
+        self.project_reads
+            .languages(self.as_project(), || self.delegate.analyzer_languages())
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.all_files_shared().map(|files| (*files).clone())
     }
 
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         let files = self.delegate.all_files_shared()?;
         let additions: Vec<ProjectFile> =
             Self::buffers_missing_from(self.overlay_project_files(), &files).collect();
@@ -1919,15 +2515,21 @@ impl Project for OverlayProject {
         // this generation shares. Copying it per call to add nothing would make
         // a whole-workspace clone the price of holding a buffer open.
         if additions.is_empty() {
+            publish_file_set(self, &files)?;
             return Ok(files);
         }
         let mut extended = (*files).clone();
         extended.extend(additions);
+        publish_file_set(self, &extended)?;
         Ok(Arc::new(extended))
     }
 
     fn has_directory(&self, rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.directory(self.as_project(), rel_path));
         if self.delegate.has_directory(rel_path) {
+            publish_directory(true);
             return true;
         }
         // `false` is the authoritative half of this answer -- no workspace file
@@ -1936,7 +2538,8 @@ impl Project for OverlayProject {
         // existence probe: it only means a listing is worth computing, and that
         // listing applies the membership rule.
         let prefix = self.delegate.root().join(rel_path);
-        self.overlays
+        let exists = self
+            .overlays
             .read()
             .expect("overlay lock poisoned")
             .keys()
@@ -1944,13 +2547,15 @@ impl Project for OverlayProject {
                 abs_path
                     .strip_prefix(&prefix)
                     .is_ok_and(|remainder| remainder.components().next().is_some())
-            })
+            });
+        publish_directory(exists);
+        exists
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
-        let mut files = self.delegate.analyzable_files(language)?;
-        self.add_analyzable_overlays(language, self.overlay_project_files(), &mut files);
-        Ok(files)
+        let _project_read = listing_read(self);
+        let files = self.all_files_shared()?;
+        self.analyzable_files_from(&files, language)
     }
 
     fn analyzable_files_from(
@@ -1958,6 +2563,7 @@ impl Project for OverlayProject {
         files: &BTreeSet<ProjectFile>,
         language: Language,
     ) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = listing_read(self);
         let mut analyzable = self.delegate.analyzable_files_from(files, language)?;
         // A caller-owned listing is filtered, not extended: a buffer belongs in
         // the answer only when the caller's set already names it (which a
@@ -1972,18 +2578,25 @@ impl Project for OverlayProject {
                 .filter(|file| files.contains(file)),
             &mut analyzable,
         );
+        publish_file_set(self, files)?;
         Ok(analyzable)
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), rel_path));
         if let Some(file) = self.delegate.file_by_rel_path(rel_path) {
             return Some(file);
         }
         let file = ProjectFile::new(self.delegate.root().to_path_buf(), rel_path.to_path_buf());
-        self.has_overlay(&file).then_some(file)
+        super::project_reads::observed_overlay_membership().then_some(file)
     }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.absolute_path(self.as_project(), abs_path));
         if let Some(file) = self.delegate.file_by_abs_path(abs_path) {
             return Some(file);
         }
@@ -1992,6 +2605,9 @@ impl Project for OverlayProject {
     }
 
     fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.absolute_path(self.as_project(), abs_path));
         self.delegate.file_by_abs_path_allow_missing(abs_path)
     }
 
@@ -2000,10 +2616,16 @@ impl Project for OverlayProject {
     }
 
     fn is_gitignored(&self, rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.git_ignore(self.as_project(), rel_path));
         self.delegate.is_gitignored(rel_path)
     }
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
         self.delegate.is_bifrostignored(rel_path)
     }
 
@@ -2030,14 +2652,18 @@ impl Project for OverlayProject {
     }
 
     fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
-        let entry = self.overlay_entry(file);
-        if let Some(entry) = entry {
-            return Ok(ProjectSourceSnapshot::overlay(
-                Arc::clone(&entry.source),
-                entry.revision,
-            ));
-        }
-        self.delegate.read_source_snapshot(file)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                let entry = self.overlay_entry(file);
+                if let Some(entry) = entry {
+                    return Ok(entry.snapshot());
+                }
+                self.delegate.read_source_snapshot(file)
+            },
+            |source| Some(source.oid()),
+        )
     }
 
     fn read_source_snapshot_limited(
@@ -2045,46 +2671,66 @@ impl Project for OverlayProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<ProjectSourceSnapshot>> {
-        let entry = self.overlay_entry(file);
-        if let Some(entry) = entry {
-            return Ok((entry.source.len() <= max_bytes).then(|| {
-                ProjectSourceSnapshot::overlay(Arc::clone(&entry.source), entry.revision)
-            }));
-        }
-        self.delegate.read_source_snapshot_limited(file, max_bytes)
+        self.project_reads.source(
+            self.as_project(),
+            file,
+            || {
+                let entry = self.overlay_entry(file);
+                if let Some(entry) = entry {
+                    return Ok((entry.source.len() <= max_bytes).then(|| entry.snapshot()));
+                }
+                self.delegate.read_source_snapshot_limited(file, max_bytes)
+            },
+            |source| source.as_ref().map(ProjectSourceSnapshot::oid),
+        )
     }
 
     fn has_overlay(&self, file: &ProjectFile) -> bool {
-        self.overlays
-            .read()
-            .expect("overlay lock poisoned")
-            .contains_key(&file.abs_path())
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.overlay_membership(self.as_project(), file.rel_path()));
+        let answer = {
+            self.overlays
+                .read()
+                .expect("overlay lock poisoned")
+                .contains_key(&file.abs_path())
+        };
+        super::project_reads::publish_overlay_membership(answer);
+        answer
     }
 
     fn overlay_content(&self) -> Option<Arc<WorkspaceOverlayContent>> {
-        let revision = self.published_generation.load(Ordering::Acquire);
-        let mut memo = self
-            .overlay_content
-            .lock()
-            .expect("overlay content memo poisoned");
-        if let Some((memoized_revision, content)) = memo.as_ref()
-            && *memoized_revision == revision
-        {
-            return Some(Arc::clone(content));
-        }
-        let overlays = self.overlays.read().expect("overlay lock poisoned");
-        let root = self.delegate.root();
-        let content = Arc::new(WorkspaceOverlayContent::new(overlays.iter().filter_map(
-            |(abs_path, entry)| {
-                let rel_path = abs_path.strip_prefix(root).ok()?;
-                Some((
-                    ProjectFile::new(root.to_path_buf(), rel_path),
-                    crate::analyzer::canonical_hash::sha256_bytes(entry.source.as_bytes()),
-                ))
-            },
-        )));
-        *memo = Some((revision, Arc::clone(&content)));
-        Some(content)
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.overlays(self.as_project()));
+        let answer = 'answer: {
+            let revision = self.published_generation.load(Ordering::Acquire);
+            let mut memo = self
+                .overlay_content
+                .lock()
+                .expect("overlay content memo poisoned");
+            if let Some((memoized_revision, content)) = memo.as_ref()
+                && *memoized_revision == revision
+            {
+                break 'answer Some(Arc::clone(content));
+            }
+            let overlays = self.overlays.read().expect("overlay lock poisoned");
+            let root = self.delegate.root();
+            let content = Arc::new(WorkspaceOverlayContent::new(overlays.iter().filter_map(
+                |(abs_path, entry)| {
+                    let rel_path = abs_path.strip_prefix(root).ok()?;
+                    Some((
+                        ProjectFile::new(root.to_path_buf(), rel_path),
+                        entry.content_digest,
+                        entry.blob_id,
+                    ))
+                },
+            )));
+            *memo = Some((revision, Arc::clone(&content)));
+            Some(content)
+        };
+        super::project_reads::publish_overlays(&answer);
+        answer
     }
 
     fn analysis_generation(&self) -> u64 {
@@ -2115,6 +2761,64 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: the default supplied-set filter enumerated the workspace again while building listing receipts"
+    )]
+    fn default_language_filter_reuses_the_supplied_listing() {
+        struct DefaultFilteringProject(TestProject);
+        impl Project for DefaultFilteringProject {
+            fn root(&self) -> &Path {
+                self.0.root()
+            }
+            fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+                self.0.project_read_slot()
+            }
+            fn install_read_recorder(&self, capability: ReadCapability) -> bool {
+                self.0.install_read_recorder(capability)
+            }
+            fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+                self.0.ignore_rules_digest()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(rel_path)
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.py"), "answer = 42\n").unwrap();
+        std::fs::write(root.join("b.ts"), "export const answer = 42;\n").unwrap();
+        std::fs::write(root.join("README.md"), "Example project\n").unwrap();
+        let project = DefaultFilteringProject(TestProject::new(root.clone(), Language::Python));
+        let files = project.all_files().unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(project.0.workspace_file_listing_count(), 1);
+        assert_eq!(
+            project
+                .analyzable_files_from(&files, Language::Python)
+                .unwrap(),
+            BTreeSet::from([ProjectFile::new(root, "a.py")])
+        );
+        let receipt = crate::analyzer::project_reads::file_set_receipt(&project, &files).unwrap();
+        assert!(receipt.listing.is_some());
+        assert!(receipt.inventory.is_some());
+        assert_eq!(
+            project.0.workspace_file_listing_count(),
+            1,
+            "language filtering and listing receipts must reuse the caller's one listing"
+        );
+    }
 
     #[brokk_bifrost_test_macros::hardwon(
         "#2770: file-set project coverage was not reported as its selected file count"
@@ -2239,15 +2943,19 @@ mod tests {
                 self.delegate.root()
             }
             fn analyzer_languages(&self) -> BTreeSet<Language> {
+                let _project_read = listing_read(self);
                 self.delegate.analyzer_languages()
             }
             fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                let _project_read = listing_read(self);
                 self.delegate.all_files()
             }
             fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                let _project_read = listing_read(self);
                 self.delegate.analyzable_files(language)
             }
             fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+                let _project_read = listing_read(self);
                 self.delegate.file_by_rel_path(rel_path)
             }
             fn read_source(&self, _file: &ProjectFile) -> io::Result<String> {
@@ -2590,8 +3298,8 @@ mod tests {
         write_file(&root, "vendor/skipped.rs", "fn skipped() {}\n");
         let project = FilesystemProject::new(&root).unwrap();
 
-        // The answers themselves, so a listing count of one cannot be bought
-        // by an is_bifrostignored that stopped consulting .bifrostignore.
+        // The discovery fill already compiled the matcher. Probes must use
+        // those same rules without asking for another listing.
         for _ in 0..8 {
             assert!(project.is_bifrostignored(Path::new("vendor/skipped.rs")));
             assert!(!project.is_bifrostignored(Path::new("kept.rs")));
@@ -2599,8 +3307,8 @@ mod tests {
 
         assert_eq!(
             project.workspace_file_listing_count(),
-            1,
-            "the ignore matcher is built from one listing and answers every later question itself"
+            0,
+            "the discovery fill built the matcher; every later probe reuses it"
         );
     }
 
@@ -2744,11 +3452,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         write_file(&root, "a.rs", "fn a() {}\n");
-        std::fs::write(root.join(BIFROST_IGNORE_FILE_NAME), b"vendor/\n\xff\xfe\n").unwrap();
-
         let project = FilesystemProject::new(&root).unwrap();
+        std::fs::write(root.join(BIFROST_IGNORE_FILE_NAME), b"vendor/\n\xff\xfe\n").unwrap();
+        project.invalidate_cached_file_listing();
         assert!(!project.is_bifrostignored(Path::new("a.rs")));
         let error = project.analyzable_files(Language::Rust).unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidData, error.kind(), "{error}");
+        // Construction also fills the listing and reads its rule inputs.
+        let error = FilesystemProject::new(&root).unwrap_err();
         assert_eq!(io::ErrorKind::InvalidData, error.kind(), "{error}");
     }
 

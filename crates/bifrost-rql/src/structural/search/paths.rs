@@ -29,6 +29,7 @@ use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::sync::Arc;
 
 /// Domain separator for a qualified-path row's stable id.
@@ -40,8 +41,8 @@ const SEGMENT_ID_DOMAIN: &[u8] = b"bifrost.code_query.path_segment.v1";
 /// policy normalization deduplicates repeated observations.
 #[derive(Default)]
 pub(super) struct PathTraversalCache {
-    rows_only: HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>,
-    resolved: HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>,
+    rows_only: CaptureScopedMemo<HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>>,
+    resolved: CaptureScopedMemo<HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>>,
 }
 
 impl PathTraversalCache {
@@ -60,8 +61,10 @@ impl PathTraversalCache {
         } else {
             &mut self.rows_only
         };
-        if let Some(cached) = cache.get(file) {
-            return Some(Arc::clone(cached));
+        if let Some(cached) = cache.read(&memo_attribution(analyzer), |cache| {
+            cache.get(file).cloned()
+        }) {
+            return Some(cached);
         }
         let token = cancellation.cloned().unwrap_or_default();
         let options = if resolved {
@@ -97,7 +100,9 @@ impl PathTraversalCache {
         } else {
             &mut self.rows_only
         };
-        cache.insert(file.clone(), Arc::clone(&derived));
+        cache.read_mut(&memo_attribution(analyzer), |cache| {
+            cache.insert(file.clone(), Arc::clone(&derived))
+        });
         Some(derived)
     }
 

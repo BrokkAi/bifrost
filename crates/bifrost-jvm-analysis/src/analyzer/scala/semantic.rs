@@ -71,6 +71,10 @@ use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableDispo
 
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableKey;
 
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -114,7 +118,7 @@ use crate::analyzer::scala::semantic_adaptation::type_identity as scala_type_ide
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v22";
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v25";
 
 /// Procedure syntax roles used by source-backed assignment relations. The
 /// Scala lowering already publishes exact assignment effects; these roles
@@ -789,6 +793,11 @@ struct LocalBinding {
     /// arrays are invariant and their element type is exactly the written
     /// type argument, so a selection on `values(i)` resolves against it.
     element_identity: Option<ScalaTypeIdentityId>,
+    /// The exact runtime class of the object an immutable binding holds,
+    /// when its initializer is a modeled factory that publishes one. This,
+    /// not the static type, is what selects a collection contract: a member
+    /// the static type declares may be overridden by the runtime class.
+    runtime_class: Option<String>,
 }
 
 fn lower_procedure<'tree>(
@@ -963,7 +972,7 @@ fn lower_procedure<'tree>(
             } else {
                 context.session.add_gap_with_impacts(
                     &mut builder,
-                    entry,
+                    implicit_return,
                     SemanticGapSubject::Value(value),
                     SemanticCapability::Values,
                     SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
@@ -1210,6 +1219,12 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                             .and_then(|initializer| self.array_element_identity(initializer))
                             .map(|identity| self.intern_type_segments(identity))
                     });
+                // A `var` can be reassigned to an object of another class, so
+                // only a `val` keeps the class its initializer allocated.
+                let runtime_class = (node.kind() == "val_definition"
+                    && !contains_token(node, "lazy"))
+                .then(|| initializer.and_then(|node| self.factory_runtime_class(node)))
+                .flatten();
                 self.locals
                     .entry(name.into())
                     .or_default()
@@ -1223,6 +1238,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                         structured_type_identity,
                         element_identity,
                         component_index: None,
+                        runtime_class,
                     });
             }
             if node.kind() == "enumerator"
@@ -1259,6 +1275,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                             structured_type_identity: None,
                             element_identity: None,
                             component_index: Some(component_index),
+                            runtime_class: None,
                         });
                 }
             }
@@ -1297,6 +1314,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                         structured_type_identity,
                         element_identity,
                         component_index: None,
+                        runtime_class: None,
                     });
             }
             Ok(WalkControl::Continue)
@@ -4328,6 +4346,13 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 .is_some_and(|name| name.path().last().map(String::as_str) == Some("Map"))
     }
 
+    /// The active collection contract for `member` on a receiver whose
+    /// runtime class is proven.
+    ///
+    /// The contract is selected by the receiver's exact runtime class, never
+    /// by its static type: `mutable.Map`'s protocol members are overridden by
+    /// the `HashMap` its factory returns, and by any user subclass. A receiver
+    /// that is not a `val` bound to a modeled factory result stays unmodeled.
     fn modeled_collection_flow(
         &self,
         receiver: Node<'tree>,
@@ -4335,20 +4360,21 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         parameter_count: usize,
     ) -> Option<std::sync::Arc<CollectionFlowContract>> {
         let overlay = self.semantic_model_overlay.as_deref()?;
-        let identity = self.expression_structured_type_identity(receiver)?;
-        let owner_name = identity.nominal_name()?;
-        // A terminal-only type name can be shadowed by an import or local
-        // declaration. Requiring the explicit qualified path keeps this query
-        // resolver-proven instead of turning a nominal name into identity.
-        if owner_name.path().len() < 2 {
+        if receiver.kind() != "identifier" {
             return None;
         }
-        let owner = owner_name.path().join(".");
+        let owner = self
+            .local_binding_at(
+                node_text(self.prepared.source(), receiver)?,
+                receiver.start_byte(),
+            )?
+            .runtime_class
+            .as_deref()?;
         let parameter_count = u32::try_from(parameter_count).ok()?;
         let matched = overlay.callable_for_application(
             SemanticModelCallableKey::new(
                 Language::Scala.config_label(),
-                &owner,
+                owner,
                 member,
                 true,
                 parameter_count,
@@ -4360,6 +4386,68 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         }
         let callable = matched.unique()?;
         overlay.unique_complete_collection_flow(&callable.id)
+    }
+
+    /// The exact runtime class a factory call returns, from the activated
+    /// declaration of the companion `apply` it invokes.
+    ///
+    /// The factory must be written as an explicitly qualified, type-applied
+    /// call, `scala.collection.mutable.Map[K, V](..)`: a terminal-only name
+    /// can be shadowed by an import or a local declaration. The model must
+    /// publish a single non-null class, which the overlay resolves by its
+    /// declaration identity.
+    fn factory_runtime_class(&self, initializer: Node<'tree>) -> Option<String> {
+        let overlay = self.semantic_model_overlay.as_deref()?;
+        if initializer.kind() != "call_expression" {
+            return None;
+        }
+        let (function, argument_lists) = flattened_call_parts(initializer).ok()?;
+        let [arguments] = argument_lists.as_slice() else {
+            return None;
+        };
+        if function.kind() != "generic_function" {
+            return None;
+        }
+        let identity = self.structured_type_identity(function)?;
+        let owner_name = identity.nominal_name()?;
+        if owner_name.path().len() < 2 {
+            return None;
+        }
+        let owner = owner_name.path().join(".");
+        let argument_count = u32::try_from(semantic_argument_nodes(*arguments).len()).ok()?;
+        let matched = overlay.callable_for_application(
+            SemanticModelCallableKey::new(
+                Language::Scala.config_label(),
+                &owner,
+                "apply",
+                false,
+                argument_count,
+            ),
+            &SemanticModelCallApplication::positional(argument_count),
+        );
+        if matched.disposition != SemanticModelCallableDisposition::Unique {
+            return None;
+        }
+        let factory = matched.unique()?;
+        let [
+            TypeRef::Declared {
+                id,
+                nullable: false,
+                ..
+            },
+        ] = factory.exact_return_classes.as_slice()
+        else {
+            return None;
+        };
+        let classes = overlay.symbols_with_id(id);
+        let [class] = classes.records.as_slice() else {
+            return None;
+        };
+        (class.language == Language::Scala.config_label()
+            && class.owner_id.is_none()
+            && class.kind == SemanticModelSymbolKind::Class
+            && !class.provenance.ambiguous)
+            .then(|| class.qualified_name.clone())
     }
 
     fn modeled_map_update_flow(
@@ -4629,9 +4717,13 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         let Some(text) = node_text(self.prepared.source(), node) else {
             return self.expression_value(builder, node, kind);
         };
-        if let Some(value) = self.constant_index_values.get(text) {
-            self.expression_values.insert(node.id(), *value);
-            return Ok(*value);
+        if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
+            &self.constant_index_values,
+            &mut self.expression_values,
+            text,
+            node.id(),
+        ) {
+            return Ok(value);
         }
         let value = self.expression_value(builder, node, kind)?;
         self.constant_index_values.insert(text.into(), value);

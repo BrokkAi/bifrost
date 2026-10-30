@@ -103,14 +103,14 @@ impl ImportAnalysisProvider for CppAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if let Some(cached) = self.imported_code_units.get(file) {
+        if let Some(cached) = self.imported_code_units.read(
+            &memo_attribution(self),
+            |memo| memo.get(file),
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        ) {
             return cached;
         }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-cpp-analysis/src/analyzer/cpp/imports.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
@@ -118,32 +118,33 @@ impl ImportAnalysisProvider for CppAnalyzer {
             return Arc::new(resolved);
         };
         for path in paths {
-            for target in resolve_include_targets_with_index(file, &path, include_targets) {
+            for target in resolve_include_targets_with_index(file, &path, &include_targets) {
                 resolved.extend(self.inner.top_level_declarations(&target));
             }
         }
 
         let resolved = Arc::new(resolved);
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::clone(&resolved);
-            persistent_fill_guard.installed("imported_code_units");
-            self.imported_code_units.insert(cache_key, cache_value);
-        };
+        if cache_fill.is_complete() {
+            self.imported_code_units.read(
+                &memo_attribution(self),
+                |memo| memo.insert(file.clone(), Arc::clone(&resolved)),
+                |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+            );
+        }
         resolved
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if let Some(cached) = self.referencing_files.get(file) {
+        if let Some(cached) = self.referencing_files.read(
+            &memo_attribution(self),
+            |memo| memo.get(file),
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        ) {
             return (*cached).clone();
         }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-cpp-analysis/src/analyzer/cpp/imports.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let references = self
             .reverse_include_index(token)
@@ -151,12 +152,13 @@ impl ImportAnalysisProvider for CppAnalyzer {
             .map(|files| (**files).clone())
             .unwrap_or_default();
 
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::new(references.clone());
-            persistent_fill_guard.installed("referencing_files");
-            self.referencing_files.insert(cache_key, cache_value);
-        };
+        if cache_fill.is_complete() {
+            self.referencing_files.read(
+                &memo_attribution(self),
+                |memo| memo.insert(file.clone(), Arc::new(references.clone())),
+                |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+            );
+        }
         references
     }
 
@@ -176,7 +178,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         Some(
             paths
                 .into_iter()
-                .flat_map(|path| resolve_include_targets_with_index(file, &path, include_targets))
+                .flat_map(|path| resolve_include_targets_with_index(file, &path, &include_targets))
                 .collect(),
         )
     }
@@ -252,48 +254,97 @@ impl CppAnalyzer {
     /// `#include <vector>` on basename alone, which
     /// `cpp_extensionless_angle_include_with_unrelated_basename_reports_boundary`
     /// pins as a boundary.
-    pub(crate) fn include_target_index(&self) -> &IncludeTargetIndex {
-        self.include_target_index.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "cpp.include_target_index",
-                || {
-                    let _scope =
-                        brokk_bifrost_core::profiling::scope("cpp.include_target_index.build");
-                    let mut files = self.inner.workspace_language_files();
-                    let listed: HashSet<ProjectFile> = files.iter().cloned().collect();
-                    files.extend(
-                        self.inner
-                            .all_files()
-                            .into_iter()
-                            .filter(|file| !listed.contains(file)),
-                    );
-                    IncludeTargetIndex::build(files.iter())
+    pub(crate) fn include_target_index(&self) -> Arc<IncludeTargetIndex> {
+        self.include_target_index
+            .read(
+                &memo_attribution(self),
+                |memo| {
+                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(
+                        self,
+                        memo,
+                        || {
+                            let _scope = brokk_bifrost_core::profiling::scope(
+                                "cpp.include_target_index.build",
+                            );
+                            let scope = AnalyzerQueryScope::new(self);
+                            let mut files = self.inner.workspace_language_files();
+                            let listed: HashSet<ProjectFile> = files.iter().cloned().collect();
+                            files.extend(
+                                self.inner
+                                    .all_files()
+                                    .into_iter()
+                                    .filter(|file| !listed.contains(file)),
+                            );
+                            let index = IncludeTargetIndex::build(files.iter());
+                            let answer = scope
+                                .read_completion()
+                                .ok()
+                                .map(|()| Self::digest_include_targets(&index));
+                            (Arc::new(index), answer)
+                        },
+                    )
+                },
+                |(_, answer)| match answer {
+                    Some(answer) => AuthorityInputs::Fact {
+                        language: Language::Cpp,
+                        subject: FactSubject::Whole,
+                        answer: *answer,
+                    },
+                    None => AuthorityInputs::Unnamed,
                 },
             )
-        })
+            .0
+    }
+
+    fn digest_include_targets(index: &IncludeTargetIndex) -> StableDigest {
+        StableDigest::sha256(
+            serde_json::to_vec(&index.workspace_relative_paths()).expect("include paths serialize"),
+        )
+    }
+
+    pub(super) fn include_target_answer(&self) -> Option<StableDigest> {
+        self.include_target_index();
+        self.include_target_index.read(
+            &memo_attribution(self),
+            |memo| memo.get().expect("complete include index").1,
+            |answer| match answer {
+                Some(answer) => AuthorityInputs::Fact {
+                    language: Language::Cpp,
+                    subject: FactSubject::Whole,
+                    answer: *answer,
+                },
+                None => AuthorityInputs::Unnamed,
+            },
+        )
     }
 
     fn reverse_include_index(
         &self,
         token: QueryToken<'_>,
     ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        brokk_bifrost_core::analyzer::capabilities::memoized_reverse_file_index(
-            &self.reverse_include_index,
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.reverse_include_index.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
                     self,
-                    "cpp.reverse_file_index",
-                    || self.inner.all_files(),
+                    memo,
+                    || {
+                        brokk_bifrost_core::analyzer::capabilities::build_reverse_file_index(
+                            &(self.inner.all_files()),
+                            |candidate| self.include_targets_for_file(token, candidate),
+                            true,
+                        )
+                    },
+                    || {
+                        brokk_bifrost_core::analyzer::capabilities::build_reverse_file_index(
+                            &(self.inner.all_files()),
+                            |candidate| self.include_targets_for_file(token, candidate),
+                            false,
+                        )
+                    },
                 )
             },
-            |candidate| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "cpp.reverse_file_index",
-                    || self.include_targets_for_file(token, candidate),
-                )
-            },
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
         )
     }
 
@@ -325,21 +376,17 @@ impl CppAnalyzer {
     /// `with_updated_inner`) since it is invalidated only when the whole
     /// analyzer generation turns over.
     fn transitive_reverse_tu_index(&self, token: QueryToken<'_>) -> Arc<TransitiveReverseTuIndex> {
-        self.transitive_reverse_tu_index.get_or_build(
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.transitive_reverse_tu_index.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
                     self,
-                    "cpp.transitive_reverse_tu_index",
+                    memo,
+                    || self.build_transitive_reverse_tu_index_data(token),
                     || self.build_transitive_reverse_tu_index_data(token),
                 )
             },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "cpp.transitive_reverse_tu_index",
-                    || self.build_transitive_reverse_tu_index_data(token),
-                )
-            },
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
         )
     }
 
@@ -504,7 +551,7 @@ impl CppAnalyzer {
         {
             let seed = ReachingCompilationEvidence::of_translation_unit(
                 &translation_unit,
-                self.compile_contexts_for(&translation_unit),
+                &self.compile_contexts_for(&translation_unit),
             );
             evidence
                 .entry(translation_unit.clone())
@@ -557,16 +604,19 @@ impl CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> HeaderLanguageAttribution {
-        match self
-            .header_language_attribution_by_file
-            .try_get_with_by_ref(file, || {
-                brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                    self.build_header_language_attribution(token, file)
+        self.header_language_attribution_by_file.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::query_cache_moka(self, memo, file, || {
+                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                        self,
+                        || self.build_header_language_attribution(token, file),
+                    )
                 })
-            }) {
-            Ok(value) => value,
-            Err(value) => *value,
-        }
+                .unwrap_or_else(|value| *value)
+            },
+            |_| self.compile_context_authority_inputs(),
+        )
     }
 
     /// The evidence walk behind [`Self::header_language_attribution`], run
@@ -591,14 +641,15 @@ impl CppAnalyzer {
         // outlives the borrow, so none of the reaching units need cloning.
         let index = self.transitive_reverse_tu_index(token);
 
-        let database_languages = index
-            .reaching_translation_units(file)
-            .flat_map(|translation_unit| {
-                self.compile_contexts_for(translation_unit)
+        let mut database_languages = Vec::new();
+        for translation_unit in index.reaching_translation_units(file) {
+            let contexts = self.compile_contexts_for(translation_unit);
+            database_languages.extend(
+                contexts
                     .iter()
-                    .map(move |context| context.tu_language(translation_unit.rel_path()))
-            })
-            .collect::<Vec<_>>();
+                    .map(|context| context.tu_language(translation_unit.rel_path())),
+            );
+        }
         if !database_languages.is_empty() {
             return attribution_from_languages(database_languages.into_iter());
         }
@@ -970,5 +1021,92 @@ pub(crate) fn build_transitive_reverse_tu_index(
             component_units,
         },
         edge_visits,
+    }
+}
+
+#[cfg(test)]
+mod include_targets_authority {
+    use super::*;
+    use brokk_bifrost_analysis::inline_project::InlineTestProject;
+
+    #[test]
+    fn include_target_digest_is_stable_for_the_same_snapshot() {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("target.cpp", "struct Target {};\n")
+            .file("spare.hpp", "struct Spare {};\n")
+            .build();
+        let cpp = CppAnalyzer::from_project(project.project().clone());
+        let first = cpp
+            .include_target_answer()
+            .expect("complete include targets");
+        assert_eq!(Some(first), cpp.include_target_answer());
+        let (_, reads) = capture_query_reads(&cpp, || cpp.include_target_index());
+        assert!(reads.keys().iter().any(|key| matches!(key,
+            ReadKey::Lookup { question, digest, .. } if *digest == first && matches!(question,
+                brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::CppIncludeTargets, subject: FactSubject::Whole, ..
+                })
+        )), "warm include targets must record the whole answer: {:?}", reads.keys());
+    }
+
+    #[test]
+    fn unimported_header_membership_changes_the_include_target_answer() {
+        use brokk_bifrost_analysis::analyzer::{
+            ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+        };
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .with_git()
+            .file("target.cpp", "struct Target {};\n")
+            .build();
+        let base = project.workspace_analyzer(AnalyzerConfig::default());
+        let cpp = resolve_analyzer::<CppAnalyzer>(base.analyzer()).expect("C++ analyzer");
+        let (_, reads) = capture_query_reads(cpp, || cpp.include_target_index());
+        let keys = reads.keys();
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert_eq!(
+            keys.len(),
+            1,
+            "whole-value fact subsumes implementation reads: {keys:?}"
+        );
+        let verify = |head: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer| {
+            brokk_bifrost_analysis::analyzer::read_verification::verify_read_set(
+                head,
+                &ChangedFacts::between(&base, head),
+                &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                &keys,
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            )
+        };
+        assert_eq!(verify(&base), ReadVerdict::Unchanged);
+        project
+            .file("unimported.hpp")
+            .write("struct Spare {};\n")
+            .expect("new header");
+        let head = project.workspace_analyzer(AnalyzerConfig::default());
+        assert_ne!(
+            verify(&head),
+            ReadVerdict::Unchanged,
+            "unimported membership changes the authority answer"
+        );
+    }
+
+    #[test]
+    fn comment_above_a_header_declaration_preserves_the_include_target_answer() {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("target.cpp", "struct Target {};\n")
+            .file("spare.hpp", "struct Spare {};\n")
+            .build();
+        let base = CppAnalyzer::from_project(project.project().clone());
+        let answer = base
+            .include_target_answer()
+            .expect("complete include targets");
+        project
+            .file("spare.hpp")
+            .write("// comment above the first declaration\nstruct Spare {};\n")
+            .expect("comment edit");
+        let head = CppAnalyzer::from_project(project.project().clone());
+        assert_eq!(Some(answer), head.include_target_answer());
     }
 }

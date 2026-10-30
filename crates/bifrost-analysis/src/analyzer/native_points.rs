@@ -48,6 +48,571 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWor
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 
+/// Completed projected points for one file's call-target batch. Retains at most
+/// 4,096 entries, never evicts, and recomputes after admission stops. Nothing
+/// survives the batch. Values must never contain selected-operation identities.
+///
+/// Source identity, selected environment/model and scope are captured once in
+/// this owner. Every fresh operation starts at staged epoch zero; later staged
+/// products and their epochs remain private to that operation. The in-memory
+/// generation/publication witnesses below disable reuse after a change.
+///
+/// Invocation depth is syntactic (AST ancestors), not resolver recursion state.
+/// Outer points currently exclude nested lookup work. Hits return stored direct
+/// work and do not introduce a new charge against an outer point's session.
+#[cfg(any(test, feature = "test-support"))]
+pub struct NativePointBatch {
+    file: crate::analyzer::ProjectFile,
+    source: std::sync::Arc<str>,
+    _source_oid: git2::Oid,
+    environment: NativePointEnvironment,
+    _scope: crate::analyzer::content_identity::WorkspaceContentIdentity,
+    model: (
+        Option<
+            NativePointPublication<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+        >,
+        Option<NativePointPublication<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ),
+    entries: std::cell::RefCell<std::collections::HashMap<NativePointKey, NativePointEntry>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativePointRole {
+    DefinitionWithEvidence,
+    ExpressionValue,
+    CallArgument(u32),
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct NativePointKey {
+    // File/content, selected environment, scope, model publication and initial
+    // staged epoch are the immutable owner prefix, captured once per batch.
+    site: (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        String,
+        String,
+        String,
+    ),
+    role: NativePointRole,
+    budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+}
+
+// Pin the publication in the owner prefix so its pointer cannot be reused
+// during this batch, without requiring structural model equality.
+#[cfg(any(test, feature = "test-support"))]
+struct NativePointPublication<T>(std::sync::Arc<T>);
+#[cfg(any(test, feature = "test-support"))]
+impl<T> PartialEq for NativePointPublication<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl<T> Eq for NativePointPublication<T> {}
+#[cfg(any(test, feature = "test-support"))]
+#[derive(PartialEq, Eq)]
+struct NativePointEnvironment {
+    generation: u64,
+    snapshots: std::sync::Arc<WorkspaceSnapshots>,
+    languages: Vec<SelectedResolutionLanguage>,
+    overlays: Vec<crate::analyzer::store::resolution_selection::SelectedResolutionOverlayMask>,
+    mounts:
+        Vec<crate::analyzer::store::resolution_selection::SelectedResolutionContentMountRequest>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone)]
+enum NativePointValue {
+    Definition(Box<crate::analyzer::usages::get_definition::DefinitionResolution>),
+    Expression(Box<NativeExpressionValueTypeLookup>),
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct NativePointEntry {
+    value: NativePointValue,
+    work: ReceiverAnalysisWork,
+    reads: std::sync::Arc<crate::analyzer::ReadLedger>,
+    incompleteness: Vec<crate::analyzer::i_analyzer::QueryReadIncomplete>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl NativePointBatch {
+    pub fn new<A: LanguageAdapter>(
+        inner: &TreeSitterAnalyzer<A>,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        file: crate::analyzer::ProjectFile,
+        source: std::sync::Arc<str>,
+        cancellation: Option<&CancellationToken>,
+    ) -> crate::analyzer::store::Result<Option<Self>> {
+        let Some(scope) = analyzer.workspace_content_identity() else {
+            return Ok(None);
+        };
+        let generation = analyzer.project().analysis_generation();
+        let model = (
+            analyzer
+                .active_semantic_model_snapshot()
+                .map(NativePointPublication),
+            analyzer
+                .semantic_model_overlay()
+                .map(NativePointPublication),
+        );
+        let (snapshots, languages) = native_point_operation_inputs(inner)?;
+        let (overlays, mounts) = match inner.selected_resolution_overlay_inputs(
+            &snapshots,
+            &cancellation.cloned().unwrap_or_default(),
+        )? {
+            SelectedResolutionOverlayInputsOutcome::Ready {
+                masks,
+                content_mounts,
+            } => (masks, content_mounts),
+            _ => return Ok(None),
+        };
+        let source_oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+            .expect("a source buffer has a Git blob identity");
+        let batch = Self {
+            file,
+            source,
+            _source_oid: source_oid,
+            _scope: scope,
+            model,
+            environment: NativePointEnvironment {
+                generation,
+                snapshots,
+                languages,
+                overlays,
+                mounts,
+            },
+            entries: std::cell::RefCell::default(),
+        };
+        Ok(batch.current(analyzer).then_some(batch))
+    }
+
+    fn current(&self, analyzer: &dyn crate::analyzer::IAnalyzer) -> bool {
+        // These are in-memory witnesses. A publication/generation change ends
+        // reuse; it never refreshes or lends a stale prefix to a new operation.
+        // The borrowed analyzer fixes scope; mutable project inputs publish a
+        // new analysis_generation. Do not rebuild workspace scope per point.
+        analyzer.project().analysis_generation() == self.environment.generation
+            && analyzer
+                .active_semantic_model_snapshot()
+                .map(NativePointPublication)
+                == self.model.0
+            && analyzer
+                .semantic_model_overlay()
+                .map(NativePointPublication)
+                == self.model.1
+    }
+
+    fn key<A: LanguageAdapter>(
+        &self,
+        inner: &TreeSitterAnalyzer<A>,
+        query: BoundedReceiverQuery<'_>,
+        role: NativePointRole,
+    ) -> Option<NativePointKey> {
+        if !inner.workspace_declaration_identities_authoritative()
+            || trace::recording()
+            || !self.current(query.analyzer)
+            || (!std::ptr::eq::<str>(query.source, self.source.as_ref())
+                && query.source != self.source.as_ref())
+        {
+            return None;
+        }
+        let tree = query.tree?;
+        let node =
+            brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering(
+                tree.root_node(),
+                query.site.focus_start_byte,
+                query.site.focus_end_byte,
+            )?;
+        Some(NativePointKey {
+            site: (
+                query.site.range.start_byte,
+                query.site.range.end_byte,
+                query.site.range.start_line,
+                query.site.range.end_line,
+                query.site.focus_start_byte,
+                query.site.focus_end_byte,
+                node.kind().to_owned(),
+                query.site.text.clone(),
+                query.site.path.clone(),
+            ),
+            role,
+            budget: query.budget,
+        })
+    }
+
+    pub fn definition<A: LanguageAdapter>(
+        &self,
+        inner: &TreeSitterAnalyzer<A>,
+        query: BoundedReceiverQuery<'_>,
+        resolve: impl FnOnce() -> BoundedResolution<
+            crate::analyzer::usages::get_definition::DefinitionResolution,
+        >,
+    ) -> BoundedResolution<crate::analyzer::usages::get_definition::DefinitionResolution> {
+        self.resolve(
+            inner,
+            query,
+            NativePointRole::DefinitionWithEvidence,
+            resolve,
+            |value| NativePointValue::Definition(Box::new(value)),
+            |value| match value {
+                NativePointValue::Definition(value) => *value,
+                NativePointValue::Expression(_) => unreachable!("point role fixes its carrier"),
+            },
+        )
+    }
+
+    pub fn expression<A: LanguageAdapter>(
+        &self,
+        inner: &TreeSitterAnalyzer<A>,
+        query: BoundedReceiverQuery<'_>,
+        role: NativePointRole,
+        resolve: impl FnOnce() -> BoundedResolution<NativeExpressionValueTypeLookup>,
+    ) -> BoundedResolution<NativeExpressionValueTypeLookup> {
+        assert!(matches!(
+            role,
+            NativePointRole::ExpressionValue | NativePointRole::CallArgument(_)
+        ));
+        self.resolve(
+            inner,
+            query,
+            role,
+            resolve,
+            |value| NativePointValue::Expression(Box::new(value)),
+            |value| match value {
+                NativePointValue::Expression(value) => *value,
+                NativePointValue::Definition(_) => unreachable!("point role fixes its carrier"),
+            },
+        )
+    }
+
+    fn resolve<A: LanguageAdapter, T: Clone>(
+        &self,
+        inner: &TreeSitterAnalyzer<A>,
+        query: BoundedReceiverQuery<'_>,
+        role: NativePointRole,
+        resolve: impl FnOnce() -> BoundedResolution<T>,
+        wrap: impl FnOnce(T) -> NativePointValue,
+        unwrap: impl FnOnce(NativePointValue) -> T,
+    ) -> BoundedResolution<T> {
+        if query
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return BoundedResolution::Cancelled {
+                work: ReceiverAnalysisWork::default(),
+            };
+        }
+        assert_eq!(
+            &self.file, query.file,
+            "one native point batch owns exactly one file"
+        );
+        let Some(key) = self.key(inner, query, role) else {
+            return resolve();
+        };
+        let cached = self.entries.borrow().get(&key).map(|entry| {
+            (
+                entry.value.clone(),
+                entry.work,
+                std::sync::Arc::clone(&entry.reads),
+                entry.incompleteness.clone(),
+            )
+        });
+        if let Some((value, work, reads, incompleteness)) = cached {
+            crate::analyzer::replay_query_reads(query.analyzer, &reads);
+            for reason in incompleteness {
+                query.analyzer.record_query_incomplete(reason);
+            }
+            if query
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return BoundedResolution::Cancelled { work };
+            }
+            return BoundedResolution::Complete {
+                value: unwrap(value),
+                work,
+            };
+        }
+        let ((fill, incompleteness), reads) =
+            crate::analyzer::capture_query_reads(query.analyzer, || {
+                let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(
+                    query.analyzer,
+                );
+                let fill =
+                    crate::analyzer::common::replayable_query_cache_fill(query.analyzer, resolve);
+                (fill, scope.captured_read_incompleteness())
+            });
+        let (result, admitted) = match fill {
+            Ok(value) => (value, true),
+            Err(value) => (value, false),
+        };
+        if admitted
+            && !query
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            && self.key(inner, query, role).as_ref() == Some(&key)
+            && let BoundedResolution::Complete { value, work } = &result
+        {
+            let value = wrap(value.clone());
+            if !value.admissible() {
+                // A nested failed point may be consumed as unknown by an
+                // enclosing point. That outer fill must not retain the failure.
+                query.analyzer.mark_execution_dependent();
+                return result;
+            }
+            // The exhaustive DTO audit also classifies optional request-local
+            // evidence. A registry-bearing outcome is an ordinary uncached
+            // result, never an error or an execution-dependent failure.
+            if !value.registry_independent() {
+                return result;
+            }
+            let mut entries = self.entries.borrow_mut();
+            if entries.len() < 4_096 {
+                entries.insert(
+                    key,
+                    NativePointEntry {
+                        value,
+                        work: *work,
+                        reads,
+                        incompleteness,
+                    },
+                );
+            }
+        }
+        result
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl NativePointValue {
+    fn registry_independent(&self) -> bool {
+        match self {
+            Self::Definition(value) => value.registry_independent(),
+            Self::Expression(value) => value.registry_independent(),
+        }
+    }
+
+    fn admissible(&self) -> bool {
+        match self {
+            Self::Definition(value) => {
+                !matches!(
+                    value.outcome.status,
+                    DefinitionLookupStatus::Cancelled | DefinitionLookupStatus::ExceededBudget(_)
+                ) && !value
+                    .outcome
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| operational_point_failure(&diagnostic.kind))
+            }
+            Self::Expression(value) => {
+                !matches!(
+                    value.value_types.status,
+                    TypeLookupStatus::Cancelled | TypeLookupStatus::ExceededBudget(_)
+                ) && !value
+                    .value_types
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| operational_point_failure(&diagnostic.kind))
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn operational_point_failure(kind: &str) -> bool {
+    matches!(
+        kind,
+        "native_store_error"
+            | "native_stale"
+            | "native_source_mismatch"
+            | "native_identity_authority_unavailable"
+            | "native_context_unavailable"
+            | "native_unavailable"
+    )
+}
+
+// This allow-list is deliberately closed. Adding an identity-bearing field to
+// a DTO requires auditing it here; raw SemanticId has no implementation. Its
+// existing is_context_local predicate lives in the store, but these projected
+// DTOs admit neither context-local nor operation-local semantic IDs at all.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) trait NativePointRegistryIndependent {
+    fn registry_independent(&self) -> bool;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! native_point_canonical_leaves {
+    ($($ty:ty),* $(,)?) => {$(
+        impl NativePointRegistryIndependent for $ty {
+            fn registry_independent(&self) -> bool { true }
+        }
+    )*};
+}
+
+// Core/model-owned values cannot contain store resolution IDs. This follows
+// from dependency direction: bifrost-core and bifrost-semantic do not mention
+// SemanticId and cannot depend on the store, so no field added inside these
+// whole-type leaves can carry a resolution identity. CodeUnit's SegmentId is
+// owned by the process-global name interner, not a point arena.
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_leaves!(
+    String,
+    str,
+    bool,
+    usize,
+    u32,
+    crate::analyzer::CodeUnit,
+    crate::analyzer::ProjectFile,
+    crate::analyzer::Range,
+    brokk_bifrost_core::analyzer::model::DeclarationKind,
+    crate::analyzer::DispatchExtensibility,
+    crate::analyzer::semantic_model::TypeRef,
+    crate::analyzer::semantic_model::SemanticModelSymbol,
+    crate::analyzer::semantic_model::SemanticModelActivationEvidence,
+    crate::analyzer::lexical_definitions::FormalParameterSlot,
+    crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity,
+);
+
+#[cfg(any(test, feature = "test-support"))]
+impl<T: NativePointRegistryIndependent> NativePointRegistryIndependent for Option<T> {
+    fn registry_independent(&self) -> bool {
+        self.as_ref().is_none_or(T::registry_independent)
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl<T: NativePointRegistryIndependent> NativePointRegistryIndependent for Vec<T> {
+    fn registry_independent(&self) -> bool {
+        self.iter().all(T::registry_independent)
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl<T: NativePointRegistryIndependent> NativePointRegistryIndependent for [T] {
+    fn registry_independent(&self) -> bool {
+        self.iter().all(T::registry_independent)
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl<T: NativePointRegistryIndependent + ?Sized> NativePointRegistryIndependent for Box<T> {
+    fn registry_independent(&self) -> bool {
+        (**self).registry_independent()
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl<T: NativePointRegistryIndependent + ?Sized> NativePointRegistryIndependent
+    for std::sync::Arc<T>
+{
+    fn registry_independent(&self) -> bool {
+        (**self).registry_independent()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! native_point_canonical_fields {
+    ($ty:ty, $($field:ident),+ $(,)?) => {
+        impl NativePointRegistryIndependent for $ty {
+            fn registry_independent(&self) -> bool {
+                let Self { $($field),+ } = self;
+                true $(&& $field.registry_independent())+
+            }
+        }
+    };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(NativeExpressionValueTypeLookup, static_type, value_types);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(
+    TypeLookupOutcome,
+    status,
+    reference,
+    types,
+    diagnostics,
+    target_kind
+);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(TypeLookupType, fqn, definitions, semantic_model_id);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(TypeLookupDiagnostic, kind, message);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(
+    ResolvedReferenceSite,
+    path,
+    text,
+    range,
+    focus_start_byte,
+    focus_end_byte
+);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(
+    crate::analyzer::lexical_definitions::LexicalDefinition,
+    source_file,
+    identifier,
+    kind,
+    name_range,
+    declaration_range
+);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(
+    crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+    symbol_id,
+    provider
+);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(
+    crate::analyzer::semantic_model::overlay::ModelProvider,
+    pack_id,
+    pack_version,
+    pack_digest
+);
+
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(
+    crate::analyzer::resolution::ExternalMemberIdentity,
+    owner,
+    ordinal
+);
+#[cfg(any(test, feature = "test-support"))]
+native_point_canonical_fields!(
+    crate::analyzer::resolution::ExternalOwnerIdentity,
+    provider_id,
+    owner_fqn
+);
+
+#[cfg(any(test, feature = "test-support"))]
+impl NativePointRegistryIndependent for TypeLookupTargetKind {
+    fn registry_independent(&self) -> bool {
+        match self {
+            Self::TypeReference | Self::ValueExpression => true,
+            Self::MemberOwner { member_name } => member_name.registry_independent(),
+        }
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl NativePointRegistryIndependent for TypeLookupStatus {
+    fn registry_independent(&self) -> bool {
+        match self {
+            Self::Resolved
+            | Self::Unavailable
+            | Self::Incomplete
+            | Self::Cancelled
+            | Self::NoType
+            | Self::Ambiguous
+            | Self::UnsupportedLanguage
+            | Self::InvalidLocation
+            | Self::NotFound
+            | Self::ExceededBudget(_) => true,
+        }
+    }
+}
+
 /// Borrow production model/declaration authority when a regression inspects raw
 /// selected answers instead of the source-only navigation projection.
 #[cfg(any(test, feature = "test-support"))]
@@ -168,6 +733,8 @@ pub struct SelectedNativeImportModel {
 }
 
 struct NativePointReference<'a> {
+    #[cfg(any(test, feature = "test-support"))]
+    batch: Option<&'a NativePointBatch>,
     query: BoundedReceiverQuery<'a>,
     namespace: Option<ResolutionNamespace>,
     call_argument_ordinal: Option<u32>,
@@ -296,13 +863,61 @@ pub fn resolve_native_definition_bounded<A: LanguageAdapter>(
     ) -> crate::analyzer::store::Result<NativePointContext>,
     after_open: impl FnOnce(),
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    resolve_native_point_bounded(
+    resolve_native_definition_reference(
         inner,
         NativePointReference {
+            #[cfg(any(test, feature = "test-support"))]
+            batch: None,
             query,
             namespace: reference_namespace,
             call_argument_ordinal: None,
         },
+        prepare_context,
+        after_open,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn resolve_native_definition_bounded_in_batch<A: LanguageAdapter>(
+    inner: &TreeSitterAnalyzer<A>,
+    query: BoundedReceiverQuery<'_>,
+    reference_namespace: Option<ResolutionNamespace>,
+    batch: Option<&NativePointBatch>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    after_open: impl FnOnce(),
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    resolve_native_definition_reference(
+        inner,
+        NativePointReference {
+            batch,
+            query,
+            namespace: reference_namespace,
+            call_argument_ordinal: None,
+        },
+        prepare_context,
+        after_open,
+    )
+}
+
+fn resolve_native_definition_reference<A: LanguageAdapter>(
+    inner: &TreeSitterAnalyzer<A>,
+    reference: NativePointReference<'_>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    after_open: impl FnOnce(),
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let query = reference.query;
+    resolve_native_point_bounded(
+        inner,
+        reference,
         prepare_context,
         after_open,
         |operation, context, locator, cancellation, selected_import_gap| {
@@ -401,6 +1016,8 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
     unavailable_value: impl Fn(&ResolvedReferenceSite, &str, String) -> O,
 ) -> BoundedResolution<O> {
     let NativePointReference {
+        #[cfg(any(test, feature = "test-support"))]
+        batch,
         query,
         namespace,
         call_argument_ordinal,
@@ -424,7 +1041,18 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
     }
     let attempt = || -> Result<_, crate::analyzer::store::StoreError> {
         let language = inner.adapter().language();
-        let (snapshots, languages) = native_point_operation_inputs(inner)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let frozen = batch.filter(|batch| batch.current(query.analyzer));
+        #[cfg(not(any(test, feature = "test-support")))]
+        let frozen: Option<&()> = None;
+        let (snapshots, languages) = match frozen {
+            #[cfg(any(test, feature = "test-support"))]
+            Some(batch) => (
+                std::sync::Arc::clone(&batch.environment.snapshots),
+                batch.environment.languages.clone(),
+            ),
+            _ => native_point_operation_inputs(inner)?,
+        };
         if !languages
             .iter()
             .any(|selected| selected.semantic_language() == language)
@@ -437,8 +1065,13 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
                 ),
             ));
         }
-        let (masks, content_mounts) =
-            match inner.selected_resolution_overlay_inputs(&snapshots, &cancellation)? {
+        let (masks, content_mounts) = match frozen {
+            #[cfg(any(test, feature = "test-support"))]
+            Some(batch) => (
+                batch.environment.overlays.clone(),
+                batch.environment.mounts.clone(),
+            ),
+            _ => match inner.selected_resolution_overlay_inputs(&snapshots, &cancellation)? {
                 SelectedResolutionOverlayInputsOutcome::Ready {
                     masks,
                     content_mounts,
@@ -450,7 +1083,8 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
                     return Ok(unavailable("native_stale", format!("{reason:?}")));
                 }
                 SelectedResolutionOverlayInputsOutcome::Cancelled => return Ok(cancelled()),
-            };
+            },
+        };
         let services = crate::analyzer::selected_services::AnalyzerSelectedServices(query.analyzer);
         let input = SelectedResolutionOperationInput::new(
             inner.project(),
@@ -474,6 +1108,8 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
             }
             SelectedResolutionOperationOpenOutcome::Cancelled => return Ok(cancelled()),
         };
+        #[cfg(any(test, feature = "test-support"))]
+        NATIVE_POINT_OPERATION_OPEN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         after_open();
         if cancellation.is_cancelled() {
             return Ok(cancelled());
@@ -1244,6 +1880,8 @@ pub fn resolve_native_type_bounded<A: LanguageAdapter>(
     resolve_native_point_bounded(
         inner,
         NativePointReference {
+            #[cfg(any(test, feature = "test-support"))]
+            batch: None,
             query,
             namespace: None,
             call_argument_ordinal: None,
@@ -1290,6 +1928,8 @@ pub fn resolve_native_observed_value_type_bounded<A: LanguageAdapter>(
     resolve_native_point_bounded(
         inner,
         NativePointReference {
+            #[cfg(any(test, feature = "test-support"))]
+            batch: None,
             query,
             namespace: None,
             call_argument_ordinal: None,
@@ -1318,6 +1958,7 @@ pub fn resolve_native_observed_value_type_bounded<A: LanguageAdapter>(
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct NativeExpressionValueTypeLookup {
     #[doc(hidden)]
     pub static_type: Option<crate::analyzer::semantic_model::TypeRef>,
@@ -1340,6 +1981,8 @@ pub fn resolve_native_expression_value_type_bounded<A: LanguageAdapter>(
     resolve_native_expression_type_projection_bounded(
         inner,
         NativePointReference {
+            #[cfg(any(test, feature = "test-support"))]
+            batch: None,
             query,
             namespace: None,
             call_argument_ordinal: None,
@@ -1365,6 +2008,61 @@ pub fn resolve_native_call_argument_type_bounded<A: LanguageAdapter>(
     resolve_native_expression_type_projection_bounded(
         inner,
         NativePointReference {
+            #[cfg(any(test, feature = "test-support"))]
+            batch: None,
+            query,
+            namespace: None,
+            call_argument_ordinal: Some(argument_ordinal),
+        },
+        prepare_context,
+        after_open,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn resolve_native_expression_value_type_bounded_in_batch<A: LanguageAdapter>(
+    inner: &TreeSitterAnalyzer<A>,
+    query: BoundedReceiverQuery<'_>,
+    batch: Option<&NativePointBatch>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    after_open: impl FnOnce(),
+) -> BoundedResolution<NativeExpressionValueTypeLookup> {
+    resolve_native_expression_type_projection_bounded(
+        inner,
+        NativePointReference {
+            batch,
+            query,
+            namespace: None,
+            call_argument_ordinal: None,
+        },
+        prepare_context,
+        after_open,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn resolve_native_call_argument_type_bounded_in_batch<A: LanguageAdapter>(
+    inner: &TreeSitterAnalyzer<A>,
+    query: BoundedReceiverQuery<'_>,
+    argument_ordinal: u32,
+    batch: Option<&NativePointBatch>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    after_open: impl FnOnce(),
+) -> BoundedResolution<NativeExpressionValueTypeLookup> {
+    resolve_native_expression_type_projection_bounded(
+        inner,
+        NativePointReference {
+            batch,
             query,
             namespace: None,
             call_argument_ordinal: Some(argument_ordinal),
@@ -2141,6 +2839,8 @@ pub fn probe_jvm_assignment_value<A: LanguageAdapter>(
     resolve_native_point_bounded(
         inner,
         NativePointReference {
+            #[cfg(any(test, feature = "test-support"))]
+            batch: None,
             query,
             namespace: None,
             call_argument_ordinal: None,

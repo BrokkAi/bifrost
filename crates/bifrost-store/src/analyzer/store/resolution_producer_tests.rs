@@ -476,6 +476,9 @@ fn typed_relation_answers(
         }};
     }
     match relation {
+        TypedFactRelation::EmbeddedTypeLookup
+        | TypedFactRelation::InterfaceMethodLookup
+        | TypedFactRelation::SupertypeNameLookup => false,
         TypedFactRelation::RustReferenceContext => {
             answered!(visit_rust_reference_context_pages, semantic)
         }

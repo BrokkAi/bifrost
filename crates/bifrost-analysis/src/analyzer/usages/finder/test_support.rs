@@ -1,11 +1,7 @@
 use super::*;
 #[doc(hidden)]
 pub fn write_fixture(root: &std::path::Path, files: &[(&str, &str)]) {
-    for (rel, content) in files {
-        ProjectFile::new(root.to_path_buf(), rel)
-            .write(content)
-            .unwrap_or_else(|err| panic!("write {rel}: {err}"));
-    }
+    crate::test_support::write_fixture_files(root, files);
 }
 
 #[doc(hidden)]

@@ -3035,13 +3035,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             |region| region.id,
             |region| region.body,
         )? {
-            let statement_next = if step.next.kind == ControlEdgeKind::Normal {
-                step.next
-            } else {
-                let relay = self.point(builder, step.region.body, Vec::new())?;
-                self.edge(builder, relay, step.next)?;
-                EdgeTarget::normal(relay)
-            };
+            let statement_next =
+                self.session
+                    .cleanup_next_target(builder, step.region.body, step.next)?;
             stack.push(Work::Statement {
                 node: step.region.body,
                 entry: step.entry,

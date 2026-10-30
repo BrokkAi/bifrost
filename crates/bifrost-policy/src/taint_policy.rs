@@ -8856,10 +8856,10 @@ impl<'a> FrontierEndpointBinder<'a> {
                 .all(|value| value.proof == first.proof && value.completeness == first.completeness),
             "the observations of one selected row share its evidence"
         );
-        Ok(compose::HopQuality {
-            proven: matches!(first.proof, ProofStatus::Proven),
-            complete: matches!(first.completeness, EvidenceCompleteness::Complete),
-        })
+        Ok(compose::HopQuality::new(
+            matches!(first.proof, ProofStatus::Proven),
+            matches!(first.completeness, EvidenceCompleteness::Complete),
+        ))
     }
 
     /// The endpoints of one procedure in the composition's terms, the origin
@@ -8907,10 +8907,10 @@ impl<'a> FrontierEndpointBinder<'a> {
                     });
                     compose::EndpointEvidence::Unknown
                 }
-                None => compose::EndpointEvidence::Known(compose::HopQuality {
-                    proven: matches!(source.proof, ProofStatus::Proven),
-                    complete: matches!(source.completeness, EvidenceCompleteness::Complete),
-                }),
+                None => compose::EndpointEvidence::Known(compose::HopQuality::new(
+                    matches!(source.proof, ProofStatus::Proven),
+                    matches!(source.completeness, EvidenceCompleteness::Complete),
+                )),
             };
             answer.sources.push(BoundSource {
                 point: source.point.clone(),

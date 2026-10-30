@@ -110,19 +110,52 @@ impl Drop for DispatchMaterializationTimer {
 #[doc(hidden)]
 pub struct IncomingActualCache {
     #[doc(hidden)]
-    pub actuals: std::sync::Mutex<
-        brokk_bifrost_core::hash::HashMap<heap::IncomingActualKey, heap::IncomingActualSet>,
+    pub actuals: brokk_bifrost_core::analyzer::memo_attribution::ReplayingMemo<
+        std::sync::Mutex<
+            brokk_bifrost_core::hash::HashMap<heap::IncomingActualKey, IncomingActualMemoEntry>,
+        >,
     >,
     #[doc(hidden)]
     pub dispatch_materialization_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl std::ops::Deref for IncomingActualCache {
-    type Target = std::sync::Mutex<
-        brokk_bifrost_core::hash::HashMap<heap::IncomingActualKey, heap::IncomingActualSet>,
-    >;
-    fn deref(&self) -> &Self::Target {
-        &self.actuals
+/// One query-local incoming answer and its replay receipt. The second Arc is
+/// the same allocation, retained only for the artifact-union accounting pass.
+#[doc(hidden)]
+pub struct IncomingActualMemoEntry {
+    replay: Arc<
+        brokk_bifrost_core::analyzer::memo_attribution::ReplayingMemoEntry<
+            Arc<heap::IncomingActualSet>,
+            super::read_ledger::ReadKey,
+        >,
+    >,
+    accounted: Arc<heap::IncomingActualSet>,
+}
+
+impl IncomingActualMemoEntry {
+    #[doc(hidden)]
+    pub fn new(
+        replay: Arc<
+            brokk_bifrost_core::analyzer::memo_attribution::ReplayingMemoEntry<
+                Arc<heap::IncomingActualSet>,
+                super::read_ledger::ReadKey,
+            >,
+        >,
+        accounted: Arc<heap::IncomingActualSet>,
+    ) -> Self {
+        Self { replay, accounted }
+    }
+
+    #[doc(hidden)]
+    pub fn replay_entry(
+        &self,
+    ) -> Arc<
+        brokk_bifrost_core::analyzer::memo_attribution::ReplayingMemoEntry<
+            Arc<heap::IncomingActualSet>,
+            super::read_ledger::ReadKey,
+        >,
+    > {
+        Arc::clone(&self.replay)
     }
 }
 

@@ -49,6 +49,7 @@ use tree_sitter::Node;
 
 /// The three per-scan return-type caches the walk shares across files.
 pub struct JavaEdgeScanCaches<'a> {
+    pub reads: &'a brokk_bifrost_core::analyzer::project_reads::ReadCapability,
     pub method_return: &'a MethodReturnCache,
     pub method_anonymous_return: &'a MethodAnonymousReturnCache,
     pub file_return: &'a FileReturnCache,
@@ -71,6 +72,7 @@ pub fn scan_file(
     caches: &JavaEdgeScanCaches<'_>,
 ) -> PerFileEdges {
     let mut ctx = JavaScan {
+        reads: caches.reads,
         java,
         graph,
         file,
@@ -89,6 +91,7 @@ pub fn scan_file(
 }
 
 struct JavaScan<'a> {
+    reads: &'a brokk_bifrost_core::analyzer::project_reads::ReadCapability,
     java: &'a dyn JavaSource,
     graph: &'a JavaGraphSource<'a>,
     file: &'a ProjectFile,
@@ -182,6 +185,10 @@ impl JavaScan<'_> {
 }
 
 impl JavaReturnTypeContext for JavaScan<'_> {
+    fn read_capability(&self) -> &brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        self.reads
+    }
+
     fn java(&self) -> &dyn JavaSource {
         self.java
     }

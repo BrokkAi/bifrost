@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 pub(crate) struct JavaMemoCaches {
     budget_bytes: u64,
-    pub(crate) resolved_imports: Cache<ProjectFile, Arc<HashMap<String, CodeUnit>>>,
+    pub(crate) resolved_imports:
+        crate::analyzer::jvm::hierarchy::DerivedMemo<ProjectFile, HashMap<String, CodeUnit>>,
     pub(crate) source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
@@ -32,14 +33,15 @@ pub(crate) struct JavaMemoCaches {
         ),
         Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>,
     >,
-    pub(crate) statement_facts: Cache<
+    pub(crate) statement_facts: crate::analyzer::jvm::hierarchy::DerivedMemo<
         (git2::Oid, ProjectFile),
-        Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>,
+        brokk_bifrost_core::analyzer::statement_facts::StatementFactRows,
     >,
     pub(crate) package_names: Cache<ProjectFile, Arc<str>>,
     pub(crate) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    pub(crate) relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
-    pub(crate) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    pub(crate) relevant_imports:
+        crate::analyzer::jvm::hierarchy::DerivedMemo<CodeUnit, HashSet<String>>,
+    pub(crate) direct_ancestors: crate::analyzer::jvm::hierarchy::AncestorMemo,
     /// `PoolSafeMemo`, not `OnceLock`, for the same reason as the two sibling
     /// cells below: this whole-workspace build is reached from rayon workers
     /// during cold scans, and a blocking `get_or_init` parks every one of them
@@ -59,29 +61,18 @@ impl JavaMemoCaches {
     pub(crate) fn new(budget_bytes: u64) -> Self {
         Self {
             budget_bytes,
-            resolved_imports: build_weighted_cache(budget_bytes / 4, weight_import_map),
+            resolved_imports: crate::analyzer::jvm::hierarchy::derived_memo(budget_bytes / 4),
             source_facts: build_weighted_cache(
                 budget_bytes / 8,
                 |_, value: &Arc<brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts>| {
                     u32::try_from(value.estimated_retained_bytes()).unwrap_or(u32::MAX)
                 },
             ),
-            statement_facts:
-                build_weighted_cache(
-                    budget_bytes / 16,
-                    |key: &(git2::Oid, ProjectFile),
-                     rows: &Arc<
-                        brokk_bifrost_core::analyzer::statement_facts::StatementFactRows,
-                    >| {
-                        weight_bytes(
-                            estimate_project_file(&key.1) + rows.estimated_retained_bytes() as u64,
-                        )
-                    },
-                ),
+            statement_facts: crate::analyzer::jvm::hierarchy::derived_memo(budget_bytes / 16),
             package_names: build_weighted_cache(budget_bytes / 16, weight_package_name),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
-            relevant_imports: build_weighted_cache(budget_bytes / 8, weight_string_set),
-            direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec),
+            relevant_imports: crate::analyzer::jvm::hierarchy::derived_memo(budget_bytes / 8),
+            direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(budget_bytes / 8),
             direct_descendant_index: KeyedPoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
@@ -93,7 +84,7 @@ impl JavaMemoCaches {
     }
 }
 
-fn weight_import_map(key: &ProjectFile, value: &Arc<HashMap<String, CodeUnit>>) -> u32 {
+pub(super) fn weight_import_map(key: &ProjectFile, value: &Arc<HashMap<String, CodeUnit>>) -> u32 {
     weight_bytes(estimate_project_file(key) + estimate_import_map(value.as_ref()))
 }
 
@@ -105,12 +96,8 @@ fn weight_project_file_set(key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>)
     weight_bytes(estimate_project_file(key) + estimate_project_file_set(value.as_ref()))
 }
 
-fn weight_string_set(key: &CodeUnit, value: &Arc<HashSet<String>>) -> u32 {
+pub(super) fn weight_string_set(key: &CodeUnit, value: &Arc<HashSet<String>>) -> u32 {
     weight_bytes(estimate_code_unit(key) + estimate_string_set(value.as_ref()))
-}
-
-fn weight_code_unit_vec(key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
-    weight_bytes(estimate_code_unit(key) + estimate_code_unit_vec(value.as_ref()))
 }
 
 fn estimate_import_map(imports: &HashMap<String, CodeUnit>) -> u64 {
@@ -129,12 +116,4 @@ fn estimate_string_set(values: &HashSet<String>) -> u64 {
     estimate_collection_bytes(size_of::<HashSet<String>>() as u64, values, |value| {
         value.len() as u64
     })
-}
-
-fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
-    estimate_collection_bytes(
-        size_of::<Vec<CodeUnit>>() as u64,
-        values,
-        estimate_code_unit,
-    )
 }

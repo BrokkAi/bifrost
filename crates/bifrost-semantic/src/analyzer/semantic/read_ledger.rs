@@ -68,6 +68,476 @@ impl IndexFamily {
     }
 }
 
+/// Closed workspace-authority families. Stable labels are never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkspaceFactFamily {
+    CSharpDeadCodeUsageEdges,
+    CSharpReachability,
+    CSharpNamespaceByFile,
+    CSharpUsingNamespaces,
+    CSharpFileUsingNamespaces,
+    CSharpNamespaceExists,
+    CSharpPersistedFqnCandidates,
+    CSharpUsingAliases,
+    CSharpImportedCodeUnits,
+    CSharpReferencingFiles,
+    CSharpDirectDescendantIndex,
+    CSharpReverseImportIndex,
+    CSharpImplicitReferenceIndex,
+    CSharpFileDependenciesByNamespace,
+    CSharpHierarchyTestFiles,
+    CSharpGlobalUsingNamespaces,
+    CSharpSortedGlobalUsingNamespaces,
+    CSharpGlobalUsingAliases,
+    CSharpGlobalStaticUsingTypeNames,
+    CSharpGlobalStaticUsingTypes,
+    CSharpUsageGlobalStaticUsingTypes,
+    CSharpCompilationConfiguration,
+    CSharpExternalDeclarations,
+    GoWorkspaceIndexes,
+    GoWorkspacePaths,
+    GoImportFacts,
+    GoReverseImports,
+    GoBuildSelection,
+
+    CppClassRanges,
+    CppExternalHeaderClosures,
+    CppCompileContexts,
+    CppDirectDescendants,
+    CppTransitiveReverseTranslationUnits,
+    CppReverseIncludes,
+    CppReconciledDefinitions,
+    CppReconcileCandidates,
+    CppHeaderLanguageAttribution,
+    CppHeaderReadings,
+    CppClassDeclarationStrength,
+    CppIncludeReachability,
+    CppReferencingFiles,
+    CppOverwrittenCandidates,
+    CppImportedCodeUnits,
+    CppIncludeTargets,
+    RubyDirectDescendants,
+    RubyReverseImports,
+    RubyAutoloadConstants,
+    RubyCanonicalSourcesReady,
+    RubyZeitwerkConventions,
+    RubyZeitwerkAutoloadFiles,
+    RubyZeitwerkConsumerFiles,
+    RubyZeitwerkAutoloadCodeUnits,
+    RubyMixinRelations,
+    RubySemanticFacts,
+    RubyTypesByIdentifier,
+    PhpDirectDescendants,
+    PhpReverseImports,
+    PhpComposerAutoload,
+    ProtocolSummaries,
+    FieldSlots,
+    JsTsUsageIndex,
+    PythonModuleSpellings,
+    PythonDescendants,
+    PythonReverseImports,
+    PythonUsageIndex,
+    PythonSavedDefaults,
+    PythonModuleMemberMutation,
+    PythonClassMemberMutation,
+    PythonEnvironmentBinding,
+    JsTsModulePaths,
+    JsTsWorkspacePackages,
+    JsTsDescendants,
+    JsTsProductionDescendants,
+    JsTsReverseImports,
+    JsTsMemberSurface,
+    JsTsReceiverMembers,
+    JsTsJsxPropsOwners,
+    JsTsJsxComponentOwners,
+    WorkspaceUsageGraph,
+    JavaUsageEvidence,
+    JavaImportInventory,
+    JavaWorkspaceClasses,
+    JavaReferencingFiles,
+    JavaReverseImports,
+    JavaSamePackageReferences,
+    JavaDescendantIndex,
+    JavaExternalDeclarations,
+    KotlinReferencingFiles,
+    KotlinReverseImports,
+    KotlinSamePackageReferences,
+    KotlinDescendantIndex,
+    KotlinRealmDescendantIndex,
+    KotlinFileDependencies,
+    KotlinTopLevelDeclarations,
+    KotlinDeadCodeEdges,
+    KotlinExternalDeclarations,
+
+    PythonExternalModuleMemberMutation,
+    RuntimeRootWriteFootprint,
+    JsTsExternalModuleMemberMutation,
+    WorkspaceFileListing,
+    DefinitionParents,
+    PathSyntheticModules,
+    PackageClassDeclarations,
+    StructuralPostingIndex,
+    RelationalFrontierAnswers,
+    BoundedIdentifierCandidates,
+    WorkspaceFileInventory,
+    WorkspaceIgnoreRules,
+    WorkspaceDirectory,
+    WorkspacePathKind,
+    WorkspaceAnalyzerLanguages,
+    WorkspaceOverlayMembership,
+    ScalaProjectTypes,
+    ScalaResolvedQuerySeed,
+    ScalaExternalIndex,
+    ScalaImportableDeclarations,
+    ScalaPackageNamespaces,
+    ScalaFileDependencyIndex,
+    ScalaLazyHierarchyIndex,
+    ScalaTypeRelations,
+    ScalaDeadCodeUsageEdges,
+    ScalaReferencingFiles,
+    ScalaReverseImportIndex,
+    ScalaSamePackageReferenceIndex,
+    JavaImportedTypeResolution,
+}
+
+impl WorkspaceFactFamily {
+    pub const LABELS: &[(Self, &str)] = &[
+        (
+            Self::CSharpDeadCodeUsageEdges,
+            "csharp_dead_code_usage_edges",
+        ),
+        (Self::CSharpReachability, "csharp_reachability"),
+        (Self::CSharpNamespaceByFile, "csharp_namespace_by_file"),
+        (Self::CSharpUsingNamespaces, "csharp_using_namespaces"),
+        (
+            Self::CSharpFileUsingNamespaces,
+            "csharp_file_using_namespaces",
+        ),
+        (Self::CSharpNamespaceExists, "csharp_namespace_exists"),
+        (
+            Self::CSharpPersistedFqnCandidates,
+            "csharp_persisted_fqn_candidates",
+        ),
+        (Self::CSharpUsingAliases, "csharp_using_aliases"),
+        (Self::CSharpImportedCodeUnits, "csharp_imported_code_units"),
+        (Self::CSharpReferencingFiles, "csharp_referencing_files"),
+        (
+            Self::CSharpDirectDescendantIndex,
+            "csharp_direct_descendant_index",
+        ),
+        (
+            Self::CSharpReverseImportIndex,
+            "csharp_reverse_import_index",
+        ),
+        (
+            Self::CSharpImplicitReferenceIndex,
+            "csharp_implicit_reference_index",
+        ),
+        (
+            Self::CSharpFileDependenciesByNamespace,
+            "csharp_file_dependencies_by_namespace",
+        ),
+        (
+            Self::CSharpHierarchyTestFiles,
+            "csharp_hierarchy_test_files",
+        ),
+        (
+            Self::CSharpGlobalUsingNamespaces,
+            "csharp_global_using_namespaces",
+        ),
+        (
+            Self::CSharpSortedGlobalUsingNamespaces,
+            "csharp_sorted_global_using_namespaces",
+        ),
+        (
+            Self::CSharpGlobalUsingAliases,
+            "csharp_global_using_aliases",
+        ),
+        (
+            Self::CSharpGlobalStaticUsingTypeNames,
+            "csharp_global_static_using_type_names",
+        ),
+        (
+            Self::CSharpGlobalStaticUsingTypes,
+            "csharp_global_static_using_types",
+        ),
+        (
+            Self::CSharpUsageGlobalStaticUsingTypes,
+            "csharp_usage_global_static_using_types",
+        ),
+        (
+            Self::CSharpCompilationConfiguration,
+            "csharp_compilation_configuration",
+        ),
+        (
+            Self::CSharpExternalDeclarations,
+            "csharp_external_declarations",
+        ),
+        (Self::GoWorkspaceIndexes, "go_workspace_indexes"),
+        (Self::GoWorkspacePaths, "go_workspace_paths"),
+        (Self::GoImportFacts, "go_import_facts"),
+        (Self::GoReverseImports, "go_reverse_imports"),
+        (Self::GoBuildSelection, "go_build_selection"),
+        (Self::CppClassRanges, "cpp_class_ranges"),
+        (
+            Self::CppExternalHeaderClosures,
+            "cpp_external_header_closures",
+        ),
+        (Self::CppCompileContexts, "cpp_compile_contexts"),
+        (Self::CppDirectDescendants, "cpp_direct_descendants"),
+        (
+            Self::CppTransitiveReverseTranslationUnits,
+            "cpp_transitive_reverse_translation_units",
+        ),
+        (Self::CppReverseIncludes, "cpp_reverse_includes"),
+        (Self::CppReconciledDefinitions, "cpp_reconciled_definitions"),
+        (Self::CppReconcileCandidates, "cpp_reconcile_candidates"),
+        (
+            Self::CppHeaderLanguageAttribution,
+            "cpp_header_language_attribution",
+        ),
+        (Self::CppHeaderReadings, "cpp_header_readings"),
+        (
+            Self::CppClassDeclarationStrength,
+            "cpp_class_declaration_strength",
+        ),
+        (Self::CppIncludeReachability, "cpp_include_reachability"),
+        (Self::CppReferencingFiles, "cpp_referencing_files"),
+        (Self::CppOverwrittenCandidates, "cpp_overwritten_candidates"),
+        (Self::CppImportedCodeUnits, "cpp_imported_code_units"),
+        (Self::CppIncludeTargets, "cpp_include_targets"),
+        (Self::RubyDirectDescendants, "ruby_direct_descendants"),
+        (Self::RubyReverseImports, "ruby_reverse_imports"),
+        (Self::RubyAutoloadConstants, "ruby_autoload_constants"),
+        (
+            Self::RubyCanonicalSourcesReady,
+            "ruby_canonical_sources_ready",
+        ),
+        (Self::RubyZeitwerkConventions, "ruby_zeitwerk_conventions"),
+        (
+            Self::RubyZeitwerkAutoloadFiles,
+            "ruby_zeitwerk_autoload_files",
+        ),
+        (
+            Self::RubyZeitwerkConsumerFiles,
+            "ruby_zeitwerk_consumer_files",
+        ),
+        (
+            Self::RubyZeitwerkAutoloadCodeUnits,
+            "ruby_zeitwerk_autoload_code_units",
+        ),
+        (Self::RubyMixinRelations, "ruby_mixin_relations"),
+        (Self::RubySemanticFacts, "ruby_semantic_facts"),
+        (Self::RubyTypesByIdentifier, "ruby_types_by_identifier"),
+        (Self::PhpDirectDescendants, "php_direct_descendants"),
+        (Self::PhpReverseImports, "php_reverse_imports"),
+        (Self::PhpComposerAutoload, "php_composer_autoload"),
+        (Self::ProtocolSummaries, "protocol_summaries"),
+        (Self::FieldSlots, "field_slots"),
+        (
+            Self::JsTsExternalModuleMemberMutation,
+            "js_ts_external_module_member_mutation",
+        ),
+        (Self::JsTsUsageIndex, "js_ts_usage_index"),
+        (Self::PythonModuleSpellings, "python_module_spellings"),
+        (Self::PythonDescendants, "python_descendants"),
+        (Self::PythonReverseImports, "python_reverse_imports"),
+        (Self::PythonUsageIndex, "python_usage_index"),
+        (Self::PythonSavedDefaults, "python_saved_defaults"),
+        (
+            Self::PythonModuleMemberMutation,
+            "python_module_member_mutation",
+        ),
+        (
+            Self::PythonClassMemberMutation,
+            "python_class_member_mutation",
+        ),
+        (Self::PythonEnvironmentBinding, "python_environment_binding"),
+        (Self::JsTsModulePaths, "js_ts_module_paths"),
+        (Self::JsTsWorkspacePackages, "js_ts_workspace_packages"),
+        (Self::JsTsDescendants, "js_ts_descendants"),
+        (
+            Self::JsTsProductionDescendants,
+            "js_ts_production_descendants",
+        ),
+        (Self::JsTsReverseImports, "js_ts_reverse_imports"),
+        (Self::JsTsMemberSurface, "js_ts_member_surface"),
+        (Self::JsTsReceiverMembers, "js_ts_receiver_members"),
+        (Self::JsTsJsxPropsOwners, "js_ts_jsx_props_owners"),
+        (Self::JsTsJsxComponentOwners, "js_ts_jsx_component_owners"),
+        (Self::WorkspaceUsageGraph, "workspace_usage_graph"),
+        (Self::JavaUsageEvidence, "java_usage_evidence"),
+        (Self::JavaImportInventory, "java_import_inventory"),
+        (Self::JavaWorkspaceClasses, "java_workspace_classes"),
+        (Self::JavaReferencingFiles, "java_referencing_files"),
+        (Self::JavaReverseImports, "java_reverse_imports"),
+        (
+            Self::JavaSamePackageReferences,
+            "java_same_package_references",
+        ),
+        (Self::JavaDescendantIndex, "java_descendant_index"),
+        (Self::JavaExternalDeclarations, "java_external_declarations"),
+        (Self::KotlinReferencingFiles, "kotlin_referencing_files"),
+        (Self::KotlinReverseImports, "kotlin_reverse_imports"),
+        (
+            Self::KotlinSamePackageReferences,
+            "kotlin_same_package_references",
+        ),
+        (Self::KotlinDescendantIndex, "kotlin_descendant_index"),
+        (
+            Self::KotlinRealmDescendantIndex,
+            "kotlin_realm_descendant_index",
+        ),
+        (Self::KotlinFileDependencies, "kotlin_file_dependencies"),
+        (
+            Self::KotlinTopLevelDeclarations,
+            "kotlin_top_level_declarations",
+        ),
+        (Self::KotlinDeadCodeEdges, "kotlin_dead_code_edges"),
+        (
+            Self::KotlinExternalDeclarations,
+            "kotlin_external_declarations",
+        ),
+        (
+            Self::PythonExternalModuleMemberMutation,
+            "python_external_module_member_mutation",
+        ),
+        (
+            Self::RuntimeRootWriteFootprint,
+            "runtime_root_write_footprint",
+        ),
+        (Self::WorkspaceFileListing, "workspace_file_listing"),
+        (Self::DefinitionParents, "definition_parents"),
+        (Self::PathSyntheticModules, "path_synthetic_modules"),
+        (Self::PackageClassDeclarations, "package_class_declarations"),
+        (Self::StructuralPostingIndex, "structural_posting_index"),
+        (
+            Self::RelationalFrontierAnswers,
+            "relational_frontier_answers",
+        ),
+        (
+            Self::BoundedIdentifierCandidates,
+            "bounded_identifier_candidates",
+        ),
+        (Self::WorkspaceFileInventory, "workspace_file_inventory"),
+        (Self::WorkspaceIgnoreRules, "workspace_ignore_rules"),
+        (Self::WorkspaceDirectory, "workspace_directory"),
+        (Self::WorkspacePathKind, "workspace_path_kind"),
+        (
+            Self::WorkspaceAnalyzerLanguages,
+            "workspace_analyzer_languages",
+        ),
+        (
+            Self::WorkspaceOverlayMembership,
+            "workspace_overlay_membership",
+        ),
+        (Self::ScalaProjectTypes, "scala_project_types"),
+        (Self::ScalaResolvedQuerySeed, "scala_resolved_query_seed"),
+        (Self::ScalaExternalIndex, "scala_external_index"),
+        (
+            Self::ScalaImportableDeclarations,
+            "scala_importable_declarations",
+        ),
+        (Self::ScalaPackageNamespaces, "scala_package_namespaces"),
+        (
+            Self::ScalaFileDependencyIndex,
+            "scala_file_dependency_index",
+        ),
+        (Self::ScalaLazyHierarchyIndex, "scala_lazy_hierarchy_index"),
+        (Self::ScalaTypeRelations, "scala_type_relations"),
+        (Self::ScalaDeadCodeUsageEdges, "scala_dead_code_usage_edges"),
+        (Self::ScalaReferencingFiles, "scala_referencing_files"),
+        (Self::ScalaReverseImportIndex, "scala_reverse_import_index"),
+        (
+            Self::ScalaSamePackageReferenceIndex,
+            "scala_same_package_reference_index",
+        ),
+        (
+            Self::JavaImportedTypeResolution,
+            "java_imported_type_resolution",
+        ),
+    ];
+
+    pub fn stable_label(self) -> &'static str {
+        let label = Self::LABELS
+            .iter()
+            .find_map(|(family, label)| (*family == self).then_some(*label))
+            .expect("every workspace fact family has a registered label");
+        debug_assert_eq!(
+            Self::from_label(label),
+            Some(self),
+            "workspace fact family labels must round-trip"
+        );
+        label
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::LABELS
+            .iter()
+            .find_map(|(family, registered)| (*registered == label).then_some(*family))
+    }
+}
+
+impl Serialize for WorkspaceFactFamily {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.stable_label())
+    }
+}
+impl<'de> Deserialize<'de> for WorkspaceFactFamily {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let label = String::deserialize(deserializer)?;
+        Self::from_label(&label).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown workspace fact family {label:?}"))
+        })
+    }
+}
+
+/// A workspace fact's mount-free subject. Names and paths use the same
+/// qualified-name and workspace-relative spelling as the authority question.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "subject", rename_all = "snake_case")]
+pub enum FactSubject {
+    Whole,
+    Class {
+        class: StableDigest,
+    },
+    File {
+        rel_path: Box<str>,
+    },
+    Named {
+        name: Box<str>,
+    },
+    NamedMember {
+        owner: Box<str>,
+        member: Box<str>,
+    },
+    ClassMember {
+        class: StableDigest,
+        member: Box<str>,
+    },
+    NameGroupMember {
+        names: Vec<Box<str>>,
+        member: Box<str>,
+    },
+    FileNamedMember {
+        rel_path: Box<str>,
+        owner: Box<str>,
+        member: Box<str>,
+        environment: Option<StableDigest>,
+    },
+}
+
+impl FactSubject {
+    /// The caller supplies the authority's canonical qualified-name set.
+    pub fn name_group_member(names: Vec<Box<str>>, member: Box<str>) -> Self {
+        assert!(
+            !names.is_empty() && names.windows(2).all(|pair| pair[0] < pair[1]),
+            "workspace fact names must be nonempty, sorted and deduplicated: {names:?}"
+        );
+        Self::NameGroupMember { names, member }
+    }
+}
+
 /// The derived-value lookups whose answers are not index probes.
 ///
 /// These are the cross-file channels: an answer can change because a file the
@@ -128,6 +598,8 @@ pub enum LookupKind {
     ProcedureDispatch,
     /// One procedure summary, by its mount-free identity.
     ProcedureSummary,
+    /// A named workspace authority answer.
+    WorkspaceFact,
 }
 
 impl LookupKind {
@@ -149,6 +621,7 @@ impl LookupKind {
             Self::Dispatch => "dispatch",
             Self::ProcedureDispatch => "procedure_dispatch",
             Self::ProcedureSummary => "procedure_summary",
+            Self::WorkspaceFact => "workspace_fact",
         }
     }
 }
@@ -414,6 +887,12 @@ impl ReadKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "question", rename_all = "snake_case")]
 pub enum LookupQuestion {
+    /// One answer from a named workspace authority.
+    WorkspaceFact {
+        family: WorkspaceFactFamily,
+        language: Language,
+        subject: FactSubject,
+    },
     /// One name lookup, optionally restricted to one language delegate.
     ///
     /// `None` is the composite question: every language currently mounted,
@@ -543,13 +1022,14 @@ impl LookupQuestion {
             Self::CallSite { .. } => "call_site",
             Self::ProcedureCallSite { .. } => "procedure_call_site",
             Self::Summary { .. } => "summary",
+            Self::WorkspaceFact { .. } => "workspace_fact",
         }
     }
 
     /// The workspace-relative path this question is about, when it names one.
     pub fn rel_path(&self) -> Option<&str> {
         match self {
-            Self::Name { .. } | Self::Summary { .. } => None,
+            Self::Name { .. } | Self::Summary { .. } | Self::WorkspaceFact { .. } => None,
             Self::Declaration { rel_path, .. }
             | Self::File { rel_path }
             | Self::CallSite { rel_path, .. }
@@ -611,6 +1091,66 @@ impl LookupQuestion {
                 hasher.field("ordinal", &(site.ordinal as u64).to_be_bytes());
             }
             Self::Summary { identity } => hasher.field("identity", identity.as_bytes()),
+            Self::WorkspaceFact {
+                family,
+                language,
+                subject,
+            } => {
+                hasher.field("family", family.stable_label().as_bytes());
+                hasher.field("language", language.config_label().as_bytes());
+                match subject {
+                    FactSubject::Whole => hasher.field("subject", b"whole"),
+                    FactSubject::Class { class } => {
+                        hasher.field("subject", b"class");
+                        hasher.field("class", class.as_bytes());
+                    }
+                    FactSubject::File { rel_path } => {
+                        hasher.field("subject", b"file");
+                        hasher.field("rel_path", rel_path.as_bytes());
+                    }
+                    FactSubject::Named { name } => {
+                        hasher.field("subject", b"named");
+                        hasher.field("name", name.as_bytes());
+                    }
+                    FactSubject::NamedMember { owner, member } => {
+                        hasher.field("subject", b"named_member");
+                        hasher.field("owner", owner.as_bytes());
+                        hasher.field("member", member.as_bytes());
+                    }
+                    FactSubject::ClassMember { class, member } => {
+                        hasher.field("subject", b"class_member");
+                        hasher.field("class", class.as_bytes());
+                        hasher.field("member", member.as_bytes());
+                    }
+                    FactSubject::NameGroupMember { names, member } => {
+                        // Direct enum construction must satisfy the same invariant.
+                        assert!(
+                            !names.is_empty() && names.windows(2).all(|pair| pair[0] < pair[1]),
+                            "workspace fact names must be nonempty, sorted and deduplicated: {names:?}"
+                        );
+                        hasher.field("subject", b"name_group_member");
+                        hasher.sequence("names", names, |hasher, name| {
+                            hasher.field("name", name.as_bytes());
+                        });
+                        hasher.field("member", member.as_bytes());
+                    }
+                    FactSubject::FileNamedMember {
+                        rel_path,
+                        owner,
+                        member,
+                        environment,
+                    } => {
+                        hasher.field("subject", b"file_named_member");
+                        hasher.field("rel_path", rel_path.as_bytes());
+                        hasher.field("owner", owner.as_bytes());
+                        hasher.field("member", member.as_bytes());
+                        hasher.field("environment_present", &[u8::from(environment.is_some())]);
+                        if let Some(environment) = environment {
+                            hasher.field("environment", environment.as_bytes());
+                        }
+                    }
+                }
+            }
         }
     }
 }

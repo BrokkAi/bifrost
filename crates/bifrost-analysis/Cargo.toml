@@ -17,23 +17,24 @@ name = "brokk_bifrost_analysis"
 
 [dependencies]
 brokk-bifrost-store.workspace = true
-brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.3" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3" }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.3" }
-brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.14.3" }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.3" }
-brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.3" }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.3" }
-brokk-bifrost-php = { path = "../bifrost-php", version = "=0.14.3" }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.3" }
-brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.14.3" }
-brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.3" }
+brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.4" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.4" }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.4" }
+brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.14.4" }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.4" }
+brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.4" }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.4" }
+brokk-bifrost-php = { path = "../bifrost-php", version = "=0.14.4" }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.4" }
+brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.14.4" }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.4" }
 arc-swap = "1.7.1"
 cap-std = { version = "4.0.2", default-features = false }
 cap-fs-ext = { version = "4.0.2", default-features = false, features = ["std"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
+hashbrown = { version = "0.17.1", default-features = false }
 moka = { version = "0.12.11", features = ["sync"] }
 rayon = "1.10.0"
 regex = "1.12.2"
@@ -96,20 +97,20 @@ test-support = [
 ]
 
 [dev-dependencies]
-brokk-bifrost-store = { path = "../bifrost-store", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-store = { path = "../bifrost-store", version = "=0.14.4", features = ["test-support"] }
 proptest = "1.11"
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes `CancellationToken`'s
 # `cancel_after_checks_for_test` hooks exist while the unit tests are built.
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.4", features = ["test-support"] }
 rusqlite = { version = "0.40.2", default-features = false, features = [
     "bundled",
     "cache",

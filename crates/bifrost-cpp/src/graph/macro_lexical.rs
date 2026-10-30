@@ -413,26 +413,16 @@ fn definition_template(
     definition: Node<'_>,
     source: &str,
 ) -> Option<MacroTemplate> {
-    let key = (file.clone(), definition.start_byte());
-    if let Some(template) = visibility
-        .macro_lexical_templates
-        .lock()
-        .expect("macro lexical template cache poisoned")
-        .get(&key)
-    {
-        return template.clone();
-    }
-    let template = (|| {
-        let body = visibility.function_macro_replacement_body(file, definition, source)?;
-        let replacement_start = function_macro_replacement_span(definition, source)?.start;
-        build_template(file, definition, source, &body, replacement_start)
-    })();
-    visibility
-        .macro_lexical_templates
-        .lock()
-        .expect("macro lexical template cache poisoned")
-        .insert(key, template.clone());
-    template
+    super::resolver::visibility_memo_value(
+        &visibility.macro_lexical_templates,
+        &visibility.reads,
+        (file.clone(), definition.start_byte()),
+        || {
+            let body = visibility.function_macro_replacement_body(file, definition, source)?;
+            let replacement_start = function_macro_replacement_span(definition, source)?.start;
+            build_template(file, definition, source, &body, replacement_start)
+        },
+    )
 }
 
 fn active_definition_template(

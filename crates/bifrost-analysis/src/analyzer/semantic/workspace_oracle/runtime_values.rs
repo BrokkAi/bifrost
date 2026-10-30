@@ -15,10 +15,67 @@ use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, SemanticCapability, SemanticOutcome,
     SemanticProviderError, SemanticRequest, SemanticWork,
 };
+use crate::analyzer::workspace_authority::{
+    AuthorityInputs, WorkspaceAuthorityMemo, memo_attribution,
+};
+use crate::analyzer::{FactSubject, WorkspaceFactFamily};
 use crate::analyzer::{LanguageDialect, parser_language_for_dialect};
 use crate::analyzer::{ProjectFile, Range};
 pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::runtime_values::*;
 use std::sync::Arc;
+
+pub(super) type AttributedRuntimeWriteFootprintCache = WorkspaceAuthorityMemo<
+    brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::runtime_values::WorkspaceRuntimeWriteFootprintCache,
+>;
+
+pub(super) fn attributed_runtime_write_footprint_cache() -> AttributedRuntimeWriteFootprintCache {
+    WorkspaceAuthorityMemo::new(WorkspaceFactFamily::RuntimeRootWriteFootprint,
+        brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::runtime_values::workspace_runtime_write_footprint_cache())
+}
+
+fn footprint_digest(
+    answer: WorkspaceRuntimeWriteFootprint,
+) -> crate::analyzer::semantic::StableDigest {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.runtime-root-write-footprint.v1");
+    digest.push(match answer {
+        WorkspaceRuntimeWriteFootprint::Closed => b"closed",
+        WorkspaceRuntimeWriteFootprint::RuntimeRootWrite => b"runtime-root-write",
+        WorkspaceRuntimeWriteFootprint::CoverageLimited => b"coverage-limited",
+    });
+    digest.finish()
+}
+
+fn footprint_inputs(
+    file: &ProjectFile,
+    answer: WorkspaceRuntimeWriteFootprint,
+) -> AuthorityInputs<'static> {
+    AuthorityInputs::Fact {
+        language: file.language(),
+        subject: FactSubject::File {
+            rel_path: crate::path_utils::rel_path_string(file).into(),
+        },
+        answer: footprint_digest(answer),
+    }
+}
+
+pub(crate) fn runtime_footprint_answer(
+    workspace: &crate::analyzer::WorkspaceAnalyzer,
+    file: &ProjectFile,
+    limits: SemanticWork,
+) -> Option<crate::analyzer::semantic::StableDigest> {
+    let oracle = WorkspaceSemanticOracle::new(workspace);
+    let mut budget = crate::analyzer::semantic::SemanticBudget::new(limits).ok()?;
+    let cancellation = crate::CancellationToken::default();
+    let (answer, _) = oracle
+        .workspace_runtime_write_footprint(
+            file,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .ok()?;
+    // An incomplete scan cannot certify an old answer, even another incomplete scan.
+    (answer != WorkspaceRuntimeWriteFootprint::CoverageLimited).then(|| footprint_digest(answer))
+}
+
 impl WorkspaceSemanticOracle<'_> {
     /// Bind a structured source candidate to its exact executable load.
     pub fn runtime_keyed_read_at_source(
@@ -282,31 +339,38 @@ impl WorkspaceSemanticOracle<'_> {
         current: &ProjectFile,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(WorkspaceRuntimeWriteFootprint, SemanticWork), SemanticProviderError> {
-        let (acquisition, _) = self
-            .runtime_write_footprints
-            .acquire(current, request.cancellation);
-        let permit = match acquisition {
-            CompleteValueAcquisition::Cached { value } => {
-                let work = SemanticWork {
-                    nested_entries: 1,
-                    ..SemanticWork::default()
+        self.runtime_write_footprints.read(
+            &memo_attribution(self.workspace.analyzer()),
+            |memo| {
+                let (acquisition, _) = memo.acquire(current, request.cancellation);
+                let permit = match acquisition {
+                    CompleteValueAcquisition::Cached { value } => {
+                        let work = SemanticWork {
+                            nested_entries: 1,
+                            ..SemanticWork::default()
+                        };
+                        request.budget.charge_work(work);
+                        return Ok((*value, work));
+                    }
+                    CompleteValueAcquisition::Leader { permit } => permit,
+                    CompleteValueAcquisition::Cancelled | CompleteValueAcquisition::Rejected => {
+                        return Ok((
+                            WorkspaceRuntimeWriteFootprint::CoverageLimited,
+                            SemanticWork::default(),
+                        ));
+                    }
                 };
-                request.budget.charge_work(work);
-                return Ok((*value, work));
-            }
-            CompleteValueAcquisition::Leader { permit } => permit,
-            CompleteValueAcquisition::Cancelled | CompleteValueAcquisition::Rejected => {
-                return Ok((
-                    WorkspaceRuntimeWriteFootprint::CoverageLimited,
-                    SemanticWork::default(),
-                ));
-            }
-        };
-        let (footprint, work) = self.scan_workspace_runtime_writes(current, request)?;
-        if footprint != WorkspaceRuntimeWriteFootprint::CoverageLimited {
-            permit.publish_complete(Arc::new(footprint));
-        }
-        Ok((footprint, work))
+                let (footprint, work) = self.scan_workspace_runtime_writes(current, request)?;
+                if footprint != WorkspaceRuntimeWriteFootprint::CoverageLimited {
+                    permit.publish_complete(Arc::new(footprint));
+                }
+                Ok((footprint, work))
+            },
+            |outcome| match outcome {
+                Ok((answer, _)) => footprint_inputs(current, *answer),
+                Err(_) => AuthorityInputs::Unnamed,
+            },
+        )
     }
 
     fn scan_workspace_runtime_writes(
@@ -410,6 +474,12 @@ impl WorkspaceSemanticOracle<'_> {
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<RuntimeKeyedReadResult>, SemanticProviderError> {
+        self.workspace
+            .analyzer()
+            .record_read(crate::analyzer::ReadKey::semantic_artifact(
+                procedure.artifact().key(),
+            ));
+        self.active_semantic_models();
         if !RUNTIME_KEYED_READ_LANGUAGES.contains(&procedure.artifact().key().language().language())
         {
             return Ok(SemanticOutcome::Complete {
@@ -446,6 +516,12 @@ impl WorkspaceSemanticOracle<'_> {
         let (acquisition, _) = self.runtime_reads.acquire(procedure, request.cancellation);
         let permit = match acquisition {
             CompleteValueAcquisition::Cached { value } => {
+                debug_assert!(
+                    value.limitations.is_empty(),
+                    "only complete runtime reads are cached"
+                );
+                self.record_closed_runtime_footprint(&file);
+
                 let work = SemanticWork {
                     nested_entries: value.endpoints.len()
                         + value.limitations.len()
@@ -484,6 +560,28 @@ impl WorkspaceSemanticOracle<'_> {
             permit.publish_complete(Arc::new(value.clone()));
         }
         Ok(outcome)
+    }
+
+    // A complete runtime-read result was built only under a closed footprint.
+    // Re-state that authority question on every result-cache hit.
+    fn record_closed_runtime_footprint(&self, file: &ProjectFile) {
+        let analyzer = self.workspace.analyzer();
+        crate::analyzer::workspace_authority::record_workspace_authority_read(
+            analyzer,
+            WorkspaceFactFamily::RuntimeRootWriteFootprint,
+            footprint_inputs(file, WorkspaceRuntimeWriteFootprint::Closed),
+        );
+        if let Some(ledger) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+            debug_assert!(ledger.keys().iter().any(|key| matches!(key,
+                crate::analyzer::ReadKey::Lookup { question: crate::analyzer::LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::RuntimeRootWriteFootprint,
+                    language,
+                    subject: FactSubject::File { rel_path },
+                }, digest, .. } if *language == file.language()
+                    && rel_path.as_ref() == crate::path_utils::rel_path_string(file)
+                    && *digest == footprint_digest(WorkspaceRuntimeWriteFootprint::Closed)
+            )), "runtime-result hits must record the precise closed-footprint fact");
+        }
     }
 
     fn build_runtime_reads(
@@ -1052,5 +1150,160 @@ impl WorkspaceSemanticOracle<'_> {
         };
         *work = work.conservative_add(rebound.work());
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod syntax_memo_input_tests {
+    use super::*;
+    use crate::CancellationToken;
+    use crate::analyzer::semantic::SemanticBudget;
+    use crate::analyzer::{Language, WorkspaceAnalyzer, capture_query_reads};
+
+    #[test]
+    fn runtime_syntax_hits_use_the_exact_source_and_dialect() {
+        let workspace = WorkspaceAnalyzer::Multi(Box::default());
+        let oracle = WorkspaceSemanticOracle::new(&workspace);
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let dialect =
+            LanguageDialect::for_path(Language::JavaScript, std::path::Path::new("memo.js"));
+        let mut read = |source: &str| {
+            let (outcome, reads) = capture_query_reads(workspace.analyzer(), || {
+                oracle
+                    .runtime_syntax_for_source(dialect, source, &mut request)
+                    .unwrap()
+            });
+            (outcome.available_value().unwrap().clone(), reads)
+        };
+        let (first, first_reads) = read("const value = 1;\n");
+        let (hit, hit_reads) = read("const value = 1;\n");
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(first_reads.keys(), hit_reads.keys());
+        let (changed, _) = read("process.env.PATH = 'replacement';\n");
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(!changed.facts.writes.is_empty());
+        let typescript =
+            LanguageDialect::for_path(Language::TypeScript, std::path::Path::new("memo.ts"));
+        let other_dialect = oracle
+            .runtime_syntax_for_source(typescript, "const value = 1;\n", &mut request)
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &first,
+            other_dialect.available_value().unwrap()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod runtime_root_write_footprint {
+    use super::*;
+    use crate::analyzer::read_verification::workspace_fact_test_support::{
+        source_workspace, verdict_without_field_slots,
+    };
+    use crate::analyzer::semantic::SemanticBudget;
+    use crate::analyzer::{Language, WorkspaceAnalyzer, capture_query_reads};
+    use crate::inline_project::InlineTestProject;
+
+    fn capture(
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+    ) -> (
+        WorkspaceRuntimeWriteFootprint,
+        Arc<crate::analyzer::ReadLedger>,
+    ) {
+        let oracle = WorkspaceSemanticOracle::new(workspace);
+        let mut budget = SemanticBudget::default();
+        let cancel = crate::CancellationToken::default();
+        let (answer, reads) = capture_query_reads(workspace.analyzer(), || {
+            oracle
+                .workspace_runtime_write_footprint(
+                    file,
+                    &mut SemanticRequest::new(&mut budget, &cancel),
+                )
+                .unwrap()
+                .0
+        });
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert_eq!(
+            reads.keys().len(),
+            1,
+            "the precise fact subsumes scanned implementation inputs"
+        );
+        (answer, reads)
+    }
+
+    #[test]
+    fn unimported_runtime_write_rejects_without_field_slot_keys() {
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file("app.js", "function read() { return process.env.PATH; }\n")
+            .file("unimported.js", "const marker = 0;\n")
+            .build();
+        let base = source_workspace(&project);
+        let (before, reads) = capture(&base, &project.file("app.js"));
+        assert_eq!(before, WorkspaceRuntimeWriteFootprint::Closed);
+        assert!(verdict_without_field_slots(&base, &base, &reads.keys()).is_unchanged());
+        project
+            .file("unimported.js")
+            .write("process.env.PATH = 'replacement';\n")
+            .unwrap();
+        let head = source_workspace(&project);
+        let (after, _) = capture(&head, &project.file("app.js"));
+        assert_eq!(after, WorkspaceRuntimeWriteFootprint::RuntimeRootWrite);
+        let verdict = verdict_without_field_slots(&base, &head, &reads.keys());
+        assert!(verdict.changed().is_some(), "{verdict:?}");
+    }
+
+    #[test]
+    fn repeated_footprint_and_result_hits_record_equal_facts() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "def read():\n    return 1\n")
+            .file("unimported.py", "marker = 0\n")
+            .build();
+        let workspace = source_workspace(&project);
+        let file = project.file("app.py");
+        let oracle = WorkspaceSemanticOracle::new(&workspace);
+        let mut budget = SemanticBudget::default();
+        let cancel = crate::CancellationToken::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancel);
+        let (_, first) = capture_query_reads(workspace.analyzer(), || {
+            oracle
+                .workspace_runtime_write_footprint(&file, &mut request)
+                .unwrap()
+        });
+        let (_, hit) = capture_query_reads(workspace.analyzer(), || {
+            oracle
+                .workspace_runtime_write_footprint(&file, &mut request)
+                .unwrap()
+        });
+        let (_, result_hit) = capture_query_reads(workspace.analyzer(), || {
+            oracle.record_closed_runtime_footprint(&file)
+        });
+        assert_eq!(first.keys().len(), 1);
+        assert_eq!(first.keys(), hit.keys());
+        assert_eq!(first.keys(), result_hit.keys());
+        assert_eq!(first.digest(), hit.digest());
+        assert_eq!(hit.unattributed_reads(), 0);
+    }
+
+    #[test]
+    fn comment_before_runtime_write_preserves_footprint_digest() {
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file("app.js", "function read() { return process.env.PATH; }\n")
+            .file("unimported.js", "process.env.PATH = 'replacement';\n")
+            .build();
+        let base = source_workspace(&project);
+        let (before, reads) = capture(&base, &project.file("app.js"));
+        assert_eq!(before, WorkspaceRuntimeWriteFootprint::RuntimeRootWrite);
+        project
+            .file("unimported.js")
+            .write("// comment above the first runtime write\nprocess.env.PATH = 'replacement';\n")
+            .unwrap();
+        let head = source_workspace(&project);
+        let (after, changed_reads) = capture(&head, &project.file("app.js"));
+        assert_eq!(before, after);
+        assert_eq!(reads.digest(), changed_reads.digest());
+        assert!(verdict_without_field_slots(&base, &head, &reads.keys()).is_unchanged());
     }
 }

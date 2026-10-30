@@ -135,6 +135,10 @@ fn assert_resolution_canonical_schema_names(conn: &Connection) {
 
     for (table, expected) in [
         (
+            "resolution_compilation_imports",
+            &["blob_id", "import_site"][..],
+        ),
+        (
             "resolution_semantic_sites",
             &[
                 "blob_id",

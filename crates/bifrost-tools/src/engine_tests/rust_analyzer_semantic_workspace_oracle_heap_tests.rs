@@ -111,9 +111,8 @@ fn caller() {
         assert_eq!(
             oracle
                 .incoming_actuals
-                .lock()
-                .expect("incoming actual memo poisoned")
-                .len(),
+                .actuals
+                .account(|actuals| actuals.lock().expect("incoming actual memo poisoned").len()),
             1
         );
         let request = SemanticRequest::new(&mut budget, &cancellation);
@@ -168,13 +167,10 @@ fn caller() {
             )
         };
         assert_eq!(answer(&reused), answer(&outcome));
-        oracle
-            .incoming_actuals
-            .lock()
-            .expect("incoming actual memo poisoned")
-            .clear();
+        // A new provider starts with an empty incoming-actual memo.
+        let fresh_oracle = fixture.analyzer.semantic_oracle_provider();
         let mut fresh_budget = SemanticBudget::default();
-        let fresh = oracle
+        let fresh = fresh_oracle
             .pointees(
                 &query,
                 &mut SemanticRequest::new(&mut fresh_budget, &cancellation),

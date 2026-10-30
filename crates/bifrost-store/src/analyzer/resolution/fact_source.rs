@@ -157,6 +157,56 @@ pub struct GoInterfaceMethod {
     pub definition: Option<SemanticId>,
 }
 
+/// Reached composed declarations and type slots; retained only by this request.
+#[derive(Debug, Clone)]
+pub struct GoModelOwnerDeclarations {
+    pub owner: crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+    pub declaration: GoMemberDeclaration,
+    pub members_state: crate::analyzer::semantic_model::overlay::ModelMembersState,
+    pub embedded: Vec<super::ResolutionTypeRef>,
+    pub methods: Vec<GoModelMemberDeclaration>,
+    pub completion: ResolutionCompletion,
+}
+
+#[derive(Debug, Clone)]
+pub struct GoModelMemberDeclaration {
+    pub member: crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+    pub owner: SemanticId,
+    pub definition: SemanticId,
+    pub callable_lookup: SemanticId,
+    pub declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
+}
+
+/// One reached modeled receiver candidate. This is query-only provenance,
+/// never a source declaration, inventory ordinal, snapshot, or persisted row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactModelMember {
+    pub target: SemanticId,
+    pub member: crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+    pub declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
+    pub owner: super::ExternalOwnerIdentity,
+    pub owners: Box<[SemanticId]>,
+    pub owner_coordinates: Box<[Option<super::ExternalOwnerIdentity>]>,
+    pub receiver_owner: Option<super::ExternalOwnerIdentity>,
+    pub receiver_proven: bool,
+    pub selected: bool,
+    pub selection_complete: bool,
+    pub incomplete_reasons: Vec<String>,
+    pub receiver: super::ResolutionSlotValue,
+    pub interface: bool,
+    pub route_exact: bool,
+    pub receiver_route_proven: bool,
+    pub completion: ResolutionCompletion,
+    pub rejected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactModelMemberSelection {
+    pub native_target_count: usize,
+    pub candidates: Vec<FactModelMember>,
+    pub completion: ResolutionCompletion,
+}
+
 /// All source fields participate in selector shadowing, including ordinary
 /// fields. Missing native bridges or value slots keep promotion incomplete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2024,6 +2074,30 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<GoMemberDeclaration>>> {
         Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Selected model declaration behind an unindexed callable-result frontier.
+    /// Outer None denotes cancellation; inner None means no unique result declaration.
+    fn unindexed_model_callable_result(
+        &self,
+        _frontier: &super::UnindexedExternalFrontier,
+        cancellation: &CancellationToken,
+        _session: Option<
+            &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+        >,
+    ) -> StoreResult<Option<Option<String>>> {
+        Ok((!cancellation.is_cancelled()).then_some(None))
+    }
+
+    /// A model owner has no source SQL inventory. The outer None denotes
+    /// cancellation; an inner None means unavailable selected model metadata.
+    fn go_model_owner_declarations(
+        &self,
+        _definition: SemanticId,
+        _owner: &super::ExternalOwnerIdentity,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<GoModelOwnerDeclarations>>> {
+        Ok((!cancellation.is_cancelled()).then_some(None))
     }
 
     /// Exact source-owned lexical hierarchy terminals. Missing terminals are

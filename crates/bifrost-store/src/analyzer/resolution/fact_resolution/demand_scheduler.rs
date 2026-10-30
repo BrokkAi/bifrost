@@ -88,6 +88,26 @@ pub struct MemberSelectionRequest {
     pub(crate) language: Language,
 }
 
+impl MemberSelectionRequest {
+    /// Static Go membership uses the supplied value category, never syntax's
+    /// implicit addressability. The lookup is already a callable identity.
+    pub(crate) fn for_go_type(
+        receiver: ResolutionTypeRef,
+        lookup: SemanticId,
+        receiver_addressable: bool,
+    ) -> Self {
+        Self {
+            policy: &DEFAULT_HIERARCHY_POLICY,
+            order: None,
+            reference: receiver.identity(),
+            values: vec![ResolutionSlotValue::runtime(receiver, receiver_addressable)],
+            lookup,
+            namespace: ResolutionNamespace::Callable,
+            language: Language::Go,
+        }
+    }
+}
+
 /// One qualified member group from evaluated slots, without a lexical ROOT.
 #[derive(Clone, Debug)]
 pub(crate) struct QualifiedMemberInput {
@@ -210,6 +230,40 @@ pub(crate) enum CloseResume<'a> {
     },
 }
 
+/// Terminal state of one demanded root. Settled roots have an empty,
+/// incomplete relation; they never authorize absence or stop sibling roots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RootClosure {
+    Published(ResolutionCompletion),
+    Settled(SettledRoot),
+    Cancelled(ResolutionCompletion),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SettledRoot(ResolutionCompletion);
+impl RootClosure {
+    pub(crate) fn settled(completion: ResolutionCompletion) -> Self {
+        assert!(
+            matches!(&completion, ResolutionCompletion::Incomplete(reasons) if !reasons.is_empty()),
+            "a settled root carries an explicit incomplete reason: {completion:?}"
+        );
+        Self::Settled(SettledRoot(completion))
+    }
+    pub(crate) fn completion(&self) -> &ResolutionCompletion {
+        match self {
+            Self::Published(completion) | Self::Cancelled(completion) => completion,
+            Self::Settled(root) => &root.0,
+        }
+    }
+    pub(crate) fn combine(self, evidence: &ResolutionCompletion) -> Self {
+        match self {
+            Self::Published(completion) => Self::Published(completion.combine(evidence)),
+            Self::Settled(root) => Self::settled(root.0.combine(evidence)),
+            Self::Cancelled(completion) => Self::Cancelled(completion.combine(evidence)),
+        }
+    }
+}
+
 pub(crate) enum CloseProgress<T> {
     Ready(T),
     Reference {
@@ -226,7 +280,7 @@ pub(crate) enum CloseProgress<T> {
 }
 
 impl<T> CloseProgress<T> {
-    fn map<U>(self, convert: impl FnOnce(T) -> U) -> CloseProgress<U> {
+    pub(crate) fn map<U>(self, convert: impl FnOnce(T) -> U) -> CloseProgress<U> {
         match self {
             Self::Ready(value) => CloseProgress::Ready(convert(value)),
             Self::Reference {
@@ -757,7 +811,7 @@ pub(crate) trait RootProvider {
         member_completion: &ResolutionCompletion,
         _provenance: HierarchyProvenanceView<'_>,
         resume: CloseResume<'_>,
-    ) -> StoreResult<CloseProgress<ResolutionCompletion>> {
+    ) -> StoreResult<CloseProgress<RootClosure>> {
         assert!(
             matches!(resume, CloseResume::Start),
             "only a suspended provider resumes"
@@ -807,7 +861,7 @@ pub(crate) trait RootProvider {
         &mut self,
         endpoint: &RelationKey,
         inputs: &[(ReferenceKey, &FactResolutionAnswer)],
-    ) -> StoreResult<ResolutionCompletion>;
+    ) -> StoreResult<RootClosure>;
 
     /// Request structural member-owner selection after positioned receivers
     /// finish. The scheduler owns its hierarchy and source dependencies. This
@@ -830,7 +884,7 @@ pub(crate) trait RootProvider {
         endpoint: &RelationKey,
         inputs: &[(ReferenceKey, &FactResolutionAnswer)],
         member_completion: &ResolutionCompletion,
-    ) -> StoreResult<ResolutionCompletion> {
+    ) -> StoreResult<RootClosure> {
         Ok(self.close(endpoint, inputs)?.combine(member_completion))
     }
 
@@ -840,7 +894,7 @@ pub(crate) trait RootProvider {
         _endpoint: &RelationKey,
         _inputs: &[(ReferenceKey, &FactResolutionAnswer)],
         _selection: &MemberSelection,
-    ) -> StoreResult<ResolutionCompletion> {
+    ) -> StoreResult<RootClosure> {
         unreachable!("a provider requesting member selection installs its result")
     }
 
@@ -991,7 +1045,7 @@ struct Relation<'source> {
     member_requested: bool,
     prefix_charged: bool,
     member_completion: ResolutionCompletion,
-    completion: Option<ResolutionCompletion>,
+    completion: Option<RootClosure>,
     /// Initial positioned receivers remain distinct from ancestor tasks.
     prefix_count: usize,
     /// Relations whose candidate reads this member phase awaits.
@@ -1628,7 +1682,7 @@ impl<'a> Scheduler<'a> {
             member_requested: false,
             prefix_charged: false,
             member_completion: ResolutionCompletion::Complete,
-            completion: closed.then_some(initial_completion),
+            completion: closed.then_some(RootClosure::Published(initial_completion)),
             waits_on: Vec::new(),
             relation_waiters: Vec::new(),
             unavailable,
@@ -3096,7 +3150,7 @@ fn drive_scheduler_inner<'source>(
             }
             _ => panic!("a continuation and its exact member reply become ready together"),
         };
-        let completion = match provider.poll_close(
+        let outcome = match provider.poll_close(
             &endpoint,
             &inputs,
             relation.selected_members.as_ref(),
@@ -3104,13 +3158,14 @@ fn drive_scheduler_inner<'source>(
             provenance,
             resume,
         )? {
-            CloseProgress::Ready(completion) => completion,
-            CloseProgress::Cancelled(completion) => {
+            CloseProgress::Ready(RootClosure::Cancelled(completion))
+            | CloseProgress::Cancelled(completion) => {
                 scheduler
                     .evidence
                     .include(&completion, cancellation, &mut scheduler.work);
                 return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
             }
+            CloseProgress::Ready(outcome) => outcome,
             CloseProgress::Reference {
                 continuation,
                 key,
@@ -3158,7 +3213,8 @@ fn drive_scheduler_inner<'source>(
                 continue;
             }
         };
-        let completion = completion.combine(&relation.member_completion);
+        let outcome = outcome.combine(&relation.member_completion);
+        let completion = outcome.completion();
         if let Some(discharges) = scheduler.closure_discharges.get(&relation.endpoint)
             && !discharges.discharged_provider_reasons.is_empty()
         {
@@ -3176,7 +3232,7 @@ fn drive_scheduler_inner<'source>(
         }
         scheduler
             .evidence
-            .include(&completion, cancellation, &mut scheduler.work);
+            .include(completion, cancellation, &mut scheduler.work);
         if cancellation.is_cancelled()
             || operation.session.resolution_stopped()
             || scheduler.evidence.cancellation_observed()
@@ -3184,7 +3240,7 @@ fn drive_scheduler_inner<'source>(
             return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
         }
         active_closes.remove(&relation.endpoint);
-        relation.completion = Some(completion);
+        relation.completion = Some(outcome);
         relation.closed = true;
         let relation_waiters = std::mem::take(&mut relation.relation_waiters);
         for waiter in std::mem::take(&mut relation.waiters) {
@@ -4101,7 +4157,7 @@ fn read_root_seeds<'a>(
 }
 
 pub(super) enum EndpointPreparation {
-    Ready(ResolutionCompletion),
+    Ready(RootClosure),
     Incomplete(ResolutionCompletion),
 }
 
@@ -4115,7 +4171,9 @@ pub(super) fn prepare_forward(
 ) -> StoreResult<EndpointPreparation> {
     let plan = match provider.discover(endpoint)? {
         RootDiscovery::AlreadyReady { completion } => {
-            return Ok(EndpointPreparation::Ready(completion));
+            return Ok(EndpointPreparation::Ready(RootClosure::Published(
+                completion,
+            )));
         }
         RootDiscovery::Ready(plan) => plan,
         RootDiscovery::Cancelled(completion) => {
@@ -4192,10 +4250,11 @@ pub(super) fn prepare_forward(
             provenance,
             CloseResume::Start,
         )? {
-            CloseProgress::Ready(completion) => completion,
-            CloseProgress::Cancelled(completion) => {
+            CloseProgress::Ready(RootClosure::Cancelled(completion))
+            | CloseProgress::Cancelled(completion) => {
                 return Ok(EndpointPreparation::Incomplete(completion));
             }
+            CloseProgress::Ready(outcome) => outcome,
             CloseProgress::Reference {
                 continuation,
                 key,
@@ -4233,9 +4292,13 @@ pub(super) fn prepare_forward(
         }
     };
     if resources.session.cancellation.is_cancelled() || resources.session.resolution_stopped() {
-        return Ok(EndpointPreparation::Incomplete(completion.combine(
-            &ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]),
-        )));
+        return Ok(EndpointPreparation::Incomplete(
+            completion
+                .completion()
+                .combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::Cancelled,
+                ])),
+        ));
     }
     Ok(EndpointPreparation::Ready(completion))
 }
@@ -4429,7 +4492,7 @@ pub(super) fn prepare_reverse(
     let mut completion = ResolutionCompletionAccumulator::default();
     for dependency in provider.reverse_dependencies(endpoint)? {
         match prepare_forward(resources, provider, &dependency, target)? {
-            EndpointPreparation::Ready(evidence) => completion.include(&evidence),
+            EndpointPreparation::Ready(evidence) => completion.include(evidence.completion()),
             EndpointPreparation::Incomplete(evidence) => {
                 completion.include(&evidence);
                 return Ok(EndpointPreparation::Incomplete(completion.finish()));
@@ -4446,7 +4509,9 @@ pub(super) fn prepare_reverse(
         ));
     }
     provider.close_reverse(endpoint);
-    Ok(EndpointPreparation::Ready(completion.finish()))
+    Ok(EndpointPreparation::Ready(RootClosure::Published(
+        completion.finish(),
+    )))
 }
 
 /// A complete lexical certificate remains useful when independent typed or
@@ -4565,7 +4630,7 @@ mod tests {
             &mut self,
             _: &RelationKey,
             _: &[(ReferenceKey, &FactResolutionAnswer)],
-        ) -> StoreResult<ResolutionCompletion> {
+        ) -> StoreResult<RootClosure> {
             panic!("the scheduler must send member evidence before publication")
         }
         fn close_with_member_completion(
@@ -4573,9 +4638,9 @@ mod tests {
             _: &RelationKey,
             _: &[(ReferenceKey, &FactResolutionAnswer)],
             member: &ResolutionCompletion,
-        ) -> StoreResult<ResolutionCompletion> {
+        ) -> StoreResult<RootClosure> {
             self.memo = Some(self.plan.combine(member));
-            Ok(self.memo.clone().unwrap())
+            Ok(RootClosure::Published(self.memo.clone().unwrap()))
         }
         fn member_selection(
             &mut self,
@@ -4752,7 +4817,8 @@ mod tests {
                         )
                         .unwrap()
                         {
-                            EndpointPreparation::Ready(c) | EndpointPreparation::Incomplete(c) => c,
+                            EndpointPreparation::Ready(c) => c.completion().clone(),
+                            EndpointPreparation::Incomplete(c) => c,
                         }
                     } else {
                         let mut scheduler = new_scheduler();
@@ -4770,7 +4836,12 @@ mod tests {
                         else {
                             panic!("ordinary relation closes")
                         };
-                        scheduler.relations[id].completion.clone().unwrap()
+                        scheduler.relations[id]
+                            .completion
+                            .as_ref()
+                            .unwrap()
+                            .completion()
+                            .clone()
                     };
                     assert_eq!(
                         completion, gap,
@@ -4819,7 +4890,7 @@ mod tests {
                 &mut self,
                 _: &RelationKey,
                 _: &[(ReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 unreachable!("unavailable member proof cannot publish")
             }
             fn member_selection(
@@ -4966,21 +5037,21 @@ mod tests {
                 &mut self,
                 _: &RelationKey,
                 _: &[(ReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
-                Ok(ResolutionCompletion::Complete)
+            ) -> StoreResult<RootClosure> {
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
             }
             fn close_selected_members(
                 &mut self,
                 _: &RelationKey,
                 _: &[(ReferenceKey, &FactResolutionAnswer)],
                 selection: &MemberSelection,
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 assert_eq!(
                     selection.discharged_provider_reasons,
                     BTreeSet::from([self.witness])
                 );
                 self.selected = true;
-                Ok(ResolutionCompletion::Complete)
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
             }
             fn retain_member_provider_reasons(
                 &mut self,
@@ -5153,7 +5224,7 @@ mod tests {
                 &mut self,
                 endpoint: &RelationKey,
                 inputs: &[(ReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 assert_eq!(inputs.len(), 1);
                 assert_eq!(inputs[0].0.environment, endpoint.environment);
                 assert!(
@@ -5161,7 +5232,7 @@ mod tests {
                         .insert(endpoint.clone(), inputs[0].1.clone())
                         .is_none()
                 );
-                Ok(ResolutionCompletion::Complete)
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
             }
 
             fn resolved_closure_discharges(
@@ -5580,7 +5651,7 @@ mod tests {
             &mut self,
             _: &RelationKey,
             _: &[(ReferenceKey, &FactResolutionAnswer)],
-        ) -> StoreResult<ResolutionCompletion> {
+        ) -> StoreResult<RootClosure> {
             panic!("source continuations close through the one scheduler protocol")
         }
         fn member_selection(
@@ -5606,7 +5677,7 @@ mod tests {
             _: &ResolutionCompletion,
             view: HierarchyProvenanceView<'_>,
             resume: CloseResume<'_>,
-        ) -> StoreResult<CloseProgress<ResolutionCompletion>> {
+        ) -> StoreResult<CloseProgress<RootClosure>> {
             self.polls += 1;
             match resume {
                 CloseResume::Start => assert!(self.outstanding.is_none()),
@@ -5628,7 +5699,9 @@ mod tests {
             }
             if self.polls == 3 {
                 self.published = true;
-                return Ok(CloseProgress::Ready(ResolutionCompletion::Complete));
+                return Ok(CloseProgress::Ready(RootClosure::Published(
+                    ResolutionCompletion::Complete,
+                )));
             }
             if let Some(cancellation) = self.cancel_on_yield.take() {
                 cancellation.cancel();
@@ -5662,7 +5735,7 @@ mod tests {
                     SemanticId::for_test("source-target")
                 )
                 .unwrap(),
-                EndpointPreparation::Ready(ResolutionCompletion::Complete)
+                EndpointPreparation::Ready(RootClosure::Published(ResolutionCompletion::Complete))
             ));
             assert_eq!(
                 (provider.polls, provider.initial_reads, provider.cancelled),
@@ -6105,7 +6178,7 @@ mod tests {
                 &mut self,
                 _: &RelationKey,
                 _: &[(ReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 unreachable!("poll protocol owns close");
             }
             fn cancel_close(&mut self, _: &RelationKey) {
@@ -6119,7 +6192,7 @@ mod tests {
                 _: &ResolutionCompletion,
                 provenance: HierarchyProvenanceView<'_>,
                 resume: CloseResume<'_>,
-            ) -> StoreResult<CloseProgress<ResolutionCompletion>> {
+            ) -> StoreResult<CloseProgress<RootClosure>> {
                 match resume {
                     CloseResume::Start => {
                         if self.cancel_at_admission {
@@ -6152,7 +6225,9 @@ mod tests {
                             );
                         }
                         self.resumes += 1;
-                        Ok(CloseProgress::Ready(answer.completion().clone()))
+                        Ok(CloseProgress::Ready(RootClosure::Published(
+                            answer.completion().clone(),
+                        )))
                     }
                     CloseResume::Members { .. } => {
                         panic!("reference wait never consumes a member selection")
@@ -6338,7 +6413,7 @@ mod tests {
                 &mut self,
                 _: &RelationKey,
                 _: &[(ReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 panic!("typed group is not a ROOT close")
             }
         }

@@ -3231,7 +3231,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
             &self.constant_index_values,
             &mut self.expression_values,
-            index,
+            &index,
             node.id(),
         ) {
             return Ok(Some((value, u128::from(index))));

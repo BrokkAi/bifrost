@@ -15,6 +15,8 @@ use brokk_bifrost_analysis::cancellation::CancellationToken;
 use brokk_bifrost_analysis::hash::HashSet;
 use brokk_bifrost_core::analyzer::definition_lookup::BoundedDefinitionLookup;
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
+use brokk_bifrost_core::analyzer::memo_attribution::{ReplayingMemo, ReplayingMemoEntry};
+use brokk_bifrost_core::analyzer::project_reads::OpaqueReadReceipt;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceConfig;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
@@ -328,10 +330,41 @@ struct ForwardScalaNameResolver<'a> {
 
 type ScalaNameResolver<'a> = ForwardScalaNameResolver<'a>;
 
+// One definition batch resolves several requests under sibling captures.
+// Each query-owned projection must replay the inputs of its completed value.
+type ScalaLookupMemo<V> =
+    ReplayingMemo<RefCell<HashMap<CodeUnit, Arc<ReplayingMemoEntry<V, OpaqueReadReceipt>>>>>;
+
+fn scala_lookup_value<V: Clone>(
+    memo: &ScalaLookupMemo<V>,
+    scala: &ScalaAnalyzer,
+    owner: &CodeUnit,
+    build: impl FnOnce() -> V,
+) -> V {
+    let value = memo
+        .read(
+            &scala
+                .tree_sitter_analyzer()
+                .read_capability()
+                .memo_attribution(),
+            |rows, capture| {
+                if let Some(value) = rows.borrow().get(owner).cloned() {
+                    return Ok::<_, std::convert::Infallible>(value);
+                }
+                let value = Arc::new(capture.build(build));
+                Ok(Arc::clone(
+                    rows.borrow_mut().entry(owner.clone()).or_insert(value),
+                ))
+            },
+        )
+        .expect("infallible Scala lookup projection");
+    (*value).clone()
+}
+
 #[derive(Default)]
 pub(crate) struct ScalaLookupCache {
-    direct_children_by_owner: RefCell<HashMap<CodeUnit, Vec<CodeUnit>>>,
-    direct_ancestors_by_owner: RefCell<HashMap<CodeUnit, ScalaDirectAncestorResolution>>,
+    direct_children_by_owner: ScalaLookupMemo<Vec<CodeUnit>>,
+    direct_ancestors_by_owner: ScalaLookupMemo<ScalaDirectAncestorResolution>,
     #[cfg(test)]
     direct_children_builds: Cell<usize>,
     #[cfg(test)]
@@ -341,20 +374,16 @@ pub(crate) struct ScalaLookupCache {
 impl ScalaLookupCache {
     fn direct_children(
         &self,
+        scala: &ScalaAnalyzer,
         support: &dyn BoundedDefinitionLookup,
         owner: &CodeUnit,
     ) -> Vec<CodeUnit> {
-        if let Some(cached) = self.direct_children_by_owner.borrow().get(owner) {
-            return cached.clone();
-        }
-        #[cfg(test)]
-        self.direct_children_builds
-            .set(self.direct_children_builds.get() + 1);
-        let resolved = support.fqn_direct_children(&owner.fq_name());
-        self.direct_children_by_owner
-            .borrow_mut()
-            .insert(owner.clone(), resolved.clone());
-        resolved
+        scala_lookup_value(&self.direct_children_by_owner, scala, owner, || {
+            #[cfg(test)]
+            self.direct_children_builds
+                .set(self.direct_children_builds.get() + 1);
+            support.fqn_direct_children(&owner.fq_name())
+        })
     }
 
     fn direct_ancestors(
@@ -364,17 +393,12 @@ impl ScalaLookupCache {
         support: &dyn BoundedDefinitionLookup,
         owner: &CodeUnit,
     ) -> ScalaDirectAncestorResolution {
-        if let Some(cached) = self.direct_ancestors_by_owner.borrow().get(owner) {
-            return cached.clone();
-        }
-        #[cfg(test)]
-        self.direct_ancestor_builds
-            .set(self.direct_ancestor_builds.get() + 1);
-        let resolved = scala_forward_direct_ancestor_resolution(scala, token, support, owner);
-        self.direct_ancestors_by_owner
-            .borrow_mut()
-            .insert(owner.clone(), resolved.clone());
-        resolved
+        scala_lookup_value(&self.direct_ancestors_by_owner, scala, owner, || {
+            #[cfg(test)]
+            self.direct_ancestor_builds
+                .set(self.direct_ancestor_builds.get() + 1);
+            scala_forward_direct_ancestor_resolution(scala, token, support, owner)
+        })
     }
 
     #[cfg(test)]
@@ -7417,7 +7441,7 @@ impl ScalaLookupCtx<'_> {
     }
 
     fn direct_children_for_owner(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
-        self.cache.direct_children(self.support, owner)
+        self.cache.direct_children(self.scala, self.support, owner)
     }
 
     fn direct_ancestors_for_owner(

@@ -497,6 +497,18 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 219,
         sql: include_str!("../migrations/cache/0219-deferred-member-selection.sql"),
     },
+    CacheMigration {
+        version: 220,
+        sql: include_str!("../migrations/cache/0220-workspace-fact-reads.sql"),
+    },
+    CacheMigration {
+        version: 221,
+        sql: include_str!("../migrations/cache/0221-compilation-imports.sql"),
+    },
+    CacheMigration {
+        version: 222,
+        sql: include_str!("../migrations/cache/0222-field-slot-exact-result-sources.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -522,8 +534,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    146, 91, 134, 77, 55, 39, 89, 128, 163, 170, 226, 240, 17, 244, 71, 207, 122, 92, 29, 155, 161,
-    130, 220, 99, 84, 44, 148, 113, 53, 205, 24, 44,
+    204, 165, 128, 252, 184, 105, 151, 40, 61, 116, 136, 206, 215, 72, 249, 53, 2, 90, 187, 88, 50,
+    135, 25, 234, 55, 161, 90, 248, 140, 182, 47, 120,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -6732,6 +6744,129 @@ mod tests {
                 CURRENT_MIGRATION_VERSION
             );
             assert!(current_schema_is_valid(&conn).unwrap());
+        }
+    }
+
+    #[test]
+    fn field_slot_source_migration_preserves_existing_atoms() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 222) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 221).unwrap();
+        conn.execute_batch("INSERT INTO class_set_field_slot_indexes VALUES(
+            1,'python',zeroblob(32),zeroblob(32),zeroblob(32),zeroblob(32),1,
+            zeroblob(32),1,1,0,0,'complete',0,0,0);
+            INSERT INTO class_set_field_slots VALUES(1,0,'external',NULL,'Owner',NULL,'owner','item');
+            INSERT INTO class_set_field_slot_atoms VALUES(1,0,0,'unknown',NULL,NULL,NULL,NULL,
+            'field_slot_incomplete','app.py',0,0,0,1,0,1,'unknown');").unwrap();
+        migrate(&mut conn).unwrap();
+        let row: (String, String, i64) = conn.query_row(
+            "SELECT source_kind, unknown_reason, source_end_byte FROM class_set_field_slot_atoms",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(row, ("unknown".into(), "field_slot_incomplete".into(), 1));
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+    #[test]
+    fn compilation_import_migration_preserves_roots_and_cascades_both_levels() {
+        let mut upgraded = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 221) {
+            upgraded.execute_batch(migration.sql).unwrap();
+        }
+        let previous = POST_BASELINE_MIGRATIONS
+            .iter()
+            .rfind(|m| m.version < 221)
+            .unwrap()
+            .version;
+        upgraded
+            .pragma_update(None, "user_version", previous)
+            .unwrap();
+        let fresh = open_in_memory_cache();
+        let seed = |conn: &Connection| {
+            conn.execute_batch(
+                "INSERT INTO blobs(id,blob_oid,lang,generation)
+                 VALUES(1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','csharp',0);
+                 INSERT INTO resolution_fragment_interiors(
+                   blob_id,lang,semantic_language,producer_epoch,interior_digest,
+                   expected_semantic_site_count,logical_rows,payload_bytes,publication_state)
+                 VALUES(1,'csharp','csharp','test',zeroblob(32),0,3,0,'building');
+                 INSERT INTO resolution_root_imports(blob_id,import_site,root_scope,anchor,kind)
+                 VALUES(1,1,0,'lexical','glob'),(1,2,0,'lexical','glob');",
+            )
+            .unwrap();
+        };
+        seed(&upgraded);
+        migrate(&mut upgraded).unwrap();
+        seed(&fresh);
+        for conn in [&fresh, &upgraded] {
+            assert!(current_schema_is_valid(conn).unwrap());
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM resolution_root_imports", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(conn.query_row("SELECT expected_compilation_import_count FROM resolution_fragment_interiors WHERE blob_id=1", [], |r| r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM resolution_compilation_imports",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            conn.execute(
+                "INSERT INTO resolution_compilation_imports VALUES(1,1),(1,2)",
+                [],
+            )
+            .unwrap();
+            assert!(
+                conn.execute("INSERT INTO resolution_compilation_imports VALUES(1,1)", [])
+                    .is_err()
+            );
+            assert!(
+                conn.execute("INSERT INTO resolution_compilation_imports VALUES(1,3)", [])
+                    .is_err()
+            );
+            let sites = conn.prepare("SELECT import_site FROM resolution_compilation_imports WHERE blob_id=?1 ORDER BY import_site").unwrap().query_map([1], |r| r.get::<_,i64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(sites, [1, 2]);
+            let plan = conn.prepare("EXPLAIN QUERY PLAN SELECT import_site FROM resolution_compilation_imports WHERE blob_id=?1 ORDER BY import_site").unwrap().query_map([1], |r| r.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("USING PRIMARY KEY (blob_id=?)")),
+                "{plan:?}"
+            );
+            validate_foreign_keys(conn).unwrap();
+            conn.execute(
+                "DELETE FROM resolution_root_imports WHERE blob_id=1 AND import_site=1",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM resolution_compilation_imports",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            conn.execute(
+                "DELETE FROM resolution_fragment_interiors WHERE blob_id=1",
+                [],
+            )
+            .unwrap();
+            for table in ["resolution_root_imports", "resolution_compilation_imports"] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0,
+                    "{table}"
+                );
+            }
+            validate_foreign_keys(conn).unwrap();
         }
     }
 

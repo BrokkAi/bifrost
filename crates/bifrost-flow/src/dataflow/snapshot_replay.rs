@@ -52,6 +52,10 @@ impl<Provider> IcfgProvider for SnapshotReplayProvider<'_, '_, Provider>
 where
     Provider: IcfgProvider + ?Sized,
 {
+    fn memo_attribution(&self) -> crate::analyzer::workspace_authority::OwnedMemoCapability {
+        self.provider.memo_attribution()
+    }
+
     fn call_transfers(
         &self,
         caller: &ProcedureHandle,

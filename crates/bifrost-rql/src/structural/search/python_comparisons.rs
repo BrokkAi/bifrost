@@ -80,6 +80,7 @@ enum LiteralInterning {
 }
 
 pub(super) fn comparison_constants_expansions(
+    analyzer: &dyn IAnalyzer,
     environment_cache: &mut EnvironmentTraversalCache,
     seed: &Arc<SeedMatch>,
     diagnostics: &mut Vec<super::results::CodeQueryDiagnostic>,
@@ -87,7 +88,7 @@ pub(super) fn comparison_constants_expansions(
     if !is_python_comparison(seed, diagnostics) {
         return Vec::new();
     }
-    let Some(tree) = parse_comparison_source(environment_cache, seed, diagnostics) else {
+    let Some(tree) = parse_comparison_source(analyzer, environment_cache, seed, diagnostics) else {
         return Vec::new();
     };
     let Some((comparison, left, right, _operator)) =
@@ -116,7 +117,7 @@ pub(super) fn comparison_using_is_expansions(
     if !is_python_comparison(seed, diagnostics) {
         return Vec::new();
     }
-    let Some(tree) = parse_comparison_source(environment_cache, seed, diagnostics) else {
+    let Some(tree) = parse_comparison_source(analyzer, environment_cache, seed, diagnostics) else {
         return Vec::new();
     };
     let Some((_comparison, left, right, operator)) =
@@ -197,7 +198,7 @@ pub(super) fn comparison_using_is_non_portable_expansions(
     if !is_python_comparison(seed, diagnostics) {
         return Vec::new();
     }
-    let Some(tree) = parse_comparison_source(environment_cache, seed, diagnostics) else {
+    let Some(tree) = parse_comparison_source(analyzer, environment_cache, seed, diagnostics) else {
         return Vec::new();
     };
     let Some((_comparison, left, right, operator)) =
@@ -288,12 +289,14 @@ fn comparison_has_value_equality(left: OperandClass, right: OperandClass) -> boo
 }
 
 fn parse_comparison_source(
+    analyzer: &dyn IAnalyzer,
     environment_cache: &mut EnvironmentTraversalCache,
     seed: &SeedMatch,
     diagnostics: &mut Vec<super::results::CodeQueryDiagnostic>,
 ) -> Option<Arc<Tree>> {
     environment_cache
         .python_syntax_tree_for(
+            analyzer,
             &seed.file,
             seed.facts.source_identity(),
             seed.facts.source(),

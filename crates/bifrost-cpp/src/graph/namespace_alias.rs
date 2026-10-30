@@ -28,7 +28,7 @@ use super::resolver::{
 use crate::source_context::cpp_guard_set_to_runtime;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tree_sitter::Node;
 
 /// One namespace alias definition in a source file visible from the root.
@@ -53,7 +53,8 @@ impl NamespaceAliasSite {
 }
 
 /// The namespace aliases of one root's visible source files, by alias name.
-pub type NamespaceAliasCell = Arc<OnceLock<HashMap<String, Vec<NamespaceAliasSite>>>>;
+pub type NamespaceAliasCell =
+    Arc<super::resolver::VisibilityCell<Arc<HashMap<String, Vec<NamespaceAliasSite>>>>>;
 
 /// How the namespace aliases in effect at a reference rebind its qualifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +119,7 @@ impl VisibilityIndex<'_> {
             return NamespaceQualifierBinding::Unaliased;
         }
         let cell = self.namespace_alias_cell(file);
-        let sites = cell.get_or_init(|| self.collect_namespace_alias_sites(file));
+        let sites = cell.get_or_init(|| Arc::new(self.collect_namespace_alias_sites(file)));
         if !components[..components.len() - 1]
             .iter()
             .any(|component| sites.contains_key(component))
@@ -128,7 +129,7 @@ impl VisibilityIndex<'_> {
         let lookup = AliasLookup {
             file,
             reference,
-            sites,
+            sites: &sites,
             raw_reference_guards: self
                 .cpp()
                 .prepared_syntax(self.token(), file)

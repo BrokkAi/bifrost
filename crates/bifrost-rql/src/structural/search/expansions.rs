@@ -10,6 +10,7 @@ pub(crate) use crate::structural::reference_edges::reference_hits_for_target;
 use crate::structural::reference_edges::{
     reference_hit_for_target, reference_hits_from_bounded_sample,
 };
+use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 
 #[derive(Clone)]
 struct CallTraversalWork {
@@ -325,13 +326,15 @@ pub(super) fn inbound_reference_expansions(
     cancellation: Option<&CancellationToken>,
     cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
-    let cache_hit = cache.inbound.contains_key(&declaration.unit);
+    let inbound = &mut cache.inbound;
+    inbound.read_mut(&memo_attribution(analyzer), |inbound| {
+    let cache_hit = inbound.contains_key(&declaration.unit);
     let mut exhausted = cache_hit && cache.inbound_exhausted.contains(&declaration.unit);
     if let Some(profile) = cache_profile {
         if cache_hit {
             profile.inbound_reference.record_hit(
                 Some(!cache.inbound_incomplete.contains(&declaration.unit)),
-                cache.inbound.get(&declaration.unit).map_or(0, Vec::len),
+                inbound.get(&declaration.unit).map_or(0, Vec::len),
             );
         } else {
             profile.inbound_reference.record_miss();
@@ -376,7 +379,7 @@ pub(super) fn inbound_reference_expansions(
             examined_references,
         ) {
             push_budget_diagnostic(diagnostics, budget);
-            cache.inbound.insert(declaration.unit.clone(), Vec::new());
+            inbound.insert(declaration.unit.clone(), Vec::new());
             if cache_profile.is_some() {
                 cache.inbound_incomplete.insert(declaration.unit.clone());
             }
@@ -604,13 +607,12 @@ pub(super) fn inbound_reference_expansions(
         if let Some(profile) = cache_profile {
             profile.inbound_reference.record_build(cache_complete);
         }
-        cache.inbound.insert(declaration.unit.clone(), hits);
+        inbound.insert(declaration.unit.clone(), hits);
     }
 
     let mut sites = Vec::new();
     let mut omitted_enclosing_declarations = 0usize;
-    for hit in cache
-        .inbound
+    for hit in inbound
         .get(&declaration.unit)
         .into_iter()
         .flatten()
@@ -665,6 +667,7 @@ pub(super) fn inbound_reference_expansions(
         })
         .collect::<Vec<_>>();
     (expansions, exhausted)
+    })
 }
 
 fn fuzzy_result_examination_count(result: &FuzzyResult) -> usize {

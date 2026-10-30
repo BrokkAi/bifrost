@@ -758,18 +758,22 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
     assert_eq!(replayed.truncated, built.truncated);
     assert_eq!(replayed.cancelled, built.cancelled);
 
-    cache.incoming.insert(
-        unit.clone(),
-        CallRelationResult {
-            diagnostics: vec![CallRelationDiagnostic {
-                code: CallRelationDiagnosticCode::ParseFailed,
-                message: "parse failed".to_string(),
-                context: "caller".to_string(),
-                reason_kind: None,
-            }],
-            ..CallRelationResult::default()
-        },
-    );
+    cache
+        .incoming
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(
+                unit.clone(),
+                CallRelationResult {
+                    diagnostics: vec![CallRelationDiagnostic {
+                        code: CallRelationDiagnosticCode::ParseFailed,
+                        message: "parse failed".to_string(),
+                        context: "caller".to_string(),
+                        reason_kind: None,
+                    }],
+                    ..CallRelationResult::default()
+                },
+            )
+        });
     let incoming = cached_call_relation(
         &analyzer,
         token,
@@ -921,19 +925,23 @@ fn call_declaration_projection_reports_retained_file_scope_target_as_omitted() {
         arguments: Vec::new(),
     };
     let mut cache = CallTraversalCache::default();
-    cache.outgoing.insert(
-        caller,
-        CallRelationResult {
-            sites: vec![site],
-            diagnostics: vec![CallRelationDiagnostic {
-                code: CallRelationDiagnosticCode::TargetsAmbiguous,
-                message: "ambiguous".to_string(),
-                context: "caller".to_string(),
-                reason_kind: None,
-            }],
-            ..CallRelationResult::default()
-        },
-    );
+    cache
+        .outgoing
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(
+                caller,
+                CallRelationResult {
+                    sites: vec![site],
+                    diagnostics: vec![CallRelationDiagnostic {
+                        code: CallRelationDiagnosticCode::TargetsAmbiguous,
+                        message: "ambiguous".to_string(),
+                        context: "caller".to_string(),
+                        reason_kind: None,
+                    }],
+                    ..CallRelationResult::default()
+                },
+            )
+        });
     let mut diagnostics = Vec::new();
 
     let scope = AnalyzerQueryScope::new(&analyzer);
@@ -982,19 +990,23 @@ fn outbound_uses_projection_reports_unindexed_target_and_suppresses_advisory() {
         },
     );
     let mut cache = ReferenceTraversalCache::default();
-    cache.outbound.insert(
-        file.clone(),
-        vec![ReferenceHit {
-            file,
-            range: declaration.range,
-            enclosing_unit: caller,
-            kind: None,
-            resolved: CodeUnit::file_scope(declaration.unit.source().clone()),
-            confidence: 1_000_000,
-            usage_kind: UsageHitKind::Reference,
-            proof: UsageProof::Unproven,
-        }],
-    );
+    cache
+        .outbound
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(
+                file.clone(),
+                vec![ReferenceHit {
+                    file,
+                    range: declaration.range,
+                    enclosing_unit: caller,
+                    kind: None,
+                    resolved: CodeUnit::file_scope(declaration.unit.source().clone()),
+                    confidence: 1_000_000,
+                    usage_kind: UsageHitKind::Reference,
+                    proof: UsageProof::Unproven,
+                }],
+            )
+        });
     let mut diagnostics = vec![diagnostic(
         CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
         CodeQueryDiagnosticImpact::Advisory,
@@ -1135,7 +1147,9 @@ fn m3_inbound_reference_distinguishes_missing_real_owner_from_file_scope() {
     let mut missing_cache = ReferenceTraversalCache::default();
     missing_cache
         .inbound
-        .insert(target.clone(), vec![reference_hit(missing_owner)]);
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(target.clone(), vec![reference_hit(missing_owner)])
+        });
     let mut diagnostics = vec![diagnostic(
         CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
         CodeQueryDiagnosticImpact::Advisory,
@@ -1165,10 +1179,14 @@ fn m3_inbound_reference_distinguishes_missing_real_owner_from_file_scope() {
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
 
     let mut file_scope_cache = ReferenceTraversalCache::default();
-    file_scope_cache.inbound.insert(
-        target.clone(),
-        vec![reference_hit(CodeUnit::file_scope(file.clone()))],
-    );
+    file_scope_cache
+        .inbound
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(
+                target.clone(),
+                vec![reference_hit(CodeUnit::file_scope(file.clone()))],
+            )
+        });
     let mut diagnostics = Vec::new();
     let (expansions, exhausted) = inbound_reference_expansions(
         &analyzer,

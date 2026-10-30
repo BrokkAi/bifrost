@@ -37,7 +37,15 @@ pub fn macro_lexical_definition(
     let binding = with_cpp_graph_source(analyzer, |graph| {
         let cpp = graph.cpp?;
         let roots = HashSet::from_iter([file.clone()]);
-        let visibility = VisibilityIndex::build(cpp, graph.token, &graph, &roots);
+        let visibility = VisibilityIndex::build(
+            brokk_bifrost_analysis::analyzer::resolve_analyzer::<crate::CppAnalyzer>(analyzer)
+                .expect("a C++ graph source has a concrete C++ analyzer")
+                .read_capability(),
+            cpp,
+            graph.token,
+            &graph,
+            &roots,
+        );
         visibility.macro_lexical_binding(file, root, source, start_byte, end_byte)
     })?;
     lexical_definition(analyzer, binding)
@@ -84,7 +92,21 @@ pub fn macro_lexical_references(
         let roots = HashSet::from_iter([file.clone()]);
         let visibility = OnceCell::new();
         macro_lexical_references_with_visibility(
-            || visibility.get_or_init(|| VisibilityIndex::build(cpp, graph.token, &graph, &roots)),
+            || {
+                visibility.get_or_init(|| {
+                    VisibilityIndex::build(
+                        brokk_bifrost_analysis::analyzer::resolve_analyzer::<crate::CppAnalyzer>(
+                            analyzer,
+                        )
+                        .expect("a C++ graph source has a concrete C++ analyzer")
+                        .read_capability(),
+                        cpp,
+                        graph.token,
+                        &graph,
+                        &roots,
+                    )
+                })
+            },
             file,
             root,
             source,

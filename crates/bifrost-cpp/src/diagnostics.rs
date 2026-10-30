@@ -102,7 +102,7 @@ pub fn collect_cpp_semantic_diagnostics(
     }
 
     let mut closures = Vec::with_capacity(contexts.len());
-    for context in contexts {
+    for context in contexts.iter() {
         match prove_include_closure(file, source, context) {
             Ok(closure) => closures.push((context, closure)),
             // One unprovable configuration sinks the file: a name absent from

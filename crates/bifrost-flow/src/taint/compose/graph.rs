@@ -39,66 +39,68 @@ pub struct PortNode {
     pub endpoint: Endpoint,
 }
 
-/// The best proof and the best completeness over a set of paths: `proven`
-/// when some path is proven at every hop, `complete` when some path is
-/// complete at every hop, each judged on its own. A finding reads the two
-/// axes separately, as the ICFG engine's `has_proven_path` and
-/// `has_complete_path` do, so conjoining hops and joining alternatives axis
-/// by axis answers both questions exactly. It is not always one path's
-/// quality: two different paths can set the two axes.
+/// The best proof and completeness over a set of paths, independently.
+/// `certain` additionally records that one path supplies both axes at every
+/// hop; independent alternatives may supply `proven` and `complete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HopQuality {
     pub proven: bool,
     pub complete: bool,
+    /// One path is proven and complete at every hop. Private so that every
+    /// value comes from `new`, `conjoin` or `join`, which keep it implying
+    /// `proven && complete`.
+    certain: bool,
 }
 
 impl HopQuality {
-    /// Proven and complete.
-    pub const CERTAIN: Self = Self {
-        proven: true,
-        complete: true,
-    };
+    /// Proven and complete on one path.
+    pub const CERTAIN: Self = Self::new(true, true);
     /// Neither proven nor complete.
-    pub const UNCERTAIN: Self = Self {
-        proven: false,
-        complete: false,
-    };
+    pub const UNCERTAIN: Self = Self::new(false, false);
 
-    /// The quality of evidence that is either proven and complete or
-    /// neither.
-    pub const fn from_uncertain(uncertain: bool) -> Self {
-        if uncertain {
-            Self::UNCERTAIN
-        } else {
-            Self::CERTAIN
+    /// Evidence for one hop, before joining alternative paths.
+    pub const fn new(proven: bool, complete: bool) -> Self {
+        Self {
+            proven,
+            complete,
+            certain: proven && complete,
         }
     }
 
-    /// Both qualities on one path, one after the other.
+    /// The quality of evidence that is either proven and complete or neither.
+    pub const fn from_uncertain(uncertain: bool) -> Self {
+        Self::new(!uncertain, !uncertain)
+    }
+
+    /// Qualities on one path, one after the other.
     #[must_use]
     pub const fn conjoin(self, other: Self) -> Self {
         Self {
             proven: self.proven && other.proven,
             complete: self.complete && other.complete,
+            certain: self.certain && other.certain,
         }
     }
 
-    /// The best of two alternatives, axis by axis.
+    /// The best of two alternatives, with certainty supplied by one path.
     #[must_use]
     pub const fn join(self, other: Self) -> Self {
         Self {
             proven: self.proven || other.proven,
             complete: self.complete || other.complete,
+            certain: self.certain || other.certain,
         }
     }
 
-    /// Whether `self` is at least as good as `other` on both axes.
+    /// Whether `self` is at least as good as `other` on every axis.
     pub const fn dominates(self, other: Self) -> bool {
-        (self.proven || !other.proven) && (self.complete || !other.complete)
+        (self.proven || !other.proven)
+            && (self.complete || !other.complete)
+            && (self.certain || !other.certain)
     }
 
     pub const fn is_certain(self) -> bool {
-        self.proven && self.complete
+        self.certain
     }
 }
 
@@ -129,7 +131,7 @@ pub enum Hop {
         crossed: Box<[CallSiteId]>,
     },
     /// Out of a callee at the end of a call: a return port to the caller's
-    /// result port.
+    /// result or thrown-value port.
     Callee {
         call: DurableCallSiteKey,
         callee: DurableProcedureKey,

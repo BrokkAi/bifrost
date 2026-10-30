@@ -122,6 +122,12 @@ pub(crate) static SEMANTIC_PACK_ACQUISITION_HOOK: OnceLock<
 > = OnceLock::new();
 
 pub(crate) fn acquisition_hook_slot() -> &'static RwLock<Option<SemanticPackAcquisitionHook>> {
+    let is_capturing = crate::analyzer::i_analyzer::has_read_attribution_ledgers();
+    debug_assert!(
+        !is_capturing,
+        "pack acquisition is host setup before captured reads"
+    );
+
     SEMANTIC_PACK_ACQUISITION_HOOK.get_or_init(|| RwLock::new(None))
 }
 

@@ -304,6 +304,7 @@ function gateScript() {
 function runGate({ code, diffBase = "", report, rawReport, failOn = "warning" }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-policy-scan-gate."));
   const reportPath = path.join(dir, "report.sarif");
+  const summaryPath = path.join(dir, "summary.md");
   if (rawReport !== undefined) {
     fs.writeFileSync(reportPath, rawReport);
   } else if (report !== undefined) {
@@ -319,20 +320,29 @@ function runGate({ code, diffBase = "", report, rawReport, failOn = "warning" })
         DIFF_BASE: diffBase,
         FAIL_ON: failOn,
         SARIF_PATH: reportPath,
+        GITHUB_STEP_SUMMARY: summaryPath,
       },
     });
     return {
       status: result.status,
       stdout: result.stdout,
       stderr: result.stderr,
+      summary: fs.existsSync(summaryPath) ? fs.readFileSync(summaryPath, "utf8") : "",
     };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
-function sarifReport({ results = [], diffBaseline, suppressionReviews = [], executionSuccessful = true, notifications = [] } = {}) {
-  const properties = { "bifrost.policyRuns": [{ policyId: "fixture.rule", completion: { type: "complete" } }] };
+function sarifReport({
+  results = [],
+  diffBaseline,
+  suppressionReviews = [],
+  executionSuccessful = true,
+  notifications = [],
+  policyRuns = [{ policyId: "fixture.rule", completion: { type: "complete" } }],
+} = {}) {
+  const properties = { "bifrost.policyRuns": policyRuns };
   if (diffBaseline !== undefined) {
     properties["bifrost.diffBaseline"] = diffBaseline;
   }
@@ -459,6 +469,38 @@ test("an unreliable code 2 prints typed policy completion details and fails", ()
   assert.match(result.stdout, /policy: bifrost\.correctness\.example/u);
   assert.match(result.stdout, /completion: \{"type":"inconclusive","reasons":\["partial_discovery"\]\}/u);
   assert.match(result.stdout, /UNRELIABLE/u);
+});
+
+test("#8111: inconclusive runs are advisory warnings under codes 0 and 1, never hidden", () => {
+  const inconclusive = {
+    policy_id: "bifrost.correctness.contradictory-condition",
+    completion: { type: "inconclusive", reasons: ["capability_incomplete"], scope: { type: "run" } },
+  };
+  const complete = { policy_id: "bifrost.code-smells.example", completion: { type: "complete" } };
+  const clean = runGate({ code: 0, report: sarifReport({ policyRuns: [complete, inconclusive] }) });
+  assert.equal(clean.status, 0, clean.stdout);
+  assert.match(
+    clean.stdout,
+    /::warning::Bifrost policy bifrost\.correctness\.contradictory-condition was inconclusive \(capability_incomplete\)/u,
+  );
+  assert.match(clean.stdout, /policy scan is clean/u);
+  assert.match(clean.summary, /\| `bifrost\.correctness\.contradictory-condition` \| capability_incomplete \|/u);
+
+  const gated = runGate({
+    code: 1,
+    report: sarifReport({ policyRuns: [inconclusive], results: [sarifFinding({ ruleId: "policy.new" })] }),
+  });
+  assert.equal(gated.status, 1);
+  assert.match(gated.stdout, /::warning::Bifrost policy bifrost\.correctness\.contradictory-condition was inconclusive/u);
+  assert.match(gated.stdout, /finding: policy\.new/u);
+
+  // A run with no verdict never passes as clean, whatever the status says.
+  const failed = runGate({
+    code: 0,
+    report: sarifReport({ policyRuns: [{ policy_id: "x.y", completion: { type: "failed", reasons: ["internal_invariant"] } }] }),
+  });
+  assert.equal(failed.status, 1);
+  assert.match(failed.stdout, /successful completed policy execution/u);
 });
 
 test("unexpected statuses and missing or invalid SARIF fail closed", () => {
@@ -895,7 +937,9 @@ test("standalone alias carries only the composite action contract", () => {
 });
 
 test("exit zero cannot label absent or incomplete policy execution clean", () => {
-  for (const completion of [undefined, [], [{ completion: { type: "inconclusive" } }], [{ completion: { type: "proven_subset" } }]]) {
+  // An inconclusive run is a verdict and may accompany exit 0 (#8111); a run
+  // with no verdict, or a proven subset that gated nothing, may not.
+  for (const completion of [undefined, [], [{ completion: { type: "failed" } }], [{ completion: { type: "proven_subset" } }]]) {
     const report = sarifReport();
     report.runs[0].properties['bifrost.policyRuns'] = completion;
     const result = runGate({ code: 0, report });

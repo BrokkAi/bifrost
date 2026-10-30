@@ -250,6 +250,7 @@ pub struct ReceiverQueryService<'a> {
     /// Language-owned point state belongs to this service's one RQL/policy
     /// request and grows only for source files that request touches.
     receiver_request: RefCell<Option<Box<dyn crate::analyzer::languages::ReceiverRequest + 'a>>>,
+    reads: RefCell<Option<super::common::QueryMemoReads>>,
 }
 
 struct PreparedReceiverFile {
@@ -508,16 +509,7 @@ fn combined_receiver_work(
     left: ReceiverAnalysisWork,
     right: ReceiverAnalysisWork,
 ) -> ReceiverAnalysisWork {
-    ReceiverAnalysisWork {
-        setup_nodes: left.setup_nodes.saturating_add(right.setup_nodes),
-        summary_expansions: left
-            .summary_expansions
-            .saturating_add(right.summary_expansions),
-        resolution_rounds: left
-            .resolution_rounds
-            .saturating_add(right.resolution_rounds),
-        scope_nodes: left.scope_nodes.saturating_add(right.scope_nodes),
-    }
+    left.saturating_add(right)
 }
 
 #[doc(hidden)]
@@ -602,6 +594,7 @@ impl<'a> ReceiverQueryService<'a> {
             prepared_java_files: RefCell::new(HashMap::default()),
             prepared_structural_files: RefCell::new(HashMap::default()),
             receiver_request: RefCell::new(None),
+            reads: RefCell::new(None),
         }
     }
 
@@ -614,14 +607,9 @@ impl<'a> ReceiverQueryService<'a> {
         if !resolver.reuses_request_scoped_native_points() {
             return resolver.resolve_type_bounded(query);
         }
+        self.ensure_receiver_request(language, query.cancellation);
         {
             let mut request = self.receiver_request.borrow_mut();
-            if request.is_none()
-                && let Some(support) = language_support_for_hook(language, "open_receiver_request")
-            {
-                let cancellation = query.cancellation.cloned().unwrap_or_default();
-                *request = support.open_receiver_request(self.analyzer, &cancellation);
-            }
             if let Some(request) = request.as_mut() {
                 return request.resolve_type(query);
             }
@@ -638,19 +626,29 @@ impl<'a> ReceiverQueryService<'a> {
         if !resolver.reuses_request_scoped_native_points() {
             return resolver.resolve_definition_bounded(query);
         }
+        self.ensure_receiver_request(language, query.cancellation);
         {
             let mut request = self.receiver_request.borrow_mut();
-            if request.is_none()
-                && let Some(support) = language_support_for_hook(language, "open_receiver_request")
-            {
-                let cancellation = query.cancellation.cloned().unwrap_or_default();
-                *request = support.open_receiver_request(self.analyzer, &cancellation);
-            }
             if let Some(request) = request.as_mut() {
                 return request.resolve_definition(query);
             }
         }
         resolver.resolve_definition_bounded(query)
+    }
+
+    #[track_caller]
+    fn ensure_receiver_request(
+        &self,
+        language: Language,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        let mut request = self.receiver_request.borrow_mut();
+        if request.is_none()
+            && let Some(support) = language_support_for_hook(language, "open_receiver_request")
+        {
+            let cancellation = cancellation.cloned().unwrap_or_default();
+            *request = support.open_receiver_request(self.analyzer, &cancellation);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -697,6 +695,49 @@ impl<'a> ReceiverQueryService<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn analyze_with_optional_structural_facts(
+        &self,
+        operation: ReceiverQueryOperation,
+        file: &ProjectFile,
+        range: Range,
+        input: ReceiverQueryInput,
+        structural_facts: Option<&Arc<FileFacts>>,
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
+        let previous = self.reads.take();
+        let (result, reads) = super::common::capture_memo_reads(self.analyzer, || {
+            if let Some(previous) = previous {
+                crate::analyzer::usages::common::replay_memo_reads(&previous, self.analyzer);
+            }
+            if crate::analyzer::read_attribution_records_reads(|| {
+                self.analyzer.read_ledger_attached()
+            }) {
+                if let Some(blob) = self.analyzer.indexed_blob_oid(file) {
+                    self.analyzer.record_read(crate::analyzer::ReadKey::file(
+                        file.language(),
+                        crate::path_utils::rel_path_string(file),
+                        blob,
+                    ));
+                } else {
+                    self.analyzer.record_unattributed_read();
+                }
+            }
+            self.analyze_with_prepared_inputs(
+                operation,
+                file,
+                range,
+                input,
+                structural_facts,
+                budget,
+                cancellation,
+            )
+        });
+        *self.reads.borrow_mut() = Some(reads);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_with_prepared_inputs(
         &self,
         operation: ReceiverQueryOperation,
         file: &ProjectFile,

@@ -468,6 +468,38 @@ impl SpliceMount for super::TypedFrontierState {
     }
 }
 
+impl SpliceMount for super::FactModelMemberSelection {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        let mut selection = self.clone();
+        selection.completion = selection.completion.splice(translation);
+        for candidate in &mut selection.candidates {
+            candidate.target = candidate.target.splice(translation);
+            candidate.owners = candidate.owners.splice(translation);
+            let ty = candidate.receiver.ty();
+            let ty = super::ResolutionTypeRef {
+                identity: ty.identity().splice(translation),
+                ..ty
+            };
+            candidate.receiver = match candidate.receiver {
+                super::ResolutionSlotValue::TypeObject(_, obligation) => {
+                    super::ResolutionSlotValue::TypeObject(ty, obligation)
+                }
+                super::ResolutionSlotValue::Runtime {
+                    addressable,
+                    obligation,
+                    ..
+                } => super::ResolutionSlotValue::Runtime {
+                    ty,
+                    addressable,
+                    obligation,
+                },
+            };
+            candidate.completion = candidate.completion.splice(translation);
+        }
+        selection
+    }
+}
+
 impl<A: SpliceMount, B: SpliceMount> SpliceMount for (A, B) {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         (self.0.splice(translation), self.1.splice(translation))
@@ -1992,6 +2024,38 @@ where
             .deferred_member_owner_proofs(&owners, &candidates, cancellation)
     }
 
+    fn unindexed_model_callable_result(
+        &self,
+        frontier: &super::UnindexedExternalFrontier,
+        cancellation: &CancellationToken,
+        session: Option<
+            &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+        >,
+    ) -> StoreResult<Option<Option<String>>> {
+        let mut frontier = frontier.clone();
+        frontier.member = frontier
+            .member
+            .map(|(fragment, lookup)| (self.argument(&fragment), self.argument(&lookup)));
+        self.inner
+            .unindexed_model_callable_result(&frontier, cancellation, session)
+    }
+
+    fn go_model_owner_declarations(
+        &self,
+        definition: SemanticId,
+        owner: &super::ExternalOwnerIdentity,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<super::fact_source::GoModelOwnerDeclarations>>> {
+        // Model coordinates and their type slots are shared-name identities;
+        // they never enter the mounted source-identity translation.
+        assert!(
+            definition.shared_name_id().is_some(),
+            "a model owner is request-local"
+        );
+        self.inner
+            .go_model_owner_declarations(definition, owner, cancellation)
+    }
+
     fn go_member_declarations(
         &self,
         definitions: &[SemanticId],
@@ -2460,7 +2524,7 @@ mod tests {
         assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        assert_eq!(typed.len(), 93, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 95, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

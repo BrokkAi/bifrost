@@ -1195,7 +1195,7 @@ impl ExtensionWorkspace {
             .map_err(|error| ExtensionError::InvalidRequest(error.into()))?;
 
         let solver_limits = clamp_solver_work(values.max_solver_steps);
-        let summaries = self.flow_state.typestate_summaries();
+        let summaries = self.flow_state.typestate_summaries(&self.analyzer);
         let summary_reads = SummaryReadRecorder::new(self.analyzer.analyzer());
         let icfg = WorkspaceIcfgProvider::new(&self.analyzer);
         let mut solver_budget = SolverBudget::new(solver_limits);

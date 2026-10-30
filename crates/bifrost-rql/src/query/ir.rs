@@ -938,12 +938,6 @@ pub enum ConfigurationRouteSegmentFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigurationRouteFilter(pub Vec<ConfigurationRouteSegmentFilter>);
 
-impl ConfigurationRouteFilter {
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
 /// Constrained-value filter over authored configuration-document facts.
 ///
 /// Every axis is an author's enumeration: an empty axis means every value,
@@ -1007,39 +1001,6 @@ pub struct ConfigurationFactsFilter {
     pub fact_ordinals: Vec<u32>,
     pub provenances: Vec<ConfigurationValueProvenance>,
     pub completenesses: Vec<ConfigurationCompletenessFilter>,
-}
-
-impl ConfigurationFactsFilter {
-    pub fn is_empty(&self) -> bool {
-        self.formats.is_empty()
-            && self.node_kinds.is_empty()
-            && self.roles.is_empty()
-            && self.scalar_kinds.is_empty()
-            && self.keys.is_empty()
-            && self.values.is_empty()
-            && self.values_ignore_case.is_empty()
-            && self.value_lt.is_none()
-            && self.value_le.is_none()
-            && self.value_gt.is_none()
-            && self.value_ge.is_none()
-            && self.xml_parent_keys.is_empty()
-            && self.xml_preceding_sibling_keys.is_empty()
-            && self.xml_sibling_attribute_keys.is_empty()
-            && self.xml_sibling_attribute_values.is_empty()
-            && self.xml_sibling_attribute_values_ignore_case.is_empty()
-            && self.xml_reference_source_keys.is_empty()
-            && self.xml_reference_target_keys.is_empty()
-            && self.xml_reference_target_element_keys.is_empty()
-            && self.xml_reference_target_child_keys.is_empty()
-            && self.xml_peer_element_keys.is_empty()
-            && self.xml_peer_attribute_keys.is_empty()
-            && self.xml_peer_child_keys.is_empty()
-            && self.xml_peer_min_shared_children.is_none()
-            && self.routes.is_empty()
-            && self.fact_ordinals.is_empty()
-            && self.provenances.is_empty()
-            && self.completenesses.is_empty()
-    }
 }
 
 /// A non-structural seed producing authored configuration facts directly from
@@ -1212,17 +1173,6 @@ pub struct EdgeFilter {
     pub site_classes: Vec<SiteClass>,
 }
 
-impl EdgeFilter {
-    pub fn is_empty(&self) -> bool {
-        self.reference_kinds.is_empty()
-            && self.proof.is_none()
-            && self.surface.is_none()
-            && self.usage_kinds.is_empty()
-            && self.relations.is_empty()
-            && self.site_classes.is_empty()
-    }
-}
-
 /// Constrained-value filter over flow-sensitive state-event rows (#1480).
 ///
 /// Both axes are enumerations the author writes, so an empty axis means "every
@@ -1234,12 +1184,6 @@ pub struct StateEventFilter {
     pub classes: Vec<StateEventClass>,
     pub subjects: Vec<FlowSubjectKind>,
     pub read_causes: Vec<StateEventReadCause>,
-}
-
-impl StateEventFilter {
-    pub fn is_empty(&self) -> bool {
-        self.classes.is_empty() && self.subjects.is_empty() && self.read_causes.is_empty()
-    }
 }
 
 /// Constrained-value filter over flow-relation rows (#1480).
@@ -1320,19 +1264,9 @@ pub struct ResultContractFailureUseFilter {
 }
 
 impl ResultContractFailureUseFilter {
-    pub fn is_empty(&self) -> bool {
-        self.provenances.is_empty() && self.consumers.is_empty()
-    }
-
     pub fn accepts(&self, provenance: FailureUseProvenance, consumer: FailureUseConsumer) -> bool {
         (self.provenances.is_empty() || self.provenances.contains(&provenance))
             && (self.consumers.is_empty() || self.consumers.contains(&consumer))
-    }
-}
-
-impl FlowRelationFilter {
-    pub fn is_empty(&self) -> bool {
-        self.relations.is_empty() && self.certainties.is_empty()
     }
 }
 
@@ -1425,12 +1359,6 @@ impl AssignmentRelationFilter {
     }
 }
 
-impl ControlRelationFilter {
-    pub fn is_empty(&self) -> bool {
-        self.relations.is_empty() && self.exit_partitions.is_empty()
-    }
-}
-
 /// Relation families accepted by the branch-relations step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchRelationKind {
@@ -1480,12 +1408,6 @@ pub struct CppProvenanceFilter {
     pub rules: Vec<CppProvenanceRule>,
 }
 
-impl CppProvenanceFilter {
-    pub fn accepts(&self, rule: CppProvenanceRule) -> bool {
-        self.rules.is_empty() || self.rules.contains(&rule)
-    }
-}
-
 impl BranchRelationFilter {
     pub fn accepts(&self, label: &str) -> bool {
         self.relations.is_empty() || self.relations.iter().any(|kind| kind.label() == label)
@@ -1502,12 +1424,6 @@ impl BranchRelationFilter {
 pub struct RewritePathFilter {
     pub domains: Vec<RewriteDomainKind>,
     pub outcomes: Vec<RewriteOutcomeKind>,
-}
-
-impl RewritePathFilter {
-    pub fn is_empty(&self) -> bool {
-        self.domains.is_empty() && self.outcomes.is_empty()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2088,10 +2004,6 @@ pub struct ScopeFilter {
 }
 
 impl ScopeFilter {
-    pub fn is_empty(&self) -> bool {
-        self.kinds.is_empty()
-    }
-
     pub fn matches(&self, kind: Option<NormalizedKind>) -> bool {
         if self.kinds.is_empty() {
             return true;
@@ -2126,17 +2038,7 @@ pub struct DecoratorBindingFilter {
     pub annotation_type: Option<String>,
 }
 
-impl DecoratorBindingFilter {
-    pub fn is_empty(&self) -> bool {
-        self.module.is_none() && self.imported_name.is_none() && self.annotation_type.is_none()
-    }
-}
-
 impl BindingFilter {
-    pub fn is_empty(&self) -> bool {
-        self.kinds.is_empty() && self.names.is_empty() && self.hoisting.is_empty()
-    }
-
     pub fn matches(&self, kind: BindingKind, name: &str, hoisting: HoistingClass) -> bool {
         (self.kinds.is_empty() || self.kinds.contains(&kind))
             && (self.names.is_empty() || self.names.iter().any(|wanted| wanted == name))
@@ -2184,14 +2086,6 @@ impl CandidateOutcomeLabel {
 pub const UNATTRIBUTED_TIER_LABEL: &str = "unattributed";
 
 impl CandidateFilter {
-    pub fn is_empty(&self) -> bool {
-        self.tiers.is_empty()
-            && !self.unattributed_tier
-            && self.outcomes.is_empty()
-            && self.rejection_reasons.is_empty()
-            && self.boundaries.is_empty()
-    }
-
     pub fn matches(
         &self,
         tier: Option<PrecedenceTier>,
@@ -2237,10 +2131,6 @@ pub struct GenerationSiteFilter {
 }
 
 impl GenerationSiteFilter {
-    pub fn is_empty(&self) -> bool {
-        self.kinds.is_empty() && self.inputs.is_empty()
-    }
-
     pub fn matches(&self, kind: GenerationKind, input: GenerationInputClass) -> bool {
         (self.kinds.is_empty() || self.kinds.contains(&kind))
             && (self.inputs.is_empty() || self.inputs.contains(&input))
@@ -2257,10 +2147,6 @@ pub struct ExportFilter {
 }
 
 impl ExportFilter {
-    pub fn is_empty(&self) -> bool {
-        self.forms.is_empty() && self.names.is_empty()
-    }
-
     pub fn matches(&self, form: ExportForm, name: &str) -> bool {
         (self.forms.is_empty() || self.forms.contains(&form))
             && (self.names.is_empty() || self.names.iter().any(|wanted| wanted == name))
@@ -2277,10 +2163,6 @@ pub struct DeclarationStateFilter {
 }
 
 impl DeclarationStateFilter {
-    pub fn is_empty(&self) -> bool {
-        self.origins.is_empty() && self.declaration_only.is_none() && self.config_gated.is_none()
-    }
-
     pub fn matches(
         &self,
         origin: DeclarationOrigin,
@@ -2317,10 +2199,6 @@ pub struct OccurrenceFilter {
 }
 
 impl OccurrenceFilter {
-    pub fn is_empty(&self) -> bool {
-        self.classes.is_empty() && self.roles.is_empty() && self.namespaces.is_empty()
-    }
-
     pub fn matches(
         &self,
         class: OccurrenceClass,
@@ -2436,12 +2314,6 @@ pub struct PathFilter {
     pub min_segments: Option<u32>,
 }
 
-impl PathFilter {
-    pub fn is_empty(&self) -> bool {
-        self.min_segments.is_none()
-    }
-}
-
 /// Options of the `segments-of` step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentsOfOptions {
@@ -2458,19 +2330,6 @@ pub struct PathSeed {
     pub where_globs: QueryPathScope,
     pub languages: Vec<Language>,
     pub filter: PathFilter,
-}
-
-impl PathSeed {
-    /// Scan exactly the named workspace-relative files for every path.
-    pub fn for_exact_paths<'a>(
-        paths: impl IntoIterator<Item = &'a str>,
-    ) -> Result<Self, glob::PatternError> {
-        Ok(Self {
-            where_globs: exact_path_globs(paths)?,
-            languages: Vec::new(),
-            filter: PathFilter::default(),
-        })
-    }
 }
 
 /// A non-structural seed producing binding rows directly from workspace facts.
@@ -3974,15 +3833,6 @@ impl SetOperator {
             Self::Except => "except",
         }
     }
-
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "union" => Some(Self::Union),
-            "intersect" => Some(Self::Intersect),
-            "except" => Some(Self::Except),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4943,10 +4793,7 @@ fn validate_cross_domain_inputs(
     depth: usize,
     nodes: &mut usize,
 ) -> Result<(ValidatedDomain, ValidatedDomain), QueryError> {
-    use super::domain::{
-        CapabilityRequirementSet, DomainKind, PackRequirementSet, QueryDomain, QueryRequirement,
-        RowDomain,
-    };
+    use super::domain::{DomainKind, QueryDomain, QueryRequirement, RowDomain};
     let code_path = child_path(op_path, "code");
     let configuration_path = child_path(op_path, "configuration");
     let code_domain = validate_plan(code, &code_path, depth + 1, nodes)?;
@@ -5041,12 +4888,7 @@ fn validate_cross_domain_inputs(
             }
         }
         .expect("an intersected selection is non-empty");
-        QueryRequirement::new(
-            input,
-            row,
-            CapabilityRequirementSet::default(),
-            PackRequirementSet::default(),
-        )
+        QueryRequirement::new(input, row)
     };
     let composed = requirement(code_input)
         .through_cross_domain_operator(&requirement(configuration_input), &descriptor)
@@ -5427,7 +5269,8 @@ impl ArityConstraint {
 /// One node pattern. All fields optional; the *root* `match` pattern must
 /// constrain at least one of kind/name/text (a wildcard root would match
 /// every node in the workspace), while nested patterns may be capture-only
-/// or empty (an empty `args` entry means "some argument exists").
+/// or empty in role fields (an empty `args` entry means "some argument exists").
+/// Entries in `all` and `any`, and boxed containment patterns, must not be empty.
 #[derive(Debug, Clone, Default)]
 pub struct Pattern {
     /// JSON `kind`: a union of kinds, each subtype-aware (`literal` matches
@@ -5991,3 +5834,7 @@ impl fmt::Display for QueryError {
 }
 
 impl std::error::Error for QueryError {}
+
+#[cfg(test)]
+#[path = "authoring_boundaries.rs"]
+mod authoring_boundaries;

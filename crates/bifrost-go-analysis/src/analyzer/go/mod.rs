@@ -1,3 +1,8 @@
+use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    AuthorityInputs, WorkspaceAuthorityMemo, memo_attribution,
+};
+use brokk_bifrost_analysis::analyzer::{FactSubject, WorkspaceFactFamily};
 use brokk_bifrost_analysis::{
     delegate_inner_methods, delegate_inner_procedure_fact_methods,
     forward_relational_definition_batch, impl_forward_query_provider,
@@ -15,6 +20,7 @@ mod external_field_memory;
 mod failure_handlers;
 mod handler_dispatch;
 mod imports;
+pub(crate) mod model_receiver;
 pub(super) mod native_call_relations;
 #[doc(hidden)]
 pub mod native_graph;
@@ -37,7 +43,43 @@ pub(crate) fn go_method_receiver_preparation(
     }
 }
 
+fn go_member_value(
+    receiver: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+    value: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+) -> brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue {
+    use brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue;
+    match receiver {
+        ResolutionSlotValue::Runtime { .. } => ResolutionSlotValue::runtime(
+            value.ty(),
+            receiver.addressable() == Some(true) || receiver.ty().indirection() == 1,
+        )
+        .inherit_obligation(value)
+        .inherit_obligation(receiver),
+        ResolutionSlotValue::TypeObject(_, _) => value,
+    }
+}
+
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for GoSupport {
+    fn projects_member_values_through_receiver(&self) -> bool {
+        true
+    }
+
+    fn member_value(
+        &self,
+        receiver: Option<brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue>,
+        value: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+    ) -> Option<brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue> {
+        Some(go_member_value(receiver?, value))
+    }
+
+    fn precedence_rules(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::resolution::precedence::PrecedenceRules
+    {
+        use brokk_bifrost_analysis::analyzer::resolution::precedence;
+        &precedence::GoPrecedenceRules
+    }
+
     fn supports_direct_type_shapes(&self) -> bool {
         true
     }
@@ -425,13 +467,41 @@ pub use crate::analyzer::go::type_identity_proof::go_native_error_result_obligat
 
 pub use crate::analyzer::go::type_identity_proof::go_native_obligation_exclusion;
 
+// Selection belongs to one analyzer view. Copying a view transports its state
+// without consulting an authority; subsequent reads still use the outer memo.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct GoSelectionValue<T> {
+    value: std::sync::RwLock<T>,
+}
+
+impl<T> GoSelectionValue<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: std::sync::RwLock::new(value),
+        }
+    }
+}
+
+impl<T: Clone> Clone for GoSelectionValue<T> {
+    fn clone(&self) -> Self {
+        Self::new(
+            self.value
+                .read()
+                .expect("Go selection lock poisoned")
+                .clone(),
+        )
+    }
+}
+
+#[derive(Clone)]
 pub struct GoAnalyzer {
     inner: TreeSitterAnalyzer<GoAdapter>,
     memo_caches: GoMemoCaches,
     #[doc(hidden)]
-    pub active_base_profile: std::sync::RwLock<Option<[u8; 32]>>,
+    pub active_base_profile: WorkspaceAuthorityMemo<GoSelectionValue<Option<[u8; 32]>>>,
     #[doc(hidden)]
-    pub build_selection_error: std::sync::RwLock<String>,
+    pub build_selection_error: WorkspaceAuthorityMemo<GoSelectionValue<String>>,
 }
 
 pub(crate) fn go_import_binding_pairs(
@@ -456,11 +526,11 @@ pub(crate) fn go_import_binding_pairs(
 }
 
 #[cfg(test)]
+#[track_caller]
 fn activate_go_tool_context_for_test(
     fixture: &crate::inline_project::BuiltInlineTestProject,
     analyzer: &GoAnalyzer,
 ) -> i64 {
-    use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome;
     use brokk_bifrost_core::cancellation::CancellationToken;
 
     use brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome;
@@ -497,29 +567,21 @@ fn activate_go_tool_context_for_test(
     .pop()
     .expect("one fixture domain");
     let profile = profile_digest(&discovery);
-    let GoInputObservationOutcome::Ready(after) = store
-        .observe_go_context_inputs(&snapshot, analyzer.project(), &cancellation)
-        .unwrap()
-    else {
-        panic!("fixture Go inputs must remain selected");
-    };
-    let GoContextPublicationOutcome::Published(context) = store
-        .publish_go_package_context(
-            snapshot.clone(),
-            fixture.root().to_path_buf(),
-            None,
-            &before,
-            &after,
-            discovery,
-            &cancellation,
-        )
-        .unwrap()
-    else {
-        panic!("Go tool publication must succeed");
-    };
-    assert!(analyzer.activate_native_context_profile(&snapshot, profile));
-    reconcile_go_summaries_for_test(analyzer, context.context_id);
-    context.context_id
+    let context_id = crate::test_support::publish_go_discovery_tail_for_test(
+        analyzer,
+        store,
+        analyzer.project(),
+        fixture.root(),
+        &snapshot,
+        &before,
+        profile,
+        discovery,
+        &cancellation,
+        "fixture Go inputs must remain selected",
+        "Go tool publication must succeed",
+    );
+    reconcile_go_summaries_for_test(analyzer, context_id);
+    context_id
 }
 
 #[cfg(test)]
@@ -530,18 +592,15 @@ fn reconcile_go_summaries_for_test(analyzer: &GoAnalyzer, context_id: i64) {
     let profile = analyzer
         .context_profile_for_test()
         .expect("selected Go native context profile");
-    let report = analyzer
-        .inner
-        .analyzer_store()
-        .reconcile_unit_summaries(
-            &snapshot,
-            brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
-                context_id,
-                profile,
-            },
-            &brokk_bifrost_core::cancellation::CancellationToken::new(),
-        )
-        .expect("reconcile summaries for the selected Go native context");
+    let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+    let report = crate::test_support::reconcile_go_summaries_for_test(
+        analyzer.inner.analyzer_store(),
+        &snapshot,
+        profile,
+        context_id,
+        &cancellation,
+    )
+    .expect("reconcile summaries for the selected Go native context");
     assert!(
         report.failed.is_empty(),
         "selected Go native summary derivation must succeed: {:?}",
@@ -623,16 +682,9 @@ pub fn mark_go_package_complete_for_test(analyzer: &GoAnalyzer, import_path: &'s
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+#[track_caller]
 pub fn persist_live_go_sources_for_test(analyzer: &GoAnalyzer) {
-    for file in analyzer.get_analyzed_files() {
-        assert!(
-            analyzer
-                .inner
-                .write_live_file_to_store_for_test(&file)
-                .is_some(),
-            "persist selected Go source facts for {file}"
-        );
-    }
+    persist_analyzed_go_files_for_test(analyzer, "persist selected Go source facts for");
     // Re-persistence withdraws summaries that depended on the replaced blobs.
     // Reconcile under the same selected snapshot and profile as production.
     let snapshots = analyzer.inner.selected_workspace_snapshots();
@@ -670,21 +722,17 @@ pub fn persist_live_go_sources_for_test(analyzer: &GoAnalyzer) {
     }
 }
 
-impl Clone for GoAnalyzer {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            memo_caches: self.memo_caches.clone(),
-            active_base_profile: std::sync::RwLock::new(
-                *self
-                    .active_base_profile
-                    .read()
-                    .expect("Go base profile lock poisoned"),
-            ),
-            build_selection_error: std::sync::RwLock::new(
-                self.build_selection_error().unwrap_or_default(),
-            ),
-        }
+#[cfg(any(test, feature = "test-support"))]
+#[track_caller]
+pub(crate) fn persist_analyzed_go_files_for_test(analyzer: &GoAnalyzer, message: &str) {
+    for file in analyzer.get_analyzed_files() {
+        assert!(
+            analyzer
+                .inner
+                .write_live_file_to_store_for_test(&file)
+                .is_some(),
+            "{message} {file}"
+        );
     }
 }
 
@@ -702,6 +750,50 @@ impl brokk_bifrost_go::source_facts::GoSourceFactProvider for GoAnalyzer {
 }
 
 impl GoAnalyzer {
+    fn profile_read(&self) -> std::sync::RwLockReadGuard<'_, Option<[u8; 32]>> {
+        self.active_base_profile.read(
+            &memo_attribution(self),
+            |lock| lock.value.read().expect("Go base profile lock poisoned"),
+            |value| {
+                workspace_facts::selection_input(
+                    "profile",
+                    workspace_facts::profile_answer(**value),
+                )
+            },
+        )
+    }
+
+    fn profile_write(&self) -> std::sync::RwLockWriteGuard<'_, Option<[u8; 32]>> {
+        self.active_base_profile.read(
+            &memo_attribution(self),
+            |lock| lock.value.write().expect("Go base profile lock poisoned"),
+            |_| AuthorityInputs::Unnamed,
+        )
+    }
+
+    fn selection_error_read(&self) -> std::sync::RwLockReadGuard<'_, String> {
+        self.build_selection_error.read(
+            &memo_attribution(self),
+            |lock| lock.value.read().expect("Go build selection lock poisoned"),
+            |value| match workspace_facts::selection_error_answer(value) {
+                Some(answer) => workspace_facts::selection_input("error", answer),
+                None => AuthorityInputs::Unnamed,
+            },
+        )
+    }
+
+    fn selection_error_write(&self) -> std::sync::RwLockWriteGuard<'_, String> {
+        self.build_selection_error.read(
+            &memo_attribution(self),
+            |lock| {
+                lock.value
+                    .write()
+                    .expect("Go build selection lock poisoned")
+            },
+            |_| AuthorityInputs::Unnamed,
+        )
+    }
+
     #[doc(hidden)]
     pub fn build_selection_error(&self) -> Option<String> {
         if self.inner.analyzer_config().go.dependency_discovery.mode
@@ -709,10 +801,7 @@ impl GoAnalyzer {
         {
             return Some("Go dependency discovery is disabled".into());
         }
-        let error = self
-            .build_selection_error
-            .read()
-            .expect("Go build selection lock poisoned");
+        let error = self.selection_error_read();
         (!error.is_empty()).then(|| error.clone())
     }
 
@@ -743,16 +832,10 @@ impl GoAnalyzer {
         } else {
             String::new()
         };
-        *self
-            .build_selection_error
-            .write()
-            .expect("Go build selection lock poisoned") = error;
+        *self.selection_error_write() = error;
         if outcome.canonical.is_none() {
             // A failed discovery must not keep a previous tool profile active.
-            *self
-                .active_base_profile
-                .write()
-                .expect("Go profile lock poisoned") = None;
+            *self.profile_write() = None;
             self.refresh_source_inventory()?;
         }
         Ok(())
@@ -794,22 +877,17 @@ impl GoAnalyzer {
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        invalidate_nearest_go_module_cache();
-        let inner = self.inner.update_all_with_progress(progress);
-        Self {
-            inner,
-            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-            active_base_profile: std::sync::RwLock::new(
-                *self
-                    .active_base_profile
-                    .read()
-                    .expect("Go base profile lock poisoned"),
-            ),
-            build_selection_error: std::sync::RwLock::new(
-                self.build_selection_error().unwrap_or_default(),
-            ),
-        }
-        .with_source_inventory()
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            invalidate_nearest_go_module_cache();
+            let inner = self.inner.update_all_with_progress(progress);
+            Self {
+                inner,
+                memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+                active_base_profile: self.active_base_profile.clone(),
+                build_selection_error: self.build_selection_error.clone(),
+            }
+            .with_source_inventory()
+        })
     }
 
     /// The selected Go snapshot the unit-summary differential test reads.
@@ -823,10 +901,7 @@ impl GoAnalyzer {
 
     #[doc(hidden)]
     pub fn native_context_base_profile(&self) -> Option<[u8; 32]> {
-        *self
-            .active_base_profile
-            .read()
-            .expect("Go base profile lock poisoned")
+        *self.profile_read()
     }
 
     #[doc(hidden)]
@@ -882,10 +957,7 @@ impl GoAnalyzer {
                 return false;
             }
         };
-        *self
-            .active_base_profile
-            .write()
-            .expect("Go base profile lock poisoned") = Some(base);
+        *self.profile_write() = Some(base);
         true
     }
 
@@ -958,15 +1030,8 @@ impl GoAnalyzer {
         Self {
             inner: self.inner.clone_with_project(project),
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-            active_base_profile: std::sync::RwLock::new(
-                *self
-                    .active_base_profile
-                    .read()
-                    .expect("Go base profile lock poisoned"),
-            ),
-            build_selection_error: std::sync::RwLock::new(
-                self.build_selection_error().unwrap_or_default(),
-            ),
+            active_base_profile: self.active_base_profile.clone(),
+            build_selection_error: self.build_selection_error.clone(),
         }
     }
 
@@ -974,18 +1039,26 @@ impl GoAnalyzer {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    fn from_inner(inner: TreeSitterAnalyzer<GoAdapter>, memo_budget: u64) -> Self {
+        Self {
+            inner,
+            memo_caches: GoMemoCaches::new(memo_budget),
+            active_base_profile: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::GoBuildSelection,
+                GoSelectionValue::new(None),
+            ),
+            build_selection_error: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::GoBuildSelection,
+                GoSelectionValue::new("Go build selection discovery has not run".into()),
+            ),
+        }
+    }
+
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         invalidate_nearest_go_module_cache();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, GoAdapter, config),
-            memo_caches: GoMemoCaches::new(memo_budget),
-            active_base_profile: std::sync::RwLock::new(None),
-            build_selection_error: std::sync::RwLock::new(
-                "Go build selection discovery has not run".into(),
-            ),
-        }
-        .with_source_inventory()
+        let inner = TreeSitterAnalyzer::new_with_config(project, GoAdapter, config);
+        Self::from_inner(inner, memo_budget).with_source_inventory()
     }
 
     #[doc(hidden)]
@@ -1007,14 +1080,7 @@ impl GoAnalyzer {
                     progress,
                 )
             },
-            |inner, memo_budget| Self {
-                inner,
-                memo_caches: GoMemoCaches::new(memo_budget),
-                active_base_profile: std::sync::RwLock::new(None),
-                build_selection_error: std::sync::RwLock::new(
-                    "Go build selection discovery has not run".into(),
-                ),
-            },
+            Self::from_inner,
         )?;
         analyzer.refresh_source_inventory()?;
         Ok(analyzer)
@@ -1101,35 +1167,46 @@ impl GoAnalyzer {
         self.inner.content_qualifier_of(file)
     }
 
-    pub(crate) fn workspace_path_index(&self) -> &packages::GoWorkspacePathIndex {
-        self.memo_caches.workspace_path_index.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "go.workspace_path_index",
-                || {
-                    self.memo_caches
-                        .workspace_path_index_build_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    // Without the recorded refusals, a refused file is an unexplained
-                    // missing clause and the index stays incomplete.
-                    let refused = self
-                        .inner
-                        .selected_source_admission_refusals()
-                        .unwrap_or_else(|error| {
-                            self.inner.record_store_error(error);
-                            Vec::new()
-                        })
-                        .into_iter()
-                        .map(|(file, _)| file)
-                        .collect();
-                    packages::GoWorkspacePathIndex::build(
-                        self.project(),
-                        |file| self.package_clause_of(file),
-                        &refused,
-                    )
-                },
-            )
-        })
+    pub(crate) fn workspace_path_index(&self) -> Arc<packages::GoWorkspacePathIndex> {
+        let value = self.memo_caches.workspace_path_index.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(
+                    self,
+                    memo,
+                    || {
+                        self.memo_caches
+                            .workspace_path_index_build_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Without the recorded refusals, a refused file is an unexplained
+                        // missing clause and the index stays incomplete.
+                        let refused = self
+                            .inner
+                            .selected_source_admission_refusals()
+                            .unwrap_or_else(|error| {
+                                self.inner.record_store_error(error);
+                                Vec::new()
+                            })
+                            .into_iter()
+                            .map(|row| row.file)
+                            .collect();
+                        let index = packages::GoWorkspacePathIndex::build(
+                            self.project(),
+                            |file| self.package_clause_of(file),
+                            &refused,
+                        );
+                        let answer = StableDigest::from_array(index.read_answer());
+                        (Arc::new(index), answer)
+                    },
+                )
+            },
+            |value| AuthorityInputs::Fact {
+                language: Language::Go,
+                subject: FactSubject::Whole,
+                answer: value.1,
+            },
+        );
+        value.0
     }
 
     pub(crate) fn same_module(&self, left: &ProjectFile, right: &ProjectFile) -> bool {
@@ -1205,7 +1282,9 @@ impl GoAnalyzer {
         &self,
     ) -> Result<Vec<(ProjectFile, String)>, brokk_bifrost_analysis::analyzer::store::StoreError>
     {
-        self.inner.selected_source_admission_refusals()
+        self.inner
+            .selected_source_admission_refusals()
+            .map(|rows| rows.into_iter().map(|row| (row.file, row.reason)).collect())
     }
 
     #[doc(hidden)]
@@ -1220,11 +1299,19 @@ impl GoAnalyzer {
         self.memo_caches.workspace_path_index_build_count()
     }
 
-    fn workspace_indexes(&self) -> Result<Arc<GoWorkspaceIndexes>, GoGraphBuildError> {
+    fn workspace_indexes(
+        &self,
+        subject: FactSubject,
+    ) -> Result<Arc<GoWorkspaceIndexes>, GoGraphBuildError> {
         // Completeness is a cheap readiness check and must still guard a warm
         // memo: an unavailable publication must not make an earlier index look
         // authoritative. Enumerate files only to describe that failure.
         if !self.graph_inventory_complete() {
+            brokk_bifrost_analysis::analyzer::workspace_authority::record_workspace_authority_read(
+                self,
+                WorkspaceFactFamily::GoWorkspaceIndexes,
+                AuthorityInputs::Unnamed,
+            );
             let files: Vec<_> = self
                 .get_analyzed_files()
                 .into_iter()
@@ -1232,49 +1319,64 @@ impl GoAnalyzer {
                 .collect();
             return Err(GoGraphBuildError::from_files(files));
         }
-        self.memo_caches
-            .workspace_indexes
-            .get_or_try_build_on_dedicated_pool(|| {
-                // Keep workspace enumeration and its whole-language read on
-                // the cold build path. A warm root only borrows the shared
-                // canonical index; repeating `get_analyzed_files` here would
-                // record a broad Scope read in every root and invalidate roots
-                // for an edit to an unrelated Go file.
-                let files: Vec<_> = self
-                    .get_analyzed_files()
-                    .into_iter()
-                    .filter(|file| file_language(file) == Language::Go)
-                    .collect();
-                let scope = AnalyzerQueryScope::new(self);
-                let source = GoGraphSource {
-                    token: scope.token(),
-                    index: self,
-                    imports: self,
-                    type_aliases: self,
-                    workspace_paths: self.workspace_path_index(),
-                    package_clauses: self,
-                    source_facts: self,
-                };
-                self.memo_caches
-                    .workspace_indexes_build_count
-                    .fetch_add(1, Ordering::Relaxed);
-                let result = build_go_workspace_indexes(source, &files);
-                if scope.store_error().is_some() {
-                    Err(GoGraphBuildError::from_files(files.clone()))
-                } else {
-                    if result.is_ok() {
-                        self.memo_caches
-                            .workspace_source_fact_load_count
-                            .fetch_add(files.len(), Ordering::Relaxed);
+        self.memo_caches.workspace_indexes.read(
+            &memo_attribution(self),
+            |memo| {
+                memo.get_or_try_build_on_dedicated_pool(|| {
+                    // Keep workspace enumeration and its whole-language read on
+                    // the cold build path. A warm root only borrows the shared
+                    // canonical index; repeating `get_analyzed_files` here would
+                    // record a broad Scope read in every root and invalidate roots
+                    // for an edit to an unrelated Go file.
+                    let files: Vec<_> = self
+                        .get_analyzed_files()
+                        .into_iter()
+                        .filter(|file| file_language(file) == Language::Go)
+                        .collect();
+                    let scope = AnalyzerQueryScope::new(self);
+                    let source = GoGraphSource {
+                        token: scope.token(),
+                        index: self,
+                        imports: self,
+                        type_aliases: self,
+                        workspace_paths: &self.workspace_path_index(),
+                        package_clauses: self,
+                        source_facts: self,
+                    };
+                    self.memo_caches
+                        .workspace_indexes_build_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    let result = build_go_workspace_indexes(source, &files);
+                    if scope.store_error().is_some() {
+                        Err(GoGraphBuildError::from_files(files.clone()))
+                    } else {
+                        if result.is_ok() {
+                            self.memo_caches
+                                .workspace_source_fact_load_count
+                                .fetch_add(files.len(), Ordering::Relaxed);
+                        }
+                        result
                     }
-                    result
-                }
-            })
+                })
+            },
+            |result| match result {
+                Ok(indexes) => AuthorityInputs::Fact {
+                    language: Language::Go,
+                    answer: StableDigest::from_array(match &subject {
+                        FactSubject::Named { name } => indexes.hierarchy.read_answer(name),
+                        FactSubject::Whole => indexes.usage_answer,
+                        _ => unreachable!("Go workspace index question"),
+                    }),
+                    subject,
+                },
+                Err(_) => AuthorityInputs::Unnamed,
+            },
+        )
     }
 
     #[doc(hidden)]
     pub fn usage_edge_index(&self) -> Result<Arc<GoEdgeIndex>, GoGraphBuildError> {
-        self.workspace_indexes()
+        self.workspace_indexes(FactSubject::Whole)
             .map(|indexes| Arc::clone(&indexes.edges))
     }
 
@@ -1340,15 +1442,15 @@ impl TypeAliasProvider for GoAnalyzer {
 impl GoAnalyzer {
     /// Cache successful hierarchy builds; unavailable source publications are
     /// retried so a transient store failure cannot become a permanent proof.
-    fn hierarchy_index(&self) -> Result<Arc<GoHierarchyIndex>, GoGraphBuildError> {
-        self.workspace_indexes()
+    fn hierarchy_index(&self, name: &str) -> Result<Arc<GoHierarchyIndex>, GoGraphBuildError> {
+        self.workspace_indexes(FactSubject::Named { name: name.into() })
             .map(|indexes| Arc::clone(&indexes.hierarchy))
     }
 }
 
 impl TypeHierarchyProvider for GoAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.hierarchy_index()
+        self.hierarchy_index(&code_unit.fq_name())
             .map(|index| index.direct_ancestors(code_unit))
             .unwrap_or_default()
     }
@@ -1357,13 +1459,13 @@ impl TypeHierarchyProvider for GoAnalyzer {
         &self,
         code_unit: &CodeUnit,
     ) -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
-        self.hierarchy_index()
+        self.hierarchy_index(&code_unit.fq_name())
             .map(|index| index.direct_descendants(code_unit))
             .unwrap_or_default()
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
-        self.hierarchy_index()
+        self.hierarchy_index(&code_unit.fq_name())
             .is_ok_and(|index| index.supports(code_unit))
     }
 }
@@ -1408,7 +1510,7 @@ impl brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyProvid
         member: &CodeUnit,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
     ) -> brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyAnswer {
-        match self.hierarchy_index() {
+        match self.hierarchy_index(&member.fq_name()) {
             Ok(index) => go_member_family(self, &index, member, cancellation),
             Err(_) => brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyAnswer::incomplete(
                 go_member_family_capability(member),
@@ -1796,26 +1898,21 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        // Package facts are keyed by import path. A module-path change
-        // therefore rekeys every Go file below this manifest, including files
-        // absent from `changed_files`, and the inner update rebuilds for it
-        // (see `GoAdapter::workspace_package_identity_digest`). Invalidate
-        // first so neither path can reuse the old nearest-module answer.
-        invalidate_nearest_go_module_cache();
-        Self {
-            inner: self.inner.update(changed_files),
-            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-            active_base_profile: std::sync::RwLock::new(
-                *self
-                    .active_base_profile
-                    .read()
-                    .expect("Go base profile lock poisoned"),
-            ),
-            build_selection_error: std::sync::RwLock::new(
-                self.build_selection_error().unwrap_or_default(),
-            ),
-        }
-        .with_source_inventory()
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            // Package facts are keyed by import path. A module-path change
+            // therefore rekeys every Go file below this manifest, including files
+            // absent from `changed_files`, and the inner update rebuilds for it
+            // (see `GoAdapter::workspace_package_identity_digest`). Invalidate
+            // first so neither path can reuse the old nearest-module answer.
+            invalidate_nearest_go_module_cache();
+            Self {
+                inner: self.inner.update(changed_files),
+                memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+                active_base_profile: self.active_base_profile.clone(),
+                build_selection_error: self.build_selection_error.clone(),
+            }
+            .with_source_inventory()
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -2221,6 +2318,16 @@ impl LanguageSupport for GoSupport {
         true
     }
 
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: WorkspaceFactFamily,
+        language: Language,
+        subject: &FactSubject,
+    ) -> Option<StableDigest> {
+        workspace_facts::answer(analyzer, family, language, subject)
+    }
+
     fn closed_receiver_summary_closes_external_body(&self) -> bool {
         true
     }
@@ -2259,15 +2366,7 @@ impl LanguageSupport for GoSupport {
         brokk_bifrost_analysis::analyzer::semantic::ValueTypeBarrierDecision,
         brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
     > {
-        use brokk_bifrost_analysis::analyzer::semantic::{
-            ValueTypeBarrierDecision, ValueTypeBarrierReason,
-        };
-        let Some(context) = request.value_type_barrier_context() else {
-            return Ok(ValueTypeBarrierDecision::Undecided(
-                ValueTypeBarrierReason::UnavailableObservation,
-            ));
-        };
-        context.classify(observation, predicate, request)
+        request.classify_value_type_barrier(observation, predicate)
     }
 
     fn observed_value_type(
@@ -2548,7 +2647,7 @@ impl LanguageSupport for GoSupport {
         &self,
     ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::languages::StructuralReceiverResolver>
     {
-        Some(&native_points::GoNativeRolloutPoints)
+        self.structural_receiver()
     }
 
     fn selected_graph_fallback_active(&self, analyzer: &dyn IAnalyzer) -> bool {
@@ -3119,6 +3218,9 @@ impl LanguageSupport for GoSupport {
         tree: &tree_sitter::Tree,
         callee_range: &Range,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        member_selection: Option<
+            &brokk_bifrost_analysis::analyzer::semantic::DeferredMemberSelection,
+        >,
     ) {
         selector_calls::apply_go_typed_selector_target_at_call(
             lookup,
@@ -3129,6 +3231,7 @@ impl LanguageSupport for GoSupport {
             tree,
             callee_range,
             cancellation,
+            member_selection,
         );
     }
 
@@ -3460,9 +3563,7 @@ mod dependency_packs {
         if domains.is_empty() {
             if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer())
             {
-                *go.active_base_profile
-                    .write()
-                    .expect("Go base profile lock poisoned") = None;
+                *go.profile_write() = None;
                 go.refresh_source_inventory()?;
             }
             return Ok(if trigger == GoReconciliationTrigger::SourceChange {
@@ -3478,17 +3579,12 @@ mod dependency_packs {
             });
         }
         if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer()) {
-            *go.active_base_profile
-                .write()
-                .expect("Go base profile lock poisoned") = Some(
+            *go.profile_write() = Some(
                 brokk_bifrost_analysis::analyzer::store::go_package_context::base_profile_digest(
                     &base_template,
                 ),
             );
-            go.build_selection_error
-                .write()
-                .expect("Go build selection lock poisoned")
-                .clear();
+            go.selection_error_write().clear();
         }
         let width = std::thread::available_parallelism()
             .map(usize::from)
@@ -3821,7 +3917,7 @@ mod hierarchy_tests {
                 func (DifferentDirection) Run(a,b [4]int, tail ...<-chan int) (int,error) { return 0,nil }\n")
             .build();
         let analyzer = GoAnalyzer::new(project.project_dyn());
-        let index = analyzer.hierarchy_index().unwrap();
+        let index = analyzer.hierarchy_index("").unwrap();
         let contract = analyzer
             .get_all_declarations()
             .into_iter()
@@ -3857,7 +3953,7 @@ mod hierarchy_tests {
         );
         for _ in 0..2 {
             assert!(
-                analyzer.hierarchy_index().is_err(),
+                analyzer.hierarchy_index("").is_err(),
                 "unavailable canonical input must not cache an empty hierarchy"
             );
         }
@@ -3913,7 +4009,7 @@ mod hierarchy_tests {
             index: &analyzer,
             imports: &analyzer,
             type_aliases: &analyzer,
-            workspace_paths: analyzer.workspace_path_index(),
+            workspace_paths: &analyzer.workspace_path_index(),
             package_clauses: &analyzer,
             source_facts: &analyzer,
         })
@@ -4022,7 +4118,7 @@ mod hierarchy_tests {
             )
             .build();
         let analyzer = GoAnalyzer::new(project.project_dyn());
-        let index = analyzer.hierarchy_index().unwrap();
+        let index = analyzer.hierarchy_index("").unwrap();
         let slice_alias = analyzer
             .get_all_declarations()
             .into_iter()
@@ -4294,12 +4390,142 @@ mod selector_calls {
         tree: &tree_sitter::Tree,
         callee_range: &Range,
         cancellation: Option<&CancellationToken>,
+        member_selection: Option<
+            &brokk_bifrost_analysis::analyzer::semantic::DeferredMemberSelection,
+        >,
     ) {
         let Some((receiver, callable, member)) = go_selector_call_parts(tree, callee_range, source)
         else {
             return;
         };
-        match go_typed_selector_target(
+        let field = callable
+            .child_by_field_name("field")
+            .expect("selected callable has field");
+        let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+            path: brokk_bifrost_core::path_utils::rel_path_string(file),
+            text: member.clone(),
+            range: Range {
+                start_byte: field.start_byte(),
+                end_byte: field.end_byte(),
+                start_line: field.start_position().row + 1,
+                end_line: field.end_position().row + 1,
+            },
+            focus_start_byte: field.start_byte(),
+            focus_end_byte: field.end_byte(),
+        };
+        let query = brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+            analyzer, file, source, tree: Some(tree), site: &site,
+            budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(), cancellation,
+        };
+        if lookup.model_member_selection.is_none()
+            && lookup.exact_external_call.as_ref().is_some_and(|proof| {
+                proof.call_application() == CallApplicationKind::BoundReceiver
+                    && proof.dispatch_extensibility().is_none()
+            })
+        {
+            lookup.go_selector_member = Some(member.clone());
+        }
+        if let Some(selection) = lookup.model_member_selection.as_deref() {
+            let temporary;
+            let descriptor = if let Some(descriptor) = member_selection {
+                descriptor
+            } else {
+                temporary = super::model_receiver::transient_selection(query, selection)
+                    .expect("structured selector builds transient descriptor");
+                &temporary
+            };
+            let session = brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(query.budget, cancellation);
+            let super::model_receiver::GoModelReceiverSelection::Handled(selected) =
+                super::model_receiver::go_selected_model_receiver_call(
+                    query,
+                    Some(selection),
+                    descriptor,
+                    &session,
+                )
+            else {
+                unreachable!("native model selection is handled");
+            };
+            match session.finish(()) {
+                BoundedResolution::Complete { .. } => {}
+                BoundedResolution::Exceeded { .. } => {
+                    lookup.budget_exhausted = true;
+                    return;
+                }
+                BoundedResolution::Cancelled { .. } => {
+                    lookup.cancelled = true;
+                    return;
+                }
+            }
+            if selection.native_target_count <= 1 {
+                lookup.targets.clear();
+            } else {
+                for target in &mut lookup.targets {
+                    target.proof = UsageProof::Unproven;
+                }
+            }
+            // Preserve incomplete evidence from native selection and call
+            // applicability. Replace only the external spelling/proof itself.
+            lookup
+                .boundaries
+                .retain(|boundary| !matches!(boundary, CallDispatchBoundaryKind::External { .. }));
+            lookup.status = Some(selected.outcome.status);
+            lookup.boundary = (selected.outcome.status
+                == DefinitionLookupStatus::UnresolvableImportBoundary)
+                .then_some(BoundaryStatus::ExternalIndexed);
+            lookup.go_interface_receiver = selected.interface;
+            lookup.go_selector_member = Some(member);
+            lookup.member_receiver_preparation = selected.preparation;
+            lookup.call_application = selected
+                .proof
+                .as_ref()
+                .map_or(CallApplicationKind::Unknown, |proof| {
+                    proof.call_application()
+                });
+            lookup.dispatch_extensibility = selected
+                .proof
+                .as_ref()
+                .and_then(|proof| proof.dispatch_extensibility());
+            lookup.exact_external_call = selected.proof;
+            lookup.boundaries.push(CallDispatchBoundaryKind::External {
+                callee_text: selected
+                    .outcome
+                    .reference
+                    .map(|site| site.text.into_boxed_str()),
+                normalized_static_owner: None,
+                external_callee_identity: selected.identity,
+            });
+            lookup.boundaries.extend(
+                selected.reasons.into_iter().map(|reason| {
+                    CallDispatchBoundaryKind::UnresolvedReason(reason.into_boxed_str())
+                }),
+            );
+            return;
+        }
+        let legacy_reasons = lookup
+            .native_resolution
+            .as_ref()
+            .map(|native| {
+                super::model_receiver::legacy_model_reasons(
+                    lookup.model_member_selection.as_deref(),
+                    &native.completion,
+                    &native.identities,
+                )
+            })
+            .unwrap_or_default();
+        let target = if !lookup.truncated
+            && !lookup.budget_exhausted
+            && !lookup.cancelled
+            && !legacy_reasons.is_empty()
+        {
+            let session = brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(query.budget, cancellation);
+            let target = crate::analyzer::usages::get_definition::go::go_g1b_legacy_model_receiver(
+                query,
+                &session,
+                &legacy_reasons,
+            );
+            session.finish(target)
+        } else {
+            go_typed_selector_target(
             analyzer,
             token,
             file,
@@ -4311,7 +4537,9 @@ mod selector_calls {
             receiver.start_byte(),
             brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
             cancellation,
-        ) {
+        )
+        };
+        match target {
             BoundedResolution::Complete {
                 value: Some(target),
                 work: receiver_work,
@@ -4433,6 +4661,7 @@ mod selector_calls {
     }
 }
 
+mod workspace_facts;
 /// Classify Go's runtime/test entry points from the persisted package clause.
 /// Only a function named `main` needs that fact; the Go crate owns the pure shape and
 /// test-file rules, while this shim supplies the analyzer's structured property.
@@ -4445,19 +4674,4 @@ pub fn go_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -
         })
         .flatten();
     brokk_bifrost_go::entry_point::go_implicit_entry_point(candidate, package_clause.as_deref())
-}
-
-/// The Go crate takes its analyzer facts as core capability traits plus the Go
-/// workspace path index; this is the one place the concrete analyzer is
-/// unpacked into them.
-pub(crate) fn go_graph_source<'a>(go: &'a GoAnalyzer, token: QueryToken<'a>) -> GoGraphSource<'a> {
-    GoGraphSource {
-        token,
-        index: go,
-        imports: go,
-        type_aliases: go,
-        workspace_paths: go.workspace_path_index(),
-        package_clauses: go,
-        source_facts: go,
-    }
 }

@@ -256,7 +256,7 @@ namespace winrt::{{ namespaceCpp }} { struct Generated {}; }
 
 #[test]
 #[hardwon(
-    "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: include comments redirected macro field donors"
+    "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: include comments redirected macro field donors"
 )]
 fn macro_field_donors_use_canonical_include_paths() {
     let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
@@ -2188,4 +2188,159 @@ fn repeated_assertion_smell_reports_reuse_the_prepared_tree() {
         1,
         "both reports must read the one retained prepared tree"
     );
+}
+
+#[test]
+#[hardwon("#7496: generation memos lost included-header read keys on warm ancestor lookups")]
+fn cached_file_reads_replay_included_headers() {
+    let project = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("parents.hpp", "namespace A { struct Base {}; }\n")
+        .file(
+            "alias.hpp",
+            "#include \"parents.hpp\"\nusing Parent = A::Base;\n",
+        )
+        .file(
+            "target.cpp",
+            "#include \"alias.hpp\"\nstruct Target : Parent {};\n",
+        )
+        .build();
+    let cpp = CppAnalyzer::from_project(project.project().clone());
+    let target = cpp
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "Target")
+        .expect("target");
+    let (first, reads) = capture_query_reads(&cpp, || cpp.get_direct_ancestors(&target));
+    assert_eq!(first.len(), 1);
+    assert!(reads.keys().iter().any(
+        |key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "alias.hpp")
+    ));
+    let (second, reads) = capture_query_reads(&cpp, || cpp.get_direct_ancestors(&target));
+    assert_eq!(first, second);
+    assert!(reads.keys().iter().any(
+        |key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "alias.hpp")
+    ));
+    assert_eq!(reads.unattributed_reads(), 0);
+    assert_eq!(cpp.visible_type_units_build_count_for_test(), 1);
+}
+
+#[test]
+fn warm_compile_contexts_record_present_and_absent_database_inputs() {
+    for database in [None, Some("[]")] {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file("target.cpp", "struct Target {};\n")
+            .build();
+        if let Some(database) = database {
+            std::fs::write(project.root().join("compile_commands.json"), database)
+                .expect("compile database");
+        }
+        let cpp = CppAnalyzer::from_project(project.project().clone());
+        let file = project.file("target.cpp");
+        cpp.compile_contexts_for(&file);
+        let (_, reads) = capture_query_reads(&cpp, || cpp.compile_contexts_for(&file));
+        assert!(
+            reads.keys().iter().any(|key| match key {
+                ReadKey::File { rel_path, .. } =>
+                    database.is_some() && rel_path.as_ref() == "compile_commands.json",
+                ReadKey::PathAbsent { rel_path, .. } =>
+                    database.is_none() && rel_path.as_ref() == "compile_commands.json",
+                _ => false,
+            }),
+            "warm compile context inputs: {:?}",
+            reads.keys()
+        );
+    }
+}
+
+#[test]
+#[hardwon("#2445: C++ visibility memos were capture-scoped but outlived one capture")]
+fn visibility_memo_replays_reads_between_captures() {
+    let project = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("target.cpp", "int answer(int input) { return input; }\n")
+        .build();
+    let cpp = CppAnalyzer::from_project(project.project().clone());
+    let target = cpp
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "answer")
+        .expect("function");
+    let scope = AnalyzerQueryScope::new(&cpp);
+    let dispatch = crate::analyzer::usages::cpp_graph::CppDispatch::new(&cpp, scope.token());
+    let visibility = brokk_bifrost_cpp::graph::resolver::VisibilityIndex::build(
+        cpp.read_capability(),
+        &cpp,
+        scope.token(),
+        &dispatch.source(),
+        &HashSet::from_iter([project.file("target.cpp")]),
+    );
+    let (cold_arity, cold_reads) = capture_query_reads(&cpp, || visibility.callable_arity(&target));
+    assert!(cold_arity.is_some());
+    assert!(!cold_reads.keys().is_empty());
+    assert_eq!(cold_reads.unattributed_reads(), 0);
+    assert!(cold_reads.is_bounded());
+    let (warm_arity, warm_reads) = capture_query_reads(&cpp, || visibility.callable_arity(&target));
+    assert_eq!(warm_arity, cold_arity);
+    assert_eq!(warm_reads.keys(), cold_reads.keys());
+    assert_eq!(warm_reads.unattributed_reads(), 0);
+    assert!(warm_reads.is_bounded());
+}
+
+#[test]
+fn guard_resolution_keeps_source_and_configuration_reads_when_warm() {
+    use brokk_bifrost_cpp::graph_support::CppSource;
+    const SOURCE: &str = "#ifdef FEATURE\nint answer();\nint answer() { return 1; }\n#endif\nvoid use() { answer(); }\n";
+    let project = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("target.cpp", SOURCE)
+        .build();
+    project.file("compile_commands.json").write(serde_json::json!([{
+        "directory": project.root(), "file": "target.cpp", "arguments": ["c++", "-DFEATURE=1", "-c", "target.cpp"]
+    }]).to_string()).expect("compile database");
+    let cpp = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("target.cpp");
+    let target = cpp
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "answer")
+        .expect("guarded function");
+    let run = || {
+        let scope = AnalyzerQueryScope::new(&cpp);
+        let prepared =
+            CppSource::prepared_syntax(&cpp, scope.token(), &file).expect("prepared file");
+        let byte = SOURCE.rfind("answer").expect("reference fixture");
+        let reference = prepared
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(byte, byte + "answer".len())
+            .expect("reference");
+        let dispatch = crate::analyzer::usages::cpp_graph::CppDispatch::new(&cpp, scope.token());
+        let visibility = brokk_bifrost_cpp::graph::resolver::VisibilityIndex::build(
+            cpp.read_capability(),
+            &cpp,
+            scope.token(),
+            &dispatch.source(),
+            &HashSet::from_iter([file.clone()]),
+        );
+        visibility.same_file_callable_guard_compatible_ignoring_order(
+            &dispatch.source(),
+            &file,
+            &target,
+            reference,
+        )
+    };
+    let (first, reads) = capture_query_reads(&cpp, run);
+    assert!(
+        first,
+        "the compile define makes the guarded declaration visible"
+    );
+    assert!(reads.keys().iter().any(
+        |key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "target.cpp")
+    ));
+    assert!(reads.keys().iter().any(|key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "compile_commands.json")));
+    let (second, reads) = capture_query_reads(&cpp, run);
+    assert_eq!(first, second);
+    assert!(reads.keys().iter().any(
+        |key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "target.cpp")
+    ));
+    assert!(reads.keys().iter().any(|key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "compile_commands.json")));
+    assert_eq!(reads.unattributed_reads(), 0);
 }

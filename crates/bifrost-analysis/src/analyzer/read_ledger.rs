@@ -48,19 +48,22 @@
 //! would have computed.
 pub use brokk_bifrost_store::analyzer::read_ledger::{ReadSetDigest, read_set_digest};
 
-use std::sync::Mutex;
+use crate::hash::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::{CodeUnit, Language, ProjectFile, SignatureMetadata};
-use crate::hash::HashSet;
 use crate::path_utils::rel_path_string;
 
-/// Domain for the digest of a whole read set.
 pub use crate::analyzer::semantic::read_ledger::IndexFamily;
 #[allow(unused_imports)]
 pub(crate) use crate::analyzer::semantic::read_ledger::READ_KEY_DOMAIN;
+/// Domain for the digest of a whole read set.
+pub use crate::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
 
 pub use crate::analyzer::semantic::read_ledger::LookupKind;
 
@@ -148,6 +151,49 @@ pub fn declaration_facts_digest(declaration: &CodeUnit, parent: Option<&CodeUnit
 /// The answer digest of a declaration-facts lookup whose declaration is absent.
 pub fn absent_declaration_facts_digest() -> StableDigest {
     absent_answer_digest(ABSENT_DECLARATION_FACTS_DOMAIN)
+}
+
+/// The exact answer of hydrating one path-backed module, including absence.
+pub(crate) fn path_synthetic_module_digest(module: Option<&CodeUnit>) -> StableDigest {
+    module.map_or_else(absent_declaration_facts_digest, |module| {
+        declaration_facts_digest(module, None)
+    })
+}
+
+/// Complete eligible path-symbol set, without hydrated declaration facts.
+pub(crate) fn path_synthetic_modules_digest(
+    language: Language,
+    modules: &[(String, crate::analyzer::store::PathSymbolRow, bool)],
+) -> StableDigest {
+    let mut facts = modules
+        .iter()
+        .map(|(storage_language, row, has_imports)| {
+            (
+                storage_language.as_str(),
+                row.rel_path.as_str(),
+                row.exact_fqn.as_str(),
+                crate::analyzer::store::code_unit_kind_to_i64(row.kind),
+                row.requires_imports,
+                row.requires_imports && *has_imports,
+            )
+        })
+        .collect::<Vec<_>>();
+    facts.sort();
+    facts.dedup();
+    let mut hash = CanonicalHasher::new(b"path-synthetic-modules-set-v2");
+    hash.value(language.config_label().as_bytes());
+    hash.sequence(
+        "modules",
+        &facts,
+        |hash, (storage, path, identity, kind, requires, present)| {
+            hash.value(storage.as_bytes());
+            hash.value(path.as_bytes());
+            hash.value(identity.as_bytes());
+            hash.value(&kind.to_be_bytes());
+            hash.value(&[u8::from(*requires), u8::from(*present)]);
+        },
+    );
+    StableDigest::from_array(hash.finish())
 }
 
 fn absent_answer_digest(domain: &[u8]) -> StableDigest {
@@ -273,8 +319,14 @@ pub mod reason {
         // An external boundary depends on the selected external inventory, which
         // is neither a unit-key dimension nor a ledgered read yet. Promote these
         // reasons to content only when #7633 (and its per-language siblings) ledger it.
+        // Selected C# configuration is neither a demonstrated unit-key dimension
+        // nor a ledgered read, so compilation disagreement is operational.
+        CSHARP_COMPILATION_ACCESS_UNKNOWN = "csharp-compilation-access-unknown" => Some(DerivationExecutionCause::Provider),
         OPEN_BOUNDARY = "OpenBoundary" => Some(DerivationExecutionCause::Provider),
         EXTERNAL_DECLARED_UNINDEXED = "external_declared_unindexed" => Some(DerivationExecutionCause::Provider),
+        // A Go import is incomplete when its package rows are missing or
+        // unconfirmed, which also depends on the selected external inventory.
+        GO_IMPORT_INCOMPLETE = "go-import-incomplete" => Some(DerivationExecutionCause::Provider),
         OWNER_INVENTORY_OPEN = "OwnerInventoryOpen" => Some(DerivationExecutionCause::Provider),
         AMBIGUOUS_MEMBER = "ambiguous_member" => None,
         AMBIGUOUS_PROCEDURE = "ambiguous_procedure" => None,
@@ -357,6 +409,158 @@ pub mod reason {
     }
 }
 
+// Hash once per routed read, including when several ledgers consume it.
+// Equality still compares the entire key; the hash is never an identity.
+fn read_key_hash(key: &ReadKey) -> u64 {
+    #[cfg(not(feature = "randomized-hash"))]
+    {
+        rustc_hash::FxBuildHasher.hash_one(key)
+    }
+    #[cfg(feature = "randomized-hash")]
+    {
+        static HASHER: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+            std::sync::OnceLock::new();
+        HASHER.get_or_init(Default::default).hash_one(key)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct LocalReadKeys {
+    table: hashbrown::HashTable<(u64, ReadKey)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReadInputIdentity {
+    Receipt(usize),
+    Capture(u64),
+}
+
+#[derive(Debug, Clone)]
+enum ReadInput {
+    Receipt(Arc<[ReadKey]>),
+    Capture(Arc<ReadSnapshot>),
+}
+
+impl ReadInput {
+    fn key_entries(&self) -> usize {
+        match self {
+            Self::Receipt(keys) => keys.len(),
+            Self::Capture(snapshot) => snapshot.key_entries,
+        }
+    }
+
+    fn nodes(&self) -> usize {
+        match self {
+            Self::Receipt(_) => 1,
+            Self::Capture(snapshot) => snapshot.nodes,
+        }
+    }
+}
+
+// Bound transitive reference metadata and Arc drop depth, even for repeated
+// captures of the same one-key answer. Crossing the bound compacts into the
+// existing owned key table; the recorded set never changes.
+const MAX_READ_SNAPSHOT_NODES: usize = 256;
+// Referenced payloads are bounded too: overlapping wide receipts must not
+// retain many copies of a workspace-sized input set. Larger inputs compact
+// into the one owned set the ledger would have held without deferred replay.
+const MAX_REFERENCED_READ_KEYS: usize = 16_384;
+
+#[derive(Debug)]
+struct ReadSnapshot {
+    capture: u64,
+    generation: u64,
+    local: Arc<LocalReadKeys>,
+    inputs: Vec<ReadInput>,
+    nodes: usize,
+    key_entries: usize,
+    // At most one canonical publication per immutable snapshot.
+    canonical: OnceLock<Arc<[ReadKey]>>,
+}
+
+impl ReadSnapshot {
+    fn unique_keys(&self) -> hashbrown::HashTable<(u64, &ReadKey)> {
+        let mut unique = hashbrown::HashTable::new();
+        let mut stack = vec![self];
+        let mut visited = HashSet::default();
+        let mut receipts = HashSet::default();
+        while let Some(snapshot) = stack.pop() {
+            if !visited.insert(std::ptr::from_ref(snapshot)) {
+                continue;
+            }
+            for (hash, key) in &snapshot.local.table {
+                unique
+                    .entry(*hash, |(_, previous)| *previous == key, |(hash, _)| *hash)
+                    .or_insert((*hash, key));
+            }
+            for input in &snapshot.inputs {
+                match input {
+                    ReadInput::Capture(child) => stack.push(child),
+                    ReadInput::Receipt(keys) => {
+                        if !receipts.insert(keys.as_ptr()) {
+                            continue;
+                        }
+                        for key in keys.iter() {
+                            let hash = read_key_hash(key);
+                            unique
+                                .entry(hash, |(_, previous)| *previous == key, |(hash, _)| *hash)
+                                .or_insert((hash, key));
+                        }
+                    }
+                }
+            }
+        }
+        unique
+    }
+
+    fn unordered_keys(&self) -> Vec<ReadKey> {
+        self.unique_keys()
+            .iter()
+            .map(|(_, key)| (*key).clone())
+            .collect()
+    }
+
+    fn contains(&self, key: &ReadKey) -> bool {
+        let hash = read_key_hash(key);
+        let mut stack = vec![self];
+        let mut visited = HashSet::default();
+        while let Some(snapshot) = stack.pop() {
+            if !visited.insert(std::ptr::from_ref(snapshot)) {
+                continue;
+            }
+            if snapshot
+                .local
+                .table
+                .find(hash, |(_, previous)| previous == key)
+                .is_some()
+            {
+                return true;
+            }
+            for input in &snapshot.inputs {
+                match input {
+                    ReadInput::Capture(child) => stack.push(child),
+                    ReadInput::Receipt(keys) if keys.contains(key) => return true,
+                    ReadInput::Receipt(_) => {}
+                }
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordedKeys {
+    generation: u64,
+    local: Arc<LocalReadKeys>,
+    last: Option<usize>,
+    inputs: HashMap<ReadInputIdentity, ReadInput>,
+    nodes: usize,
+    referenced_keys: usize,
+    // One immutable snapshot of this ledger's current named set. Clear it only
+    // when that set changes; diagnostic counts have independent event semantics.
+    snapshot: Option<Arc<ReadSnapshot>>,
+}
+
 /// The set of inputs one request read, plus the crossings it could not name.
 ///
 /// Shared behind an `Arc` and written from every thread the analyzer spends the
@@ -365,24 +569,169 @@ pub mod reason {
 /// to each helper task; explicit Broadcast records background inputs on all
 /// active ledgers. Ordinary nested scopes carry no ledger and leave
 /// their enclosing ledger visible.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ReadLedger {
-    keys: Mutex<HashSet<ReadKey>>,
+    identity: brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity,
+    keys: Mutex<RecordedKeys>,
     unattributed_reads: AtomicUsize,
     execution_dependences: AtomicUsize,
 }
 
+impl Default for ReadLedger {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "read-ledger capture identity exhausted");
+        Self {
+            identity: brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity(id),
+            keys: Mutex::default(),
+            unattributed_reads: AtomicUsize::default(),
+            execution_dependences: AtomicUsize::default(),
+        }
+    }
+}
+
 impl ReadLedger {
+    pub const fn capture_identity(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity {
+        self.identity
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Record one named input.
     pub fn record(&self, key: ReadKey) {
-        self.keys
-            .lock()
-            .expect("read ledger mutex poisoned")
-            .insert(key);
+        self.record_key(Cow::Owned(key), &mut None);
+    }
+
+    pub(crate) fn record_borrowed(&self, key: &ReadKey, hash: &mut Option<u64>) {
+        self.record_key(Cow::Borrowed(key), hash);
+    }
+
+    fn record_key(&self, key: Cow<'_, ReadKey>, hash: &mut Option<u64>) {
+        let mut keys = self.keys.lock().expect("read ledger mutex poisoned");
+        if keys
+            .last
+            .and_then(|index| keys.local.table.get_bucket(index))
+            .is_some_and(|(_, previous)| previous == key.as_ref())
+        {
+            return;
+        }
+        let hash = *hash.get_or_insert_with(|| read_key_hash(&key));
+        if let Some(index) = keys
+            .local
+            .table
+            .find_bucket_index(hash, |(_, previous)| previous == key.as_ref())
+        {
+            keys.last = Some(index);
+            return;
+        }
+        keys.snapshot = None;
+        keys.generation = keys
+            .generation
+            .checked_add(1)
+            .expect("read ledger generation exhausted");
+        let index = Arc::make_mut(&mut keys.local)
+            .table
+            .insert_unique(hash, (hash, key.into_owned()), |(hash, _)| *hash)
+            .bucket_index();
+        keys.last = Some(index);
+    }
+
+    fn snapshot(&self) -> Arc<ReadSnapshot> {
+        let mut keys = self.keys.lock().expect("read ledger mutex poisoned");
+        if let Some(snapshot) = &keys.snapshot {
+            return Arc::clone(snapshot);
+        }
+        let snapshot = Arc::new(ReadSnapshot {
+            capture: self.identity.0,
+            generation: keys.generation,
+            local: Arc::clone(&keys.local),
+            inputs: keys.inputs.values().cloned().collect(),
+            nodes: 1 + keys.nodes,
+            key_entries: keys.local.table.len().saturating_add(keys.referenced_keys),
+            canonical: OnceLock::new(),
+        });
+        debug_assert!(snapshot.nodes <= MAX_READ_SNAPSHOT_NODES);
+        keys.snapshot = Some(Arc::clone(&snapshot));
+        snapshot
+    }
+
+    pub(crate) fn absorb_receipt(&self, receipt: &Arc<[ReadKey]>) {
+        if receipt.is_empty() {
+            return;
+        }
+        self.absorb(
+            ReadInputIdentity::Receipt(receipt.as_ptr() as usize),
+            ReadInput::Receipt(Arc::clone(receipt)),
+        );
+    }
+
+    pub(crate) fn absorb_capture(&self, capture: &ReadLedger) {
+        if self.identity == capture.identity || capture.is_empty() {
+            return;
+        }
+        let snapshot = capture.snapshot();
+        self.absorb(
+            ReadInputIdentity::Capture(snapshot.capture),
+            ReadInput::Capture(snapshot),
+        );
+    }
+
+    fn absorb(&self, identity: ReadInputIdentity, input: ReadInput) {
+        let mut keys = self.keys.lock().expect("read ledger mutex poisoned");
+        if let Some(previous) = keys.inputs.get(&identity) {
+            let same = match (previous, &input) {
+                (ReadInput::Receipt(a), ReadInput::Receipt(b)) => Arc::ptr_eq(a, b),
+                // Captures grow monotonically, but concurrent forwards may
+                // arrive out of order. An older version cannot withdraw keys.
+                (ReadInput::Capture(a), ReadInput::Capture(b)) => a.generation >= b.generation,
+                _ => unreachable!("input identity determines its kind"),
+            };
+            if same {
+                return;
+            }
+        }
+        keys.snapshot = None;
+        keys.generation = keys
+            .generation
+            .checked_add(1)
+            .expect("read ledger generation exhausted");
+        let added = input.nodes();
+        let added_keys = input.key_entries();
+        if let Some(previous) = keys.inputs.insert(identity, input) {
+            keys.nodes -= previous.nodes();
+            keys.referenced_keys -= previous.key_entries();
+        }
+        keys.nodes += added;
+        keys.referenced_keys = keys.referenced_keys.saturating_add(added_keys);
+        if 1 + keys.nodes > MAX_READ_SNAPSHOT_NODES
+            || keys.referenced_keys > MAX_REFERENCED_READ_KEYS
+        {
+            let snapshot = ReadSnapshot {
+                capture: self.identity.0,
+                generation: keys.generation,
+                local: Arc::clone(&keys.local),
+                inputs: keys.inputs.values().cloned().collect(),
+                nodes: 1 + keys.nodes,
+                key_entries: keys.local.table.len().saturating_add(keys.referenced_keys),
+                canonical: OnceLock::new(),
+            };
+            let mut local = LocalReadKeys::default();
+            for (hash, key) in snapshot.unique_keys() {
+                local
+                    .table
+                    .insert_unique(hash, (hash, key.clone()), |(hash, _)| *hash);
+            }
+            keys.local = Arc::new(local);
+            keys.inputs.clear();
+            keys.nodes = 0;
+            keys.referenced_keys = 0;
+            keys.last = None;
+        }
     }
 
     /// Record one funnel crossing whose input could not be named.
@@ -391,13 +740,22 @@ impl ReadLedger {
     /// ledger counted one of these read something the ledger cannot verify, so
     /// the unit is `Unbounded` and is never reused.
     pub fn record_unattributed(&self) {
-        self.unattributed_reads.fetch_add(1, Ordering::Relaxed);
+        self.record_unattributed_reads(1);
+    }
+
+    pub fn record_unattributed_reads(&self, count: usize) {
+        self.unattributed_reads.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Execution depended on state that named content reads cannot reproduce.
     /// Use the same admission rule as an unattributable read.
     pub fn mark_execution_dependent(&self) {
-        self.execution_dependences.fetch_add(1, Ordering::Relaxed);
+        self.mark_execution_dependent_reads(1);
+    }
+
+    pub fn mark_execution_dependent_reads(&self, count: usize) {
+        self.execution_dependences
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     /// Execution events survive resolver narrowing: they are not input reads.
@@ -417,24 +775,52 @@ impl ReadLedger {
 
     /// How many distinct inputs were recorded.
     pub fn len(&self) -> usize {
-        self.keys.lock().expect("read ledger mutex poisoned").len()
+        let keys = self.keys.lock().expect("read ledger mutex poisoned");
+        if keys.inputs.is_empty() {
+            return keys.local.table.len();
+        }
+        drop(keys);
+        self.snapshot().unique_keys().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        let keys = self.keys.lock().expect("read ledger mutex poisoned");
+        keys.local.table.is_empty() && keys.inputs.is_empty()
+    }
+
+    /// Search immutable inputs without flattening them or cloning their keys.
+    pub(crate) fn contains_read_key(&self, key: &ReadKey) -> bool {
+        self.snapshot().contains(key)
+    }
+
+    /// Set-valued receipts and internal forwarding do not require ordering.
+    #[doc(hidden)]
+    pub fn unordered_keys(&self) -> Vec<ReadKey> {
+        self.snapshot().unordered_keys()
+    }
+
+    /// Inspect a completed read set by reference, without cloning or ordering
+    /// its keys. Used to certify that a memo hit replayed its named inputs.
+    #[doc(hidden)]
+    pub fn keys_satisfy(&self, mut predicate: impl FnMut(&ReadKey) -> bool) -> bool {
+        let snapshot = self.snapshot();
+        snapshot.unique_keys().iter().all(|(_, key)| predicate(key))
+    }
+
+    /// Share the one canonical publication of this immutable read snapshot.
+    #[doc(hidden)]
+    pub fn canonical_keys(&self) -> Arc<[ReadKey]> {
+        let snapshot = self.snapshot();
+        Arc::clone(snapshot.canonical.get_or_init(|| {
+            let mut keys = snapshot.unordered_keys();
+            keys.sort();
+            keys.into()
+        }))
     }
 
     /// Every recorded key, in canonical order.
     pub fn keys(&self) -> Vec<ReadKey> {
-        let mut keys = self
-            .keys
-            .lock()
-            .expect("read ledger mutex poisoned")
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        keys.sort();
-        keys
+        self.canonical_keys().to_vec()
     }
 
     /// The digest of this read set: the sorted canonical encodings of its keys,
@@ -443,7 +829,7 @@ impl ReadLedger {
     /// Deliberately independent of insertion order and of the set's hash seed,
     /// and, because every key is mount-free, of the workspace root.
     pub fn digest(&self) -> ReadSetDigest {
-        read_set_digest(&self.keys())
+        read_set_digest(&self.unordered_keys())
     }
 }
 
@@ -475,6 +861,105 @@ mod tests {
         let mut reversed = keys.clone();
         reversed.reverse();
         assert_eq!(read_set_digest(&reversed), forward.digest());
+    }
+
+    #[test]
+    fn absorbed_snapshots_freeze_keys_and_keep_later_versions() {
+        let source = ReadLedger::new();
+        source.record(file_key("first.rs", 1));
+        let target = ReadLedger::new();
+        target.absorb_capture(&source);
+        target.absorb_capture(&source);
+        let first = target.keys();
+        assert_eq!(first, vec![file_key("first.rs", 1)]);
+        source.record(file_key("later.rs", 2));
+        assert_eq!(target.keys(), first);
+        target.absorb_capture(&source);
+        let mut expected = vec![file_key("first.rs", 1), file_key("later.rs", 2)];
+        expected.sort();
+        assert_eq!(target.keys(), expected);
+        assert!(target.contains_read_key(&expected[0]));
+        assert_eq!(target.digest(), read_set_digest(&expected));
+        let receipt: Arc<[ReadKey]> = vec![file_key("receipt.rs", 3)].into();
+        target.absorb_receipt(&receipt);
+        target.absorb_receipt(&receipt);
+        assert_eq!(target.len(), 3);
+        target.absorb_capture(&target);
+        assert_eq!(target.len(), 3);
+    }
+
+    #[test]
+    fn out_of_order_capture_versions_cannot_withdraw_inputs() {
+        let source = ReadLedger::new();
+        source.record(file_key("first.rs", 1));
+        let older = source.snapshot();
+        source.record(file_key("second.rs", 2));
+        let newer = source.snapshot();
+        let target = ReadLedger::new();
+        let identity = ReadInputIdentity::Capture(source.capture_identity().0);
+        target.absorb(identity, ReadInput::Capture(newer));
+        target.absorb(identity, ReadInput::Capture(older));
+        assert_eq!(target.keys(), source.keys());
+        assert_eq!(target.len(), 2);
+    }
+
+    #[test]
+    fn long_capture_chains_compact_without_losing_inputs() {
+        let mut previous = ReadLedger::new();
+        let mut expected = Vec::new();
+        for index in 0..1024 {
+            let next = ReadLedger::new();
+            next.absorb_capture(&previous);
+            let key = ReadKey::index(IndexFamily::DefinitionExact, format!("item{index}"));
+            next.record(key.clone());
+            expected.push(key);
+            assert!(next.snapshot().nodes <= MAX_READ_SNAPSHOT_NODES);
+            previous = next;
+        }
+        expected.sort();
+        assert_eq!(previous.keys(), expected);
+        assert_eq!(previous.digest(), read_set_digest(&expected));
+    }
+
+    #[test]
+    fn wide_receipts_compact_instead_of_retaining_duplicate_payloads() {
+        let receipt: Arc<[ReadKey]> = (0..=MAX_REFERENCED_READ_KEYS)
+            .map(|index| ReadKey::index(IndexFamily::DefinitionExact, format!("wide{index}")))
+            .collect::<Vec<_>>()
+            .into();
+        let ledger = ReadLedger::new();
+        ledger.absorb_receipt(&receipt);
+        assert!(ledger.keys.lock().unwrap().inputs.is_empty());
+        assert_eq!(ledger.len(), receipt.len());
+        assert_eq!(ledger.digest(), read_set_digest(&receipt));
+    }
+
+    #[test]
+    fn repeated_keys_and_snapshots_preserve_the_set_across_table_growth() {
+        let ledger = ReadLedger::new();
+        let mut expected = Vec::new();
+        for index in 0..512 {
+            let key = ReadKey::index(IndexFamily::DefinitionExact, format!("item{index}"));
+            // Both owned and borrowed recording must keep the one-entry repeat
+            // shortcut valid after insertion grows and rehashes the table.
+            ledger.record(key.clone());
+            ledger.record_borrowed(&key, &mut None);
+            expected.push(key);
+            if index % 31 == 0 {
+                let mut sorted = expected.clone();
+                sorted.sort();
+                assert_eq!(ledger.keys(), sorted);
+            }
+        }
+        for key in expected.iter().rev() {
+            ledger.record_borrowed(key, &mut None);
+            ledger.record(key.clone());
+            assert!(ledger.contains_read_key(key));
+        }
+        expected.sort();
+        assert_eq!(ledger.keys(), expected);
+        assert_eq!(ledger.len(), expected.len());
+        assert_eq!(ledger.digest(), read_set_digest(&expected));
     }
 
     #[test]

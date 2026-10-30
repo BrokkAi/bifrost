@@ -600,6 +600,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.facts.package_references.extend(package_references);
         }
         self.facts.validate_package_relations();
+        crate::implicit_supertype::publish_written_supertype_names(&mut self.facts);
         self.finish_root_import_demands();
         self.validate_directive_facts();
         self.validate_reference_owners();

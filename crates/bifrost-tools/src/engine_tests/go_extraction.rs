@@ -1491,11 +1491,7 @@ func caller() {
 }
         "#;
             let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
-            let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
-            let _overlay_scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
-                fixture.analyzer.analyzer(),
-                Some(overlay),
-            );
+            let _catalog = brokk_bifrost_go_analysis::analyzer::go::native_points::activate_receiver_models_for_test(fixture.analyzer.analyzer());
             let (shape, text) = go_shape(&fixture, source, "embedded.Open(\"book.xlsx\")");
             let lookup = modeled_lookup(
                 &fixture,
@@ -1570,8 +1566,6 @@ func caller() {
 
         use brokk_bifrost_core::analyzer::model::ProjectFile;
 
-        use brokk_bifrost_core::analyzer::model::Range;
-
         use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity;
 
         use brokk_bifrost_core::analyzer::usages::model::UsageProof;
@@ -1589,7 +1583,6 @@ func caller() {
         use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
         use brokk_bifrost_analysis::test_support::AnalyzerFixture;
-        use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
 
         fn activate_go_declaration_payload(
             fixture: &AnalyzerFixture,
@@ -1880,6 +1873,27 @@ func caller(idleTicker *time.Ticker) { idleTicker.Stop() }
                     None,
                 );
 
+                assert!(lookup.targets.is_empty(), "{lookup:#?}");
+                if !modeled {
+                    // An owner declaration alone does not prove a member declaration.
+                    assert_eq!(
+                        lookup.status,
+                        Some(DefinitionLookupStatus::Incomplete),
+                        "{lookup:#?}"
+                    );
+                    assert!(lookup.exact_external_call.is_none(), "{lookup:#?}");
+                    assert!(
+                        lookup.boundaries.iter().all(|boundary| !matches!(
+                            boundary,
+                            CallDispatchBoundaryKind::External {
+                                external_callee_identity: Some(_),
+                                ..
+                            }
+                        )),
+                        "{lookup:#?}"
+                    );
+                    continue;
+                }
                 assert_eq!(
                     lookup.status,
                     Some(DefinitionLookupStatus::UnresolvableImportBoundary),
@@ -2538,31 +2552,6 @@ func caller() {
                     "Open",
                 );
                 let file = ProjectFile::new(fixture.project_root(), "main.go");
-                let tree = brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
-                    &file,
-                    Language::Go,
-                    &source,
-                )
-                .expect("Go tree");
-                let focus_start_byte = source.find("Open").expect("Open reference");
-                let focus_end_byte = focus_start_byte + "Open".len();
-                let focus_line = source[..focus_start_byte]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1;
-                let site = ResolvedReferenceSite {
-                    path: brokk_bifrost_core::path_utils::rel_path_string(&file),
-                    text: "Open".to_owned(),
-                    range: Range {
-                        start_byte: focus_start_byte,
-                        end_byte: focus_end_byte,
-                        start_line: focus_line,
-                        end_line: focus_line,
-                    },
-                    focus_start_byte,
-                    focus_end_byte,
-                };
                 let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
                     brokk_bifrost_go_analysis::GoAnalyzer,
                 >(fixture.analyzer.analyzer())
@@ -2572,33 +2561,6 @@ func caller() {
                     index_builds_before, 0,
                     "the bounded regression must exercise a cold workspace path index"
                 );
-                let bounded = brokk_bifrost_go_analysis::analyzer::usages::get_definition::go::resolve_go_bounded(
-                fixture.analyzer.analyzer(),
-                &file,
-                &source,
-                Some(&tree),
-                &site,
-                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(
-                ),
-                None,
-            );
-                let brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete {
-                    value: bounded,
-                    ..
-                } = bounded
-                else {
-                    panic!(
-                        "bounded Go lookup should complete without scanning the workspace: {bounded:#?}"
-                    );
-                };
-                assert_eq!(bounded.status, DefinitionLookupStatus::NoDefinition);
-                assert!(bounded.reference.is_none(), "{bounded:#?}");
-                assert_eq!(
-                    go.workspace_path_index_build_count_for_test(),
-                    index_builds_before,
-                    "bounded resolution must not initialize the whole-workspace path index"
-                );
-
                 let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
                 let lookup = CallRelationService::dispatch_at_bounded(
                     fixture.analyzer.analyzer(),
@@ -3219,6 +3181,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                         rel_path: record.persisted_relative_path().to_owned(),
                     });
                     let SelectedPackageRows::Ready(by_lookup) = operation
+                        .ready
                         .selected_package_members_by_lookup(*peer, &cancellation)
                         .unwrap()
                     else {
@@ -6368,6 +6331,31 @@ type Item struct{ Decoy bool }
         Ok(())
     }).unwrap();
         }
+        /// Drives the Go demand state directly: separate public calls get fresh
+        /// arenas, so a settled registration would not survive, and a repeated
+        /// read within one callback takes the pending-root completion without
+        /// reaching admission.
+        #[test]
+        #[brokk_bifrost_test_macros::hardwon(
+            "#7868: Go admission read a settled incomplete endpoint as Complete"
+        )]
+        fn go_admission_retains_settled_endpoint_reasons() {
+            let fixture = GoRootResolutionOperationFixture::new();
+            let context_id =
+                publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let GoPreparedImportContextOutcome::Ready(prepared) = operation
+                .go_import_binding_context(context_id, GO_ROOT_CONSUMER_PATH, "go", &cancellation)
+                .unwrap()
+            else {
+                panic!("Go fixture prepares its import context")
+            };
+            operation
+                .assert_go_settled_readmission_for_test(prepared.demand, GO_ROOT_CONSUMER_PATH)
+                .unwrap();
+        }
+
         #[test]
         fn production_go_point_statement_decoded_row_and_engine_work_is_repeatable() {
             let measurements = [
@@ -7110,6 +7098,7 @@ type Item struct{ Decoy bool }
                 .unwrap()
                 .unwrap();
             let SelectedPackageRows::Ready(references) = operation
+                .ready
                 .selected_package_references(source.ordinal(), &cancellation)
                 .unwrap()
             else {
@@ -7458,6 +7447,28 @@ type Item struct{ Decoy bool }
             ));
         }
         #[test]
+        fn selected_go_import_base_matches_full_diagnostic_evidence() {
+            for source in [
+                "package consumer; import \"fmt\"; func Use() { fmt.Println(1) }",
+                "package consumer; import provider \"example.test/root/provider\"; func Use() { provider.Call() }",
+                "package consumer; import . \"example.test/root/provider\"; func Use() { Call() }",
+            ] {
+                let fixture = GoRootResolutionOperationFixture::with_consumer(source);
+                let context_id =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+                let cancellation = CancellationToken::new();
+                fixture
+                    .open_ready(&cancellation)
+                    .assert_go_import_stages_equivalent_for_test(
+                        context_id,
+                        GO_ROOT_CONSUMER_PATH,
+                        "go",
+                        &cancellation,
+                    );
+            }
+        }
+
+        #[test]
         #[hardwon("#5076: cached presumed fmt imports lost their request-owned shared-name digest")]
         fn selected_go_cached_presumed_import_reinterns_shared_lookup_in_second_request() {
             use brokk_bifrost_analysis::analyzer::resolution::local_identity::SharedNameInterner;
@@ -7534,6 +7545,690 @@ type Item struct{ Decoy bool }
                     assert_eq!(answer.binding().targets(), targets);
                 } else {
                     first_targets = Some(answer.binding().targets().to_vec());
+                }
+            }
+        }
+        #[test]
+        fn go_model_type_owner_mint_closes_only_selected_type_frontiers() {
+            use crate::inline_project::InlineTestProject;
+            use brokk_bifrost_analysis::AnalyzerConfig;
+            use brokk_bifrost_analysis::analyzer::resolution::fact_source::SelectedTypedFactSource;
+            use brokk_bifrost_analysis::analyzer::resolution::{
+                GoMemberDeclarationKind, TypedFactPageVisitor, TypedFactRequest,
+            };
+            use brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModelMembersState;
+            use brokk_bifrost_analysis::analyzer::semantic_model::{
+                AuthoredSemanticModelPack, CatalogOptions, CompilerOptions,
+                SemanticModelActivationRequest, SemanticModelRuntimeLimits,
+                SemanticModelRuntimeOutcome, SemanticPackCatalog, SessionPackSource,
+                SessionPackSourceKind, acquire_active_semantic_models, compile_pack,
+            };
+            use serde_json::json;
+
+            // Synthetic engine fixture: no product pack declarations.
+            for (case, source, competing_source, expected_owner) in [
+                (
+                    "type",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing() }",
+                    false,
+                    true,
+                ),
+                (
+                    "receiver",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing() }; type Local struct{}; func (Local) Missing() {}",
+                    false,
+                    true,
+                ),
+                (
+                    "pointer-near-miss",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use() { (remote.Item{}).Missing() }",
+                    false,
+                    true,
+                ),
+                (
+                    "defined",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing() }",
+                    false,
+                    true,
+                ),
+                (
+                    "defined-absent",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing() }",
+                    false,
+                    true,
+                ),
+                (
+                    "promotion-uncertain",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing() }",
+                    false,
+                    true,
+                ),
+                (
+                    "field-shadow",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing() }",
+                    false,
+                    true,
+                ),
+                (
+                    "embedding",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing() }",
+                    false,
+                    true,
+                ),
+                (
+                    "source-interface",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; type Local interface { remote.Item; Own() }; func Use(probe Local) { probe.Missing(); probe.Own(); probe.Absent() }",
+                    false,
+                    true,
+                ),
+                (
+                    "model-interface",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing(); probe.Own(); probe.Absent() }",
+                    false,
+                    true,
+                ),
+                (
+                    "interface-cycle",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing(); probe.Own(); probe.Absent() }",
+                    false,
+                    true,
+                ),
+                (
+                    "promoted-field",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item; func Use(probe remote.Item) { probe.Missing(); probe.Own(); probe.Absent() }",
+                    false,
+                    true,
+                ),
+                (
+                    "ambiguous",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item",
+                    false,
+                    false,
+                ),
+                (
+                    "unknown",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item",
+                    false,
+                    false,
+                ),
+                (
+                    "value",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe = remote.Item",
+                    false,
+                    false,
+                ),
+                (
+                    "source",
+                    "package consumer; import remote \"example.test/root/provider\"; var Probe remote.Item",
+                    true,
+                    false,
+                ),
+            ] {
+                let fixture = GoRootResolutionOperationFixture::with_consumer(source);
+                let context_id =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+                fixture.store.conn.execute(move |conn| {
+                    conn.execute(
+                        "UPDATE go_context_publications SET complete=1 WHERE context_id=?1",
+                        [context_id],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "UPDATE go_package_instances SET complete=1 WHERE context_id=?1",
+                        [context_id],
+                    )
+                    .unwrap();
+                });
+                if !competing_source {
+                    fixture.store.conn.execute(|conn| {
+                        conn.execute(
+                            "DELETE FROM go_package_files WHERE rel_path=?1",
+                            [GO_ROOT_PROVIDER_PATH],
+                        )
+                        .unwrap();
+                        conn.execute(
+                            "UPDATE go_package_instances SET package_name='' WHERE tool_import_path='example.test/root/provider'",
+                            [],
+                        ).unwrap();
+                    });
+                }
+                let locator = json!({"kind":"artifact", "path":"fixture.go", "symbol":"fixture"});
+                let mut types = vec![json!({
+                    "id":"package", "name":"example.test/root/provider", "type_kind":"module",
+                    "aliases":["provider"], "visibility":"public", "locator":locator,
+                })];
+                for name in if case == "ambiguous" {
+                    vec!["First", "Second"]
+                } else if case == "unknown" {
+                    Vec::new()
+                } else {
+                    vec!["Item"]
+                } {
+                    types.push(json!({
+                        "id":name.to_ascii_lowercase(), "name":format!("example.test/root/provider.{name}"),
+                        "aliases":["example.test/root/provider.Item"],
+                        "type_kind":if matches!(case, "defined" | "defined-absent") { "class" } else if matches!(case, "source-interface" | "model-interface" | "interface-cycle") { "interface" } else { "struct" },
+                        "embedded_types": if matches!(case, "model-interface" | "interface-cycle" | "promoted-field") {
+                            vec![json!({"target":{"kind":"named", "name":"example.test/root/provider.Base"}})]
+                        } else if case == "promotion-uncertain" { vec![json!({"target":{"kind":"named", "name":"missing.Type"}})] } else if case == "embedding" {
+                            vec![json!({"target":{"kind":"pointer", "element":{"kind":"named", "name":"example.test/root/provider.hidden"}}, "pointer":true})]
+                        } else { Vec::new() },
+                        "visibility":"public", "locator":locator,
+                    }));
+                }
+                if case == "embedding" {
+                    types.push(json!({"id":"hidden", "name":"example.test/root/provider.hidden", "type_kind":"struct", "visibility":"private", "locator":locator}));
+                }
+                if matches!(
+                    case,
+                    "model-interface" | "interface-cycle" | "promoted-field"
+                ) {
+                    types.push(json!({"id":"base", "name":"example.test/root/provider.Base", "type_kind":if case == "promoted-field" { "struct" } else { "interface" },
+                        "embedded_types":if case == "interface-cycle" {vec![json!({"target":{"kind":"named", "name":"example.test/root/provider.Item"}})]} else {Vec::new()},
+                        "visibility":"public", "locator":locator}));
+                }
+                let mut members = Vec::new();
+                if case == "embedding" {
+                    members.push(json!({"id":"item.other", "owner":"item", "name":"Other", "member_kind":"field", "visibility":"public", "is_static":false,
+                        "signature":{"parameters":[], "returns":{"kind":"named", "name":"example.test/root/provider.hidden"}}, "locator":locator}));
+                }
+                if matches!(
+                    case,
+                    "model-interface" | "interface-cycle" | "promoted-field"
+                ) {
+                    members.push(json!({"id":"item.own", "owner":"item", "name":"Own", "member_kind":"method",
+                        "visibility":"public", "is_static":false, "signature":{"parameters":[]}, "locator":locator}));
+                }
+                let authored: AuthoredSemanticModelPack = serde_json::from_value(json!({
+                    "schema_version":brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                    "language":"go", "ecosystem":"go-module", "pack_id":"test.go-model-owner", "version":"1.0.0",
+                    "compatibility":{}, "license":"MIT", "safety":{"generated_code_only":false,"review_required":false},
+                    "producer":{"name":"test-only", "version":"1.0.0"},
+                    "provenance":{"source":"Synthetic engine fixture for request-local Go type owners"},
+                    "completeness":"complete",
+                    "shards":[{"id":"declarations", "activation":[{}],
+                        "payload":{"kind":"declaration_facts", "types":types, "members": if case == "defined-absent" { Vec::new() } else if case == "field-shadow" {
+                            vec![json!({"id":"item.field", "owner":"item", "name":"Missing", "member_kind":"field",
+                                "visibility":"public", "is_static":false,
+                                "signature":{"parameters":[], "returns":{"kind":"pointer", "element":{"kind":"named", "name":"example.test/root/provider.Item"}}},
+                                "locator":locator,
+                            }), json!({"id":"item.other", "owner":"item", "name":"Other", "member_kind":"field",
+                                "visibility":"public", "is_static":false,
+                                "signature":{"parameters":[], "returns":{"kind":"named", "name":"int"}},
+                                "locator":locator,
+                            })]
+                        } else if expected_owner {
+                            members.push(json!({
+                                "id":"item.missing", "owner":if matches!(case, "model-interface" | "interface-cycle" | "promoted-field") { "base" } else { "item" }, "name":"Missing", "member_kind":"method",
+                                "visibility":"public", "is_static":false,
+                                "receiver":{"pointer":case == "pointer-near-miss"},
+                                "signature":{"parameters":[]},
+                                "locator":{"kind":"artifact", "path":"fixture.go", "symbol":"Item.Missing"},
+                            }));
+                            members
+                        } else { Vec::new() }}}],
+                })).unwrap();
+                let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+                let catalog =
+                    SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+                catalog
+                    .register_compiled_pack(
+                        &compiled,
+                        &SessionPackSource {
+                            kind: SessionPackSourceKind::Embedded,
+                            source_id: "test:go-model-owner".into(),
+                        },
+                    )
+                    .unwrap();
+                let project = InlineTestProject::with_language(Language::Go)
+                    .file("probe.go", "package probe\n")
+                    .build();
+                let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+                let cancellation = CancellationToken::new();
+                let activation = SemanticModelActivationRequest {
+                    approximate_standard_libraries: Vec::new(),
+                    bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                    evidence: vec![brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence {
+                        language:"go".into(), ecosystem:"go-module".into(), package:None, module:None,
+                        toolchain:None, target:None, configuration:None, artifact_sha256:None,
+                    }], controls:Vec::new(), limits:SemanticModelRuntimeLimits::default(),
+                };
+                assert!(matches!(
+                    acquire_active_semantic_models(
+                        workspace.analyzer(),
+                        &catalog,
+                        None,
+                        &activation,
+                        &cancellation
+                    ),
+                    SemanticModelRuntimeOutcome::Ready { .. }
+                ));
+                let mut operation = open_ready_operation(
+                    &fixture.store,
+                    selected_operation_input(
+                        &fixture.project,
+                        &fixture.workspace_id,
+                        &fixture.snapshots,
+                        &fixture.languages,
+                        &fixture.overlay_masks,
+                        Vec::new(),
+                    ),
+                    &cancellation,
+                ).with_go_model_authority(workspace.analyzer().semantic_model_overlay().map(|overlay| overlay as std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>));
+                let GoPreparedImportContextOutcome::Ready(prepared) = operation
+                    .go_file_import_context(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
+                    .unwrap()
+                else {
+                    panic!("prepared modeled import")
+                };
+                assert_eq!(
+                    prepared.demand.modeled_imports.len(),
+                    usize::from(!competing_source),
+                    "modeled binder in {case}"
+                );
+                assert_eq!(
+                    prepared.demand.import_packages.len(),
+                    usize::from(competing_source),
+                    "source binder in {case}"
+                );
+                let at = source.rfind("Item").unwrap();
+                let locator = SelectedSemanticLocator::for_reference_range(
+                    "go",
+                    GO_ROOT_CONSUMER_PATH,
+                    at,
+                    at + 4,
+                );
+                let result = operation
+                    .resolve_native_reference_types_bounded_for_go_request(
+                        *prepared,
+                        None,
+                        None,
+                        &locator,
+                        None,
+                        ReceiverAnalysisBudget::default(),
+                        &cancellation,
+                        &mut SelectedResolutionContextMetrics,
+                        &mut Default::default(),
+                        &mut Default::default(),
+                    )
+                    .unwrap();
+                let BoundedResolution::Complete {
+                    value:
+                        SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
+                            answer,
+                        )),
+                    ..
+                } = result
+                else {
+                    panic!("{case}: native type result")
+                };
+                let frontiers = answer.answer.projected_frontiers();
+                assert_eq!(
+                    frontiers.iter().any(|frontier| frontier
+                        .possible_values()
+                        .iter()
+                        .any(|value| value.ty().identity().shared_name_id().is_some())),
+                    expected_owner,
+                    "{case}: {frontiers:#?}"
+                );
+                let mut minted_identity = None;
+                if expected_owner {
+                    let brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeTypes::Ready { external_owners, .. } = &answer.value_types else { panic!("external type projection") };
+                    let [(owner_identity, owner)] = external_owners.as_slice() else {
+                        panic!("one defining external owner")
+                    };
+                    minted_identity = Some(*owner_identity);
+                    assert_eq!(
+                        owner.provider_id.as_ref(),
+                        compiled.manifest.semantic_sha256
+                    );
+                    assert_eq!(
+                        owner.owner_fqn.as_ref(),
+                        "example.test/root/provider.Item",
+                        "canonical import path, independent of the remote alias"
+                    );
+                    let frontier = frontiers
+                        .iter()
+                        .find(|frontier| !frontier.possible_values().is_empty())
+                        .unwrap();
+                    assert_eq!(
+                        frontier.completion(),
+                        &ResolutionCompletion::Complete,
+                        "{frontier:?}"
+                    );
+                    assert!(matches!(frontier.possible_values(), [
+                        brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue::TypeObject(..)
+                    ]));
+                    // With the provider record disabled, this rooted Type slot
+                    // is complete-empty and has no qualified-member frontier.
+                    // Minting adds its TypeObject and preserves that empty frontier.
+                    assert!(frontier.unindexed_external().is_empty(), "{frontier:?}");
+                    // This is the model-authority/typed-reader boundary: field
+                    // slots must carry types, never model field memory tokens.
+                    let typed = operation.ready.typed_source();
+                    let metadata = typed
+                        .go_model_owner_declarations(*owner_identity, owner, &cancellation)
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        metadata.members_state,
+                        if case == "promotion-uncertain" {
+                            ModelMembersState::MayIncludePromotionCopies
+                        } else {
+                            ModelMembersState::Exact
+                        }
+                    );
+                    if case == "embedding" {
+                        assert_eq!(metadata.embedded.len(), 1);
+                        assert_eq!(
+                            metadata.embedded[0].indirection(),
+                            1,
+                            "pointer fact and structured pointer are one layer"
+                        );
+                        let GoMemberDeclarationKind::Struct { fields } = metadata.declaration.kind
+                        else {
+                            panic!("model struct")
+                        };
+                        assert_eq!(
+                            fields.len(),
+                            2,
+                            "ordinary field plus retained private embedding edge"
+                        );
+                        assert!(fields.iter().all(|field| field.field.is_none()));
+                        assert_eq!(
+                            fields.iter().filter(|field| field.embedded).count(),
+                            1,
+                            "same target type alone does not imply embedding"
+                        );
+                        for field in fields {
+                            let mut seeds = Vec::new();
+                            let read = typed
+                                .visit_intrinsic_seed_pages_for_slots(
+                                    TypedFactRequest::new(&[field.value_type.unwrap()]),
+                                    &cancellation,
+                                    &mut TypedFactPageVisitor::new(&mut |page| {
+                                        seeds.extend_from_slice(page);
+                                        Ok(true)
+                                    }),
+                                )
+                                .unwrap();
+                            assert!(read.is_exhausted());
+                            let [seed] = seeds.as_slice() else {
+                                panic!("one field type seed")
+                            };
+                            let [value] = seed.row().frontier().possible_values() else {
+                                panic!("one field type object")
+                            };
+                            assert_eq!(value.ty().identity(), metadata.embedded[0].identity());
+                            assert_eq!(value.ty().indirection(), u32::from(field.embedded));
+                        }
+                    } else if case == "field-shadow" {
+                        let GoMemberDeclarationKind::Struct { fields } = metadata.declaration.kind
+                        else {
+                            panic!("model struct")
+                        };
+                        assert_eq!(fields.len(), 2);
+                        assert!(
+                            fields
+                                .iter()
+                                .all(|field| field.field.is_none() && !field.embedded)
+                        );
+                        let slots = fields
+                            .iter()
+                            .map(|field| field.value_type.unwrap())
+                            .collect::<Vec<_>>();
+                        let mut seeds = Vec::new();
+                        let read = typed
+                            .visit_intrinsic_seed_pages_for_slots(
+                                TypedFactRequest::new(&slots),
+                                &cancellation,
+                                &mut TypedFactPageVisitor::new(&mut |page| {
+                                    seeds.extend_from_slice(page);
+                                    Ok(true)
+                                }),
+                            )
+                            .unwrap();
+                        assert!(read.is_exhausted());
+                        assert_eq!(seeds.len(), 2);
+                        assert!(seeds.iter().all(|seed| seed.row().frontier().completion()
+                            == &ResolutionCompletion::Complete));
+                        assert!(seeds.iter().any(|seed| {
+                            seed.row().frontier().possible_values().iter().any(|value| {
+                                value.ty().identity() == *owner_identity
+                                    && value.ty().indirection() == 1
+                                    && value.ty().reference_indirection() == 0
+                            })
+                        }));
+                        assert!(seeds.iter().any(|seed| seed.row().spelling() == "int"));
+                    }
+                }
+                if matches!(
+                    case,
+                    "source-interface" | "model-interface" | "interface-cycle" | "promoted-field"
+                ) {
+                    for (selector, found) in [("Missing", true), ("Own", true), ("Absent", false)] {
+                        let GoPreparedImportContextOutcome::Ready(prepared) = operation
+                            .go_file_import_context(
+                                context_id,
+                                GO_ROOT_CONSUMER_PATH,
+                                &cancellation,
+                            )
+                            .unwrap()
+                        else {
+                            panic!("prepared interface request")
+                        };
+                        let at = source.find(&format!(".{selector}(")).unwrap() + 1;
+                        let locator = SelectedSemanticLocator::for_reference_range(
+                            "go",
+                            GO_ROOT_CONSUMER_PATH,
+                            at,
+                            at + selector.len(),
+                        );
+                        let result = operation
+                            .resolve_native_reference_units_bounded_for_go_request(
+                                *prepared,
+                                None,
+                                &locator,
+                                ReceiverAnalysisBudget::default(),
+                                &cancellation,
+                                &mut SelectedResolutionContextMetrics,
+                                &mut Default::default(),
+                                &mut Default::default(),
+                            )
+                            .unwrap();
+                        let BoundedResolution::Complete {
+                            value:
+                                SelectedResolutionOperationOutcome::Native(
+                                    SelectedResolutionLocated::Found(answer),
+                                ),
+                            ..
+                        } = result
+                        else {
+                            panic!("{case}.{selector}: interface binding unavailable")
+                        };
+                        assert_eq!(
+                            answer.answer.binding().targets().len(),
+                            usize::from(found),
+                            "{case}.{selector}: {:?}",
+                            answer.answer
+                        );
+                        if case != "promoted-field" {
+                            assert_ne!(
+                                answer.answer.binding().completion(),
+                                &ResolutionCompletion::Complete,
+                                "{case}.{selector}: a boundary terminal never proves complete empty inventory or implementation family"
+                            );
+                        }
+                        if case == "promoted-field" && selector == "Missing" {
+                            let [candidate] = answer
+                                .model_member_selection
+                                .as_ref()
+                                .expect("projected model selection")
+                                .candidates
+                                .as_slice()
+                            else {
+                                panic!("one projected model method")
+                            };
+                            assert_eq!(
+                                candidate.owner.owner_fqn.as_ref(),
+                                "example.test/root/provider.Base"
+                            );
+                            assert!(
+                                !candidate.receiver_route_proven,
+                                "model embedding supplies no receiver storage proof"
+                            );
+                            assert!(candidate.route_exact && !candidate.interface);
+                            assert!(
+                                matches!(&answer.definitions, brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Ready(rows) if rows.is_empty()),
+                                "model token must not become a source unit"
+                            );
+                        }
+                        if found {
+                            let [member] = answer.answer.member_owners() else {
+                                panic!(
+                                    "{case}.{selector}: one declaring owner: {:?}",
+                                    answer.answer
+                                )
+                            };
+                            if selector == "Missing" {
+                                assert!(
+                                    member.owner().shared_name_id().is_some(),
+                                    "method comes from a real model owner"
+                                );
+                                if case == "source-interface" {
+                                    assert_eq!(Some(member.owner()), minted_identity);
+                                } else {
+                                    assert_ne!(
+                                        Some(member.owner()),
+                                        minted_identity,
+                                        "embedding reaches Base's method"
+                                    );
+                                }
+                                assert_eq!(member.hierarchy_depth(), 1);
+                            } else if case == "source-interface" {
+                                assert!(
+                                    member.owner().shared_name_id().is_none(),
+                                    "source direct method retained"
+                                );
+                                assert_eq!(member.hierarchy_depth(), 0);
+                            } else {
+                                assert_eq!(Some(member.owner()), minted_identity);
+                                assert_eq!(member.hierarchy_depth(), 0);
+                            }
+                            if case == "interface-cycle" {
+                                assert!(
+                                    answer
+                                        .answer
+                                        .binding()
+                                        .witnesses()
+                                        .iter()
+                                        .all(|w| w.completion() != &ResolutionCompletion::Complete),
+                                    "cyclic inventory never becomes a complete positive witness"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Observe actual model candidates in the receiver walk. The
+                // unit projection remains checkpoint 4; inspect native binding.
+                if matches!(
+                    case,
+                    "receiver"
+                        | "embedding"
+                        | "pointer-near-miss"
+                        | "defined"
+                        | "defined-absent"
+                        | "promotion-uncertain"
+                        | "field-shadow"
+                ) {
+                    let GoPreparedImportContextOutcome::Ready(prepared) = operation
+                        .go_file_import_context(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
+                        .unwrap()
+                    else {
+                        panic!("prepared receiver request")
+                    };
+                    let at = source.find(".Missing").unwrap() + 1;
+                    let locator = SelectedSemanticLocator::for_reference_range(
+                        "go",
+                        GO_ROOT_CONSUMER_PATH,
+                        at,
+                        at + 7,
+                    );
+                    let result = operation
+                        .resolve_native_reference_units_bounded_for_go_request(
+                            *prepared,
+                            None,
+                            &locator,
+                            ReceiverAnalysisBudget::default(),
+                            &cancellation,
+                            &mut SelectedResolutionContextMetrics,
+                            &mut Default::default(),
+                            &mut Default::default(),
+                        )
+                        .unwrap();
+                    let BoundedResolution::Complete {
+                        value:
+                            SelectedResolutionOperationOutcome::Native(
+                                SelectedResolutionLocated::Found(answer),
+                            ),
+                        ..
+                    } = result
+                    else {
+                        panic!("model receiver binding must remain available")
+                    };
+                    if matches!(
+                        case,
+                        "receiver" | "embedding" | "defined" | "promotion-uncertain"
+                    ) {
+                        assert_eq!(
+                            answer.answer.binding().targets().len(),
+                            1,
+                            "{:?}",
+                            answer.answer.binding()
+                        );
+                        assert!(
+                            answer.answer.binding().targets()[0]
+                                .shared_name_id()
+                                .is_some()
+                        );
+                        if case == "promotion-uncertain" {
+                            assert!(
+                                answer.answer.member_owners().is_empty(),
+                                "an unmarked promotion copy has no exact declaring owner or depth"
+                            );
+                            assert_ne!(
+                                answer.answer.binding().completion(),
+                                &ResolutionCompletion::Complete,
+                                "promotion copies cannot supply exact depth or declaring owner proof"
+                            );
+                            assert!(
+                                answer
+                                    .answer
+                                    .binding()
+                                    .witnesses()
+                                    .iter()
+                                    .all(|witness| witness.completion()
+                                        != &ResolutionCompletion::Complete)
+                            );
+                        } else {
+                            let [member] = answer.answer.member_owners() else {
+                                panic!("one model declaring owner")
+                            };
+                            assert_eq!(Some(member.owner()), minted_identity);
+                            assert_eq!(member.hierarchy_depth(), 0);
+                        }
+                    } else {
+                        assert!(
+                            answer.answer.binding().targets().is_empty(),
+                            "{:?}",
+                            answer.answer.binding()
+                        );
+                        assert_ne!(
+                            answer.answer.binding().completion(),
+                            &ResolutionCompletion::Complete
+                        );
+                    }
                 }
             }
         }

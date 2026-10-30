@@ -12,6 +12,7 @@
 use super::*;
 use crate::analyzer::semantic::SemanticBudgetDimension;
 use crate::query::PlanPartitioning;
+use crate::structural::execution::plan::StepOutputCap;
 use std::path::Path;
 
 /// Which files a query's seed enumeration runs over.
@@ -34,29 +35,10 @@ pub struct CodeQueryExecutionScope<'a> {
     /// Ancestor union suffix steps appended to a flattened leaf. They run on
     /// rows normally but cannot narrow diagnostics across the original set.
     inherited_suffix_steps: usize,
-    /// Optional policy expansion selection. This is query-specific: existing
-    /// whole-workspace and per-seed execution scopes leave it unset.
-    source_selection: Option<CodeQuerySourceSelection<'a>>,
     /// Optional compilation-local call-target outcomes shared by selector
     /// scans. The analyzer and model authority are rechecked at query entry.
     shared_call_target_outcomes:
         Option<crate::analyzer::usages::call_relations::CallTargetOutcomeCache>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct CodeQuerySourceSelection<'a> {
-    suffix_steps: usize,
-    source_rows: &'a [DetailedCodeQueryEvidence],
-}
-
-impl<'a> CodeQuerySourceSelection<'a> {
-    pub(super) const fn suffix_steps(self) -> usize {
-        self.suffix_steps
-    }
-
-    pub(super) const fn source_rows(self) -> &'a [DetailedCodeQueryEvidence] {
-        self.source_rows
-    }
 }
 
 impl<'a> CodeQueryExecutionScope<'a> {
@@ -67,7 +49,6 @@ impl<'a> CodeQueryExecutionScope<'a> {
             workspace_files: None,
             branch_path: &[],
             inherited_suffix_steps: 0,
-            source_selection: None,
             shared_call_target_outcomes: None,
         }
     }
@@ -92,27 +73,6 @@ impl<'a> CodeQueryExecutionScope<'a> {
             workspace_files: Some(workspace_files),
             branch_path,
             inherited_suffix_steps: 0,
-            source_selection: None,
-            shared_call_target_outcomes: None,
-        }
-    }
-
-    /// Select the exact rows produced by the source prefix before running the
-    /// appended expansion suffix. The caller must have already validated that
-    /// `suffix_steps` is the number of steps appended to that source prefix.
-    pub(super) const fn for_source_rows(
-        suffix_steps: usize,
-        source_rows: &'a [DetailedCodeQueryEvidence],
-    ) -> Self {
-        Self {
-            seed_files: None,
-            workspace_files: None,
-            branch_path: &[],
-            inherited_suffix_steps: 0,
-            source_selection: Some(CodeQuerySourceSelection {
-                suffix_steps,
-                source_rows,
-            }),
             shared_call_target_outcomes: None,
         }
     }
@@ -150,10 +110,6 @@ impl<'a> CodeQueryExecutionScope<'a> {
 
     pub(super) const fn inherited_suffix_steps(&self) -> usize {
         self.inherited_suffix_steps
-    }
-
-    pub(super) const fn source_selection(&self) -> Option<CodeQuerySourceSelection<'a>> {
-        self.source_selection
     }
 
     pub(super) fn shared_call_target_outcomes(
@@ -2473,6 +2429,7 @@ pub struct MergedUnitRows {
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub truncated: bool,
     fair_share_divisor: usize,
+    step_output_caps: Vec<Option<StepOutputCap>>,
 }
 
 impl MergedUnitRows {
@@ -2490,6 +2447,48 @@ impl MergedUnitRows {
             .map(|(result_index, evidence)| evidence.to_detailed(root, result_index))
             .collect()
     }
+}
+
+fn unit_step_output_caps(query: &CodeQuery) -> Vec<Option<StepOutputCap>> {
+    let union = PlanPartitioning::classify(&query.plan).is_seed_union();
+    let mut caps = Vec::new();
+    let plans = if union {
+        PlanPartitioning::union_leaf_plans(&query.plan)
+            .expect("a seed union has flattened leaves")
+            .into_iter()
+            .map(|(plan, _, inherited)| {
+                (
+                    CodeQuery {
+                        plan,
+                        limit: usize::MAX,
+                        ..query.clone()
+                    },
+                    inherited,
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![(query.clone(), 0)]
+    };
+    for (query, inherited) in plans {
+        let plan = select_physical_plan(&query, UnionExecutionStrategy::Sequential, 1, inherited)
+            .expect("executed unit queries have valid physical plans");
+        caps.extend(plan.step_output_caps().into_iter().map(|cap| {
+            cap.map(|cap| {
+                if union {
+                    StepOutputCap::PipelineRows
+                } else {
+                    cap
+                }
+            })
+        }));
+    }
+    caps
+}
+
+/// Expected physical counter slots in a persisted query-unit product.
+pub fn unit_plan_node_count(query: &CodeQuery) -> usize {
+    unit_step_output_caps(query).len()
 }
 
 /// Merge the rows of several unit executions of one query into the vector one
@@ -2526,6 +2525,7 @@ pub fn merge_unit_rows(
         }
         PlanPartitioning::BySeed | PlanPartitioning::Whole(_) => 1,
     };
+    let step_output_caps = unit_step_output_caps(query);
     let mut raw_rows = Vec::new();
 
     for unit in units {
@@ -2568,6 +2568,7 @@ pub fn merge_unit_rows(
         diagnostics,
         truncated,
         fair_share_divisor,
+        step_output_caps,
     }
 }
 
@@ -2870,17 +2871,24 @@ impl MergedUnitRows {
         ) {
             return Some(MergedLimit::PipelineRows);
         }
-        // The final step's cap is the root limit and every earlier step's is
-        // `max_pipeline_rows`; the smaller of the two widens whenever either
-        // could have cut a step's output.
-        if reached(
-            self.budgeted_work.max_step_outputs(),
-            if self.fair_share_divisor == 1 {
-                result_limit.min(limits.max_pipeline_rows)
-            } else {
-                physical_cap(limits.max_pipeline_rows)
-            },
-        ) {
+        assert!(
+            self.budgeted_work.step_outputs.is_empty()
+                || self.budgeted_work.step_outputs.len() == self.step_output_caps.len(),
+            "step output counters follow the executed physical plan layout"
+        );
+        // The executor can stop at equality, before examining another input.
+        // Set plans retain the existing conservative branch-share allowance.
+        if self
+            .budgeted_work
+            .step_outputs
+            .iter()
+            .zip(&self.step_output_caps)
+            .any(|(&outputs, cap)| {
+                cap.is_some_and(|cap| {
+                    reached(outputs, cap.resolve(physical_cap(limits.max_pipeline_rows)))
+                })
+            })
+        {
             return Some(MergedLimit::StepOutputs);
         }
         self.reached_semantic_limit(&limits.semantic)

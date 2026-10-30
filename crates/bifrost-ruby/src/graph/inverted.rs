@@ -24,6 +24,7 @@ use crate::graph::syntax::{
 };
 use crate::graph_support::RubySource;
 use crate::syntax::ruby_semantic_identifier_range;
+use brokk_bifrost_core::analyzer::memo_attribution::MemoAttribution;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
@@ -41,8 +42,8 @@ use tree_sitter::Node;
 /// shared cross-language driver -- stays in `brokk-bifrost-analysis` and calls
 /// this per file, so the Ruby half is a pure function of a parsed file and the
 /// two sources.
-pub fn scan_file(
-    graph: RubyGraphSource<'_>,
+pub fn scan_file<A: MemoAttribution>(
+    graph: RubyGraphSource<'_, A>,
     ruby: &dyn RubySource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -66,8 +67,8 @@ pub fn scan_file(
     scan.evidence.edges
 }
 
-struct RubyEdgeScan<'a> {
-    semantic: &'a RubySemanticIndex<'a>,
+struct RubyEdgeScan<'a, A: MemoAttribution> {
+    semantic: &'a RubySemanticIndex<'a, A>,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     visible_files: HashSet<ProjectFile>,
@@ -75,7 +76,7 @@ struct RubyEdgeScan<'a> {
     evidence: RubyEdgeEvidence<'a>,
 }
 
-impl RubyEdgeScan<'_> {
+impl<A: MemoAttribution> RubyEdgeScan<'_, A> {
     fn scan(&mut self, root: Node<'_>) {
         let mut state = RubyEdgeWalkState {
             scan: self,
@@ -134,8 +135,8 @@ impl RubyEdgeEvidence<'_> {
     }
 }
 
-struct RubyEdgeWalkState<'scan, 'ctx> {
-    scan: &'scan mut RubyEdgeScan<'ctx>,
+struct RubyEdgeWalkState<'scan, 'ctx, A: MemoAttribution> {
+    scan: &'scan mut RubyEdgeScan<'ctx, A>,
     locals: LocalInferenceEngine<String>,
     lexical_stack: Vec<String>,
     method_stack: Vec<ReceiverMode>,
@@ -143,7 +144,7 @@ struct RubyEdgeWalkState<'scan, 'ctx> {
     exits: Vec<RubyScopeExit>,
 }
 
-impl RubyEdgeWalkState<'_, '_> {
+impl<A: MemoAttribution> RubyEdgeWalkState<'_, '_, A> {
     fn enter(&mut self, node: Node<'_>) -> TreeWalkAction {
         if let Some(declaration) = ruby_type_body_declaration(node) {
             let owner = self.type_owner(declaration);

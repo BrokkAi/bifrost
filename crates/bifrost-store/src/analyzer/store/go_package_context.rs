@@ -23,8 +23,9 @@ use brokk_bifrost_go::package_discovery::{GoPackage, GoPackageDiscovery};
 /// contexts from builds of this change before its final gap vocabulary, so
 /// those contexts are never selected.
 /// Version 14 hashes an input by kind, path and content OID only; modified time and length no longer take part, so an unchanged save reuses the context.
+/// Version 15 resolves relative source imports outside module mode by importer directory.
 #[doc(hidden)]
-pub const DERIVATION_VERSION: i64 = 14;
+pub const DERIVATION_VERSION: i64 = 15;
 
 #[derive(Debug, Default)]
 #[doc(hidden)]
@@ -643,6 +644,28 @@ fn observe_recorded_input(
     Ok(None)
 }
 
+/// Structured evidence shared by source inventory, publication and Go navigation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GoSourceImportRefusal {
+    pub importer: String,
+    pub spelling: String,
+    pub role: String,
+    pub reason: GoSourceImportRefusalReason,
+    pub directory: Option<String>,
+    pub candidates: Vec<String>,
+    pub module_manifest: Option<String>,
+    pub declared_names: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoSourceImportRefusalReason {
+    RelativeImportInModuleMode,
+    RelativeImportOutsideWorkspace,
+    SourcePackageDirectoryUnavailable,
+    ConflictingSourcePackageNames,
+}
+
 struct PackageRows {
     import_path: String,
     name: String,
@@ -657,6 +680,7 @@ struct PackageRows {
     complete: bool,
     files: Vec<(String, &'static str)>,
     imports: std::collections::BTreeMap<(&'static str, String), Option<String>>,
+    relative_refusals: std::collections::BTreeMap<(&'static str, String), GoSourceImportRefusal>,
 }
 
 struct GoSourceInventoryRows {
@@ -1098,6 +1122,7 @@ impl AnalyzerStore {
                 complete,
                 files: members,
                 imports,
+                relative_refusals: Default::default(),
             });
         }
         drop(conn);
@@ -1145,6 +1170,7 @@ impl AnalyzerStore {
                     tool.complete &= package.complete;
                     tool.gaps.extend(package.gaps);
                     tool.gaps.sort_by_cached_key(serde_json::Value::to_string);
+                    tool.relative_refusals.extend(package.relative_refusals);
                     for (key, target) in package.imports {
                         tool.imports.entry(key).or_insert(target);
                     }
@@ -1279,7 +1305,9 @@ impl AnalyzerStore {
                             if cancellation.is_cancelled() { return Ok(false); }
                             let target: Option<(i64,bool)> = tx.query_row("SELECT package_id,complete FROM go_package_instances WHERE context_id=?1 AND tool_import_path=?2",params![context_id,target],|value|Ok((value.get(0)?,value.get(1)?))).optional()?;
                             let complete = row.complete && target.is_some_and(|(_,complete)|complete);
-                            let gaps = if complete { "[]".to_owned() } else { serde_json::to_string(&json!([{"code":"incomplete_import_provider","evidence":spelling}])).expect("Go gap evidence is JSON") };
+                            let evidence = row.relative_refusals.get(&(*role, spelling.clone()))
+                                .map_or_else(|| json!(spelling), |refusal| json!(refusal));
+                            let gaps = if complete { "[]".to_owned() } else { serde_json::to_string(&json!([{"code":"incomplete_import_provider","evidence":evidence}])).expect("Go gap evidence is JSON") };
                             tx.execute("INSERT INTO go_package_imports(context_id,importer_package_id,source_spelling,import_role,target_package_id,complete,gaps) VALUES(?1,?2,?3,?4,?5,?6,jsonb(?7))",params![context_id,importer,spelling,role,target.map(|(id,_)|id),complete,gaps])?;
                     }
                 }
@@ -1301,6 +1329,11 @@ impl AnalyzerStore {
 pub fn source_inventory_profile() -> [u8; 32] {
     CanonicalHasher::new(b"bifrost-go-source-inventory-profile:v2").finish()
 }
+
+pub(crate) const MODULE_MANIFESTS_SQL: &str =
+    "SELECT rel_path FROM workspace_file_versions WHERE workspace_id=?1 AND lang='go' AND generation=?2
+             AND input_kind='configuration' AND (rel_path='go.mod' OR rel_path GLOB '*/go.mod')
+             AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until)";
 
 pub(crate) const SOURCE_INVENTORY_SQL: &str =
     "SELECT f.file_version_id,f.rel_path,f.blob_oid,a.package_name,b.id,m.content_package,
@@ -1372,6 +1405,20 @@ impl AnalyzerStore {
         let mut packages = BTreeMap::<String, PackageRows>::new();
         let mut names = BTreeMap::<String, BTreeSet<String>>::new();
         let mut aliases = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut relative_imports = BTreeMap::new();
+        // Snapshot module paths are this publication query's transient result.
+        // Read them once rather than sorting a correlated subquery per source.
+        let module_manifests = conn
+            .prepare_cached(MODULE_MANIFESTS_SQL)?
+            .query_map(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision
+                ],
+                |row| row.get::<_, String>(0).map(PathBuf::from),
+            )?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
         let mut query = conn.prepare_cached(SOURCE_INVENTORY_SQL)?;
         let mut files = query.query(params![
             snapshot.workspace_id.as_str(),
@@ -1396,6 +1443,14 @@ impl AnalyzerStore {
             let complete: Option<bool> = file.get(8)?;
             let has_build_constraints: bool = file.get(9)?;
             let build_selection_facts_version: i64 = file.get(10)?;
+            let module_manifest = Path::new(&path)
+                .parent()
+                .expect("source file parent")
+                .ancestors()
+                .map(|directory| directory.join("go.mod"))
+                .find(|manifest| module_manifests.contains(manifest))
+                .map(|manifest| crate::path_utils::workspace_relative_slash_path(&manifest));
+            let module_mode = module_manifest.is_some();
             publication.field("path", path.as_bytes());
 
             let (Some(anchor), Some(blob), Some(name)) = (anchor, blob, name) else {
@@ -1447,6 +1502,7 @@ impl AnalyzerStore {
                     complete: true,
                     files: Vec::new(),
                     imports: BTreeMap::new(),
+                    relative_refusals: Default::default(),
                 }
             });
             if file_has_build_constraints {
@@ -1486,6 +1542,26 @@ impl AnalyzerStore {
                 }
                 publication.field("import-role", role.as_bytes());
                 publication.field("import", spelling.as_bytes());
+                if matches!(import_path.segments[0].as_str(), "." | "..") {
+                    let directory = crate::path_utils::normalize_relative_path_from(
+                        Path::new(&path).parent().expect("source file parent"),
+                        &import_path.segments.iter().collect::<PathBuf>(),
+                    );
+                    publication.field("relative-import-module-mode", &[u8::from(module_mode)]);
+                    if let Some(directory) = &directory {
+                        publication.field(
+                            "relative-import-directory",
+                            crate::path_utils::workspace_relative_slash_path(directory).as_bytes(),
+                        );
+                    }
+                    if let Some(manifest) = &module_manifest {
+                        publication.field("relative-import-module", manifest.as_bytes());
+                    }
+                    relative_imports.insert(
+                        (anchor.clone(), role, spelling.clone()),
+                        (path.clone(), directory, module_manifest.clone()),
+                    );
+                }
                 package.imports.insert((role, spelling), None);
             }
             let mut alias_query = conn.prepare_cached("SELECT package_name FROM workspace_file_package_rows WHERE file_version_id=?1 ORDER BY package_name")?;
@@ -1536,6 +1612,16 @@ impl AnalyzerStore {
         }
         drop(refusals);
         drop(refused);
+        let mut directories = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+        for package in packages
+            .values()
+            .filter(|package| package.files.iter().any(|(_, role)| *role != "xtest"))
+        {
+            directories
+                .entry(package.directory.clone())
+                .or_default()
+                .insert(package.import_path.clone());
+        }
         for package in packages.values_mut() {
             let declared = &names[&package.import_path];
             if declared.len() != 1 {
@@ -1544,7 +1630,64 @@ impl AnalyzerStore {
                 package.gaps.push(json!({"code":"conflicting_source_package_names","evidence":{"package":package.import_path,"names":declared}}));
                 gaps.push(json!({"code":"conflicting_source_package_names","evidence":{"package":package.import_path,"names":declared}}));
             }
-            for ((_, spelling), target) in &mut package.imports {
+            for ((role, spelling), target) in &mut package.imports {
+                if let Some((importer, directory, module_manifest)) =
+                    relative_imports.get(&(package.import_path.clone(), *role, spelling.clone()))
+                {
+                    let candidates = directory
+                        .as_ref()
+                        .and_then(|directory| directories.get(&root.join(directory)));
+                    let reason = if module_manifest.is_some() {
+                        Some(GoSourceImportRefusalReason::RelativeImportInModuleMode)
+                    } else if directory.is_none() {
+                        Some(GoSourceImportRefusalReason::RelativeImportOutsideWorkspace)
+                    } else if let Some(candidates) = candidates.filter(|rows| rows.len() == 1) {
+                        let candidate = candidates.first().expect("one source provider");
+                        if names[candidate].len() == 1 {
+                            *target = Some(candidate.clone());
+                            publication.field("relative-import-target", candidate.as_bytes());
+                            None
+                        } else {
+                            Some(GoSourceImportRefusalReason::ConflictingSourcePackageNames)
+                        }
+                    } else if candidates.is_some() {
+                        Some(GoSourceImportRefusalReason::ConflictingSourcePackageNames)
+                    } else {
+                        Some(GoSourceImportRefusalReason::SourcePackageDirectoryUnavailable)
+                    };
+                    if let Some(reason) = reason {
+                        let candidates = candidates
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let declared_names = candidates
+                            .iter()
+                            .flat_map(|candidate| names[candidate].iter().cloned())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        let refusal = GoSourceImportRefusal {
+                            importer: importer.clone(),
+                            spelling: spelling.clone(),
+                            role: (*role).into(),
+                            reason,
+                            directory: directory
+                                .as_ref()
+                                .map(|path| crate::path_utils::workspace_relative_slash_path(path)),
+                            candidates,
+                            module_manifest: module_manifest.clone(),
+                            declared_names,
+                        };
+                        gaps.push(
+                            json!({"code":"source_import_provider_unavailable","evidence":refusal}),
+                        );
+                        package
+                            .relative_refusals
+                            .insert((*role, spelling.clone()), refusal);
+                    }
+                    continue;
+                }
                 match aliases.get(spelling) {
                     Some(candidates) if candidates.len()==1 => {
                         let candidate = candidates.first().expect("one source provider");
@@ -1612,13 +1755,25 @@ impl AnalyzerStore {
                 )
             })
             .transpose()?;
-        let boundaries = conn.prepare_cached(
-            "SELECT rel_path FROM workspace_file_versions WHERE workspace_id=?1 AND lang='go' AND generation=?2
-             AND input_kind='configuration' AND (rel_path='go.mod' OR rel_path LIKE '%/go.mod')
-             AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until)")?
-            .query_map(params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision],|row|row.get::<_,String>(0))?
-            .map(|row|row.map(|path|PathBuf::from(path).parent().expect("module path parent").to_path_buf()))
-            .collect::<std::result::Result<BTreeSet<_>,_>>()?;
+        let boundaries = conn
+            .prepare_cached(MODULE_MANIFESTS_SQL)?
+            .query_map(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|row| {
+                row.map(|path| {
+                    PathBuf::from(path)
+                        .parent()
+                        .expect("module path parent")
+                        .to_path_buf()
+                })
+            })
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
         // The output can cut off across several saves, updating its input key
         // without moving valid_from. Compare membership against recorded source
         // versions, rather than treating valid_from as the latest input key.
@@ -2132,6 +2287,7 @@ mod tests {
                 complete: true,
                 files: vec![("member.go".into(), "go")],
                 imports: Default::default(),
+                relative_refusals: Default::default(),
             }]
         };
         let publish =

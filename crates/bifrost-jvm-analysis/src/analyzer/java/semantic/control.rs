@@ -3776,13 +3776,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "implicit monitor acquisition exceptions are not yet lowered",
         )?;
         self.edge(builder, monitor, EdgeTarget::normal(body_entry))?;
-        let cleanup_destination = if next.kind == ControlEdgeKind::Normal {
-            next.point
-        } else {
-            let relay = self.point(builder, node, Vec::new())?;
-            self.edge(builder, relay, next)?;
-            relay
-        };
+        let cleanup_destination = self.session.cleanup_next_target(builder, node, next)?.point;
         let body_exit = self.point(builder, body, Vec::new())?;
         let normal_route = builder.normal_cleanup_completion(region, cleanup_destination);
         self.route(builder, body_exit, &normal_route, stack)?;
@@ -4202,14 +4196,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         carried: Option<ValueId>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
-        let Some(route) =
-            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        let Some((route, abort)) = self.session.prepare_implicit_abort(builder, node, scope)?
         else {
             return Err(JavaLoweringError::Invalid(
                 "implicit abort has no matching structured continuation".into(),
             ));
         };
-        let abort = self.point(builder, node, Vec::new())?;
         if let Some(binder) = self
             .catch_binders
             .get(&route.destination().target())

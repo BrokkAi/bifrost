@@ -19,9 +19,9 @@ name = "brokk_bifrost_cpp_analysis"
 workspace = true
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3" }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.3" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.4" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.4" }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.4" }
 git2 = { version = "0.20.2", default-features = false }
 moka = { version = "0.12.11", features = ["sync"] }
 rayon = "1.10.0"
@@ -46,10 +46,10 @@ test-support = ["brokk-bifrost-analysis/test-support"]
 randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.4", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.14.4", features = ["test-support"] }
 rusqlite = { version = "0.40.2", default-features = false, features = [
 "bundled",
 "cache",

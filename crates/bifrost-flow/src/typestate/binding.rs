@@ -858,12 +858,6 @@ pub struct TypestateBindingPlan {
     event_bindings: Box<[BoundTypestateEvent]>,
     call_noninterference_bindings: Box<[BoundTypestateCallNonInterference]>,
     terminal_bindings: Box<[BoundTypestateTerminal]>,
-    subject_by_object:
-        HashMap<TypestateSubjectClassKey, HashMap<AbstractObject, TypestateSubjectId>>,
-    events_by_call: HashMap<
-        crate::analyzer::semantic::CallSiteHandle,
-        HashMap<OracleCallContext, Box<[usize]>>,
-    >,
     terminals_by_point: HashMap<ProgramPointHandle, HashMap<OracleCallContext, Box<[usize]>>>,
     initial_seeds_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     events_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
@@ -1148,14 +1142,6 @@ impl TypestateBindingPlan {
         )
         .map_err(TypestateBindingPlanError::Canonicalization)?;
 
-        let mut subject_by_object =
-            HashMap::<_, HashMap<AbstractObject, TypestateSubjectId>>::new();
-        for subject in &compiled_subjects {
-            subject_by_object
-                .entry(subject.key.class.clone())
-                .or_default()
-                .insert(subject.object.clone(), subject.id);
-        }
         let event_indexes = index_sites(&compiled_events, |binding| &binding.site);
         let terminal_indexes = index_sites(&compiled_terminals, |binding| &binding.site);
         let initial_seed_indexes = index_initial_seed_points(&compiled_seeds);
@@ -1173,8 +1159,6 @@ impl TypestateBindingPlan {
             event_bindings: compiled_events.into_boxed_slice(),
             call_noninterference_bindings: compiled_call_noninterference.into_boxed_slice(),
             terminal_bindings: compiled_terminals.into_boxed_slice(),
-            subject_by_object,
-            events_by_call: event_indexes.calls,
             terminals_by_point: terminal_indexes.points,
             initial_seeds_by_point_all_contexts: initial_seed_indexes,
             events_by_point_all_contexts: event_indexes.all_points,
@@ -1197,9 +1181,14 @@ impl TypestateBindingPlan {
         &self.subjects
     }
 
-    /// Visit every semantic artifact identity retained by this plan.
+    /// Visit the semantic artifact identity of every procedure and scoped
+    /// locator that a subject root chain or an observation site names.
     ///
-    /// Registries use this to reject stale bindings before solver execution.
+    /// This omits the relation arenas that a call-result root retains as
+    /// audit provenance: call-result equality excludes that provenance, and
+    /// typestate finding identities hash these keys. A registry that rejects
+    /// stale bindings before solver execution must also validate the keys of
+    /// `for_each_retained_artifact`, which includes those arenas.
     /// Duplicate keys are intentional here: callers that need a set can
     /// deduplicate without this hot-path model retaining another index.
     pub fn for_each_retained_artifact_key(&self, mut visit: impl FnMut(&SemanticArtifactKey)) {
@@ -1210,8 +1199,7 @@ impl TypestateBindingPlan {
     }
 
     /// Visit every concrete semantic artifact allocation retained by handles
-    /// in this plan. Key-only scoped locators are intentionally excluded: they
-    /// retain identities but do not own semantic IR allocations.
+    /// in this plan, including scoped locators and call-result relation arenas.
     pub fn for_each_retained_artifact(&self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
         self.for_each_retained_subject_root(|root| {
             visit_access_path_root_artifact_values(root, &mut visit)
@@ -1263,17 +1251,6 @@ impl TypestateBindingPlan {
             .map(|index| self.subjects[index].id())
     }
 
-    pub fn subject_for_object(
-        &self,
-        class: &TypestateSubjectClassKey,
-        object: &AbstractObject,
-    ) -> Option<TypestateSubjectId> {
-        self.subject_by_object
-            .get(class)
-            .and_then(|subjects| subjects.get(object))
-            .copied()
-    }
-
     pub fn initial_seeds(&self) -> &[BoundTypestateInitialSeed] {
         &self.initial_seeds
     }
@@ -1320,17 +1297,6 @@ impl TypestateBindingPlan {
         id: TypestateTerminalBindingId,
     ) -> Option<&BoundTypestateTerminal> {
         self.terminal_bindings.get(id.index())
-    }
-
-    pub fn event_bindings_at_call_site(
-        &self,
-        call: &crate::analyzer::semantic::CallSiteHandle,
-        context: &OracleCallContext,
-    ) -> impl Iterator<Item = &BoundTypestateEvent> {
-        indexed_bindings(
-            site_indexes(&self.events_by_call, call, context),
-            &self.event_bindings,
-        )
     }
 
     pub fn event_bindings_at_program_point_all_contexts(
@@ -1535,11 +1501,7 @@ fn visit_access_path_root_artifact_values(
     root: &AccessPathRoot,
     visit: &mut impl FnMut(&Arc<SemanticArtifact>),
 ) {
-    visit_access_path_root_references(root, |reference| {
-        if let AccessPathRootArtifactReference::Procedure(procedure) = reference {
-            visit(procedure.artifact());
-        }
-    });
+    root.for_each_retained_artifact(visit);
 }
 
 fn visit_observation_site_artifact_values(
@@ -2134,10 +2096,6 @@ const fn site_rank(site: &TypestateObservationSite) -> u8 {
 
 struct SiteIndexes {
     points: HashMap<ProgramPointHandle, HashMap<OracleCallContext, Box<[usize]>>>,
-    calls: HashMap<
-        crate::analyzer::semantic::CallSiteHandle,
-        HashMap<OracleCallContext, Box<[usize]>>,
-    >,
     all_points: HashMap<ProgramPointHandle, Box<[usize]>>,
     all_calls: HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
 }
@@ -2172,7 +2130,6 @@ fn index_sites<T>(values: &[T], site: impl Fn(&T) -> &TypestateObservationSite) 
     let all_calls = flatten_site_indexes(&calls);
     SiteIndexes {
         points: box_site_indexes(points),
-        calls: box_site_indexes(calls),
         all_points,
         all_calls,
     }

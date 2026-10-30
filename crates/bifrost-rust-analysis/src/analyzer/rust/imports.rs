@@ -775,11 +775,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-rust-analysis/src/analyzer/rust/imports.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let resolved =
             brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
@@ -794,8 +790,9 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 {
                     let cache_key = file.clone();
                     let cache_value = Arc::clone(&resolved);
-                    persistent_fill_guard.installed("imported_code_units");
-                    self.imported_code_units.insert(cache_key, cache_value);
+                    if cache_fill.is_complete() {
+                        self.imported_code_units.insert(cache_key, cache_value);
+                    }
                 };
                 resolved
             }
@@ -807,11 +804,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-rust-analysis/src/analyzer/rust/imports.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let referencing = brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
             self,
@@ -851,8 +844,9 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 {
                     let cache_key = file.clone();
                     let cache_value = Arc::new(referencing.clone());
-                    persistent_fill_guard.installed("referencing_files");
-                    self.referencing_files.insert(cache_key, cache_value);
+                    if cache_fill.is_complete() {
+                        self.referencing_files.insert(cache_key, cache_value);
+                    }
                 };
                 referencing
             }

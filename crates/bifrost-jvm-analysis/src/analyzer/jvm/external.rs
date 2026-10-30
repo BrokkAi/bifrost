@@ -228,46 +228,58 @@ pub(crate) struct JvmExternalDeclarationIndex {
     dispatch_behavior_identity: OnceLock<StableDigest>,
 }
 
-pub(crate) fn get_or_build_external_declaration_index<'a>(
+pub(crate) fn get_or_build_external_declaration_index(
     analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
-    index: &'a OnceLock<Arc<JvmExternalDeclarationIndex>>,
+    index: &brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
+            Arc<JvmExternalDeclarationIndex>,
+        >,
+    >,
+    authority: (
+        brokk_bifrost_core::analyzer::model::Language,
+        brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+    ),
+    inputs: &crate::analyzer::jvm::hierarchy::DerivedMemo<(), ()>,
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
     store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
-) -> &'a JvmExternalDeclarationIndex {
-    index
-        .get_or_init(|| {
+) -> Arc<JvmExternalDeclarationIndex> {
+    crate::analyzer::jvm::authority::initialize_external_index(
+        analyzer,
+        authority,
+        index,
+        inputs,
+        || {
             let value = JvmExternalDeclarationIndex::build_for_project_with_inventory(
                 config, project, store,
             )
             .unwrap_or_else(|error| {
-                analyzer.record_degraded_persistent_fill(
-                    "jvm.external_index",
-                    &format!("inventory_store:{error}"),
-                );
+                analyzer.record_query_failure(error.clone());
                 eprintln!("JVM external inventory publication failed: {error}");
                 JvmExternalDeclarationIndex::build_for_project(config, project)
             });
-            // These diagnostics describe absent configuration or immutable
-            // content, not a failed provider attempt. Every other provider
-            // diagnostic is conservatively execution-dependent.
-            if value.production_diagnostics.iter().any(|diagnostic| {
-                !matches!(
+            for diagnostic in &value.production_diagnostics {
+                // These retained boundary statuses are not provider failures.
+                // In particular an unacquired JDK remains a query obligation,
+                // rather than invalidating unrelated workspace-only reads.
+                if matches!(
                     diagnostic.code.as_str(),
                     "jdk.home.unavailable"
                         | "java.source_binary_conflict"
                         | "artifact.kind"
                         | "artifact.role"
-                )
-            }) {
-                analyzer.record_degraded_persistent_fill(
-                    "jvm.external_index",
-                    &format!("provider:{:?}", value.production_diagnostics),
+                ) {
+                    continue;
+                }
+                analyzer.record_query_incomplete(
+                    brokk_bifrost_analysis::analyzer::common::external_index_incompleteness(
+                        diagnostic,
+                    ),
                 );
             }
             value
-        })
-        .as_ref()
+        },
+    )
 }
 
 pub(crate) fn java_inventory_providers(
@@ -2150,6 +2162,12 @@ impl JvmExternalDeclarationIndex {
         let mut index = Self::build_from_artifacts(artifacts);
         index.production_diagnostics.extend(diagnostics);
         let index = Arc::new(index);
+        if index.production_diagnostics.iter().any(|diagnostic| {
+            brokk_bifrost_analysis::analyzer::common::external_index_incompleteness(diagnostic)
+                .is_execution_dependent()
+        }) {
+            return index;
+        }
         Arc::clone(
             memo.lock()
                 .expect("external index memo poisoned")
@@ -2362,6 +2380,8 @@ impl JvmExternalDeclarationIndex {
     /// results. A single incomplete marker captures the only diagnostic state
     /// the resolution boundary observes: whether any producer diagnostic made
     /// a negative lookup uncertain.
+    /// Pure checksum of this immutable index, with no Project or analyzer reads.
+    /// The selecting analyzer records external authority inputs even on hits.
     pub(crate) fn dispatch_behavior_identity(&self) -> StableDigest {
         *self.dispatch_behavior_identity.get_or_init(|| {
             let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN);
@@ -3190,7 +3210,8 @@ fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
 /// the same cost the other seven languages already pay for their overlay-backed
 /// boundary evidence.
 pub(crate) struct JvmExternalDeclarations<'a> {
-    artifacts: &'a JvmExternalDeclarationIndex,
+    artifacts:
+        brokk_bifrost_analysis::analyzer::common::IndexOwner<'a, JvmExternalDeclarationIndex>,
     packs: Option<
         Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
     >,
@@ -3205,13 +3226,15 @@ pub(crate) struct JvmExternalDeclarations<'a> {
 
 impl<'a> JvmExternalDeclarations<'a> {
     pub(crate) fn new(
-        artifacts: &'a JvmExternalDeclarationIndex,
+        artifacts: impl Into<
+            brokk_bifrost_analysis::analyzer::common::IndexOwner<'a, JvmExternalDeclarationIndex>,
+        >,
         packs: Option<
             Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
         >,
     ) -> Self {
         Self {
-            artifacts,
+            artifacts: artifacts.into(),
             packs,
             selected_jdk_artifact_sha256: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -5801,6 +5824,62 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use brokk_bifrost_test_macros::hardwon;
+
+    type SourceDependencyPack = (
+        ResolvedDependency,
+        brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyPackPreparationOutcome,
+    );
+
+    #[track_caller]
+    fn prepare_source_dependency_pack(
+        temp: &tempfile::TempDir,
+        source_jar_name: &str,
+        source_entry: &str,
+        source: &[u8],
+        artifact_jar_name: &str,
+        coordinate: JvmMavenCoordinate,
+    ) -> SourceDependencyPack {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let source_jar = temp.path().join(source_jar_name);
+        write_zip_entry(&source_jar, source_entry, source);
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: temp.path().join(artifact_jar_name),
+            source_artifact_path: Some(source_jar),
+            coordinate: Some(coordinate),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            std::slice::from_ref(&dependency),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        (dependency, prepared)
+    }
+
+    #[track_caller]
+    fn assert_generated_source_pack(
+        prepared: &brokk_bifrost_semantic::analyzer::semantic_model::dependency::DependencyPackPreparationOutcome,
+        language: &str,
+    ) {
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.profile.artifacts_read, 1);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(prepared.packs[0].evidence.language, language);
+    }
+
     #[test]
     #[hardwon("ad9166babf21: exact external selection admitted an inaccessible private overload")]
     fn java_external_exact_selection_rejects_inaccessible_overloads() {
@@ -6263,7 +6342,7 @@ mod tests {
             "SELECT callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn='com.example.probe.Registry'",
             [provider], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(coverage, (true, true, true, true));
-        let declared = JvmExternalDeclarations::new(&stored, None)
+        let declared = JvmExternalDeclarations::new(stored.as_ref(), None)
             .resolve_member_spelling("com.example.probe.Registry.register", "app", |owner| {
                 stored.get(owner).cloned()
             })
@@ -7880,33 +7959,15 @@ mod tests {
 
     #[test]
     fn scala_library_dependency_uses_source_pack_and_exact_toolchain_evidence() {
-        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
-
         let temp = tempfile::tempdir().unwrap();
-        let source_jar = temp.path().join("scala-library-2.13.16-sources.jar");
-        write_zip_entry(
-            &source_jar,
+        let (dependency, prepared) = prepare_source_dependency_pack(
+            &temp,
+            "scala-library-2.13.16-sources.jar",
             "scala/example/LibraryApi.scala",
             b"package scala.example\ntrait LibraryApi { def value: String }\n",
+            "scala-library-2.13.16.jar",
+            JvmMavenCoordinate::new("org.scala-lang", "scala-library", "2.13.16"),
         );
-        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
-            artifact_path: temp.path().join("scala-library-2.13.16.jar"),
-            source_artifact_path: Some(source_jar),
-            coordinate: Some(JvmMavenCoordinate::new(
-                "org.scala-lang",
-                "scala-library",
-                "2.13.16",
-            )),
-            origin: JvmDependencyOrigin::MavenRepository,
-        });
 
         assert_eq!(dependency.evidence.language, "scala");
         assert_eq!(
@@ -7922,23 +7983,7 @@ mod tests {
             ExternalArtifactKind::ScalaSourceJar
         );
 
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let prepared = prepare_dependency_semantic_packs(
-            &catalog,
-            &JvmDependencyPackAdapter,
-            &[dependency],
-            &DependencyPackLimits::default(),
-            None,
-        );
-
-        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
-        assert_eq!(prepared.profile.artifacts_read, 1);
-        assert_eq!(prepared.packs.len(), 1);
-        assert_eq!(
-            prepared.packs[0].status,
-            DependencyPackPreparationStatus::Generated
-        );
-        assert_eq!(prepared.packs[0].evidence.language, "scala");
+        assert_generated_source_pack(&prepared, "scala");
     }
 
     #[test]
@@ -7996,33 +8041,15 @@ mod tests {
 
     #[test]
     fn kotlin_library_dependency_uses_source_pack_and_exact_toolchain_evidence() {
-        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
-
         let temp = tempfile::tempdir().unwrap();
-        let source_jar = temp.path().join("kotlin-stdlib-2.2.0-sources.jar");
-        write_zip_entry(
-            &source_jar,
+        let (dependency, prepared) = prepare_source_dependency_pack(
+            &temp,
+            "kotlin-stdlib-2.2.0-sources.jar",
             "kotlin/example/LibraryApi.kt",
             b"package kotlin.example\ninterface LibraryApi {\n    fun value(): String\n}\n",
+            "kotlin-stdlib-2.2.0.jar",
+            JvmMavenCoordinate::new("org.jetbrains.kotlin", "kotlin-stdlib", "2.2.0"),
         );
-        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
-            artifact_path: temp.path().join("kotlin-stdlib-2.2.0.jar"),
-            source_artifact_path: Some(source_jar),
-            coordinate: Some(JvmMavenCoordinate::new(
-                "org.jetbrains.kotlin",
-                "kotlin-stdlib",
-                "2.2.0",
-            )),
-            origin: JvmDependencyOrigin::MavenRepository,
-        });
 
         assert_eq!(dependency.evidence.language, "kotlin");
         assert_eq!(
@@ -8038,23 +8065,7 @@ mod tests {
             ExternalArtifactKind::KotlinSourceJar
         );
 
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        let prepared = prepare_dependency_semantic_packs(
-            &catalog,
-            &JvmDependencyPackAdapter,
-            &[dependency],
-            &DependencyPackLimits::default(),
-            None,
-        );
-
-        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
-        assert_eq!(prepared.profile.artifacts_read, 1);
-        assert_eq!(prepared.packs.len(), 1);
-        assert_eq!(
-            prepared.packs[0].status,
-            DependencyPackPreparationStatus::Generated
-        );
-        assert_eq!(prepared.packs[0].evidence.language, "kotlin");
+        assert_generated_source_pack(&prepared, "kotlin");
     }
 
     #[test]
@@ -8530,6 +8541,7 @@ mod tests {
         );
     }
 
+    #[track_caller]
     fn write_zip_entry(path: &Path, entry_name: &str, bytes: &[u8]) {
         brokk_bifrost_analysis::test_support::zip_helpers::write_zip_unwrap(
             path,

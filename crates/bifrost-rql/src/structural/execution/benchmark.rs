@@ -14,6 +14,8 @@
 //! deliberately distinguishes analyzer-generation cache warmth from sibling
 //! reuse inside one composed request.
 
+use brokk_bifrost_core::analyzer::project::AsProject;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
@@ -293,6 +295,7 @@ struct FixtureStats {
 /// store. This preserves real snapshot encoding and SQLite writes without
 /// allowing one cold candidate to hydrate another candidate's artifacts.
 struct PersistentFileSetProject {
+    project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
     sources: FileSetProject,
     persistence_root: PathBuf,
 }
@@ -304,6 +307,7 @@ impl PersistentFileSetProject {
         persistence_root: &Path,
     ) -> Self {
         Self {
+            project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
             sources: FileSetProject::new(source_root.to_path_buf(), paths),
             persistence_root: persistence_root.to_path_buf(),
         }
@@ -311,6 +315,25 @@ impl PersistentFileSetProject {
 }
 
 impl Project for PersistentFileSetProject {
+    fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.ignore_rules(self.as_project()));
+        self.sources.ignore_rules_digest()
+    }
+    fn project_read_slot(
+        &self,
+    ) -> Option<&brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot> {
+        Some(&self.project_reads)
+    }
+    fn install_read_recorder(
+        &self,
+        capability: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
+    ) -> bool {
+        self.sources.install_read_recorder(capability.clone());
+        self.project_reads.install(capability);
+        true
+    }
     fn root(&self) -> &Path {
         self.sources.root()
     }
@@ -320,18 +343,26 @@ impl Project for PersistentFileSetProject {
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
-        self.sources.analyzer_languages()
+        self.project_reads
+            .languages(self.as_project(), || self.sources.analyzer_languages())
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
         self.sources.all_files()
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        let _project_read = brokk_bifrost_core::analyzer::project_reads::listing_read(self);
         self.sources.analyzable_files(language)
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.path(self.as_project(), rel_path));
         self.sources.file_by_rel_path(rel_path)
     }
 

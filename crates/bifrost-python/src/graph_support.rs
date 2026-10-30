@@ -53,6 +53,9 @@ pub trait PythonSource:
 {
     /// Path-derived module units for `module_fq`; `None` when the store could
     /// not answer the path-symbol query at all.
+    /// Cover language-local memo inputs on hits as well as misses.
+    fn record_memo_inputs(&self) -> [u8; 32];
+
     fn path_module_fqn(&self, module_fq: &str) -> Option<Vec<CodeUnit>>;
 
     /// [`Self::path_module_fqn`] for a whole batch, resolved in one store
@@ -101,6 +104,16 @@ pub trait PythonSource:
 /// the export/importer walks needs it; the index build itself must not.
 pub trait PythonUsageSource: PythonSource {
     fn usage_index(&self) -> Arc<PythonUsageIndex>;
+    fn module_binding_timeline(
+        &self,
+        file: &ProjectFile,
+        build: &mut dyn FnMut() -> crate::usage_index::ModuleBindingTimeline,
+    ) -> Arc<crate::usage_index::ModuleBindingTimeline>;
+    fn scope_facts(
+        &self,
+        file: &ProjectFile,
+        build: &mut dyn FnMut() -> Option<crate::usage_index::PythonScopeFacts>,
+    ) -> Option<Arc<crate::usage_index::PythonScopeFacts>>;
 
     /// A cancelled initialization publishes no partial index.
     fn usage_index_with_cancellation(
@@ -256,6 +269,44 @@ impl std::fmt::Debug for PythonModuleSpellings {
 }
 
 impl PythonModuleSpellings {
+    /// Complete spelling authority, including selected packaging roots and executed path extensions.
+    /// Sorting rows removes hash iteration order; source text never enters this projection.
+    pub fn authority_rows(&self) -> Vec<String> {
+        let mut rows = Vec::new();
+        for (last, candidates) in &self.by_last_component {
+            for candidate in candidates {
+                let root = self
+                    .project()
+                    .and_then(|project| python_declared_import_root(project, &candidate.file))
+                    .map(|path| {
+                        brokk_bifrost_core::path_utils::workspace_relative_slash_path(&path)
+                    });
+                rows.push(format!(
+                    "module:{last:?}:{:?}:{:?}:{root:?}",
+                    brokk_bifrost_core::path_utils::rel_path_string(&candidate.file),
+                    candidate.components
+                ));
+            }
+        }
+        rows.extend(self.package_dirs.iter().map(|directory| {
+            format!(
+                "package:{:?}",
+                brokk_bifrost_core::path_utils::workspace_relative_slash_path(directory)
+            )
+        }));
+        for (directory, extensions) in &self.path_extensions {
+            for extension in extensions {
+                rows.push(format!(
+                    "extension:{:?}:{:?}",
+                    brokk_bifrost_core::path_utils::workspace_relative_slash_path(directory),
+                    brokk_bifrost_core::path_utils::workspace_relative_slash_path(extension)
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
     pub(crate) fn project(&self) -> Option<&dyn Project> {
         self.project.as_deref()
     }

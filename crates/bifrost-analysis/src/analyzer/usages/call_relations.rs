@@ -1,5 +1,6 @@
 //! Analyzer-owned call relations shared by query traversal and LSP call hierarchy.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -223,6 +224,10 @@ pub enum CallDispatchBoundaryKind {
 #[derive(Debug, Clone, Default)]
 #[doc(hidden)]
 pub struct CallDispatchLookup {
+    #[doc(hidden)]
+    pub native_resolution: Option<Box<crate::analyzer::usages::get_definition::NativeResolutionCompletion>>,
+    #[doc(hidden)]
+    pub model_member_selection: Option<Box<crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
     #[doc(hidden)]
     pub status: Option<DefinitionLookupStatus>,
     /// The refined external-root evidence for a
@@ -773,6 +778,7 @@ impl CallTargetOutcomeCache {
 
 #[derive(Default)]
 pub struct CallBindingCache {
+    reads: Option<super::common::QueryMemoReads>,
     conversions: super::call_conversion::CallConversionCache,
     formals: HashMap<(CodeUnit, usize), Option<FormalParameterLayout>>,
     python_receiver_is_class: HashMap<(ProjectFile, usize, usize), Option<bool>>,
@@ -790,6 +796,22 @@ pub struct CallBindingCache {
 }
 
 impl CallBindingCache {
+    fn with_read_capture<T>(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = self.reads.take();
+        let (value, reads) = super::common::capture_memo_reads(analyzer, || {
+            if let Some(previous) = previous {
+                crate::analyzer::usages::common::replay_memo_reads(&previous, analyzer);
+            }
+            operation(self)
+        });
+        self.reads = Some(reads);
+        value
+    }
+
     /// Attach compilation-local Rust call-target outcomes, when available.
     #[doc(hidden)]
     pub fn with_shared_call_target_outcomes(
@@ -812,6 +834,21 @@ impl CallBindingCache {
         Option<(String, crate::analyzer::semantic_model::Signature)>,
         crate::analyzer::usages::call_conversion::ConversionUnknown,
     > {
+        self.with_read_capture(analyzer, |cache| {
+            cache.select_model_signature_with_memo(analyzer, shape, caller_source, candidates)
+        })
+    }
+
+    fn select_model_signature_with_memo(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        shape: &super::call_shape::CallShapeReport,
+        caller_source: Option<(&ProjectFile, &str)>,
+        candidates: &[(String, crate::analyzer::semantic_model::Signature)],
+    ) -> Result<
+        Option<(String, crate::analyzer::semantic_model::Signature)>,
+        crate::analyzer::usages::call_conversion::ConversionUnknown,
+    > {
         self.conversions
             .select_model_signature(analyzer, shape, caller_source, candidates)
     }
@@ -819,6 +856,18 @@ impl CallBindingCache {
     /// Populate the adjacent shared conversion relation using this query's
     /// source cache and the already-selected signature.
     pub fn populate_conversions(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        report: &mut super::call_binding::CallBindingReport,
+        signature: Option<&str>,
+        model_signature: Option<(&str, &str, &crate::analyzer::semantic_model::Signature)>,
+    ) {
+        self.with_read_capture(analyzer, |cache| {
+            cache.populate_conversions_with_memo(analyzer, report, signature, model_signature)
+        })
+    }
+
+    fn populate_conversions_with_memo(
         &mut self,
         analyzer: &dyn IAnalyzer,
         report: &mut super::call_binding::CallBindingReport,
@@ -848,6 +897,17 @@ impl CallBindingCache {
         unit: &CodeUnit,
         actual_count: usize,
     ) -> Option<FormalParameterLayout> {
+        self.with_read_capture(analyzer, |cache| {
+            cache.formal_layout_with_memo(analyzer, unit, actual_count)
+        })
+    }
+
+    fn formal_layout_with_memo(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        actual_count: usize,
+    ) -> Option<FormalParameterLayout> {
         self.formals
             .entry((unit.clone(), actual_count))
             .or_insert_with(|| formal_slots_for_unit(analyzer, unit, actual_count))
@@ -857,6 +917,18 @@ impl CallBindingCache {
     /// Resolve this exact callee range. Pipeline consumers batch their selected
     /// candidates first; other consumers and late misses demand only this site.
     pub fn resolved_call_target(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_range: Range,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<CallTargetLookupOutcome> {
+        self.with_read_capture(analyzer, |cache| {
+            cache.resolved_call_target_with_memo(analyzer, file, callee_range, cancellation)
+        })
+    }
+
+    fn resolved_call_target_with_memo(
         &mut self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
@@ -899,6 +971,18 @@ impl CallBindingCache {
     /// The per-file session keeps parsing and Rust's macro visibility walk
     /// query-local while reusing the exact source snapshot across call sites.
     pub fn resolved_external_call_dispatch(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        call_span: Range,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<ResolverOwnedExternalCallDispatch> {
+        self.with_read_capture(analyzer, |cache| {
+            cache.resolved_external_call_dispatch_with_memo(analyzer, file, call_span, cancellation)
+        })
+    }
+
+    fn resolved_external_call_dispatch_with_memo(
         &mut self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
@@ -950,6 +1034,15 @@ impl CallBindingCache {
             for reads in &prefetch.reads {
                 replay_query_reads(analyzer, reads);
             }
+            if let Some(ledger) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+                debug_assert!(
+                    prefetch
+                        .reads
+                        .iter()
+                        .all(|reads| reads.keys().iter().all(|key| ledger.keys().contains(key))),
+                    "a shared prefetch hit must replay all retained inputs"
+                );
+            }
             self.call_targets.extend(
                 prefetch
                     .targets
@@ -986,6 +1079,17 @@ impl CallBindingCache {
     /// File groups share resolver setup, without speculating about other calls.
     /// All retained groups and outcomes die with this query or policy compile.
     pub fn prefetch_selected_call_targets(
+        &mut self,
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        candidates: impl IntoIterator<Item = (ProjectFile, Range)>,
+        cancellation: Option<&CancellationToken>,
+    ) -> crate::analyzer::store::Result<()> {
+        self.with_read_capture(workspace.analyzer(), |cache| {
+            cache.prefetch_selected_call_targets_with_memo(workspace, candidates, cancellation)
+        })
+    }
+
+    fn prefetch_selected_call_targets_with_memo(
         &mut self,
         workspace: &crate::analyzer::WorkspaceAnalyzer,
         candidates: impl IntoIterator<Item = (ProjectFile, Range)>,
@@ -1102,23 +1206,28 @@ pub enum CallBindingStatus {
     Unavailable,
 }
 
-#[derive(Default)]
 #[doc(hidden)]
 pub struct CallSyntaxCache {
-    files: HashMap<ProjectFile, Option<Arc<FileFacts>>>,
+    files: super::common::QueryReadMemo<ProjectFile, Option<Arc<FileFacts>>>,
+}
+
+impl Default for CallSyntaxCache {
+    fn default() -> Self {
+        Self {
+            files: super::common::query_read_memo(),
+        }
+    }
 }
 
 impl CallSyntaxCache {
-    fn facts(&mut self, analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<&Arc<FileFacts>> {
-        self.files
-            .entry(file.clone())
-            .or_insert_with(|| {
-                analyzer
-                    .structural_fact_providers()
-                    .into_iter()
-                    .find_map(|provider| provider.structural_facts(file))
-            })
-            .as_ref()
+    fn facts(&mut self, analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<Arc<FileFacts>> {
+        let value = super::common::query_memo_value(&self.files, analyzer, file, || {
+            analyzer
+                .structural_fact_providers()
+                .into_iter()
+                .find_map(|provider| provider.structural_facts(file))
+        });
+        (*value).clone()
     }
 
     fn syntax_for_range(
@@ -1128,7 +1237,7 @@ impl CallSyntaxCache {
         start_byte: usize,
         end_byte: usize,
     ) -> Option<CallSiteSyntax> {
-        call_site_syntax_for_reference(self.facts(analyzer, file)?, start_byte, end_byte)
+        call_site_syntax_for_reference(self.facts(analyzer, file)?.as_ref(), start_byte, end_byte)
     }
 
     fn range_is_keyword_label(
@@ -1139,7 +1248,7 @@ impl CallSyntaxCache {
         end_byte: usize,
     ) -> bool {
         self.facts(analyzer, file)
-            .is_some_and(|facts| range_is_call_keyword_label(facts, start_byte, end_byte))
+            .is_some_and(|facts| range_is_call_keyword_label(&facts, start_byte, end_byte))
     }
 }
 
@@ -1549,6 +1658,7 @@ impl CallDispatchSession {
             max_candidates,
             cancellation,
             None,
+            None,
         )
     }
 
@@ -1561,6 +1671,7 @@ impl CallDispatchSession {
         max_candidates: usize,
         cancellation: Option<&CancellationToken>,
         definition_session: Option<&mut super::get_definition::ScalarCallTargetSession<'a>>,
+        member_selection: Option<&crate::analyzer::semantic::DeferredMemberSelection>,
     ) -> CallDispatchLookup {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return CallDispatchLookup {
@@ -1652,33 +1763,18 @@ impl CallDispatchSession {
         {
             return lookup;
         }
-        let callee_range = match exact_call_reference_for_call(tree, self.language, call_span) {
-            Some(ExactCallReference::Resolvable(range)) => range,
-            Some(ExactCallReference::Unsupported(ExactCallReferenceGap::RubyCallableObject)) => {
-                return unresolved_dispatch_lookup(
-                    DefinitionLookupStatus::NoDefinition,
-                    "unsupported_ruby_callable_object_dispatch: resolving `receiver.(...)` requires value/heap callable-target information"
-                        .to_string(),
-                    work,
-                );
-            }
-            Some(ExactCallReference::Unsupported(ExactCallReferenceGap::CallOfValue)) => {
-                return unresolved_dispatch_lookup(
-                    DefinitionLookupStatus::NoDefinition,
-                    "unsupported_call_of_value: callee expression does not name a declaration; dispatch requires callable-value information".to_string(),
-                    work,
-                );
-            }
-            None => {
-                return unresolved_dispatch_lookup(
-                    DefinitionLookupStatus::InvalidLocation,
-                    format!(
-                        "range [{}, {}) is not one exact supported call expression in {}",
-                        call_span.start_byte, call_span.end_byte, self.file
-                    ),
-                    work,
-                );
-            }
+        let callee_range = match classify_exact_reference_for_dispatch(
+            exact_call_reference_for_call(tree, self.language, call_span),
+            || {
+                format!(
+                    "range [{}, {}) is not one exact supported call expression in {}",
+                    call_span.start_byte, call_span.end_byte, self.file
+                )
+            },
+            work,
+        ) {
+            ControlFlow::Continue(range) => range,
+            ControlFlow::Break(lookup) => return lookup,
         };
         // Batched resolution gives each callee range the outcome a batch of
         // that range alone gives: the per-file prefetch of `CallBindingCache`
@@ -1820,6 +1916,7 @@ impl CallDispatchSession {
             tree,
             &callee_range,
             cancellation,
+            member_selection,
         );
         lookup
     }
@@ -1835,6 +1932,7 @@ fn refine_selector_call_target_at_call(
     tree: &tree_sitter::Tree,
     callee_range: &Range,
     cancellation: Option<&CancellationToken>,
+    member_selection: Option<&crate::analyzer::semantic::DeferredMemberSelection>,
 ) {
     if let Some(support) =
         language_support_for_hook(language_for_file(file), "refine_selector_call_target")
@@ -1848,6 +1946,7 @@ fn refine_selector_call_target_at_call(
             tree,
             callee_range,
             cancellation,
+            member_selection,
         );
     }
 }
@@ -1984,35 +2083,18 @@ impl CallRelationService {
                 lookups[index] = Some(lookup);
                 continue;
             }
-            match exact_call_reference_for_call(tree, language, call_span) {
-                Some(ExactCallReference::Resolvable(range)) => resolvable.push((index, range)),
-                Some(ExactCallReference::Unsupported(
-                    ExactCallReferenceGap::RubyCallableObject,
-                )) => {
-                    lookups[index] = Some(unresolved_dispatch_lookup(
-                        DefinitionLookupStatus::NoDefinition,
-                        "unsupported_ruby_callable_object_dispatch: resolving `receiver.(...)` requires value/heap callable-target information"
-                            .to_string(),
-                        work,
-                    ));
-                }
-                Some(ExactCallReference::Unsupported(ExactCallReferenceGap::CallOfValue)) => {
-                    lookups[index] = Some(unresolved_dispatch_lookup(
-                        DefinitionLookupStatus::NoDefinition,
-                        "unsupported_call_of_value: callee expression does not name a declaration; dispatch requires callable-value information".to_string(),
-                        work,
-                    ));
-                }
-                None => {
-                    lookups[index] = Some(unresolved_dispatch_lookup(
-                        DefinitionLookupStatus::InvalidLocation,
-                        format!(
-                            "range [{}, {}) is not one exact supported call expression in {file}",
-                            call_span.start_byte, call_span.end_byte
-                        ),
-                        work,
-                    ));
-                }
+            match classify_exact_reference_for_dispatch(
+                exact_call_reference_for_call(tree, language, call_span),
+                || {
+                    format!(
+                        "range [{}, {}) is not one exact supported call expression in {file}",
+                        call_span.start_byte, call_span.end_byte
+                    )
+                },
+                work,
+            ) {
+                ControlFlow::Continue(range) => resolvable.push((index, range)),
+                ControlFlow::Break(lookup) => lookups[index] = Some(lookup),
             }
         }
         let references = resolvable
@@ -2068,6 +2150,7 @@ impl CallRelationService {
                     tree,
                     callee_range,
                     cancellation,
+                    None,
                 );
             }
             lookups[*index] = Some(lookup);
@@ -2780,6 +2863,37 @@ pub fn unresolved_dispatch_lookup(
     }
 }
 
+fn classify_exact_reference_for_dispatch(
+    reference: Option<ExactCallReference>,
+    invalid_location: impl FnOnce() -> String,
+    work: CallRelationWork,
+) -> ControlFlow<CallDispatchLookup, Range> {
+    match reference {
+        Some(ExactCallReference::Resolvable(range)) => ControlFlow::Continue(range),
+        Some(ExactCallReference::Unsupported(ExactCallReferenceGap::RubyCallableObject)) => {
+            ControlFlow::Break(unresolved_dispatch_lookup(
+                DefinitionLookupStatus::NoDefinition,
+                "unsupported_ruby_callable_object_dispatch: resolving `receiver.(...)` requires value/heap callable-target information"
+                    .to_string(),
+                work,
+            ))
+        }
+        Some(ExactCallReference::Unsupported(ExactCallReferenceGap::CallOfValue)) => {
+            ControlFlow::Break(unresolved_dispatch_lookup(
+                DefinitionLookupStatus::NoDefinition,
+                "unsupported_call_of_value: callee expression does not name a declaration; dispatch requires callable-value information"
+                    .to_string(),
+                work,
+            ))
+        }
+        None => ControlFlow::Break(unresolved_dispatch_lookup(
+            DefinitionLookupStatus::InvalidLocation,
+            invalid_location(),
+            work,
+        )),
+    }
+}
+
 fn unresolved_call_boundary(
     status: DefinitionLookupStatus,
     callee_text: Option<Box<str>>,
@@ -3038,6 +3152,8 @@ fn apply_call_target_outcome(
         .unique_incomplete_native_source_candidate()
         .map(|(_, reason)| Box::<str>::from(reason));
     let CallTargetLookupOutcome {
+        native_resolution,
+        model_member_selection,
         outcome,
         authority,
         call_application,
@@ -3048,6 +3164,8 @@ fn apply_call_target_outcome(
         unproven_link_unit,
         truncated,
     } = outcome;
+    lookup.native_resolution = native_resolution;
+    lookup.model_member_selection = model_member_selection;
     let exact_external_callee = exact_external_call
         .as_ref()
         .map(|proof| Box::<str>::from(proof.canonical_callee()));
@@ -4361,6 +4479,38 @@ pub mod registry_fixture_support {
     }
 }
 
+/// Admit a native incoming-call request before resolving its language analyzer.
+/// The diagnostic is constructed only after cancellation and target validation.
+pub fn native_incoming_preflight(
+    target: &CodeUnit,
+    limits: CallRelationLimits,
+    cancellation: &CancellationToken,
+    budget_diagnostic: impl FnOnce() -> CallRelationDiagnostic,
+) -> Option<CallRelationResult> {
+    if cancellation.is_cancelled() {
+        return Some(CallRelationResult {
+            cancelled: true,
+            proof_authority: UsageProofAuthority::Native,
+            ..CallRelationResult::default()
+        });
+    }
+    if !is_call_relation_unit(target) {
+        return Some(CallRelationResult {
+            proof_authority: UsageProofAuthority::Native,
+            ..CallRelationResult::default()
+        });
+    }
+    if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+        return Some(CallRelationResult {
+            truncated: true,
+            proof_authority: UsageProofAuthority::Native,
+            diagnostics: vec![budget_diagnostic()],
+            ..CallRelationResult::default()
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4431,6 +4581,8 @@ mod tests {
             "relay",
         );
         let outcome = |status, structure_unavailable, truncated| CallTargetLookupOutcome {
+            native_resolution: None,
+            model_member_selection: None,
             outcome: DefinitionLookupOutcome {
                 modeled_definitions: Vec::new(),
                 status,

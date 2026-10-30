@@ -1,7 +1,5 @@
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 
-use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
-
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 
 use brokk_bifrost_analysis::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
@@ -103,7 +101,6 @@ use brokk_bifrost_js_ts::access_chain::resolve_import_member_chain;
 use brokk_bifrost_js_ts::graph::source::declaration_ids_for_unit;
 use brokk_bifrost_js_ts::imports::js_ts_direct_import_export_name;
 use brokk_bifrost_js_ts::imports::js_ts_module_identity;
-use brokk_bifrost_js_ts::imports::js_ts_module_specifier_probed_paths;
 use brokk_bifrost_js_ts::imports::require_call_module_specifier;
 use brokk_bifrost_js_ts::imports::resolve_js_ts_direct_import_candidates;
 use brokk_bifrost_js_ts::imports::resolve_js_ts_imported_member_chain;
@@ -1902,7 +1899,6 @@ fn resolve_js_ts_module_as_namespace(
         file, module, language, aliases,
     );
     if files.is_empty() {
-        record_unresolved_module_specifier(analyzer, file, language, module, aliases);
         return gated_boundary(
             || !is_bare_js_ts_specifier(module),
             format!("`{module}` is a package import outside this partial workspace analysis"),
@@ -2178,34 +2174,6 @@ fn ts_global_object_receiver_type(receiver: &str) -> Option<&'static str> {
     }
 }
 
-/// Record the workspace paths one module specifier probed and did not find.
-///
-/// A specifier that resolves to a file makes the reader open it, and the file
-/// key names what it read. A specifier that resolves to nothing makes the
-/// reader return with no key at all, and yet the answer is about the
-/// workspace: the sibling could be added in the next commit. Naming each
-/// probed path is the exact form of that dependency -- one key per path the
-/// resolver stat'ed -- and the head answers it from its own path map.
-fn record_unresolved_module_specifier(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    language: Language,
-    module: &str,
-    aliases: Option<&AliasResolver>,
-) {
-    if !brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
-        analyzer.read_ledger_attached()
-    }) {
-        return;
-    }
-    for candidate in js_ts_module_specifier_probed_paths(file, module, language, aliases) {
-        analyzer.record_read(ReadKey::path_absent(
-            language,
-            rel_path_string(&candidate).as_str(),
-        ));
-    }
-}
-
 /// What a JS/TS import or `export ... from` specifier token names in the module
 /// its statement points at.
 ///
@@ -2280,7 +2248,6 @@ fn resolve_js_ts_module_binding(
         file, module, language, aliases,
     );
     if files.is_empty() {
-        record_unresolved_module_specifier(analyzer, file, language, module, aliases);
         // Only a bare specifier (`react`, `lodash`) is a confident external
         // package boundary. A relative/absolute specifier (`./`, `../`, `/`)
         // that resolves to no file is an in-workspace path that did not land —
@@ -2395,9 +2362,6 @@ fn jsts_local_dotted_outcome(
         js_ts_candidates_outcome(analyzer, local.candidates)
     };
     if local.incomplete {
-        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-            format!("property reaching for `{reference}`").into_boxed_str(),
-        ));
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
                 claim: None,
             kind: "analysis_incomplete".to_string(),
@@ -2616,6 +2580,11 @@ fn jsts_exact_local_dotted_candidates(
             active_cancellation.as_ref().unwrap_or(&local_cancellation),
         )
     });
+    record_property_evidence_completeness(
+        ctx.analyzer,
+        evidence.as_ref(),
+        &format!("{}.{target_member}", ctx.receiver),
+    );
     let evidence_complete = evidence
         .as_ref()
         .is_some_and(PropertySourceQueryResult::properties_complete);
@@ -2678,17 +2647,30 @@ fn jsts_exact_local_dotted_candidates(
         })
         .collect();
     if !evidence_complete && candidates.is_empty() && !has_local_definition {
-        ctx.analyzer
-            .record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-                format!("property reaching for `{}.{target_member}`", ctx.receiver)
-                    .into_boxed_str(),
-            ));
         return None;
     }
     Some(JstsLocalDottedCandidates {
         candidates,
         incomplete: !evidence_complete,
     })
+}
+
+fn record_property_evidence_completeness(
+    analyzer: &dyn IAnalyzer,
+    evidence: Option<&PropertySourceQueryResult>,
+    reference: &str,
+) {
+    if evidence.is_some_and(PropertySourceQueryResult::properties_complete) {
+        return;
+    }
+    let detail = format!("property reaching for `{reference}`").into_boxed_str();
+    let reason = if evidence.is_some_and(PropertySourceQueryResult::properties_execution_dependent)
+    {
+        QueryReadIncomplete::SemanticEvidenceUnavailable(detail)
+    } else {
+        QueryReadIncomplete::SemanticEvidenceGap(detail)
+    };
+    analyzer.record_query_incomplete(reason);
 }
 
 fn jsts_property_definition_reaches(
@@ -4643,6 +4625,128 @@ mod tests {
     use brokk_bifrost_js_ts::syntax::slice;
     use brokk_bifrost_js_ts::test_support::parse_javascript;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#2445: deterministic property gaps were mistaken for execution failure")]
+    fn property_gap_keeps_partial_outcome_bounded_but_limit_refuses_reuse() {
+        use super::{
+            JstsLocalDottedCandidates, PropertySourceQueryResult, jsts_local_dotted_outcome,
+            record_property_evidence_completeness,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::CfgAlgorithmError;
+        use brokk_bifrost_analysis::analyzer::semantic::ids::{ProgramPointId, SourceMappingId};
+        use brokk_bifrost_analysis::analyzer::semantic::oracle::DurableIdentityError;
+        use brokk_bifrost_analysis::analyzer::semantic::property_reaching::{
+            PropertyReachingIncompleteReason as Projection,
+            PropertySourceQueryIncompleteReason as Reason, PropertySourceQueryState as State,
+        };
+        use brokk_bifrost_analysis::analyzer::{MultiAnalyzer, capture_query_reads};
+        let analyzer = MultiAnalyzer::default();
+        let projection = |reason| Reason::PropertyProjection(Box::new(reason));
+        for (reason, execution) in [
+            (Reason::CapabilityUnsupported, false),
+            (Reason::Unknown, false),
+            (Reason::Materialization(State::Unsupported), false),
+            (Reason::ProcedureRelations(State::Unproven), false),
+            (Reason::PropertyProjectionIncomplete, false),
+            (projection(Projection::EvaluationSourceUnknown), false),
+            (
+                projection(Projection::DurableIdentityUnavailable {
+                    point: ProgramPointId::new(0),
+                    event_index: 0,
+                    reason: DurableIdentityError::StaleRow,
+                }),
+                true,
+            ),
+            (
+                projection(Projection::SourceMappingUnavailable {
+                    point: ProgramPointId::new(0),
+                    event_index: 0,
+                    source: SourceMappingId::new(0),
+                }),
+                true,
+            ),
+            (Reason::Materialization(State::ExceededBudget), true),
+            (Reason::Cancelled, true),
+            (projection(Projection::Cancelled), true),
+            (
+                projection(Projection::Reachability(CfgAlgorithmError::InvalidNode(
+                    ProgramPointId::new(0),
+                ))),
+                true,
+            ),
+            (
+                projection(Projection::ReachingDefinitions(
+                    CfgAlgorithmError::InvalidNode(ProgramPointId::new(0)),
+                )),
+                true,
+            ),
+            (
+                projection(Projection::Dominators(CfgAlgorithmError::InvalidNode(
+                    ProgramPointId::new(0),
+                ))),
+                true,
+            ),
+            (
+                projection(Projection::ReachingPairs(CfgAlgorithmError::InvalidNode(
+                    ProgramPointId::new(0),
+                ))),
+                true,
+            ),
+            (
+                projection(Projection::InputRelationBudgetExceeded {
+                    limit: 0,
+                    observed: 1,
+                }),
+                true,
+            ),
+            (
+                projection(Projection::ReachingPairBudgetExceeded {
+                    limit: 0,
+                    observed: 1,
+                }),
+                true,
+            ),
+        ] {
+            let property_projection = matches!(&reason, Reason::PropertyProjection(_));
+            let evidence = PropertySourceQueryResult::from_parts(
+                Vec::new(),
+                Vec::new(),
+                vec![reason],
+                Vec::new(),
+            );
+            if property_projection {
+                assert!(
+                    evidence.evaluations_complete(),
+                    "property-side failure changed evaluation completeness: {evidence:?}"
+                );
+            }
+            let (outcome, reads) = capture_query_reads(&analyzer, || {
+                record_property_evidence_completeness(&analyzer, Some(&evidence), "owner.run");
+                jsts_local_dotted_outcome(
+                    &analyzer,
+                    "owner.run",
+                    JstsLocalDottedCandidates {
+                        candidates: Vec::new(),
+                        incomplete: !evidence.properties_complete(),
+                    },
+                )
+            });
+            assert!(
+                outcome
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == "analysis_incomplete")
+            );
+            assert_eq!(
+                reads.execution_dependences() > 0,
+                execution,
+                "{evidence:?}: {reads:?}"
+            );
+            assert_eq!(reads.unattributed_reads(), 0);
+            assert_eq!(reads.is_bounded(), !execution, "{evidence:?}: {reads:?}");
+        }
+    }
 
     #[test]
     #[hardwon("#4271: a generator var was assigned to the enclosing program scope")]

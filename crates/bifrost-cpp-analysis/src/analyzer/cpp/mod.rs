@@ -25,6 +25,7 @@ use crate::analyzer::usages::get_definition::cpp::resolve_cpp_bounded;
 use crate::analyzer::usages::get_type::resolve_cpp_type_bounded;
 use brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::ForwardQueryProvider;
 use brokk_bifrost_analysis::analyzer::assignment_facts::OverwrittenLocalCandidates;
+use brokk_bifrost_analysis::analyzer::capture_query_reads;
 use brokk_bifrost_analysis::analyzer::clone_detection::detect_structural_clone_smells_for_corpus;
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
@@ -47,6 +48,8 @@ use brokk_bifrost_analysis::analyzer::languages::fqn_bulk_nodes;
 use brokk_bifrost_analysis::analyzer::languages::overloaded_function_fqns;
 use brokk_bifrost_analysis::analyzer::languages::ready_preflight;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+use brokk_bifrost_analysis::analyzer::read_ledger::{FactSubject, ReadKey, WorkspaceFactFamily};
+use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::AnalyzerStoreContext;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress;
@@ -56,6 +59,10 @@ use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOu
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
 use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    AuthorityInputs, CaptureScopedMemo, WorkspaceAuthorityMemo, memo_attribution,
+    workspace_authority_file_input,
+};
 use brokk_bifrost_core::analyzer::capabilities::DescendantIndexVariant;
 use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
@@ -89,7 +96,7 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_cpp::adapter::parse_cpp_file_with_object_macro_fields;
 use brokk_bifrost_cpp::clones::cpp_clone_parser;
-use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
+use brokk_bifrost_cpp::compile_context::CppCompileContexts;
 pub(crate) use brokk_bifrost_cpp::declarations::CppRecoveredExportClassIndex;
 pub(crate) use brokk_bifrost_cpp::declarations::{
     ObjectMacroFieldEvent, collect_cpp_object_macro_field_events,
@@ -151,26 +158,44 @@ mod structural;
 #[cfg(test)]
 mod tests;
 
+type IncludeTargetSnapshot = (Arc<IncludeTargetIndex>, Option<StableDigest>);
+type ReverseIncludeIndex = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
+
 type CallMacroHazards = Arc<CachedFileRead<HashMap<(usize, usize), bool>>>;
 
 /// A snapshot-derived value and the evidence that prevents a complete answer.
 /// Keeping them in one weighted entry makes eviction and invalidation atomic.
 struct CachedFileRead<T> {
     value: Arc<T>,
+    reads: Arc<[ReadKey]>,
+    unattributed_reads: usize,
+    execution_dependences: usize,
     incompleteness: Box<[brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete]>,
 }
 
 impl<T> CachedFileRead<T> {
     fn replay(&self, analyzer: &CppAnalyzer) -> Arc<T> {
+        brokk_bifrost_analysis::analyzer::replay_query_read_receipt(
+            analyzer,
+            self.reads.iter().cloned(),
+            self.unattributed_reads,
+            self.execution_dependences,
+        );
         for reason in &self.incompleteness {
             analyzer.record_query_incomplete(reason.clone());
         }
         Arc::clone(&self.value)
     }
 
-    fn complete(value: Arc<T>) -> Arc<Self> {
+    fn complete(
+        value: Arc<T>,
+        reads: &brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger,
+    ) -> Arc<Self> {
         Arc::new(Self {
             value,
+            reads: reads.keys().into(),
+            unattributed_reads: reads.unattributed_reads(),
+            execution_dependences: reads.execution_dependences(),
             incompleteness: Box::default(),
         })
     }
@@ -201,7 +226,7 @@ pub struct CppAnalyzer {
         ),
         Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
     >,
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    imported_code_units: WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<CodeUnit>>>>,
     /// Owner-specific fields materialized from object-like macros in the
     /// owner's include closure. This remains an analyzer overlay because the
     /// donor macro and consuming aggregate live in different parsed blobs.
@@ -229,8 +254,8 @@ pub struct CppAnalyzer {
         Arc<CachedFileRead<expression_branch_facts::CAssignmentCandidates>>,
     >,
     cpp_overwritten_candidates_by_procedure:
-        Cache<CAssignmentCandidateKey, Arc<OverwrittenLocalCandidates>>,
-    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+        WorkspaceAuthorityMemo<Cache<CAssignmentCandidateKey, Arc<OverwrittenLocalCandidates>>>,
+    referencing_files: WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     direct_ancestors: Cache<CodeUnit, Arc<CachedFileRead<Vec<CodeUnit>>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<CachedFileRead<Vec<CodeUnit>>>>,
     /// The per-file structured using index behind
@@ -242,14 +267,16 @@ pub struct CppAnalyzer {
     /// The immutable analyzer generation and reference root determine the
     /// language and source-only guard proof without evaluating that proof
     /// before a cache lookup.
-    unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, ProjectFile), bool>,
+    unconditional_include_reachability:
+        WorkspaceAuthorityMemo<Cache<(ProjectFile, ProjectFile, ProjectFile), bool>>,
     /// The declaration-strength answer behind
     /// [`CppSource::cached_class_declaration_strength`]. Memoized here rather
     /// than per query for the same reason as `source_using_index_by_file`: the
     /// C++ inverse scan asks it once per declaration seed, and on a translation
     /// unit the parser could not fully recover each ask re-derives the
     /// export-macro recovery shapes from the file's `ERROR` subtrees (#1496).
-    class_declaration_strength: Cache<CodeUnit, CppClassDeclarationStrength>,
+    class_declaration_strength:
+        WorkspaceAuthorityMemo<Cache<CodeUnit, CppClassDeclarationStrength>>,
     /// The per-file embedded export-macro class recovery behind
     /// [`CppSource::recovered_export_class_index`], memoized here for the same
     /// reason as `source_using_index_by_file` (#1496).
@@ -265,7 +292,8 @@ pub struct CppAnalyzer {
     /// [`projection::CppCReading`]. `None` is a real, memoized answer: it says
     /// the two readings of that blob agree, so every question about the C view
     /// is answered from the file's own row-set.
-    c_readings_by_file: Cache<ProjectFile, Option<Arc<projection::CppCReading>>>,
+    c_readings_by_file:
+        WorkspaceAuthorityMemo<Cache<ProjectFile, Option<Arc<projection::CppCReading>>>>,
     /// The per-file answer behind [`Self::header_language_attribution`].
     ///
     /// The attribution reads only the compile database and the transitive
@@ -275,7 +303,8 @@ pub struct CppAnalyzer {
     /// visited AST node, and each ask normalized the path of the file and of
     /// every translation unit reaching it: 9.6 percent of the BehaviorTree
     /// `integer_sequence` query was this one per-file question (#1496).
-    header_language_attribution_by_file: Cache<ProjectFile, HeaderLanguageAttribution>,
+    header_language_attribution_by_file:
+        WorkspaceAuthorityMemo<Cache<ProjectFile, HeaderLanguageAttribution>>,
     /// The object-like field-list macro events of one file, in source order.
     ///
     /// [`Self::build_macro_composed_fields`] collects these for every file in
@@ -288,7 +317,8 @@ pub struct CppAnalyzer {
     /// Every callable declaration sharing one member identifier, bucketed by
     /// owner terminal. The identifier-index store read and the bucketing pass
     /// that produce it are what #1908 stopped repeating per queried fq name.
-    reconcile_candidates_by_identifier: Cache<String, Arc<CppReconcileCandidates>>,
+    reconcile_candidates_by_identifier:
+        WorkspaceAuthorityMemo<Cache<String, Arc<CppReconcileCandidates>>>,
     /// #1134 resolution-time identity-reconciliation overlay. Maps the canonical
     /// `fq_name` a header declaration carries to the provisional out-of-line
     /// member definition `CodeUnit`s whose per-file identity extraction could not
@@ -300,9 +330,14 @@ pub struct CppAnalyzer {
     /// exactly that pair, so the old per-fq key never hit for a bare identifier
     /// whose namesakes have distinct owners: 1,277 distinct keys, 1,277
     /// identical rebuilds (#1908). See `reconciled_definitions`.
-    reconciled_definitions_by_group: Cache<CppReconcileGroupKey, Arc<CppReconciledGroup>>,
-    include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
-    reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reconciled_definitions_by_group:
+        WorkspaceAuthorityMemo<Cache<CppReconcileGroupKey, Arc<CppReconciledGroup>>>,
+    include_target_index: Arc<
+        WorkspaceAuthorityMemo<
+            brokk_bifrost_analysis::analyzer::common::QueryCacheCell<IncludeTargetSnapshot>,
+        >,
+    >,
+    reverse_include_index: WorkspaceAuthorityMemo<Arc<PoolSafeMemo<ReverseIncludeIndex>>>,
     /// The transitive answer over [`Self::reverse_include_index`]: for a
     /// header, every workspace translation unit (`.c`/`.cc`/`.cpp`/`.cxx`)
     /// whose include closure reaches it. Built once over the whole include
@@ -311,7 +346,8 @@ pub struct CppAnalyzer {
     /// `reverse_include_index` does -- as bitsets over the graph's SCC
     /// condensation, which is what took envoy's build from 1,362 s to seconds
     /// (#2899). Backs [`Self::header_language_attribution`].
-    transitive_reverse_tu_index: Arc<PoolSafeMemo<TransitiveReverseTuIndex>>,
+    transitive_reverse_tu_index:
+        WorkspaceAuthorityMemo<Arc<PoolSafeMemo<TransitiveReverseTuIndex>>>,
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
@@ -321,9 +357,15 @@ pub struct CppAnalyzer {
     /// of the include-closure builds in the incident trace were test-side, and
     /// the request had already said `include_tests: false`). Two cells at most:
     /// the exclusion verdict is a pure function of the analyzer and the file.
-    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
-    compile_contexts: Arc<OnceLock<CppCompileContexts>>,
-    external_header_closures: Arc<KeyedPoolSafeMemo<ProjectFile, external::ReachedExternalHeaders>>,
+    direct_descendant_index: WorkspaceAuthorityMemo<
+        Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+    >,
+    compile_contexts: WorkspaceAuthorityMemo<
+        Arc<brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Arc<CppCompileContexts>>>,
+    >,
+    external_header_closures: WorkspaceAuthorityMemo<
+        Arc<KeyedPoolSafeMemo<ProjectFile, external::ReachedExternalHeaders>>,
+    >,
     #[cfg(any(test, feature = "test-support"))]
     authoritative_visibility_build_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -417,11 +459,17 @@ impl ForwardQueryProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        self.inner.read_capability()
+    }
+
     pub(crate) fn update_all_with_progress(
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        self.with_updated_inner(self.inner.update_all_with_progress(progress))
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            self.with_updated_inner(self.inner.update_all_with_progress(progress))
+        })
     }
 
     /// Share snapshot-deterministic file reads, including their incompleteness.
@@ -437,12 +485,18 @@ impl CppAnalyzer {
         K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
         T: Default + Send + Sync + 'static,
     {
+        // Master's replayable fill refuses to cache an execution-dependent,
+        // cancelled or snapshot-crossing build; the entry also keeps this
+        // build's read keys so a warm hit replays them into the reader.
         match cache.try_get_with_by_ref(key, || {
             brokk_bifrost_analysis::analyzer::common::replayable_query_cache_fill(self, || {
                 let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
-                let value = read();
+                let (value, reads) = capture_query_reads(self, read);
                 Arc::new(CachedFileRead {
                     value: Arc::new(value),
+                    reads: reads.keys().into(),
+                    unattributed_reads: reads.unattributed_reads(),
+                    execution_dependences: reads.execution_dependences(),
                     incompleteness: scope.captured_read_incompleteness().into_boxed_slice(),
                 })
             })
@@ -506,24 +560,37 @@ impl CppAnalyzer {
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
     ) -> Arc<OverwrittenLocalCandidates> {
         let key = (procedure.artifact().materialization_id(), procedure.id());
-        match self
-            .cpp_overwritten_candidates_by_procedure
-            .try_get_with_by_ref(&key, || {
-                let filled = brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                    let scope = AnalyzerQueryScope::new(self);
-                    let value = expression_branch_facts::build_cpp_overwritten_local_candidates(
-                        workspace, procedure, cancellation,
-                    );
-                    if value.reason.is_some_and(|reason| brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some()) {
-                        self.mark_execution_dependent();
+        match self.cpp_overwritten_candidates_by_procedure.read(
+            &memo_attribution(self),
+            |memo| {
+                memo.try_get_with_by_ref(&key, || {
+                    let filled =
+                        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                            self,
+                            || {
+                                let scope = AnalyzerQueryScope::new(self);
+                                let value =
+                                    expression_branch_facts::build_cpp_overwritten_local_candidates(
+                                        workspace,
+                                        procedure,
+                                        cancellation,
+                                    );
+                                if value.reason.is_some_and(|reason| {
+                                    brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some()
+                                }) {
+                                    self.mark_execution_dependent();
+                                }
+                                scope.read_completion().map(|()| Arc::new(value))
+                            },
+                        );
+                    match filled {
+                        Ok(value) => value.map_err(Err),
+                        Err(value) => Err(value),
                     }
-                    scope.read_completion().map(|()| Arc::new(value))
-                });
-                match filled {
-                    Ok(value) => value.map_err(Err),
-                    Err(value) => Err(value),
-                }
-            }) {
+                })
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        ) {
             Ok(value) => value,
             Err(attempt) => match attempt.as_ref() {
                 Ok(value) => Arc::clone(value),
@@ -761,7 +828,7 @@ impl CppAnalyzer {
                 CppSource::canonical_include_paths(self, token, &file).unwrap_or_default();
             for include in includes {
                 for target in
-                    resolve_include_targets_with_index(&file, &include, include_target_index)
+                    resolve_include_targets_with_index(&file, &include, &include_target_index)
                 {
                     if target != *owner_file {
                         queue.push_back(target);
@@ -969,9 +1036,9 @@ impl CppAnalyzer {
                     facts.estimated_retained_bytes().min(u32::MAX as usize) as u32
                 },
             ),
-            imported_code_units: build_weighted_cache(
-                memo_budget / 4,
-                weight_code_unit_set_by_file,
+            imported_code_units: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppImportedCodeUnits,
+                build_weighted_cache(memo_budget / 4, weight_code_unit_set_by_file),
             ),
             macro_composed_fields_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
@@ -993,11 +1060,14 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 cache::weight_c_assignment_candidates,
             ),
-            cpp_overwritten_candidates_by_procedure: build_weighted_cache(
-                memo_budget / 8,
-                cache::weight_cpp_overwritten_candidates,
+            cpp_overwritten_candidates_by_procedure: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppOverwrittenCandidates,
+                build_weighted_cache(memo_budget / 8, cache::weight_cpp_overwritten_candidates),
             ),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            referencing_files: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppReferencingFiles,
+                build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            ),
             direct_ancestors: cache::build_file_read_cache(
                 memo_budget / 8,
                 weight_code_unit_vec_by_unit,
@@ -1010,13 +1080,13 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_source_using_index,
             ),
-            unconditional_include_reachability: build_weighted_cache(
-                memo_budget / 8,
-                weight_include_reachability,
+            unconditional_include_reachability: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppIncludeReachability,
+                build_weighted_cache(memo_budget / 8, weight_include_reachability),
             ),
-            class_declaration_strength: build_weighted_cache(
-                memo_budget / 8,
-                cache::weight_class_declaration_strength,
+            class_declaration_strength: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppClassDeclarationStrength,
+                build_weighted_cache(memo_budget / 8, cache::weight_class_declaration_strength),
             ),
             recovered_export_class_index_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
@@ -1026,29 +1096,50 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 cache::weight_orphaned_namespace_scopes,
             ),
-            c_readings_by_file: build_weighted_cache(memo_budget / 8, cache::weight_c_reading),
-            header_language_attribution_by_file: build_weighted_cache(
-                memo_budget / 8,
-                cache::weight_header_language_attribution,
+            c_readings_by_file: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppHeaderReadings,
+                build_weighted_cache(memo_budget / 8, cache::weight_c_reading),
+            ),
+            header_language_attribution_by_file: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppHeaderLanguageAttribution,
+                build_weighted_cache(memo_budget / 8, cache::weight_header_language_attribution),
             ),
             object_macro_field_events_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_object_macro_field_events,
             ),
-            reconcile_candidates_by_identifier: build_weighted_cache(
-                memo_budget / 8,
-                weight_reconcile_candidates,
+            reconcile_candidates_by_identifier: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppReconcileCandidates,
+                build_weighted_cache(memo_budget / 8, weight_reconcile_candidates),
             ),
-            reconciled_definitions_by_group: build_weighted_cache(
-                memo_budget / 8,
-                weight_reconciled_groups,
+            reconciled_definitions_by_group: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppReconciledDefinitions,
+                build_weighted_cache(memo_budget / 8, weight_reconciled_groups),
             ),
-            include_target_index: Arc::new(OnceLock::new()),
-            reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            transitive_reverse_tu_index: Arc::new(PoolSafeMemo::new()),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            compile_contexts: Arc::new(OnceLock::new()),
-            external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
+            include_target_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppIncludeTargets,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            reverse_include_index: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppReverseIncludes,
+                Arc::new(PoolSafeMemo::new()),
+            ),
+            transitive_reverse_tu_index: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppTransitiveReverseTranslationUnits,
+                Arc::new(PoolSafeMemo::new()),
+            ),
+            direct_descendant_index: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppDirectDescendants,
+                Arc::new(KeyedPoolSafeMemo::new()),
+            ),
+            compile_contexts: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppCompileContexts,
+                Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new()),
+            ),
+            external_header_closures: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::CppExternalHeaderClosures,
+                Arc::new(KeyedPoolSafeMemo::new()),
+            ),
             #[cfg(any(test, feature = "test-support"))]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1152,7 +1243,7 @@ impl CppAnalyzer {
             }
             !cancelled
         };
-        let candidates = self.reconcile_candidates_by_identifier.try_get_with_by_ref(
+        let candidates = self.reconcile_candidates_by_identifier.read(&memo_attribution(self), |memo| memo.try_get_with_by_ref(
             key.member_identifier.as_str(),
             || {
                 let scope = AnalyzerQueryScope::new(self);
@@ -1202,7 +1293,7 @@ impl CppAnalyzer {
                     .map(Arc::new)
                     .ok_or(brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::Cancelled)
             },
-        );
+        ), |_| AuthorityInputs::SourceOf(&[Language::Cpp]));
         let candidates = match candidates {
             Ok(candidates) => candidates,
             Err(reason) => {
@@ -1215,27 +1306,31 @@ impl CppAnalyzer {
             self.reconcile_candidate_evaluation_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
-        let groups = self
-            .reconciled_definitions_by_group
-            .try_get_with_by_ref(&key, || {
-                // This builder runs on a cache miss, inside whatever request
-                // scope the caller opened; nesting one here makes the syntax
-                // reads below provable without changing what they memoize
-                // (issue #2414 step 3).
-                let scope = AnalyzerQueryScope::new(self);
-                let groups = cpp_reconcile_group(
-                    self,
-                    scope.token(),
-                    &key,
-                    &candidates,
-                    &keep_going,
-                    &on_candidate,
-                );
-                scope.read_completion()?;
-                groups.map(Arc::new).ok_or(
+        let groups = self.reconciled_definitions_by_group.read(
+            &memo_attribution(self),
+            |memo| {
+                memo.try_get_with_by_ref(&key, || {
+                    // This builder runs on a cache miss, inside whatever request
+                    // scope the caller opened; nesting one here makes the syntax
+                    // reads below provable without changing what they memoize
+                    // (issue #2414 step 3).
+                    let scope = AnalyzerQueryScope::new(self);
+                    let groups = cpp_reconcile_group(
+                        self,
+                        scope.token(),
+                        &key,
+                        &candidates,
+                        &keep_going,
+                        &on_candidate,
+                    );
+                    scope.read_completion()?;
+                    groups.map(Arc::new).ok_or(
                     brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::Cancelled,
                 )
-            });
+                })
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        );
         match groups {
             Ok(groups) => groups,
             Err(reason) => {
@@ -1462,19 +1557,54 @@ impl CppAnalyzer {
             .collect()
     }
 
-    pub(crate) fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext] {
-        self.compile_contexts
-            .get_or_init(|| {
-                CppCompileContexts::load_with_io_error(self.inner.project(), |error| {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        self.record_degraded_persistent_fill(
-                            "cpp.compile_contexts",
-                            &format!("project_io:{error}"),
-                        );
-                    }
-                })
-            })
-            .contexts_for(file)
+    fn compile_context_authority_inputs(&self) -> AuthorityInputs<'static> {
+        match workspace_authority_file_input(self, Language::Cpp, "compile_commands.json") {
+            Some(key) => AuthorityInputs::SourceAndFiles {
+                languages: &[Language::Cpp],
+                files: vec![key].into(),
+            },
+            None => AuthorityInputs::Unnamed,
+        }
+    }
+
+    fn record_compile_context_inputs(&self) {
+        if let Some(key) =
+            workspace_authority_file_input(self, Language::Cpp, "compile_commands.json")
+        {
+            self.record_read(key);
+        }
+    }
+
+    fn compile_contexts(&self) -> Arc<CppCompileContexts> {
+        self.record_compile_context_inputs();
+        self.compile_contexts.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    memo,
+                    || {
+                        CppCompileContexts::load_with_io_error(self.inner.project(), |error| {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                self.record_query_failure(
+                                    brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                                        format!("C++ compile contexts IO: {error}"),
+                                    ),
+                                );
+                            }
+                        })
+                    },
+                )
+            },
+            |_| self.compile_context_authority_inputs(),
+        )
+    }
+
+    pub(crate) fn compile_contexts_for(
+        &self,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_cpp::compile_context::CppCompileContextView {
+        self.compile_contexts().shared_contexts_for(file)
     }
 
     pub(crate) fn resolve_external_include(
@@ -1484,17 +1614,8 @@ impl CppAnalyzer {
         include: &std::path::Path,
         quoted: bool,
     ) -> brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution {
-        self.compile_contexts
-            .get_or_init(|| {
-                CppCompileContexts::load_with_io_error(self.inner.project(), |error| {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        self.record_degraded_persistent_fill(
-                            "cpp.compile_contexts",
-                            &format!("project_io:{error}"),
-                        );
-                    }
-                })
-            })
+        self.record_unattributed_read();
+        self.compile_contexts()
             .resolve_external_include(file, including_file, include, quoted)
     }
 
@@ -1570,7 +1691,11 @@ impl CppAnalyzer {
         &self,
         file: &ProjectFile,
     ) -> Arc<PoolSafeMemo<external::ReachedExternalHeaders>> {
-        self.external_header_closures.cell(file)
+        self.external_header_closures.read(
+            &memo_attribution(self),
+            |memo| memo.cell(file),
+            |_| AuthorityInputs::Unnamed,
+        )
     }
 
     fn record_external_header_closure_build(&self) {
@@ -1676,6 +1801,7 @@ impl CppAnalyzer {
             token,
         };
         let visibility = VisibilityIndex::build(
+            self.read_capability(),
             self,
             token,
             &graph,
@@ -1893,8 +2019,10 @@ impl CppAnalyzer {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn unconditional_include_reachability_cache_len_for_test(&self) -> u64 {
-        self.unconditional_include_reachability.run_pending_tasks();
-        self.unconditional_include_reachability.entry_count()
+        self.unconditional_include_reachability.account(|memo| {
+            memo.run_pending_tasks();
+            memo.entry_count() as usize
+        }) as u64
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2183,7 +2311,7 @@ impl CppSource for CppAnalyzer {
             })
     }
 
-    fn include_target_index(&self) -> &IncludeTargetIndex {
+    fn include_target_index(&self) -> Arc<IncludeTargetIndex> {
         CppAnalyzer::include_target_index(self)
     }
 
@@ -2249,11 +2377,11 @@ impl CppSource for CppAnalyzer {
         donor_source: &ProjectFile,
         reference_file: &ProjectFile,
     ) -> Option<bool> {
-        self.unconditional_include_reachability.get(&(
-            first.clone(),
-            donor_source.clone(),
-            reference_file.clone(),
-        ))
+        self.unconditional_include_reachability.read(
+            &memo_attribution(self),
+            |memo| memo.get(&(first.clone(), donor_source.clone(), reference_file.clone())),
+            |_| self.compile_context_authority_inputs(),
+        )
     }
 
     fn cache_unconditional_include_reachability(
@@ -2263,24 +2391,23 @@ impl CppSource for CppAnalyzer {
         reference_file: &ProjectFile,
         reaches: bool,
     ) {
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-cpp-analysis/src/analyzer/cpp/mod.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let scope = AnalyzerQueryScope::new(self);
-        if scope.read_completion().is_err() {
+        if scope.read_completion().is_err() || !cache_fill.is_complete() {
             return;
         }
 
-        {
-            let cache_key = (first.clone(), donor_source.clone(), reference_file.clone());
-            let cache_value = reaches;
-            persistent_fill_guard.installed("unconditional_include_reachability");
-            self.unconditional_include_reachability
-                .insert(cache_key, cache_value);
-        };
+        self.unconditional_include_reachability.read(
+            &memo_attribution(self),
+            |memo| {
+                memo.insert(
+                    (first.clone(), donor_source.clone(), reference_file.clone()),
+                    reaches,
+                )
+            },
+            |_| self.compile_context_authority_inputs(),
+        );
     }
 
     fn recovered_export_class_index(
@@ -2313,7 +2440,11 @@ impl CppSource for CppAnalyzer {
         &self,
         candidate: &CodeUnit,
     ) -> Option<CppClassDeclarationStrength> {
-        self.class_declaration_strength.get(candidate)
+        self.class_declaration_strength.read(
+            &memo_attribution(self),
+            |memo| memo.get(candidate),
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        )
     }
 
     fn cache_class_declaration_strength(
@@ -2321,24 +2452,18 @@ impl CppSource for CppAnalyzer {
         candidate: &CodeUnit,
         strength: CppClassDeclarationStrength,
     ) {
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-cpp-analysis/src/analyzer/cpp/mod.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let scope = AnalyzerQueryScope::new(self);
-        if scope.read_completion().is_err() {
+        if scope.read_completion().is_err() || !cache_fill.is_complete() {
             return;
         }
 
-        {
-            let cache_key = candidate.clone();
-            let cache_value = strength;
-            persistent_fill_guard.installed("class_declaration_strength");
-            self.class_declaration_strength
-                .insert(cache_key, cache_value);
-        };
+        self.class_declaration_strength.read(
+            &memo_attribution(self),
+            |memo| memo.insert(candidate.clone(), strength),
+            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+        );
     }
 
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -2354,7 +2479,10 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::template_metadata(self, code_unit)
     }
 
-    fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext] {
+    fn compile_contexts_for(
+        &self,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_cpp::compile_context::CppCompileContextView {
         CppAnalyzer::compile_contexts_for(self, file)
     }
 
@@ -2784,6 +2912,8 @@ impl CodeUnitIndex for CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     brokk_bifrost_analysis::delegate_inner_procedure_fact_methods!();
 
     fn cpp_expression_source_facts(
@@ -3206,13 +3336,6 @@ impl IAnalyzer for CppAnalyzer {
         fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
     }
 
-    fn record_query_incomplete(
-        &self,
-        reason: brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete,
-    ) {
-        self.inner.record_query_incomplete(reason);
-    }
-
     brokk_bifrost_analysis::delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
     }
@@ -3234,7 +3357,9 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        self.with_updated_inner(self.inner.update(changed_files))
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            self.with_updated_inner(self.inner.update(changed_files))
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -3549,6 +3674,23 @@ fn cpp_spelled_member_identifier<'a>(
 pub struct CppSupport;
 
 impl LanguageSupport for CppSupport {
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: WorkspaceFactFamily,
+        language: Language,
+        subject: &FactSubject,
+    ) -> Option<StableDigest> {
+        if family != WorkspaceFactFamily::CppIncludeTargets
+            || language != Language::Cpp
+            || *subject != FactSubject::Whole
+        {
+            return None;
+        }
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+        cpp.include_target_answer()
+    }
+
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
@@ -4114,8 +4256,8 @@ impl StructuralReceiverResolver for CppSupport {
 
 #[derive(Default)]
 struct CppDeadCodeMemo {
-    file_count: Option<usize>,
-    overloaded_fqns: Option<HashSet<String>>,
+    file_count: CaptureScopedMemo<Option<usize>>,
+    overloaded_fqns: CaptureScopedMemo<Option<HashSet<String>>>,
 }
 
 struct CppDeadCodeBulk;
@@ -4140,22 +4282,26 @@ impl DeadCodeBulkProof for CppDeadCodeBulk {
             file_count,
             overloaded_fqns,
         } = memo.downcast_mut().expect("C++ bulk memo");
-        if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Cpp))
-            > file_cap
-        {
-            return true;
-        }
-
-        let empty_overloads = HashSet::default();
-        let overloads = if candidate.is_function() {
-            overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Cpp))
-        } else {
-            &empty_overloads
-        };
-        matches!(
-            dead_code_bulk_eligibility(analyzer, candidate, overloads),
-            CppDeadCodeBulkEligibility::NeedsPrecise
-        )
+        file_count.read_mut(&memo_attribution(analyzer), |file_count| {
+            if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Cpp))
+                > file_cap
+            {
+                return true;
+            }
+            overloaded_fqns.read_mut(&memo_attribution(analyzer), |overloaded_fqns| {
+                let empty_overloads = HashSet::default();
+                let overloads = if candidate.is_function() {
+                    overloaded_fqns
+                        .get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Cpp))
+                } else {
+                    &empty_overloads
+                };
+                matches!(
+                    dead_code_bulk_eligibility(analyzer, candidate, overloads),
+                    CppDeadCodeBulkEligibility::NeedsPrecise
+                )
+            })
+        })
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {

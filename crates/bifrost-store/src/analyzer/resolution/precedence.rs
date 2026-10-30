@@ -5,14 +5,57 @@
 use super::local_identity::ResolutionIdentityCatalogBuilder;
 use super::model::{BindingOrigin, PrecedenceStep, SemanticId};
 use crate::analyzer::structural::PrecedenceTier;
+#[cfg(test)]
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionNamespace, ResolutionRootImportFact, ResolutionRootImportKind,
+    ResolutionNamespace, ResolutionRootImportFact, ResolutionRootImportKind, ResolutionScopeId,
 };
 
-pub(crate) trait PrecedenceRules: Sync {
+/// Every namespace a declaration can occupy, and so every namespace whose
+/// choice points a scope, checkpoint or import rank publishes.
+///
+/// `Macro` is Rust's alone. A `macro_rules!` item is a source-order binder
+/// (textual scope), and rustc resolves a single-segment macro name in textual
+/// scope first: a visible `macro_rules!` beats every import, glob or named,
+/// of the scope (checked with rustc 1.97), and a macro-expanded definition
+/// cannot shadow it (E0659). Without a macro rank on the checkpoint
+/// continuation, the binder did not shadow that continuation, so a glob from
+/// an unindexed crate kept its open boundary beside the found macro.
+pub(super) const EFFECTIVE_NAMESPACES: [ResolutionNamespace; 5] = [
+    ResolutionNamespace::Type,
+    ResolutionNamespace::Value,
+    ResolutionNamespace::Callable,
+    ResolutionNamespace::Constructor,
+    ResolutionNamespace::Macro,
+];
+
+/// Static language policy for precedence data and root-import lowering.
+pub trait PrecedenceRules: Sync {
     /// Lower is stronger; path comparison remains shared.
     fn origin_rank(&self, _origin: BindingOrigin) -> Option<u32> {
+        None
+    }
+
+    /// The precedence of a lexical continuation, for a language whose
+    /// continuation is its own form. `activation` says where lookup continues:
+    /// `None` is the scope's exit to its parent, and `Some(position)` is the
+    /// step back from the activation checkpoint at `position` within the
+    /// scope. Shared lowering asks this first at every scope kind, so a
+    /// language returning `Some` takes precedence over the TypeBody rule and
+    /// the checkpoint fallback. `None` keeps those shared forms.
+    fn continuation_precedence(
+        &self,
+        _identities: &mut ResolutionIdentityCatalogBuilder,
+        _scope: ResolutionScopeId,
+        _activation: Option<usize>,
+    ) -> Option<Vec<PrecedenceStep>> {
+        None
+    }
+
+    /// The namespaces whose scope choice ranks a scope's own bindings and
+    /// imports above its outward continuation (`ScopeChoice`). None keeps the
+    /// plain scope fallback.
+    fn scope_choice_namespaces(&self) -> Option<&'static [ResolutionNamespace]> {
         None
     }
 
@@ -69,10 +112,23 @@ impl PrecedenceRules for JvmPrecedenceRules {
         }
     }
 }
-struct DefaultPrecedenceRules;
+pub struct DefaultPrecedenceRules;
 impl PrecedenceRules for DefaultPrecedenceRules {}
-struct GoPrecedenceRules;
+pub struct GoPrecedenceRules;
 impl PrecedenceRules for GoPrecedenceRules {
+    /// Go ranks every lexical continuation by spelling, including from a
+    /// type body.
+    fn continuation_precedence(
+        &self,
+        identities: &mut ResolutionIdentityCatalogBuilder,
+        scope: ResolutionScopeId,
+        activation: Option<usize>,
+    ) -> Option<Vec<PrecedenceStep>> {
+        Some(super::fact_lowering::go_spelling_precedence(
+            identities, scope, activation, 1,
+        ))
+    }
+
     fn root_import_steps(
         &self,
         identities: &mut ResolutionIdentityCatalogBuilder,
@@ -84,8 +140,13 @@ impl PrecedenceRules for GoPrecedenceRules {
         super::fact_lowering::go_spelling_precedence(identities, import.root_scope, None, 0)
     }
 }
-struct RustPrecedenceRules;
+pub struct RustPrecedenceRules;
 impl PrecedenceRules for RustPrecedenceRules {
+    /// Every namespace a Rust declaration can occupy, including `Macro`.
+    fn scope_choice_namespaces(&self) -> Option<&'static [ResolutionNamespace]> {
+        Some(&EFFECTIVE_NAMESPACES)
+    }
+
     fn root_import_steps(
         &self,
         identities: &mut ResolutionIdentityCatalogBuilder,
@@ -100,31 +161,66 @@ impl PrecedenceRules for RustPrecedenceRules {
     }
 }
 
-pub(crate) fn precedence_rules(language: Language) -> &'static dyn PrecedenceRules {
-    static JAVA: JvmPrecedenceRules = JvmPrecedenceRules {
-        origin_rank: java_binding_origin_rank,
-    };
-    static KOTLIN: JvmPrecedenceRules = JvmPrecedenceRules {
-        origin_rank: kotlin_binding_origin_rank,
-    };
-    static SCALA: JvmPrecedenceRules = JvmPrecedenceRules {
-        origin_rank: scala_binding_origin_rank,
-    };
-    static RUST: RustPrecedenceRules = RustPrecedenceRules;
-    static GO: GoPrecedenceRules = GoPrecedenceRules;
-    static PYTHON: DefaultPrecedenceRules = DefaultPrecedenceRules;
-    static CSHARP: DefaultPrecedenceRules = DefaultPrecedenceRules;
-    static DEFAULT: DefaultPrecedenceRules = DefaultPrecedenceRules;
-    match language {
-        Language::Java => &JAVA,
-        Language::Kotlin => &KOTLIN,
-        Language::Scala => &SCALA,
-        Language::Rust => &RUST,
-        Language::Go => &GO,
-        Language::Python => &PYTHON,
-        Language::CSharp => &CSHARP,
-        _ => &DEFAULT,
+pub struct CSharpPrecedenceRules;
+impl PrecedenceRules for CSharpPrecedenceRules {
+    /// The effective namespaces the C# producer emits; TypeOrValue
+    /// references expand to Type and Value during shared lowering.
+    fn scope_choice_namespaces(&self) -> Option<&'static [ResolutionNamespace]> {
+        Some(&[
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Value,
+            ResolutionNamespace::Callable,
+            ResolutionNamespace::Constructor,
+        ])
     }
+
+    fn root_import_steps(
+        &self,
+        identities: &mut ResolutionIdentityCatalogBuilder,
+        import: &ResolutionRootImportFact,
+        kind: ResolutionRootImportKind,
+        choice: SemanticId,
+        namespace: ResolutionNamespace,
+    ) -> Vec<PrecedenceStep> {
+        let import_choice = identities.semantic(super::fact_lowering::import_choice_identity(
+            import.root_scope,
+            namespace,
+        ));
+        super::fact_lowering::scope_choice_precedence(
+            identities,
+            choice,
+            &[],
+            import_choice,
+            namespace,
+            match kind {
+                ResolutionRootImportKind::Named => ScopeChoice::MemberOrAlias,
+                ResolutionRootImportKind::Glob => ScopeChoice::Import,
+            },
+        )
+    }
+}
+
+pub static CSHARP_PRECEDENCE_RULES: &dyn PrecedenceRules = &CSharpPrecedenceRules;
+
+/// Language tables are selected by each language's store support.
+pub static JAVA_PRECEDENCE_RULES: &dyn PrecedenceRules = &JvmPrecedenceRules {
+    origin_rank: java_binding_origin_rank,
+};
+pub static KOTLIN_PRECEDENCE_RULES: &dyn PrecedenceRules = &JvmPrecedenceRules {
+    origin_rank: kotlin_binding_origin_rank,
+};
+pub static SCALA_PRECEDENCE_RULES: &dyn PrecedenceRules = &JvmPrecedenceRules {
+    origin_rank: scala_binding_origin_rank,
+};
+
+/// The ordinal at one scope level's import choice: member or alias is 0,
+/// use or import is 1, and outward continuation is 2. Languages classify
+/// their own binders into these choices; shared lowering assembles the steps.
+#[derive(Debug, Clone, Copy)]
+pub enum ScopeChoice {
+    MemberOrAlias = 0,
+    Import = 1,
+    Outward = 2,
 }
 
 fn java_binding_origin_rank(origin: BindingOrigin) -> Option<u32> {

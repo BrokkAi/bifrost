@@ -297,7 +297,9 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
 
     let disabled = pack_activation_project("[]", true);
     let (_, _, disabled_run) = run_pack_activation_policy(&disabled, &jdk21);
-    assert_eq!(disabled_run["exit_status"], 2, "{disabled_run:#}");
+    // Disabling dependency packs is a complete pack decision, so the run is
+    // only Bifrost's own inconclusive verdict, which is advisory (#8111).
+    assert_eq!(disabled_run["exit_status"], 0, "{disabled_run:#}");
     assert_eq!(
         disabled_run["report"]["packs"]["dependency_mode"],
         "disabled"

@@ -164,7 +164,18 @@ pub(super) fn drive_package_bridges<R: PackagePairingRules>(
     else {
         return Ok(PackageBridgeAssembly::cancelled());
     };
-    let pairs = plan.iter().flat_map(|entry| {
+    let pairs = package_bridge_pairs(&plan, references, plan_rules, cancellation);
+    assemble_package_bridges(operation, pairs, bridge_rules, cancellation)
+}
+
+/// Pair selected sources, references and members in the shared source-major order.
+pub(super) fn package_bridge_pairs<'a, R: PackagePairingRules>(
+    plan: &'a PackagePlan<'_, R>,
+    references: &'a [LoweredPackageReference],
+    plan_rules: &'a R,
+    cancellation: &'a CancellationToken,
+) -> impl Iterator<Item = PackageBridgePair<'a, <R::Bridges as PackageBridgeRules>::Extra>> {
+    plan.iter().flat_map(move |entry| {
         references
             .iter()
             .take_while(|_| !cancellation.is_cancelled())
@@ -179,8 +190,7 @@ pub(super) fn drive_package_bridges<R: PackagePairingRules>(
                         extra: target.extra,
                     })
             })
-    });
-    assemble_package_bridges(operation, pairs, bridge_rules, cancellation)
+    })
 }
 
 pub(super) fn assemble_package_bridges<'a, R: PackageBridgeRules>(

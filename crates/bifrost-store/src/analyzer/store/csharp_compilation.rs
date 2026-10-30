@@ -22,7 +22,7 @@
 
 use super::{AnalyzerStore, ReaderGuard, Result, WorkspaceSnapshotId};
 use crate::analyzer::canonical_hash::CanonicalHasher;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// Increment when the rules derived from the same inputs change. Older sets
 /// stop satisfying the validity rule and the next publication replaces them.
@@ -551,16 +551,7 @@ impl AnalyzerStore {
         snapshot: &WorkspaceSnapshotId,
     ) -> Result<Option<SelectedCSharpCompilations<'_>>> {
         let conn = self.read_conn()?;
-        let selected = conn
-            .query_row(SELECTED_SET_SQL, snapshot_params(snapshot), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, bool>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .optional()?;
-        let Some((set_id, membership_complete, DERIVATION_VERSION)) = selected else {
+        let Some((set_id, membership_complete)) = selected_set(&conn, snapshot)? else {
             return Ok(None);
         };
         Ok(Some(SelectedCSharpCompilations {
@@ -572,9 +563,105 @@ impl AnalyzerStore {
     }
 }
 
+fn selected_set(conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<Option<(i64, bool)>> {
+    let selected = conn
+        .query_row(SELECTED_SET_SQL, snapshot_params(snapshot), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?;
+    let Some((set_id, membership_complete, DERIVATION_VERSION)) = selected else {
+        return Ok(None);
+    };
+    Ok(Some((set_id, membership_complete)))
+}
+
+/// A borrowed view of one revision's compilation rules, with no retained rows.
+/// The shared selection's connection is the one an operation already holds;
+/// a second checkout would deadlock a single-connection store. The production
+/// owner keeps its ReaderGuard and delegates each read through this view.
+pub(super) struct CSharpCompilationView<'a> {
+    conn: &'a Connection,
+    snapshot: &'a WorkspaceSnapshotId,
+    set_id: i64,
+    membership_complete: bool,
+}
+
 impl SelectedCSharpCompilations<'_> {
-    /// Assembly and compilation-wide imports for one member of this selection.
+    fn view(&self) -> CSharpCompilationView<'_> {
+        CSharpCompilationView {
+            conn: &self.conn,
+            snapshot: &self.snapshot,
+            set_id: self.set_id,
+            membership_complete: self.membership_complete,
+        }
+    }
+
+    /// Assembly and compilation-wide imports for one selected compilation.
     pub fn metadata(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Option<CSharpCompilationMetadata>> {
+        self.view().metadata(project_path)
+    }
+
+    /// Whether the rules state all source membership.
+    pub fn membership_complete(&self) -> bool {
+        self.view().membership_complete()
+    }
+
+    /// Selected source memberships; None when membership is unproven.
+    pub fn compilations_of(&self, rel_path: &str) -> Result<Option<Vec<i64>>> {
+        self.view().compilations_of(rel_path)
+    }
+
+    /// All reference edges reachable from root, and their completeness.
+    pub fn referenced_closure(&self, root: i64) -> Result<(Vec<i64>, bool)> {
+        self.view().referenced_closure(root)
+    }
+
+    /// Compilations provably visible from root, including root itself.
+    pub fn visible_closure(&self, root: i64) -> Result<Vec<i64>> {
+        self.view().visible_closure(root)
+    }
+
+    /// Project count; zero denotes the implicit compilation.
+    pub fn project_count(&self) -> Result<usize> {
+        self.view().project_count()
+    }
+
+    /// Whether every explicit include selects a source in this revision.
+    pub fn includes_selected(&self) -> Result<bool> {
+        self.view().includes_selected()
+    }
+
+    /// The selected set's recorded diagnostic gaps.
+    pub fn gaps(&self) -> Result<Vec<CSharpCompilationGap>> {
+        self.view().gaps()
+    }
+}
+
+impl<'a> CSharpCompilationView<'a> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn selected(
+        conn: &'a Connection,
+        snapshot: &'a WorkspaceSnapshotId,
+    ) -> Result<Option<Self>> {
+        Ok(
+            selected_set(conn, snapshot)?.map(|(set_id, membership_complete)| Self {
+                conn,
+                snapshot,
+                set_id,
+                membership_complete,
+            }),
+        )
+    }
+
+    /// Assembly and compilation-wide imports for one member of this selection.
+    pub(super) fn metadata(
         &self,
         project_path: Option<&str>,
     ) -> Result<Option<CSharpCompilationMetadata>> {
@@ -619,14 +706,14 @@ impl SelectedCSharpCompilations<'_> {
     }
 
     /// Whether the rules state all source membership.
-    pub fn membership_complete(&self) -> bool {
+    pub(super) fn membership_complete(&self) -> bool {
         self.membership_complete
     }
 
     /// The compilations that contain the selected source `rel_path`, possibly
     /// none. `None` when membership is not proven: the rules are incomplete
     /// or the revision does not select that source.
-    pub fn compilations_of(&self, rel_path: &str) -> Result<Option<Vec<i64>>> {
+    pub(super) fn compilations_of(&self, rel_path: &str) -> Result<Option<Vec<i64>>> {
         if !self.membership_complete {
             return Ok(None);
         }
@@ -731,7 +818,7 @@ impl SelectedCSharpCompilations<'_> {
     /// Every compilation `root` reaches over any ProjectReference edge,
     /// itself included, and whether each one's direct references are all
     /// known. A compilation outside a complete closure is provably invisible.
-    pub fn referenced_closure(&self, root: i64) -> Result<(Vec<i64>, bool)> {
+    pub(super) fn referenced_closure(&self, root: i64) -> Result<(Vec<i64>, bool)> {
         let mut statement = self.conn.prepare_cached(REFERENCE_CLOSURE_SQL)?;
         let mut rows = statement.query(params![root])?;
         let mut reached = Vec::new();
@@ -746,7 +833,7 @@ impl SelectedCSharpCompilations<'_> {
 
     /// The compilations `root` provably sees through proven edges and
     /// proven transitive flow, itself included.
-    pub fn visible_closure(&self, root: i64) -> Result<Vec<i64>> {
+    pub(super) fn visible_closure(&self, root: i64) -> Result<Vec<i64>> {
         let mut statement = self.conn.prepare_cached(VISIBLE_CLOSURE_SQL)?;
         let mut visible = statement
             .query_map(params![root], |row| row.get::<_, i64>(0))?
@@ -759,7 +846,7 @@ impl SelectedCSharpCompilations<'_> {
 
     /// How many project files the configuration declares. Zero means the
     /// one implicit compilation of every selected source.
-    pub fn project_count(&self) -> Result<usize> {
+    pub(super) fn project_count(&self) -> Result<usize> {
         Ok(self
             .conn
             .prepare_cached(PROJECT_COUNT_SQL)?
@@ -769,7 +856,7 @@ impl SelectedCSharpCompilations<'_> {
     /// Whether every explicit Compile Include names a source the revision
     /// selects. An unselected include is a compilation member whose global
     /// directives and declarations this analysis cannot see.
-    pub fn includes_selected(&self) -> Result<bool> {
+    pub(super) fn includes_selected(&self) -> Result<bool> {
         Ok(!self
             .conn
             .prepare_cached(UNSELECTED_INCLUDE_SQL)?
@@ -786,7 +873,7 @@ impl SelectedCSharpCompilations<'_> {
     }
 
     /// The set's recorded gaps, for diagnostics.
-    pub fn gaps(&self) -> Result<Vec<CSharpCompilationGap>> {
+    pub(super) fn gaps(&self) -> Result<Vec<CSharpCompilationGap>> {
         let gaps: String = self.conn.query_row(
             "SELECT json(gaps) FROM csharp_compilation_sets WHERE set_id = ?1",
             [self.set_id],

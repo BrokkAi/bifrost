@@ -112,7 +112,8 @@ impl ValueFlowQueryState {
             );
             return Vec::new();
         };
-        let Some(handle) = analysis_context.value_flow_handle(plan_ref) else {
+        let Some(handle) = analysis_context.value_flow_handle(workspace.analyzer(), plan_ref)
+        else {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedValueFlowPlanReference,

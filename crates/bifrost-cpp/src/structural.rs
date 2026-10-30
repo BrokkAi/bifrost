@@ -1809,7 +1809,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: unrelated comparisons suppress alloca-in-loop"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: unrelated comparisons suppress alloca-in-loop"
     )]
     fn alloca_bound_must_constrain_loop_variable() {
         for (condition, expected) in [
@@ -1840,7 +1840,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: integer switches borrow unrelated enum cases"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: integer switches borrow unrelated enum cases"
     )]
     fn integer_switch_is_not_an_enum_switch() {
         let source = "enum E { A, B }; void f(int value) { switch(value) { case A: break; } }";
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: enum coverage needs scoped local declaration evidence"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: enum coverage needs scoped local declaration evidence"
     )]
     fn enum_switch_uses_local_type_evidence() {
         for (source, expected) in [

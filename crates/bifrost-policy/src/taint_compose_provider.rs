@@ -1948,9 +1948,11 @@ fn continuation_quality(
     let mut boundaries = result
         .boundaries()
         .iter()
-        .map(|boundary| HopQuality {
-            proven: boundary.proof == ProofStatus::Proven,
-            complete: boundary.completeness == EvidenceCompleteness::Complete,
+        .map(|boundary| {
+            HopQuality::new(
+                boundary.proof == ProofStatus::Proven,
+                boundary.completeness == EvidenceCompleteness::Complete,
+            )
         })
         .collect::<Vec<_>>();
     let mut entered = false;
@@ -1959,10 +1961,10 @@ fn continuation_quality(
             || candidate.target().semantics().properties().invocation
                 == ProcedureInvocationKind::Deferred;
         if deferred {
-            boundaries.push(HopQuality {
-                proven: *candidate.proof() == ProofStatus::Proven,
-                complete: false,
-            });
+            boundaries.push(HopQuality::new(
+                *candidate.proof() == ProofStatus::Proven,
+                false,
+            ));
         } else {
             entered = true;
         }

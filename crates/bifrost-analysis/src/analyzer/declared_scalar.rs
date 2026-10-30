@@ -26,6 +26,24 @@ pub enum DeclaredScalarType {
     Boolean,
 }
 
+fn rust_integer_scalar_type(name: &str) -> Option<DeclaredScalarType> {
+    match name {
+        "i8" => Some(DeclaredScalarType::Signed(8)),
+        "i16" => Some(DeclaredScalarType::Signed(16)),
+        "i32" => Some(DeclaredScalarType::Signed(32)),
+        "i64" => Some(DeclaredScalarType::Signed(64)),
+        "i128" => Some(DeclaredScalarType::Signed(128)),
+        "isize" => Some(DeclaredScalarType::Signed(usize::BITS as u16)),
+        "u8" => Some(DeclaredScalarType::Unsigned(8)),
+        "u16" => Some(DeclaredScalarType::Unsigned(16)),
+        "u32" => Some(DeclaredScalarType::Unsigned(32)),
+        "u64" => Some(DeclaredScalarType::Unsigned(64)),
+        "u128" => Some(DeclaredScalarType::Unsigned(128)),
+        "usize" => Some(DeclaredScalarType::Unsigned(usize::BITS as u16)),
+        _ => None,
+    }
+}
+
 /// Each parameter and local value of the procedure, whether it is a
 /// parameter, and the syntax node its source mapping names exactly.
 #[doc(hidden)]
@@ -294,22 +312,9 @@ pub fn rust_scalar_type_from_type(source: &str, type_node: Node<'_>) -> Option<D
     if type_node.kind() != "primitive_type" {
         return None;
     }
-    match source.get(type_node.byte_range())? {
-        "i8" => Some(DeclaredScalarType::Signed(8)),
-        "i16" => Some(DeclaredScalarType::Signed(16)),
-        "i32" => Some(DeclaredScalarType::Signed(32)),
-        "i64" => Some(DeclaredScalarType::Signed(64)),
-        "i128" => Some(DeclaredScalarType::Signed(128)),
-        "isize" => Some(DeclaredScalarType::Signed(usize::BITS as u16)),
-        "u8" => Some(DeclaredScalarType::Unsigned(8)),
-        "u16" => Some(DeclaredScalarType::Unsigned(16)),
-        "u32" => Some(DeclaredScalarType::Unsigned(32)),
-        "u64" => Some(DeclaredScalarType::Unsigned(64)),
-        "u128" => Some(DeclaredScalarType::Unsigned(128)),
-        "usize" => Some(DeclaredScalarType::Unsigned(usize::BITS as u16)),
-        "bool" => Some(DeclaredScalarType::Boolean),
-        _ => None,
-    }
+    let name = source.get(type_node.byte_range())?;
+    rust_integer_scalar_type(name)
+        .or_else(|| (name == "bool").then_some(DeclaredScalarType::Boolean))
 }
 
 #[doc(hidden)]
@@ -318,31 +323,21 @@ pub fn rust_scalar_type_from_literal(source: &str, node: Node<'_>) -> Option<Dec
         "boolean_literal" | "true" | "false" => Some(DeclaredScalarType::Boolean),
         "integer_literal" => {
             let text = source.get(node.byte_range())?;
-            let (digits, scalar_type) = if let Some(digits) = text.strip_suffix("isize") {
-                (digits, DeclaredScalarType::Signed(usize::BITS as u16))
-            } else if let Some(digits) = text.strip_suffix("usize") {
-                (digits, DeclaredScalarType::Unsigned(usize::BITS as u16))
-            } else {
-                let suffix = [
-                    ("u128", DeclaredScalarType::Unsigned(128)),
-                    ("i128", DeclaredScalarType::Signed(128)),
-                    ("u64", DeclaredScalarType::Unsigned(64)),
-                    ("i64", DeclaredScalarType::Signed(64)),
-                    ("u32", DeclaredScalarType::Unsigned(32)),
-                    ("i32", DeclaredScalarType::Signed(32)),
-                    ("u16", DeclaredScalarType::Unsigned(16)),
-                    ("i16", DeclaredScalarType::Signed(16)),
-                    ("u8", DeclaredScalarType::Unsigned(8)),
-                    ("i8", DeclaredScalarType::Signed(8)),
-                ];
-                suffix
-                    .into_iter()
-                    .find_map(|(suffix, scalar_type)| {
-                        text.strip_suffix(suffix)
-                            .map(|digits| (digits, scalar_type))
-                    })
-                    .unwrap_or((text, DeclaredScalarType::Signed(32)))
-            };
+            let (digits, scalar_type) = [
+                "isize", "usize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8",
+                "i8",
+            ]
+            .into_iter()
+            .find_map(|suffix| {
+                text.strip_suffix(suffix).map(|digits| {
+                    (
+                        digits,
+                        rust_integer_scalar_type(suffix)
+                            .expect("recognized Rust integer suffix has a scalar type"),
+                    )
+                })
+            })
+            .unwrap_or((text, DeclaredScalarType::Signed(32)));
             if !digits
                 .as_bytes()
                 .first()

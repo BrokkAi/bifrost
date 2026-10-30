@@ -28,6 +28,7 @@ use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryImportBinder,
     CodeQueryLexicalScope, CodeQueryRange, CodeQueryResolutionCandidate,
 };
+use super::traversal_memo::{self, TraversalMemo};
 use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::usages::get_definition::trace::HierarchyHopRecord;
 use crate::analyzer::usages::get_definition::{
@@ -36,24 +37,43 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    CaptureScopedMemo, PendingMemo, memo_attribution,
+};
 use brokk_bifrost_rql::{BindingFilter, CandidateFilter, ScopeFilter};
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Parser, Tree};
 
 /// Complete environment products retained by an explicitly scoped row-family
 /// session. Query-local diagnostic suppression never enters this store.
-#[derive(Default)]
 pub(super) struct EnvironmentTraversalStore {
-    files: HashMap<ProjectFile, Arc<EnvironmentFileResult>>,
-    traced: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
-    joined_scopes: HashMap<ProjectFile, HashSet<u32>>,
+    files: TraversalMemo<ProjectFile, Arc<EnvironmentFileResult>>,
+    traced: TraversalMemo<ProjectFile, Arc<OccurrenceFileResult>>,
+    // The producing query selects scopes from earlier pipeline rows. Its
+    // full receipt is not available at this projection boundary yet.
+    joined_scopes: PendingMemo<Mutex<HashMap<ProjectFile, HashSet<u32>>>>,
     environment_derivations: usize,
     environment_reuses: usize,
     traced_occurrence_derivations: usize,
     traced_occurrence_reuses: usize,
 }
 
+impl Default for EnvironmentTraversalStore {
+    fn default() -> Self {
+        Self {
+            files: traversal_memo::new(),
+            traced: traversal_memo::new(),
+            joined_scopes: PendingMemo::new(Mutex::new(HashMap::default())),
+            environment_derivations: 0,
+            environment_reuses: 0,
+            traced_occurrence_derivations: 0,
+            traced_occurrence_reuses: 0,
+        }
+    }
+}
+
 impl EnvironmentTraversalStore {
+    #[cfg(test)]
     pub(super) fn stats(&self) -> (usize, usize, usize, usize) {
         (
             self.environment_derivations,
@@ -88,18 +108,20 @@ type PythonVariableIndexCache = (
 /// reported, so one file is derived once and one axis gap is reported once.
 #[derive(Default)]
 pub(super) struct EnvironmentTraversalCache {
-    files: HashMap<ProjectFile, Arc<EnvironmentFileResult>>,
-    python_dynamic_scope_calls: HashMap<ProjectFile, Arc<Vec<Range>>>,
-    binding_use_completeness: HashMap<BindingKey, bool>,
-    traced: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
-    python_syntax_tree: Option<PythonSyntaxTree>,
-    python_variable_index: Option<PythonVariableIndexCache>,
+    files: CaptureScopedMemo<HashMap<ProjectFile, Arc<EnvironmentFileResult>>>,
+    python_dynamic_scope_calls: CaptureScopedMemo<HashMap<ProjectFile, Arc<Vec<Range>>>>,
+    binding_use_completeness: CaptureScopedMemo<HashMap<BindingKey, bool>>,
+    traced: CaptureScopedMemo<HashMap<ProjectFile, Arc<OccurrenceFileResult>>>,
+    python_syntax_tree: CaptureScopedMemo<Option<PythonSyntaxTree>>,
+    python_variable_index: CaptureScopedMemo<Option<PythonVariableIndexCache>>,
     // One exact target revision, never a workspace-lived proof map.
-    python_return_binding_proof: Option<(
-        ProjectFile,
-        ContentIdentity,
-        super::python_variables::PythonInitializerProof,
-    )>,
+    python_return_binding_proof: CaptureScopedMemo<
+        Option<(
+            ProjectFile,
+            ContentIdentity,
+            super::python_variables::PythonInitializerProof,
+        )>,
+    >,
     shared: Option<Arc<Mutex<EnvironmentTraversalStore>>>,
     select_joined_scopes: bool,
     reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
@@ -186,11 +208,13 @@ impl EnvironmentTraversalCache {
         {
             return None;
         }
-        if let Some((cached_file, cached_content, proof)) = &self.python_return_binding_proof
-            && cached_file == file
-            && *cached_content == content
+        if let Some((cached_file, cached_content, proof)) = self
+            .python_return_binding_proof
+            .read(&memo_attribution(analyzer), Clone::clone)
+            && &cached_file == file
+            && cached_content == content
         {
-            return Some(proof.clone());
+            return Some(proof);
         }
         let environment = self.environment_for(analyzer, file);
         if !python_environment_matches_source(&environment, file, content, facts.source())
@@ -201,12 +225,16 @@ impl EnvironmentTraversalCache {
         {
             return None;
         }
-        let index = self.python_variable_index_for(file, content, facts.source(), &environment)?;
+        let index =
+            self.python_variable_index_for(analyzer, file, content, facts.source(), &environment)?;
         let proof = super::python_variables::PythonInitializerProof {
             index,
             dynamic_scope_calls: Arc::new(python_dynamic_scope_calls_from_facts(&facts)),
         };
-        self.python_return_binding_proof = Some((file.clone(), content, proof.clone()));
+        self.python_return_binding_proof
+            .read_mut(&memo_attribution(analyzer), |cached| {
+                *cached = Some((file.clone(), content, proof.clone()))
+            });
         Some(proof)
     }
 
@@ -218,6 +246,7 @@ impl EnvironmentTraversalCache {
     ) -> Option<super::python_variables::PythonInitializerProof> {
         let environment = self.environment_for(analyzer, file);
         let index = self.python_variable_index_for(
+            analyzer,
             file,
             facts.source_identity(),
             facts.source(),
@@ -234,16 +263,19 @@ impl EnvironmentTraversalCache {
     /// with the number of files visited by a workspace query.
     pub(super) fn python_variable_index_for(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         content_identity: ContentIdentity,
         source: &str,
         environment: &EnvironmentFileResult,
     ) -> Option<Arc<super::python_variables::PythonVariableIndex>> {
-        if let Some((cached_file, cached_content, index)) = &self.python_variable_index
-            && cached_file == file
-            && cached_content == &content_identity
+        if let Some((cached_file, cached_content, index)) = self
+            .python_variable_index
+            .read(&memo_attribution(analyzer), Clone::clone)
+            && &cached_file == file
+            && cached_content == content_identity
         {
-            return Some(Arc::clone(index));
+            return Some(index);
         }
         // Qualify the environment once when building an inventory, not on
         // every variable-row cache hit. Return proofs additionally validate
@@ -258,7 +290,10 @@ impl EnvironmentTraversalCache {
             &tree,
             environment,
         ));
-        self.python_variable_index = Some((file.clone(), content_identity, Arc::clone(&index)));
+        self.python_variable_index
+            .read_mut(&memo_attribution(analyzer), |cached| {
+                *cached = Some((file.clone(), content_identity, Arc::clone(&index)))
+            });
         Some(index)
     }
 
@@ -267,15 +302,18 @@ impl EnvironmentTraversalCache {
     /// reparsing that source per row without retaining ASTs for multiple files.
     pub(super) fn python_syntax_tree_for(
         &mut self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         content_identity: ContentIdentity,
         source: &str,
     ) -> Result<Arc<Tree>, &'static str> {
-        if let Some((cached_file, cached_content, result)) = &self.python_syntax_tree
-            && cached_file == file
-            && cached_content == &content_identity
+        if let Some((cached_file, cached_content, result)) = self
+            .python_syntax_tree
+            .read(&memo_attribution(analyzer), Clone::clone)
+            && &cached_file == file
+            && cached_content == content_identity
         {
-            return result.clone();
+            return result;
         }
 
         let result = (|| {
@@ -294,7 +332,10 @@ impl EnvironmentTraversalCache {
             }
             Ok(Arc::new(tree))
         })();
-        self.python_syntax_tree = Some((file.clone(), content_identity, result.clone()));
+        self.python_syntax_tree
+            .read_mut(&memo_attribution(analyzer), |cached| {
+                *cached = Some((file.clone(), content_identity, result.clone()))
+            });
         result
     }
 
@@ -322,7 +363,12 @@ impl EnvironmentTraversalCache {
     /// Remember one declaring scope reached by a binding row. A later scope
     /// seed in the same correlated batch can project exactly these rows while
     /// retaining its ordinary scan and budget accounting.
-    pub(super) fn record_joined_scope(&mut self, file: &ProjectFile, scope: u32) {
+    pub(super) fn record_joined_scope(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        scope: u32,
+    ) {
         if !self.select_joined_scopes {
             return;
         }
@@ -333,15 +379,24 @@ impl EnvironmentTraversalCache {
             .lock()
             .expect("a row-family environment cache lock is not poisoned")
             .joined_scopes
-            .entry(file.clone())
-            .or_default()
-            .insert(scope);
+            .read(&memo_attribution(analyzer), |scopes| {
+                scopes
+                    .lock()
+                    .expect("joined-scope memo lock poisoned")
+                    .entry(file.clone())
+                    .or_default()
+                    .insert(scope);
+            });
     }
 
     /// `None` means the caller requested the ordinary exhaustive scope
     /// projection. `Some` is the exact set reached by preceding binding rows,
     /// including an empty set when no binding reached a scope.
-    pub(super) fn joined_scopes(&self, file: &ProjectFile) -> Option<HashSet<u32>> {
+    pub(super) fn joined_scopes(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> Option<HashSet<u32>> {
         if !self.select_joined_scopes {
             return None;
         }
@@ -353,29 +408,52 @@ impl EnvironmentTraversalCache {
                         .lock()
                         .expect("a row-family environment cache lock is not poisoned")
                         .joined_scopes
-                        .get(file)
-                        .cloned()
+                        .read(&memo_attribution(analyzer), |scopes| {
+                            scopes
+                                .lock()
+                                .expect("joined-scope memo lock poisoned")
+                                .get(file)
+                                .cloned()
+                        })
                 })
                 .unwrap_or_default(),
         )
     }
 
-    pub(super) fn record_binding_use_completeness(&mut self, value: &BindingValue, complete: bool) {
+    pub(super) fn record_binding_use_completeness(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        value: &BindingValue,
+        complete: bool,
+    ) {
         let key = value.set_difference_key();
-        if let Some(previous) = self.binding_use_completeness.get(&key) {
+        if let Some(previous) = self
+            .binding_use_completeness
+            .read(&memo_attribution(analyzer), |completeness| {
+                completeness.get(&key).copied()
+            })
+        {
             assert_eq!(
-                *previous, complete,
+                previous, complete,
                 "one query derives stable binding-use completeness for each binder"
             );
         } else {
-            self.binding_use_completeness.insert(key, complete);
+            self.binding_use_completeness
+                .read_mut(&memo_attribution(analyzer), |completeness| {
+                    completeness.insert(key, complete)
+                });
         }
     }
 
-    pub(super) fn binding_use_completeness(&self, value: &BindingValue) -> Option<bool> {
+    pub(super) fn binding_use_completeness(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        value: &BindingValue,
+    ) -> Option<bool> {
         self.binding_use_completeness
-            .get(&value.set_difference_key())
-            .copied()
+            .read(&memo_attribution(analyzer), |completeness| {
+                completeness.get(&value.set_difference_key()).copied()
+            })
     }
 
     /// Derive (or replay) one file's lexical environment.
@@ -388,34 +466,40 @@ impl EnvironmentTraversalCache {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Arc<EnvironmentFileResult> {
-        if let Some(cached) = self.files.get(file) {
-            return Arc::clone(cached);
+        if let Some(cached) = self
+            .files
+            .read(&memo_attribution(analyzer), |memo| memo.get(file).cloned())
+        {
+            return cached;
         }
-        if let Some(shared) = &self.shared {
+        let derived = if let Some(shared) = &self.shared {
             let mut shared = shared
                 .lock()
                 .expect("a row-family environment cache lock is not poisoned");
-            if let Some(cached) = shared.files.get(file).cloned() {
+            let (value, built) = traversal_memo::derive(
+                &shared.files,
+                analyzer,
+                file.clone(),
+                || {
+                    Ok::<_, std::convert::Infallible>(Arc::new(environment_for_file(
+                        analyzer, file,
+                    )))
+                },
+                |value| value.completeness.is_complete(),
+            )
+            .expect("environment derivation is infallible");
+            if built {
+                shared.environment_derivations = shared.environment_derivations.saturating_add(1);
+            } else {
                 shared.environment_reuses = shared.environment_reuses.saturating_add(1);
-                self.files.insert(file.clone(), Arc::clone(&cached));
-                return cached;
             }
-        }
-        let mut derived = Arc::new(environment_for_file(analyzer, file));
-        if let Some(shared) = &self.shared {
-            let mut shared = shared
-                .lock()
-                .expect("a row-family environment cache lock is not poisoned");
-            shared.environment_derivations = shared.environment_derivations.saturating_add(1);
-            if derived.completeness.is_complete() {
-                if let Some(cached) = shared.files.get(file).cloned() {
-                    derived = cached;
-                } else {
-                    shared.files.insert(file.clone(), Arc::clone(&derived));
-                }
-            }
-        }
-        self.files.insert(file.clone(), Arc::clone(&derived));
+            value
+        } else {
+            Arc::new(environment_for_file(analyzer, file))
+        };
+        self.files.read_mut(&memo_attribution(analyzer), |memo| {
+            memo.insert(file.clone(), Arc::clone(&derived))
+        });
         derived
     }
 
@@ -426,8 +510,11 @@ impl EnvironmentTraversalCache {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Arc<Vec<Range>> {
-        if let Some(cached) = self.python_dynamic_scope_calls.get(file) {
-            return Arc::clone(cached);
+        if let Some(cached) = self
+            .python_dynamic_scope_calls
+            .read(&memo_attribution(analyzer), |memo| memo.get(file).cloned())
+        {
+            return cached;
         }
         let calls = if crate::analyzer::common::language_for_file(file) == Language::Python {
             analyzer
@@ -442,7 +529,9 @@ impl EnvironmentTraversalCache {
         };
         let calls = Arc::new(calls);
         self.python_dynamic_scope_calls
-            .insert(file.clone(), Arc::clone(&calls));
+            .read_mut(&memo_attribution(analyzer), |calls_by_file| {
+                calls_by_file.insert(file.clone(), Arc::clone(&calls))
+            });
         calls
     }
 
@@ -457,44 +546,44 @@ impl EnvironmentTraversalCache {
         file: &ProjectFile,
         cancellation: Option<&CancellationToken>,
     ) -> Option<Arc<OccurrenceFileResult>> {
-        if let Some(cached) = self.traced.get(file) {
-            return Some(Arc::clone(cached));
-        }
-        if let Some(shared) = &self.shared {
-            let mut shared = shared
-                .lock()
-                .expect("a row-family trace cache lock is not poisoned");
-            if let Some(cached) = shared.traced.get(file).cloned() {
-                shared.traced_occurrence_reuses = shared.traced_occurrence_reuses.saturating_add(1);
-                self.traced.insert(file.clone(), Arc::clone(&cached));
-                return Some(cached);
-            }
+        if let Some(cached) = self
+            .traced
+            .read(&memo_attribution(analyzer), |memo| memo.get(file).cloned())
+        {
+            return Some(cached);
         }
         let token = cancellation.cloned().unwrap_or_default();
-        let mut derived = Arc::new(
+        let build = || {
             occurrences_for_file_with_options(
                 analyzer,
                 file,
                 OccurrenceDerivationOptions::WITH_CANDIDATES,
                 &token,
             )
-            .ok()?,
-        );
-        if let Some(shared) = &self.shared {
+            .map(Arc::new)
+        };
+        let derived = if let Some(shared) = &self.shared {
             let mut shared = shared
                 .lock()
                 .expect("a row-family trace cache lock is not poisoned");
-            shared.traced_occurrence_derivations =
-                shared.traced_occurrence_derivations.saturating_add(1);
-            if derived.completeness.is_complete() {
-                if let Some(cached) = shared.traced.get(file).cloned() {
-                    derived = cached;
-                } else {
-                    shared.traced.insert(file.clone(), Arc::clone(&derived));
-                }
+            let (value, built) =
+                traversal_memo::derive(&shared.traced, analyzer, file.clone(), build, |value| {
+                    value.completeness.is_complete()
+                })
+                .ok()?;
+            if built {
+                shared.traced_occurrence_derivations =
+                    shared.traced_occurrence_derivations.saturating_add(1);
+            } else {
+                shared.traced_occurrence_reuses = shared.traced_occurrence_reuses.saturating_add(1);
             }
-        }
-        self.traced.insert(file.clone(), Arc::clone(&derived));
+            value
+        } else {
+            build().ok()?
+        };
+        self.traced.read_mut(&memo_attribution(analyzer), |memo| {
+            memo.insert(file.clone(), Arc::clone(&derived))
+        });
         Some(derived)
     }
 
@@ -1045,7 +1134,7 @@ mod tests {
         let mut cache = EnvironmentTraversalCache::default();
         assert!(
             cache
-                .python_variable_index_for(&file, content, source, &environment)
+                .python_variable_index_for(analyzer, &file, content, source, &environment)
                 .is_some()
         );
         assert!(
@@ -1055,11 +1144,13 @@ mod tests {
         );
         // Keep the populated index, but force proof acquisition to inspect
         // poisoned file-only environment entries before any cached-index hit.
-        cache.python_return_binding_proof = None;
+        cache.python_return_binding_proof = CaptureScopedMemo::default();
         let stale = ContentIdentity::hash_bytes(b"another source revision");
         let mut bad = environment.clone();
         bad.scopes[1].content_identity = stale;
-        cache.files.insert(file.clone(), Arc::new(bad));
+        cache.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(file.clone(), Arc::new(bad))
+        });
         assert!(
             cache
                 .python_return_binding_proof_for(analyzer, procedure)
@@ -1074,7 +1165,9 @@ mod tests {
             .expect("factory parameter has a binding row");
         let mut bad = environment.clone();
         bad.bindings[marker].content_identity = stale;
-        cache.files.insert(file.clone(), Arc::new(bad));
+        cache.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(file.clone(), Arc::new(bad))
+        });
         assert!(
             cache
                 .python_return_binding_proof_for(analyzer, procedure)
@@ -1082,7 +1175,9 @@ mod tests {
         );
         let mut bad = environment.clone();
         bad.bindings[marker].file = project.file("other.py");
-        cache.files.insert(file.clone(), Arc::new(bad));
+        cache.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(file.clone(), Arc::new(bad))
+        });
         assert!(
             cache
                 .python_return_binding_proof_for(analyzer, procedure)
@@ -1090,7 +1185,9 @@ mod tests {
         );
         let mut bad = environment.clone();
         bad.scopes.clear();
-        cache.files.insert(file.clone(), Arc::new(bad));
+        cache.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(file.clone(), Arc::new(bad))
+        });
         assert!(
             cache
                 .python_return_binding_proof_for(analyzer, procedure)
@@ -1098,10 +1195,12 @@ mod tests {
         );
         assert!(
             cache
-                .python_variable_index_for(&file, stale, source, &environment)
+                .python_variable_index_for(analyzer, &file, stale, source, &environment)
                 .is_none()
         );
-        cache.files.insert(file.clone(), Arc::new(environment));
+        cache.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(file.clone(), Arc::new(environment))
+        });
         assert!(
             cache
                 .python_return_binding_proof_for(analyzer, procedure)

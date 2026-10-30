@@ -70,7 +70,8 @@ mod effective_using_scale_tests {
         let dispatch = CppDispatch::new(analyzer, query_token);
         let graph = dispatch.source();
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(cpp, query_token, &graph, &roots);
+        let visibility =
+            VisibilityIndex::build(cpp.read_capability(), cpp, query_token, &graph, &roots);
         let target = cpp
             .get_all_declarations()
             .into_iter()

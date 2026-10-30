@@ -274,6 +274,8 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             context: ReceiverContext::new(None, receiver.start_byte()),
             budget,
         };
+        self.aliases
+            .record_authority_read(crate::tsconfig::JsTsReadAuthority::ReceiverMembers);
         let cache_key = ReceiverAnalysisCacheKey::for_receiver(&query);
         if let Some(cached) = self.member_target_cache.borrow().get(&cache_key).cloned() {
             return ReceiverAnalysisReport::without_work(cached, budget);
@@ -544,6 +546,8 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     /// and each of them would otherwise repeat the scope walk and the module
     /// reads behind it.
     fn jsx_component_props_owners(&self, site: Node<'tree>, name: &str) -> Vec<CodeUnit> {
+        self.aliases
+            .record_authority_read(crate::tsconfig::JsTsReadAuthority::JsxComponentOwners);
         let scope = enclosing_scope_id(site);
         if let Some(cached) = self
             .jsx_component_owner_cache
@@ -884,6 +888,8 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     fn jsx_component_prop_owners(&self, component: &CodeUnit) -> Vec<CodeUnit> {
+        self.aliases
+            .record_authority_read(crate::tsconfig::JsTsReadAuthority::JsxPropsOwners);
         let cache_key = (component.source().clone(), component.fq_name());
         if let Some(cached) = self.jsx_props_owner_cache.borrow().get(&cache_key) {
             return cached.clone();
@@ -2985,6 +2991,72 @@ mod tests {
     use brokk_bifrost_core::analyzer::query_token::QueryToken;
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
+
+    #[test]
+    #[hardwon(
+        "#2445: operation-local JS/TS receiver cache hits omitted their workspace dependencies"
+    )]
+    fn receiver_memo_hits_notify_the_recording_bridge() {
+        use crate::tsconfig::JsTsReadAuthority;
+        let root = tempfile::tempdir().unwrap();
+        let source = "interface Props { title: string } function Panel(props: Props) {} class Owner { run() {} } const owner = new Owner(); owner.run();";
+        let mut host = FakeJsTsSource::new_in(root.path(), "app.ts", source);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        host.aliases = Arc::new(
+            AliasResolver::new(host.project.clone()).with_configuration_read_recorder(Arc::new(
+                move |authority, _| recorded.lock().unwrap().push(authority),
+            )),
+        );
+        let tree = parse_js_ts_tree(&host.file, source, Language::TypeScript).unwrap();
+        let provider = JsTsReceiverFactProvider::new(
+            &host,
+            &host,
+            Language::TypeScript,
+            &host.file,
+            source,
+            tree.root_node(),
+            crate::syntax::compute_import_binder(source, &tree),
+        );
+        let component = host
+            .declarations
+            .iter()
+            .map(|(unit, _)| unit)
+            .find(|unit| unit.identifier() == "Panel")
+            .unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut receiver = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "member_expression" {
+                receiver = node.child_by_field_name("object");
+                break;
+            }
+            brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed(node, &mut stack);
+        }
+        let receiver = receiver.unwrap();
+        for _ in 0..2 {
+            seen.lock().unwrap().clear();
+            provider.resolve_member_targets_report(
+                receiver,
+                "run",
+                receiver.start_byte(),
+                ReceiverAnalysisBudget::default(),
+            );
+            provider.jsx_component_prop_owners(component);
+            provider.jsx_component_props_owners(tree.root_node(), "Panel");
+            let seen = seen.lock().unwrap();
+            for authority in [
+                JsTsReadAuthority::ReceiverMembers,
+                JsTsReadAuthority::JsxPropsOwners,
+                JsTsReadAuthority::JsxComponentOwners,
+            ] {
+                assert!(seen.contains(&authority), "{seen:?} lacks {authority:?}");
+            }
+        }
+        assert!(!provider.member_target_cache.borrow().is_empty());
+        assert!(!provider.jsx_props_owner_cache.borrow().is_empty());
+        assert!(!provider.jsx_component_owner_cache.borrow().is_empty());
+    }
 
     #[test]
     #[hardwon("#4271: a default-value reference was mistaken for a destructuring binder")]

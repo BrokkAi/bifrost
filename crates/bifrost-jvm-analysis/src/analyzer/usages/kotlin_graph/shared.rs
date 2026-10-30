@@ -597,6 +597,9 @@ fn build_kotlin_inbound_edges_with_completeness(
         &prepared_files,
         |prepared, frontier| {
             let graph = KotlinGraphSource {
+        reads: brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            crate::analyzer::kotlin::KotlinAnalyzer,
+        >(analyzer).expect("a Kotlin graph requires its language analyzer").read_capability(),
                 index: analyzer,
                 hierarchy: analyzer.type_hierarchy_provider(),
                 imports: analyzer.import_analysis_provider(),

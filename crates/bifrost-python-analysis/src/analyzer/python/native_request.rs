@@ -50,16 +50,29 @@ impl PythonAnalyzer {
         &self,
         snapshot: &WorkspaceSnapshotId,
     ) -> Option<std::result::Result<(), String>> {
-        match self
-            .native_environment_reconcile
-            .read()
-            .expect("Python reconcile lock poisoned")
-            .as_ref()
-        {
-            Some(Ok(completed)) if completed == snapshot => Some(Ok(())),
-            Some(Err((failed, message))) if failed == snapshot => Some(Err(message.clone())),
-            _ => None,
-        }
+        self.native_environment_reconcile.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| match memo
+                .read()
+                .expect("Python reconcile lock poisoned")
+                .as_ref()
+            {
+                Some(Ok(completed)) if completed == snapshot => Some(Ok(())),
+                Some(Err((failed, message))) if failed == snapshot => Some(Err(message.clone())),
+                _ => None,
+            },
+            // Reconciliation also reads installed runtime and provider state.
+            // A source-only certificate cannot cover those inputs.
+            |_| brokk_bifrost_analysis::analyzer::AuthorityInputs::Unnamed,
+        )
+    }
+
+    fn set_reconcile_state(&self, state: PythonEnvironmentReconcileState) {
+        self.native_environment_reconcile.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| *memo.write().expect("Python reconcile lock poisoned") = state,
+            |_| brokk_bifrost_analysis::analyzer::AuthorityInputs::Unnamed,
+        );
     }
 
     /// Publish coordinated native fixture inputs without selecting native product dispatch.
@@ -121,10 +134,7 @@ impl PythonAnalyzer {
     ) -> Result<()> {
         let snapshots = self.inner.selected_workspace_snapshots();
         let snapshot = snapshots.get("python").expect("selected Python snapshot");
-        *self
-            .native_environment_reconcile
-            .write()
-            .expect("Python reconcile lock poisoned") = None;
+        self.set_reconcile_state(None);
         // The inner build flushes native blob rows before cold reconciliation.
         // WorkspaceAnalyzer updates every delegate before invoking this hook,
         // so reconciliation reads the fully published selected snapshot.
@@ -137,11 +147,7 @@ impl PythonAnalyzer {
         let receipt = match receipt {
             Ok(receipt) => receipt,
             Err(error) => {
-                *self
-                    .native_environment_reconcile
-                    .write()
-                    .expect("Python reconcile lock poisoned") =
-                    Some(Err((snapshot.clone(), error.to_string())));
+                self.set_reconcile_state(Some(Err((snapshot.clone(), error.to_string()))));
                 return Err(error);
             }
         };
@@ -162,10 +168,7 @@ impl PythonAnalyzer {
         } else {
             Some(Ok(snapshot.clone()))
         };
-        *self
-            .native_environment_reconcile
-            .write()
-            .expect("Python reconcile lock poisoned") = state;
+        self.set_reconcile_state(state);
         Ok(())
     }
 }

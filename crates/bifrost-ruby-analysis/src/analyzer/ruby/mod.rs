@@ -1,3 +1,12 @@
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+use brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily;
+use brokk_bifrost_analysis::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    AuthorityInputs, WorkspaceAuthorityMemo,
+};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    ReplayingMemo, ReplayingMemoEntry, memo_attribution,
+};
 #[doc(hidden)]
 pub mod adapter;
 mod clones;
@@ -198,13 +207,30 @@ pub use crate::analyzer::ruby::external::RubyGemArchivePackProducer;
 
 pub use crate::analyzer::ruby::semantic::ruby_declared_scalar_types;
 
+type MemoEntry<T> = Arc<ReplayingMemoEntry<T, ReadKey>>;
+type BoundedMemo<K, V> = Arc<ReplayingMemo<Cache<K, MemoEntry<V>>>>;
+type AuthorityCell<T> =
+    Arc<WorkspaceAuthorityMemo<brokk_bifrost_analysis::analyzer::common::QueryCacheCell<T>>>;
+type ReverseImports = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
+type AutoloadConstantFiles = HashMap<String, HashSet<ProjectFile>>;
+type AuthorityWithFiles<M> = Arc<WorkspaceAuthorityMemo<(M, Cache<(), Arc<[ReadKey]>>)>>;
+
+fn weight_load_authority_files(_key: &(), files: &Arc<[ReadKey]>) -> u32 {
+    let mut heap = RetainedHeap::default();
+    heap.slice(files.as_ref());
+    for key in files.iter() {
+        retained_read_key(&mut heap, key);
+    }
+    u32::try_from(heap.total()).unwrap_or(u32::MAX).max(1)
+}
+
 #[derive(Clone)]
 pub struct RubyAnalyzer {
     inner: TreeSitterAnalyzer<RubyAdapter>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    imported_code_units: BoundedMemo<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: BoundedMemo<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    direct_ancestors: BoundedMemo<CodeUnit, Arc<Vec<CodeUnit>>>,
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
@@ -212,21 +238,23 @@ pub struct RubyAnalyzer {
     /// gets an index that was never built over them (issue #1748). Two cells at
     /// most, because the exclusion verdict is a pure function of the analyzer
     /// and the file.
-    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
-    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
-    source_readiness: Arc<OnceLock<()>>,
-    zeitwerk_project: Arc<OnceLock<bool>>,
-    zeitwerk_autoload_files: Arc<OnceLock<HashSet<ProjectFile>>>,
-    zeitwerk_consumer_files: Arc<OnceLock<HashSet<ProjectFile>>>,
-    zeitwerk_autoload_code_units: Arc<OnceLock<HashSet<CodeUnit>>>,
+    direct_descendant_index: Arc<
+        WorkspaceAuthorityMemo<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
+    >,
+    reverse_import_index: AuthorityWithFiles<PoolSafeMemo<Arc<ReverseImports>>>,
+    autoload_constant_files: AuthorityWithFiles<OnceLock<Arc<AutoloadConstantFiles>>>,
+    source_readiness: AuthorityCell<()>,
+    zeitwerk_project: AuthorityCell<bool>,
+    zeitwerk_autoload_files: AuthorityCell<Arc<HashSet<ProjectFile>>>,
+    zeitwerk_consumer_files: AuthorityCell<Arc<HashSet<ProjectFile>>>,
+    zeitwerk_autoload_code_units: AuthorityCell<Arc<HashSet<CodeUnit>>>,
     #[allow(dead_code)]
-    mixin_relations: Arc<OnceLock<Vec<TypeRelation>>>,
-    semantic_facts: Arc<OnceLock<RubySemanticFacts>>,
+    mixin_relations: AuthorityCell<Arc<Vec<TypeRelation>>>,
+    semantic_facts: AuthorityCell<Arc<RubySemanticFacts>>,
     /// Class/module declarations indexed by their trailing identifier, for
     /// resolving relative (unqualified) supertype references without scanning
     /// every declaration.
-    types_by_identifier: Arc<OnceLock<HashMap<String, Vec<CodeUnit>>>>,
+    types_by_identifier: AuthorityCell<Arc<HashMap<String, Vec<CodeUnit>>>>,
 }
 
 brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::impl_forward_query_provider!(
@@ -234,14 +262,34 @@ brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::impl_forward_query
 );
 
 impl RubyAnalyzer {
+    fn authority_inputs(&self) -> AuthorityInputs<'static> {
+        self.authority_inputs_with(&[])
+    }
+
+    fn authority_inputs_with(&self, extra: &[ReadKey]) -> AuthorityInputs<'static> {
+        let mut files = extra.to_vec();
+        for rel_path in ["Gemfile", "Gemfile.lock"] {
+            let Some(key) = brokk_bifrost_analysis::analyzer::workspace_authority::workspace_authority_file_input(self, Language::Ruby, rel_path) else {
+                return AuthorityInputs::Unnamed;
+            };
+            files.push(key);
+        }
+        AuthorityInputs::SourceAndFiles {
+            languages: &[Language::Ruby],
+            files: files.into(),
+        }
+    }
+
     pub(crate) fn update_all_with_progress(
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        Self::from_inner(
-            self.inner.update_all_with_progress(progress),
-            self.memo_budget,
-        )
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::from_inner(
+                self.inner.update_all_with_progress(progress),
+                self.memo_budget,
+            )
+        })
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
@@ -285,20 +333,92 @@ impl RubyAnalyzer {
         Self {
             inner,
             memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            autoload_constant_files: Arc::new(OnceLock::new()),
-            source_readiness: Arc::new(OnceLock::new()),
-            zeitwerk_project: Arc::new(OnceLock::new()),
-            zeitwerk_autoload_files: Arc::new(OnceLock::new()),
-            zeitwerk_consumer_files: Arc::new(OnceLock::new()),
-            zeitwerk_autoload_code_units: Arc::new(OnceLock::new()),
-            mixin_relations: Arc::new(OnceLock::new()),
-            semantic_facts: Arc::new(OnceLock::new()),
-            types_by_identifier: Arc::new(OnceLock::new()),
+            imported_code_units: Arc::new(ReplayingMemo::new(build_weighted_cache(
+                memo_budget / 4,
+                |_key, entry: &MemoEntry<Arc<HashSet<CodeUnit>>>| {
+                    u32::try_from(entry.retained_bytes(|key| {
+                        let mut heap = RetainedHeap::default();
+                        retained_read_key(&mut heap, key);
+                        heap.total()
+                    }))
+                    .unwrap_or(u32::MAX)
+                    .max(1)
+                },
+            ))),
+            referencing_files: Arc::new(ReplayingMemo::new(build_weighted_cache(
+                memo_budget / 8,
+                |_key, entry: &MemoEntry<Arc<HashSet<ProjectFile>>>| {
+                    u32::try_from(entry.retained_bytes(|key| {
+                        let mut heap = RetainedHeap::default();
+                        retained_read_key(&mut heap, key);
+                        heap.total()
+                    }))
+                    .unwrap_or(u32::MAX)
+                    .max(1)
+                },
+            ))),
+            direct_ancestors: Arc::new(ReplayingMemo::new(build_weighted_cache(
+                memo_budget / 8,
+                |_key, entry: &MemoEntry<Arc<Vec<CodeUnit>>>| {
+                    u32::try_from(entry.retained_bytes(|key| {
+                        let mut heap = RetainedHeap::default();
+                        retained_read_key(&mut heap, key);
+                        heap.total()
+                    }))
+                    .unwrap_or(u32::MAX)
+                    .max(1)
+                },
+            ))),
+            direct_descendant_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyDirectDescendants,
+                KeyedPoolSafeMemo::new(),
+            )),
+            reverse_import_index: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyReverseImports,
+                (
+                    PoolSafeMemo::new(),
+                    build_weighted_cache(memo_budget / 16, weight_load_authority_files),
+                ),
+            )),
+            autoload_constant_files: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyAutoloadConstants,
+                (
+                    OnceLock::new(),
+                    build_weighted_cache(memo_budget / 16, weight_load_authority_files),
+                ),
+            )),
+            source_readiness: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyCanonicalSourcesReady,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            zeitwerk_project: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyZeitwerkConventions,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            zeitwerk_autoload_files: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyZeitwerkAutoloadFiles,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            zeitwerk_consumer_files: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyZeitwerkConsumerFiles,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            zeitwerk_autoload_code_units: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyZeitwerkAutoloadCodeUnits,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            mixin_relations: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyMixinRelations,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            semantic_facts: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubySemanticFacts,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
+            types_by_identifier: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyTypesByIdentifier,
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            )),
         }
     }
 
@@ -329,7 +449,11 @@ impl RubyAnalyzer {
 
     #[cfg(test)]
     pub(crate) fn global_semantic_index_initialized_for_test(&self) -> bool {
-        self.semantic_facts.get().is_some()
+        self.semantic_facts.read(
+            &memo_attribution(self),
+            |memo| memo.get().is_some(),
+            |_| self.authority_inputs(),
+        )
     }
 
     /// Store reader checkouts, one per relational batch this analyzer has run.
@@ -432,14 +556,18 @@ impl RubyAnalyzer {
         self.inner.ranges_limited(unit, limit)
     }
 
-    pub(crate) fn semantic_facts(&self) -> &RubySemanticFacts {
-        self.semantic_facts.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "ruby.semantic_facts",
-                || brokk_bifrost_ruby::graph_support::build_ruby_semantic_facts(self),
-            )
-        })
+    pub(crate) fn semantic_facts(&self) -> std::sync::Arc<RubySemanticFacts> {
+        self.semantic_facts.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    memo,
+                    || brokk_bifrost_ruby::graph_support::build_ruby_semantic_facts(self),
+                )
+            },
+            |_| self.authority_inputs(),
+        )
     }
 
     pub(crate) fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
@@ -625,6 +753,8 @@ impl CodeUnitIndex for RubyAnalyzer {
 }
 
 impl IAnalyzer for RubyAnalyzer {
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
 
     brokk_bifrost_analysis::analyzer::i_analyzer::forward_relational_definition_batch!();
@@ -707,7 +837,9 @@ impl IAnalyzer for RubyAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+        })
     }
 
     fn update_all(&self) -> Self {

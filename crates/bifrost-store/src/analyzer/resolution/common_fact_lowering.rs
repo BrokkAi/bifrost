@@ -13,8 +13,9 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionImportRouteKind, ResolutionImportSelectorFact, ResolutionInvocationRoleFact,
     ResolutionJvmAliasFact, ResolutionJvmAliasId, ResolutionJvmAliasOwnerSegmentFact,
     ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberQualifierCompatibility,
-    ResolutionNameId, ResolutionNamespace, ResolutionPackageObjectExportFact, ResolutionScopeFact,
-    ResolutionScopeId, ResolutionSingletonRelationFact, ResolutionSiteFact, ResolutionSiteId,
+    ResolutionNameId, ResolutionNameLookupKind, ResolutionNamespace,
+    ResolutionPackageObjectExportFact, ResolutionScopeFact, ResolutionScopeId,
+    ResolutionSingletonRelationFact, ResolutionSiteFact, ResolutionSiteId,
     ResolutionTypeRelationId,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::HoistingClass;
@@ -591,6 +592,8 @@ pub struct LoweredPackageObjectExport {
 #[doc(hidden)]
 pub struct LoweredSharedLanguageFacts {
     pub(crate) aliases: Vec<LoweredJvmAlias>,
+    pub(crate) compilation_imports:
+        Vec<brokk_bifrost_core::analyzer::resolution_facts::ResolutionCompilationImportFact>,
     pub(crate) call_argument_lists: Vec<LoweredCallArgumentList>,
     pub(crate) call_arguments: Vec<LoweredCallArgument>,
     pub(crate) named_argument_labels: Vec<LoweredNamedArgumentLabel>,
@@ -728,6 +731,12 @@ fn lower_root_imports(
     routes
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LoweredNameLookup {
+    pub lookup: SemanticId,
+    pub kind: ResolutionNameLookupKind,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct LoweredCommonFacts {
@@ -736,6 +745,7 @@ pub struct LoweredCommonFacts {
     pub(crate) definition_unit_crosswalks: Vec<LoweredDefinitionUnitCrosswalk>,
     #[doc(hidden)]
     pub deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
+    pub(crate) name_lookups: Vec<LoweredNameLookup>,
     pub(crate) declared_type_relations: Vec<LoweredDeclaredTypeRelation>,
     pub(crate) relation_members: Vec<LoweredRelationMember>,
     pub(crate) declared_root_routes: Vec<LoweredDeclaredRootRoute>,
@@ -763,6 +773,7 @@ impl LoweredCommonFacts {
         mut additional_definition_namespaces: Vec<LoweredAdditionalDefinitionNamespace>,
         mut definition_unit_crosswalks: Vec<LoweredDefinitionUnitCrosswalk>,
         mut deferred_member_owners: Vec<LoweredDeferredMemberOwner>,
+        mut name_lookups: Vec<LoweredNameLookup>,
         mut declared_type_relations: Vec<LoweredDeclaredTypeRelation>,
         mut relation_members: Vec<LoweredRelationMember>,
         mut declared_root_routes: Vec<LoweredDeclaredRootRoute>,
@@ -808,6 +819,8 @@ impl LoweredCommonFacts {
                 .all(|pair| pair[0].definition != pair[1].definition)
         );
 
+        name_lookups.sort_unstable();
+        name_lookups.dedup();
         declared_type_relations.sort_unstable();
         relation_members.sort_unstable();
         for members in relation_members.chunk_by(|left, right| left.relation == right.relation) {
@@ -931,6 +944,7 @@ impl LoweredCommonFacts {
             additional_definition_namespaces,
             definition_unit_crosswalks,
             deferred_member_owners,
+            name_lookups,
             declared_type_relations,
             relation_members,
             declared_root_routes,
@@ -1389,6 +1403,7 @@ fn lower_shared_language_facts(
 
     LoweredSharedLanguageFacts {
         aliases: lowered_aliases,
+        compilation_imports: facts.compilation_imports.clone(),
         call_argument_lists,
         call_arguments,
         named_argument_labels,
@@ -1478,6 +1493,24 @@ pub(crate) fn lower_common_resolution_facts(
             })
         })
         .collect::<Vec<_>>();
+    let name_lookups = facts
+        .name_lookups
+        .iter()
+        .map(|fact| LoweredNameLookup {
+            lookup: identities.lookup_semantic(
+                language,
+                match fact.kind {
+                    ResolutionNameLookupKind::EmbeddedType
+                    | ResolutionNameLookupKind::SupertypeName => ResolutionNamespace::Type,
+                    ResolutionNameLookupKind::InterfaceMethod => {
+                        member_lookup_namespace(ResolutionMemberKind::Method)
+                    }
+                },
+                names[&identifiers[&fact.site].name],
+            ),
+            kind: fact.kind,
+        })
+        .collect();
     let hierarchy_by_member = member_hierarchy_frontiers(facts);
     let deferred_member_owners = facts
         .deferred_member_owners
@@ -2025,6 +2058,7 @@ pub(crate) fn lower_common_resolution_facts(
         additional_definition_namespaces,
         definition_unit_crosswalks,
         deferred_member_owners,
+        name_lookups,
         declared_type_relations,
         relation_members,
         declared_root_routes,

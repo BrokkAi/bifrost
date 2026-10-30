@@ -10,9 +10,13 @@
 
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::project::Project;
+use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use moka::sync::Cache;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, LazyLock};
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
 use crate::declarations::go_package_fq;
@@ -47,6 +51,35 @@ pub struct GoWorkspacePathIndex {
 }
 
 impl GoWorkspacePathIndex {
+    /// Complete path authority, excluding source positions and host mounts.
+    pub fn read_answer(&self) -> [u8; 32] {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+        use brokk_bifrost_core::path_utils::{rel_path_string, workspace_relative_slash_path};
+        let mut hash = CanonicalHasher::new(b"go-workspace-paths-v1");
+        hash.value(&[u8::from(self.complete)]);
+        for root in &self.module_roots {
+            hash.value(root.import_path.as_bytes());
+            hash.value(workspace_relative_slash_path(&root.workspace_dir).as_bytes());
+        }
+        hash.sequence("unnamed", &self.unnamed_module_roots, |hash, root| {
+            hash.value(workspace_relative_slash_path(root).as_bytes())
+        });
+        let mut paths = self.exact_import_paths.iter().collect::<Vec<_>>();
+        paths.sort();
+        hash.sequence("packages", &paths, |hash, path| hash.value(path.as_bytes()));
+        let mut representatives = self
+            .representative_by_directory
+            .iter()
+            .map(|(dir, file)| (workspace_relative_slash_path(dir), rel_path_string(file)))
+            .collect::<Vec<_>>();
+        representatives.sort();
+        hash.sequence("representatives", &representatives, |hash, (dir, file)| {
+            hash.value(dir.as_bytes());
+            hash.value(file.as_bytes());
+        });
+        hash.finish()
+    }
+
     /// `refused_sources` are the sources that source admission refused at the
     /// selected revision. They supply no `package` clause and no facts, but
     /// they are explained exclusions rather than missing inventory.
@@ -61,7 +94,7 @@ impl GoWorkspacePathIndex {
         };
         let (module_roots, unnamed_module_roots, module_roots_complete) =
             go_module_roots_from_files(project, &files);
-        let go_files = files
+        let mut go_files = files
             .into_iter()
             .filter(|file| {
                 file.rel_path()
@@ -70,6 +103,7 @@ impl GoWorkspacePathIndex {
             })
             .filter(|file| !is_under_unnamed_module(file, &unnamed_module_roots, &module_roots))
             .collect::<Vec<_>>();
+        go_files.sort();
         let mut representative_by_directory: HashMap<PathBuf, ProjectFile> = HashMap::default();
         for file in go_files
             .iter()
@@ -613,6 +647,50 @@ fn nearest_go_module_lookup(file: &ProjectFile) -> Option<GoModuleLookup<(String
 
 type GoModuleAnchor = (PathBuf, String);
 type GoModuleCacheKey = (PathBuf, PathBuf);
+type GoModuleCacheEntry = (GoModuleLookup<GoModuleAnchor>, GoModuleInputs);
+
+/// Shared original probes with the starting point for one directory's answer.
+#[derive(Clone)]
+pub struct GoModuleInputs {
+    inputs: std::sync::Arc<[GoModuleInput]>,
+    offset: usize,
+}
+
+impl std::ops::Deref for GoModuleInputs {
+    type Target = [GoModuleInput];
+
+    fn deref(&self) -> &Self::Target {
+        &self.inputs[self.offset..]
+    }
+}
+
+/// The exact non-source probes behind a cached nearest-module answer.
+#[derive(Clone, Debug)]
+pub enum GoModuleInput {
+    File {
+        rel_path: String,
+        blob: [u8; 20],
+        content_digest: [u8; 32],
+    },
+    PathAbsent {
+        rel_path: String,
+    },
+    Unavailable,
+}
+
+/// Replays the receipt, including negative probes, while the entry is resident.
+/// An evicted entry is re-probed from disk and its newly computed receipt is
+/// checked against the generation's file hashes in the same way. The analyzer
+/// records it on every file-identity read, including warm hydration.
+pub fn nearest_go_module_inputs(file: &ProjectFile) -> GoModuleInputs {
+    let Some(dir) = file.abs_path().parent().map(Path::to_path_buf) else {
+        return GoModuleInputs {
+            inputs: std::sync::Arc::from([GoModuleInput::Unavailable]),
+            offset: 0,
+        };
+    };
+    nearest_go_module_entry(&dir, file.root()).1
+}
 
 #[derive(Clone)]
 enum GoModuleLookup<T> {
@@ -621,19 +699,46 @@ enum GoModuleLookup<T> {
     Invalid,
 }
 
-fn nearest_go_module_cache()
--> &'static Mutex<HashMap<GoModuleCacheKey, GoModuleLookup<GoModuleAnchor>>> {
-    static CACHE: OnceLock<Mutex<HashMap<GoModuleCacheKey, GoModuleLookup<GoModuleAnchor>>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
+// A byte budget, so that retained directory chains cannot grow with the
+// workspace. Eviction is cheap: re-walking one chain costs a few go.mod probes,
+// and the new receipt is recomputed with its answer. 8 MiB is within the range
+// of the workspace's other weighed caches.
+const NEAREST_GO_MODULE_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn nearest_go_module_cache() -> &'static Cache<GoModuleCacheKey, GoModuleCacheEntry> {
+    static CACHE: LazyLock<Cache<GoModuleCacheKey, GoModuleCacheEntry>> = LazyLock::new(|| {
+        build_weighted_cache(
+            NEAREST_GO_MODULE_CACHE_BYTES,
+            |key: &GoModuleCacheKey, entry: &GoModuleCacheEntry| {
+                let mut bytes = 256usize
+                    .saturating_add(key.0.to_string_lossy().len())
+                    .saturating_add(key.1.to_string_lossy().len());
+                if let GoModuleLookup::Found((anchor, module_path)) = &entry.0 {
+                    bytes = bytes
+                        .saturating_add(anchor.to_string_lossy().len())
+                        .saturating_add(module_path.len());
+                }
+                // Charge the full shared allocation for every entry, even
+                // when this directory's receipt starts at a later offset.
+                bytes = entry.1.inputs.iter().fold(bytes, |bytes, input| {
+                    bytes.saturating_add(match input {
+                        GoModuleInput::File { rel_path, .. }
+                        | GoModuleInput::PathAbsent { rel_path } => {
+                            64usize.saturating_add(rel_path.len())
+                        }
+                        GoModuleInput::Unavailable => 64,
+                    })
+                });
+                bytes.min(u32::MAX as usize) as u32
+            },
+        )
+    });
+    &CACHE
 }
 
 /// Clear cached nearest-module answers after the workspace file set changes.
 pub fn invalidate_nearest_go_module_cache() {
-    nearest_go_module_cache()
-        .lock()
-        .expect("go module cache mutex")
-        .clear();
+    nearest_go_module_cache().invalidate_all();
 }
 
 #[cfg(test)]
@@ -643,20 +748,24 @@ fn go_mod_probe_attempts() -> &'static Mutex<HashMap<PathBuf, usize>> {
 }
 
 fn nearest_go_module_anchor(dir: &Path, root: &Path) -> GoModuleLookup<GoModuleAnchor> {
+    nearest_go_module_entry(dir, root).0
+}
+
+fn nearest_go_module_entry(dir: &Path, root: &Path) -> GoModuleCacheEntry {
     let cache = nearest_go_module_cache();
     let mut visited = Vec::new();
+    let mut inputs = Vec::new();
     let mut cursor = dir;
     let result = loop {
         let key = (root.to_path_buf(), cursor.to_path_buf());
-        if let Some(cached) = cache
-            .lock()
-            .expect("go module cache mutex")
-            .get(&key)
-            .cloned()
-        {
-            break cached;
+        if let Some(cached) = cache.get(&key) {
+            if visited.is_empty() {
+                return cached;
+            }
+            inputs.extend(cached.1.iter().cloned());
+            break cached.0;
         }
-        visited.push(key);
+        visited.push((key, inputs.len()));
         #[cfg(test)]
         {
             *go_mod_probe_attempts()
@@ -665,15 +774,38 @@ fn nearest_go_module_anchor(dir: &Path, root: &Path) -> GoModuleLookup<GoModuleA
                 .entry(root.to_path_buf())
                 .or_default() += 1;
         }
-        match std::fs::read_to_string(cursor.join("go.mod")) {
+        let path = cursor.join("go.mod");
+        let rel_path = match path.strip_prefix(root) {
+            Ok(path) => brokk_bifrost_core::path_utils::workspace_relative_slash_path(path),
+            Err(_) => {
+                inputs.push(GoModuleInput::Unavailable);
+                break GoModuleLookup::Invalid;
+            }
+        };
+        match std::fs::read_to_string(path) {
             Ok(contents) => {
+                let snapshot = brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot::disk(
+                    contents.as_str(),
+                );
+                inputs.push(GoModuleInput::File {
+                    content_digest: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                        contents.as_bytes(),
+                    ),
+                    rel_path,
+                    blob: snapshot.oid().as_bytes().try_into().expect("blob width"),
+                });
                 break match go_module_path_from_source(&contents) {
                     Some(module_path) => GoModuleLookup::Found((cursor.to_path_buf(), module_path)),
                     None => GoModuleLookup::Invalid,
                 };
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => break GoModuleLookup::Invalid,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                inputs.push(GoModuleInput::PathAbsent { rel_path })
+            }
+            Err(_) => {
+                inputs.push(GoModuleInput::Unavailable);
+                break GoModuleLookup::Invalid;
+            }
         }
         if cursor == root {
             break GoModuleLookup::Missing;
@@ -683,13 +815,22 @@ fn nearest_go_module_anchor(dir: &Path, root: &Path) -> GoModuleLookup<GoModuleA
             None => break GoModuleLookup::Missing,
         }
     };
+    let inputs: std::sync::Arc<[GoModuleInput]> = inputs.into();
     if !visited.is_empty() {
-        let mut guard = cache.lock().expect("go module cache mutex");
-        for key in visited {
-            guard.entry(key).or_insert_with(|| result.clone());
+        for (key, offset) in visited {
+            cache.insert(
+                key,
+                (
+                    result.clone(),
+                    GoModuleInputs {
+                        inputs: Arc::clone(&inputs),
+                        offset,
+                    },
+                ),
+            );
         }
     }
-    result
+    (result, GoModuleInputs { inputs, offset: 0 })
 }
 
 /// Import path with no `go.mod`: the project-relative parent directory, or the
@@ -1189,6 +1330,59 @@ mod tests {
         assert!(index.exact_package_exists("example.com/repo/ordinary"));
         assert!(index.exact_package_exists("example.com/repo/external"));
         assert!(index.exact_package_exists("example.com/repo/external_test"));
+    }
+
+    #[test]
+    #[hardwon("#2445: nearest-module receipts copied every probe suffix in a directory walk")]
+    fn nearest_module_probe_receipts_share_the_walk_allocation() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        reset_cache_probe_count(repo.path());
+        write_file(repo.path(), "go.mod", "module example.com/repo\n");
+        write_file(repo.path(), "a/b/file.go", "package b\n");
+        let file = ProjectFile::new(repo.path().to_path_buf(), "a/b/file.go");
+        let receipt = super::nearest_go_module_inputs(&file);
+        assert_eq!(receipt.len(), 3);
+        {
+            let cache = super::nearest_go_module_cache();
+            for (dir, offset) in [("a/b", 0), ("a", 1), ("", 2)] {
+                let entry = cache
+                    .get(&(repo.path().to_path_buf(), repo.path().join(dir)))
+                    .unwrap();
+                assert!(std::sync::Arc::ptr_eq(&receipt.inputs, &entry.1.inputs));
+                assert_eq!(entry.1.offset, offset);
+                assert_eq!(entry.1.len(), 3 - offset);
+            }
+        }
+        let warm = super::nearest_go_module_inputs(&ProjectFile::new(
+            repo.path().to_path_buf(),
+            "a/file.go",
+        ));
+        assert!(std::sync::Arc::ptr_eq(&receipt.inputs, &warm.inputs));
+        assert!(
+            matches!(&warm[0], super::GoModuleInput::PathAbsent { rel_path } if rel_path == "a/go.mod")
+        );
+        assert!(
+            matches!(&warm[1], super::GoModuleInput::File { rel_path, .. } if rel_path == "go.mod")
+        );
+
+        // A new sibling walk appends only the ancestor's visible suffix.
+        write_file(repo.path(), "a/c/file.go", "package c\n");
+        let sibling = super::nearest_go_module_inputs(&ProjectFile::new(
+            repo.path().to_path_buf(),
+            "a/c/file.go",
+        ));
+        assert_eq!(sibling.len(), 3);
+        assert!(
+            matches!(&sibling[0], super::GoModuleInput::PathAbsent { rel_path } if rel_path == "a/c/go.mod")
+        );
+        assert!(
+            matches!(&sibling[1], super::GoModuleInput::PathAbsent { rel_path } if rel_path == "a/go.mod")
+        );
+        assert!(
+            matches!(&sibling[2], super::GoModuleInput::File { rel_path, .. } if rel_path == "go.mod")
+        );
+        assert_eq!(go_mod_probe_attempts().lock().unwrap()[repo.path()], 4);
     }
 
     #[test]

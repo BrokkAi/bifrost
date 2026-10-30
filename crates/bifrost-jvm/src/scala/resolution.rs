@@ -237,6 +237,7 @@ pub(super) fn extract_scala_resolution<'source>(
     // copied from their canonical source declarations.
     builder.finish_access_boundaries(root, source_declarations);
     builder.validate();
+    crate::implicit_supertype::publish_written_supertype_names(&mut builder.facts);
     ScalaResolutionExtraction {
         facts: builder.facts,
         site_occurrences: builder.site_occurrences,
@@ -4306,6 +4307,11 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         }
         for (alias, identity, target) in std::mem::take(&mut self.pending_type_aliases) {
             let input = self.declared_type_identity_slot(alias, target);
+            if let Some(terminal) = scala_callable_result_type_head(target)
+                && let Some(&reference) = self.sites_by_node.get(&terminal.id())
+            {
+                crate::implicit_supertype::publish_alias_supertype_name(&mut self.facts, reference);
+            }
             self.facts
                 .type_transfers
                 .push(ResolutionTypeTransferFact::new(

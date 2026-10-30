@@ -60,7 +60,7 @@ pub struct WorkspaceSemanticOracle<'a> {
     workspace: &'a WorkspaceAnalyzer,
     runtime_reads: runtime_values::RuntimeReadCache,
     runtime_syntax: runtime_values::RuntimeSyntaxCache,
-    runtime_write_footprints: runtime_values::WorkspaceRuntimeWriteFootprintCache,
+    runtime_write_footprints: runtime_values::AttributedRuntimeWriteFootprintCache,
     // Completed incoming bindings live only as long as this query provider.
     #[doc(hidden)]
     pub incoming_actuals: Arc<IncomingActualCache>,
@@ -188,7 +188,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 .map_or_else(runtime_syntax_cache, |caches| {
                     caches.runtime_syntax().clone()
                 }),
-            runtime_write_footprints: runtime_values::workspace_runtime_write_footprint_cache(),
+            runtime_write_footprints: runtime_values::attributed_runtime_write_footprint_cache(),
             limits,
             hierarchy_expansion,
             active_semantic_model_snapshot,
@@ -199,7 +199,17 @@ impl<'a> WorkspaceSemanticOracle<'a> {
     }
 
     pub(crate) fn python_saved_default_safety(&self) -> Option<&SavedDefaultArgumentSafety> {
-        self.python_saved_default_safety.as_deref()
+        let safety = self.python_saved_default_safety.as_deref()?;
+        crate::analyzer::workspace_authority::record_workspace_authority_read(
+            self.workspace.analyzer(),
+            crate::analyzer::WorkspaceFactFamily::PythonSavedDefaults,
+            crate::analyzer::AuthorityInputs::Fact {
+                language: crate::analyzer::Language::Python,
+                subject: crate::analyzer::FactSubject::Whole,
+                answer: safety.fact_fingerprint(),
+            },
+        );
+        Some(safety)
     }
 
     pub(crate) fn python_saved_default_is_available(
@@ -225,6 +235,16 @@ impl<'a> WorkspaceSemanticOracle<'a> {
     }
 
     pub fn active_semantic_models(&self) -> Option<&Arc<ResolvedActiveSemanticModels>> {
+        if let Some(snapshot) = &self.active_semantic_model_snapshot {
+            self.workspace
+                .analyzer()
+                .record_read(crate::analyzer::ReadKey::Models(
+                    crate::analyzer::semantic::StableDigest::sha256(
+                        snapshot.active_models().active_model_set_hash(),
+                    ),
+                ));
+        }
+
         match self.active_semantic_model_snapshot.as_ref() {
             Some(snapshot) => Some(snapshot.active_models()),
             None => None,
@@ -233,10 +253,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
 
     #[doc(hidden)]
     pub fn active_semantic_model_snapshot(&self) -> Option<Arc<ActiveSemanticModelSnapshot>> {
+        self.active_semantic_models();
+
         self.active_semantic_model_snapshot.as_ref().map(Arc::clone)
     }
 
     pub(super) fn semantic_model_overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
+        self.active_semantic_models();
+
         self.active_semantic_model_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.overlay())

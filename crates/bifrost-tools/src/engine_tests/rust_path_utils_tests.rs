@@ -76,6 +76,7 @@ mod rust_departing_tests_tests {
     fn a_failed_workspace_listing_reports_the_failure_rather_than_a_confident_absence() {
         let (_temp, analyzer) = unlistable_workspace();
         let context = std::sync::Arc::new(AnalyzerQueryContext::default());
+        let context_attribution = context.enter();
         analyzer.begin_query(&context);
 
         let resolved = WorkspaceFileResolver::for_analyzer(&analyzer).resolve_literal("widget.rs");
@@ -84,6 +85,7 @@ mod rust_departing_tests_tests {
             .store_error()
             .expect("a failed workspace listing must reach the request boundary");
         analyzer.end_query(&context);
+        drop(context_attribution);
         assert!(
             matches!(resolved, ResolvedFileInput::NotFound(_)),
             "the bare name still has no answer"
@@ -110,6 +112,7 @@ mod rust_departing_tests_tests {
             .expect("fixture file");
         let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
         let context = std::sync::Arc::new(AnalyzerQueryContext::default());
+        let context_attribution = context.enter();
         analyzer.begin_query(&context);
 
         let resolver = WorkspaceFileResolver::for_analyzer(&analyzer);
@@ -124,5 +127,6 @@ mod rust_departing_tests_tests {
 
         assert!(context.store_error().is_none());
         analyzer.end_query(&context);
+        drop(context_attribution);
     }
 }

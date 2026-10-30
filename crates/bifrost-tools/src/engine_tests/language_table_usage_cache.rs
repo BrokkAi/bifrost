@@ -91,6 +91,7 @@ mod tests {
         let cancellation = CancellationToken::default();
 
         let (first, first_lifecycle) = ready_graph(cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || {
@@ -100,6 +101,7 @@ mod tests {
             || true,
         ));
         let (second, second_lifecycle) = ready_graph(cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || panic!("warm acquisition must not rebuild"),
@@ -121,6 +123,7 @@ mod tests {
 
         for _ in 0..2 {
             let acquisition = cache.acquire(
+                &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
                 key(91),
                 &cancellation,
                 || {
@@ -146,6 +149,7 @@ mod tests {
         let cancellation = CancellationToken::default();
 
         let cancelled = cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || WorkspaceUsageGraphCacheBuildOutcome::Cancelled,
@@ -158,6 +162,7 @@ mod tests {
         assert_eq!(0, cache.len_for_test());
 
         let (_, lifecycle) = ready_graph(cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || WorkspaceUsageGraphCacheBuildOutcome::Complete(empty_graph()),
@@ -174,6 +179,7 @@ mod tests {
 
         for content_seed in [1, 2] {
             let (_, lifecycle) = ready_graph(cache.acquire(
+                &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
                 key(content_seed),
                 &cancellation,
                 || {
@@ -199,6 +205,7 @@ mod tests {
             WorkspaceUsageGraphKind::Exact,
         ] {
             let (_, lifecycle) = ready_graph(cache.acquire(
+                &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
                 key_with_kind(1, kind, UsageEcosystem::Rust),
                 &cancellation,
                 || WorkspaceUsageGraphCacheBuildOutcome::Complete(empty_graph()),
@@ -218,6 +225,7 @@ mod tests {
 
         for key in [incumbent_jvm_key(1), selected_key(1)] {
             let (_, lifecycle) = ready_graph(cache.acquire(
+                &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
                 key,
                 &cancellation,
                 || {
@@ -239,6 +247,7 @@ mod tests {
         let cancellation = CancellationToken::default();
 
         let stale = cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             selected_key(1),
             &cancellation,
             || WorkspaceUsageGraphCacheBuildOutcome::Stale,
@@ -248,6 +257,7 @@ mod tests {
         assert_eq!(0, cache.len_for_test());
 
         let failed: Result<WorkspaceUsageGraphCacheAcquisition, &str> = cache.acquire_fallible(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             selected_key(1),
             &cancellation,
             || Err("selected graph build failed"),
@@ -257,6 +267,7 @@ mod tests {
         assert_eq!(0, cache.len_for_test());
 
         let (_, lifecycle) = ready_graph(cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             selected_key(1),
             &cancellation,
             || WorkspaceUsageGraphCacheBuildOutcome::Complete(empty_graph()),
@@ -272,6 +283,7 @@ mod tests {
         let cancellation = CancellationToken::default();
 
         let cancelled: Result<WorkspaceUsageGraphCacheAcquisition, &str> = cache.acquire_fallible(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             selected_key(7),
             &cancellation,
             || {
@@ -287,6 +299,7 @@ mod tests {
         assert_eq!(0, cache.len_for_test());
 
         let (_, lifecycle) = ready_graph(cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             selected_key(7),
             &CancellationToken::default(),
             || WorkspaceUsageGraphCacheBuildOutcome::Complete(empty_graph()),
@@ -302,6 +315,7 @@ mod tests {
         let cancellation = CancellationToken::default();
 
         let acquisition = cache.acquire(
+            &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
             key(1),
             &cancellation,
             || WorkspaceUsageGraphCacheBuildOutcome::Complete(empty_graph()),
@@ -327,6 +341,7 @@ mod tests {
         let leader_builds = Arc::clone(&builds);
         let leader = thread::spawn(move || {
             ready_graph(leader_cache.acquire(
+                &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
                 key(1),
                 &CancellationToken::default(),
                 || {
@@ -344,6 +359,7 @@ mod tests {
         let follower_cache = Arc::clone(&cache);
         let follower = thread::spawn(move || {
             ready_graph(follower_cache.acquire(
+                &brokk_bifrost_analysis::analyzer::MultiAnalyzer::default(),
                 key(1),
                 &CancellationToken::default(),
                 || panic!("same-key follower must not build"),

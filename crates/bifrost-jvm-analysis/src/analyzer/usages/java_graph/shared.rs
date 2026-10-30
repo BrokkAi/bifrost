@@ -205,12 +205,13 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             limit_exceeded: &mut limit_exceeded,
         };
         let mut relational_session = None;
-        let return_caches = OwnedReturnTypeCaches::default();
+        let return_caches = OwnedReturnTypeCaches::new(self.java.read_capability());
         for file in &files {
             let _scan_scope = brokk_bifrost_core::profiling::scope("java_graph::scan_file");
             let cache_key = java_evidence_cache_key(analyzer, file, overloads, &spec);
             if let (Some(caches), Some((key, content))) = (analyzer.snapshot_caches(), cache_key) {
                 match caches.java_usage_evidence().acquire(
+                    analyzer,
                     key,
                     cancellation,
                     || {

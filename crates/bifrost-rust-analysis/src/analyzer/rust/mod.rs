@@ -1,4 +1,7 @@
 use brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+    SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+};
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
 use brokk_bifrost_analysis::{
@@ -171,6 +174,21 @@ fn standard_deref_trait(evidence: &SelectedTypeHeadEvidence<'_>) -> bool {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSupport {
+    fn demand_installer(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::store::resolution_operation::NativeDemandInstaller>
+    {
+        Some(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_demand::RUST_DEMAND_INSTALLER)
+    }
+
+    fn precedence_rules(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::resolution::precedence::PrecedenceRules
+    {
+        use brokk_bifrost_analysis::analyzer::resolution::precedence;
+        &precedence::RustPrecedenceRules
+    }
+
     fn selected_receiver_step(
         &self,
         request: brokk_bifrost_analysis::analyzer::store::language_support::SelectedReceiverStepRequest<'_>,
@@ -457,17 +475,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSuppo
     }
 
     fn is_configuration_input_path(&self, path: &Path) -> bool {
-        matches!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some("Cargo.toml" | "Cargo.lock")
-        ) || (path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|n| n == ".cargo")
-            && matches!(
-                path.file_name().and_then(|n| n.to_str()),
-                Some("config" | "config.toml")
-            ))
+        file_dependency_evidence::cargo_input(path)
     }
     fn selected_macro_source_rows(
         &self,
@@ -808,14 +816,24 @@ pub struct RustAnalyzer {
 
 impl_forward_query_provider!(RustAnalyzer);
 
+/// One-shot selected opening plus attempt progress, including failed store opens.
+pub(crate) struct RustSelectedOperationOpenReport<'analyzer> {
+    pub(crate) outcome: brokk_bifrost_analysis::analyzer::store::Result<
+        SelectedResolutionOperationOpenOutcome<'analyzer, 'analyzer>,
+    >,
+    pub(crate) store_open_attempted: bool,
+}
+
 impl RustAnalyzer {
     pub(crate) fn update_all_with_progress(
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        crate_naming::invalidate();
-        let inner = self.inner.update_all_with_progress(progress);
-        Self::from_inner(inner, self.memo_budget)
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            crate_naming::invalidate();
+            let inner = self.inner.update_all_with_progress(progress);
+            Self::from_inner(inner, self.memo_budget)
+        })
     }
 
     fn capture_dependency_overlay(
@@ -868,6 +886,59 @@ impl RustAnalyzer {
         })
     }
 
+    pub(crate) fn open_selected_rust_operation(
+        &self,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> RustSelectedOperationOpenReport<'_> {
+        use brokk_bifrost_analysis::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+
+        let snapshots = self.inner.selected_workspace_snapshots();
+        let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+        // Every returned report follows an overlay attempt. Identity admission
+        // belongs to callers; cancellation is handled by overlay preparation.
+        let (outcome, store_open_attempted) = match self
+            .inner
+            .selected_rust_resolution_overlay_inputs(snapshots.as_ref(), cancellation)
+        {
+            Ok(SelectedResolutionOverlayInputsOutcome::Ready {
+                masks,
+                content_mounts,
+            }) => {
+                let input = SelectedResolutionOperationInput::new(
+                    self.inner.project(),
+                    self.inner.workspace_id(),
+                    snapshots.as_ref(),
+                    &languages,
+                    &masks,
+                )
+                .with_content_mounts(content_mounts);
+                (
+                    self.inner
+                        .analyzer_store()
+                        .open_selected_resolution_operation(input, cancellation),
+                    true,
+                )
+            }
+            Ok(SelectedResolutionOverlayInputsOutcome::Unavailable(reason)) => (
+                Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason)),
+                false,
+            ),
+            Ok(SelectedResolutionOverlayInputsOutcome::Stale(reason)) => (
+                Ok(SelectedResolutionOperationOpenOutcome::Stale(reason)),
+                false,
+            ),
+            Ok(SelectedResolutionOverlayInputsOutcome::Cancelled) => {
+                (Ok(SelectedResolutionOperationOpenOutcome::Cancelled), false)
+            }
+            Err(error) => (Err(error), false),
+        };
+        RustSelectedOperationOpenReport {
+            outcome,
+            store_open_attempted,
+        }
+    }
+
     pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
     }
@@ -898,11 +969,7 @@ impl RustAnalyzer {
         &self,
         oid: git2::Oid,
     ) -> Result<Arc<RustUsageFacts>, RustCargoRouteError> {
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-rust-analysis/src/analyzer/rust/mod.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let key: RustFactCacheKey = (self.inner.language_generation("rust"), oid);
         if let Some(cached) = self.rust_usage_facts.get(&key) {
@@ -934,8 +1001,9 @@ impl RustAnalyzer {
         {
             let cache_key = key;
             let cache_value = Arc::clone(&facts);
-            persistent_fill_guard.installed("rust_usage_facts");
-            self.rust_usage_facts.insert(cache_key, cache_value);
+            if cache_fill.is_complete() {
+                self.rust_usage_facts.insert(cache_key, cache_value);
+            }
         };
         Ok(facts)
     }
@@ -949,11 +1017,7 @@ impl RustAnalyzer {
         if let Some(cached) = self.declaration_facts.get(file) {
             return Ok(cached);
         }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-rust-analysis/src/analyzer/rust/mod.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
         let facts = Arc::new(
             brokk_bifrost_rust::usage_queries::rust_declaration_facts(
                 self,
@@ -966,8 +1030,9 @@ impl RustAnalyzer {
         {
             let cache_key = file.clone();
             let cache_value = Arc::clone(&facts);
-            persistent_fill_guard.installed("declaration_facts");
-            self.declaration_facts.insert(cache_key, cache_value);
+            if cache_fill.is_complete() {
+                self.declaration_facts.insert(cache_key, cache_value);
+            }
         };
         Ok(facts)
     }
@@ -1027,11 +1092,7 @@ impl RustAnalyzer {
         file: &ProjectFile,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Arc<RustDeclarationSourceProperties>, RustCargoRouteError> {
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-rust-analysis/src/analyzer/rust/mod.rs",
-            );
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         let (generation, oid) = self.selected_rust_source_while(file, keep_going)?;
         let key = (generation, oid, file.clone());
@@ -1080,9 +1141,10 @@ impl RustAnalyzer {
         {
             let cache_key = key;
             let cache_value = Arc::clone(&properties);
-            persistent_fill_guard.installed("declaration_source_properties");
-            self.declaration_source_properties
-                .insert(cache_key, cache_value);
+            if cache_fill.is_complete() {
+                self.declaration_source_properties
+                    .insert(cache_key, cache_value);
+            }
         };
         Ok(properties)
     }
@@ -2467,16 +2529,18 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        // Before the early return: a `Cargo.toml` edit renames a crate without
-        // changing a single Rust source, so the manifest memos must be dropped
-        // even on the update that hands back a clone.
-        crate_naming::invalidate();
-        if rust_indexed_sources_unchanged(self, changed_files) {
-            return self.clone();
-        }
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            // Before the early return: a `Cargo.toml` edit renames a crate without
+            // changing a single Rust source, so the manifest memos must be dropped
+            // even on the update that hands back a clone.
+            crate_naming::invalidate();
+            if rust_indexed_sources_unchanged(self, changed_files) {
+                return self.clone();
+            }
 
-        let inner = self.inner.update(changed_files);
-        Self::from_inner(inner, self.memo_budget)
+            let inner = self.inner.update(changed_files);
+            Self::from_inner(inner, self.memo_budget)
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -3616,14 +3680,9 @@ impl LanguageSupport for RustSupport {
         crate::analyzer::semantic::ValueTypeBarrierDecision,
         crate::analyzer::semantic::SemanticProviderError,
     > {
-        use crate::analyzer::semantic::{ValueTypeBarrierDecision, ValueTypeBarrierReason};
-        let Some(context) = request.value_type_barrier_context() else {
-            return Ok(ValueTypeBarrierDecision::Undecided(
-                ValueTypeBarrierReason::UnavailableObservation,
-            ));
-        };
-        context.classify(observation, predicate, request)
+        request.classify_value_type_barrier(observation, predicate)
     }
+
     fn observed_value_type(
         &self,
         _analyzer: &dyn IAnalyzer,

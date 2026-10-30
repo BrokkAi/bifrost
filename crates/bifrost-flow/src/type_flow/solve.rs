@@ -349,12 +349,6 @@ pub struct RootIncompleteEvidence {
     pub feedback_iteration: usize,
 }
 
-impl RootIncompleteEvidence {
-    pub fn is_empty(&self) -> bool {
-        self.lanes.is_empty()
-    }
-}
-
 /// Work and termination detail for one independently bounded solver run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeFlowSolveAttempt {

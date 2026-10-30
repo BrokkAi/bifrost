@@ -69,10 +69,6 @@ impl<Fact, Value> IdeDataflowSeed<Fact, Value> {
     pub const fn value(&self) -> &Value {
         &self.value
     }
-
-    pub fn into_parts(self) -> (Fact, Value) {
-        (self.fact, self.value)
-    }
 }
 
 /// One reusable entry-to-exit fact relation and its relative IDE jump function.
@@ -616,7 +612,10 @@ where
 {
     problem: &'problem Problem,
     call_context_limits: Option<OracleLimits>,
-    trace: RefCell<IdeTrace<Problem::Fact, Problem::EdgeFunction>>,
+    trace: crate::analyzer::workspace_authority::CaptureScopedMemo<
+        RefCell<IdeTrace<Problem::Fact, Problem::EdgeFunction>>,
+    >,
+    attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
 }
 
 impl<'problem, Problem> IdeFactAdapter<'problem, Problem>
@@ -624,6 +623,7 @@ where
     Problem: IdeDataflowProblem,
 {
     fn new(
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
         problem: &'problem Problem,
         relation_limit: usize,
         capture_operation_limit: usize,
@@ -632,11 +632,10 @@ where
     ) -> Self {
         Self {
             problem,
+            attribution,
             call_context_limits,
-            trace: RefCell::new(IdeTrace::new(
-                relation_limit,
-                capture_operation_limit,
-                function_limit,
+            trace: crate::analyzer::workspace_authority::CaptureScopedMemo::new(RefCell::new(
+                IdeTrace::new(relation_limit, capture_operation_limit, function_limit),
             )),
         }
     }
@@ -653,114 +652,119 @@ where
             &mut dyn DataflowOutput<IdeTransition<Problem::Fact, Problem::EdgeFunction>>,
         ),
     ) {
-        let caller_context = edge.call_context().cloned();
-        let callee_context = match (
-            self.call_context_limits,
-            edge.call_context(),
-            edge.call_transfer(),
-        ) {
-            (Some(limits), Some(context), Some(transfer)) => {
-                Some(context.extended(transfer.origin.clone(), limits))
-            }
-            _ => None,
-        };
-        let key = TransferKey {
-            edge: owned_edge(edge),
-            call_transfer: edge.call_transfer().cloned(),
-            caller_context,
-            callee_context,
-            entry: edge
-                .summary_entry_fact()
-                .copied()
-                .expect("summary-backed IDE edges retain their exact entry fact"),
-            input: fact,
-        };
-        let trace = self.trace.borrow();
-        if let Some(cached) = trace.get(&key) {
-            for output in cached {
-                if !out.emit(output.fact) {
-                    break;
-                }
-            }
-            return;
-        }
-        if trace.attempted_work.is_some() {
-            drop(trace);
-            let mut collector = IdeFactOnlyCollector { fact_output: out };
-            callback(self.problem, edge, fact, &mut collector);
-            if fact == self.problem.zero_fact() && collector.fact_output.should_continue() {
-                let _ = collector.fact_output.emit(fact);
-            }
-            return;
-        }
-
-        let remaining = trace.remaining_relations();
-        let remaining_operations = trace.remaining_capture_operations();
-        let max_new_functions = trace.function_limit.saturating_sub(trace.functions.len());
-        let mut collector = IdeTransitionCollector::new(
-            self.problem,
-            out,
-            &trace.function_ids,
-            remaining,
-            remaining_operations,
-            max_new_functions,
-        );
-        callback(self.problem, edge, fact, &mut collector);
-        if fact == self.problem.zero_fact() && collector.should_continue() {
-            let _ = collector.emit(IdeTransition::new(
-                fact,
-                self.problem.identity_edge_function(),
-            ));
-        }
-        if collector.relation_overflowed {
-            let staged = collector.transitions.len();
-            let staged_meets = collector.capture_meets;
-            drop(collector);
-            drop(trace);
-            self.trace
-                .borrow_mut()
-                .mark_relation_exhausted(staged, staged_meets);
-            return;
-        }
-        if collector.operation_overflowed {
-            let staged = collector.transitions.len();
-            let attempted_meets = collector.capture_meets.saturating_add(1);
-            drop(collector);
-            drop(trace);
-            self.trace
-                .borrow_mut()
-                .mark_capture_operations_exhausted(staged, attempted_meets);
-            return;
-        }
-        if collector.function_overflowed {
-            let staged = collector.transitions.len();
-            let attempted_functions = trace
-                .functions
-                .len()
-                .saturating_add(collector.staged_functions.len())
-                .saturating_add(1);
-            let staged_meets = collector.capture_meets;
-            drop(collector);
-            drop(trace);
-            self.trace.borrow_mut().mark_functions_exhausted(
-                staged,
-                staged_meets,
-                attempted_functions,
-            );
-            return;
-        }
-        if collector.stopped || !collector.fact_output.should_continue() {
-            return;
-        }
-        let collected = collector.into_outputs();
-        drop(trace);
         self.trace
-            .borrow_mut()
-            .insert(key, collected.outputs, collected.capture_meets);
+            .read(&self.attribution.capability(), |trace_cell| {
+                let caller_context = edge.call_context().cloned();
+                let callee_context = match (
+                    self.call_context_limits,
+                    edge.call_context(),
+                    edge.call_transfer(),
+                ) {
+                    (Some(limits), Some(context), Some(transfer)) => {
+                        Some(context.extended(transfer.origin.clone(), limits))
+                    }
+                    _ => None,
+                };
+                let key = TransferKey {
+                    edge: owned_edge(edge),
+                    call_transfer: edge.call_transfer().cloned(),
+                    caller_context,
+                    callee_context,
+                    entry: edge
+                        .summary_entry_fact()
+                        .copied()
+                        .expect("summary-backed IDE edges retain their exact entry fact"),
+                    input: fact,
+                };
+                let trace = trace_cell.borrow();
+                if let Some(cached) = trace.get(&key) {
+                    for output in cached {
+                        if !out.emit(output.fact) {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                if trace.attempted_work.is_some() {
+                    drop(trace);
+                    let mut collector = IdeFactOnlyCollector { fact_output: out };
+                    callback(self.problem, edge, fact, &mut collector);
+                    if fact == self.problem.zero_fact() && collector.fact_output.should_continue() {
+                        let _ = collector.fact_output.emit(fact);
+                    }
+                    return;
+                }
+
+                let remaining = trace.remaining_relations();
+                let remaining_operations = trace.remaining_capture_operations();
+                let max_new_functions = trace.function_limit.saturating_sub(trace.functions.len());
+                let mut collector = IdeTransitionCollector::new(
+                    self.problem,
+                    out,
+                    &trace.function_ids,
+                    remaining,
+                    remaining_operations,
+                    max_new_functions,
+                );
+                callback(self.problem, edge, fact, &mut collector);
+                if fact == self.problem.zero_fact() && collector.should_continue() {
+                    let _ = collector.emit(IdeTransition::new(
+                        fact,
+                        self.problem.identity_edge_function(),
+                    ));
+                }
+                if collector.relation_overflowed {
+                    let staged = collector.transitions.len();
+                    let staged_meets = collector.capture_meets;
+                    drop(collector);
+                    drop(trace);
+                    trace_cell
+                        .borrow_mut()
+                        .mark_relation_exhausted(staged, staged_meets);
+                    return;
+                }
+                if collector.operation_overflowed {
+                    let staged = collector.transitions.len();
+                    let attempted_meets = collector.capture_meets.saturating_add(1);
+                    drop(collector);
+                    drop(trace);
+                    trace_cell
+                        .borrow_mut()
+                        .mark_capture_operations_exhausted(staged, attempted_meets);
+                    return;
+                }
+                if collector.function_overflowed {
+                    let staged = collector.transitions.len();
+                    let attempted_functions = trace
+                        .functions
+                        .len()
+                        .saturating_add(collector.staged_functions.len())
+                        .saturating_add(1);
+                    let staged_meets = collector.capture_meets;
+                    drop(collector);
+                    drop(trace);
+                    trace_cell.borrow_mut().mark_functions_exhausted(
+                        staged,
+                        staged_meets,
+                        attempted_functions,
+                    );
+                    return;
+                }
+                if collector.stopped || !collector.fact_output.should_continue() {
+                    return;
+                }
+                let collected = collector.into_outputs();
+                drop(trace);
+                trace_cell
+                    .borrow_mut()
+                    .insert(key, collected.outputs, collected.capture_meets);
+            });
     }
 
     fn into_trace(self) -> IdeTrace<Problem::Fact, Problem::EdgeFunction> {
-        self.trace.into_inner()
+        self.trace.read(&self.attribution.capability(), |trace| {
+            trace.replace(IdeTrace::new(0, 0, 0))
+        })
     }
 }
 
@@ -1595,6 +1599,7 @@ where
     let seed_facts = bounded_seed_facts::<Problem>(&input, problem.zero_fact(), request);
     let remaining = request.budget.remaining();
     let adapter = IdeFactAdapter::new(
+        provider.memo_attribution(),
         problem,
         remaining.ide_relations,
         remaining.edge_function_operations,

@@ -1630,6 +1630,286 @@ where
     })
 }
 
+/// Complete may-live value sets at each node's entry. The holder belongs to
+/// one solve; exhaustion never publishes a partially computed set.
+#[derive(Debug)]
+pub struct LiveValueSets(ReachingSets);
+
+impl LiveValueSets {
+    pub fn live_in(&self, node_index: usize, value: usize) -> bool {
+        self.0.reaches_in(node_index, value)
+    }
+
+    pub const fn work(&self) -> CfgAlgorithmWork {
+        self.0.work()
+    }
+}
+
+/// Backward may liveness, including every edge supplied by the graph (notably
+/// exceptional edges). Generated facts are upward-exposed uses; killed facts
+/// are definitions. All nodes are seeded, including non-terminating loops.
+pub fn live_values<G>(
+    graph: &G,
+    facts: &GenKillFacts,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<LiveValueSets, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
+    request.checkpoint()?;
+    let started = request.budget.used();
+    assert_eq!(facts.node_count, graph.node_count());
+    let stride = facts.words_per_node;
+    let mut in_sets = vec![0_u64; graph.node_count() * stride];
+    let mut queued = vec![true; graph.node_count()];
+    let mut worklist = (0..graph.node_count()).rev().collect::<VecDeque<_>>();
+    let mut outgoing = vec![0_u64; stride];
+    while let Some(index) = worklist.pop_front() {
+        request.visit_node()?;
+        queued[index] = false;
+        let node = required_node(graph, index);
+        let row = index * stride;
+        outgoing.fill(0);
+        for (_, successor) in graph.successors(node) {
+            request.visit_edge()?;
+            let successor_row = required_index(graph, successor)? * stride;
+            for word in 0..stride {
+                outgoing[word] |= in_sets[successor_row + word];
+            }
+        }
+        let mut changed = false;
+        for word in 0..stride {
+            let value = (outgoing[word] & !facts.killed[row + word]) | facts.generated[row + word];
+            changed |= value != in_sets[row + word];
+            in_sets[row + word] = value;
+        }
+        if changed {
+            for (_, predecessor) in graph.predecessors(node) {
+                request.visit_edge()?;
+                let predecessor = required_index(graph, predecessor)?;
+                if !queued[predecessor] {
+                    queued[predecessor] = true;
+                    worklist.push_back(predecessor);
+                }
+            }
+        }
+    }
+    Ok(LiveValueSets(ReachingSets {
+        node_count: facts.node_count,
+        definition_count: facts.definition_count,
+        words_per_node: stride,
+        entry_sets: in_sets.into_boxed_slice(),
+        work: request.budget.used().saturating_sub(started),
+    }))
+}
+
+/// Construct ordered use/def facts from the IR, without consulting source text.
+/// New effect variants must specify their operand behavior here.
+pub fn value_liveness_facts(
+    procedure: &ProcedureSemantics,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<GenKillFacts, ProgramPointId> {
+    use crate::analyzer::semantic::{
+        CaptureSource, GuardPredicate, SemanticEffect, SynchronizationPayload,
+    };
+    request.checkpoint()?;
+    let mut facts = GenKillFacts::new(procedure.points().len(), procedure.values().len());
+    // Keep every IR-described receiver alternative alive at invocation. A
+    // callee-value index avoids a whole-procedure selection scan per call;
+    // retaining alternatives without dominance filtering is conservative.
+    let mut receiver_hints = vec![Vec::new(); procedure.values().len()];
+    for point in procedure.points() {
+        request.visit_node()?;
+        for event in &point.events {
+            request.visit_node()?;
+            if let SemanticEffect::CallableCreation { result, callable }
+            | SemanticEffect::CallableReference { result, callable } = &event.effect
+            {
+                let hints = &mut receiver_hints[result.index()];
+                hints.extend(callable.bound_receiver);
+                match callable.kind {
+                    crate::analyzer::semantic::CallableReferenceKind::ModuleQualified {
+                        qualifier,
+                    }
+                    | crate::analyzer::semantic::CallableReferenceKind::TypeQualifiedMethod {
+                        qualifier,
+                    } => hints.push(qualifier),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut uses = Vec::new();
+    let mut definitions = Vec::new();
+    for point in procedure.points() {
+        request.visit_node()?;
+        let index = point.id.index();
+        for event in &point.events {
+            request.visit_node()?;
+            uses.clear();
+            definitions.clear();
+            match &event.effect {
+                SemanticEffect::Entry
+                | SemanticEffect::NormalExit
+                | SemanticEffect::ExceptionalExit => {}
+                // The taint client prunes only Complete or Refinable snapshots.
+                // classify_snapshot_openness permits only call-target gaps in
+                // Refinable snapshots, whose receiver/argument uses are lowered
+                // independently of target resolution. Other gaps disable pruning.
+                SemanticEffect::Gap { .. } => {}
+                SemanticEffect::Assignment { target, value } => {
+                    uses.push(*value);
+                    definitions.push(*target);
+                }
+                SemanticEffect::AggregateInitializer {
+                    aggregate, value, ..
+                } => {
+                    uses.extend([*aggregate, *value]);
+                }
+                SemanticEffect::ValueFlow { source, target, .. } => {
+                    uses.push(*source);
+                    definitions.push(*target);
+                }
+                SemanticEffect::ValueUse { value, .. } => uses.push(*value),
+                SemanticEffect::Allocation { allocation } => {
+                    definitions.push(
+                        procedure
+                            .allocation(*allocation)
+                            .expect("validated allocation")
+                            .result,
+                    );
+                }
+                SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } => {
+                    location_value_uses(procedure, *location, &mut uses);
+                    definitions.push(*result);
+                }
+                SemanticEffect::MemoryStore {
+                    location, value, ..
+                } => {
+                    location_value_uses(procedure, *location, &mut uses);
+                    uses.push(*value);
+                }
+                SemanticEffect::Synchronization {
+                    subject, payload, ..
+                } => {
+                    uses.push(*subject);
+                    match payload {
+                        Some(SynchronizationPayload::Send { value, .. }) => uses.push(*value),
+                        Some(SynchronizationPayload::Receive { result }) => {
+                            definitions.push(*result)
+                        }
+                        None => {}
+                    }
+                }
+                SemanticEffect::CallableCreation { result, .. }
+                | SemanticEffect::CallableReference { result, .. } => {
+                    uses.extend(&receiver_hints[result.index()]);
+                    definitions.push(*result);
+                }
+                SemanticEffect::CaptureBind { capture } => {
+                    let capture = procedure.capture(*capture).expect("validated capture");
+                    uses.push(capture.callable);
+                    match capture.captured {
+                        CaptureSource::Value(value) => uses.push(value),
+                        CaptureSource::Location(location) => {
+                            location_value_uses(procedure, location, &mut uses)
+                        }
+                    }
+                }
+                SemanticEffect::Invoke { call_site } => {
+                    let call = procedure.call_site(*call_site).expect("validated call");
+                    uses.push(call.callee);
+                    uses.extend(call.receiver);
+                    uses.extend(call.arguments.iter().map(|argument| argument.value));
+                    uses.extend(&receiver_hints[call.callee.index()]);
+                    definitions.extend(call.normal_result_values());
+                    definitions.extend(call.thrown);
+                }
+                // Transfer creates call outputs before entering the continuation.
+                // Defining them here would incorrectly kill live-in call results.
+                SemanticEffect::CallContinuation { .. } => {}
+                SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
+                    uses.extend(value)
+                }
+                SemanticEffect::AsyncSuspend { awaited, .. } => uses.extend(awaited),
+                SemanticEffect::AsyncResume { result, .. } => definitions.extend(result),
+            }
+            for &value in &uses {
+                request.visit_node()?;
+                let (word, bit) = facts.locate(index, value.index());
+                if facts.killed[word] & bit == 0 {
+                    facts.record_generated(index, value.index());
+                }
+            }
+            for &value in &definitions {
+                request.visit_node()?;
+                facts.record_killed(index, value.index());
+            }
+        }
+    }
+    // Guard and switch operands are structured facts, not effect variants.
+    for guard in procedure.guard_facts() {
+        request.visit_node()?;
+        uses.clear();
+        uses.extend(guard.subject);
+        match guard.predicate {
+            GuardPredicate::ConstantEquality { constant, .. }
+            | GuardPredicate::OrderedIntegerComparison { constant, .. }
+            | GuardPredicate::OrderedFloatComparison { constant, .. } => uses.push(constant),
+            GuardPredicate::InstanceOf { value, classes }
+            | GuardPredicate::ExactClass { value, classes, .. } => uses.extend([value, classes]),
+            GuardPredicate::HasMember { value, member } => uses.extend([value, member]),
+            GuardPredicate::Truthy { value } => uses.push(value),
+            GuardPredicate::ConstantBoolean { .. }
+            | GuardPredicate::NullComparison { .. }
+            | GuardPredicate::NanComparison { .. }
+            | GuardPredicate::Opaque { .. } => {}
+        }
+        for value in &uses {
+            request.visit_node()?;
+            facts.record_generated(guard.point.index(), value.index());
+        }
+    }
+    for switch in procedure.switch_facts() {
+        request.visit_node()?;
+        if let Some(value) = switch.selector {
+            facts.record_generated(switch.point.index(), value.index());
+        }
+        for case in &switch.cases {
+            request.visit_node()?;
+            facts.record_generated(switch.point.index(), case.value.index());
+        }
+    }
+    Ok(facts)
+}
+
+fn location_value_uses(
+    procedure: &ProcedureSemantics,
+    location: crate::analyzer::semantic::MemoryLocationId,
+    uses: &mut Vec<crate::analyzer::semantic::ValueId>,
+) {
+    use crate::analyzer::semantic::MemoryLocationKind;
+    match procedure
+        .memory_location(location)
+        .expect("validated location")
+        .kind
+    {
+        MemoryLocationKind::Field { base, .. } | MemoryLocationKind::Property { base, .. } => {
+            uses.push(base)
+        }
+        MemoryLocationKind::Index { base, index, .. } => {
+            uses.push(base);
+            uses.extend(index);
+        }
+        MemoryLocationKind::Dereference { address } => uses.push(address),
+        MemoryLocationKind::LexicalCell { binding } => uses.push(binding),
+        MemoryLocationKind::Capture { binding, .. } => uses.extend(binding),
+        MemoryLocationKind::Static { .. } => {}
+    }
+}
+
 #[doc(hidden)]
 pub fn required_node<G>(graph: &G, index: usize) -> G::Node
 where
@@ -2416,5 +2696,68 @@ mod tests {
         assert_eq!(rows, vec![(1, 1), (2, 2), (3, 4), (4, 5)]);
         assert!(result.non_exiting_regions.is_empty());
         assert_eq!(result.unreachable_points, 0);
+    }
+}
+#[cfg(test)]
+mod liveness_tests {
+    use super::test_support::SyntheticGraph;
+    use super::*;
+
+    #[test]
+    fn live_values_preserves_loop_back_edge_and_exception_only_uses() {
+        // Value 0 is read only before the back edge; value 1 only in the
+        // exceptional successor. Neither read may disappear at point 2.
+        let graph = SyntheticGraph::new(
+            6,
+            &[
+                (0, 1, 0),
+                (1, 2, 0),
+                (2, 3, 0),
+                (3, 1, 0),
+                (2, 4, 1),
+                (4, 5, 0),
+                (3, 5, 0),
+            ],
+        );
+        let mut facts = GenKillFacts::new(6, 3);
+        facts.record_killed(0, 0);
+        facts.record_killed(0, 1);
+        facts.record_generated(1, 0);
+        facts.record_generated(4, 1);
+        let mut budget = CfgAlgorithmBudget::default();
+        let cancellation = CancellationToken::default();
+        let live = live_values(
+            &graph,
+            &facts,
+            &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap();
+        assert!(live.live_in(3, 0), "the next iteration reads value 0");
+        assert!(
+            live.live_in(2, 1),
+            "only the exception handler reads value 1"
+        );
+        assert!(!live.live_in(2, 2), "an unused temporary is dead");
+        assert!(
+            !live.live_in(0, 0),
+            "the definition kills the incoming value"
+        );
+    }
+
+    #[test]
+    fn live_values_exhaustion_publishes_no_partial_kill_information() {
+        let graph = SyntheticGraph::new(2, &[(0, 1, 0)]);
+        let mut facts = GenKillFacts::new(2, 1);
+        facts.record_generated(1, 0);
+        let mut budget = CfgAlgorithmBudget::uniform(0);
+        let cancellation = CancellationToken::default();
+        assert!(matches!(
+            live_values(
+                &graph,
+                &facts,
+                &mut CfgAlgorithmRequest::new(&mut budget, &cancellation)
+            ),
+            Err(CfgAlgorithmError::ExceededBudget(_))
+        ));
     }
 }

@@ -1123,6 +1123,11 @@ fn acquire_with_resolution(
     cancellation: &CancellationToken,
     resolve: impl Fn() -> SemanticModelResolutionOutcome,
 ) -> SemanticModelRuntimeOutcome {
+    debug_assert!(
+        !crate::analyzer::workspace_authority::memo_attribution(analyzer).is_capturing(),
+        "model acquisition precedes captured reads of the published Models key"
+    );
+
     let RuntimeArtifactPublication {
         jdk_artifacts_by_configured_home,
         python_runtime,
@@ -1574,8 +1579,35 @@ pub(crate) fn push_explanation(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[track_caller]
+pub(crate) fn resolved_active_models_fixture(
+    active_model_set_hash: impl Into<String>,
+    shards: Vec<Arc<ActiveSemanticModelShard>>,
+) -> ResolvedActiveSemanticModels {
+    let mut report = SemanticModelActivationReport::default();
+    let indexes = MatcherIndexes::build(
+        &shards,
+        SemanticModelRuntimeLimits::default(),
+        &CancellationToken::default(),
+        &mut report,
+    )
+    .expect("active-model fixture matcher builds");
+    ResolvedActiveSemanticModels {
+        source_reader: None,
+        active_model_set_hash: active_model_set_hash.into(),
+        shards,
+        indexes,
+        extraction_gaps: Vec::new(),
+        extraction_gaps_by_declaration: HashMap::default(),
+        report,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod unmaterialized_call_shape_binding_tests {
+
+    use super::resolved_active_models_fixture;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActivatedProcedureSummary;
 
@@ -1755,6 +1787,54 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         }
     }
 
+    fn compile_python_fixture_shard(
+        source: serde_json::Value,
+        evidence: SemanticModelActivationEvidence,
+        source_id: String,
+        evidence_rank: EvidenceRank,
+        source_rank: u8,
+    ) -> ActiveSemanticModelShard {
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("Python fixture compiles");
+        let decoded = decode_shard(
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("Python fixture decodes");
+        let manifest = Arc::new(compiled.manifest);
+        let has_callable_values = decoded.callable_values().is_some();
+        let descriptor = manifest
+            .shards
+            .iter()
+            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+            .expect("fixture descriptor exists")
+            .clone();
+        ActiveSemanticModelShard {
+            metadata: std::sync::Arc::new(
+                crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                    descriptor,
+                    selectors: decoded.activation().to_vec(),
+                    row_store: None,
+                    has_callable_values,
+                    manifest,
+                    approximate: false,
+                    source_kind: CatalogPackSourceKind::Embedded,
+                    source_id,
+                    matched_evidence: evidence.clone(),
+                    matching_evidence: vec![evidence],
+                    evidence_rank,
+                    source_rank,
+                },
+            ),
+            decoded: Some(decoded),
+        }
+    }
+
     fn python_artifact_shard(
         evidence: &SemanticModelActivationEvidence,
         source_rank: u8,
@@ -1766,50 +1846,13 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             "package": {"name": evidence.package.as_ref().unwrap().name.clone()},
             "artifact_sha256": evidence.artifact_sha256.as_ref().unwrap().clone(),
         }]);
-        let compiled = compile_source(
-            SourceFormat::Json,
-            &serde_json::to_vec(&source).unwrap(),
-            &CompilerOptions::default(),
+        compile_python_fixture_shard(
+            source,
+            evidence.clone(),
+            format!("test:pypi:{}", evidence.artifact_sha256.as_deref().unwrap()),
+            EvidenceRank::ExactArtifact,
+            source_rank,
         )
-        .expect("exact-PyPI fixture compiles");
-        let shard = decode_shard(
-            &compiled.shards[0].descriptor,
-            &compiled.shards[0].bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("exact-PyPI fixture decodes");
-        {
-            let decoded = shard;
-            let manifest = Arc::new(compiled.manifest);
-            let has_callable_values = decoded.callable_values().is_some();
-            ActiveSemanticModelShard {
-                metadata: std::sync::Arc::new(
-                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
-                        descriptor: manifest
-                            .shards
-                            .iter()
-                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
-                            .expect("fixture descriptor exists")
-                            .clone(),
-                        selectors: decoded.activation().to_vec(),
-                        row_store: None,
-                        has_callable_values,
-                        manifest,
-                        approximate: false,
-                        source_kind: CatalogPackSourceKind::Embedded,
-                        source_id: format!(
-                            "test:pypi:{}",
-                            evidence.artifact_sha256.as_deref().unwrap()
-                        ),
-                        matched_evidence: evidence.clone(),
-                        matching_evidence: vec![evidence.clone()],
-                        evidence_rank: EvidenceRank::ExactArtifact,
-                        source_rank,
-                    },
-                ),
-                decoded: Some(decoded),
-            }
-        }
     }
 
     fn python_pypi_wildcard_shard(
@@ -1822,47 +1865,13 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         source["shards"][0]["activation"] = serde_json::json!([{
             "package": {"name": evidence.package.as_ref().unwrap().name.clone()},
         }]);
-        let compiled = compile_source(
-            SourceFormat::Json,
-            &serde_json::to_vec(&source).unwrap(),
-            &CompilerOptions::default(),
+        compile_python_fixture_shard(
+            source,
+            evidence.clone(),
+            "test:pypi-wildcard".to_owned(),
+            EvidenceRank::NamedCoordinate,
+            source_rank,
         )
-        .expect("PyPI wildcard fixture compiles");
-        let shard = decode_shard(
-            &compiled.shards[0].descriptor,
-            &compiled.shards[0].bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("PyPI wildcard fixture decodes");
-        {
-            let decoded = shard;
-            let manifest = Arc::new(compiled.manifest);
-            let has_callable_values = decoded.callable_values().is_some();
-            ActiveSemanticModelShard {
-                metadata: std::sync::Arc::new(
-                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
-                        descriptor: manifest
-                            .shards
-                            .iter()
-                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
-                            .expect("fixture descriptor exists")
-                            .clone(),
-                        selectors: decoded.activation().to_vec(),
-                        row_store: None,
-                        has_callable_values,
-                        manifest,
-                        approximate: false,
-                        source_kind: CatalogPackSourceKind::Embedded,
-                        source_id: "test:pypi-wildcard".to_owned(),
-                        matched_evidence: evidence.clone(),
-                        matching_evidence: vec![evidence.clone()],
-                        evidence_rank: EvidenceRank::NamedCoordinate,
-                        source_rank,
-                    },
-                ),
-                decoded: Some(decoded),
-            }
-        }
     }
 
     fn python_generic_shard() -> ActiveSemanticModelShard {
@@ -1870,18 +1879,6 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         source["language"] = "python".into();
         source["ecosystem"] = "python".into();
         source["shards"][0]["activation"] = serde_json::json!([{}]);
-        let compiled = compile_source(
-            SourceFormat::Json,
-            &serde_json::to_vec(&source).unwrap(),
-            &CompilerOptions::default(),
-        )
-        .expect("generic Python fixture compiles");
-        let shard = decode_shard(
-            &compiled.shards[0].descriptor,
-            &compiled.shards[0].bytes,
-            &DecodeLimits::default(),
-        )
-        .expect("generic Python fixture decodes");
         let evidence = SemanticModelActivationEvidence {
             language: "python".to_owned(),
             ecosystem: "python".to_owned(),
@@ -1892,35 +1889,13 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             configuration: None,
             artifact_sha256: None,
         };
-        {
-            let decoded = shard;
-            let manifest = Arc::new(compiled.manifest);
-            let has_callable_values = decoded.callable_values().is_some();
-            ActiveSemanticModelShard {
-                metadata: std::sync::Arc::new(
-                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
-                        descriptor: manifest
-                            .shards
-                            .iter()
-                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
-                            .expect("fixture descriptor exists")
-                            .clone(),
-                        selectors: decoded.activation().to_vec(),
-                        row_store: None,
-                        has_callable_values,
-                        manifest,
-                        approximate: false,
-                        source_kind: CatalogPackSourceKind::Embedded,
-                        source_id: "test:generic-python".to_owned(),
-                        matched_evidence: evidence.clone(),
-                        matching_evidence: vec![evidence],
-                        evidence_rank: EvidenceRank::Language,
-                        source_rank: 0,
-                    },
-                ),
-                decoded: Some(decoded),
-            }
-        }
+        compile_python_fixture_shard(
+            source,
+            evidence,
+            "test:generic-python".to_owned(),
+            EvidenceRank::Language,
+            0,
+        )
     }
 
     #[test]
@@ -2619,24 +2594,8 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let higher_rank_other_artifact = python_artifact_shard(&other_evidence, 1);
         let lower_rank_selected_artifact = python_artifact_shard(&selected_evidence, 0);
         let shards = vec![higher_rank_other_artifact, lower_rank_selected_artifact];
-        let mut report = SemanticModelActivationReport::default();
         let shards = shards.into_iter().map(Arc::new).collect::<Vec<_>>();
-        let indexes = MatcherIndexes::build(
-            &shards,
-            SemanticModelRuntimeLimits::default(),
-            &CancellationToken::default(),
-            &mut report,
-        )
-        .expect("same-spelling Python artifact shards index");
-        let active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:two-python-artifacts".to_owned(),
-            shards,
-            indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
-            report,
-        };
+        let active = resolved_active_models_fixture("test:two-python-artifacts", shards);
         let selected_target = target_for_language(
             brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
@@ -2776,24 +2735,9 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         );
 
         let generic_shard = python_generic_shard();
-        let mut generic_report = SemanticModelActivationReport::default();
         let generic_shard = Arc::new(generic_shard);
-        let generic_indexes = MatcherIndexes::build(
-            std::slice::from_ref(&generic_shard),
-            SemanticModelRuntimeLimits::default(),
-            &CancellationToken::default(),
-            &mut generic_report,
-        )
-        .expect("generic Python summary indexes");
-        let generic_active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:generic-python".to_owned(),
-            shards: vec![generic_shard],
-            indexes: generic_indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
-            report: generic_report,
-        };
+        let generic_active =
+            resolved_active_models_fixture("test:generic-python", vec![generic_shard]);
         let generic_target = target_for_language(
             brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
@@ -2959,24 +2903,8 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
     fn python_pypi_wildcard_selector_requires_selected_artifact_evidence() {
         let evidence = python_evidence('a');
         let shard = python_pypi_wildcard_shard(&evidence, 0);
-        let mut report = SemanticModelActivationReport::default();
         let shard = Arc::new(shard);
-        let indexes = MatcherIndexes::build(
-            std::slice::from_ref(&shard),
-            SemanticModelRuntimeLimits::default(),
-            &CancellationToken::default(),
-            &mut report,
-        )
-        .expect("PyPI wildcard summary indexes");
-        let active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:pypi-wildcard".to_owned(),
-            shards: vec![shard],
-            indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
-            report,
-        };
+        let active = resolved_active_models_fixture("test:pypi-wildcard", vec![shard]);
         let target = target_for_language(
             brokk_bifrost_core::analyzer::model::Language::Python,
             "com.acme.Api",
@@ -3329,17 +3257,11 @@ pub(crate) mod active_model_set_identity_tests {
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActiveSemanticModelShard;
     use sha2::Digest;
 
-    use brokk_bifrost_core::cancellation::CancellationToken;
-
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::CandidateSelection;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogPackSourceKind;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::EvidenceRank;
-
-    use brokk_bifrost_core::hash::HashMap;
-
-    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::MatcherIndexes;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::artifact::PayloadKind;
 
@@ -3350,10 +3272,6 @@ pub(crate) mod active_model_set_identity_tests {
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelActivationEvidence;
-
-    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelActivationReport;
-
-    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelRuntimeLimits;
 
     use sha2::Sha256;
 
@@ -3496,29 +3414,14 @@ pub(crate) mod active_model_set_identity_tests {
         format!("{:x}", hasher.finalize())
     }
 
+    #[track_caller]
     fn resolved(active: Vec<CandidateSelection>) -> ResolvedActiveSemanticModels {
         let active_model_set_hash = active_model_set_hash(&active, &[]);
         let shards = active
             .into_iter()
             .map(|selection| std::sync::Arc::new(selection.active))
             .collect::<Vec<_>>();
-        let mut report = SemanticModelActivationReport::default();
-        let indexes = MatcherIndexes::build(
-            &shards,
-            SemanticModelRuntimeLimits::default(),
-            &CancellationToken::default(),
-            &mut report,
-        )
-        .expect("identity fixture matcher builds");
-        ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash,
-            shards,
-            indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
-            report,
-        }
+        super::resolved_active_models_fixture(active_model_set_hash, shards)
     }
 
     #[test]
@@ -3584,5 +3487,72 @@ pub(crate) mod active_model_set_identity_tests {
             !resolved(second).proves_normal_continuation_absent(target),
             "the exact-artifact returning record wins in the second context"
         );
+    }
+}
+
+#[cfg(test)]
+mod model_read_attribution_tests {
+    use super::*;
+    use crate::analyzer::semantic::StableDigest;
+    use crate::analyzer::{MultiAnalyzer, ReadKey, capture_query_reads};
+
+    #[test]
+    fn published_models_record_the_model_key_on_every_snapshot_hit() {
+        let analyzer = MultiAnalyzer::default();
+        let caches = analyzer.snapshot_caches().unwrap();
+        let mut report = SemanticModelActivationReport::default();
+        let indexes = MatcherIndexes::build(
+            &[],
+            SemanticModelRuntimeLimits::default(),
+            &CancellationToken::default(),
+            &mut report,
+        )
+        .unwrap();
+        let active = Arc::new(ResolvedActiveSemanticModels {
+            source_reader: None,
+            active_model_set_hash: "test:published-model-key".to_owned(),
+            shards: Vec::new(),
+            indexes,
+            extraction_gaps: Vec::new(),
+            extraction_gaps_by_declaration: HashMap::default(),
+            report,
+        });
+        let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(
+            active.clone(),
+            None,
+            None,
+            Arc::new(HashMap::default()),
+            None,
+        ));
+        caches.semantic_models().published.lock().unwrap().snapshot = Some(snapshot.clone());
+        for _ in 0..2 {
+            let (selected, reads) =
+                capture_query_reads(&analyzer, || analyzer.active_semantic_model_snapshot());
+            assert!(Arc::ptr_eq(&selected.unwrap(), &snapshot));
+            assert_eq!(
+                reads.keys(),
+                vec![ReadKey::Models(StableDigest::sha256(
+                    active.active_model_set_hash()
+                ))]
+            );
+            assert_eq!(reads.unattributed_reads(), 0);
+        }
+    }
+
+    #[test]
+    fn native_inventory_store_cell_returns_the_bound_capability_on_hits() {
+        let analyzer = MultiAnalyzer::default();
+        let cache = SemanticModelRuntimeCache::default();
+        let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
+        cache.bind_inventory_store(&store);
+        for _ in 0..2 {
+            let (selected, reads) =
+                capture_query_reads(&analyzer, || cache.native_inventory_store());
+            assert!(Arc::ptr_eq(&selected.unwrap(), &store));
+            assert!(
+                reads.keys().is_empty(),
+                "a store capability has no derived answer"
+            );
+        }
     }
 }

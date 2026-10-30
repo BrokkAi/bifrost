@@ -111,7 +111,7 @@ impl TypestateQueryState {
             );
             return Vec::new();
         };
-        let Some(handle) = analysis_context.handle(protocol_ref) else {
+        let Some(handle) = analysis_context.handle(workspace.analyzer(), protocol_ref) else {
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 CodeQueryDiagnosticCode::UnresolvedProtocolReference,

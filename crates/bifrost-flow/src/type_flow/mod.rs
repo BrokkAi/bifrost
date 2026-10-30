@@ -112,7 +112,7 @@ pub use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
 pub use dynamic_stores::DynamicWriteEvidence;
 pub use field_slots::{
     FieldSlot, FieldSlotIndex, FieldSlotIndexAcquisitionKind, FieldSlotIndexCache,
-    FieldSlotIndexMissReason, active_semantic_model_pack_digest,
+    FieldSlotIndexMissReason, active_semantic_model_pack_digest, field_slot_class_identity,
 };
 pub use plan::{
     MemberAccessSite, ProcedureDispatchReadContract, ProcedureRefinements, TypeFlowPlan,

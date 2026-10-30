@@ -134,7 +134,9 @@ pub(super) fn loop_relation_expansions(
                 brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled => Some(DerivationExecutionCause::Cancelled),
                 brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(_)
                 | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(_) => Some(DerivationExecutionCause::Provider),
-                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(_) => None,
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(_)
+                | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ArtifactUnavailable(_)
+                | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(_) => None,
             };
             report_open(workspace.analyzer(), procedure, reason, cause, diagnostics);
             return Vec::new();

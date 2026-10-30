@@ -13,6 +13,20 @@ use brokk_bifrost_semantic::analyzer::semantic_model::catalog::{
 use composition::{CompositionGroupKey, RowCompositionReads};
 use rusqlite::named_params;
 
+fn attach_search_spelling(
+    group: &mut SearchGroup,
+    owner: Option<&str>,
+    qualified: &str,
+    spelling: &str,
+) {
+    group.standalone.insert(spelling.to_owned());
+    group.standalone.insert(qualified.to_owned());
+    if let Some(owner) = owner {
+        group.standalone.insert(format!("{owner}.{spelling}"));
+        group.members.insert(spelling.to_owned());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct RowOverlay {
     pub(super) active: Arc<ResolvedActiveSemanticModels>,
@@ -1089,20 +1103,14 @@ impl RowOverlay {
                 return None;
             }
             let seed = (language.to_owned(), owner.unwrap_or(id).to_owned());
-            let raw = owner.map(|owner| format!("{owner}.{spelling}"));
             if let Some(indices) = by_owner.get(&seed) {
                 for &index in indices {
                     let group = &mut groups[index];
-                    group.standalone.insert(spelling.to_owned());
-                    group.standalone.insert(qualified.to_owned());
-                    if let Some(raw) = &raw {
-                        group.standalone.insert(raw.clone());
-                        group.members.insert(spelling.to_owned());
-                    }
+                    attach_search_spelling(group, owner, qualified, spelling);
                 }
             } else {
                 let mut spellings = vec![spelling.to_owned(), qualified.to_owned()];
-                spellings.extend(raw);
+                spellings.extend(owner.map(|owner| format!("{owner}.{spelling}")));
                 orphans.push((seed, spellings));
             }
         }
@@ -1238,12 +1246,7 @@ impl RowOverlay {
             }
             for key in &keys_by_owner[&(language.clone(), owner.as_ref().unwrap_or(id).clone())] {
                 let group = groups.get_mut(key).expect("discovered group");
-                group.standalone.insert(spelling.clone());
-                group.standalone.insert(qualified_name.clone());
-                if let Some(owner) = owner {
-                    group.members.insert(spelling.clone());
-                    group.standalone.insert(format!("{owner}.{spelling}"));
-                }
+                attach_search_spelling(group, owner.as_deref(), qualified_name, spelling);
             }
         }
         for symbol in generated {
@@ -1255,13 +1258,13 @@ impl RowOverlay {
                 symbol.owner_id.as_ref().unwrap_or(&symbol.id).clone(),
             )] {
                 let group = groups.get_mut(key).expect("generated group discovered");
-                group.standalone.insert(symbol.qualified_name.clone());
                 for spelling in std::iter::once(&symbol.name).chain(&symbol.aliases) {
-                    group.standalone.insert(spelling.clone());
-                    if let Some(owner) = &symbol.owner_id {
-                        group.members.insert(spelling.clone());
-                        group.standalone.insert(format!("{owner}.{spelling}"));
-                    }
+                    attach_search_spelling(
+                        group,
+                        symbol.owner_id.as_deref(),
+                        &symbol.qualified_name,
+                        spelling,
+                    );
                 }
             }
         }

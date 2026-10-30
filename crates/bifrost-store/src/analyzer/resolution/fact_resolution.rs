@@ -6,6 +6,9 @@
 //! binding/type fixed point and transfer classification is operation-local and
 //! dropped with the answer.
 
+/// Registered native incompleteness label; readers share this value.
+pub const GO_MODEL_CALLABLE_RESULT_UNTYPED: &str = "go-model-callable-result-untyped";
+
 #[path = "fact_resolution/completed_roots.rs"]
 #[doc(hidden)]
 pub mod completed_roots;
@@ -79,7 +82,7 @@ pub(crate) use demand_scheduler::{
     MemberSelectionOutcome as DemandMemberSelectionOutcome,
     MemberSelectionRequest as DemandMemberSelectionRequest, Outcome as DemandAcyclicOutcome,
     QualifiedMemberId, QualifiedMemberInput, QualifiedMemberProvider,
-    ReferenceKey as DemandReferenceKey, RelationKey as DemandRelationKey,
+    ReferenceKey as DemandReferenceKey, RelationKey as DemandRelationKey, RootClosure,
     RootDiscovery as DemandRootDiscovery, RootPlan as DemandRootPlan,
     RootProvider as DemandRootProvider, RootUnavailableReason as DemandRootUnavailableReason,
     TypedConstructionInput, Unsupported as DemandAcyclicUnsupported,
@@ -734,6 +737,7 @@ pub struct FactResolutionAnswer {
     application_completion: Option<ResolutionCompletion>,
     member_owners: Box<[FactMemberOwner]>,
     member_rejections: Box<[FactMemberRejection]>,
+    model_member_selection: Option<Box<super::FactModelMemberSelection>>,
     absent_member: Option<Box<FactAbsentMember>>,
     #[doc(hidden)]
     pub type_bound_receiver: bool,
@@ -1008,6 +1012,7 @@ impl super::worker_transport::WorkerAnswer for FactResolutionAnswer {
             application_completion,
             member_owners,
             member_rejections,
+            model_member_selection,
             absent_member,
             type_bound_receiver,
             observed_type_identity,
@@ -1067,6 +1072,8 @@ impl super::worker_transport::WorkerAnswer for FactResolutionAnswer {
                     }
                 })
                 .collect(),
+            model_member_selection: model_member_selection
+                .map(|selection| Box::new(selection.splice(translation))),
             absent_member: absent_member.map(|value| {
                 let FactAbsentMember { owners } = *value;
                 Box::new(FactAbsentMember {
@@ -1326,6 +1333,33 @@ impl FactResolutionAnswer {
             },
             member_owners: member_owners.into_boxed_slice(),
             member_rejections: member_rejections.into_boxed_slice(),
+            model_member_selection: match &self.model_member_selection {
+                Some(selection) => {
+                    let mut candidates = Vec::with_capacity(selection.candidates.len());
+                    for candidate in &selection.candidates {
+                        if cancelled() {
+                            return None;
+                        }
+                        candidates.push(super::FactModelMember {
+                            owners: copy(&candidate.owners, cancelled)?,
+                            completion: clone_resolution_completion_with_poll(
+                                &candidate.completion,
+                                cancelled,
+                            )?,
+                            ..candidate.clone()
+                        });
+                    }
+                    Some(Box::new(super::FactModelMemberSelection {
+                        native_target_count: selection.native_target_count,
+                        candidates,
+                        completion: clone_resolution_completion_with_poll(
+                            &selection.completion,
+                            cancelled,
+                        )?,
+                    }))
+                }
+                None => None,
+            },
             absent_member,
             type_bound_receiver: self.type_bound_receiver,
             observed_type_identity: self.observed_type_identity,
@@ -1353,6 +1387,7 @@ impl FactResolutionAnswer {
             application_completion: None,
             member_owners: Box::new([]),
             member_rejections: Box::new([]),
+            model_member_selection: None,
             type_bound_receiver: false,
             observed_type_identity: None,
             binding: ResolutionAnswer::new(targets, Vec::new(), completion.clone()),
@@ -1430,6 +1465,10 @@ impl FactResolutionAnswer {
     /// so a trace can retain their exact owner. A target reached lexically,
     /// through a module route, or through an import has no owner to name and
     /// is deliberately absent rather than claimed at depth zero.
+    pub fn model_member_selection(&self) -> Option<&super::FactModelMemberSelection> {
+        self.model_member_selection.as_deref()
+    }
+
     pub fn member_owners(&self) -> &[FactMemberOwner] {
         &self.member_owners
     }
@@ -2756,7 +2795,11 @@ type GenericTypeAliasParameterKey = (BindingFragmentId, SemanticId, u32, Semanti
 type GenericFormalKey = (BindingFragmentId, SemanticId, u32, SemanticId);
 type GenericFormalDefaultKey = (BindingFragmentId, SemanticId, u32, SemanticId);
 type QualifiedRouteKey = (BindingFragmentId, SemanticId, u32, SemanticId);
-type DeclarationTypeKey = (BindingFragmentId, SemanticId, DeclarationTypeRole);
+// SelectedTypedRowKey::External carries no coordinates, so external
+// declarations are told apart only by the definition id. That id is interned
+// from the declaring provider, owner FQN and member ordinal, so two providers'
+// rows for one FQN never share an entry.
+type DeclarationTypeKey = (super::SelectedTypedRowKey, SemanticId, DeclarationTypeRole);
 type MemberOwnerKey = (
     super::SelectedTypedRowKey,
     SemanticId,
@@ -2957,6 +3000,7 @@ struct RustExternalTypeImportPath {
 
 #[derive(Debug, Default)]
 struct FactReadCache {
+    unindexed_model_results: HashMap<super::UnindexedExternalFrontier, Option<String>>,
     rust_external_import_path_rows: FactRowInterner<SemanticId, RustExternalTypeImportPath>,
     rust_external_import_paths_by_boundary: ExhaustedFactRelations<SemanticId, SemanticId>,
     typed_frontier_rows:
@@ -3193,6 +3237,8 @@ pub struct FactReadSession<'a> {
     java_inheritance_declarations:
         HashMap<SemanticId, Option<super::fact_source::JavaInheritanceDeclaration>>,
     go_member_declarations: HashMap<SemanticId, Option<super::fact_source::GoMemberDeclaration>>,
+    go_model_owners: HashMap<SemanticId, Option<super::fact_source::GoModelOwnerDeclarations>>,
+    go_model_members: HashMap<SemanticId, SemanticId>,
     go_package_member_sources: go_methods::GoPackageMemberInputsMemo,
     go_callable_lookups: HashMap<SemanticId, SemanticId>,
     go_universe_types: Option<HashMap<SemanticId, super::universe::UniverseEntry>>,
@@ -3377,6 +3423,8 @@ impl<'a> FactReadSession<'a> {
             context_identities: None,
             java_inheritance_declarations: HashMap::default(),
             go_member_declarations: HashMap::default(),
+            go_model_owners: HashMap::default(),
+            go_model_members: HashMap::default(),
             go_package_member_sources: Default::default(),
             go_callable_lookups: HashMap::default(),
             go_universe_types: None,
@@ -3478,6 +3526,27 @@ impl<'a> FactReadSession<'a> {
             arena,
             super::ResolutionIdentityDigestKey::Semantic(semantic),
         )
+    }
+
+    fn unindexed_model_result_declaration(
+        &mut self,
+        frontier: &super::UnindexedExternalFrontier,
+    ) -> StoreResult<Option<Option<String>>> {
+        if let Some(cached) = self.cache.unindexed_model_results.get(frontier) {
+            return Ok(Some(cached.clone()));
+        }
+        let Some(declaration) = self.typed_source.unindexed_model_callable_result(
+            frontier,
+            self.cancellation,
+            self.resolution_session,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.cache
+            .unindexed_model_results
+            .insert(frontier.clone(), declaration.clone());
+        Ok(Some(declaration))
     }
 
     fn charge_scope_steps(&self, count: usize) -> bool {
@@ -3725,12 +3794,6 @@ impl<'a> FactReadSession<'a> {
         Ok(answer)
     }
 
-    fn jvm_external_provider_type_identity(&self, boundary: SemanticId) -> Option<SemanticId> {
-        self.context_identities
-            .as_ref()?
-            .jvm_external_provider_type_identity(boundary)
-    }
-
     fn jvm_external_provider_type_identity_for_reference(
         &self,
         reference: SemanticId,
@@ -3741,6 +3804,18 @@ impl<'a> FactReadSession<'a> {
                 crate::analyzer::resolution::ExternalOwnerLanguage::Jvm,
                 reference,
             )
+    }
+
+    fn external_provider_type_identity_for_reference(
+        &self,
+        reference: SemanticId,
+    ) -> Option<(
+        crate::analyzer::resolution::ExternalOwnerLanguage,
+        SemanticId,
+    )> {
+        self.context_identities
+            .as_ref()?
+            .external_provider_type_identity_for_reference(reference)
     }
 
     /// A scope-proven nominal name is usable without an indexed type row.
@@ -6274,7 +6349,7 @@ impl<'a> FactReadSession<'a> {
                     )
             },
             |row, _, _| Some(vec![row.row().definition()]),
-            SelectedTypedRow::<LoweredDeclarationTypeProperty>::natural_identity,
+            |row| (row.identity_key(), row.row().definition(), row.row().role()),
             ObservedFactRelation::Primary,
             |row, _, _| {
                 Some(vec![
@@ -6314,7 +6389,7 @@ impl<'a> FactReadSession<'a> {
                 )
             },
             |row, _, _| Some(vec![row.row().slot()]),
-            SelectedTypedRow::<LoweredDeclarationTypeProperty>::natural_identity,
+            |row| (row.identity_key(), row.row().definition(), row.row().role()),
             ObservedFactRelation::Secondary,
             |row, _, _| {
                 Some(vec![
@@ -8811,7 +8886,7 @@ impl DemandRootProvider for AssembledSource {
         &mut self,
         _endpoint: &DemandRelationKey,
         _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> StoreResult<ResolutionCompletion> {
+    ) -> StoreResult<RootClosure> {
         unreachable!("an assembled source requires no relation installation")
     }
 }
@@ -10643,8 +10718,10 @@ impl<'a> FactResolutionOperation<'a> {
                     &DemandRelationKey::caller(endpoint.clone()),
                     target,
                 )? {
-                    demand_scheduler::EndpointPreparation::Ready(completion)
-                    | demand_scheduler::EndpointPreparation::Incomplete(completion) => completion,
+                    demand_scheduler::EndpointPreparation::Ready(outcome) => {
+                        outcome.completion().clone()
+                    }
+                    demand_scheduler::EndpointPreparation::Incomplete(completion) => completion,
                 },
             )
         })
@@ -12897,7 +12974,7 @@ impl PreloadedFactResolutionService {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 unreachable!("fixture relations use the base source or remain unavailable")
             }
         }
@@ -13781,6 +13858,7 @@ pub(crate) fn incomplete_fact_resolution_answer(
         application_completion: None,
         member_owners: Box::new([]),
         member_rejections: Box::new([]),
+        model_member_selection: None,
         absent_member: None,
         type_bound_receiver: false,
         observed_type_identity: None,
@@ -19269,7 +19347,9 @@ impl<'resources, 'source, 'metrics> TypedReverseNarrowing<'resources, 'source, '
                         target,
                     )?;
                     let evidence = match evidence {
-                        demand_scheduler::EndpointPreparation::Ready(evidence) => evidence,
+                        demand_scheduler::EndpointPreparation::Ready(evidence) => {
+                            evidence.completion().clone()
+                        }
                         demand_scheduler::EndpointPreparation::Incomplete(evidence) => {
                             self.completion.include(
                                 &evidence,
@@ -21717,6 +21797,7 @@ impl ExactCycleDetector {
 
 #[derive(Debug, Clone, Default)]
 struct ExplicitReceiverTargetEvidence {
+    model_member_selection: Option<Box<super::FactModelMemberSelection>>,
     values: BTreeSet<ResolutionSlotValue>,
     category_open: bool,
 }
@@ -21823,6 +21904,7 @@ fn go_receiver_overlay_states(
                 );
             }
         };
+        // Terminal receiver addressable: see "Go receiver addressability" in go_receiver_anchor.rs.
         insert(overlay.slot, ResolutionSlotValue::runtime(overlay.ty, true));
         for &(slot, value) in overlay.typed_slots.iter() {
             insert(slot, value);
@@ -21845,6 +21927,7 @@ fn go_receiver_overlay_slot_value(
         .filter_map(|&(candidate, value)| (candidate == slot).then_some(value))
         .collect::<Vec<_>>();
     if overlay.slot == slot {
+        // Terminal receiver addressable: see "Go receiver addressability" in go_receiver_anchor.rs.
         values.push(ResolutionSlotValue::runtime(overlay.ty, true));
     }
     if let Some((_, ty)) = overlay
@@ -25383,7 +25466,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     reference,
                 )?;
                 let evidence = match preparation {
-                    demand_scheduler::EndpointPreparation::Ready(evidence) => {
+                    demand_scheduler::EndpointPreparation::Ready(outcome) => {
+                        let evidence = outcome.completion().clone();
                         if let Some(retired) = provider.resolved_closure_discharges(
                             &DemandRelationKey::caller(request.endpoint().clone()),
                         ) {
@@ -26031,6 +26115,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             application_completion: None,
             member_owners: Box::new([]),
             member_rejections: Box::new([]),
+            model_member_selection: None,
             absent_member: None,
             type_bound_receiver: false,
             observed_type_identity: None,
@@ -31366,9 +31451,12 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     .find(|assessment| assessment.candidate == target)
                     .expect("a selected target was assessed");
                 match self.prove_exact_selection_closes_owner_ancestors(
-                    target,
                     assessment,
                     obligation,
+                    signatures
+                        .get(&target)
+                        .map(|row| row.get(self.session).row().clone())
+                        .as_ref(),
                     previous_states,
                 )? {
                     SemanticDischargeProof::Proven(reasons) => {
@@ -31786,24 +31874,55 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
     /// can be more specific. A companion relation offers another direct root,
     /// not an inherited member, even though the recorded owner path has a hop.
     ///
-    /// Only hierarchy residuals of these roots and their ancestors are covered.
+    /// Hierarchy residuals are covered for these roots and their ancestors.
+    /// An exact declared match with one root also closes its external member
+    /// inventories; sibling roots and inherited matches do not gain that proof.
     /// Unknown arguments, conversions, defaults, varargs and other incomplete
     /// reasons retain their existing obligations.
     fn prove_exact_selection_closes_owner_ancestors(
         &mut self,
-        target: SemanticId,
         assessment: &CandidateAssessment,
         obligation: &LoweredCallApplicabilityObligation,
+        signature: Option<&LoweredCallableSignatureProperty>,
         previous_states: &StateMap,
     ) -> StoreResult<SemanticDischargeProof> {
-        debug_assert_eq!(assessment.candidate, target);
+        let target = assessment.candidate;
         debug_assert_eq!(assessment.verdict, ApplicabilityVerdict::Applicable);
         let requires_closed_frontier =
             !super::fact_source::language_exact_call_closes_ancestor_frontier(
                 obligation.language(),
             );
-        if !assessment.is_exact_match(obligation.argument_slots().len()) {
+        if !assessment.is_exact_match(obligation.argument_slots().len())
+            || assessment
+                .conversions
+                .iter()
+                .any(|conversion| conversion.source_type != conversion.target_type)
+        {
             return Ok(SemanticDischargeProof::Unproven);
+        }
+        if !obligation.argument_slots().is_empty() {
+            let Some(signature) = signature else {
+                return Ok(SemanticDischargeProof::Unproven);
+            };
+            // Zero-argument calls need no generic guard. With arguments,
+            // external candidates require a Complete signature: materialization
+            // in resolution_typed/external_owners.rs records a type-variable
+            // formal or result as UnsupportedExternalSignatureTypeVariable.
+            // This external refusal is missing inventory data (#7860).
+            // Source method counts are known, so reject method type parameters.
+            // This deliberately also rejects an unused <T> in m(File): it
+            // would dominate, but the count cannot distinguish unused parameters
+            // from parameters mentioned by a formal. Source class variables need
+            // no separate guard: raw/unknown receivers cannot give identity
+            // conversions, and known receiver substitutions have concrete formals.
+            let unproven_generic = if self.callable_type_parameter_count_is_known(target) {
+                signature.type_parameter_count() != 0
+            } else {
+                signature.completion() != &ResolutionCompletion::Complete
+            };
+            if unproven_generic {
+                return Ok(SemanticDischargeProof::Unproven);
+            }
         }
         let owner = match self.member_owner_by_target.get(&target) {
             Some(Some(owner)) => owner.owner(),
@@ -31837,6 +31956,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         }
         let mut roots = BTreeSet::new();
         let mut root_shapes = BTreeSet::new();
+        let mut lookup_namespaces = BTreeSet::new();
         {
             // Reuse the same root planner with the same typed frontiers. Do
             // not derive a second language-specific receiver/companion ladder.
@@ -31854,6 +31974,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 });
             };
             for ((_, shape), offered_roots) in &prepared.hierarchy_roots {
+                lookup_namespaces.insert(shape.namespace);
                 for root in offered_roots {
                     if self.poll_cancelled() {
                         return Ok(SemanticDischargeProof::Cancelled);
@@ -31868,6 +31989,9 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 if self.poll_cancelled() {
                     return Ok(SemanticDischargeProof::Cancelled);
                 }
+                // Java's nearest-owner planner offers direct origins rather
+                // than hierarchy roots. Both carry the callee's lookup shape.
+                lookup_namespaces.insert(origin.shape.namespace);
                 roots.insert(origin.owner);
                 if requires_closed_frontier {
                     root_shapes.insert((origin.shape, origin.owner));
@@ -31904,6 +32028,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 return self.hierarchy_residual_reasons_for_owners(&[owner]);
             }
         }
+        let single_declaring_root = roots.len() == 1 && roots.contains(&owner);
         let mut owners = BTreeSet::new();
         let mut pending = roots;
         while let Some(owner) = pending.pop_first() {
@@ -31975,7 +32100,42 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 }
             }
         }
-        self.hierarchy_residual_reasons_for_owners(&owners.into_iter().collect::<Vec<_>>())
+        let owners = owners.into_iter().collect::<Vec<_>>();
+        let proof = self.hierarchy_residual_reasons_for_owners(&owners)?;
+        let SemanticDischargeProof::Proven(mut reasons) = proof else {
+            return Ok(proof);
+        };
+        if single_declaring_root {
+            // JLS 15.12.2: an identity phase-1 match is more specific than
+            // every other phase-1-applicable overload. An unlisted member of
+            // the same signature is a duplicate, or overridden or hidden.
+            // Boxing is phase 2 and variable arity is phase 3. The generic
+            // obligations for calls with arguments are checked above.
+            // External candidates are public and therefore accessible. A
+            // package-private same-signature member in an unlisted ancestor
+            // would make the compiled call ambiguous, so cannot exist in
+            // code that compiles. No-route, inherited and sibling-root paths
+            // do not gain this inventory proof.
+            for owner in owners {
+                if self.poll_cancelled() {
+                    return Ok(SemanticDischargeProof::Cancelled);
+                }
+                // Name-only jvm-unindexed-import ancestors also match
+                // external_owner_identity; no inventory reason exists for them,
+                // so including their identity here removes nothing.
+                if self
+                    .session
+                    .context_identities
+                    .as_ref()
+                    .is_some_and(|identities| identities.external_owner_identity(owner).is_some())
+                {
+                    for &namespace in &lookup_namespaces {
+                        reasons.insert(self.external_inventory_absence_reason(owner, namespace));
+                    }
+                }
+            }
+        }
+        Ok(SemanticDischargeProof::Proven(reasons))
     }
 
     fn hierarchy_residual_reasons_for_owners(
@@ -34344,14 +34504,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             shape,
             members.iter().map(|member| member.get(self.session).row()),
         )?;
-        let completion = if !coverage.covers(shape.namespace) || specified_gap.is_some() {
-            specified_gap
-                .unwrap_or_else(|| self.external_inventory_absence_gap(owner, shape.namespace))
-        } else {
-            ResolutionCompletion::Complete
-        };
-        let mut completion = completion;
+        let has_specified_gap = specified_gap.is_some();
+        let mut completion = specified_gap.unwrap_or(ResolutionCompletion::Complete);
         let mut targets = Vec::new();
+        let mut declares_field = false;
         for member in members {
             if self.poll_cancelled() {
                 return Ok(None);
@@ -34362,6 +34518,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             }
             if member.external_visibility() == Some(DeclaredVisibility::Public) {
                 let target = member.definition();
+                declares_field |= member.kind() == ResolutionMemberKind::Field;
                 self.record_member_owner(
                     target,
                     member.kind(),
@@ -34380,6 +34537,15 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         }
         targets.sort_unstable();
         targets.dedup();
+        // An inherited field still needs the queried owner's absence proof.
+        // Hierarchy completion remains independent.
+        if !coverage.covers(shape.namespace)
+            && !has_specified_gap
+            && !owner_declares_field_uniquely(declares_field, &targets)
+        {
+            completion =
+                completion.combine(&self.external_inventory_absence_gap(owner, shape.namespace));
+        }
         Ok(Some(ResolutionAnswer::new(targets, Vec::new(), completion)))
     }
 
@@ -34388,6 +34554,14 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         owner: SemanticId,
         namespace: ResolutionNamespace,
     ) -> ResolutionCompletion {
+        incomplete(self.external_inventory_absence_reason(owner, namespace))
+    }
+
+    fn external_inventory_absence_reason(
+        &self,
+        owner: SemanticId,
+        namespace: ResolutionNamespace,
+    ) -> SemanticId {
         let identities = self
             .session
             .context_identities
@@ -34402,7 +34576,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         hash.field("provider", owner.provider_id.as_bytes());
         hash.field("owner", owner.owner_fqn.as_bytes());
         hash.field("namespace", namespace.identity_label().as_bytes());
-        incomplete(identities.named_semantic(hash.finish(), "OwnerInventoryOpen", &owner.owner_fqn))
+        identities.named_semantic(hash.finish(), "OwnerInventoryOpen", &owner.owner_fqn)
     }
 
     fn cached_hierarchy_reference_parts(
@@ -37278,7 +37452,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                         )?;
                         match outcome {
                             demand_scheduler::EndpointPreparation::Ready(
-                                ResolutionCompletion::Complete,
+                                RootClosure::Published(ResolutionCompletion::Complete),
                             ) => {
                                 ready.insert(request.endpoint().clone());
                             }
@@ -40194,7 +40368,21 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     if let Some(search) = search {
                         searched_member_surface = true;
                         self.include_semantic_completion(&mut completion, &search.completion);
+                        // A complete member inventory cannot close an open
+                        // receiver route, even when its runtime category is known.
+                        let selection_completion =
+                            qualifier.completion().combine(&search.completion);
                         for member in search.rejected {
+                            self.record_go_model_receiver_candidate(
+                                reference,
+                                member.target,
+                                &member.owners,
+                                value,
+                                &selection_completion,
+                                true,
+                                receiver_category_closed,
+                                &selection_completion,
+                            )?;
                             self.record_member_rejection(
                                 member.target,
                                 member.kind,
@@ -40203,6 +40391,16 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                             );
                         }
                         for member in search.members {
+                            self.record_go_model_receiver_candidate(
+                                reference,
+                                member.target,
+                                &member.owners,
+                                member.value,
+                                &qualifier.completion().combine(&member.completion),
+                                false,
+                                receiver_category_closed,
+                                &selection_completion,
+                            )?;
                             only_known_trait_items = false;
                             self.record_member_owner(
                                 member.target,
@@ -40976,6 +41174,13 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         implementation_hop: bool,
         route_kind: FactMemberRouteKind,
     ) {
+        if !self.go_member_owner_path_is_depth_exact(&owner_path) {
+            // A retained promotion copy cannot identify its declaring owner or
+            // depth. Keep its candidate and incompleteness, but poison exact
+            // attribution even if another route named an owner earlier.
+            self.member_owner_by_target.insert(target, None);
+            return;
+        }
         let mut owner = self.fact_member_owner(target, kind, owner_path, implementation_hop);
         owner.route_kind = route_kind;
         self.member_owner_by_target
@@ -41016,6 +41221,10 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         owner_path: Box<[SemanticId]>,
         reason: RejectionReason,
     ) {
+        if !self.go_member_owner_path_is_depth_exact(&owner_path) {
+            self.member_rejection_by_target.insert(target, None);
+            return;
+        }
         let recorded = Some(FactMemberRejection {
             owner: self.fact_member_owner(target, kind, owner_path, false),
             reason,
@@ -44835,6 +45044,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
     ) -> StoreResult<bool> {
         let mut external =
             BTreeMap::<SemanticId, BTreeSet<super::UnindexedExternalFrontier>>::new();
+        let mut callable_packages =
+            BTreeMap::<SemanticId, BTreeSet<super::UnindexedExternalFrontier>>::new();
         for (&slot, projection) in projections {
             if self.poll_cancelled() {
                 return Ok(false);
@@ -44886,13 +45097,23 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 }
                 let route = route.get(self.session);
                 if let Some(qualifier) = previous.get(&route.row().qualifier_slot()) {
-                    output.extend(qualifier.unindexed_external().iter().map(|frontier| {
-                        super::UnindexedExternalFrontier {
-                            provider_path: frontier.provider_path.clone(),
-                            provider_package_id: frontier.provider_package_id,
+                    for provider in qualifier.unindexed_external() {
+                        let frontier = super::UnindexedExternalFrontier {
+                            provider_path: provider.provider_path.clone(),
+                            provider_package_id: provider.provider_package_id,
                             member: Some((route.fragment(), route.row().lookup())),
+                        };
+                        // Only a package frontier proves a package function.
+                        // A prior unknown member/result must not be reinterpreted
+                        // as a same-named function in that package.
+                        if provider.member.is_none() && projection.kind().is_callable_result() {
+                            callable_packages
+                                .entry(slot)
+                                .or_default()
+                                .insert(frontier.clone());
                         }
-                    }));
+                        output.insert(frontier);
+                    }
                 }
             }
         }
@@ -44935,6 +45156,49 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                             status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
                         },
                     ]));
+                }
+                if state.possible_values().is_empty()
+                    && projections
+                        .get(&slot)
+                        .is_some_and(|projection| projection.kind().is_callable_result())
+                    && let Some(identities) = self.session.context_identities.clone()
+                {
+                    let mut declarations = answers
+                        .get(&projections[&slot].reference())
+                        .into_iter()
+                        .flat_map(|answer| answer.targets())
+                        .filter_map(|target| identities.model_member_identity(*target))
+                        .map(|member| format!("selected model callable {member:?}"))
+                        .collect::<Vec<_>>();
+                    for external in callable_packages.get(&slot).into_iter().flatten() {
+                        let Some(declaration) =
+                            self.session.unindexed_model_result_declaration(external)?
+                        else {
+                            return Ok(false);
+                        };
+                        if let Some(declaration) = declaration {
+                            declarations.push(declaration);
+                        }
+                    }
+                    for declaration in declarations {
+                        let mut hash =
+                            brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                                b"model-callable-result-untyped:v1",
+                            );
+                        hash.field("declaration", declaration.as_bytes());
+                        let reason = identities.named_semantic(
+                            hash.finish(),
+                            GO_MODEL_CALLABLE_RESULT_UNTYPED,
+                            &declaration,
+                        );
+                        let completion =
+                            state
+                                .completion()
+                                .combine(&ResolutionCompletion::incomplete([
+                                    ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                                ]));
+                        state = state.with_completion(completion);
+                    }
                 }
                 states.insert(slot, Arc::new(state.with_unindexed_external(frontier)));
             }
@@ -45790,25 +46054,31 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 continue;
             };
             // An external declaration may still have a stable type identity.
-            // Rust keeps its boundary on that value; JVM implicit providers
+            // Rust keeps its boundary on that value; selected external providers
             // discharge only their own boundary for equality, then restore an
             // enumeration boundary if the value is used as a member owner.
             // Passing either identity through ordinary transfers preserves
             // reference, pointer and wrapper layers.
             let mut rust_external_types = Vec::new();
-            let mut jvm_external_types = Vec::new();
+            let mut provider_external_types = Vec::new();
             let mut closed_provider_boundaries = Vec::new();
-            let jvm_identity = match projection.kind() {
+            let provider_identity = match projection.kind() {
                 BindingProjectionKind::TargetTypeIdentity
                 | BindingProjectionKind::TargetNominalTypeIdentity => self
                     .session
-                    .jvm_nominal_type_identity_for_answer(projection.reference(), answer),
+                    .external_provider_type_identity_for_reference(projection.reference())
+                    .map(|(_, identity)| identity)
+                    .or_else(|| {
+                        self.session
+                            .jvm_nominal_type_identity_for_answer(projection.reference(), answer)
+                    }),
                 // A mixed name can be a workspace package. Only registered
                 // provider coordinates establish its external type identity;
                 // an implicit provider's nominal claim cannot classify it.
                 BindingProjectionKind::TargetTypeOrDeclaredValueType => self
                     .session
-                    .jvm_external_provider_type_identity_for_reference(projection.reference())
+                    .external_provider_type_identity_for_reference(projection.reference())
+                    .map(|(_, identity)| identity)
                     .filter(|identity| {
                         self.session
                             .context_identities
@@ -45820,11 +46090,11 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 _ => None,
             };
             if answer.targets().is_empty()
-                && let Some(identity) = jvm_identity
+                && let Some(identity) = provider_identity
             {
-                jvm_external_types.push(ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                    identity, 0,
-                )));
+                provider_external_types.push(ResolutionSlotValue::type_object(
+                    ResolutionTypeRef::new(identity, 0),
+                ));
             }
             if matches!(
                 projection.kind(),
@@ -45840,10 +46110,15 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                             crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
                     } = *reason
                     {
-                        if let Some(identity) =
-                            self.session.jvm_external_provider_type_identity(semantic)
+                        if let Some((_, identity)) = self
+                            .session
+                            .context_identities
+                            .as_ref()
+                            .and_then(|identities| {
+                                identities.external_provider_type_identity(semantic)
+                            })
                         {
-                            jvm_external_types.push(ResolutionSlotValue::type_object(
+                            provider_external_types.push(ResolutionSlotValue::type_object(
                                 ResolutionTypeRef::new(identity, 0),
                             ));
                             closed_provider_boundaries.push(*reason);
@@ -45862,7 +46137,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 }
             }
             let has_rust_external_types = !rust_external_types.is_empty();
-            let has_jvm_external_types = !jvm_external_types.is_empty();
+            let has_provider_external_types = !provider_external_types.is_empty();
             if has_rust_external_types
                 && !merge_state_values(
                     &mut states,
@@ -45878,7 +46153,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             {
                 return Ok(None);
             }
-            if has_jvm_external_types {
+            if has_provider_external_types {
                 let completion = match answer.completion() {
                     ResolutionCompletion::Complete => ResolutionCompletion::Complete,
                     ResolutionCompletion::Incomplete(reasons) => {
@@ -45905,7 +46180,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                 if !merge_state_values(
                     &mut states,
                     *slot,
-                    jvm_external_types,
+                    provider_external_types,
                     &completion,
                     None,
                     self.cancellation,
@@ -45916,7 +46191,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     return Ok(None);
                 }
             }
-            if has_rust_external_types || has_jvm_external_types {
+            if has_rust_external_types || has_provider_external_types {
                 continue;
             }
             let instantiated = call_result_projections
@@ -46584,6 +46859,8 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                     slot,
                     Arc::new(TypedFrontierState::new(
                         slot,
+                        // Terminal receiver addressable: see "Go receiver
+                        // addressability" in go_receiver_anchor.rs.
                         [ResolutionSlotValue::runtime(
                             ty,
                             addressable.unwrap_or(true),
@@ -50892,6 +51169,39 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
         let mut values = Vec::new();
         let mut external_result_type_identities = BTreeSet::new();
         let mut completion = ResolutionCompletion::Complete;
+        if answer.targets().len() > 1
+            && matches!(
+                projection.kind(),
+                BindingProjectionKind::TargetDeclaredValueType
+                    | BindingProjectionKind::TargetTypeOrDeclaredValueType
+            )
+            && answer.targets().iter().any(|target| {
+                self.session
+                    .context_identities
+                    .as_ref()
+                    .is_some_and(|identities| {
+                        identities.external_member_identity(*target).is_some()
+                    })
+                    && member_owners.get(target).is_some_and(|owners| {
+                        owners
+                            .iter()
+                            .any(|(kind, _)| *kind == ResolutionMemberKind::Field)
+                    })
+            })
+        {
+            // Equal declared types cannot turn an ambiguous field selection
+            // into an exact value proof.
+            let parts = std::iter::once(projection.reference())
+                .chain(answer.targets().iter().copied())
+                .map(CanonicalIdentityPart::identity)
+                .collect::<Vec<_>>();
+            completion = incomplete(canonical_service_reason(
+                self.session,
+                &*self.hierarchy,
+                b"non-unique-external-field-selection",
+                &parts,
+            )?);
+        }
         let mut pending = false;
         let namespace_definitions =
             if projection.kind() == BindingProjectionKind::TargetTypeOrDeclaredValueType {
@@ -50921,7 +51231,20 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             } else {
                 HashSet::default()
             };
+        // Lexical selection already retained the route's language, including
+        // scalar prerequisites whose root seed is consumed by their frame.
+        let language = if self.selected_route_language != Language::None {
+            self.selected_route_language
+        } else {
+            self.root_seed
+                .as_ref()
+                .map_or(Language::None, ReferenceSeed::language)
+        };
+        let member_value_support =
+            crate::analyzer::store::store_language_support_for_hook(language, "member_value")
+                .filter(|support| support.projects_member_values_through_receiver());
         for &target in answer.targets() {
+            let value_start = values.len();
             // A struct literal's owner names the declaration that owns the
             // fields the literal writes. An enum struct variant is a
             // constructor whose named fields are its own, so the constructor
@@ -51091,6 +51414,40 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
                             &mut completion,
                             &mut pending,
                         )?;
+                    }
+                }
+            }
+            if matches!(
+                projection.kind(),
+                BindingProjectionKind::TargetDeclaredValueType
+                    | BindingProjectionKind::TargetTypeOrDeclaredValueType
+            ) && member_owners.get(&target).is_some_and(|owners| {
+                owners
+                    .iter()
+                    .any(|(kind, _)| *kind == ResolutionMemberKind::Field)
+            }) && let Some(support) = member_value_support
+            {
+                let declared = values.split_off(value_start);
+                let mut projected = HashSet::default();
+                let receivers = self
+                    .receiver_level_matches
+                    .get(&(projection.reference(), target));
+                for value in declared {
+                    for receiver in receivers
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .map(Some)
+                        .chain(receivers.is_none_or(HashSet::is_empty).then_some(None))
+                    {
+                        match support.member_value(receiver, value) {
+                            Some(value) => {
+                                if projected.insert(value) {
+                                    values.push(value);
+                                }
+                            }
+                            None => pending = true,
+                        }
                     }
                 }
             }
@@ -51908,6 +52265,37 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             .collect::<Vec<_>>();
         member_rejections.sort_by_key(|rejection| rejection.owner.target());
         let member_rejections = member_rejections.into_boxed_slice();
+        let mut model_member_selection: Option<Box<super::FactModelMemberSelection>> = None;
+        // Ordinary source and JVM answers never scan a Go candidate payload.
+        if !self.session.go_model_owners.is_empty() {
+            for ((reference, _), evidence) in &self.receiver_target_evidence {
+                if *reference != self.root {
+                    continue;
+                }
+                if let Some(selection) = &evidence.model_member_selection {
+                    let output = model_member_selection.get_or_insert_with(|| {
+                        Box::new(super::FactModelMemberSelection {
+                            native_target_count: 0,
+                            candidates: Vec::new(),
+                            completion: ResolutionCompletion::Complete,
+                        })
+                    });
+                    output.completion = output.completion.combine(&selection.completion);
+                    for candidate in &selection.candidates {
+                        if !output.candidates.contains(candidate) {
+                            output.candidates.push(candidate.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(selection) = &mut model_member_selection {
+            selection.native_target_count = binding.targets().len();
+            for candidate in &mut selection.candidates {
+                candidate.selected =
+                    binding.targets().contains(&candidate.target) && !candidate.rejected;
+            }
+        }
         Ok(Some(FactResolutionAnswer {
             site_metadata: self.root_site_metadata,
             callable_receiver_dispositions,
@@ -51920,6 +52308,7 @@ impl<'resources, 'source> FactEvaluation<'resources, 'source> {
             .collect(),
             member_owners,
             member_rejections,
+            model_member_selection,
             absent_member: (!absent_member_owners.is_empty()).then(|| {
                 Box::new(FactAbsentMember {
                     owners: absent_member_owners,
@@ -55927,6 +56316,294 @@ mod tests {
     };
     #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon(
+        "#7968: a rejected member decided an interface mismatch while a shallower depth was open"
+    )]
+    fn go_interface_satisfaction_keeps_open_embedded_depth_undecided() {
+        use super::super::fact_source::{
+            GoMemberDeclaration, GoMemberDeclarationKind, GoStructField,
+        };
+        use super::go_methods::{GoMemberSearchPreparation, GoSatisfactionMember};
+        let source =
+            "package p\ntype Inner struct{}\nfunc (*Inner) M() {}\ntype Outer struct { Inner }\n";
+        let mut fixture = parsed_go_service_fixture(source, b"go-open-embedded-satisfaction");
+        let definition = |position| {
+            lowered_semantic_at(
+                &fixture.lexical,
+                positioned_site_at(
+                    &fixture.facts,
+                    position,
+                    ResolutionIdentifierRole::Declaration,
+                    ResolutionNamespace::Type,
+                ),
+                LoweredSemanticRole::Definition,
+            )
+        };
+        let inner = definition(source.find("Inner struct").unwrap());
+        let outer = definition(source.find("Outer struct").unwrap());
+        let (_, method) = callable_definition_at(
+            &fixture.facts,
+            &fixture.lexical,
+            source.find("M()").unwrap(),
+        );
+        let method_row = *fixture
+            .typed
+            .deferred_member_owners()
+            .iter()
+            .find(|row| row.definition() == method)
+            .unwrap();
+        let field = fixture
+            .typed
+            .member_owners()
+            .iter()
+            .find(|row| row.kind() == ResolutionMemberKind::Field)
+            .unwrap()
+            .definition();
+        let field_slot = fixture
+            .typed
+            .declaration_types()
+            .iter()
+            .find(|row| row.definition() == field && row.role() == DeclarationTypeRole::Value)
+            .unwrap()
+            .slot();
+        fixture.service.set_go_member_declarations([
+            GoMemberDeclaration {
+                definition: outer,
+                kind: GoMemberDeclarationKind::Struct {
+                    fields: vec![GoStructField {
+                        callable_lookup: SemanticId::for_test(b"embedded-Inner-name"),
+                        embedded: true,
+                        field: Some(field),
+                        value_type: Some(field_slot),
+                    }],
+                },
+            },
+            GoMemberDeclaration {
+                definition: inner,
+                kind: GoMemberDeclarationKind::Struct { fields: vec![] },
+            },
+            GoMemberDeclaration {
+                definition: method,
+                kind: GoMemberDeclarationKind::Method {
+                    pointer_receiver: Some(true),
+                },
+            },
+        ]);
+        let cancellation = CancellationToken::new();
+        let mut session = preloaded_session(&fixture.service, &cancellation);
+        let mut hierarchy = HierarchyOperationArena::default();
+        let mut evaluation = FactEvaluation::from_lexical_answer(
+            &mut session,
+            &mut hierarchy,
+            method,
+            ResolutionAnswer::new([method], [], ResolutionCompletion::Complete),
+        );
+        // A query snapshot may retain a known embedded type before its frontier
+        // closes. This is route 1: promotion must carry the shallower gap.
+        let gap = incomplete(SemanticId::for_test(b"shallower-embedded-frontier-open"));
+        let states = shared_map(&HashMap::from_iter([
+            (
+                field_slot,
+                TypedFrontierState::new(
+                    field_slot,
+                    [ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                        inner, 0,
+                    ))],
+                    gap.clone(),
+                ),
+            ),
+            (
+                method_row.owner_frontier(),
+                TypedFrontierState::new(
+                    method_row.owner_frontier(),
+                    [ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                        inner, 1,
+                    ))],
+                    ResolutionCompletion::Complete,
+                ),
+            ),
+        ]));
+        let mut outcomes = Vec::new();
+        for indirection in [0, 1] {
+            let search = evaluation
+                .go_receiver_members(
+                    method,
+                    method_row.lookup(),
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(outer, indirection)),
+                    &[method_row],
+                    &states,
+                )
+                .unwrap();
+            let GoMemberSearchPreparation::Ready(search) = search else {
+                panic!("promotion search must finish its known paths")
+            };
+            assert_ne!(search.search_completion, ResolutionCompletion::Complete);
+            if indirection == 0 {
+                assert_eq!(
+                    search.rejected.len(),
+                    1,
+                    "the deeper pointer method was visited and rejected"
+                );
+                assert!(search.members.is_empty());
+            } else {
+                assert_eq!(
+                    search.members.len(),
+                    1,
+                    "the pointer pass visits the deeper method"
+                );
+                assert_eq!(search.members[0].fields.len(), 1);
+            }
+            outcomes.push(match search.method_for_satisfaction() {
+                GoSatisfactionMember::Method(_) => "selected",
+                GoSatisfactionMember::Excluded => "excluded",
+                GoSatisfactionMember::Open(_) => "open",
+            });
+        }
+        assert_eq!(
+            outcomes,
+            ["open", "open"],
+            "the per-pass member gate must remain open while a shallower depth is open"
+        );
+    }
+
+    #[test]
+    fn go_interface_satisfaction_keeps_closed_ambiguous_promotion_inconclusive() {
+        use super::super::fact_source::{
+            GoMemberDeclaration, GoMemberDeclarationKind, GoStructField,
+        };
+        use super::go_methods::{GoMemberSearchPreparation, GoSatisfactionMember};
+        let source = "package p\ntype Left struct{}\nfunc (Left) M() {}\ntype Right struct{}\nfunc (Right) M() {}\ntype Outer struct { Left; Right }\n";
+        let mut fixture = parsed_go_service_fixture(source, b"go-closed-ambiguous-satisfaction");
+        let definition = |spelling: &str| {
+            lowered_semantic_at(
+                &fixture.lexical,
+                positioned_site_at(
+                    &fixture.facts,
+                    source.find(spelling).unwrap(),
+                    ResolutionIdentifierRole::Declaration,
+                    ResolutionNamespace::Type,
+                ),
+                LoweredSemanticRole::Definition,
+            )
+        };
+        let left = definition("Left struct");
+        let right = definition("Right struct");
+        let outer = definition("Outer struct");
+        let rows = fixture.typed.deferred_member_owners().to_vec();
+        assert_eq!(rows.len(), 2);
+        let methods = [
+            callable_definition_at(
+                &fixture.facts,
+                &fixture.lexical,
+                source.find("M()").unwrap(),
+            )
+            .1,
+            callable_definition_at(
+                &fixture.facts,
+                &fixture.lexical,
+                source.rfind("M()").unwrap(),
+            )
+            .1,
+        ];
+        let mut states = HashMap::default();
+        let mut fields = Vec::new();
+        let mut metadata = Vec::new();
+        for ((name, owner), method) in [("Left", left), ("Right", right)].into_iter().zip(methods) {
+            let field = fixture
+                .typed
+                .member_owners()
+                .iter()
+                .find(|row| row.kind() == ResolutionMemberKind::Field && row.member_name() == name)
+                .unwrap()
+                .definition();
+            let field_slot = fixture
+                .typed
+                .declaration_types()
+                .iter()
+                .find(|row| row.definition() == field && row.role() == DeclarationTypeRole::Value)
+                .unwrap()
+                .slot();
+            let method_slot = rows
+                .iter()
+                .find(|row| row.definition() == method)
+                .unwrap()
+                .owner_frontier();
+            for slot in [field_slot, method_slot] {
+                states.insert(
+                    slot,
+                    TypedFrontierState::new(
+                        slot,
+                        [ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                            owner, 0,
+                        ))],
+                        ResolutionCompletion::Complete,
+                    ),
+                );
+            }
+            fields.push(GoStructField {
+                callable_lookup: SemanticId::for_test(name.as_bytes()),
+                embedded: true,
+                field: Some(field),
+                value_type: Some(field_slot),
+            });
+            metadata.push(GoMemberDeclaration {
+                definition: owner,
+                kind: GoMemberDeclarationKind::Struct { fields: vec![] },
+            });
+            metadata.push(GoMemberDeclaration {
+                definition: method,
+                kind: GoMemberDeclarationKind::Method {
+                    pointer_receiver: Some(false),
+                },
+            });
+        }
+        metadata.push(GoMemberDeclaration {
+            definition: outer,
+            kind: GoMemberDeclarationKind::Struct { fields },
+        });
+        fixture.service.set_go_member_declarations(metadata);
+        let states = shared_map(&states);
+        let reference = methods[0];
+        let cancellation = CancellationToken::new();
+        let mut session = preloaded_session(&fixture.service, &cancellation);
+        let mut hierarchy = HierarchyOperationArena::default();
+        let mut evaluation = FactEvaluation::from_lexical_answer(
+            &mut session,
+            &mut hierarchy,
+            reference,
+            ResolutionAnswer::new([reference], [], ResolutionCompletion::Complete),
+        );
+        for indirection in [0, 1] {
+            let search = evaluation
+                .go_receiver_members(
+                    reference,
+                    rows[0].lookup(),
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(outer, indirection)),
+                    &rows,
+                    &states,
+                )
+                .unwrap();
+            let GoMemberSearchPreparation::Ready(search) = search else {
+                panic!("closed promotion inventory must finish its known paths")
+            };
+            assert_eq!(search.members.len(), 2);
+            assert!(search.members.iter().all(|member| member.fields.len() == 1));
+            assert_eq!(
+                search.search_completion,
+                ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::InconsistentPrecedence(reference),
+                ])
+            );
+            // #8099 tracks exact exclusion for closed ambiguity. Preserve the
+            // existing Inconclusive answer; neither T nor *T may satisfy here.
+            assert!(matches!(
+                search.method_for_satisfaction(),
+                GoSatisfactionMember::Open(_)
+            ));
+        }
+    }
+
     /// A test's plain map with each value in its own shared cell, as the
     /// scheduler holds answers and states.
     fn shared_map<V: Clone>(
@@ -56580,6 +57257,7 @@ mod tests {
         evaluation.receiver_target_evidence.insert(
             (target, target),
             ExplicitReceiverTargetEvidence {
+                model_member_selection: None,
                 values: values.into_iter().collect(),
                 category_open: open,
             },
@@ -60334,7 +61012,7 @@ mod tests {
                 &mut self,
                 endpoint: &DemandRelationKey,
                 inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 if self.fail_close {
                     return Err(StoreError::new("injected root materialization failure"));
                 }
@@ -60343,7 +61021,7 @@ mod tests {
                     assert_eq!(*answer, &self.expected[&root.reference]);
                     self.supplied.push(root.reference);
                 }
-                Ok(ResolutionCompletion::Complete)
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
             }
         }
         let facts = single_unqualified_reverse_facts();
@@ -60633,7 +61311,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 panic!("an already-ready endpoint closes no selected relation");
             }
         }
@@ -60816,7 +61494,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 panic!("an already-ready endpoint closes no selected relation");
             }
         }
@@ -61007,7 +61685,7 @@ mod tests {
                 &mut self,
                 endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 if endpoint.endpoint == self.gated {
                     assert!(
                         !self
@@ -61020,7 +61698,7 @@ mod tests {
                     );
                 }
                 assert!(self.closed.insert(endpoint.endpoint.clone()));
-                Ok(ResolutionCompletion::Complete)
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
             }
         }
 
@@ -61114,7 +61792,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 panic!("an already-ready endpoint closes no selected relation");
             }
         }
@@ -61208,7 +61886,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 panic!("an already-ready endpoint closes no selected relation");
             }
         }
@@ -61470,7 +62148,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 unreachable!("fixture source is already assembled")
             }
         }
@@ -61528,7 +62206,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 unreachable!("fixture source is already assembled")
             }
         }
@@ -61896,9 +62574,9 @@ mod tests {
                 &mut self,
                 endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 assert!(self.closed.insert(endpoint.endpoint.clone()));
-                Ok(ResolutionCompletion::Complete)
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
             }
         }
 
@@ -62016,7 +62694,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 panic!("an already-ready endpoint closes no selected relation");
             }
         }
@@ -62154,10 +62832,10 @@ mod tests {
                 &mut self,
                 endpoint: &DemandRelationKey,
                 inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 assert!(inputs.is_empty());
                 self.closed.push(endpoint.endpoint.clone());
-                Ok(ResolutionCompletion::Complete)
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
             }
         }
         let facts = single_unqualified_reverse_facts();
@@ -62365,7 +63043,7 @@ mod tests {
                 &mut self,
                 _endpoint: &DemandRelationKey,
                 _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-            ) -> StoreResult<ResolutionCompletion> {
+            ) -> StoreResult<RootClosure> {
                 panic!("an immutable base relation must not install a selected overlay");
             }
         }
@@ -68463,6 +69141,10 @@ mod tests {
             })
         });
         FactResolutionAnswer {
+            model_member_selection: answer
+                .model_member_selection
+                .as_ref()
+                .map(|selection| Box::new(selection.splice(&OperationBlind))),
             site_metadata: answer.site_metadata,
             callable_receiver_dispositions: answer
                 .callable_receiver_dispositions
@@ -76520,6 +77202,7 @@ mod tests {
             application_completion: None,
             member_owners: Box::new([]),
             member_rejections: Box::new([]),
+            model_member_selection: None,
             absent_member: None,
             type_bound_receiver: false,
             observed_type_identity: None,
@@ -77702,4 +78385,15 @@ pub mod go_failure_fixture_support {
     ) -> (ResolutionSiteId, SemanticId) {
         callable_definition_at(&fixture.facts, &fixture.lexical, position)
     }
+}
+
+/// Java, Kotlin and Scala allow one field per name on an owner, and a field
+/// declared on the owner hides every supertype field with that name. So when
+/// the owner itself declares the one selected field, an open value inventory
+/// cannot add a second candidate and the hierarchy cannot change the
+/// selection. This is the owner-coverage half of field selection; the
+/// hierarchy-sensitivity hook of #7779 cites this rule instead of deciding it
+/// again.
+fn owner_declares_field_uniquely(declares_field: bool, targets: &[SemanticId]) -> bool {
+    declares_field && targets.len() == 1
 }

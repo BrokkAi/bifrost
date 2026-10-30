@@ -952,6 +952,68 @@ mod tests {
     }
 
     #[test]
+    fn lazy_rust_fact_publication_keeps_the_root_file_in_the_capture() {
+        use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
+        use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub fn unused() {}\n")
+            .build();
+        let file = fixture.file("src/lib.rs");
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let candidate = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "unused")
+            .unwrap();
+        let store = analyzer.analyzer_store();
+        let oid = analyzer.live_path_snapshot().oid_for_path(&file).unwrap();
+        let generation = store.current_generation("rust").unwrap();
+        // Retain the live declaration while losing its canonical facts, as
+        // the catch-up path sees after an interrupted publication.
+        store.delete_rust_facts_for_test("rust");
+        assert!(
+            store
+                .blobs_with_rust_facts("rust", generation, &[oid])
+                .unwrap()
+                .is_empty()
+        );
+        store.reset_parsed_blob_transaction_starts_for_test();
+        let mut skipped = Vec::new();
+        let (finding, reads) = capture_query_reads(&analyzer, || {
+            let finding = super::bulk_graph_finding(
+                &mut super::DeclarationSyntaxCache::new(&analyzer),
+                &Default::default(),
+                &candidate,
+                super::GraphIncomingUsage::default(),
+                &mut skipped,
+            )
+            .expect("the dead-code product consumes freshly published Rust visibility");
+            assert!(
+                store.parsed_blob_transaction_starts_for_test() > 0,
+                "the capture must actually publish a parsed blob, not take a warm path"
+            );
+            finding
+        });
+        assert_eq!(finding.file, file);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            store
+                .blobs_with_rust_facts("rust", generation, &[oid])
+                .unwrap()
+                .contains(&oid)
+        );
+        assert!(
+            reads
+                .keys()
+                .contains(&ReadKey::file(Language::Rust, "src/lib.rs", oid)),
+            "the lazily parsed root must remain a captured dependency: {:?}",
+            reads.keys()
+        );
+        assert_eq!(reads.unattributed_reads(), 0);
+    }
+
+    #[test]
     fn rust_dead_code_visibility_catches_up_missing_facts() {
         use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
 

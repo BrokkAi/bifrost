@@ -531,8 +531,8 @@ bifrost --root . \
 
 The C# taint row does not conclude today: C# taint discovery over the two
 matched endpoints is incomplete, so `bifrost.security.csharp.stored-request-to-sql`
-reports an inconclusive run (`partial_discovery`) and exits 2 rather than
-reporting the flow.
+reports an inconclusive run (`partial_discovery`) rather than reporting the
+flow.
 
 ### Rust SQL-injection taint support
 
@@ -655,7 +655,7 @@ A host that scans repositories it does not trust owns both reserved paths: it
 deletes whatever the checkout holds there and writes its own reviewed
 selection and model bytes before the run. Without the reviewed model, a
 selected declaration that reaches the API leaves the effect set open, so the
-run is inconclusive (exit 2) with an `absence-requires-exhaustive-coverage`
+run is inconclusive with an `absence-requires-exhaustive-coverage`
 obligation; it is never clean.
 
 | Language | Modeled API and written arity | Model to install |
@@ -2063,7 +2063,7 @@ Soundness is stricter here than for a match policy, because `none` and
 `exactly` are claims about a *set*. If the subject query or the occurrence scan
 is incomplete for any reason -- an adapter that marks the asserted role
 unsupported, a truncated result, an exhausted budget -- the run reports
-`inconclusive` with **no** findings and exits with status 2. A partial row set
+`inconclusive` with **no** findings, which is never a clean result. A partial row set
 can make a satisfied assertion look violated as easily as the reverse, so an
 assertion over incomplete input is never a pass and never a clean.
 
@@ -2508,7 +2508,7 @@ the same command exits 0 with completion `complete`. The kill makes that
 result clean: delete the `:kills` block and both validated flows are reported.
 
 With the unreliable `App.java`, an unresolvable wrapper sits between the origin
-and the observation. The run exits 2 with completion `inconclusive` under both
+and the observation. The run ends with completion `inconclusive` under both
 `:unmodeled paranoid` and `:unmodeled require-model`. An unresolved call is
 never a clean result.
 
@@ -2670,7 +2670,7 @@ Two facts have to hold for that, and both are visible in the source:
    subclass could override `put`, so the resolved member is not proven to be
    the complete target set.
 
-`inconclusive_app.py` exits 2. Its keyword call `store.put(value=value)`
+`inconclusive_app.py` ends inconclusive. Its keyword call `store.put(value=value)`
 binds the formal named `value` exactly and is reported as a definite finding.
 Its second function reads the origin as `source.read()` on an instance of
 `AcmeSource`. That read reaches a static method through an instance, which the
@@ -3634,10 +3634,10 @@ reach:
 
 | Verdict | Findings and completion | Exit status |
 | --- | --- | --- |
-| `abstain` (default) | Retained; the run stays `inconclusive` with its typed reasons | Unreliable (2) |
+| `abstain` (default) | Retained; the run stays `inconclusive` with its typed reasons | `--on-inconclusive` decides: by default (`pass`) the findings alone; under `unreliable`, unreliable (2) |
 | `warn-unreliable` | Retained unchanged; the run also carries `unknown_verdict` in its report JSON | Whatever the findings alone produce |
 | `fail-closed` | Retained unchanged, plus an `unknown_verdict_fail_closed` diagnostic naming the reasons | As if a finding at the policy's severity were present |
-| `treat-may-as-finding` | Explicit assertion may evidence is published as possible; coverage obligations remain inconclusive | Unreliable (2) if inconclusive; otherwise the findings determine the exit |
+| `treat-may-as-finding` | Explicit assertion may evidence is published as possible; coverage obligations remain inconclusive | As `abstain` if inconclusive; otherwise the findings determine the exit |
 
 `treat-may-as-finding` publishes explicit may evidence from assertion rows as
 findings with `certainty: possible`, retaining the reasons. Flow and taint
@@ -3645,7 +3645,8 @@ already publish possible findings under every verdict; this spelling does not
 change their publication or hide findings under the other verdicts. Unsupported
 relations, budget-truncated aggregates, and unmet absence obligations do not
 become possible findings. Unmet coverage obligations still make the run
-`inconclusive` and its exit status unreliable (2), even when findings are present.
+`inconclusive`, so under `--on-inconclusive unreliable` its exit status is
+unreliable (2) even when findings are present.
 Human and JSON output retain possible certainty and reasons; SARIF marks possible
 findings as `review` results and retains `bifrost.certainty`.
 

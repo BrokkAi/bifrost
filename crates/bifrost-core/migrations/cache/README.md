@@ -284,3 +284,8 @@ validates blob IDs divisible by 64, or every blob when
 `BIFROST_SEAL_VALIDATION=all` is set before the first decision. Immutability and
 publication state-order guards remain unconditional. Every writable store
 connection must register the function; a missing registration fails the seal.
+
+Migration `0222-field-slot-exact-result-sources.sql` rebuilds the field-slot atom
+table while preserving its rows, primary key, foreign key and checks. It admits
+exact call and access result sources so complete factory-backed inventories
+can be published and replayed instead of failing schema validation.

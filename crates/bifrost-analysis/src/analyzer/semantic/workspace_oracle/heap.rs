@@ -1116,31 +1116,45 @@ pub fn incoming_actual_queries(
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<IncomingActualSet, InterruptionOrProvider> {
     let key = (procedure.durable_key(), formal_value, context.clone());
-    if let Some(answer) = oracle
+    let attribution =
+        crate::analyzer::workspace_authority::memo_attribution(oracle.workspace.analyzer());
+    let answer = oracle
         .incoming_actuals
-        .lock()
-        .expect("incoming actual memo poisoned")
-        .get(&key)
-    {
-        return Ok(answer.clone());
-    }
-    let answer = compute_incoming_actual_queries(
-        oracle,
-        procedure,
-        formal_value,
-        context,
-        limits,
-        staged,
-        cancellation,
-    )?;
-    // Only successful enumeration is reusable. Interruptions propagate above
-    // without retaining a partial answer or charging a later memo hit.
-    oracle
-        .incoming_actuals
-        .lock()
-        .expect("incoming actual memo poisoned")
-        .insert(key, answer.clone());
-    Ok(answer)
+        .actuals
+        .read(&attribution, |actuals, capture| {
+            if let Some(entry) = actuals
+                .lock()
+                .expect("incoming actual memo poisoned")
+                .get(&key)
+            {
+                return Ok(entry.replay_entry());
+            }
+            let mut accounted = None;
+            let entry = std::sync::Arc::new(capture.try_build(|| {
+                let answer = std::sync::Arc::new(compute_incoming_actual_queries(
+                    oracle,
+                    procedure,
+                    formal_value,
+                    context,
+                    limits,
+                    staged,
+                    cancellation,
+                )?);
+                accounted = Some(std::sync::Arc::clone(&answer));
+                Ok::<_, InterruptionOrProvider>(answer)
+            })?);
+            // Only successful enumeration is reusable. Its captured inputs must
+            // accompany later hits, even when they belong to another root capture.
+            let mut actuals = actuals.lock().expect("incoming actual memo poisoned");
+            let retained = actuals.entry(key).or_insert_with(|| {
+                crate::analyzer::semantic::workspace_oracle::IncomingActualMemoEntry::new(
+                    std::sync::Arc::clone(&entry),
+                    accounted.expect("a successful memo build returned its accounting owner"),
+                )
+            });
+            Ok::<_, InterruptionOrProvider>(retained.replay_entry())
+        })?;
+    Ok(answer.as_ref().clone())
 }
 
 pub(crate) fn compute_incoming_actual_queries(

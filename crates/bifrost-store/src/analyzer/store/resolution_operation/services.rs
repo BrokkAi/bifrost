@@ -20,6 +20,9 @@ pub trait SelectedAnalyzerServices: Send + Sync {
 }
 
 pub trait SelectedModelAuthority {
+    /// The activated set from which this authority was composed.
+    fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>>;
+
     /// Selected composed alias groups for an owner name or declaration ID.
     fn model_selected_groups(
         &self,

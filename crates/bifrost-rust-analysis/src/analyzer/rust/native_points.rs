@@ -456,65 +456,14 @@ fn resolve_rust_definition_bounded_with_after_open_and_evidence(
         .into_complete_resolution();
     }
 
-    let snapshots = rust.inner.selected_workspace_snapshots();
-    let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+    let report = rust.open_selected_rust_operation(&cancellation);
+    // Existing counter readers observe completed calls. Record returned attempt
+    // progress before projecting failures or invoking the after-open callback.
     note_rust_definition_overlay_preparation();
-    let (masks, content_mounts) = match rust
-        .inner
-        .selected_rust_resolution_overlay_inputs(snapshots.as_ref(), &cancellation)
-    {
-        Ok(SelectedResolutionOverlayInputsOutcome::Ready {
-            masks,
-            content_mounts,
-        }) => (masks, content_mounts),
-        Ok(SelectedResolutionOverlayInputsOutcome::Unavailable(reason)) => {
-            return complete_definition(
-                query.site,
-                DefinitionLookupStatus::Unavailable,
-                "native_unavailable",
-                format!("selected Rust point operation is unavailable: {reason:?}"),
-            )
-            .into_complete_resolution();
-        }
-        Ok(SelectedResolutionOverlayInputsOutcome::Stale(reason)) => {
-            return complete_definition(
-                query.site,
-                DefinitionLookupStatus::Unavailable,
-                "native_stale",
-                format!("selected Rust point operation is stale: {reason:?}"),
-            )
-            .into_complete_resolution();
-        }
-        Ok(SelectedResolutionOverlayInputsOutcome::Cancelled) => {
-            return BoundedResolution::Cancelled {
-                work: ReceiverAnalysisWork::default(),
-            };
-        }
-        Err(error) => {
-            return complete_definition(
-                query.site,
-                DefinitionLookupStatus::Unavailable,
-                "native_store_error",
-                format!("selected Rust point operation failed to open: {error}"),
-            )
-            .into_complete_resolution();
-        }
-    };
-    let input = SelectedResolutionOperationInput::new(
-        rust.inner.project(),
-        rust.inner.workspace_id(),
-        snapshots.as_ref(),
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
-
-    note_rust_definition_operation_open();
-    let mut operation = match rust
-        .inner
-        .analyzer_store()
-        .open_selected_resolution_operation(input, &cancellation)
-    {
+    if report.store_open_attempted {
+        note_rust_definition_operation_open();
+    }
+    let mut operation = match report.outcome {
         Ok(SelectedResolutionOperationOpenOutcome::Ready(operation)) => *operation,
         Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason)) => {
             return complete_definition(

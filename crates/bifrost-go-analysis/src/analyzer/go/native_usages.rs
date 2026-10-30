@@ -14,8 +14,6 @@ use crate::analyzer::go::selected_reverse::go_selected_inverse_for_usage_scope;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GoReverseConfirmationMemo;
 use brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageBatchQuery;
 
-use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
-
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
 
 use brokk_bifrost_core::analyzer::usages::outcome::GraphFailureReason;
@@ -222,24 +220,23 @@ impl NativeUsageProjection for GoUsageProjection<'_> {
         file: &ProjectFile,
         _pending: &[NativeUsageSite],
     ) -> Result<NativeUsageFile<Self::Context>, Self::Error> {
-        let source = self.go.indexed_source(file).ok_or_else(|| {
-            DIAGNOSTICS.diagnostic(
-                self.primary,
-                "native_source_unavailable",
-                format!("selected Go usage source is unavailable: {file}"),
-            )
-        })?;
-        if !self
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::SelectedNativeSourceError;
+        let source = self
             .go
             .inner
-            .source_matches_selected_native_content(file, &source)
-        {
-            return Err(DIAGNOSTICS.diagnostic(
-                self.primary,
-                "stale_selected_source",
-                format!("selected Go usage source changed: {file}"),
-            ));
-        }
+            .selected_native_usage_source(file, || {})
+            .map_err(|error| match error {
+                SelectedNativeSourceError::Unavailable => DIAGNOSTICS.diagnostic(
+                    self.primary,
+                    "native_source_unavailable",
+                    format!("selected Go usage source is unavailable: {file}"),
+                ),
+                SelectedNativeSourceError::Stale => DIAGNOSTICS.diagnostic(
+                    self.primary,
+                    "stale_selected_source",
+                    format!("selected Go usage source changed: {file}"),
+                ),
+            })?;
         Ok(NativeUsageFile::new(source, ()))
     }
 }

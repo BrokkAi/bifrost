@@ -5,6 +5,9 @@
 //! deliberately kept out of `brokk-bifrost-go` and out of core, so each method
 //! below fetches or fills a cache slot and hands the actual resolution to the
 //! Go crate along with the file list and workspace path index it needs.
+use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
+use brokk_bifrost_analysis::analyzer::{FactSubject, Language};
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
@@ -61,76 +64,67 @@ impl ImportAnalysisProvider for GoAnalyzer {
     }
 
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
-            return cached;
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-go-analysis/src/analyzer/go/imports.rs",
-            );
-
-        let resolved = Arc::new(go_imported_code_units_of(
-            &self.inner,
-            &self.import_tables(),
-            file,
-            &self.inner.import_info_of(token, file),
-        ));
-
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::clone(&resolved);
-            persistent_fill_guard.installed("imported_code_units");
-            self.memo_caches
-                .imported_code_units
-                .insert(cache_key, cache_value);
-        };
-        resolved
+        let entry = self
+            .memo_caches
+            .imported_code_units
+            .read(&memo_attribution(self), |cache, capture| {
+                if let Some(cached) = cache.get(file) {
+                    return Ok::<_, std::convert::Infallible>(cached);
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let entry = Arc::new(capture.build_weighted(|| {
+                    let scope = AnalyzerQueryScope::new(self);
+                    let value = Arc::new(go_imported_code_units_of(
+                        &self.inner,
+                        &self.import_tables(),
+                        file,
+                        &self.inner.import_info_of(scope.token(), file),
+                    ));
+                    let bytes = brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set(
+                        file, &value,
+                    ) as usize;
+                    (value, bytes)
+                }));
+                if cache_fill.is_complete() {
+                    cache.insert(file.clone(), Arc::clone(&entry));
+                }
+                Ok(entry)
+            })
+            .unwrap();
+        Arc::clone(&entry)
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        if let Some(cached) = self.memo_caches.referencing_files.get(file) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-go-analysis/src/analyzer/go/imports.rs",
-            );
-
-        let reverse_index =
-            brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
-                &self.memo_caches.reverse_import_index,
-                || {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "go.reverse_file_index",
-                        || self.inner.all_files(),
-                    )
-                },
-                |candidate| {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "go.reverse_file_index",
-                        || self.imported_code_units_of(candidate),
-                    )
-                },
-            );
-        let referencing = reverse_index
-            .get(file)
-            .map(|files| (**files).clone())
-            .unwrap_or_default();
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::new(referencing.clone());
-            persistent_fill_guard.installed("referencing_files");
-            self.memo_caches
-                .referencing_files
-                .insert(cache_key, cache_value);
-        };
-        referencing
+        let entry = self
+            .memo_caches
+            .referencing_files
+            .read(&memo_attribution(self), |cache, capture| {
+                if let Some(cached) = cache.get(file) {
+                    return Ok::<_, std::convert::Infallible>(cached);
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let entry = Arc::new(capture.build_weighted(|| {
+                    let value = self
+                        .reverse_import_index()
+                        .index
+                        .get(file)
+                        .cloned()
+                        .unwrap_or_default();
+                    let bytes =
+                        brokk_bifrost_core::analyzer::weighted_cache::weight_project_file_set(
+                            file, &value,
+                        ) as usize;
+                    (value, bytes)
+                }));
+                if cache_fill.is_complete() {
+                    cache.insert(file.clone(), Arc::clone(&entry));
+                }
+                Ok(entry)
+            })
+            .unwrap();
+        (**entry).clone()
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
@@ -169,7 +163,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
             let all_files = self.inner.all_files();
             for path in unresolved {
                 resolved.extend(go_directory_sibling_import_files(
-                    self.workspace_path_index(),
+                    &self.workspace_path_index(),
                     &all_files,
                     file,
                     &path,
@@ -249,7 +243,104 @@ impl ImportAnalysisProvider for GoAnalyzer {
     }
 }
 
+type GoReverseImportIndex = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
+pub(crate) struct GoReverseImports {
+    index: GoReverseImportIndex,
+    pub(super) answer: Option<StableDigest>,
+}
+
+struct FailedGoReverseImports {
+    value: Arc<GoReverseImports>,
+    receipt: brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt,
+}
+
+fn reverse_import_value(index: GoReverseImportIndex) -> GoReverseImports {
+    use brokk_bifrost_core::path_utils::rel_path_string;
+    let mut rows = index
+        .iter()
+        .map(|(file, sources)| {
+            let mut sources = sources.iter().map(rel_path_string).collect::<Vec<_>>();
+            sources.sort();
+            (rel_path_string(file), sources)
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+        b"go-reverse-imports-v1",
+    );
+    hash.sequence("targets", &rows, |hash, (target, sources)| {
+        hash.value(target.as_bytes());
+        hash.sequence("sources", sources, |hash, source| {
+            hash.value(source.as_bytes())
+        });
+    });
+    GoReverseImports {
+        index,
+        answer: Some(StableDigest::from_array(hash.finish())),
+    }
+}
+
 impl GoAnalyzer {
+    fn try_reverse_import_value(
+        &self,
+        build: impl FnOnce() -> GoReverseImportIndex,
+    ) -> Result<GoReverseImports, FailedGoReverseImports> {
+        let ((index, inventory_complete), receipt) =
+            brokk_bifrost_analysis::analyzer::common::capture_query_cache_build(self, || {
+                let index = build();
+                (index, self.graph_inventory_complete())
+            });
+        if !receipt.is_complete() || receipt.unattributed_reads() != 0 || !inventory_complete {
+            return Err(FailedGoReverseImports {
+                value: Arc::new(GoReverseImports {
+                    index,
+                    answer: None,
+                }),
+                receipt,
+            });
+        }
+        Ok(reverse_import_value(index))
+    }
+
+    pub(super) fn reverse_import_index(&self) -> Arc<GoReverseImports> {
+        self.memo_caches.reverse_import_index.read(
+            &memo_attribution(self),
+            |memo| {
+                let parallel = || {
+                    self.try_reverse_import_value(|| {
+                        brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                            &self.inner.all_files(),
+                            |candidate| self.imported_code_units_of(candidate),
+                            true,
+                        )
+                    })
+                };
+                let serial = || {
+                    self.try_reverse_import_value(|| {
+                        brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                            &self.inner.all_files(),
+                            |candidate| self.imported_code_units_of(candidate),
+                            false,
+                        )
+                    })
+                };
+                memo.get_or_try_build_wave(parallel, serial)
+                    .unwrap_or_else(|failure| {
+                        failure.receipt.replay();
+                        Arc::clone(&failure.value)
+                    })
+            },
+            |value| match value.answer {
+                Some(answer) => AuthorityInputs::Fact {
+                    language: Language::Go,
+                    subject: FactSubject::Whole,
+                    answer,
+                },
+                None => AuthorityInputs::Unnamed,
+            },
+        )
+    }
+
     /// Resolve only `file`'s namespace from persisted import and package facts.
     /// This deliberately avoids the whole-workspace package graph used by bulk
     /// usage analysis.
@@ -260,7 +351,7 @@ impl GoAnalyzer {
     ) -> (HashMap<String, Vec<String>>, Vec<String>) {
         brokk_bifrost_go::imports::go_definition_import_namespaces(
             &self.inner,
-            self.workspace_path_index(),
+            &self.workspace_path_index(),
             |candidate| self.package_clause_of(candidate),
             file,
             &self.inner.import_info_of(token, file),
@@ -278,12 +369,12 @@ impl GoAnalyzer {
         })
     }
 
-    fn import_tables(&self) -> GoImportTables<'_> {
+    fn import_tables(&self) -> GoImportTables {
         let facts = self.import_facts();
         GoImportTables {
-            package_files: &facts.package_files,
-            dir_parent_files: &facts.dir_parent_files,
-            dir_parent_suffix_files: &facts.dir_parent_suffix_files,
+            package_files: Arc::clone(&facts.package_files),
+            dir_parent_files: Arc::clone(&facts.dir_parent_files),
+            dir_parent_suffix_files: Arc::clone(&facts.dir_parent_suffix_files),
         }
     }
 
@@ -291,78 +382,108 @@ impl GoAnalyzer {
     /// same question -- which package does this file declare -- so they are
     /// built in one pass; separately, each read every file's persisted package
     /// clause again.
-    pub(crate) fn import_facts(&self) -> &GoImportFacts {
-        self.memo_caches.import_facts.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "go.import_facts",
-                || {
-                    let files = self.inner.all_files();
-                    let mut package_of_file: HashMap<ProjectFile, String> = HashMap::default();
-                    for file in &files {
-                        if let Some(package) = self.go_package_of(file) {
-                            package_of_file.insert(file.clone(), package);
+    pub(crate) fn import_facts(&self) -> Arc<GoImportFacts> {
+        self.memo_caches.import_facts.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    memo,
+                    || {
+                        let files = self.inner.all_files();
+                        let mut package_of_file: HashMap<ProjectFile, String> = HashMap::default();
+                        for file in &files {
+                            if let Some(package) = self.go_package_of(file) {
+                                package_of_file.insert(file.clone(), package);
+                            }
                         }
-                    }
-                    // A file with no persisted package clause is the one shape
-                    // `import_reachability` cannot decide, so name the size of that
-                    // tail once per workspace rather than per undecided pair.
-                    brokk_bifrost_core::profiling::note_with(|| {
-                        format!(
-                            "go::import_facts[files={}, without_package_clause={}]",
-                            files.len(),
-                            files.len() - package_of_file.len()
-                        )
-                    });
+                        // A file with no persisted package clause is the one shape
+                        // `import_reachability` cannot decide, so name the size of that
+                        // tail once per workspace rather than per undecided pair.
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!(
+                                "go::import_facts[files={}, without_package_clause={}]",
+                                files.len(),
+                                files.len() - package_of_file.len()
+                            )
+                        });
 
-                    let mut package_files: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-                    let mut dir_parent_files: HashMap<String, Vec<ProjectFile>> =
-                        HashMap::default();
-                    let mut dir_parent_suffix_files: HashMap<String, Vec<ProjectFile>> =
-                        HashMap::default();
-                    for file in &files {
-                        let Some(package) = package_of_file.get(file) else {
-                            continue;
-                        };
-                        package_files
-                            .entry(package.clone())
-                            .or_default()
-                            .push(file.clone());
-                        let parent = parent_path_key(file);
-                        for suffix in path_suffixes(&parent) {
-                            dir_parent_suffix_files
-                                .entry(suffix.to_string())
+                        let mut package_files: HashMap<String, Vec<ProjectFile>> =
+                            HashMap::default();
+                        let mut dir_parent_files: HashMap<String, Vec<ProjectFile>> =
+                            HashMap::default();
+                        let mut dir_parent_suffix_files: HashMap<String, Vec<ProjectFile>> =
+                            HashMap::default();
+                        for file in &files {
+                            let Some(package) = package_of_file.get(file) else {
+                                continue;
+                            };
+                            package_files
+                                .entry(package.clone())
+                                .or_default()
+                                .push(file.clone());
+                            let parent = parent_path_key(file);
+                            for suffix in path_suffixes(&parent) {
+                                dir_parent_suffix_files
+                                    .entry(suffix.to_string())
+                                    .or_default()
+                                    .push(file.clone());
+                            }
+                            dir_parent_files
+                                .entry(parent)
                                 .or_default()
                                 .push(file.clone());
                         }
-                        dir_parent_files
-                            .entry(parent)
-                            .or_default()
-                            .push(file.clone());
-                    }
 
-                    GoImportFacts {
-                        package_of_file,
-                        package_files: share(package_files),
-                        dir_parent_files: share(dir_parent_files),
-                        dir_parent_suffix_files: share(dir_parent_suffix_files),
-                    }
-                },
-            )
-        })
+                        let mut hash =
+                            brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+                                b"go-import-facts-v1",
+                            );
+                        let mut rows = package_of_file
+                            .iter()
+                            .map(|(file, package)| {
+                                (
+                                    brokk_bifrost_core::path_utils::rel_path_string(file),
+                                    package.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        rows.sort();
+                        hash.sequence("packages", &rows, |hash, (file, package)| {
+                            hash.value(file.as_bytes());
+                            hash.value(package.as_bytes());
+                        });
+                        let answer = StableDigest::from_array(hash.finish());
+                        GoImportFacts {
+                            answer,
+                            package_of_file,
+                            package_files: Arc::new(share(package_files)),
+                            dir_parent_files: Arc::new(share(dir_parent_files)),
+                            dir_parent_suffix_files: Arc::new(share(dir_parent_suffix_files)),
+                        }
+                    },
+                )
+            },
+            |value| AuthorityInputs::Fact {
+                language: Language::Go,
+                subject: FactSubject::Whole,
+                answer: value.answer,
+            },
+        )
     }
 }
 
 /// Every workspace-scale Go import fact, built in one pass over the analyzed
 /// file list.
 pub(crate) struct GoImportFacts {
+    pub(super) answer: StableDigest,
     /// Canonical package identity of each file that persisted a package
     /// clause. Absence means the clause was never persisted, which is what
     /// `import_reachability` reports as `Unknown`.
     package_of_file: HashMap<ProjectFile, String>,
-    package_files: HashMap<String, Arc<Vec<ProjectFile>>>,
-    dir_parent_files: HashMap<String, Arc<Vec<ProjectFile>>>,
-    dir_parent_suffix_files: HashMap<String, Arc<Vec<ProjectFile>>>,
+    package_files: Arc<HashMap<String, Arc<Vec<ProjectFile>>>>,
+    dir_parent_files: Arc<HashMap<String, Arc<Vec<ProjectFile>>>>,
+    dir_parent_suffix_files: Arc<HashMap<String, Arc<Vec<ProjectFile>>>>,
 }
 
 impl GoImportFacts {

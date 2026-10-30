@@ -3706,8 +3706,8 @@ impl UnmaterializedExternalTarget {
     }
 
     /// Build the provenance artifact key that anchors the bound summary. It
-    /// reuses the synthetic mount, path, and language of `locator` -- so
-    /// `ExternalSummaryTarget::matches(self.locator())` succeeds -- and copies the
+    /// reuses the synthetic mount, path, and language of `locator` -- so the
+    /// external summary target lookup, which compares locators, finds it -- and copies the
     /// caller-analysis validity fields from `template` so the bound summary's
     /// dependency fingerprint matches the active compatibility key.
     pub fn provenance_artifact_key(&self, template: &SemanticArtifactKey) -> SemanticArtifactKey {

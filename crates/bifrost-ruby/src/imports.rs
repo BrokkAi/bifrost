@@ -94,7 +94,11 @@ fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
 /// `require_relative` is resolved relative to the requiring file's directory.
 /// Bare `require` is resolved as a project-root-relative load path only when a
 /// matching project file exists.
-pub fn resolve_required_file(file: &ProjectFile, load: &RubyLoadInfo) -> Option<ProjectFile> {
+pub fn resolve_required_file(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+    load: &RubyLoadInfo,
+) -> Option<ProjectFile> {
     let raw_path = load.import.identifier.as_deref()?;
     if load.has_receiver {
         return None;
@@ -102,43 +106,60 @@ pub fn resolve_required_file(file: &ProjectFile, load: &RubyLoadInfo) -> Option<
     match load.kind {
         RubyLoadKind::RequireRelative => {
             let base = file.rel_path().parent().unwrap_or_else(|| Path::new(""));
-            resolve_relative_required_file(file, &base.join(raw_path))
+            resolve_relative_required_file(ruby, file, &base.join(raw_path))
         }
         RubyLoadKind::Require | RubyLoadKind::Autoload => {
-            resolve_project_required_file(file, Path::new(raw_path))
+            resolve_project_required_file(ruby, file, Path::new(raw_path))
         }
         RubyLoadKind::Load => None,
     }
 }
 
-fn resolve_generic_load(file: &ProjectFile, load: &RubyLoadInfo) -> Option<ProjectFile> {
+fn resolve_generic_load(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+    load: &RubyLoadInfo,
+) -> Option<ProjectFile> {
     load.generic
-        .then(|| resolve_required_file(file, load))
+        .then(|| resolve_required_file(ruby, file, load))
         .flatten()
 }
 
-fn resolve_relative_required_file(file: &ProjectFile, path: &Path) -> Option<ProjectFile> {
-    resolve_candidate(file, path, false)
+fn resolve_relative_required_file(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+    path: &Path,
+) -> Option<ProjectFile> {
+    resolve_candidate(ruby, file, path, false)
 }
 
-fn resolve_project_required_file(file: &ProjectFile, path: &Path) -> Option<ProjectFile> {
+fn resolve_project_required_file(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+    path: &Path,
+) -> Option<ProjectFile> {
     if path.is_absolute() {
         return None;
     }
-    resolve_required_path_candidates(file, path)
-        .or_else(|| resolve_required_path_candidates(file, &Path::new("lib").join(path)))
+    resolve_required_path_candidates(ruby, file, path)
+        .or_else(|| resolve_required_path_candidates(ruby, file, &Path::new("lib").join(path)))
 }
 
-fn resolve_required_path_candidates(file: &ProjectFile, path: &Path) -> Option<ProjectFile> {
-    resolve_candidate(file, path, false).or_else(|| {
+fn resolve_required_path_candidates(
+    ruby: &dyn RubySource,
+    file: &ProjectFile,
+    path: &Path,
+) -> Option<ProjectFile> {
+    resolve_candidate(ruby, file, path, false).or_else(|| {
         path.extension()
             .is_none()
-            .then(|| resolve_candidate(file, path, true))
+            .then(|| resolve_candidate(ruby, file, path, true))
             .flatten()
     })
 }
 
 fn resolve_candidate(
+    ruby: &dyn RubySource,
     file: &ProjectFile,
     path: &Path,
     directory_index: bool,
@@ -151,7 +172,8 @@ fn resolve_candidate(
         candidate.set_extension("rb");
     }
     let project_file = ProjectFile::new(file.root().to_path_buf(), candidate);
-    project_file.exists().then_some(project_file)
+    ruby.required_file_exists(&project_file)
+        .then_some(project_file)
 }
 
 /// Resolves `.`/`..` components without touching the filesystem. Returns `None`
@@ -287,7 +309,7 @@ pub fn ruby_required_files_checked(
         ruby.source_facts(file)?
             .loads
             .iter()
-            .filter_map(|load| resolve_generic_load(file, load))
+            .filter_map(|load| resolve_generic_load(ruby, file, load))
             .collect(),
     )
 }
@@ -315,7 +337,7 @@ pub fn build_autoload_constant_files(
             };
             let files = index.entry(constant.join("$")).or_default();
             files.insert(file.clone());
-            if let Some(required) = resolve_required_file(&file, &load) {
+            if let Some(required) = resolve_required_file(ruby, &file, &load) {
                 files.insert(required);
             }
         }
@@ -359,7 +381,7 @@ pub fn build_zeitwerk_consumer_files(ruby: &dyn RubySource) -> HashSet<ProjectFi
 
 pub fn build_zeitwerk_autoload_code_units(ruby: &dyn RubySource) -> HashSet<CodeUnit> {
     let mut units = HashSet::default();
-    for file in ruby.zeitwerk_autoload_files() {
+    for file in ruby.zeitwerk_autoload_files().iter() {
         for code_unit in ruby.top_level_declarations(file) {
             units.insert(code_unit.clone());
         }
@@ -367,10 +389,10 @@ pub fn build_zeitwerk_autoload_code_units(ruby: &dyn RubySource) -> HashSet<Code
     units
 }
 
-pub fn ruby_zeitwerk_visible_files_for<'a>(
-    ruby: &'a dyn RubySource,
+pub fn ruby_zeitwerk_visible_files_for(
+    ruby: &dyn RubySource,
     file: &ProjectFile,
-) -> Option<&'a HashSet<ProjectFile>> {
+) -> Option<std::sync::Arc<HashSet<ProjectFile>>> {
     ruby.zeitwerk_consumer_files()
         .contains(file)
         .then(|| ruby.zeitwerk_autoload_files())
@@ -432,7 +454,7 @@ pub fn ruby_imported_files_from_infos(
         loads
             .iter()
             .filter(|load| imports.contains(&load.import))
-            .filter_map(|load| resolve_generic_load(file, load))
+            .filter_map(|load| resolve_generic_load(ruby, file, load))
             .collect(),
     )
 }

@@ -18,11 +18,11 @@ default = []
 test-support = ["brokk-bifrost-analysis/test-support"]
 
 [dependencies]
-brokk-bifrost-rust-analysis = { path = "../bifrost-rust-analysis", version = "=0.14.3" }
-brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.14.3" }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.14.3" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.14.3" }
+brokk-bifrost-rust-analysis = { path = "../bifrost-rust-analysis", version = "=0.14.4" }
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.14.4" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.4" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.14.4" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.14.4" }
 cap-std = { version = "4.0.2", default-features = false }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 cvss = { version = "2.2.0", default-features = false, features = ["std", "v3", "v4"] }
@@ -38,13 +38,13 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 workspace-hack.workspace = true
 
 [dev-dependencies]
-brokk-bifrost-jvm-analysis = { path = "../bifrost-jvm-analysis", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-cpp-analysis = { path = "../bifrost-cpp-analysis", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.14.3" }
-brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-jvm-analysis = { path = "../bifrost-jvm-analysis", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-cpp-analysis = { path = "../bifrost-cpp-analysis", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.14.4" }
+brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.14.4", features = ["test-support"] }
 
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.4", features = ["test-support"] }
 tempfile = "3.23.0"
 
 # Unix: the RQLP directory loader's symlink/permission tests inspect raw modes.

@@ -55,10 +55,14 @@ pub fn run_for_policy_id<'a>(report: &'a Value, policy_id: &str) -> &'a Value {
     matching[0]
 }
 
+/// An abstaining run is Bifrost's own `inconclusive` verdict. Under the
+/// default `on_inconclusive` reading (#8111) that verdict is advisory: with no
+/// gating finding `run_policy` exits 0, and the run's completion and unmet
+/// obligation, not the top-level status, carry the open absence claim.
 #[allow(dead_code)]
 pub fn assert_mcp_policy_abstains(structured: &Value) {
-    assert_eq!(structured["exit_status"], 2, "{structured}");
-    assert_ne!(structured["status"], "clean", "{structured}");
+    assert_eq!(structured["exit_status"], 0, "{structured}");
+    assert_eq!(structured["status"], "clean", "{structured}");
     let run = &structured["report"]["runs"][0];
     assert_eq!(run["completion"]["type"], "inconclusive", "{run}");
     assert!(

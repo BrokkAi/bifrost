@@ -13,9 +13,13 @@ pub use brokk_bifrost_core::path_utils::{
     workspace_relative_slash_path,
 };
 
+use crate::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
 use crate::analyzer::store::StoreError;
+use crate::analyzer::workspace_authority::{
+    AuthorityInputs, WorkspaceAuthorityMemo, memo_attribution,
+};
 use crate::analyzer::{
-    IAnalyzer, Project, ProjectFile, WorkspaceFileIndex, WorkspaceFileIndexCell,
+    IAnalyzer, Language, Project, ProjectFile, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
 use glob::{MatchOptions, Pattern};
 use serde::Serialize;
@@ -148,11 +152,11 @@ pub struct WorkspaceFileResolver<'a> {
     /// The active request's shared listing cell, when a query scope was open.
     /// Resolvers are built per call site and per symbol, so without this each
     /// one paid its own whole-workspace walk (#1334).
-    shared_index: Option<WorkspaceFileIndexCell>,
+    shared_index: Option<WorkspaceAuthorityMemo<WorkspaceFileIndexCell>>,
     /// This resolver's own listing: used when no request scope is available,
     /// and as the fallback if the shared cell turns out to describe a different
     /// workspace than this resolver's project.
-    private_index: OnceLock<Arc<WorkspaceFileIndex>>,
+    private_index: WorkspaceAuthorityMemo<OnceLock<Arc<WorkspaceFileIndex>>>,
 }
 
 impl<'a> WorkspaceFileResolver<'a> {
@@ -163,8 +167,13 @@ impl<'a> WorkspaceFileResolver<'a> {
         Self {
             analyzer,
             project: analyzer.project(),
-            shared_index: analyzer.workspace_file_index_cell(),
-            private_index: OnceLock::new(),
+            shared_index: analyzer.workspace_file_index_cell().map(|cell| {
+                WorkspaceAuthorityMemo::new(WorkspaceFactFamily::WorkspaceFileInventory, cell)
+            }),
+            private_index: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::WorkspaceFileInventory,
+                OnceLock::new(),
+            ),
         }
     }
 
@@ -195,7 +204,7 @@ impl<'a> WorkspaceFileResolver<'a> {
             return ResolvedFileInput::NotFound(trimmed.to_string());
         };
 
-        match matches {
+        match matches.as_slice() {
             [] => ResolvedFileInput::NotFound(trimmed.to_string()),
             [file] => ResolvedFileInput::File(file.clone()),
             _ => ResolvedFileInput::Ambiguous(AmbiguousPathInput {
@@ -240,9 +249,9 @@ impl<'a> WorkspaceFileResolver<'a> {
         }
     }
 
-    fn basename_matches(&self, basename: &str) -> Option<&[ProjectFile]> {
+    fn basename_matches(&self, basename: &str) -> Option<Vec<ProjectFile>> {
         match self.index().matches(basename) {
-            Ok(matches) => matches,
+            Ok(matches) => matches.map(<[_]>::to_vec),
             // A workspace whose listing failed cannot say whether it holds a
             // file with this basename, and `None` here becomes `NotFound` --
             // the assertion that it definitely does not (#2325). Record the
@@ -257,18 +266,47 @@ impl<'a> WorkspaceFileResolver<'a> {
         }
     }
 
-    fn index(&self) -> &WorkspaceFileIndex {
-        // `get_or_init` runs on this resolver's own `Arc` handle, which is how
-        // the request-shared cell guarantees the walk happens once even when
-        // many `rayon` workers miss it at the same instant.
-        if let Some(shared) = &self.shared_index {
-            let index = shared.get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project)));
-            if index.covers(self.project.root()) {
-                return index;
-            }
+    fn index(&self) -> Arc<WorkspaceFileIndex> {
+        let attribution = memo_attribution(self.analyzer);
+        let shared = self.shared_index.as_ref().map(|shared_index| {
+            shared_index.read(
+                &attribution,
+                |cell| {
+                    Arc::clone(
+                        cell.get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project))),
+                    )
+                },
+                |index| {
+                    index
+                        .inventory_answer()
+                        .map_or(AuthorityInputs::Unnamed, |answer| AuthorityInputs::Fact {
+                            language: Language::None,
+                            subject: FactSubject::Whole,
+                            answer,
+                        })
+                },
+            )
+        });
+        if let Some(index) = shared.filter(|index| index.covers(self.project.root())) {
+            return index;
         }
-        self.private_index
-            .get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project)))
+        // A basename can be introduced by a previously unobserved non-source
+        // file, so the complete workspace inventory certifies this index.
+        self.private_index.read(
+            &attribution,
+            |cell| {
+                Arc::clone(cell.get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project))))
+            },
+            |index| {
+                index
+                    .inventory_answer()
+                    .map_or(AuthorityInputs::Unnamed, |answer| AuthorityInputs::Fact {
+                        language: Language::None,
+                        subject: FactSubject::Whole,
+                        answer,
+                    })
+            },
+        )
     }
 }
 
@@ -277,6 +315,58 @@ fn is_bare_literal_candidate(input: &str, rel: &Path) -> bool {
         return false;
     }
     rel.components().count() == 1
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::analyzer::workspace_authority::workspace_fact_key;
+    use crate::analyzer::{Language, MultiAnalyzer, TestProject, capture_query_reads};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: basename buckets and their certificate came from separate listings"
+    )]
+    fn non_source_basename_hits_record_the_workspace_inventory_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("config.json"), "{}").unwrap();
+        let project = TestProject::new(directory.path(), Language::Python);
+        let analyzer = MultiAnalyzer::default();
+        let resolver = WorkspaceFileResolver {
+            analyzer: &analyzer,
+            project: &project,
+            shared_index: None,
+            private_index: WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::WorkspaceFileInventory,
+                OnceLock::new(),
+            ),
+        };
+        let before = project.workspace_file_listing_count();
+        let first = resolver.basename_matches("config.json");
+        assert_eq!(
+            project.workspace_file_listing_count() - before,
+            1,
+            "the buckets and inventory must describe one listing"
+        );
+        assert_eq!(first.as_deref().map(<[_]>::len), Some(1));
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert_eq!(
+                resolver
+                    .basename_matches("config.json")
+                    .as_deref()
+                    .map(<[_]>::len),
+                Some(1)
+            );
+        });
+        let expected = workspace_fact_key(
+            WorkspaceFactFamily::WorkspaceFileInventory,
+            FactSubject::Whole,
+            crate::analyzer::workspace_authority::workspace_file_inventory_answer(&project)
+                .unwrap(),
+        );
+        assert_eq!(reads.keys(), &[expected]);
+        assert_eq!(reads.unattributed_reads(), 0);
+    }
 }
 
 #[cfg(test)]

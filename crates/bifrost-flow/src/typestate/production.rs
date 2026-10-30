@@ -29,9 +29,12 @@
 //! grounds `memoizable_outcome` states for value flow: exceeding a budget or
 //! being cancelled is a property of the request, not of the artifact, so
 //! freezing one into the cache would deny a later, better-funded request the
-//! better answer it could reach. See [`publish_exact_result`].
+//! better answer it could reach. See [`solve_typestate_with_production_summaries`].
 
+use crate::analyzer::ReadKey;
+use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry};
 use crate::semantic_summary::{ProcedureDependencyComponentOrder, ProcedureDependencyGraph};
+use brokk_bifrost_core::analyzer::memo_attribution::ReplayedMemoValue;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -193,24 +196,31 @@ impl ProductionSummaryLifecycleCounters {
 
 /// One bounded, content-keyed in-memory repository owned by one workspace.
 ///
-/// The handle itself is the capability: every entry is addressed by keys that
-/// name their own semantic inputs, so there is no separate lease to pair a
-/// repository with a generation. Share one `Arc` between every surface that
-/// analyzes the same workspace.
+/// Storage survives analyzer generations. Each query creates a reader with
+/// its current analyzer's owned attribution capability; storage never retains
+/// a reader or a query's recording destination.
 #[derive(Debug)]
-pub struct ProductionTypestateSummaryRepository {
+pub(crate) struct ProductionTypestateSummaryStorage {
     state: Mutex<ProductionTypestateSummaryRepositoryState>,
-    semantic_summaries: Arc<ProductionSemanticSummaryRepository>,
+    semantic_summaries: Arc<crate::dataflow::ProductionSemanticSummaryStorage>,
     /// Counters live behind their own lock rather than inside `state` so a
     /// rejection can be recorded after the state guard is dropped.
     counters: Mutex<ProductionSummaryLifecycleCounters>,
     flights: Mutex<HashMap<ProductionSummaryResultKey, Arc<ProductionSummaryFlight>>>,
 }
 
+/// A query's capability-bearing reader; the workspace keeps only its storage.
+#[derive(Debug)]
+pub struct ProductionTypestateSummaryRepository {
+    storage: Arc<ProductionTypestateSummaryStorage>,
+    semantic_summaries: Arc<ProductionSemanticSummaryRepository>,
+    attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+}
+
 #[derive(Debug)]
 struct ProductionTypestateSummaryRepositoryState {
-    protocol: CompleteProtocolSummaryRepository,
-    results: HashMap<ProductionSummaryResultKey, CachedTypestateSummaryResult>,
+    protocol: super::summary::CompleteProtocolSummaryStorage,
+    results: HashMap<ProductionSummaryResultKey, RetainedTypestateSummaryResult>,
     retained_result_bytes: usize,
     next_result_sequence: u64,
     max_result_entries: usize,
@@ -229,33 +239,30 @@ impl crate::analyzer::SummaryAnswers for ProductionTypestateSummaryRepository {
     }
 }
 
-impl Default for ProductionTypestateSummaryRepository {
+impl Default for ProductionTypestateSummaryStorage {
     fn default() -> Self {
         Self::with_limits(TypestateSummaryRepositoryLimits::default())
     }
 }
 
-impl ProductionTypestateSummaryRepository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_limits(limits: TypestateSummaryRepositoryLimits) -> Self {
+impl ProductionTypestateSummaryStorage {
+    pub(crate) fn with_limits(limits: TypestateSummaryRepositoryLimits) -> Self {
         Self::with_shared_semantic_summaries(
             limits,
-            Arc::new(ProductionSemanticSummaryRepository::with_limits(
-                limits.semantic,
-            )),
+            Arc::new(
+                crate::dataflow::ProductionSemanticSummaryStorage::with_limits(limits.semantic),
+            ),
         )
     }
-
-    pub fn with_shared_semantic_summaries(
+    pub(crate) fn with_shared_semantic_summaries(
         limits: TypestateSummaryRepositoryLimits,
-        semantic_summaries: Arc<ProductionSemanticSummaryRepository>,
+        semantic_summaries: Arc<crate::dataflow::ProductionSemanticSummaryStorage>,
     ) -> Self {
         Self {
             state: Mutex::new(ProductionTypestateSummaryRepositoryState {
-                protocol: CompleteProtocolSummaryRepository::with_limits(limits.protocol),
+                protocol: super::summary::CompleteProtocolSummaryStorage::with_limits(
+                    limits.protocol,
+                ),
                 results: HashMap::default(),
                 retained_result_bytes: 0,
                 next_result_sequence: 0,
@@ -267,6 +274,28 @@ impl ProductionTypestateSummaryRepository {
             flights: Mutex::new(HashMap::default()),
         }
     }
+    pub(crate) fn reader(
+        self: &Arc<Self>,
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+    ) -> ProductionTypestateSummaryRepository {
+        ProductionTypestateSummaryRepository {
+            storage: Arc::clone(self),
+            semantic_summaries: Arc::new(self.semantic_summaries.reader(attribution.clone())),
+            attribution,
+        }
+    }
+}
+
+impl ProductionTypestateSummaryRepository {
+    pub fn new(attribution: crate::analyzer::workspace_authority::OwnedMemoCapability) -> Self {
+        Self::with_limits(TypestateSummaryRepositoryLimits::default(), attribution)
+    }
+    pub fn with_limits(
+        limits: TypestateSummaryRepositoryLimits,
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+    ) -> Self {
+        Arc::new(ProductionTypestateSummaryStorage::with_limits(limits)).reader(attribution)
+    }
 
     pub fn counters(&self) -> ProductionSummaryLifecycleCounters {
         *self.lifecycle_counters()
@@ -274,6 +303,19 @@ impl ProductionTypestateSummaryRepository {
 
     pub fn retained_result_count(&self) -> usize {
         self.state().results.len()
+    }
+
+    pub fn retained_result_bytes(&self) -> usize {
+        self.state().retained_result_bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_result_receipt_bytes(&self) -> usize {
+        self.state()
+            .results
+            .values()
+            .map(|cached| cached.entry.retained_read_bytes(read_key_heap_bytes))
+            .sum()
     }
 
     /// Retained semantic procedure summaries, the identities shared by every
@@ -332,8 +374,19 @@ impl ProductionTypestateSummaryRepository {
         counters.recomputations = counters.recomputations.saturating_add(1);
     }
 
-    fn result(&self, key: &ProductionSummaryResultKey) -> Option<CachedTypestateSummaryResult> {
-        self.state().results.get(key).cloned()
+    fn result(
+        &self,
+        key: &ProductionSummaryResultKey,
+    ) -> Option<ReplayedMemoValue<CachedTypestateSummaryResult, ReadKey>> {
+        ReplayingMemo::new(())
+            .read(&self.attribution.capability(), |_, _| {
+                self.state()
+                    .results
+                    .get(key)
+                    .map(|cached| Arc::clone(&cached.entry))
+                    .ok_or(())
+            })
+            .ok()
     }
 
     fn record_hit(&self) {
@@ -344,20 +397,14 @@ impl ProductionTypestateSummaryRepository {
     fn publish_result(
         &self,
         key: ProductionSummaryResultKey,
-        result: Arc<TypestateSummaryResult>,
-        semantic_charge: crate::analyzer::semantic::SemanticBudgetReplay,
-        solver_charge: SolverWork,
-        execution_charge: Option<SemanticExecutionBudgetCharge>,
+        entry: Arc<ReplayingMemoEntry<CachedTypestateSummaryResult, ReadKey>>,
     ) -> (bool, usize) {
         let mut state = self.state();
         if state.results.contains_key(&key) {
             return (true, 0);
         }
-        let mut retained = CachedTypestateSummaryResult {
-            result,
-            semantic_charge,
-            solver_charge,
-            execution_charge,
+        let mut retained = RetainedTypestateSummaryResult {
+            entry,
             published_sequence: 0,
         };
         let retained_bytes = key
@@ -402,14 +449,19 @@ impl ProductionTypestateSummaryRepository {
         (true, evictions)
     }
 
-    fn protocol_snapshot(
+    /// Presence is cache telemetry only; no row or read receipt reaches a solve.
+    fn has_compatible_protocol_rows_for_diagnostics(
         &self,
         semantic_summaries: &ProtocolSemanticSummarySet<'_>,
         protocol: &CompiledProtocol,
         bindings: &TypestateBindingPlan,
-    ) -> CompleteProtocolSummaryRepository {
-        let protocol_repository = self.state().protocol.clone();
-        semantic_summaries.compatible_repository(&protocol_repository, protocol, bindings)
+    ) -> bool {
+        let state = self
+            .storage
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        semantic_summaries.has_compatible_rows_for_diagnostics(&state.protocol, protocol, bindings)
     }
 
     fn protocol_limits(&self) -> ProtocolSummaryRepositoryLimits {
@@ -434,13 +486,15 @@ impl ProductionTypestateSummaryRepository {
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, ProductionTypestateSummaryRepositoryState> {
-        self.state
+        self.storage
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn lifecycle_counters(&self) -> std::sync::MutexGuard<'_, ProductionSummaryLifecycleCounters> {
-        self.counters
+        self.storage
+            .counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -455,6 +509,7 @@ impl ProductionTypestateSummaryRepository {
         key: &ProductionSummaryResultKey,
     ) -> ProductionSummaryFlightAdmission<'_> {
         let mut flights = self
+            .storage
             .flights
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -516,6 +571,7 @@ impl Drop for ProductionSummaryFlightLeader<'_> {
         }
         let mut flights = self
             .repository
+            .storage
             .flights
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -534,7 +590,6 @@ struct CachedTypestateSummaryResult {
     semantic_charge: crate::analyzer::semantic::SemanticBudgetReplay,
     solver_charge: SolverWork,
     execution_charge: Option<SemanticExecutionBudgetCharge>,
-    published_sequence: u64,
 }
 
 impl CachedTypestateSummaryResult {
@@ -547,6 +602,39 @@ impl CachedTypestateSummaryResult {
                     .map_or(0, SemanticExecutionBudgetCharge::retained_bytes),
             )
     }
+}
+
+#[derive(Debug, Clone)]
+struct RetainedTypestateSummaryResult {
+    entry: Arc<ReplayingMemoEntry<CachedTypestateSummaryResult, ReadKey>>,
+    published_sequence: u64,
+}
+
+impl RetainedTypestateSummaryResult {
+    fn retained_bytes(&self) -> usize {
+        retained_result_entry_bytes(&self.entry)
+    }
+}
+
+fn read_key_heap_bytes(key: &ReadKey) -> usize {
+    use crate::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+    let mut heap = RetainedHeap::default();
+    retained_read_key(&mut heap, key);
+    heap.total()
+}
+
+fn retained_result_entry_bytes(
+    entry: &ReplayingMemoEntry<CachedTypestateSummaryResult, ReadKey>,
+) -> usize {
+    entry
+        .retained_bytes(read_key_heap_bytes)
+        .saturating_add(std::mem::size_of::<RetainedTypestateSummaryResult>())
+        .saturating_add(
+            std::mem::size_of::<ReplayingMemoEntry<CachedTypestateSummaryResult, ReadKey>>()
+                .saturating_sub(std::mem::size_of::<CachedTypestateSummaryResult>()),
+        )
+        // Arc control blocks for the retained entry and its read-key slice.
+        .saturating_add(4 * std::mem::size_of::<usize>())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -565,7 +653,6 @@ impl ProductionSummaryResultKey {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.root.retained_bytes())
-            .saturating_add(std::mem::size_of_val(self.entry_facts.as_ref()))
             .saturating_add(
                 self.entry_facts
                     .iter()
@@ -676,43 +763,50 @@ where
     ProjectionProvider: IcfgProvider + ?Sized,
 {
     let mut lifecycle = ProductionSummaryLifecycleCounters::default();
-    let semantic_work_before = semantic_budget.replay_snapshot();
-    let solver_work_before = request.budget.used();
-    let execution_before = execution_context.snapshot();
-    let provider_behavior = production_icfg_behavior(provider.behavior_identity());
-    let projection_behavior = production_summary_behavior(projection_provider.behavior_identity());
-    let result_key = production_result_key(
-        summary_identity(root, projection_behavior),
-        provider_behavior,
-        entry_facts,
-        protocol,
-        bindings,
-        execution_context.provider_context(execution_before.as_ref()),
-        execution_context.semantic_allowance_key(semantic_budget.remaining()),
-        request.budget.remaining(),
-    )?;
-    let _flight_leader = if repository.result(&result_key).is_none() {
-        match repository.begin_flight(&result_key) {
-            ProductionSummaryFlightAdmission::Leader(leader) => Some(leader),
-            ProductionSummaryFlightAdmission::Follower(flight) => {
-                flight.wait();
-                return solve_typestate_with_production_summaries(
-                    repository,
-                    observer,
-                    root,
-                    entry_facts,
-                    provider,
-                    projection_provider,
-                    execution_context,
-                    protocol,
-                    bindings,
-                    semantic_budget,
-                    request,
-                );
+    // A leader may finish without publishing, so followers retry without recursion.
+    let (
+        semantic_work_before,
+        solver_work_before,
+        execution_before,
+        projection_behavior,
+        result_key,
+        _flight_leader,
+    ) = loop {
+        let semantic_work_before = semantic_budget.replay_snapshot();
+        let solver_work_before = request.budget.used();
+        let execution_before = execution_context.snapshot();
+        let provider_behavior = production_icfg_behavior(provider.behavior_identity());
+        let projection_behavior =
+            production_summary_behavior(projection_provider.behavior_identity());
+        let result_key = production_result_key(
+            summary_identity(root, projection_behavior),
+            provider_behavior,
+            entry_facts,
+            protocol,
+            bindings,
+            execution_context.provider_context(execution_before.as_ref()),
+            execution_context.semantic_allowance_key(semantic_budget.remaining()),
+            request.budget.remaining(),
+        )?;
+        let _flight_leader = if repository.result(&result_key).is_none() {
+            match repository.begin_flight(&result_key) {
+                ProductionSummaryFlightAdmission::Leader(leader) => Some(leader),
+                ProductionSummaryFlightAdmission::Follower(flight) => {
+                    flight.wait();
+                    continue;
+                }
             }
-        }
-    } else {
-        None
+        } else {
+            None
+        };
+        break (
+            semantic_work_before,
+            solver_work_before,
+            execution_before,
+            projection_behavior,
+            result_key,
+            _flight_leader,
+        );
     };
     if request.cancellation.is_cancelled() {
         repository.record_miss();
@@ -742,7 +836,7 @@ where
             repository.record_hit();
             lifecycle.hits = lifecycle.hits.saturating_add(1);
             return Ok(ProductionTypestateSolveResult {
-                result: cached.result,
+                result: Arc::clone(&cached.result),
                 cache_status: TypestateProductionCacheStatus::Hit,
                 protocol_cache_status: None,
                 published_protocol_summaries: 0,
@@ -761,6 +855,123 @@ where
 
     repository.record_recomputation();
     lifecycle.recomputations = lifecycle.recomputations.saturating_add(1);
+    let mut computed = None;
+    let mut cacheable = false;
+    let mut cache_status = TypestateProductionCacheStatus::MissIncomplete;
+    ReplayingMemo::new(()).read(&repository.attribution.capability(), |_, capture| {
+        let mut entry = capture.try_build_weighted(|| {
+            let value = compute_typestate_summary(
+                repository,
+                observer,
+                root,
+                entry_facts,
+                provider,
+                projection_provider,
+                projection_behavior,
+                protocol,
+                bindings,
+                semantic_budget,
+                request,
+                &mut lifecycle,
+            )?;
+            let mut execution_charge = None;
+            if value.semantic_publication_accepted {
+                // The result may outlive its cache entry, even on rejection.
+                semantic_budget.bind_replay_holder(&value.result, &semantic_work_before);
+                let coverage = value.result.result().coverage();
+                let budget_dependent = matches!(
+                    coverage.semantic_status(),
+                    SemanticInputStatus::ExceededBudget { .. } | SemanticInputStatus::Cancelled
+                ) || coverage
+                    .boundaries()
+                    .iter()
+                    .any(|boundary| matches!(boundary.kind(), SummaryBoundaryKind::Limit(_)));
+                if value.result.result().termination().is_fixed_point()
+                    && !value.result.result().witness_retention_truncated()
+                    && !budget_dependent
+                {
+                    if let Some(charge) = execution_context.charge_since(execution_before.as_ref())
+                    {
+                        execution_charge = charge;
+                        cacheable = true;
+                    } else {
+                        repository.record_rejection();
+                        lifecycle.rejections = lifecycle.rejections.saturating_add(1);
+                    }
+                }
+            }
+            let retained = CachedTypestateSummaryResult {
+                result: Arc::clone(&value.result),
+                semantic_charge: semantic_budget.replay_since(&semantic_work_before),
+                solver_charge: request.budget.used().saturating_sub(solver_work_before),
+                execution_charge,
+            };
+            let bytes = retained.retained_bytes();
+            computed = Some(value);
+            Ok::<_, ProductionTypestateSolveError>((retained, bytes))
+        })?;
+        if cacheable {
+            let max_bytes = repository.state().max_result_bytes;
+            if result_key
+                .retained_bytes()
+                .saturating_add(retained_result_entry_bytes(&entry))
+                > max_bytes
+            {
+                // Keep a bounded refusal marker if the value itself still fits.
+                entry.refuse_replay();
+            }
+        }
+        let entry = Arc::new(entry);
+        if cacheable {
+            let (published, evictions) = repository.publish_result(result_key, Arc::clone(&entry));
+            lifecycle.evictions = lifecycle.evictions.saturating_add(evictions);
+            cache_status = if published {
+                TypestateProductionCacheStatus::MissPublished
+            } else {
+                lifecycle.rejections = lifecycle.rejections.saturating_add(1);
+                TypestateProductionCacheStatus::MissCapacityRejected
+            };
+        }
+        Ok::<_, ProductionTypestateSolveError>(entry)
+    })?;
+    let computed = computed.expect("cold result entry was built");
+    Ok(ProductionTypestateSolveResult {
+        result: computed.result,
+        cache_status,
+        protocol_cache_status: computed.protocol_cache_status,
+        published_protocol_summaries: computed.published_protocol_summaries,
+        rejected_protocol_reuse: computed.rejected_protocol_reuse,
+        lifecycle,
+    })
+}
+
+struct ComputedTypestateSummaryResult {
+    result: Arc<TypestateSummaryResult>,
+    protocol_cache_status: Option<ProtocolSummaryCacheStatus>,
+    published_protocol_summaries: usize,
+    rejected_protocol_reuse: bool,
+    semantic_publication_accepted: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_typestate_summary<Provider, ProjectionProvider>(
+    repository: &ProductionTypestateSummaryRepository,
+    observer: &dyn SummaryReadObserver,
+    root: &ProcedureHandle,
+    entry_facts: &[TypestateFact],
+    provider: &Provider,
+    projection_provider: &ProjectionProvider,
+    projection_behavior: SummaryBehaviorKey,
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+    lifecycle: &mut ProductionSummaryLifecycleCounters,
+) -> Result<ComputedTypestateSummaryResult, ProductionTypestateSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+    ProjectionProvider: IcfgProvider + ?Sized,
+{
     let semantic_summaries = match project_production_semantic_summaries_with_behavior(
         std::slice::from_ref(root),
         projection_provider,
@@ -789,24 +1000,12 @@ where
                     ProductionTypestateSolveError::Protocol(ProtocolSummarySolveError::Solve(error))
                 })?,
             );
-            let cache_status = publish_exact_result(
-                repository,
-                result_key,
-                &result,
-                execution_context,
-                execution_before.as_ref(),
-                semantic_budget,
-                &semantic_work_before,
-                request.budget.used().saturating_sub(solver_work_before),
-                &mut lifecycle,
-            );
-            return Ok(ProductionTypestateSolveResult {
+            return Ok(ComputedTypestateSummaryResult {
                 result,
-                cache_status,
                 protocol_cache_status: None,
                 published_protocol_summaries: 0,
                 rejected_protocol_reuse: false,
-                lifecycle,
+                semantic_publication_accepted: true,
             });
         }
     };
@@ -829,21 +1028,25 @@ where
     let semantic_set = semantic_summaries
         .protocol_summaries()
         .map_err(ProductionTypestateSolveError::ProtocolKey)?;
-    let mut compatible = if semantic_publication_accepted {
-        repository.protocol_snapshot(&semantic_set, protocol, bindings)
-    } else {
-        CompleteProtocolSummaryRepository::with_limits(repository.protocol_limits())
-    };
-    let has_compatible_protocol_summaries = !compatible.is_empty();
-    let rejected_protocol_reuse = has_compatible_protocol_summaries;
-    if rejected_protocol_reuse {
+    let rejections_before_protocol_diagnostic = lifecycle.rejections;
+    if semantic_publication_accepted
+        && repository.has_compatible_protocol_rows_for_diagnostics(
+            &semantic_set,
+            protocol,
+            bindings,
+        )
+    {
         // Portable protocol rows do not yet carry stable witness fragments.
-        // Reject them before execution so policy-provider budgets and latency
-        // cannot be consumed by a result that must be discarded anyway.
+        // Count their rejection without serving any rows to the solve.
         repository.record_rejection();
         lifecycle.rejections = lifecycle.rejections.saturating_add(1);
     }
-    compatible = CompleteProtocolSummaryRepository::with_limits(repository.protocol_limits());
+    // Preserve the existing diagnostic accessor using the counter delta only.
+    let rejected_protocol_reuse = lifecycle.rejections != rejections_before_protocol_diagnostic;
+    let mut compatible = CompleteProtocolSummaryRepository::with_limits(
+        repository.protocol_limits(),
+        repository.attribution.clone(),
+    );
     let solved = solve_typestate_with_reusable_summaries(
         root,
         entry_facts,
@@ -870,28 +1073,12 @@ where
     } else {
         0
     };
-    let cache_status = if semantic_publication_accepted {
-        publish_exact_result(
-            repository,
-            result_key,
-            &result,
-            execution_context,
-            execution_before.as_ref(),
-            semantic_budget,
-            &semantic_work_before,
-            request.budget.used().saturating_sub(solver_work_before),
-            &mut lifecycle,
-        )
-    } else {
-        TypestateProductionCacheStatus::MissIncomplete
-    };
-    Ok(ProductionTypestateSolveResult {
+    Ok(ComputedTypestateSummaryResult {
         result,
-        cache_status,
         protocol_cache_status: Some(protocol_cache_status),
         published_protocol_summaries,
         rejected_protocol_reuse,
-        lifecycle,
+        semantic_publication_accepted,
     })
 }
 
@@ -927,62 +1114,11 @@ fn production_result_key(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_exact_result(
-    repository: &ProductionTypestateSummaryRepository,
-    key: ProductionSummaryResultKey,
-    result: &Arc<TypestateSummaryResult>,
-    execution_context: ProductionTypestateExecutionContext<'_>,
-    execution_before: Option<&SemanticExecutionBudgetSnapshot>,
-    semantic_budget: &mut SemanticBudget,
-    semantic_before: &crate::analyzer::semantic::SemanticBudgetReplaySnapshot,
-    solver_charge: SolverWork,
-    lifecycle: &mut ProductionSummaryLifecycleCounters,
-) -> TypestateProductionCacheStatus {
-    // The result can outlive its cache entry, including capacity rejection.
-    semantic_budget.bind_replay_holder(result, semantic_before);
-    let coverage = result.result().coverage();
-    let budget_dependent = matches!(
-        coverage.semantic_status(),
-        SemanticInputStatus::ExceededBudget { .. } | SemanticInputStatus::Cancelled
-    ) || coverage
-        .boundaries()
-        .iter()
-        .any(|boundary| matches!(boundary.kind(), SummaryBoundaryKind::Limit(_)));
-    if !result.result().termination().is_fixed_point()
-        || result.result().witness_retention_truncated()
-        || budget_dependent
-    {
-        TypestateProductionCacheStatus::MissIncomplete
-    } else if let Some(execution_charge) = execution_context.charge_since(execution_before) {
-        let semantic_charge = semantic_budget.replay_since(semantic_before);
-        let (published, evictions) = repository.publish_result(
-            key,
-            Arc::clone(result),
-            semantic_charge,
-            solver_charge,
-            execution_charge,
-        );
-        lifecycle.evictions = lifecycle.evictions.saturating_add(evictions);
-        if published {
-            TypestateProductionCacheStatus::MissPublished
-        } else {
-            lifecycle.rejections = lifecycle.rejections.saturating_add(1);
-            TypestateProductionCacheStatus::MissCapacityRejected
-        }
-    } else {
-        repository.record_rejection();
-        lifecycle.rejections = lifecycle.rejections.saturating_add(1);
-        TypestateProductionCacheStatus::MissIncomplete
-    }
-}
-
 /// Owned semantic identities in bottom-up publication order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionSemanticSummarySet {
     summaries: Vec<SemanticProcedureSummary>,
     components: Vec<std::ops::Range<usize>>,
-    complete_call_targets: HashMap<(ProcedureHandle, CallSiteId), Box<[ProcedureHandle]>>,
     behavior: SummaryBehaviorKey,
     procedure_semantics_precharged: bool,
 }
@@ -1005,23 +1141,6 @@ impl ProductionSemanticSummarySet {
         self.summaries
             .iter()
             .find(|summary| summary.key().identity() == &identity)
-    }
-
-    /// Exact materialized targets retained from the same projection that
-    /// produced this complete summary set.
-    ///
-    /// The stable summary stores durable dependency identities. This
-    /// generation-local companion reconnects one source call occurrence to
-    /// its materialized handles without asking the dispatch provider a second
-    /// time. Calls with an open boundary are deliberately absent.
-    pub fn complete_call_targets(
-        &self,
-        procedure: &ProcedureHandle,
-        call: CallSiteId,
-    ) -> Option<&[ProcedureHandle]> {
-        self.complete_call_targets
-            .get(&(procedure.clone(), call))
-            .map(Box::as_ref)
     }
 
     /// Whether projection already paid to materialize every live procedure
@@ -1173,8 +1292,6 @@ where
         .map(|(index, procedure)| (procedure, index))
         .collect::<HashMap<_, _>>();
     let mut direct_dependencies = vec![Vec::<ProcedureHandle>::new(); procedures.len()];
-    let mut complete_call_targets =
-        vec![HashMap::<CallSiteId, Box<[ProcedureHandle]>>::default(); procedures.len()];
     let mut direct_call_effects = vec![Vec::<DirectCallEffect>::new(); procedures.len()];
     let mut direct_effects = vec![Vec::<SummaryEffect>::new(); procedures.len()];
     let mut cursor = 0usize;
@@ -1204,7 +1321,6 @@ where
                         dependency,
                         evidence,
                     )?;
-                    complete_call_targets[cursor].insert(call.id, Box::new([target.clone()]));
                     dependencies.push(target);
                     continue;
                 }
@@ -1251,9 +1367,7 @@ where
                     )?);
                 }
                 if let Some(dispatch) = dispatch {
-                    // Exact candidates are stable may-dependencies. Do not put
-                    // them in `complete_call_targets`: raw dispatch does not
-                    // establish a complete target set for this invocation.
+                    // Exact candidates are stable may-dependencies.
                     for candidate in dispatch.candidates().iter().filter(|candidate| {
                         matches!(candidate.proof(), ProofStatus::Proven)
                             && matches!(candidate.completeness(), EvidenceCompleteness::Complete)
@@ -1277,9 +1391,9 @@ where
                 continue;
             }
             let outcome = provider.call_transfers(&procedure, call.id, request)?;
-            let (value, outcome_evidence, dispatch_complete) = match outcome {
+            let (value, outcome_evidence) = match outcome {
                 SemanticOutcome::Complete { value, .. } => {
-                    (value, SummaryEvidence::proven_complete(), true)
+                    (value, SummaryEvidence::proven_complete())
                 }
                 SemanticOutcome::Ambiguous { .. } => {
                     direct_effects[cursor].push(project_open_call_effect(
@@ -1299,7 +1413,7 @@ where
                     // from the partial answer. Each retained transfer is still
                     // a real may-call dependency and must not inherit the
                     // aggregate dispatch incompleteness a second time.
-                    (partial, SummaryEvidence::proven_complete(), false)
+                    (partial, SummaryEvidence::proven_complete())
                 }
                 SemanticOutcome::Unknown { .. } | SemanticOutcome::Unsupported { .. } => {
                     direct_effects[cursor].push(project_open_call_effect(
@@ -1330,15 +1444,6 @@ where
                     call_ordinal,
                 )?);
             }
-            if dispatch_complete && value.boundaries.is_empty() && !value.transfers.is_empty() {
-                let mut targets = value
-                    .transfers
-                    .iter()
-                    .map(|transfer| transfer.callee.clone())
-                    .collect::<Vec<_>>();
-                canonicalize_procedures(&mut targets, behavior);
-                complete_call_targets[cursor].insert(call.id, targets.into_boxed_slice());
-            }
             for transfer in value.transfers {
                 let dependency = summary_identity(&transfer.callee, behavior);
                 let evidence =
@@ -1360,7 +1465,6 @@ where
                 let index = procedures.len();
                 procedures.push(dependency.clone());
                 direct_dependencies.push(Vec::new());
-                complete_call_targets.push(HashMap::default());
                 direct_call_effects.push(Vec::new());
                 direct_effects.push(Vec::new());
                 index_by_handle.insert(dependency.clone(), index);
@@ -1403,10 +1507,6 @@ where
         .iter()
         .map(|&old| direct_effects[old].clone())
         .collect::<Vec<_>>();
-    let canonical_call_targets = canonical_order
-        .iter()
-        .map(|&old| complete_call_targets[old].clone())
-        .collect::<Vec<_>>();
     let graph = ProcedureDependencyGraph::new(canonical_edges);
     let mut graph_budget = CfgAlgorithmBudget::default();
     let mut graph_request = CfgAlgorithmRequest::new(&mut graph_budget, request.cancellation);
@@ -1426,7 +1526,6 @@ where
         DirectSummaryProjection {
             calls: &canonical_call_effects,
             effects: &canonical_effects,
-            call_targets: &canonical_call_targets,
         },
         &graph,
         &sccs.components,
@@ -1659,7 +1758,6 @@ fn project_open_call_effect(
 struct DirectSummaryProjection<'a> {
     calls: &'a [Vec<DirectCallEffect>],
     effects: &'a [Vec<SummaryEffect>],
-    call_targets: &'a [HashMap<CallSiteId, Box<[ProcedureHandle]>>],
 }
 
 fn build_summary_set(
@@ -1673,7 +1771,6 @@ fn build_summary_set(
     let DirectSummaryProjection {
         calls: direct_calls,
         effects: direct_effects,
-        call_targets: direct_call_targets,
     } = direct;
     let identities = procedures
         .iter()
@@ -1814,20 +1911,9 @@ fn build_summary_set(
         return Err(ProductionSummaryProjectionError::InvalidDependencyGraph);
     }
 
-    let complete_call_targets = procedures
-        .iter()
-        .zip(direct_call_targets)
-        .flat_map(|(procedure, calls)| {
-            calls
-                .iter()
-                .map(|(&call, targets)| ((procedure.clone(), call), targets.clone()))
-        })
-        .collect();
-
     Ok(ProductionSemanticSummarySet {
         summaries,
         components: summary_components,
-        complete_call_targets,
         behavior,
         procedure_semantics_precharged: true,
     })

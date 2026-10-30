@@ -10,6 +10,7 @@
 //! are therefore carried for those values and for the values that copy into
 //! one. Every other value would carry state that nothing reads.
 
+use std::cell::LazyCell;
 use std::collections::VecDeque;
 
 use super::correlations::{
@@ -158,7 +159,6 @@ struct FieldAccesses {
     members: Vec<Box<str>>,
     /// The values whose origins a query can observe. See [`tracked_values`].
     tracked: HashSet<ValueId>,
-    receiver_truthiness_is_pure: bool,
     truthiness_is_pure: Vec<bool>,
     pure_reads: HashSet<(usize, MemoryLocationId)>,
     locations: HashMap<MemoryLocationId, (usize, ValueId)>,
@@ -226,7 +226,7 @@ impl FieldAccesses {
         let mut truthiness_is_pure = Vec::with_capacity(members.len());
         for member in &members {
             check_cancelled(Some(cancellation))?;
-            let Some(slot) = field_slots.slot(class, member) else {
+            let Some(slot) = field_slots.slot(workspace, adapter, class, member) else {
                 truthiness_is_pure.push(false);
                 continue;
             };
@@ -250,7 +250,7 @@ impl FieldAccesses {
         for (field, member) in members.iter().enumerate() {
             check_cancelled(Some(cancellation))?;
             record_entry_work(budget, 1);
-            let Some(slot) = field_slots.slot(class, member) else {
+            let Some(slot) = field_slots.slot(workspace, adapter, class, member) else {
                 continue;
             };
             if slot.atoms.is_empty() {
@@ -298,7 +298,6 @@ impl FieldAccesses {
         Ok(Self {
             members,
             tracked,
-            receiver_truthiness_is_pure: adapter.truthiness_is_pure(workspace, class),
             truthiness_is_pure,
             pure_reads,
             locations,
@@ -512,6 +511,7 @@ fn transfer(
 fn refine_edge(
     procedure: &ProcedureHandle,
     accesses: &FieldAccesses,
+    receiver_truthiness_is_pure: &LazyCell<bool, impl FnOnce() -> bool>,
     point: ProgramPointId,
     edge_id: crate::analyzer::semantic::ControlEdgeId,
     state: &mut State,
@@ -541,7 +541,7 @@ fn refine_edge(
             && !origins.is_some_and(|origins| {
                 !origins.is_empty()
                     && origins.iter().all(|origin| match origin {
-                        Origin::Receiver => accesses.receiver_truthiness_is_pure,
+                        Origin::Receiver => *LazyCell::force(receiver_truthiness_is_pure),
                         Origin::Read { field, .. } => accesses.truthiness_is_pure[*field],
                         Origin::PureTruthiness => true,
                     })
@@ -613,6 +613,8 @@ pub(super) fn derive(
         // Without a loaded plain member this analysis has no load to refine.
         return Ok(Vec::new());
     }
+    let receiver_truthiness_is_pure =
+        LazyCell::new(|| adapter.truthiness_is_pure(workspace, class));
     let semantics = procedure.semantics();
     let mut origins = HashMap::default();
     for value in semantics.values() {
@@ -670,6 +672,7 @@ pub(super) fn derive(
             refine_edge(
                 procedure,
                 &accesses,
+                &receiver_truthiness_is_pure,
                 point,
                 edge_id,
                 &mut next,

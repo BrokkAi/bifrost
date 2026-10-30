@@ -171,42 +171,7 @@ pub fn selected_rust_definition_shadow_result_with_after_open(
     {
         return RustDefinitionShadowResult::Unavailable(detail);
     }
-    let snapshots = rust.inner.selected_workspace_snapshots();
-    let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
-    let (masks, content_mounts) = match rust
-        .inner
-        .selected_rust_resolution_overlay_inputs(snapshots.as_ref(), &cancellation)
-    {
-        Ok(SelectedResolutionOverlayInputsOutcome::Ready {
-            masks,
-            content_mounts,
-        }) => (masks, content_mounts),
-        Ok(SelectedResolutionOverlayInputsOutcome::Unavailable(reason)) => {
-            return RustDefinitionShadowResult::Unavailable(format!("{reason:?}"));
-        }
-        Ok(SelectedResolutionOverlayInputsOutcome::Stale(reason)) => {
-            return RustDefinitionShadowResult::Stale(format!("{reason:?}"));
-        }
-        Ok(SelectedResolutionOverlayInputsOutcome::Cancelled) => {
-            return RustDefinitionShadowResult::Cancelled {
-                work: ReceiverAnalysisWork::default(),
-            };
-        }
-        Err(error) => return RustDefinitionShadowResult::StoreError(error.to_string()),
-    };
-    let input = SelectedResolutionOperationInput::new(
-        rust.inner.project(),
-        rust.inner.workspace_id(),
-        snapshots.as_ref(),
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
-    let mut operation = match rust
-        .inner
-        .analyzer_store()
-        .open_selected_resolution_operation(input, &cancellation)
-    {
+    let mut operation = match rust.open_selected_rust_operation(&cancellation).outcome {
         Ok(SelectedResolutionOperationOpenOutcome::Ready(operation)) => *operation,
         Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason)) => {
             return RustDefinitionShadowResult::Unavailable(format!("{reason:?}"));

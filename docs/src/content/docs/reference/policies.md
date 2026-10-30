@@ -1966,7 +1966,7 @@ Used by `(on-unknown :verdict ...)`.
 
 | Spelling | Meaning |
 | --- | --- |
-| `abstain` | Keep the findings, publish the inconclusive completion, and exit unreliable. The default. |
+| `abstain` | Keep the findings and publish the inconclusive completion; `--on-inconclusive` decides the exit status. The default. |
 | `warn-unreliable` | Keep the findings and the inconclusive completion, mark them unreliable, and exit on the findings alone. |
 | `fail-closed` | Treat the blocked verdict as a gate failure at the policy severity, and name the unknown that caused it. |
 | `treat-may-as-finding` | Publish explicit may evidence as possible findings with its reasons; unmet coverage obligations still make the run inconclusive. Flow and taint already retain possible findings under every verdict. |
@@ -2303,7 +2303,7 @@ same value as the computed policy status.
 
 | Status | Meaning |
 | --- | --- |
-| `0` | The run is reliable, no active finding met the `--fail-on` threshold, and no suppression record is orphaned. |
+| `0` | The run is reliable, no active finding met the `--fail-on` threshold, and no suppression record is orphaned. Inconclusive runs are reported and do not change the status. |
 | `1` | The run is reliable, and at least one active finding met the threshold or at least one suppression record has `orphan_state: orphaned`. |
 | `2` | The run is unreliable, or the command could not run. Status 2 takes precedence over status 1. |
 
@@ -2316,11 +2316,12 @@ A run is unreliable, and exits 2, when any of these is true:
 - The report has a report diagnostic with severity `error`. Every report
   diagnostic code except `workspace-model-inert` has severity `error`.
 - The report dropped diagnostics (`diagnostics_truncated: true`).
-- A policy run's completion is `inconclusive`, `unsupported`, or `failed`, or
-  it is `not_run` after the user explicitly named its policy ID.
-  The exception: an `inconclusive` run whose policy declares
-  `(on-unknown :verdict warn-unreliable)` or `(on-unknown :verdict
-  fail-closed)` does not make the batch unreliable.
+- A policy run's completion is `unsupported` or `failed`, or it is `not_run`
+  after the user explicitly named its policy ID.
+- A policy run's completion is `inconclusive` and the run used
+  `--on-inconclusive unreliable`. The exception: an `inconclusive` run whose
+  policy declares `(on-unknown :verdict warn-unreliable)` or `(on-unknown
+  :verdict fail-closed)` does not make the batch unreliable.
 - No finding met the threshold and a policy run's completion is
   `proven_subset`. A proven subset cannot support a clean result.
 
@@ -2340,6 +2341,17 @@ entry claims, and, under `--diff-base`, whose disposition is `new`.
 With `(on-unknown :verdict fail-closed)`, an inconclusive run counts as a
 finding at the policy's severity.
 
+`--on-inconclusive` decides what an `inconclusive` run does when its policy
+declares the default `abstain` or `treat-may-as-finding`:
+
+| Value | An inconclusive run |
+| --- | --- |
+| `pass` (default) | Is advisory. It is reported, its findings gate as any other's, and it never makes the batch unreliable. This is how SlopCop reads the same verdict. |
+| `unreliable` | Makes the batch exit 2, even when a finding met the threshold. This was the behavior before v0.14.4. |
+
+A policy's `warn-unreliable` or `fail-closed` verdict is applied under either
+value.
+
 The explanation flags (`--explain-finding`, `--explain-candidate`,
 `--explain-near-misses`) exit 0 whenever they produce an answer, whatever the
 answer says, and 2 when they cannot produce one. `--accept-current` exits 0
@@ -2355,7 +2367,7 @@ values.
 | `complete` | none | yes | yes | yes | none |
 | `proven_subset` | `codes`: the CodeQuery diagnostic codes that limited the search | yes | no | no; exits 2 | `BIFROST_POLICY_PROVEN_SUBSET` (warning) |
 | `proven_by_summary` | none | yes | no | yes | `BIFROST_POLICY_PROVEN_BY_SUMMARY` (warning) |
-| `inconclusive` | `reasons`: list of incomplete reasons; `scope`: which files the verdict concerns | no | no | no; exits 2 unless `on-unknown` says otherwise | `BIFROST_POLICY_INCONCLUSIVE` (warning) |
+| `inconclusive` | `reasons`: list of incomplete reasons; `scope`: which files the verdict concerns | no | no | yes, as an advisory verdict; exits 2 under `--on-inconclusive unreliable` unless `on-unknown` says otherwise | `BIFROST_POLICY_INCONCLUSIVE` (warning) |
 | `not_run` | `unavailable_capabilities`: unavailable capability labels and reasons; `selected_by`: explicit policy ID or pack/category/default | yes for implicit selection; no for an explicit policy ID | no | implicit selection does not affect the exit status; explicit ID exits 2 | `BIFROST_POLICY_NOT_RUN` (note) |
 | `unsupported` | `capability`: the missing capability | no | no | no; exits 2 | `BIFROST_POLICY_UNSUPPORTED` (warning) |
 | `failed` | `reasons`: list of failure reasons | no | no | no; exits 2 | `BIFROST_POLICY_FAILED` (error) |
@@ -2725,7 +2737,7 @@ scope decision is in the run's `bifrost.scopeReviews`.
 | --- | --- |
 | `exitCode` | The policy exit status (0, 1, or 2). The CLI sets it; a library renderer without an outcome omits it. |
 | `exitCodeDescription` | `Policy gate passed: no gated findings` (0), `Policy gate failed: findings or policy obligations met the failure threshold` (1), or `Policy analysis was incomplete or invalid and is unreliable` (2). |
-| `executionSuccessful` | `false` when any report diagnostic is an error, diagnostics were dropped, the run stopped at its deadline, any policy run is not reliable, or the exit status is 2. |
+| `executionSuccessful` | `false` when any report diagnostic is an error, diagnostics were dropped, the run stopped at its deadline, any policy run reached no verdict (`failed`, `unsupported`, or an explicitly requested `not_run`), or the exit status is 2. An `inconclusive` run is a verdict and leaves it `true`. |
 | `toolExecutionNotifications` | One notification per report diagnostic, one for dropped diagnostics, and one per policy run whose completion is not `complete`. |
 
 Notification `descriptor.id` values:
@@ -2757,14 +2769,16 @@ optional `byte_range`, and `related` locations. Use the code for automation;
 message wording can change.
 
 Every code has severity `error`, and so makes the run exit 2, except
-`workspace-model-inert`, which is a `warning`.
+`workspace-model-inert`, which is a `warning`, and
+`diff-base-policy-unqualified` for a base run that was `inconclusive`, which is
+also a `warning`.
 
 | Code | Meaning | Next step |
 | --- | --- | --- |
 | `workspace-snapshot-deadline-exceeded` | The workspace snapshot was not ready within the request's time budget. No policy ran. | Retry after workspace initialization finishes. |
 | `diff-base-deadline-exceeded` | The time budget expired while the diff base was evaluated. No policy ran against the head. | Retry, or run without `--diff-base` to measure the head alone. |
 | `diff-base-unreliable` | The diff base resolved, but its evaluation was not reliable. Every head finding gates, and the diff review has `degraded: true`. | Read the message for the base's failure, fix it, and rerun. |
-| `diff-base-policy-unqualified` | One policy's base run was not reliable. That policy uses full gating. | Read the policy's completion and diagnostics in the message and in `diff.unqualified_policies`. |
+| `diff-base-policy-unqualified` | One policy's base run could not classify head findings. That policy uses full gating. A `warning` when the base run was `inconclusive`, because full gating hides no new finding; otherwise an `error`. | Read the policy's completion and diagnostics in the message and in `diff.unqualified_policies`. |
 | `suppression-load-failed` | A suppression file is malformed, unsafe, oversized, or conflicts with another. None of that file applies. | Fix the file named in `source`. Limits are in [Suppression file](#suppression-file). |
 | `suppression-audit-retention-exceeded` | Suppression or scope reviews did not fit the report retention budget. | Remove dead records, or split the run into smaller selections. |
 | `scope-load-failed` | The scope file is malformed or exceeds a limit. None of it applies. | Fix the file named in `source`. Limits are in [Scope file](#scope-file). |

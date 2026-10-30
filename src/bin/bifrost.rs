@@ -36,8 +36,8 @@ use brokk_bifrost::policy::{
     MAX_RQLP_SOURCE_BYTES, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE,
     PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome,
     PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExecutionStage,
-    PolicyFailOn, PolicyFindingId, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions,
-    PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
+    PolicyFailOn, PolicyFindingId, PolicyOnInconclusive, PolicyRangeRequest, PolicyRenderError,
+    PolicyScopeOptions, PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
     PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
     escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, policy_bundles,
     policy_source_identity, rank_policy_near_misses, relation_schema_catalog, write_policy_human,
@@ -739,6 +739,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--list-row-schemas"
                 | "--format"
                 | "--fail-on"
+                | "--on-inconclusive"
                 | "--suppressions-file"
                 | "--scope-file"
                 | "--baseline-file"
@@ -789,6 +790,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--exclude-policy-id"
             | "--format"
             | "--fail-on"
+            | "--on-inconclusive"
             | "--suppressions-file"
             | "--scope-file"
             | "--baseline-file"
@@ -862,6 +864,8 @@ fn run_inner(
     let mut policy_format_seen = false;
     let mut policy_fail_on = PolicyFailOn::Warning;
     let mut policy_fail_on_seen = false;
+    let mut policy_on_inconclusive = PolicyOnInconclusive::default();
+    let mut policy_on_inconclusive_seen = false;
     let mut policy_suppressions = PolicySuppressionOptions::default();
     let mut policy_suppressions_seen = false;
     let mut policy_scope = PolicyScopeOptions::default();
@@ -1106,6 +1110,16 @@ fn run_inner(
                 policy_fail_on = parse_policy_fail_on(&value)?;
                 policy_fail_on_seen = true;
             }
+            "--on-inconclusive" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--on-inconclusive requires pass or unreliable".to_string())?;
+                if policy_on_inconclusive_seen {
+                    return Err("--on-inconclusive may only be provided once".to_string());
+                }
+                policy_on_inconclusive = parse_policy_on_inconclusive(&value)?;
+                policy_on_inconclusive_seen = true;
+            }
             "--suppressions-file" => {
                 let value = args
                     .next()
@@ -1307,6 +1321,7 @@ fn run_inner(
                 || no_builtin_policies
                 || policy_format_seen
                 || policy_fail_on_seen
+                || policy_on_inconclusive_seen
                 || policy_suppressions_seen
                 || policy_scope_seen
                 || policy_baseline_seen
@@ -1393,6 +1408,7 @@ fn run_inner(
             // than silently ignored.
             if policy_format_seen
                 || policy_fail_on_seen
+                || policy_on_inconclusive_seen
                 || policy_suppressions_seen
                 || policy_scope_seen
                 || policy_baseline_seen
@@ -1406,7 +1422,7 @@ fn run_inner(
                 || !tool_sources.is_empty()
             {
                 return Err(
-                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --policy-timings, --policy-cost-hints, --verbose, --color, or --sources"
+                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --on-inconclusive, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --policy-timings, --policy-cost-hints, --verbose, --color, or --sources"
                         .to_string(),
                 );
             }
@@ -1500,6 +1516,7 @@ fn run_inner(
                 root,
                 format: policy_format,
                 fail_on: policy_fail_on,
+                on_inconclusive: policy_on_inconclusive,
                 evaluation_date: policy_evaluation_date,
                 suppressions: policy_suppressions,
                 scope: policy_scope,
@@ -1864,6 +1881,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             root,
             format,
             fail_on,
+            on_inconclusive: PolicyOnInconclusive::default(),
             evaluation_date,
             suppressions: PolicySuppressionOptions::default(),
             scope: PolicyScopeOptions::default(),
@@ -2011,6 +2029,16 @@ fn parse_policy_fail_on(value: &str) -> Result<PolicyFailOn, String> {
         "error" => Ok(PolicyFailOn::Error),
         other => Err(format!(
             "Invalid --fail-on value: {other}. Expected never, finding, note, warning, or error."
+        )),
+    }
+}
+
+fn parse_policy_on_inconclusive(value: &str) -> Result<PolicyOnInconclusive, String> {
+    match value {
+        "pass" => Ok(PolicyOnInconclusive::Pass),
+        "unreliable" => Ok(PolicyOnInconclusive::Unreliable),
+        other => Err(format!(
+            "Invalid --on-inconclusive value: {other}. Expected pass or unreliable."
         )),
     }
 }
@@ -2251,6 +2279,7 @@ struct PolicyModeRequest {
     root: PathBuf,
     format: PolicyOutputFormat,
     fail_on: PolicyFailOn,
+    on_inconclusive: PolicyOnInconclusive,
     evaluation_date: Option<PolicyEvaluationDate>,
     suppressions: PolicySuppressionOptions,
     scope: PolicyScopeOptions,
@@ -2292,6 +2321,7 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
             .with_baseline(request.baseline.clone())
             .with_required_schema_versions(request.require_explicit_schema_versions)
             .with_fail_on(request.fail_on)
+            .with_on_inconclusive(request.on_inconclusive)
             .with_incremental(request.incremental)
             .with_policy_timings(request.policy_timings)
             .with_policy_cost_hints(request.policy_cost_hints.clone());
@@ -2827,6 +2857,10 @@ OPTIONS:
     --color MODE           Human output color: auto, always, or never (default: auto)
     --fail-on THRESHOLD    Policy finding threshold: never, finding, note, warning, or error
                            (default: warning; finding includes unrated findings)
+    --on-inconclusive MODE What a run whose verdict is inconclusive, and whose policy declares
+                           no on-unknown handling, does to the exit status: pass (default)
+                           reports it and exits 0 when no finding gates; unreliable exits 2.
+                           A policy's on-unknown warn-unreliable or fail-closed outranks it
     --suppressions-file PATH
                            Load accepted findings from this workspace-relative JSON file
                            instead of the three default files, which are read in this order

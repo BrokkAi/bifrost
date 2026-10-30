@@ -62,23 +62,12 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-jvm-analysis/src/analyzer/scala/hierarchy.rs",
-            );
-
-        let ancestors = self.resolve_direct_ancestors(token, code_unit);
-        {
-            let cache_key = code_unit.clone();
-            let cache_value = Arc::new(ancestors.clone());
-            persistent_fill_guard.installed("direct_ancestors");
-            self.direct_ancestors.insert(cache_key, cache_value);
-        };
-        ancestors
+        crate::analyzer::jvm::hierarchy::memoized_ancestors(
+            &self.direct_ancestors,
+            self,
+            code_unit,
+            || self.resolve_direct_ancestors(token, code_unit),
+        )
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
@@ -111,15 +100,22 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
         if scope.cancellation().is_cancelled() {
             return None;
         }
-        self.lazy_hierarchy_index
-            .get_or_init(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.lazy_hierarchy_index.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
                     self,
-                    "scala.lazy_hierarchy_index",
+                    memo,
                     || self.build_lazy_hierarchy_index(),
                 )
-            })
-            .direct_descendants_while(token, self, code_unit, scope)
+                .direct_descendants_while(token, self, code_unit, scope)
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Scala,
+                ])
+            },
+        )
     }
 }
 
@@ -204,26 +200,24 @@ impl ScalaLazyHierarchyIndex {
         scala: &ScalaAnalyzer,
         candidate: &CodeUnit,
     ) -> Arc<Vec<CodeUnit>> {
-        if let Some(cached) = scala.direct_ancestors.get(candidate) {
-            return cached;
-        }
-        let ancestors = self
-            .contexts
-            .get(candidate)
-            .map(|context| {
-                scala.resolve_direct_ancestor_units_with_context(
-                    token,
-                    candidate,
-                    &self.types,
-                    context,
-                )
-            })
-            .unwrap_or_default();
-        let ancestors = Arc::new(ancestors);
-        scala
-            .direct_ancestors
-            .insert(candidate.clone(), Arc::clone(&ancestors));
-        ancestors
+        Arc::new(crate::analyzer::jvm::hierarchy::memoized_ancestors(
+            &scala.direct_ancestors,
+            scala,
+            candidate,
+            || {
+                self.contexts
+                    .get(candidate)
+                    .map(|context| {
+                        scala.resolve_direct_ancestor_units_with_context(
+                            token,
+                            candidate,
+                            &self.types,
+                            context,
+                        )
+                    })
+                    .unwrap_or_default()
+            },
+        ))
     }
 
     /// Map a resolved ancestor to the concrete same-source declaration identity
@@ -324,16 +318,22 @@ impl ScalaAnalyzer {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn type_relations(&self, token: QueryToken<'_>) -> &[TypeRelation] {
-        self.type_relations
-            .get_or_init(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+    pub(crate) fn type_relations(&self, token: QueryToken<'_>) -> Arc<Vec<TypeRelation>> {
+        self.type_relations.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
                     self,
-                    "scala.type_relations",
+                    memo,
                     || self.collect_type_relations(token),
                 )
-            })
-            .as_slice()
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Scala,
+                ])
+            },
+        )
     }
 
     #[allow(dead_code)]
@@ -561,9 +561,21 @@ impl ScalaAnalyzer {
         }
         let _scope =
             brokk_bifrost_core::profiling::scope("ScalaAnalyzer::resolve_external_member_family");
-        let index = self
-            .lazy_hierarchy_index
-            .get_or_init(|| self.build_lazy_hierarchy_index());
+        let index = self.lazy_hierarchy_index.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    memo,
+                    || self.build_lazy_hierarchy_index(),
+                )
+            },
+            |_| {
+                brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[
+                    Language::Scala,
+                ])
+            },
+        );
         let scan = index.class_candidate_count();
         if scan > max_visits {
             return ExternalMemberFamilyAnswer::stopped(

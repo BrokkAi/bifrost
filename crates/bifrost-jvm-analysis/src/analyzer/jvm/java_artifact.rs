@@ -22,8 +22,6 @@ use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredShard;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::BoundedProducerDiagnostics;
 
-use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
-
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactKind;
@@ -567,23 +565,11 @@ fn finish_production(
             None,
             "JAR contains no externally visible Java declarations",
         );
-        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        return ArtifactProduction {
-            artifact_sha256: Some(artifact_sha256.to_owned()),
-            pack: None,
-            completeness: Completeness::Partial,
-            diagnostics,
-            suppressed_diagnostics,
-        };
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
-        request,
-        artifact_sha256,
-        "bifrost-java-jar",
-        "java",
-        diagnostics,
-        suppressed_diagnostics,
+    let shards = if types.is_empty() {
+        Vec::new()
+    } else {
         vec![AuthoredShard {
             id: "declarations.external".to_owned(),
             activation: request.activation.clone(),
@@ -600,7 +586,16 @@ fn finish_production(
             deferred_yields: None,
             conditional_type_refinements: None,
             callable_values: None,
-        }],
+        }]
+    };
+    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
+        request,
+        artifact_sha256,
+        "bifrost-java-jar",
+        "java",
+        diagnostics,
+        suppressed_diagnostics,
+        shards,
     )
 }
 
@@ -3243,6 +3238,8 @@ impl<'a> SignatureCursor<'a> {
 mod tests {
 
     use crate::analyzer::jvm::java_artifact::*;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
 
     use crate::analyzer::jvm::external::TestClassFile;
 

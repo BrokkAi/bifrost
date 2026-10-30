@@ -16,7 +16,7 @@ use crate::{
     PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
     PolicyEvaluationDate, PolicyExecutionMetadata, PolicyFinding, PolicyFindingBaseline,
     PolicyFindingEvidence, PolicyFindingSuppression, PolicyIncrementalReview, PolicyLevel,
-    PolicyObligationKind, PolicyPackActivationReview, PolicyReportDiagnostic,
+    PolicyObligationKind, PolicyOnInconclusive, PolicyPackActivationReview, PolicyReportDiagnostic,
     PolicyReportDiagnosticCode, PolicyReportDocument, PolicyReportEvaluationContext,
     PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicyRunScope, PolicyRunScopeKind,
     PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionPolicyHashState,
@@ -853,16 +853,14 @@ impl<'a> SarifInvocation<'a> {
         // advisory one states a fact the reader needs. Completion and execution
         // termination are independent reliability signals; an outcome's status
         // additionally records the resolved threshold/unreliable decision.
-        let report_execution_successful = report
-            .diagnostics()
-            .iter()
-            .all(|diagnostic| diagnostic.severity() != PolicyDiagnosticSeverity::Error)
-            && !report.diagnostics_truncated()
-            && report.execution().termination().is_none()
-            && report
-                .runs()
-                .iter()
-                .all(|run| run.completion().is_reliable());
+        // Bifrost's own inconclusive verdict is a verdict, so the execution
+        // succeeded and the run's warning notification carries it (#8111); a
+        // caller that reads it as unreliable says so through the exit status.
+        let report_execution_successful = !crate::coordinator::report_lacks_verdict(
+            report,
+            report.diagnostics(),
+            PolicyOnInconclusive::Pass,
+        );
         let execution_successful =
             report_execution_successful && exit_status != Some(POLICY_EXIT_UNRELIABLE);
 
@@ -1424,6 +1422,44 @@ mod tests {
                 assert!(value.get("exitCode").is_none());
                 assert!(value.get("exitCodeDescription").is_none());
             }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#8111: an inconclusive verdict marked the SARIF execution unsuccessful although SlopCop reads it as clean"
+    )]
+    fn inconclusive_run_is_a_successful_execution_with_a_warning_notification() {
+        let report = crate::test_support::report_with_run_completion(
+            "test:inconclusive",
+            r#"(policy
+  :schema-version 1
+  :id "test.inconclusive"
+  :name "Inconclusive"
+  :message "Avoid target"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql :schema-version 1 (language typescript (function :name "target")))))"#,
+            PolicyRunCompletion::inconclusive(vec![
+                crate::PolicyIncompleteReason::CapabilityIncomplete,
+            ])
+            .unwrap(),
+        );
+        for (status, successful) in [
+            (None, true),
+            (Some(POLICY_EXIT_CLEAN), true),
+            (Some(POLICY_EXIT_UNRELIABLE), false),
+        ] {
+            let value =
+                serde_json::to_value(SarifInvocation::from_report(&report, status)).unwrap();
+            assert_eq!(value["executionSuccessful"], successful, "{status:?}");
+            let notifications = value["toolExecutionNotifications"].as_array().unwrap();
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0]["level"], "warning");
+            assert_eq!(
+                notifications[0]["descriptor"]["id"],
+                "BIFROST_POLICY_INCONCLUSIVE"
+            );
         }
     }
 

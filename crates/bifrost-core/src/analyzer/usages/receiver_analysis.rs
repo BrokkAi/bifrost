@@ -327,6 +327,22 @@ pub struct ReceiverAnalysisWork {
     pub scope_nodes: usize,
 }
 
+impl ReceiverAnalysisWork {
+    /// Combine independently measured work without charging or clamping budgets.
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            setup_nodes: self.setup_nodes.saturating_add(other.setup_nodes),
+            summary_expansions: self
+                .summary_expansions
+                .saturating_add(other.summary_expansions),
+            resolution_rounds: self
+                .resolution_rounds
+                .saturating_add(other.resolution_rounds),
+            scope_nodes: self.scope_nodes.saturating_add(other.scope_nodes),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverAnalysisReport<T> {
     pub outcome: ReceiverAnalysisOutcome<T>,

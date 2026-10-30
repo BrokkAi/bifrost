@@ -49,6 +49,8 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
 
+type CanonicalNamespaceCandidates = HashMap<([u8; 32], String), Arc<Vec<String>>>;
+
 /// The whole-pass state the per-file walk shares: the terminal-segment index
 /// over `targets`, and the namespace-candidate memo the walk fills as it goes.
 ///
@@ -58,7 +60,7 @@ use tree_sitter::Node;
 pub struct PythonEdgeScan<'a> {
     targets: Option<&'a HashSet<String>>,
     targets_by_terminal: HashMap<String, Vec<String>>,
-    canonical_namespace_candidates: Mutex<HashMap<String, Arc<Vec<String>>>>,
+    canonical_namespace_candidates: Mutex<CanonicalNamespaceCandidates>,
 }
 
 impl<'a> PythonEdgeScan<'a> {
@@ -266,7 +268,7 @@ struct PyScan<'a> {
     same_file: HashMap<String, String>,
     module_bindings: Arc<ModuleBindingTimeline>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
-    canonical_namespace_candidates: &'a Mutex<HashMap<String, Arc<Vec<String>>>>,
+    canonical_namespace_candidates: &'a Mutex<CanonicalNamespaceCandidates>,
     input: &'a FileEdgeScanInput<'a>,
     edges: PerFileEdges,
     /// Rooted-mode existence checks deferred until [`PyScan::resolve_pending`] runs
@@ -598,11 +600,12 @@ impl PyScan<'_> {
     }
 
     fn canonical_namespace_candidates(&self, direct: &str) -> Arc<Vec<String>> {
+        let key = (self.python.record_memo_inputs(), direct.to_owned());
         if let Some(cached) = self
             .canonical_namespace_candidates
             .lock()
             .expect("Python namespace candidate cache mutex poisoned")
-            .get(direct)
+            .get(&key)
             .cloned()
         {
             return cached;
@@ -619,7 +622,7 @@ impl PyScan<'_> {
         self.canonical_namespace_candidates
             .lock()
             .expect("Python namespace candidate cache mutex poisoned")
-            .entry(direct.to_string())
+            .entry(key)
             .or_insert_with(|| resolved.clone())
             .clone()
     }

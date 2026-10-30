@@ -15,6 +15,7 @@ pub mod resolver;
 pub mod scope;
 pub mod syntax;
 
+use brokk_bifrost_core::analyzer::memo_attribution::{MemoAttribution, MemoCapability};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, CodeUnitIndex, DefinitionLookupAccess,
@@ -35,8 +36,8 @@ use brokk_bifrost_core::analyzer::{
 /// factory-return inference in [`extractor`] reaches it; the diagnostics pass
 /// builds a [`resolver::RubySemanticIndex`] and never touches it at all, so
 /// returning a handle would force the build there too.
-#[derive(Clone, Copy)]
-pub struct RubyGraphSource<'a> {
+pub struct RubyGraphSource<'a, A: MemoAttribution> {
+    pub attribution: &'a MemoCapability<A>,
     /// Proof that a request scope is open: the import accessors reached from
     /// this source cross the import tier's storage (issue #2423).
     pub token: QueryToken<'a>,
@@ -44,7 +45,7 @@ pub struct RubyGraphSource<'a> {
     pub definitions: &'a DefinitionLookupAccess<'a>,
 }
 
-impl RubyGraphSource<'_> {
+impl<A: MemoAttribution> RubyGraphSource<'_, A> {
     pub fn with_definitions<R>(&self, read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R) -> R {
         let mut read = Some(read);
         let mut resolved = None;
@@ -54,5 +55,12 @@ impl RubyGraphSource<'_> {
             }
         });
         resolved.expect("definition lookup access must invoke its consumer exactly once")
+    }
+}
+
+impl<A: MemoAttribution> Copy for RubyGraphSource<'_, A> {}
+impl<A: MemoAttribution> Clone for RubyGraphSource<'_, A> {
+    fn clone(&self) -> Self {
+        *self
     }
 }

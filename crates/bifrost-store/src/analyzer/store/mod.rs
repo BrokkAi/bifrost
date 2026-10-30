@@ -3365,6 +3365,100 @@ impl AnalyzerStore {
         Ok(snapshot)
     }
 
+    /// Path-derived module facts for bounded batches of selected candidate blobs.
+    /// Admission is deliberately separate: callers batch import presence once.
+    #[doc(hidden)]
+    pub fn path_symbol_rows_for_blob_keys_at_snapshots(
+        &self,
+        snapshots: &WorkspaceSnapshots,
+        entries: &[(Oid, String)],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<Vec<(String, PathSymbolRow)>> {
+        let mut by_lang: HashMap<String, Vec<Oid>> = HashMap::default();
+        for (oid, lang) in entries {
+            by_lang.entry(lang.clone()).or_default().push(*oid);
+        }
+        let mut conn = self.read_conn_for_workspace(snapshots)?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, by_lang.keys().map(String::as_str))?;
+        // Refusal rows complete the selected revision's source domain. Read
+        // them once for this whole-set query, rather than re-scanning them for
+        // every OID chunk. Their scope and OID must match: old or foreign
+        // refusals cannot explain a currently unpublished input.
+        let mut refused: HashMap<String, HashSet<Oid>> = HashMap::default();
+        let mut refusal_statement = tx.prepare_cached(
+            "SELECT refusals.blob_oid
+             FROM temp.selected_workspace_revisions AS selected
+             CROSS JOIN main.workspace_source_refusals AS refusals
+               ON refusals.workspace_id=selected.workspace_id
+              AND refusals.lang=selected.lang
+              AND refusals.generation=selected.generation
+             WHERE selected.lang=?1 AND refusals.valid_from<=selected.revision
+               AND (refusals.valid_until IS NULL OR selected.revision<refusals.valid_until)",
+        )?;
+        for lang in by_lang.keys() {
+            let rows = refusal_statement.query_map([lang], |row| row.get::<_, String>(0))?;
+            let language_refusals = refused.entry(lang.clone()).or_default();
+            for row in rows {
+                language_refusals.insert(Oid::from_str(&row?)?);
+            }
+        }
+        drop(refusal_statement);
+        // The ready-only live view can omit an unavailable blob. Only an
+        // explicit selected-revision refusal explains a missing publication.
+        let published = parsed_blob_keys_conn(&tx, entries)?;
+        let missing = entries
+            .iter()
+            .filter(|entry| {
+                !published.contains(*entry)
+                    && !refused
+                        .get(&entry.1)
+                        .is_some_and(|oids| oids.contains(&entry.0))
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(StoreError::new(format!(
+                "path-symbol set inputs are not complete: {missing:?}"
+            )));
+        }
+        let mut out = Vec::new();
+        for (lang, mut oids) in by_lang {
+            if let Some(refused) = refused.get(&lang) {
+                oids.retain(|oid| !refused.contains(oid));
+            }
+            oids.sort();
+            oids.dedup();
+            for chunk in oids.chunks(900) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                // Drive from bounded OIDs before expanding the live view. Without
+                // this join order SQLite can range over every language file for
+                // each chunk, even when the snapshot/blob index is available.
+                let sql = format!(
+                    "SELECT files.lang,files.rel_path,files.blob_oid,rows.kind,rows.package_name,
+                            rows.short_name,rows.exact_fqn,rows.normalized_fqn,rows.requires_imports
+                     FROM main.blobs AS candidates INDEXED BY sqlite_autoindex_blobs_1
+                     CROSS JOIN live_workspace_files AS files
+                       ON files.lang=candidates.lang AND files.blob_oid=candidates.blob_oid
+                     CROSS JOIN main.workspace_file_path_symbol_rows AS rows
+                       ON rows.file_version_id=files.file_id
+                     WHERE candidates.lang=? AND candidates.blob_oid IN ({placeholders})"
+                );
+                let parameters = std::iter::once(lang.clone())
+                    .chain(chunk.iter().map(Oid::to_string))
+                    .collect::<Vec<_>>();
+                let mut statement = tx.prepare_cached(&sql)?;
+                let rows = statement.query_map(params_from_iter(parameters.iter()), |row| {
+                    Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
+                })?;
+                out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     #[doc(hidden)]
     pub fn path_symbol_rows_by_fqn_for_langs_at_snapshots(
         &self,
@@ -24151,9 +24245,8 @@ pub mod structural_vocabulary;
 mod standalone_language_table {
     #[unsafe(no_mangle)]
     fn __brokk_bifrost_store_language_supports_v1() -> &'static super::StoreLanguageTable {
-        static TABLE: super::StoreLanguageTable =
-            [None; crate::analyzer::Language::ANALYZABLE.len()];
-        &TABLE
+        static TABLE: std::sync::OnceLock<super::StoreLanguageTable> = std::sync::OnceLock::new();
+        TABLE.get_or_init(super::language_support::neutral_fixture::precedence_fixture_supports)
     }
 }
 

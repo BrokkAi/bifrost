@@ -3,6 +3,21 @@ name: Bifrost Policy Scan
 # more, and this is the field it reads. The full exit-code contract -- 0 clean,
 # 1 a policy gate failure, 2 unreliable, and why unreliable must never be read
 # as clean -- lives in the README, which is the listing body.
+#
+# Exit codes, as SlopCop reads the same report (#8111):
+#   0  no finding crossed fail-on and every run gave a verdict. A run whose
+#      completion is Bifrost's own `inconclusive` verdict counts as one: it
+#      is advisory, listed as a ::warning:: and in the job summary, and never
+#      gates. SlopCop calls this `clean`.
+#   1  a finding crossed fail-on, or an orphaned suppression decision.
+#      Inconclusive runs are listed alongside and do not change the status.
+#   2  unreliable: the evaluation terminated, a report diagnostic is an error,
+#      report diagnostics were truncated, or a run reached no verdict (failed,
+#      unsupported, an explicitly requested not_run, or a proven_subset run
+#      with nothing to gate). SlopCop calls this `incomplete`.
+# `on-inconclusive: unreliable` restores the strict reading, in which an
+# inconclusive run exits 2. A policy's own `(on-unknown :verdict ...)`
+# declaration outranks the input.
 description: >-
   Run Bifrost static-analysis policies, upload SARIF to code scanning, and fail
   closed when a scan is unreliable.
@@ -19,7 +34,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.14.3
+    default: v0.14.4
   packs-source:
     description: >-
       Trusted JSON source selection with repository, exact rules_version and
@@ -80,6 +95,13 @@ inputs:
     description: 'Severity gate: never, finding, note, warning, or error.'
     required: false
     default: warning
+  on-inconclusive:
+    description: >-
+      What an inconclusive policy run does to the gate: pass (default) lists it
+      as a warning and never fails the job on it; unreliable fails the job with
+      exit 2, as Bifrost before v0.14.4 did.
+    required: false
+    default: pass
   diff-base:
     description: >-
       Git revision to diff against. When set, the same policies also evaluate
@@ -437,6 +459,7 @@ runs:
         WORKDIR: ${{ inputs.working-directory }}
         SARIF_FILE: ${{ inputs.sarif-file }}
         FAIL_ON: ${{ inputs.fail-on }}
+        ON_INCONCLUSIVE: ${{ inputs.on-inconclusive }}
         POLICY_PACKS: ${{ steps.policy-selection.outputs.packs }}
         POLICY_IDS: ${{ inputs.policy-ids }}
         EXCLUDE_POLICY_IDS: ${{ inputs.exclude-policy-ids }}
@@ -470,6 +493,13 @@ runs:
         for p in ${POLICY_CATEGORIES}; do args+=(--policy-category "${p}"); done
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
         if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
+        # pass is the engine default, so it is passed only when it differs:
+        # a pinned engine older than the flag then still runs.
+        case "${ON_INCONCLUSIVE:-pass}" in
+          pass) ;;
+          unreliable) args+=(--on-inconclusive unreliable) ;;
+          *) echo "::error::on-inconclusive must be pass or unreliable, not '${ON_INCONCLUSIVE}'."; exit 1 ;;
+        esac
         if [ "${FULL_EVALUATION:-false}" = true ]; then args+=(--no-incremental); fi
         if [ "${POLICY_TIMINGS:-false}" = true ]; then args+=(--policy-timings); fi
         stderr_file="${SARIF_FILE}.stderr.log"
@@ -692,6 +722,32 @@ runs:
           echo "::error::invalid SARIF report at ${SARIF_PATH}; expected a SARIF 2.1.0 object with runs and result arrays."
           exit 1
         fi
+        # Inconclusive runs are advisory under status 0 and 1, never hidden:
+        # each is a warning annotation and a job-summary row.
+        list_inconclusive() {
+          local inconclusive
+          if ! inconclusive=$(jq -r '
+            .runs[].properties["bifrost.policyRuns"][]?
+            | select(.completion.type == "inconclusive")
+            | "\(.policy_id // "unknown")\t\((.completion.reasons // []) | join(", "))"
+          ' "${SARIF_PATH}"); then
+            echo "::error::unable to extract inconclusive policy runs from ${SARIF_PATH}."
+            exit 1
+          fi
+          [ -n "${inconclusive}" ] || return 0
+          {
+            echo "### Bifrost: inconclusive policies (advisory)"
+            echo
+            echo "These policies ran and could not prove there is nothing more to find. They do not gate this job."
+            echo
+            echo "| Policy | Reasons |"
+            echo "| --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          while IFS=$'\t' read -r policy reasons; do
+            echo "::warning::Bifrost policy ${policy} was inconclusive (${reasons}). It is advisory and does not gate this job."
+            echo "| \`${policy}\` | ${reasons} |" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          done <<< "${inconclusive}"
+        }
         case "${CODE}" in
           0)
             if ! jq -e '
@@ -699,14 +755,17 @@ runs:
                 all(.invocations[]; .executionSuccessful == true)
                 and (.properties["bifrost.policyRuns"] | type == "array" and length > 0)
                 and all(.properties["bifrost.policyRuns"][];
-                  .completion.type == "complete" or .completion.type == "proven_by_summary"))
+                  .completion.type == "complete" or .completion.type == "proven_by_summary"
+                  or .completion.type == "inconclusive"))
             ' "${SARIF_PATH}" >/dev/null; then
               echo "::error::Bifrost returned clean status 0 but SARIF lacks successful completed policy execution."
               exit 1
             fi
+            list_inconclusive
             echo "Bifrost policy scan is clean."
             ;;
           1)
+            list_inconclusive
             echo "::group::Bifrost policy gate causes"
             if ! causes=$(jq -r --arg fail_on "${FAIL_ON}" '
               def severity:

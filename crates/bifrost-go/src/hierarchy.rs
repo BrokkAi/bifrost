@@ -129,6 +129,58 @@ pub struct GoHierarchyIndex {
 }
 
 impl GoHierarchyIndex {
+    /// Position-free answer for all hierarchy questions about one qualified name.
+    pub fn read_answer(&self, name: &str) -> [u8; 32] {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+        let identity = |unit: &CodeUnit| unit.declaration_id().to_string();
+        let mut hash = CanonicalHasher::new(b"go-hierarchy-question-v1");
+        hash.value(name.as_bytes());
+        hash.value(&[
+            u8::from(self.supported.contains(name)),
+            u8::from(self.enumeration_complete),
+            u8::from(self.tracked_methods.contains(name)),
+            u8::from(self.unenumerated_methods.contains(name)),
+        ]);
+        let mut ancestors = self
+            .direct_ancestors
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(identity)
+            .collect::<Vec<_>>();
+        ancestors.sort();
+        let mut descendants = self
+            .direct_descendants
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(identity)
+            .collect::<Vec<_>>();
+        descendants.sort();
+        for (label, rows) in [("ancestors", ancestors), ("descendants", descendants)] {
+            hash.sequence(label, &rows, |hash, identity| {
+                hash.value(identity.as_bytes())
+            });
+        }
+        for (label, table) in [
+            ("implements", &self.member_implements),
+            ("implemented_by", &self.member_implemented_by),
+        ] {
+            let mut rows = table
+                .get(name)
+                .into_iter()
+                .flatten()
+                .map(|edge| (identity(&edge.member), identity(&edge.owner)))
+                .collect::<Vec<_>>();
+            rows.sort();
+            hash.sequence(label, &rows, |hash, (member, owner)| {
+                hash.value(member.as_bytes());
+                hash.value(owner.as_bytes());
+            });
+        }
+        hash.finish()
+    }
+
     pub fn build(source: GoGraphSource<'_>) -> Result<Self, GoGraphBuildError> {
         let mut builder = GoHierarchyBuilder::new(source);
         builder.collect()?;

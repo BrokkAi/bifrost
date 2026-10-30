@@ -1,6 +1,7 @@
 use super::*;
 use crate::syntax::{
-    csharp_using_directive_is_static, csharp_using_directive_target_node, map_csharp_type_arguments,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_using_directive_target_node, map_csharp_type_arguments,
 };
 
 impl Producer<'_, '_> {
@@ -17,6 +18,7 @@ impl Producer<'_, '_> {
             return;
         }
         let is_static = csharp_using_directive_is_static(node);
+        let is_global = csharp_using_directive_is_global(node);
         let names = parts
             .iter()
             .map(|&part| self.name(part))
@@ -51,6 +53,11 @@ impl Producer<'_, '_> {
             anchor: ResolutionRootImportAnchor::Lexical,
             position: None,
         });
+        if is_global {
+            self.facts
+                .compilation_imports
+                .push(ResolutionCompilationImportFact { import_site: site });
+        }
         let route = if bound.is_some() {
             &names[..names.len() - 1]
         } else {
@@ -139,6 +146,11 @@ impl Producer<'_, '_> {
     }
 
     pub(super) fn finish_imports(&mut self) {
+        // ECMA-334 14.6.1 / 7.7.1 requires using directives before every
+        // member of a compilation unit or namespace body, so the last
+        // directive's end is the producer-side activation point. A global
+        // using is visited in compilation-unit scope and precedes the other
+        // usings there; it contributes to that same scope position.
         for import in &mut self.facts.root_imports {
             import.position = Some(self.directive_ends[&import.root_scope]);
         }

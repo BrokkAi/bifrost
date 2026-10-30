@@ -1586,11 +1586,14 @@ impl SemanticGapImpacts {
 /// workspace resolution and binding of that call answers -- for example
 /// Scala argument-evaluation strictness, which the resolved signature proves
 /// because a deferring callee carries its own procedure-level gap that keeps
-/// every binding to it open. `RetainedEvaluationOrder` marks a point-scoped
-/// gap where the adapter retained every evaluation but chose one deterministic
-/// order for evaluations whose relative order the language leaves open. A
-/// consumer may discharge that gap only when its answer depends on the set of
-/// evaluations rather than their order. `RetainedControlTopology` marks a
+/// every binding to it open. `RetainedEvaluationOrder` marks an evaluation
+/// whose operand order the language leaves open. The producer must map the gap
+/// to the whole evaluation; points mapped inside that span form its region. The
+/// producer retains every evaluation in the region and chooses one deterministic
+/// order. A consumer may discharge the gap only when its answer depends on the
+/// set of those evaluations rather than their order, or when the answer lies
+/// entirely outside the region. A missing source mapping fails closed.
+/// `RetainedControlTopology` marks a
 /// point-scoped control gap where every source-local parent normal successor is
 /// retained, but feasibility, blocking, termination, or concurrent child
 /// execution remains unresolved. On an exceptional-control gap it marks an

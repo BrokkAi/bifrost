@@ -16,6 +16,7 @@ pub mod dependency_evidence;
 pub(crate) mod diagnostics;
 pub(crate) mod external;
 pub(crate) mod providers;
+mod workspace_facts;
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for JavascriptSupport {
     fn selected_dependency_file_evidence(
         &self,
@@ -746,6 +747,15 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
 }
 
 impl LanguageSupport for JavascriptSupport {
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+        family: brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+        language: Language,
+        subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        workspace_facts::answer(analyzer, family, language, subject)
+    }
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
@@ -999,6 +1009,15 @@ impl LanguageSupport for JavascriptSupport {
 pub struct TypescriptSupport;
 
 impl LanguageSupport for TypescriptSupport {
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+        family: brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+        language: Language,
+        subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        workspace_facts::answer(analyzer, family, language, subject)
+    }
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,

@@ -215,6 +215,22 @@ pub fn finish_incoming_sites<M>(
     unproven.into_iter().map(|(_, metadata)| metadata).collect()
 }
 
+/// Resolve the first structural caller, retaining the selected edge's owner fallback.
+pub fn structural_incoming_caller<'a>(
+    providers: impl IntoIterator<Item = &'a dyn crate::analyzer::structural::StructuralFactProvider>,
+    edge: &ReferenceEdgeRow,
+    syntax: &CallSiteSyntax,
+) -> Option<CodeUnit> {
+    providers
+        .into_iter()
+        .find_map(|provider| {
+            provider
+                .structural_enclosing_code_units(&edge.site.file, &[syntax.range])
+                .and_then(|mut owners| owners.pop().flatten())
+        })
+        .or(edge.site.enclosing.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

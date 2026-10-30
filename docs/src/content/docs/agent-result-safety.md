@@ -77,14 +77,17 @@ seven values. Choose the claim from this table:
 | `complete` | Yes | Yes, within the recorded scope | 0 or 1 | “This policy retained no findings in its recorded analyzer and dependency scope.” With findings: “Bifrost proved these findings.” | “The issue cannot occur.” |
 | `proven_subset` | Yes | No. The run searched only part of the program. `codes` lists the diagnostic codes that limited it. | 1 when a finding meets `fail_on`, otherwise 2 | “Bifrost proved these findings, but the run covered only part of the program, so there may be others.” | “There are no other findings.” |
 | `proven_by_summary` | Yes | Only under authored summaries of external procedures. It is not proof from analyzed code. | 0 or 1 | “This policy retained no findings, if the authored summaries of the external procedures it used are correct.” | “Analysis of the code proves the issue is absent.” |
-| `inconclusive` | No | No. `reasons` says why, for example `cancelled` or `deadline_exceeded`. | 2, unless the policy's `on-unknown` verdict is `warn-unreliable` or `fail-closed` | “The run did not finish its analysis because of the reported reason. The retained findings are leads, not a complete result.” | “The policy passed.” |
+| `inconclusive` | No | No. `reasons` says why, for example `cancelled` or `deadline_exceeded`. | 0 or 1 by default: the run is advisory and the findings decide. 2 under `--on-inconclusive unreliable`, unless the policy's `on-unknown` verdict is `warn-unreliable` (0 or 1) or `fail-closed` (1) | “The run did not finish its analysis because of the reported reason. The retained findings are leads, not a complete result.” | “The policy passed.” |
 | `not_run` (implicit) | Yes | No. The policy did not run and makes no absence claim. | 0 or 1 based on policies that ran | “This selected policy did not run because the reported capability was unavailable.” | “The policy found no findings.” |
 | `not_run` (explicit ID) | No | No. The policy did not run and makes no absence claim. | 2 | “Bifrost could not honor the requested policy ID because the reported capability was unavailable.” | “The policy passed.” |
 | `unsupported` | No | No. `capability` names what is missing. | 2 | “Bifrost cannot evaluate this policy here because the named capability is missing.” | “The policy passed” or “nothing applies.” |
 | `failed` | No | No. `reasons` says why. | 2 | “The policy run failed for the reported reason, so it gives no result.” | “The policy passed.” |
 
 Only `complete` supports a zero-finding or "all findings" claim without
-qualification. The batch exits with the highest status that any run requires.
+qualification. An exit status of 0 is therefore not a claim that the code is
+clean: an `inconclusive` run can exit 0 and still supports only the
+qualified claim above. The batch exits with the highest status that any run
+requires.
 An error diagnostic, truncated diagnostics, or an execution termination in the
 report also gives the batch exit status 2. [Policy
 Reference](/reference/policies/) gives the exact exit rules, the reason codes

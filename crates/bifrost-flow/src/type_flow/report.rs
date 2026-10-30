@@ -54,20 +54,6 @@ pub struct TypeFlowReport {
 }
 
 impl TypeFlowReport {
-    /// The merged class set for the member access at `span` in `file`, when
-    /// any root reported one.
-    pub fn class_set_at(
-        &self,
-        file: &ProjectFile,
-        span: SourceSpan,
-        member: &str,
-    ) -> Option<&ReceiverClassSet> {
-        let key = (file.clone(), span, member.into());
-        self.site_index
-            .get(&key)
-            .map(|index| &self.class_sets[*index])
-    }
-
     pub fn class_sets(&self) -> &[ReceiverClassSet] {
         &self.class_sets
     }
@@ -266,7 +252,7 @@ pub fn solve_type_flow_workspace(
     let _cancellation_scope =
         AnalyzerQueryScope::with_cancellation(workspace.analyzer(), cancellation);
     let value_flow_cache = ValueFlowCache::default();
-    let summary_state = TypeFlowSummaryState::default();
+    let summary_state = TypeFlowSummaryState::new(workspace);
     let mut report = TypeFlowReport::default();
     for language in Language::ANALYZABLE {
         let Some(adapter) = type_flow_adapter(language) else {
@@ -364,6 +350,9 @@ fn solve_language(
                 Err(_) => report.record_failed_root(),
             }
         }
+    }
+    if cancellation.is_cancelled() {
+        return Err(TypeFlowError::Cancelled);
     }
     Ok(())
 }

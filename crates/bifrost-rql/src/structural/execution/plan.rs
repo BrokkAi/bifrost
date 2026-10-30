@@ -80,7 +80,37 @@ pub(crate) enum LogicalQueryOperator {
     },
 }
 
+/// The output allowance of one physical pipeline step.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StepOutputCap {
+    PipelineRows,
+    Terminal(usize),
+}
+
+impl StepOutputCap {
+    pub(crate) fn resolve(self, max_pipeline_rows: usize) -> usize {
+        match self {
+            Self::PipelineRows => max_pipeline_rows,
+            Self::Terminal(cap) => cap,
+        }
+    }
+}
+
 impl LogicalQueryOperator {
+    pub(crate) fn step_output_cap(&self, terminal_cap: Option<usize>) -> StepOutputCap {
+        let Self::Step {
+            final_in_authored_suffix,
+            ..
+        } = self
+        else {
+            panic!("only pipeline steps have a step output cap");
+        };
+        match (*final_in_authored_suffix, terminal_cap) {
+            (true, Some(cap)) => StepOutputCap::Terminal(cap),
+            _ => StepOutputCap::PipelineRows,
+        }
+    }
+
     fn dependencies(&self) -> &[LogicalQueryNodeId] {
         match self {
             Self::Seed(_)
@@ -699,12 +729,44 @@ impl PhysicalQueryPlan {
         }
     }
 
-    pub(crate) const fn root(&self) -> PhysicalQueryNodeId {
-        self.root
+    pub(crate) fn terminal_caps(
+        &self,
+        root: PhysicalQueryNodeId,
+        terminal_cap: Option<usize>,
+    ) -> Vec<Option<usize>> {
+        let mut caps = vec![None; self.node_count()];
+        let mut pending = vec![(root, terminal_cap)];
+        while let Some((node, cap)) = pending.pop() {
+            caps[node.index()] = cap;
+            let dependency_cap = match self.logical_node(node).operator() {
+                LogicalQueryOperator::Limit { count, .. } => Some(count.saturating_add(1)),
+                _ => None,
+            };
+            pending.extend(
+                self.node(node)
+                    .dependencies()
+                    .iter()
+                    .map(|&id| (id, dependency_cap)),
+            );
+        }
+        caps
     }
 
-    pub(crate) fn suffix_input(&self, suffix_steps: usize) -> PhysicalQueryNodeId {
-        PhysicalQueryNodeId::from_logical(self.logical.suffix_input(suffix_steps))
+    pub(crate) fn step_output_caps(&self) -> Vec<Option<StepOutputCap>> {
+        let caps = self.terminal_caps(self.root(), None);
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let operator = self.logical.node(node.logical_node()).operator();
+                matches!(operator, LogicalQueryOperator::Step { .. })
+                    .then(|| operator.step_output_cap(caps[index]))
+            })
+            .collect()
+    }
+
+    pub(crate) const fn root(&self) -> PhysicalQueryNodeId {
+        self.root
     }
 
     /// How many operators this plan holds. Node ids are dense over this range,

@@ -16,6 +16,7 @@ pub(crate) fn is_rust_named_declaration_kind(kind: &str) -> bool {
             | "enum_item"
             | "union_item"
             | "trait_item"
+            | "trait_alias"
             | "mod_item"
             | "function_item"
             | "function_signature_item"
@@ -24,6 +25,7 @@ pub(crate) fn is_rust_named_declaration_kind(kind: &str) -> bool {
             | "const_item"
             | "static_item"
             | "macro_definition"
+            | "decl_macro"
             | "type_item"
             | "associated_type"
     )
@@ -277,7 +279,7 @@ fn rust_declaration_kind(node: Node<'_>) -> RustDeclarationKind {
         "struct_item" => RustDeclarationKind::Struct,
         "enum_item" => RustDeclarationKind::Enum,
         "union_item" => RustDeclarationKind::Union,
-        "trait_item" => RustDeclarationKind::Trait,
+        "trait_item" | "trait_alias" => RustDeclarationKind::Trait,
         "mod_item" if node.child_by_field_name("body").is_some() => {
             RustDeclarationKind::InlineModule
         }
@@ -288,7 +290,7 @@ fn rust_declaration_kind(node: Node<'_>) -> RustDeclarationKind {
         "enum_variant" => RustDeclarationKind::EnumVariant,
         "const_item" => RustDeclarationKind::Const,
         "static_item" => RustDeclarationKind::Static,
-        "macro_definition" => RustDeclarationKind::Macro,
+        "macro_definition" | "decl_macro" => RustDeclarationKind::Macro,
         "type_item" => RustDeclarationKind::TypeAlias,
         "associated_type" => RustDeclarationKind::AssociatedType,
         kind => panic!("Rust declaration property has unsupported kind {kind:?}"),

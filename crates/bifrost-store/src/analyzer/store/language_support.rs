@@ -162,6 +162,35 @@ pub struct WrapperPayloadProjection {
 }
 
 pub trait StoreLanguageSupport: Send + Sync {
+    /// Install a language-owned provider on native point operations.
+    fn demand_installer(&self) -> Option<super::resolution_operation::NativeDemandInstaller> {
+        None
+    }
+
+    /// Whether field values depend on the selected receiver. The default
+    /// bypasses member-value projection entirely.
+    fn projects_member_values_through_receiver(&self) -> bool {
+        false
+    }
+
+    /// Project a selected field's declared value through its receiver. A
+    /// language that needs receiver evidence returns None until it is known.
+    /// Other languages preserve the declared value, including unqualified fields.
+    fn member_value(
+        &self,
+        _receiver: Option<crate::analyzer::resolution::ResolutionSlotValue>,
+        value: crate::analyzer::resolution::ResolutionSlotValue,
+    ) -> Option<crate::analyzer::resolution::ResolutionSlotValue> {
+        Some(value)
+    }
+
+    /// Binding precedence data and the file-local import lowering form.
+    fn precedence_rules(
+        &self,
+    ) -> &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules {
+        &crate::analyzer::resolution::precedence::DefaultPrecedenceRules
+    }
+
     /// File publications retain their canonical OwnModule identity for hydration.
     fn publishes_own_module_file_anchors(&self) -> bool {
         false
@@ -494,13 +523,53 @@ pub mod neutral_fixture {
         static OVERLAYS: RefCell<Vec<StoreLanguageTable>> = const { RefCell::new(Vec::new()) };
     }
 
-    pub struct NeutralFakeStoreLanguageSupport;
+    pub struct NeutralFakeStoreLanguageSupport(
+        &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules,
+    );
     impl StoreLanguageSupport for NeutralFakeStoreLanguageSupport {
+        fn precedence_rules(
+            &self,
+        ) -> &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules {
+            self.0
+        }
         fn call_applicability_adapter(
             &self,
         ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
             Some(&NeutralFakeCallApplicabilityAdapter)
         }
+    }
+
+    /// Store-only fixtures have no linked language assembly. Register the
+    /// existing precedence tables explicitly, without importing adapters or
+    /// replacing the other neutral hooks with language algorithms.
+    pub(crate) fn precedence_fixture_supports() -> StoreLanguageTable {
+        use crate::analyzer::resolution::precedence::*;
+        static DEFAULT: NeutralFakeStoreLanguageSupport =
+            NeutralFakeStoreLanguageSupport(&DefaultPrecedenceRules);
+        static JAVA: NeutralFakeStoreLanguageSupport =
+            NeutralFakeStoreLanguageSupport(JAVA_PRECEDENCE_RULES);
+        static KOTLIN: NeutralFakeStoreLanguageSupport =
+            NeutralFakeStoreLanguageSupport(KOTLIN_PRECEDENCE_RULES);
+        static SCALA: NeutralFakeStoreLanguageSupport =
+            NeutralFakeStoreLanguageSupport(SCALA_PRECEDENCE_RULES);
+        static RUST: NeutralFakeStoreLanguageSupport =
+            NeutralFakeStoreLanguageSupport(&RustPrecedenceRules);
+        static CSHARP: NeutralFakeStoreLanguageSupport =
+            NeutralFakeStoreLanguageSupport(CSHARP_PRECEDENCE_RULES);
+        static GO: NeutralFakeStoreLanguageSupport =
+            NeutralFakeStoreLanguageSupport(&GoPrecedenceRules);
+        let mut table: StoreLanguageTable = [Some(&DEFAULT); Language::ANALYZABLE.len()];
+        for (language, support) in [
+            (Language::Java, &JAVA),
+            (Language::Kotlin, &KOTLIN),
+            (Language::Scala, &SCALA),
+            (Language::Rust, &RUST),
+            (Language::Go, &GO),
+            (Language::CSharp, &CSHARP),
+        ] {
+            table[language_index(language).expect("fixture language")] = Some(support);
+        }
+        table
     }
 
     pub struct NeutralFakeCallApplicabilityAdapter;
@@ -526,9 +595,10 @@ pub mod neutral_fixture {
     /// Register only the fixture languages, without changing the linked table.
     pub fn neutral_rules_fixture(languages: &[Language]) -> NeutralRulesFixture {
         let mut table: StoreLanguageTable = [None; Language::ANALYZABLE.len()];
+        let precedence_supports = precedence_fixture_supports();
         for &language in languages {
             let index = language_index(language).expect("neutral fixture requires a language");
-            table[index] = Some(&NeutralFakeStoreLanguageSupport);
+            table[index] = precedence_supports[index];
         }
         let depth = OVERLAYS.with(|overlays| {
             let mut overlays = overlays.borrow_mut();
@@ -539,6 +609,19 @@ pub mod neutral_fixture {
             depth,
             _thread: std::marker::PhantomData,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::analyzer::store) fn demand_installer_fixture(
+        language: Language,
+        support: &'static dyn StoreLanguageSupport,
+    ) -> NeutralRulesFixture {
+        let fixture = neutral_rules_fixture(&[language]);
+        OVERLAYS.with(|overlays| {
+            overlays.borrow_mut().last_mut().unwrap()[language_index(language).unwrap()] =
+                Some(support);
+        });
+        fixture
     }
 
     #[cfg(test)]

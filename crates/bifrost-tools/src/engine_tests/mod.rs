@@ -59,6 +59,8 @@ mod ruby_reference_edges;
 
 mod go_module_overlay;
 
+mod csharp_imports;
+mod csharp_namespaces;
 mod csharp_receiver_query;
 mod csharp_store;
 

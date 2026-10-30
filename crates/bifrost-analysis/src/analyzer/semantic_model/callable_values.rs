@@ -240,7 +240,8 @@ pub(crate) fn query_activated_callable_values(
     Ok(result)
 }
 
-pub(crate) fn callable_publication_matches(
+#[doc(hidden)]
+pub fn callable_publication_matches(
     shard: &crate::analyzer::semantic_model::ActiveSemanticModelShard,
     factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> bool {

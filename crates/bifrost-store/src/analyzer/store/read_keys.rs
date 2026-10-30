@@ -5,6 +5,7 @@
 //! makes adding a new [`ReadKey`] variant an exhaustive-match compile error for
 //! every store client instead of letting two product tables drift.
 
+use brokk_bifrost_semantic::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
 use git2::Oid;
 
 use super::{Result, StoreError};
@@ -38,6 +39,9 @@ pub(super) struct ReadKeyColumns {
     pub(super) site_ordinal: Option<i64>,
     pub(super) decl_kind: Option<&'static str>,
     pub(super) decl_signature: Option<String>,
+    pub(super) workspace_fact_family: Option<&'static str>,
+    pub(super) fact_member: Option<String>,
+    pub(super) fact_names: Option<String>,
 }
 
 impl ReadKeyColumns {
@@ -59,6 +63,9 @@ impl ReadKeyColumns {
             site_ordinal: None,
             decl_kind: None,
             decl_signature: None,
+            workspace_fact_family: None,
+            fact_member: None,
+            fact_names: None,
         };
         match key {
             ReadKey::File {
@@ -130,6 +137,51 @@ impl ReadKeyColumns {
                         columns.end_byte = Some(site.end_byte as i64);
                         columns.site_ordinal = Some(site.ordinal as i64);
                     }
+                    LookupQuestion::WorkspaceFact {
+                        family,
+                        language,
+                        subject,
+                    } => {
+                        columns.workspace_fact_family = Some(family.stable_label());
+                        columns.languages = Some(language.config_label().to_string());
+                        match subject {
+                            FactSubject::Whole => {}
+                            FactSubject::Class { class } => {
+                                columns.subject = Some(class.as_bytes().to_vec())
+                            }
+                            FactSubject::File { rel_path } => {
+                                columns.rel_path = Some(rel_path.to_string())
+                            }
+                            FactSubject::Named { name } => columns.name = Some(name.to_string()),
+                            FactSubject::NamedMember { owner, member } => {
+                                columns.name = Some(owner.to_string());
+                                columns.fact_member = Some(member.to_string());
+                            }
+                            FactSubject::ClassMember { class, member } => {
+                                columns.subject = Some(class.as_bytes().to_vec());
+                                columns.fact_member = Some(member.to_string());
+                            }
+                            FactSubject::NameGroupMember { names, member } => {
+                                columns.fact_names = Some(
+                                    serde_json::to_string(names)
+                                        .expect("qualified names serialize"),
+                                );
+                                columns.fact_member = Some(member.to_string());
+                            }
+                            FactSubject::FileNamedMember {
+                                rel_path,
+                                owner,
+                                member,
+                                environment,
+                            } => {
+                                columns.rel_path = Some(rel_path.to_string());
+                                columns.name = Some(owner.to_string());
+                                columns.fact_member = Some(member.to_string());
+                                columns.subject =
+                                    environment.map(|digest| digest.as_bytes().to_vec());
+                            }
+                        }
+                    }
                     LookupQuestion::Summary { identity } => {
                         columns.subject = Some(identity.as_bytes().to_vec());
                     }
@@ -166,7 +218,8 @@ impl ReadKeyColumns {
 ///
 /// `row` must select `key_digest`, `kind`, `family`, `languages`, `rel_path`,
 /// `name`, `index_key`, `blob_oid`, `subject`, `start_byte`, `end_byte`,
-/// `digest`, `site_ordinal`, `decl_kind`, and `decl_signature`, in that order.
+/// `digest`, `site_ordinal`, `decl_kind`, `decl_signature`, and
+/// `workspace_fact_family`, `fact_member`, `fact_names`, in that order.
 /// Comparing the rebuilt key's canonical digest with `key_digest` turns column
 /// fidelity into a checked store invariant.
 pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
@@ -185,6 +238,17 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     let site_ordinal = row.get::<_, Option<i64>>(12)?;
     let decl_kind = row.get::<_, Option<String>>(13)?;
     let decl_signature = row.get::<_, Option<String>>(14)?;
+    let workspace_fact_family = row.get::<_, Option<String>>(15)?;
+    let fact_member = row.get::<_, Option<String>>(16)?;
+    let fact_names = row.get::<_, Option<String>>(17)?;
+    let is_workspace_fact = kind == "lookup" && family.as_deref() == Some("workspace_fact");
+    if !is_workspace_fact
+        && (workspace_fact_family.is_some() || fact_member.is_some() || fact_names.is_some())
+    {
+        return Err(StoreError::corrupt(
+            "workspace fact columns on a different read kind",
+        ));
+    }
 
     let missing = |column: &str| StoreError::new(format!("read key `{kind}` has no {column}"));
     let key = match kind.as_str() {
@@ -203,61 +267,140 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         },
         "lookup" => {
             let lookup_kind = lookup_kind_of(family.as_deref().ok_or_else(|| missing("kind"))?)?;
-            let question = match (rel_path, name, subject, start_byte, end_byte) {
-                (None, Some(name), None, None, None) => LookupQuestion::Name {
-                    language: languages.as_deref().map(decode_language).transpose()?,
-                    name: Box::from(name.as_str()),
-                },
-                (Some(rel_path), Some(fq_name), None, None, None) => LookupQuestion::Declaration {
-                    rel_path: Box::from(rel_path.as_str()),
-                    fq_name: Box::from(fq_name.as_str()),
-                    kind: CodeUnitType::ALL
-                        .into_iter()
-                        .find(|kind| Some(kind.identity_label()) == decl_kind.as_deref())
-                        .ok_or_else(|| {
-                            StoreError::new(format!("unknown declaration kind {decl_kind:?}"))
-                        })?,
-                    signature: decl_signature,
-                },
-                (Some(rel_path), None, None, None, None) => LookupQuestion::File {
-                    rel_path: Box::from(rel_path.as_str()),
-                },
-                (Some(rel_path), None, Some(subject), Some(start), Some(end)) => {
-                    match (lookup_kind, site_ordinal) {
-                        (LookupKind::Dispatch, None) => LookupQuestion::CallSite {
-                            rel_path: Box::from(rel_path.as_str()),
-                            artifact: decode_digest(&subject, "call site artifact")?,
-                            site: CallSiteLocator {
-                                start_byte: start as usize,
-                                end_byte: end as usize,
-                            },
-                        },
-                        (LookupKind::ProcedureDispatch, Some(ordinal)) => {
-                            LookupQuestion::ProcedureCallSite {
-                                rel_path: Box::from(rel_path.as_str()),
-                                procedure: decode_digest(&subject, "procedure lineage")?,
-                                site: ProcedureCallSiteLocator {
-                                    start_byte: start as usize,
-                                    end_byte: end as usize,
-                                    ordinal: ordinal as usize,
-                                },
-                            }
+            let question = if lookup_kind == LookupKind::WorkspaceFact {
+                if start_byte.is_some()
+                    || end_byte.is_some()
+                    || site_ordinal.is_some()
+                    || index_key.is_some()
+                    || blob_oid.is_some()
+                    || decl_kind.is_some()
+                    || decl_signature.is_some()
+                {
+                    return Err(StoreError::corrupt(
+                        "workspace fact carries unrelated question columns",
+                    ));
+                }
+                let invalid = || StoreError::corrupt("inconsistent workspace fact subject columns");
+                let scalar = |bytes: &[u8]| {
+                    decode_digest(bytes, "workspace fact subject")
+                        .map_err(|error| StoreError::corrupt(error.to_string()))
+                };
+                let subject = match (rel_path, name, subject, fact_member, fact_names) {
+                    (None, None, None, None, None) => FactSubject::Whole,
+                    (None, None, Some(class), None, None) => FactSubject::Class {
+                        class: scalar(&class)?,
+                    },
+                    (Some(rel_path), None, None, None, None) => FactSubject::File {
+                        rel_path: rel_path.into(),
+                    },
+                    (None, Some(name), None, None, None) => {
+                        FactSubject::Named { name: name.into() }
+                    }
+                    (None, Some(owner), None, Some(member), None) => FactSubject::NamedMember {
+                        owner: owner.into(),
+                        member: member.into(),
+                    },
+                    (None, None, Some(class), Some(member), None) => FactSubject::ClassMember {
+                        class: scalar(&class)?,
+                        member: member.into(),
+                    },
+                    (None, None, None, Some(member), Some(names)) => {
+                        let names: Vec<Box<str>> =
+                            serde_json::from_str(&names).map_err(|error| {
+                                StoreError::corrupt(format!("workspace fact names: {error}"))
+                            })?;
+                        if names.is_empty() || !names.windows(2).all(|pair| pair[0] < pair[1]) {
+                            return Err(StoreError::corrupt(
+                                "workspace fact names must be nonempty, sorted and deduplicated",
+                            ));
                         }
-                        (other, ordinal) => {
-                            return Err(StoreError::new(format!(
-                                "lookup kind `{}` cannot carry a call-site question with site ordinal {ordinal:?}",
-                                other.stable_label()
-                            )));
+                        FactSubject::name_group_member(names, member.into())
+                    }
+                    (Some(rel_path), Some(owner), environment, Some(member), None) => {
+                        FactSubject::FileNamedMember {
+                            rel_path: rel_path.into(),
+                            owner: owner.into(),
+                            member: member.into(),
+                            environment: environment.as_deref().map(scalar).transpose()?,
                         }
                     }
+                    _ => return Err(invalid()),
+                };
+                LookupQuestion::WorkspaceFact {
+                    family: workspace_fact_family_of(
+                        workspace_fact_family
+                            .as_deref()
+                            .ok_or_else(|| StoreError::corrupt("missing workspace fact family"))?,
+                    )?,
+                    language: decode_language(
+                        languages.as_deref().ok_or_else(|| {
+                            StoreError::corrupt("missing workspace fact language")
+                        })?,
+                    )
+                    .map_err(|error| StoreError::corrupt(error.to_string()))?,
+                    subject,
                 }
-                (None, None, Some(identity), None, None) => LookupQuestion::Summary {
-                    identity: decode_digest(&identity, "summary identity")?,
-                },
-                columns => {
-                    return Err(StoreError::new(format!(
-                        "read key `lookup` has no question in its columns: {columns:?}"
-                    )));
+            } else {
+                match (rel_path, name, subject, start_byte, end_byte) {
+                    (None, Some(name), None, None, None) => LookupQuestion::Name {
+                        language: languages.as_deref().map(decode_language).transpose()?,
+                        name: Box::from(name.as_str()),
+                    },
+                    (Some(rel_path), Some(fq_name), None, None, None) => {
+                        LookupQuestion::Declaration {
+                            rel_path: Box::from(rel_path.as_str()),
+                            fq_name: Box::from(fq_name.as_str()),
+                            kind: CodeUnitType::ALL
+                                .into_iter()
+                                .find(|kind| Some(kind.identity_label()) == decl_kind.as_deref())
+                                .ok_or_else(|| {
+                                    StoreError::new(format!(
+                                        "unknown declaration kind {decl_kind:?}"
+                                    ))
+                                })?,
+                            signature: decl_signature,
+                        }
+                    }
+                    (Some(rel_path), None, None, None, None) => LookupQuestion::File {
+                        rel_path: Box::from(rel_path.as_str()),
+                    },
+                    (Some(rel_path), None, Some(subject), Some(start), Some(end)) => {
+                        match (lookup_kind, site_ordinal) {
+                            (LookupKind::Dispatch, None) => LookupQuestion::CallSite {
+                                rel_path: Box::from(rel_path.as_str()),
+                                artifact: decode_digest(&subject, "call site artifact")?,
+                                site: CallSiteLocator {
+                                    start_byte: start as usize,
+                                    end_byte: end as usize,
+                                },
+                            },
+                            (LookupKind::ProcedureDispatch, Some(ordinal)) => {
+                                LookupQuestion::ProcedureCallSite {
+                                    rel_path: Box::from(rel_path.as_str()),
+                                    procedure: decode_digest(&subject, "procedure lineage")?,
+                                    site: ProcedureCallSiteLocator {
+                                        start_byte: start as usize,
+                                        end_byte: end as usize,
+                                        ordinal: ordinal as usize,
+                                    },
+                                }
+                            }
+                            (other, ordinal) => {
+                                return Err(StoreError::new(format!(
+                                    "lookup kind `{}` cannot carry a call-site question with site ordinal {ordinal:?}",
+                                    other.stable_label()
+                                )));
+                            }
+                        }
+                    }
+                    (None, None, Some(identity), None, None) => LookupQuestion::Summary {
+                        identity: decode_digest(&identity, "summary identity")?,
+                    },
+                    columns => {
+                        return Err(StoreError::new(format!(
+                            "read key `lookup` has no question in its columns: {columns:?}"
+                        )));
+                    }
                 }
             };
             if !lookup_question_matches_kind(lookup_kind, &question) {
@@ -270,7 +413,22 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
             ReadKey::Lookup {
                 kind: lookup_kind,
                 question,
-                digest: decode_digest(&digest.ok_or_else(|| missing("answer"))?, "lookup answer")?,
+                digest: {
+                    let answer = digest.as_deref().ok_or_else(|| {
+                        if is_workspace_fact {
+                            StoreError::corrupt("missing workspace fact answer")
+                        } else {
+                            missing("answer")
+                        }
+                    })?;
+                    decode_digest(answer, "lookup answer").map_err(|error| {
+                        if is_workspace_fact {
+                            StoreError::corrupt(error.to_string())
+                        } else {
+                            error
+                        }
+                    })?
+                },
             }
         }
         "artifact" => ReadKey::Artifact {
@@ -325,7 +483,7 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     };
     let rebuilt = key.canonical_digest();
     if rebuilt.as_bytes().as_slice() != key_digest.as_slice() {
-        return Err(StoreError::new(format!(
+        return Err(StoreError::corrupt(format!(
             "read key `{kind}` did not rebuild to its stored identity {}",
             hex_of(&key_digest)
         )));
@@ -334,6 +492,16 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
 }
 
 fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> bool {
+    if kind == LookupKind::WorkspaceFact || matches!(question, LookupQuestion::WorkspaceFact { .. })
+    {
+        return matches!(
+            (kind, question),
+            (
+                LookupKind::WorkspaceFact,
+                LookupQuestion::WorkspaceFact { .. }
+            )
+        );
+    }
     matches!(
         (kind, question),
         (
@@ -392,6 +560,9 @@ fn decode_oid(text: &str) -> Result<Oid> {
 }
 
 fn decode_language(label: &str) -> Result<Language> {
+    if label == Language::None.config_label() {
+        return Ok(Language::None);
+    }
     super::canonical_language_label(label)
         .ok_or_else(|| StoreError::new(format!("unknown language label `{label}`")))
 }
@@ -410,7 +581,7 @@ const ALL_INDEX_FAMILIES: [IndexFamily; 9] = [
 ];
 
 /// Every derived-value lookup kind.
-const ALL_LOOKUP_KINDS: [LookupKind; 15] = [
+const ALL_LOOKUP_KINDS: [LookupKind; 16] = [
     LookupKind::ResolvedName,
     LookupKind::Definitions,
     LookupKind::IdentifierCandidates,
@@ -426,6 +597,7 @@ const ALL_LOOKUP_KINDS: [LookupKind; 15] = [
     LookupKind::Dispatch,
     LookupKind::ProcedureDispatch,
     LookupKind::ProcedureSummary,
+    LookupKind::WorkspaceFact,
 ];
 
 /// Every derived-artifact kind.
@@ -447,6 +619,11 @@ fn index_family_of(label: &str) -> Result<IndexFamily> {
         .ok_or_else(|| StoreError::new(format!("unknown index family `{label}`")))
 }
 
+fn workspace_fact_family_of(label: &str) -> Result<WorkspaceFactFamily> {
+    WorkspaceFactFamily::from_label(label)
+        .ok_or_else(|| StoreError::corrupt(format!("unknown workspace fact family `{label}`")))
+}
+
 fn lookup_kind_of(label: &str) -> Result<LookupKind> {
     ALL_LOOKUP_KINDS
         .into_iter()
@@ -462,6 +639,42 @@ fn artifact_kind_of(label: &str) -> Result<DerivedArtifactKind> {
 }
 
 #[cfg(test)]
+pub(super) fn workspace_fact_subjects() -> Vec<FactSubject> {
+    let class = StableDigest::sha256(b"class");
+    vec![
+        FactSubject::Whole,
+        FactSubject::Class { class },
+        FactSubject::File {
+            rel_path: "src/item.py".into(),
+        },
+        FactSubject::Named {
+            name: "pkg.Item".into(),
+        },
+        FactSubject::NamedMember {
+            owner: "pkg.Item".into(),
+            member: "method".into(),
+        },
+        FactSubject::ClassMember {
+            class,
+            member: "method".into(),
+        },
+        FactSubject::name_group_member(vec!["pkg.A".into(), "pkg.B".into()], "method".into()),
+        FactSubject::FileNamedMember {
+            rel_path: "src/item.py".into(),
+            owner: "pkg.Item".into(),
+            member: "method".into(),
+            environment: None,
+        },
+        FactSubject::FileNamedMember {
+            rel_path: "src/item.py".into(),
+            owner: "pkg.Item".into(),
+            member: "method".into(),
+            environment: Some(StableDigest::sha256(b"environment")),
+        },
+    ]
+}
+
+#[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
 
@@ -471,7 +684,7 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         connection
             .query_row(
-                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15",
+                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18",
                 params![
                     columns.key_digest.as_slice(),
                     columns.kind,
@@ -488,6 +701,9 @@ mod tests {
                     columns.site_ordinal,
                     columns.decl_kind,
                     columns.decl_signature,
+                    columns.workspace_fact_family,
+                    columns.fact_member,
+                    columns.fact_names,
                 ],
                 |row| {
                     decode_read_key(row).map_err(|error| {
@@ -519,5 +735,96 @@ mod tests {
             error.to_string().contains("cannot carry question `file`"),
             "{error}"
         );
+    }
+    #[test]
+    fn workspace_fact_columns_reject_inconsistent_subjects() {
+        for (family, subject) in [
+            (
+                WorkspaceFactFamily::WorkspaceFileListing,
+                FactSubject::Whole,
+            ),
+            (
+                WorkspaceFactFamily::WorkspaceFileInventory,
+                FactSubject::Whole,
+            ),
+            (
+                WorkspaceFactFamily::WorkspaceIgnoreRules,
+                FactSubject::Whole,
+            ),
+            (
+                WorkspaceFactFamily::WorkspaceDirectory,
+                FactSubject::File {
+                    rel_path: "nested".into(),
+                },
+            ),
+            (
+                WorkspaceFactFamily::WorkspaceOverlayMembership,
+                FactSubject::Whole,
+            ),
+            (
+                WorkspaceFactFamily::WorkspaceOverlayMembership,
+                FactSubject::File {
+                    rel_path: "a.py".into(),
+                },
+            ),
+        ] {
+            let key = ReadKey::lookup(
+                LookupKind::WorkspaceFact,
+                LookupQuestion::WorkspaceFact {
+                    family,
+                    language: Language::None,
+                    subject,
+                },
+                StableDigest::sha256(b"answer"),
+            );
+            assert_eq!(decode_columns(&ReadKeyColumns::of(&key)).unwrap(), key);
+        }
+        for subject in workspace_fact_subjects() {
+            let key = ReadKey::lookup(
+                LookupKind::WorkspaceFact,
+                LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::FieldSlots,
+                    language: Language::Python,
+                    subject,
+                },
+                StableDigest::sha256(b"answer"),
+            );
+            assert_eq!(decode_columns(&ReadKeyColumns::of(&key)).unwrap(), key);
+            let mut columns = ReadKeyColumns::of(&key);
+            columns.start_byte = Some(0);
+            assert!(
+                decode_columns(&columns)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unrelated question columns")
+            );
+        }
+        let key = ReadKey::lookup(
+            LookupKind::WorkspaceFact,
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::FieldSlots,
+                language: Language::Python,
+                subject: FactSubject::name_group_member(
+                    vec!["pkg.A".into(), "pkg.B".into()],
+                    "method".into(),
+                ),
+            },
+            StableDigest::sha256(b"answer"),
+        );
+        for invalid in [
+            "[]",
+            "[1]",
+            "[\"pkg.B\",\"pkg.A\"]",
+            "[\"pkg.A\",\"pkg.A\"]",
+            "{}",
+            "not json",
+        ] {
+            let mut columns = ReadKeyColumns::of(&key);
+            columns.fact_names = Some(invalid.into());
+            assert!(decode_columns(&columns).is_err(), "{invalid}");
+        }
+        let mut columns = ReadKeyColumns::of(&key);
+        columns.name = Some("unexpected owner".into());
+        assert!(decode_columns(&columns).is_err());
     }
 }

@@ -1828,44 +1828,47 @@ fn start_pack_warm_worker(
     std::thread::Builder::new()
         .name("bifrost-semantic-pack-warm".to_string())
         .spawn(move || {
-            let _attribution =
-                brokk_bifrost_analysis::analyzer::ReadAttribution::broadcast().install();
-            #[cfg(test)]
-            if let Some(hold) = &warm.hold {
-                hold.park_until_released();
-                if hold.panic_after_release {
-                    panic!("injected semantic-pack warm failure");
-                }
-            }
-            // The installed stage is what the query path awaits: catalog open
-            // and the packs already installed for this workspace, with nothing
-            // fetched, verified, extracted, or generated. Only when that stage
-            // leaves acquisitions outstanding does the warm continue to the
-            // full activation (issue #3401).
-            let source_snapshot = analyzer;
-            let analyzer = source_snapshot.as_ref().clone();
-            let installed = activate_session_installed_semantic_packs(&project_root, &analyzer);
-            // Publish an immutable activated snapshot before releasing the
-            // installed-stage barrier. Later acquisition works on its own clone.
-            *warm
-                .installed_snapshot
-                .lock()
-                .expect("semantic-pack snapshot mutex poisoned") =
-                Some((Arc::downgrade(&source_snapshot), Arc::new(analyzer.clone())));
-            match installed {
-                None => warm.publish_final(None),
-                Some(InstalledPackStageOutcome::Settled(state)) => {
-                    warm.publish_final(Some(Arc::new(state)))
-                }
-                Some(InstalledPackStageOutcome::AcquisitionPending(state)) => {
-                    warm.publish_acquisition_pending(Arc::new(state));
-                    #[cfg(test)]
-                    if let Some(hold) = &warm.hold {
-                        hold.park_expensive_stage_until_released();
+            brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+                #[cfg(test)]
+                if let Some(hold) = &warm.hold {
+                    hold.park_until_released();
+                    if hold.panic_after_release {
+                        panic!("injected semantic-pack warm failure");
                     }
-                    warm.publish_final(activate_session_semantic_packs(&project_root, &analyzer));
                 }
-            }
+                // The installed stage is what the query path awaits: catalog open
+                // and the packs already installed for this workspace, with nothing
+                // fetched, verified, extracted, or generated. Only when that stage
+                // leaves acquisitions outstanding does the warm continue to the
+                // full activation (issue #3401).
+                let source_snapshot = analyzer;
+                let analyzer = source_snapshot.as_ref().clone();
+                let installed = activate_session_installed_semantic_packs(&project_root, &analyzer);
+                // Publish an immutable activated snapshot before releasing the
+                // installed-stage barrier. Later acquisition works on its own clone.
+                *warm
+                    .installed_snapshot
+                    .lock()
+                    .expect("semantic-pack snapshot mutex poisoned") =
+                    Some((Arc::downgrade(&source_snapshot), Arc::new(analyzer.clone())));
+                match installed {
+                    None => warm.publish_final(None),
+                    Some(InstalledPackStageOutcome::Settled(state)) => {
+                        warm.publish_final(Some(Arc::new(state)))
+                    }
+                    Some(InstalledPackStageOutcome::AcquisitionPending(state)) => {
+                        warm.publish_acquisition_pending(Arc::new(state));
+                        #[cfg(test)]
+                        if let Some(hold) = &warm.hold {
+                            hold.park_expensive_stage_until_released();
+                        }
+                        warm.publish_final(activate_session_semantic_packs(
+                            &project_root,
+                            &analyzer,
+                        ));
+                    }
+                }
+            })
         })
         .map_err(|error| format!("Failed to spawn semantic-pack warm thread: {error}"))
 }
@@ -2666,7 +2669,7 @@ impl WorkspaceQueryScope {
         document_root: Arc<WorkspaceRoot>,
         pack_activation: SessionPackActivation,
     ) -> Self {
-        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::root());
         Self::with_context(source_snapshot, document_root, pack_activation, context)
     }
 
@@ -2677,7 +2680,10 @@ impl WorkspaceQueryScope {
         context: Arc<crate::analyzer::AnalyzerQueryContext>,
     ) -> Self {
         let snapshot = Arc::new(source_snapshot.as_ref().clone());
-        snapshot.begin_query(&context);
+        {
+            let _attribution = context.enter();
+            snapshot.begin_query(&context);
+        }
         Self {
             source_snapshot,
             snapshot,
@@ -2687,8 +2693,17 @@ impl WorkspaceQueryScope {
         }
     }
 
-    fn arc(&self) -> &Arc<WorkspaceAnalyzer> {
-        &self.source_snapshot
+    /// Enter on the worker executing this operation. The retained handle can
+    /// cross threads; only this entered view exposes analyzer operations.
+    fn enter(&self) -> WorkspaceQueryEntry<'_> {
+        WorkspaceQueryEntry {
+            scope: self,
+            _attribution: self.context.enter(),
+        }
+    }
+
+    fn has_source(&self, source: &Arc<WorkspaceAnalyzer>) -> bool {
+        Arc::ptr_eq(&self.source_snapshot, source)
     }
 
     fn scope_snapshot(&self, source_snapshot: Arc<WorkspaceAnalyzer>) -> Self {
@@ -2727,11 +2742,16 @@ impl WorkspaceQueryScope {
     }
 }
 
-impl Deref for WorkspaceQueryScope {
+struct WorkspaceQueryEntry<'a> {
+    scope: &'a WorkspaceQueryScope,
+    _attribution: crate::analyzer::i_analyzer::ReadAttributionGuard,
+}
+
+impl Deref for WorkspaceQueryEntry<'_> {
     type Target = WorkspaceAnalyzer;
 
     fn deref(&self) -> &Self::Target {
-        self.snapshot.as_ref()
+        self.scope.snapshot.as_ref()
     }
 }
 
@@ -3311,14 +3331,16 @@ impl WorkspaceSession {
         changed_files: &BTreeSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), SearchToolsServiceError> {
-        let uncancelled = CancellationToken::default();
-        self.snapshot
-            .refresh_updated_workspace_contexts(
-                changed_files,
-                &crate::analyzer::semantic_model::DependencyPackLimits::default(),
-                cancellation.unwrap_or(&uncancelled),
-            )
-            .map_err(|error| SearchToolsServiceError::internal(error.to_string()))
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            let uncancelled = CancellationToken::default();
+            self.snapshot
+                .refresh_updated_workspace_contexts(
+                    changed_files,
+                    &crate::analyzer::semantic_model::DependencyPackLimits::default(),
+                    cancellation.unwrap_or(&uncancelled),
+                )
+                .map_err(|error| SearchToolsServiceError::internal(error.to_string()))
+        })
     }
 
     /// Re-run the shared activation transaction after dependency inputs or the
@@ -3328,20 +3350,22 @@ impl WorkspaceSession {
     /// A deferred warm settles first: the refresh must supersede the startup
     /// activation, not race it to the analyzer's overlay.
     fn refresh_pack_activation(&mut self) {
-        self.snapshot
-            .invalidate_dependency_pack_state(&crate::analyzer::DependencyPackEcosystem::ALL);
-        let root = self.snapshot.analyzer().project().root();
-        self.semantic_packs.wait();
-        self.semantic_packs
-            .installed_snapshot
-            .lock()
-            .expect("semantic-pack snapshot mutex poisoned")
-            .take();
-        self.semantic_packs
-            .publish_final(activate_session_semantic_packs(
-                root,
-                self.snapshot.as_ref(),
-            ));
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            self.snapshot
+                .invalidate_dependency_pack_state(&crate::analyzer::DependencyPackEcosystem::ALL);
+            let root = self.snapshot.analyzer().project().root();
+            self.semantic_packs.wait();
+            self.semantic_packs
+                .installed_snapshot
+                .lock()
+                .expect("semantic-pack snapshot mutex poisoned")
+                .take();
+            self.semantic_packs
+                .publish_final(activate_session_semantic_packs(
+                    root,
+                    self.snapshot.as_ref(),
+                ));
+        })
     }
 
     /// Queue a background warm of the current snapshot's lazy query indexes.
@@ -3910,6 +3934,7 @@ impl SearchToolsService {
                 continue;
             }
             let result = {
+                let snapshot = snapshot.enter();
                 // The coordinator analyzes this session's project under the
                 // policy configuration and activates the policy's semantic
                 // sources itself, as every entry point does (#3735).
@@ -4378,7 +4403,7 @@ impl SearchToolsService {
                 let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
                 let result = self
                     .diff_scoring
-                    .score_worktree(&snapshot, params, &options, token)
+                    .score_worktree(&snapshot.enter(), params, &options, token)
                     .map_err(SearchToolsServiceError::internal);
                 return snapshot.finish("score_diff", result.and_then(Self::structured_only));
             }
@@ -4460,6 +4485,8 @@ impl SearchToolsService {
                 "analyzer request was cancelled or exceeded its request-wide time budget",
             ));
         }
+        let request = snapshot;
+        let snapshot = request.enter();
         let result = (|| match name {
             "search_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -4748,7 +4775,8 @@ impl SearchToolsService {
         } else {
             result
         };
-        snapshot.finish(name, result)
+        drop(snapshot);
+        request.finish(name, result)
     }
 
     pub fn query_code_result(
@@ -4805,10 +4833,15 @@ impl SearchToolsService {
             if generation != self.workspace_generation() {
                 continue;
             }
-            let root = snapshot.analyzer().project().root();
-            let arguments =
-                crate::tool_arguments::normalize_tool_arguments("query_code", arguments, root)
-                    .map_err(SearchToolsServiceError::invalid_params)?;
+            let arguments = {
+                let snapshot = snapshot.enter();
+                crate::tool_arguments::normalize_tool_arguments(
+                    "query_code",
+                    arguments,
+                    snapshot.analyzer().project().root(),
+                )
+                .map_err(SearchToolsServiceError::invalid_params)?
+            };
             return Ok(PreparedQueryCode {
                 snapshot,
                 arguments,
@@ -4921,25 +4954,26 @@ impl SearchToolsService {
         query_taint_results: &crate::rql::TaintResultRegistrationSet,
     ) -> Result<(crate::rql::CodeQueryResponse, QueryCodeExecutionTiming), SearchToolsServiceError>
     {
+        let entered = snapshot.enter();
         let input_decode_started = Instant::now();
         let query_languages = arguments.get("languages").cloned();
-        let query = Self::decode_query_code_input(snapshot, arguments)?;
+        let query = Self::decode_query_code_input(&entered, arguments)?;
         let input_decode_ns = duration_ns(input_decode_started.elapsed());
         let query_execution_started = Instant::now();
-        let mut response = CodeIntelligenceRuntime::new(snapshot, &self.flow_state, cancellation)
+        let mut response = CodeIntelligenceRuntime::new(&entered, &self.flow_state, cancellation)
             .execute_query_with_all_analysis_registrations(
                 workspace_generation,
                 query_protocols,
                 query_value_flows,
                 query_taint_results,
                 &query,
-                self.query_execution_limits(snapshot),
+                self.query_execution_limits(&entered),
             );
         mark_pack_acquisition_pending(
             &snapshot.pack_activation,
             &query,
             query_languages.as_ref(),
-            &snapshot.analyzer().languages(),
+            &entered.analyzer().languages(),
             &mut response,
         );
         Ok((
@@ -4959,7 +4993,7 @@ impl SearchToolsService {
     /// own analyzed files.
     fn query_execution_limits(
         &self,
-        snapshot: &WorkspaceQueryScope,
+        snapshot: &WorkspaceAnalyzer,
     ) -> crate::rql::CodeQueryExecutionLimits {
         if self.workspace_scaled_query_limits {
             brokk_bifrost_policy::workspace_scaled_query_limits(snapshot)
@@ -4993,7 +5027,7 @@ impl SearchToolsService {
     }
 
     fn decode_query_code_input(
-        snapshot: &WorkspaceQueryScope,
+        snapshot: &WorkspaceQueryEntry<'_>,
         arguments: Value,
     ) -> Result<crate::rql::CodeQuery, SearchToolsServiceError> {
         let Some(query_file) = arguments.get("query_file") else {
@@ -5028,7 +5062,7 @@ impl SearchToolsService {
             }
         };
         let contents = read_workspace_document(
-            snapshot.document_root(),
+            snapshot.scope.document_root(),
             path,
             &["rql", "json"],
             MAX_QUERY_FILE_BYTES,
@@ -5952,28 +5986,30 @@ impl SearchToolsService {
     }
 
     fn handle_refresh(&self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
-        let _params = serde_json::from_value::<RefreshParams>(arguments).map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
-        })?;
-        let mut guard = self.write_session()?;
-        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        // `refresh` promises a from-disk rebuild: drop the cached workspace
-        // listing so `update_all`'s file discovery re-walks the tree and
-        // re-unions the git index instead of reusing a cached listing.
-        session
-            .snapshot
-            .analyzer()
-            .project()
-            .invalidate_cached_file_listing();
-        let observation = self.build_progress.begin(self.workspace_generation());
-        let next = session
-            .snapshot
-            .update_all_with_progress(observation.sink());
-        session.snapshot = Arc::new(next);
-        observation.complete();
-        session.refresh_pack_activation();
-        session.schedule_index_warm();
-        Self::structured_only(refresh_result(session.snapshot.analyzer()))
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            let _params = serde_json::from_value::<RefreshParams>(arguments).map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+            })?;
+            let mut guard = self.write_session()?;
+            let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+            // `refresh` promises a from-disk rebuild: drop the cached workspace
+            // listing so `update_all`'s file discovery re-walks the tree and
+            // re-unions the git index instead of reusing a cached listing.
+            session
+                .snapshot
+                .analyzer()
+                .project()
+                .invalidate_cached_file_listing();
+            let observation = self.build_progress.begin(self.workspace_generation());
+            let next = session
+                .snapshot
+                .update_all_with_progress(observation.sink());
+            session.snapshot = Arc::new(next);
+            observation.complete();
+            session.refresh_pack_activation();
+            session.schedule_index_warm();
+            Self::structured_only(refresh_result(session.snapshot.analyzer()))
+        })
     }
 
     /// Incrementally re-analyze exactly the given project-relative paths, reusing the
@@ -5985,30 +6021,32 @@ impl SearchToolsService {
         arguments: Value,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
-        let paths: Vec<String> = arguments
-            .get("paths")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut guard = self.write_session()?;
-        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        let root = session.snapshot.analyzer().project().root().to_path_buf();
-        let changed: BTreeSet<ProjectFile> = paths
-            .iter()
-            .map(|rel| ProjectFile::new(root.clone(), rel.as_str()))
-            .collect();
-        // Explicit edits and watcher deltas use the same publication path.
-        session
-            .snapshot
-            .analyzer()
-            .project()
-            .invalidate_cached_file_listing();
-        Self::apply_changed_files(session, changed, cancellation)?;
-        Self::structured_only(refresh_result(session.snapshot.analyzer()))
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            let paths: Vec<String> = arguments
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut guard = self.write_session()?;
+            let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+            let root = session.snapshot.analyzer().project().root().to_path_buf();
+            let changed: BTreeSet<ProjectFile> = paths
+                .iter()
+                .map(|rel| ProjectFile::new(root.clone(), rel.as_str()))
+                .collect();
+            // Explicit edits and watcher deltas use the same publication path.
+            session
+                .snapshot
+                .analyzer()
+                .project()
+                .invalidate_cached_file_listing();
+            Self::apply_changed_files(session, changed, cancellation)?;
+            Self::structured_only(refresh_result(session.snapshot.analyzer()))
+        })
     }
 
     fn handle_activate_workspace(
@@ -6262,7 +6300,7 @@ impl SearchToolsService {
             ));
         }
         let mut result = get_symbol_sources_with_source_budget(
-            initial_snapshot.analyzer(),
+            initial_snapshot.enter().analyzer(),
             params.clone(),
             GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES,
             cancellation,
@@ -6275,7 +6313,7 @@ impl SearchToolsService {
         }
         if self.update_strategy == UpdateStrategy::WatchFiles {
             let candidate_files =
-                symbol_source_candidate_files(initial_snapshot.analyzer(), &result);
+                symbol_source_candidate_files(initial_snapshot.enter().analyzer(), &result);
 
             // Compute the stale set from a read-locked snapshot; the disk
             // reads inside `stale_symbol_source_files` happen with no session
@@ -6294,7 +6332,7 @@ impl SearchToolsService {
             }
 
             let final_snapshot = if stale_files.is_empty() {
-                Arc::clone(initial_snapshot.arc())
+                None
             } else {
                 let mut guard = self.write_session()?;
                 let session = guard.as_mut().ok_or_else(Self::closed_error)?;
@@ -6307,13 +6345,15 @@ impl SearchToolsService {
                 let analyzer = session.snapshot.analyzer();
                 let stale_files = stale_symbol_source_files(analyzer, stale_files)?;
                 Self::apply_changed_files(session, stale_files, cancellation)?;
-                Arc::clone(&session.snapshot)
+                Some(Arc::clone(&session.snapshot))
             };
 
-            if !Arc::ptr_eq(initial_snapshot.arc(), &final_snapshot) {
+            if let Some(final_snapshot) =
+                final_snapshot.filter(|snapshot| !initial_snapshot.has_source(snapshot))
+            {
                 let final_snapshot = initial_snapshot.scope_snapshot(final_snapshot);
                 result = get_symbol_sources_with_source_budget(
-                    final_snapshot.analyzer(),
+                    final_snapshot.enter().analyzer(),
                     params,
                     GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES,
                     cancellation,
@@ -6383,72 +6423,76 @@ impl SearchToolsService {
         named: &[String],
         cancellation: Option<&CancellationToken>,
     ) -> Result<bool, SearchToolsServiceError> {
-        if self.update_strategy != UpdateStrategy::WatchFiles || named.is_empty() {
-            return Ok(false);
-        }
-        let _scope = profiling::scope("SearchToolsService::apply_stale_named_files");
-        let peek_snapshot = {
-            let guard = self.read_session()?;
-            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-            Arc::clone(&session.snapshot)
-        };
-        let root = peek_snapshot.analyzer().project().root().to_path_buf();
-        let candidates = named
-            .iter()
-            .map(|path| ProjectFile::new(root.clone(), PathBuf::from(path)))
-            .filter(|file| file.abs_path().is_file())
-            .collect::<BTreeSet<_>>();
-        let stale = stale_symbol_source_files(peek_snapshot.analyzer(), candidates)?;
-        if stale.is_empty() {
-            return Ok(false);
-        }
-        let mut guard = self.write_session()?;
-        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        Self::apply_watcher_delta(session, cancellation)?;
-        // Another thread may have applied the change between the peek and the
-        // write lock; recompute against the now-current snapshot.
-        let stale = stale_symbol_source_files(session.snapshot.analyzer(), stale)?;
-        Self::apply_changed_files(session, stale, cancellation)?;
-        Ok(true)
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            if self.update_strategy != UpdateStrategy::WatchFiles || named.is_empty() {
+                return Ok(false);
+            }
+            let _scope = profiling::scope("SearchToolsService::apply_stale_named_files");
+            let peek_snapshot = {
+                let guard = self.read_session()?;
+                let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+                Arc::clone(&session.snapshot)
+            };
+            let root = peek_snapshot.analyzer().project().root().to_path_buf();
+            let candidates = named
+                .iter()
+                .map(|path| ProjectFile::new(root.clone(), PathBuf::from(path)))
+                .filter(|file| file.abs_path().is_file())
+                .collect::<BTreeSet<_>>();
+            let stale = stale_symbol_source_files(peek_snapshot.analyzer(), candidates)?;
+            if stale.is_empty() {
+                return Ok(false);
+            }
+            let mut guard = self.write_session()?;
+            let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+            Self::apply_watcher_delta(session, cancellation)?;
+            // Another thread may have applied the change between the peek and the
+            // write lock; recompute against the now-current snapshot.
+            let stale = stale_symbol_source_files(session.snapshot.analyzer(), stale)?;
+            Self::apply_changed_files(session, stale, cancellation)?;
+            Ok(true)
+        })
     }
 
     fn apply_watcher_delta(
         session: &mut WorkspaceSession,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), SearchToolsServiceError> {
-        let _scope = profiling::scope("SearchToolsService::apply_watcher_delta");
-        let watcher = match &session.watcher {
-            SessionWatcher::Disabled => return Ok(()),
-            SessionWatcher::Active(watcher) => watcher,
-        };
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            let _scope = profiling::scope("SearchToolsService::apply_watcher_delta");
+            let watcher = match &session.watcher {
+                SessionWatcher::Disabled => return Ok(()),
+                SessionWatcher::Active(watcher) => watcher,
+            };
 
-        let delta = {
-            let _scope = profiling::scope("SearchToolsService::take_changed_files");
-            watcher.take_changed_files()
-        };
-        if profiling::enabled() {
-            profiling::note(format!(
-                "watcher_delta files={} full_refresh={}",
-                delta.files.len(),
-                delta.requires_full_refresh
-            ));
-        }
-        if delta.requires_full_refresh {
-            session.snapshot = Arc::new({
-                let _scope = profiling::scope("SearchToolsService::snapshot_update_all");
-                session.snapshot.update_all()
-            });
-            session.refresh_pack_activation();
-            session.schedule_index_warm();
-            return Ok(());
-        }
+            let delta = {
+                let _scope = profiling::scope("SearchToolsService::take_changed_files");
+                watcher.take_changed_files()
+            };
+            if profiling::enabled() {
+                profiling::note(format!(
+                    "watcher_delta files={} full_refresh={}",
+                    delta.files.len(),
+                    delta.requires_full_refresh
+                ));
+            }
+            if delta.requires_full_refresh {
+                session.snapshot = Arc::new({
+                    let _scope = profiling::scope("SearchToolsService::snapshot_update_all");
+                    session.snapshot.update_all()
+                });
+                session.refresh_pack_activation();
+                session.schedule_index_warm();
+                return Ok(());
+            }
 
-        if delta.files.is_empty() {
-            return Ok(());
-        }
+            if delta.files.is_empty() {
+                return Ok(());
+            }
 
-        let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
-        Self::apply_changed_files(session, changed_files, cancellation)
+            let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
+            Self::apply_changed_files(session, changed_files, cancellation)
+        })
     }
 
     fn apply_changed_files(
@@ -6456,26 +6500,28 @@ impl SearchToolsService {
         changed_files: BTreeSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), SearchToolsServiceError> {
-        if changed_files.is_empty() {
-            return Ok(());
-        }
-        if profiling::enabled() {
-            profiling::note(format!("snapshot_changed_files={}", changed_files.len()));
-        }
-        let mut refresh_packs = changed_files_invalidate_pack_activation(&changed_files);
-        session.snapshot = Arc::new({
-            let _scope = profiling::scope("SearchToolsService::snapshot_update");
-            session.snapshot.update(&changed_files)
-        });
-        refresh_packs |= session.pack_activation_scope_changed();
-        if refresh_packs {
-            // Activation already rediscovers tool contexts for this snapshot.
-            session.refresh_pack_activation();
-        } else {
-            session.refresh_updated_contexts(&changed_files, cancellation)?;
-        }
-        session.schedule_index_warm();
-        Ok(())
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            if changed_files.is_empty() {
+                return Ok(());
+            }
+            if profiling::enabled() {
+                profiling::note(format!("snapshot_changed_files={}", changed_files.len()));
+            }
+            let mut refresh_packs = changed_files_invalidate_pack_activation(&changed_files);
+            session.snapshot = Arc::new({
+                let _scope = profiling::scope("SearchToolsService::snapshot_update");
+                session.snapshot.update(&changed_files)
+            });
+            refresh_packs |= session.pack_activation_scope_changed();
+            if refresh_packs {
+                // Activation already rediscovers tool contexts for this snapshot.
+                session.refresh_pack_activation();
+            } else {
+                session.refresh_updated_contexts(&changed_files, cancellation)?;
+            }
+            session.schedule_index_warm();
+            Ok(())
+        })
     }
 
     fn decode_and_run<P, R>(
@@ -6832,7 +6878,7 @@ impl SearchToolsService {
             if workspace_generation != self.workspace_generation() {
                 continue;
             }
-            let root = snapshot.analyzer().project().root().to_path_buf();
+            let root = snapshot.enter().analyzer().project().root().to_path_buf();
             return Ok(RunPolicyPreparation::Ready(Box::new(PreparedRunPolicy {
                 snapshot,
                 root,
@@ -6876,8 +6922,9 @@ impl SearchToolsService {
             if workspace_generation != self.workspace_generation() {
                 continue;
             }
-            let root = snapshot.analyzer().project().root().to_path_buf();
+            let root = snapshot.enter().analyzer().project().root().to_path_buf();
             let result = (|| {
+                let snapshot = snapshot.enter();
                 let _scope = profiling::scope("explain_policy.explain_policy_inputs");
                 let answer = match &question {
                     ExplainPolicyQuestion::Explanation(target) => {
@@ -6938,6 +6985,7 @@ impl SearchToolsService {
             include_stage_timings,
         } = prepared;
         let result = (|| {
+            let snapshot = snapshot.enter();
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
             // The coordinator analyzes this session's project under the policy
             // configuration and activates the policy's semantic sources itself,
@@ -7445,10 +7493,11 @@ fn assemble_session_with_warm(
             std::thread::Builder::new()
                 .name("bifrost-usage-index-warm".to_string())
                 .spawn(move || {
-                    let _attribution =
-                        brokk_bifrost_analysis::analyzer::ReadAttribution::broadcast().install();
-                    let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
-                    snapshot.warm_rust_usage_facts();
+                    brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+                        let _scope =
+                            profiling::scope("mcp_cold.query_index_construction.rust_usage");
+                        snapshot.warm_rust_usage_facts();
+                    })
                 })
                 .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?,
         )
@@ -8824,6 +8873,7 @@ mod watcher_startup_tests {
                 "{value}"
             );
             let snapshot = service.snapshot_for_query().unwrap();
+            let snapshot = snapshot.enter();
             let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
                 brokk_bifrost_go_analysis::analyzer::GoAnalyzer,
             >(snapshot.analyzer())
@@ -8839,13 +8889,14 @@ mod watcher_startup_tests {
         };
         let (initial_snapshot, initial_profile) = resolve();
         let initial_scope = service.snapshot_for_query().unwrap();
-        let initial_context = initial_scope
+        let initial_entry = initial_scope.enter();
+        let initial_context = initial_entry
             .store()
             .unwrap()
             .selected_go_context(&initial_snapshot, &initial_profile)
             .unwrap()
             .unwrap();
-        let initial_digest: Vec<u8> = initial_scope
+        let initial_digest: Vec<u8> = initial_entry
             .store()
             .unwrap()
             .read_conn()
@@ -8856,6 +8907,7 @@ mod watcher_startup_tests {
                 |row| row.get(0),
             )
             .unwrap();
+        drop(initial_entry);
         drop(initial_scope);
         let edited = [2, 3, 4].map(|value| {
             fixture
@@ -8871,7 +8923,8 @@ mod watcher_startup_tests {
         });
         let (latest, profile) = &edited[2];
         let scope = service.snapshot_for_query().unwrap();
-        let conn = scope.store().unwrap().read_conn().unwrap();
+        let entry = scope.enter();
+        let conn = entry.store().unwrap().read_conn().unwrap();
         let (publications, open, context_id, digest): (i64,i64,i64,Vec<u8>) = conn.query_row(
             "SELECT count(*),sum(p.valid_until IS NULL),max(p.context_id),p.input_digest FROM go_context_selections s JOIN go_context_publications p USING(selection_id) WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2 AND s.profile_digest=?3 AND s.derivation_version=?4",
             rusqlite::params![latest.workspace_id.as_str(),latest.generation.get(),profile,brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION],
@@ -9107,8 +9160,9 @@ mod watcher_startup_tests {
         };
         hold.release();
         let request = service.snapshot_for_query_with_cancellation(None).unwrap();
-        assert!(!Arc::ptr_eq(&original, request.arc()));
+        assert!(!request.has_source(&original));
 
+        let request = request.enter();
         // The worker published both profiles, but only the tool profile has
         // live summaries. Native rename checks the request's exact profile,
         // so success proves the handed-off request selected that live summary.
@@ -9175,7 +9229,7 @@ mod watcher_startup_tests {
             Arc::clone(&session.snapshot)
         };
         let request = service.snapshot_for_query_with_cancellation(None).unwrap();
-        assert!(Arc::ptr_eq(&replacement, request.arc()));
+        assert!(request.has_source(&replacement));
     }
 
     #[test]
@@ -10075,6 +10129,24 @@ mod analyzer_failure_boundary_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#7876: an MCP snapshot request lost stale-generation store failures without attribution"
+    )]
+    fn snapshot_request_entry_records_stale_generation_on_its_own_context() {
+        let (_temp, root, service) = multi_language_service();
+        let scope = service.snapshot_for_query().unwrap();
+        make_java_store_stale(&root);
+        let definitions: Vec<_> = scope.enter().analyzer().definitions("Model").collect();
+        assert!(definitions.is_empty(), "the stale store read ran");
+        let error = scope
+            .context
+            .store_error()
+            .expect("request owns the stale failure");
+        assert!(error.is_stale_generation());
+        assert!(scope.finish("stale_snapshot", Ok(())).is_err());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#847: concurrent query scopes must not share SQLite failure state"
     )]
     fn overlapping_query_scopes_do_not_share_store_failures() {
@@ -10085,7 +10157,11 @@ mod analyzer_failure_boundary_tests {
 
         make_java_store_stale(&root);
 
-        let definitions: Vec<_> = failing_scope.analyzer().definitions("Model").collect();
+        let definitions: Vec<_> = failing_scope
+            .enter()
+            .analyzer()
+            .definitions("Model")
+            .collect();
         assert!(definitions.is_empty());
         assert!(failing_scope.context.store_error().is_some());
         assert!(
@@ -10138,7 +10214,7 @@ mod analyzer_failure_boundary_tests {
         );
 
         let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
-        let interactive = service.query_execution_limits(&scope);
+        let interactive = service.query_execution_limits(&scope.enter());
         let defaults = crate::rql::CodeQueryExecutionLimits::default();
         assert_eq!(
             interactive.semantic, defaults.semantic,
@@ -10152,7 +10228,7 @@ mod analyzer_failure_boundary_tests {
 
         let trusted = service
             .with_workspace_scaled_query_limits()
-            .query_execution_limits(&scope);
+            .query_execution_limits(&scope.enter());
         assert!(
             trusted.semantic.rows_per_dimension.is_some(),
             "a trusted host must get the audited workspace's own row table: {:?}",
@@ -11307,6 +11383,160 @@ mod query_protocol_tests {
         assert_eq!(
             after_advance.pointer("/work/semantic/typestate/summary_recomputations"),
             Some(&json!(0))
+        );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_read_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerQueryScope, ReadLedger, capture_query_reads, read_attribution_fallback_count,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#7761: refresh workers recorded project inputs into another analyzer's capture")]
+    fn refresh_does_not_record_into_active_query_captures() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("Factory.java"),
+            "package example; class Before {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("helper.js"), "export function helper() {}\n").unwrap();
+        std::fs::write(root.join("Second.java"), "class Second {}\n").unwrap();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.clone()).unwrap());
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::clone(&project),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            !workspace
+                .analyzer()
+                .get_definitions("example.Before")
+                .is_empty()
+        );
+        let observer = workspace.clone_for_index_warm(Arc::clone(&project));
+        let ledger = Arc::new(ReadLedger::new());
+        let scope = AnalyzerQueryScope::with_read_ledger(observer.analyzer(), Arc::clone(&ledger));
+        let file = ProjectFile::new(root.clone(), "Factory.java");
+        assert!(!project.has_overlay(&file));
+        let expected = ledger.keys();
+        let fallbacks = read_attribution_fallback_count();
+        assert!(
+            !expected.is_empty(),
+            "the shared project's recorder must reach the observer"
+        );
+        std::fs::write(
+            root.join("Factory.java"),
+            "package example; class After {}\n",
+        )
+        .unwrap();
+        let changed = BTreeSet::from([file]);
+        // The observer stays attached for the complete update. This helper
+        // deliberately carries no request frame, as a refresh worker does.
+        let (updated, reads) = capture_query_reads(observer.analyzer(), || {
+            std::thread::scope(|threads| {
+                threads.spawn(|| workspace.update(&changed)).join().unwrap()
+            })
+        });
+        assert!(
+            reads.keys().is_empty(),
+            "maintenance recorded inputs: {:?}",
+            reads.keys()
+        );
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert_eq!(ledger.keys(), expected);
+        let (rebuilt, reads) = capture_query_reads(observer.analyzer(), || updated.update_all());
+        assert!(
+            reads.keys().is_empty(),
+            "full refresh recorded inputs: {:?}",
+            reads.keys()
+        );
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert_eq!(ledger.keys(), expected);
+        // Auto admission is normally requested by a structural query. Mark it
+        // here without filling any index, then exercise the actual warmer's
+        // provider fan-out and its nested parallel file acquisition.
+        use brokk_bifrost_analysis::analyzer::structural::index::{
+            QueryStructuralIndexSession, StructuralIndexAcquisition, StructuralIndexLifecycle,
+        };
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            let session = QueryStructuralIndexSession::default();
+            let providers = rebuilt.analyzer().structural_fact_providers();
+            assert!(!providers.is_empty());
+            for provider in providers {
+                let cache = provider.snapshot_structural_index_cache().unwrap().inner();
+                let content = provider.structural_content_identity().unwrap();
+                session.defer_auto_build(cache, content);
+            }
+            session.publish_auto_observations();
+            assert!(!rebuilt.analyzer().structural_indexes_warm());
+        });
+        let (_, reads) = capture_query_reads(observer.analyzer(), || {
+            // Like refresh above, this independent maintenance worker carries
+            // no query frame while the shared observer's capture stays open.
+            std::thread::scope(|threads| {
+                threads
+                    .spawn(|| rebuilt.analyzer().warm_structural_indexes())
+                    .join()
+                    .unwrap();
+            });
+        });
+        assert!(
+            reads.keys().is_empty(),
+            "structural warm recorded inputs: {:?}",
+            reads.keys()
+        );
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert_eq!(ledger.keys(), expected);
+        brokk_bifrost_analysis::analyzer::without_project_reads(|| {
+            assert!(rebuilt.analyzer().structural_indexes_warm());
+            let mut indexed_files = 0;
+            for provider in rebuilt.analyzer().structural_fact_providers() {
+                let cache = provider.snapshot_structural_index_cache().unwrap().inner();
+                let StructuralIndexAcquisition::Ready {
+                    index, lifecycle, ..
+                } = cache.acquire(provider, &CancellationToken::default())
+                else {
+                    panic!("structural warm must publish a complete index");
+                };
+                assert_eq!(lifecycle, StructuralIndexLifecycle::Hit);
+                indexed_files += index.file_count();
+            }
+            assert!(
+                indexed_files >= 3,
+                "cold acquisition must index all fixture files"
+            );
+        });
+        assert_eq!(ledger.unattributed_reads(), 0);
+        assert_eq!(
+            read_attribution_fallback_count(),
+            fallbacks,
+            "maintenance must not cross an unattributed recorder"
+        );
+        drop(scope);
+        assert!(
+            rebuilt
+                .analyzer()
+                .get_definitions("example.Before")
+                .is_empty()
+        );
+        assert!(
+            !rebuilt
+                .analyzer()
+                .get_definitions("example.After")
+                .is_empty()
+        );
+        let (_, reads) = capture_query_reads(observer.analyzer(), || {
+            assert!(!project.has_overlay(changed.first().unwrap()));
+        });
+        assert!(
+            !reads.keys().is_empty(),
+            "ordinary query recording must resume after refresh"
         );
     }
 }

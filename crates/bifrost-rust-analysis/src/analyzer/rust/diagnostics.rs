@@ -150,19 +150,9 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::model::SemanticDiagnosticReportStatus;
 
-    use brokk_bifrost_core::analyzer::project::TestProject;
-    use tempfile::tempdir;
-
+    #[track_caller]
     fn rust_project(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
-        let temp = tempdir().unwrap();
-        for (path, contents) in files {
-            ProjectFile::new(temp.path().to_path_buf(), path)
-                .write(*contents)
-                .unwrap();
-        }
-        let project = TestProject::new(temp.path().to_path_buf(), Language::Rust);
-        let analyzer = RustAnalyzer::from_project(project);
-        (temp, analyzer)
+        crate::analyzer::rust::test_support::lazy_project(files)
     }
 
     fn report_for(

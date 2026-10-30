@@ -10,6 +10,8 @@
 //! Unsupported or ambiguous shapes are recorded gaps that leave membership
 //! unproven, never a complete absence.
 
+use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
+
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 use brokk_bifrost_analysis::analyzer::common::local_xml_name;
@@ -898,6 +900,7 @@ impl CSharpAnalyzer {
     /// `Some(None)` when the revision has no valid selection; `None` after a
     /// store error, which is recorded.
     fn selected_compilations(&self) -> Option<Option<SelectedCSharpCompilations<'_>>> {
+        self.compilation_authority_inputs();
         let snapshots = self.inner.selected_workspace_snapshots();
         let Some(snapshot) = snapshots.get(csharp_compilation::STORAGE_LANGUAGE) else {
             return Some(None);
@@ -1061,22 +1064,33 @@ impl CSharpAnalyzer {
     /// inventory, a failed listing, a capped or unreadable configuration
     /// file) publishes nothing, and the next lookup retries.
     pub(crate) fn compilation_config_digest(&self) -> Option<StableDigest> {
-        self.memo_caches
-            .compilation_config_digest
-            .get_or_try_build_on_dedicated_pool(|| {
-                let inventory =
+        self.memo_caches.compilation_config_digest.read(
+            &memo_attribution(self),
+            |cell| {
+                cell.get_or_try_build_on_dedicated_pool(|| {
+                    let inventory =
                     brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer::source_file_inventory(
                         &self.inner,
                     );
-                if !inventory.complete {
-                    return Err(());
-                }
-                let project = self.inner.project();
-                let workspace_files = project.all_files_shared().map_err(drop)?;
-                read_config_digest(project, &workspace_files).ok_or(())
-            })
-            .ok()
-            .map(|digest| *digest)
+                    if !inventory.complete {
+                        return Err(());
+                    }
+                    let project = self.inner.project();
+                    let workspace_files = project.all_files_shared().map_err(drop)?;
+                    read_config_digest(project, &workspace_files).ok_or(())
+                })
+                .ok()
+                .map(|digest| *digest)
+            },
+            |answer| match answer {
+                Some(answer) => AuthorityInputs::Fact {
+                    language: Language::CSharp,
+                    subject: brokk_bifrost_analysis::analyzer::read_ledger::FactSubject::Whole,
+                    answer: *answer,
+                },
+                None => AuthorityInputs::Unnamed,
+            },
+        )
     }
 }
 
@@ -2090,6 +2104,63 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_membership_answers_keep_the_request_capture_on_memo_hits() {
+        use brokk_bifrost_analysis::analyzer::{
+            FactSubject, LookupQuestion, ReadKey, WorkspaceFactFamily, capture_query_reads,
+        };
+        use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
+        use brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource;
+
+        let (_root, project, _files, analyzer) = analyzed(&[
+            ("App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+            ("Caller.cs", "public class Caller {}"),
+            ("Declared.cs", "public class Declared {}"),
+        ]);
+        let reference = file(&project, "Caller.cs");
+        let declaring = file(&project, "Declared.cs");
+        let unit = analyzer
+            .declarations(&declaring)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("declared class");
+
+        // Graph scanners borrow the request's source and build a fresh view
+        // per scan. Repeat with a warm analyzer but a new request capture.
+        for _ in 0..2 {
+            let (_, reads) = capture_query_reads(&analyzer, || {
+                let membership = MembershipScopedSource::new(&analyzer, &reference);
+                assert!(membership.admit(&unit));
+                // This answer is served by the view's CaptureScopedMemo.
+                assert!(membership.admit(&unit));
+                assert_eq!(membership.doubt(), 0);
+            });
+            assert_eq!(reads.unattributed_reads(), 0);
+            let keys = reads.keys();
+            assert!(
+                keys.iter().any(|key| matches!(
+                    key,
+                    ReadKey::Lookup {
+                        question: LookupQuestion::WorkspaceFact {
+                            family: WorkspaceFactFamily::CSharpCompilationConfiguration,
+                            language: Language::CSharp,
+                            subject: FactSubject::Whole,
+                        },
+                        ..
+                    }
+                )),
+                "membership must retain its selected configuration authority: {keys:?}"
+            );
+            assert!(
+                keys.iter().any(|key| matches!(
+                    key,
+                    ReadKey::Scope { languages, .. } if languages.as_ref() == [Language::CSharp]
+                )),
+                "membership must retain the source inventory containing Declared.cs: {keys:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sibling_projects_scope_global_using_sources() {
         let (_root, project, analyzed, analyzer) = analyzed(&[
             ("A/A.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
@@ -2690,7 +2761,13 @@ mod tests {
             );
         }
         assert_eq!(project.workspace_file_listing_count(), listings);
-        assert!(analyzer.memo_caches.compilation_config_digest.is_ready());
+        assert!(
+            analyzer
+                .memo_caches
+                .compilation_config_digest
+                .account(|cell| usize::from(cell.is_ready()))
+                == 1
+        );
     }
 
     /// Delegates to a disk project but leaves `ignored` out of its listings,

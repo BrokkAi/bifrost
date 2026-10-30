@@ -102,13 +102,13 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::hash::HashSet;
 
 use brokk_bifrost_core::text_utils::compute_line_starts;
+use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 
 use brokk_bifrost_core::analyzer::go_facts::GoSourceTypeShape;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionCallableReceiverOrigin, ResolutionNamespace, ResolutionSiteKind,
 };
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
-use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -1213,12 +1213,11 @@ impl<'analyzer> GoSelectedReferenceFile<'analyzer> {
             "selected Go reference range must fit indexed source: {start_byte}..{end_byte} of {}",
             self.source_len,
         );
-        Range {
+        brokk_bifrost_core::analyzer::semantic_diagnostics::range_for_byte_span(
+            &self.line_starts,
             start_byte,
             end_byte,
-            start_line: find_line_index_for_offset(&self.line_starts, start_byte) + 1,
-            end_line: find_line_index_for_offset(&self.line_starts, end_byte.saturating_sub(1)) + 1,
-        }
+        )
     }
 }
 
@@ -1489,15 +1488,31 @@ func externalTest() {
 }
 "#;
 
+    #[track_caller]
     fn fixture() -> (BuiltInlineTestProject, GoAnalyzer) {
-        let fixture = InlineTestProject::with_language(Language::Go)
-            .file("go.mod", "module example.test/native\n\ngo 1.22\n")
-            .file(MODEL, MODEL_SOURCE)
-            .file(CLIENT, CLIENT_SOURCE)
-            .file(NAMED, NAMED_SOURCE)
-            .file(DOT, DOT_SOURCE)
-            .file(EXTERNAL, EXTERNAL_SOURCE)
-            .build();
+        go_fixture(
+            "example.test/native",
+            &[
+                (MODEL, MODEL_SOURCE),
+                (CLIENT, CLIENT_SOURCE),
+                (NAMED, NAMED_SOURCE),
+                (DOT, DOT_SOURCE),
+                (EXTERNAL, EXTERNAL_SOURCE),
+            ],
+        )
+    }
+
+    #[track_caller]
+    fn go_fixture(
+        module_path: &str,
+        files: &[(&str, &str)],
+    ) -> (BuiltInlineTestProject, GoAnalyzer) {
+        let mut builder = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", format!("module {module_path}\n\ngo 1.22\n"));
+        for (path, source) in files {
+            builder = builder.file(*path, *source);
+        }
+        let fixture = builder.build();
         let analyzer = GoAnalyzer::new(fixture.project_dyn());
         persist_selected_go_sources(&analyzer);
         (fixture, analyzer)
@@ -1581,16 +1596,12 @@ func externalTest() {
         assert_eq!(hits[0].proof, UsageProof::Unproven);
     }
 
+    #[track_caller]
     fn persist_selected_go_sources(analyzer: &GoAnalyzer) {
-        for file in analyzer.get_analyzed_files() {
-            assert!(
-                analyzer
-                    .inner
-                    .write_live_file_to_store_for_test(&file)
-                    .is_some(),
-                "persist Go resolution facts for {file}"
-            );
-        }
+        crate::analyzer::go::persist_analyzed_go_files_for_test(
+            analyzer,
+            "persist Go resolution facts for",
+        );
         analyzer
             .refresh_source_inventory()
             .expect("publish and reconcile the Go fixture's final source-inventory generation");
@@ -1617,16 +1628,9 @@ func externalTest() {
             .unwrap_or_else(|| panic!("missing Go declaration {name} in {path}"))
     }
 
+    #[track_caller]
     fn transitive_fixture(files: &[(&str, &str)]) -> (BuiltInlineTestProject, GoAnalyzer) {
-        let mut builder = InlineTestProject::with_language(Language::Go)
-            .file("go.mod", "module example.test/transitive\n\ngo 1.22\n");
-        for (path, source) in files {
-            builder = builder.file(*path, *source);
-        }
-        let fixture = builder.build();
-        let analyzer = GoAnalyzer::new(fixture.project_dyn());
-        persist_selected_go_sources(&analyzer);
-        (fixture, analyzer)
+        go_fixture("example.test/transitive", files)
     }
 
     fn inverse(analyzer: &GoAnalyzer, target: &CodeUnit) -> EdgeDerivationResult {

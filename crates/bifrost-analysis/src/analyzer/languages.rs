@@ -112,6 +112,14 @@ impl SavedDefaultFunction {
         }
     }
 
+    pub fn path(&self) -> &WorkspaceRelativePath {
+        &self.path
+    }
+
+    pub fn declaration_start_byte(&self) -> u32 {
+        self.declaration_start_byte
+    }
+
     fn from_locator(locator: &SemanticLocator) -> Self {
         let segment = locator
             .declaration()
@@ -140,6 +148,7 @@ pub struct SavedDefaultArgumentSafety {
     keyword_only_workspace_open: bool,
     positional_functions_open: HashSet<SavedDefaultFunction>,
     keyword_only_functions_open: HashSet<SavedDefaultFunction>,
+    fact_fingerprint: Option<StableDigest>,
 }
 
 impl SavedDefaultArgumentSafety {
@@ -167,6 +176,7 @@ impl SavedDefaultArgumentSafety {
 
     #[doc(hidden)]
     pub fn mark_workspace_open(&mut self, kind: SavedDefaultKind) {
+        self.fact_fingerprint = None;
         let (open, functions) = self.kind_evidence_mut(kind);
         *open = true;
         // Release the allocation, rather than retaining a redundant set.
@@ -196,6 +206,7 @@ impl SavedDefaultArgumentSafety {
         kind: SavedDefaultKind,
         max_functions: usize,
     ) {
+        self.fact_fingerprint = None;
         let (open, functions) = self.kind_evidence_mut(kind);
         if *open || functions.contains(&function) {
             return;
@@ -228,7 +239,51 @@ impl SavedDefaultArgumentSafety {
         }
     }
 
-    pub(crate) fn fingerprint(&self) -> StableDigest {
+    /// The bounded set that needs stable declaration identities for the Fact.
+    pub fn open_functions(&self) -> impl Iterator<Item = &SavedDefaultFunction> {
+        self.positional_functions_open
+            .iter()
+            .chain(&self.keyword_only_functions_open)
+    }
+
+    /// Complete the whole-value Fact once, after the bounded survey finishes.
+    /// The callback translates source positions to structural identities.
+    pub fn finalize_fact_fingerprint(
+        &mut self,
+        identity: impl Fn(&SavedDefaultFunction) -> Option<StableDigest>,
+    ) -> Option<()> {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-python-saved-default-fact/v1");
+        digest.push(&[
+            u8::from(self.positional_workspace_open),
+            u8::from(self.keyword_only_workspace_open),
+        ]);
+        for (label, functions) in [
+            (b"positional".as_slice(), &self.positional_functions_open),
+            (
+                b"keyword-only".as_slice(),
+                &self.keyword_only_functions_open,
+            ),
+        ] {
+            digest.push(label);
+            let mut identities = functions
+                .iter()
+                .map(&identity)
+                .collect::<Option<Vec<_>>>()?;
+            identities.sort_unstable();
+            for identity in identities {
+                digest.push(identity.as_bytes());
+            }
+        }
+        self.fact_fingerprint = Some(digest.finish());
+        Some(())
+    }
+
+    pub fn fact_fingerprint(&self) -> StableDigest {
+        self.fact_fingerprint
+            .expect("saved-default Fact requires the complete survey")
+    }
+
+    pub fn fingerprint(&self) -> StableDigest {
         let mut digest = LengthDelimitedDigest::new(b"bifrost-python-saved-default-safety/v1");
         digest.push(&[
             u8::from(self.positional_workspace_open),
@@ -1064,6 +1119,26 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_point_batch(
+        &self,
+        _analyzer: &dyn crate::analyzer::IAnalyzer,
+        _file: crate::analyzer::ProjectFile,
+        _source: std::sync::Arc<str>,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Option<crate::analyzer::native_points::NativePointBatch> {
+        None
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn trial_definition_in_batch(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+        _batch: Option<&crate::analyzer::native_points::NativePointBatch>,
+    ) -> Option<crate::analyzer::usages::get_definition::DefinitionResolution> {
+        self.trial_definition(query)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn definition_lexical_site<'a>(
         &self,
@@ -1502,6 +1577,23 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    /// The head's answer to one `WorkspaceFact` question about a workspace
+    /// authority this language owns, as the digest the capture recorded.
+    ///
+    /// Read-set verification asks it again on the head and compares digests,
+    /// so the answer must be computed the same way the recording site computed
+    /// it. `None` means this language cannot answer the question, which
+    /// invalidates the recorded key; that is the default for every family.
+    fn workspace_fact_answer(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _family: crate::analyzer::semantic::read_ledger::WorkspaceFactFamily,
+        _language: Language,
+        _subject: &crate::analyzer::semantic::read_ledger::FactSubject,
+    ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+        None
+    }
+
     /// Prove the initializer and reference census for a package-scope
     /// callable value. `None` means the rule does not apply or its language
     /// analyzer is unavailable; `Some(Err(_))` preserves a structured reason
@@ -1800,6 +1892,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _tree: &tree_sitter::Tree,
         _callee_range: &Range,
         _cancellation: Option<&CancellationToken>,
+        _member_selection: Option<&crate::analyzer::semantic::DeferredMemberSelection>,
     ) {
     }
 

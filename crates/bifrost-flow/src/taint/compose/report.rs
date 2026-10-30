@@ -82,7 +82,12 @@ pub(super) fn build_report<Provider: CompositionProvider>(
         let mut by_source: Vec<(ComposedSourceId, Vec<&LabeledPath>)> = Vec::new();
         for path in &paths {
             classes = classes.union(&path.reached);
-            qualities.insert(path_quality(path.quality));
+            if path.quality.proven && path.quality.complete && !path.quality.is_certain() {
+                qualities.insert(PathQuality::PROVEN_PARTIAL);
+                qualities.insert(PathQuality::UNPROVEN_COMPLETE);
+            } else {
+                qualities.insert(path_quality(path.quality));
+            }
             match by_source
                 .iter_mut()
                 .find(|(source, _)| *source == path.source)
@@ -339,6 +344,15 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
             };
             let kind = if matches!(hop, Hop::Caller { .. }) {
                 IcfgEdgeKind::Call
+            } else if matches!(
+                hop,
+                Hop::Callee {
+                    from:
+                        crate::analyzer::semantic::partial_flow::PartialFlowPort::ExceptionalReturn,
+                    ..
+                }
+            ) {
+                IcfgEdgeKind::ExceptionalReturn
             } else {
                 IcfgEdgeKind::NormalReturn
             };
@@ -349,7 +363,14 @@ impl<Provider: CompositionProvider> WitnessBuilder<'_, Provider> {
                 hop.quality(),
             ));
         }
-        let quality = path_quality(path.quality);
+        // Reconstruction follows the proven derivation when there is one.
+        // Completeness supplied only by another alternative does not make
+        // that retained path certain.
+        let quality = if path.quality.proven && !path.quality.is_certain() {
+            PathQuality::PROVEN_PARTIAL
+        } else {
+            path_quality(path.quality)
+        };
         let retained_bytes = std::mem::size_of::<SummaryWitness>()
             .saturating_add(std::mem::size_of_val(steps.as_slice()));
         let emitted = steps.len();

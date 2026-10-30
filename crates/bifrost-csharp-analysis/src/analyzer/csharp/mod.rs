@@ -12,6 +12,13 @@
 pub fn trial_native_csharp_selected() -> bool {
     std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_some()
 }
+use brokk_bifrost_analysis::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    WorkspaceAuthorityMemo, record_workspace_authority_read,
+};
+use brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest;
+
+use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
 
 use brokk_bifrost_analysis::{
     delegate_inner_methods, delegate_inner_procedure_fact_methods,
@@ -37,6 +44,8 @@ mod imports;
 mod semantic;
 mod structural;
 mod test_classification;
+#[cfg(test)]
+mod workspace_facts;
 
 use brokk_bifrost_core::analyzer::model::Range;
 
@@ -189,10 +198,6 @@ use crate::analyzer::csharp::external::CSharpExternalDeclarationIndex;
 
 use crate::analyzer::csharp::external::CSharpExternalDeclarations;
 
-use crate::analyzer::csharp::external::CSharpExternalMember;
-
-use crate::analyzer::csharp::external::CSharpExternalType;
-
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 
 pub use crate::analyzer::csharp::catch_facts::CSharpCatchFacts;
@@ -214,17 +219,18 @@ fn cached_file_value<T: Clone + Send + Sync + 'static>(
     if let Some(cached) = cache.get(file) {
         return (*cached).clone();
     }
-    match cache.try_get_with_by_ref(file, || {
-        brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
-            Arc::new(compute())
+    let value =
+        brokk_bifrost_analysis::analyzer::common::query_cache_moka(analyzer, cache, file, || {
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
+                Arc::new(compute())
+            })
         })
-    }) {
-        Ok(value) => (*value).clone(),
-        Err(value) => (**value).clone(),
-    }
+        .unwrap_or_else(|value| Arc::clone(value.as_ref()));
+    (*value).clone()
 }
 
 fn cached_limited_query_rows<T>(
+    analyzer: &dyn IAnalyzer,
     cached: impl FnOnce() -> Option<LimitedQueryRows<T>>,
     compute: impl FnOnce() -> LimitedQueryRows<T>,
     cache_complete: impl FnOnce(&[T]),
@@ -232,19 +238,30 @@ fn cached_limited_query_rows<T>(
     if let Some(rows) = cached() {
         return rows;
     }
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
     let batch = compute();
-    if batch.complete {
+    if batch.complete && scope.captured_read_incompleteness().is_empty() {
         cache_complete(&batch.rows);
     }
     batch
 }
+
+type CSharpExternalIndexMemo = WorkspaceAuthorityMemo<
+    Arc<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+            brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
+                Arc<CSharpExternalDeclarationIndex>,
+            >,
+        >,
+    >,
+>;
 
 #[derive(Clone)]
 pub struct CSharpAnalyzer {
     inner: TreeSitterAnalyzer<CSharpAdapter>,
     memo_caches: Arc<CSharpMemoCaches>,
     csharp_config: CSharpAnalyzerConfig,
-    external_index: Arc<std::sync::OnceLock<CSharpExternalDeclarationIndex>>,
+    external_index: Arc<CSharpExternalIndexMemo>,
 }
 
 impl_forward_query_provider!(CSharpAnalyzer);
@@ -254,18 +271,18 @@ impl CSharpAnalyzer {
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        Self {
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| Self {
             inner: self.inner.update_all_with_progress(progress),
             memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
             csharp_config: self.csharp_config.clone(),
-            external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+            external_index: Self::empty_external_index(),
+        })
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone_for_index_warm(project);
         clone.memo_caches = Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes()));
-        clone.external_index = Arc::new(std::sync::OnceLock::new());
+        clone.external_index = Self::empty_external_index();
         clone
     }
 
@@ -286,7 +303,7 @@ impl CSharpAnalyzer {
             inner: TreeSitterAnalyzer::new_with_config(project, CSharpAdapter, config),
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
             csharp_config,
-            external_index: Arc::new(std::sync::OnceLock::new()),
+            external_index: Self::empty_external_index(),
         }
     }
 
@@ -309,7 +326,7 @@ impl CSharpAnalyzer {
             inner,
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
             csharp_config,
-            external_index: Arc::new(std::sync::OnceLock::new()),
+            external_index: Self::empty_external_index(),
         })
     }
 
@@ -367,17 +384,22 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
-        let key = namespace.to_string();
-        self.memo_caches
-            .namespace_exists
-            .get_or_try_build(&key, || {
-                #[cfg(any(test, feature = "test-support"))]
-                self.memo_caches
-                    .namespace_exists_build_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.inner.try_persisted_package_may_exist(namespace)
-            })
-            .is_none_or(|exists| *exists)
+        self.memo_caches.namespace_exists.read(
+            &memo_attribution(self),
+            |namespace_exists_memo| {
+                let key = namespace.to_string();
+                namespace_exists_memo
+                    .get_or_try_build(self, &key, || {
+                        #[cfg(any(test, feature = "test-support"))]
+                        self.memo_caches
+                            .namespace_exists_build_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.inner.try_persisted_package_may_exist(namespace)
+                    })
+                    .is_none_or(|exists| *exists)
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     fn persisted_declaration_candidates_by_fqn_cached(
@@ -385,25 +407,30 @@ impl CSharpAnalyzer {
         fqn: &str,
         normalized: bool,
     ) -> BTreeSet<CodeUnit> {
-        let key = PersistedFqnLookup {
-            name: if normalized {
-                csharp_normalize_full_name(fqn)
-            } else {
-                fqn.to_string()
+        self.memo_caches.persisted_fqn_candidates.read(
+            &memo_attribution(self),
+            |persisted_fqn_candidates_memo| {
+                let key = PersistedFqnLookup {
+                    name: if normalized {
+                        csharp_normalize_full_name(fqn)
+                    } else {
+                        fqn.to_string()
+                    },
+                    normalized,
+                };
+                persisted_fqn_candidates_memo
+                    .get_or_try_build(self, &key, || {
+                        #[cfg(any(test, feature = "test-support"))]
+                        self.memo_caches
+                            .persisted_fqn_candidate_build_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.inner
+                            .try_lookup_declarations_by_persisted_fqn(&key.name, key.normalized)
+                    })
+                    .map_or_else(BTreeSet::new, |candidates| (*candidates).clone())
             },
-            normalized,
-        };
-        self.memo_caches
-            .persisted_fqn_candidates
-            .get_or_try_build(&key, || {
-                #[cfg(any(test, feature = "test-support"))]
-                self.memo_caches
-                    .persisted_fqn_candidate_build_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.inner
-                    .try_lookup_declarations_by_persisted_fqn(&key.name, key.normalized)
-            })
-            .map_or_else(BTreeSet::new, |candidates| (*candidates).clone())
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -435,9 +462,15 @@ impl CSharpAnalyzer {
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
-        cached_file_value(self, &self.memo_caches.namespace_by_file, file, || {
-            graph_support::compute_namespace_of_file(self, file)
-        })
+        self.memo_caches.namespace_by_file.read(
+            &memo_attribution(self),
+            |namespace_by_file_memo| {
+                cached_file_value(self, namespace_by_file_memo, file, || {
+                    graph_support::compute_namespace_of_file(self, file)
+                })
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     /// The bounded twin of [`Self::namespace_of_file`], sharing its memo cell.
@@ -448,43 +481,50 @@ impl CSharpAnalyzer {
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<String> {
-        if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
-            return limited_known_rows(1, std::iter::once((*cached).clone()), limit);
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
-            );
-        let batch = graph_support::compute_namespace_of_file_limited(self, file, limit);
-        if batch.complete {
-            let namespace = batch.rows.first().cloned().unwrap_or_default();
-            {
-                let cache_key = file.clone();
-                let cache_value = Arc::new(namespace);
-                persistent_fill_guard.installed("namespace_by_file");
-                self.memo_caches
-                    .namespace_by_file
-                    .insert(cache_key, cache_value);
-            };
-        }
-        batch
+        self.memo_caches.namespace_by_file.read(
+            &memo_attribution(self),
+            |namespace_by_file_memo| {
+                if let Some(cached) = namespace_by_file_memo.get(file) {
+                    return limited_known_rows(1, std::iter::once((*cached).clone()), limit);
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let batch = graph_support::compute_namespace_of_file_limited(self, file, limit);
+                if batch.complete {
+                    let namespace = batch.rows.first().cloned().unwrap_or_default();
+                    if cache_fill.is_complete() {
+                        namespace_by_file_memo.insert(file.clone(), Arc::new(namespace));
+                    }
+                }
+                batch
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
-    pub fn external_declaration_index(&self) -> &CSharpExternalDeclarationIndex {
-        self.external_index.get_or_init(|| {
-            let value = CSharpExternalDeclarationIndex::build_for_project(
-                &self.csharp_config,
-                self.inner.project(),
-            );
-            if !value.is_complete() || !value.production_diagnostics().is_empty() {
-                self.record_degraded_persistent_fill(
-                    "csharp.external_index",
-                    &format!("provider:{:?}", value.production_diagnostics()),
-                );
-            }
-            value
-        })
+    // Installed assemblies and NuGet cache contents have no verifier input
+    // identity yet. Both a build and a retained hit must refuse unit reuse.
+    pub fn external_declaration_index(&self) -> Arc<CSharpExternalDeclarationIndex> {
+        self.external_index.read(
+            &memo_attribution(self),
+            |cell| {
+                brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
+                    self,
+                    cell,
+                    || {
+                        let value = CSharpExternalDeclarationIndex::build_for_project(
+                            &self.csharp_config,
+                            self.inner.project(),
+                        );
+                        for diagnostic in value.production_diagnostics() {
+                            self.record_query_incomplete(brokk_bifrost_analysis::analyzer::common::external_index_incompleteness(diagnostic));
+                        }
+                        Arc::new(value)
+                    },
+                )
+            },
+            |_| AuthorityInputs::Unnamed,
+        )
     }
 
     /// The assembly declaration index *if an earlier pass already built it*.
@@ -495,7 +535,11 @@ impl CSharpAnalyzer {
     /// ladder peeks here instead and treats an unbuilt index as an unknown
     /// boundary rather than a reason to go and build one.
     pub(crate) fn retained_external_index(&self) -> Option<&CSharpExternalDeclarationIndex> {
-        self.external_index.get()
+        self.external_index.read(
+            &memo_attribution(self),
+            |cell| cell.get().map(|entry| entry.replay().as_ref()),
+            |_| AuthorityInputs::Unnamed,
+        )
     }
 
     pub fn external_type_candidates(
@@ -503,12 +547,13 @@ impl CSharpAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
         reference: &str,
-    ) -> Vec<&CSharpExternalType> {
-        self.external_declaration_index().resolve_in_file(
-            reference,
-            &self.namespace_of_file(file),
-            &self.using_namespaces_of(token, file),
-            &self.using_aliases_of(token, file),
+    ) -> external::CSharpTypeCandidates {
+        external::CSharpTypeCandidates::new(
+            self.external_declaration_index(),
+            reference.to_owned(),
+            self.namespace_of_file(file),
+            self.using_namespaces_of(token, file),
+            self.using_aliases_of(token, file),
         )
     }
 
@@ -542,7 +587,7 @@ impl CSharpAnalyzer {
             (Some(_), _) => return (BoundaryStatus::ExternalIndexed, None),
             (None, _) => {}
         }
-        let index = self.external_declaration_index();
+        let index = candidates.index();
         if !index.is_complete() || !index.production_diagnostics().is_empty() {
             return (BoundaryStatus::ExternalDeclaredUnindexed, None);
         }
@@ -570,8 +615,12 @@ impl CSharpAnalyzer {
         &self,
         owner: &str,
         name: &str,
-    ) -> Vec<&CSharpExternalMember> {
-        self.external_declaration_index().members_named(owner, name)
+    ) -> external::CSharpMemberCandidates {
+        external::CSharpMemberCandidates::new(
+            self.external_declaration_index(),
+            owner.to_owned(),
+            name.to_owned(),
+        )
     }
 
     /// The external declaration surface C# resolution reads: this analyzer's
@@ -685,24 +734,22 @@ impl CSharpAnalyzer {
     }
 
     pub fn using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
-        if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
-            );
-        let namespaces = graph_support::compute_using_namespaces_of(self, token, file);
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::new(namespaces.clone());
-            persistent_fill_guard.installed("using_namespaces");
-            self.memo_caches
-                .using_namespaces
-                .insert(cache_key, cache_value);
-        };
-        namespaces
+        self.memo_caches.using_namespaces.read(
+            &memo_attribution(self),
+            |using_namespaces_memo| {
+                if let Some(cached) = using_namespaces_memo.get(file) {
+                    return (*cached).clone();
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let namespaces = graph_support::compute_using_namespaces_of(self, token, file);
+                if cache_fill.is_complete() {
+                    using_namespaces_memo.insert(file.clone(), Arc::new(namespaces.clone()));
+                }
+                namespaces
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     pub(crate) fn using_namespaces_of_limited(
@@ -712,32 +759,28 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<String> {
-        if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
-            return limited_known_rows(cached.len(), cached.iter().cloned(), limit);
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
-            );
-        let batch = graph_support::compute_using_namespaces_of_limited(
-            self,
-            token,
-            file,
-            limit,
-            &mut continue_query,
-        );
-        if batch.complete {
-            {
-                let cache_key = file.clone();
-                let cache_value = Arc::new(batch.rows.clone());
-                persistent_fill_guard.installed("using_namespaces");
-                self.memo_caches
-                    .using_namespaces
-                    .insert(cache_key, cache_value);
-            };
-        }
-        batch
+        self.memo_caches.using_namespaces.read(
+            &memo_attribution(self),
+            |using_namespaces_memo| {
+                if let Some(cached) = using_namespaces_memo.get(file) {
+                    return limited_known_rows(cached.len(), cached.iter().cloned(), limit);
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let batch = graph_support::compute_using_namespaces_of_limited(
+                    self,
+                    token,
+                    file,
+                    limit,
+                    &mut continue_query,
+                );
+                if batch.complete && cache_fill.is_complete() {
+                    using_namespaces_memo.insert(file.clone(), Arc::new(batch.rows.clone()));
+                }
+                batch
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     pub fn using_aliases_of(
@@ -745,24 +788,22 @@ impl CSharpAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<HashMap<String, String>> {
-        if let Some(cached) = self.memo_caches.using_aliases.get(file) {
-            return cached;
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-csharp-analysis/src/analyzer/csharp/mod.rs",
-            );
-        let aliases = Arc::new(graph_support::compute_using_aliases_of(self, token, file));
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::clone(&aliases);
-            persistent_fill_guard.installed("using_aliases");
-            self.memo_caches
-                .using_aliases
-                .insert(cache_key, cache_value);
-        };
-        aliases
+        self.memo_caches.using_aliases.read(
+            &memo_attribution(self),
+            |using_aliases_memo| {
+                if let Some(cached) = using_aliases_memo.get(file) {
+                    return cached;
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let aliases = Arc::new(graph_support::compute_using_aliases_of(self, token, file));
+                if cache_fill.is_complete() {
+                    using_aliases_memo.insert(file.clone(), Arc::clone(&aliases));
+                }
+                aliases
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     pub(crate) fn using_aliases_of_limited(
@@ -772,42 +813,56 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)> {
-        let cache = &self.memo_caches.using_aliases;
-        cached_limited_query_rows(
-            || {
-                cache.get(file).map(|cached| {
-                    limited_known_rows(
-                        cached.len(),
-                        cached
-                            .iter()
-                            .map(|(alias, target)| (alias.clone(), target.clone())),
-                        limit,
-                    )
-                })
-            },
-            || {
-                graph_support::compute_using_aliases_of_limited(
+        self.memo_caches.using_aliases.read(
+            &memo_attribution(self),
+            |using_aliases_memo| {
+                let cache = using_aliases_memo;
+                cached_limited_query_rows(
                     self,
-                    token,
-                    file,
-                    limit,
-                    &mut continue_query,
+                    || {
+                        cache.get(file).map(|cached| {
+                            limited_known_rows(
+                                cached.len(),
+                                cached
+                                    .iter()
+                                    .map(|(alias, target)| (alias.clone(), target.clone())),
+                                limit,
+                            )
+                        })
+                    },
+                    || {
+                        graph_support::compute_using_aliases_of_limited(
+                            self,
+                            token,
+                            file,
+                            limit,
+                            &mut continue_query,
+                        )
+                    },
+                    |rows| {
+                        cache.insert(file.clone(), Arc::new(rows.iter().cloned().collect()));
+                    },
                 )
             },
-            |rows| {
-                cache.insert(file.clone(), Arc::new(rows.iter().cloned().collect()));
-            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
         )
     }
 
-    pub(crate) fn global_using_namespaces(&self, token: QueryToken<'_>) -> &HashSet<String> {
-        self.memo_caches.global_using_namespaces.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "csharp.global_using_namespaces",
-                || graph_support::compute_global_using_namespaces(self, token),
-            )
-        })
+    pub(crate) fn global_using_namespaces(
+        &self,
+        token: QueryToken<'_>,
+    ) -> std::sync::Arc<HashSet<String>> {
+        self.memo_caches.global_using_namespaces.read(
+            &memo_attribution(self),
+            |global_using_namespaces_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    global_using_namespaces_memo,
+                    || graph_support::compute_global_using_namespaces(self, token),
+                )
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     pub(crate) fn global_using_namespaces_limited(
@@ -815,34 +870,100 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<String> {
-        let cache = &self.memo_caches.global_using_namespaces;
-        cached_limited_query_rows(
-            || {
-                cache
-                    .get()
-                    .map(|cached| limited_known_rows(cached.len(), cached.iter().cloned(), limit))
-            },
-            || {
-                graph_support::compute_global_using_namespaces_limited(
+        self.memo_caches.global_using_namespaces.read(
+            &memo_attribution(self),
+            |global_using_namespaces_memo| {
+                let cache = global_using_namespaces_memo;
+                cached_limited_query_rows(
                     self,
-                    limit,
-                    &mut continue_query,
+                    || {
+                        cache.get().map(|cached| {
+                            limited_known_rows(cached.len(), cached.iter().cloned(), limit)
+                        })
+                    },
+                    || {
+                        graph_support::compute_global_using_namespaces_limited(
+                            self,
+                            limit,
+                            &mut continue_query,
+                        )
+                    },
+                    |rows| {
+                        cache.get_or_init(|| Arc::new(rows.iter().cloned().collect()));
+                    },
                 )
             },
-            |rows| {
-                cache.get_or_init(|| rows.iter().cloned().collect());
-            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
         )
     }
 
-    fn global_using_aliases(&self, token: QueryToken<'_>) -> &HashMap<String, String> {
-        self.memo_caches.global_using_aliases.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+    fn empty_external_index() -> Arc<CSharpExternalIndexMemo> {
+        Arc::new(WorkspaceAuthorityMemo::new(
+            WorkspaceFactFamily::CSharpExternalDeclarations,
+            Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new()),
+        ))
+    }
+
+    fn global_alias_inputs(aliases: &HashMap<String, String>) -> AuthorityInputs<'static> {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+        let mut rows: Vec<_> = aliases.iter().collect();
+        rows.sort_unstable();
+        let mut digest = CanonicalHasher::new(b"csharp-global-using-aliases-v1");
+        for (alias, target) in rows {
+            digest.value(alias.as_bytes());
+            digest.value(target.as_bytes());
+        }
+        AuthorityInputs::Fact {
+            language: Language::CSharp,
+            subject: FactSubject::Whole,
+            answer: StableDigest::from_array(digest.finish()),
+        }
+    }
+
+    fn complete_global_alias_inputs(&self) -> AuthorityInputs<'static> {
+        let scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(self);
+        Self::global_alias_inputs(&self.global_using_aliases(scope.token()))
+    }
+
+    /// Membership also depends on the complete MSBuild input inventory. The
+    /// configuration fact detects new and removed project/props/targets paths,
+    /// including previously absent implicit imports; source Scope alone cannot.
+    fn compilation_authority_inputs(&self) -> AuthorityInputs<'static> {
+        if let Some(answer) = self.compilation_config_digest() {
+            record_workspace_authority_read(
                 self,
-                "csharp.global_using_aliases",
-                || graph_support::compute_global_using_aliases(self, token),
-            )
-        })
+                WorkspaceFactFamily::CSharpCompilationConfiguration,
+                AuthorityInputs::Fact {
+                    language: Language::CSharp,
+                    subject: FactSubject::Whole,
+                    answer,
+                },
+            );
+        } else {
+            record_workspace_authority_read(
+                self,
+                WorkspaceFactFamily::CSharpCompilationConfiguration,
+                AuthorityInputs::Unnamed,
+            );
+        }
+        AuthorityInputs::SourceOf(&[Language::CSharp])
+    }
+
+    fn global_using_aliases(
+        &self,
+        token: QueryToken<'_>,
+    ) -> std::sync::Arc<HashMap<String, String>> {
+        self.memo_caches.global_using_aliases.read(
+            &memo_attribution(self),
+            |global_using_aliases_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    global_using_aliases_memo,
+                    || graph_support::compute_global_using_aliases(self, token),
+                )
+            },
+            |answer| Self::global_alias_inputs(answer),
+        )
     }
 
     pub(crate) fn global_using_aliases_limited(
@@ -850,42 +971,54 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)> {
-        let cache = &self.memo_caches.global_using_aliases;
-        cached_limited_query_rows(
-            || {
-                cache.get().map(|cached| {
-                    limited_known_rows(
-                        cached.len(),
-                        cached
-                            .iter()
-                            .map(|(alias, target)| (alias.clone(), target.clone())),
-                        limit,
-                    )
-                })
-            },
-            || {
-                graph_support::compute_global_using_aliases_limited(
+        self.memo_caches.global_using_aliases.read(
+            &memo_attribution(self),
+            |global_using_aliases_memo| {
+                let cache = global_using_aliases_memo;
+                cached_limited_query_rows(
                     self,
-                    limit,
-                    &mut continue_query,
+                    || {
+                        cache.get().map(|cached| {
+                            limited_known_rows(
+                                cached.len(),
+                                cached
+                                    .iter()
+                                    .map(|(alias, target)| (alias.clone(), target.clone())),
+                                limit,
+                            )
+                        })
+                    },
+                    || {
+                        graph_support::compute_global_using_aliases_limited(
+                            self,
+                            limit,
+                            &mut continue_query,
+                        )
+                    },
+                    |rows| {
+                        cache.get_or_init(|| Arc::new(rows.iter().cloned().collect()));
+                    },
                 )
             },
-            |rows| {
-                cache.get_or_init(|| rows.iter().cloned().collect());
-            },
+            |_| self.complete_global_alias_inputs(),
         )
     }
 
-    pub(crate) fn global_static_using_type_names(&self, token: QueryToken<'_>) -> &[String] {
-        self.memo_caches
-            .global_static_using_type_names
-            .get_or_init(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+    pub(crate) fn global_static_using_type_names(
+        &self,
+        token: QueryToken<'_>,
+    ) -> std::sync::Arc<Vec<String>> {
+        self.memo_caches.global_static_using_type_names.read(
+            &memo_attribution(self),
+            |global_static_using_type_names_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
                     self,
-                    "csharp.global_static_using_type_names",
+                    global_static_using_type_names_memo,
                     || graph_support::compute_global_static_using_type_names(self, token),
                 )
-            })
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     pub(crate) fn global_static_using_type_names_limited(
@@ -893,47 +1026,66 @@ impl CSharpAnalyzer {
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<String> {
-        if let Some(cached) = self.memo_caches.global_static_using_type_names.get() {
-            return limited_known_rows(cached.len(), cached.iter().cloned(), limit);
-        }
-        let batch = graph_support::compute_global_static_using_type_names_limited(
-            self,
-            limit,
-            &mut continue_query,
-        );
-        if batch.complete {
-            let _ = self
-                .memo_caches
-                .global_static_using_type_names
-                .set(batch.rows.clone());
-        }
-        batch
-    }
-
-    pub(crate) fn global_static_using_types(&self, token: QueryToken<'_>) -> &[CodeUnit] {
-        self.memo_caches.global_static_using_types.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "csharp.global_static_using_types",
-                || graph_support::compute_global_static_using_types(self, token),
-            )
-        })
-    }
-
-    pub(crate) fn usage_global_static_using_types(&self, token: QueryToken<'_>) -> &[CodeUnit] {
-        self.memo_caches
-            .usage_global_static_using_types
-            .get_or_init(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.memo_caches.global_static_using_type_names.read(
+            &memo_attribution(self),
+            |global_static_using_type_names_memo| {
+                if let Some(cached) = global_static_using_type_names_memo.get() {
+                    return limited_known_rows(cached.len(), cached.iter().cloned(), limit);
+                }
+                let batch = graph_support::compute_global_static_using_type_names_limited(
                     self,
-                    "csharp.usage_global_static_using_types",
+                    limit,
+                    &mut continue_query,
+                );
+                if batch.complete {
+                    let _ = global_static_using_type_names_memo.set(Arc::new(batch.rows.clone()));
+                }
+                batch
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
+    }
+
+    pub(crate) fn global_static_using_types(
+        &self,
+        token: QueryToken<'_>,
+    ) -> std::sync::Arc<Vec<CodeUnit>> {
+        self.memo_caches.global_static_using_types.read(
+            &memo_attribution(self),
+            |global_static_using_types_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    global_static_using_types_memo,
+                    || graph_support::compute_global_static_using_types(self, token),
+                )
+            },
+            |_| self.compilation_authority_inputs(),
+        )
+    }
+
+    pub(crate) fn usage_global_static_using_types(
+        &self,
+        token: QueryToken<'_>,
+    ) -> std::sync::Arc<Vec<CodeUnit>> {
+        self.memo_caches.usage_global_static_using_types.read(
+            &memo_attribution(self),
+            |usage_global_static_using_types_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    usage_global_static_using_types_memo,
                     || graph_support::compute_usage_global_static_using_types(self, token),
                 )
-            })
+            },
+            |_| self.compilation_authority_inputs(),
+        )
     }
 }
 
 impl CSharpSource for CSharpAnalyzer {
+    fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        self.inner.read_capability()
+    }
+
     fn persisted_declaration_candidates_by_fqn(
         &self,
         fqn: &str,
@@ -1139,7 +1291,7 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::using_aliases_of_limited(self, token, file, limit, continue_query)
     }
 
-    fn global_static_using_type_names(&self) -> &[String] {
+    fn global_static_using_type_names(&self) -> std::sync::Arc<Vec<String>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         CSharpAnalyzer::global_static_using_type_names(self, token)
@@ -1153,37 +1305,43 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::global_static_using_type_names_limited(self, limit, continue_query)
     }
 
-    fn global_static_using_types(&self) -> &[CodeUnit] {
+    fn global_static_using_types(&self) -> std::sync::Arc<Vec<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         CSharpAnalyzer::global_static_using_types(self, token)
     }
 
-    fn usage_global_static_using_types(&self) -> &[CodeUnit] {
+    fn usage_global_static_using_types(&self) -> std::sync::Arc<Vec<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         CSharpAnalyzer::usage_global_static_using_types(self, token)
     }
 
-    fn global_using_namespaces(&self) -> &HashSet<String> {
+    fn global_using_namespaces(&self) -> std::sync::Arc<HashSet<String>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         CSharpAnalyzer::global_using_namespaces(self, token)
     }
 
     fn file_using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
-        cached_file_value(self, &self.memo_caches.file_using_namespaces, file, || {
-            graph_support::file_using_namespaces(self, token, file)
-        })
+        self.memo_caches.file_using_namespaces.read(
+            &memo_attribution(self),
+            |file_using_namespaces_memo| {
+                cached_file_value(self, file_using_namespaces_memo, file, || {
+                    graph_support::file_using_namespaces(self, token, file)
+                })
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     fn sorted_global_using_namespaces(&self) -> Vec<String> {
-        self.memo_caches
-            .sorted_global_using_namespaces
-            .get_or_init(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.memo_caches.sorted_global_using_namespaces.read(
+            &memo_attribution(self),
+            |sorted_global_using_namespaces_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
                     self,
-                    "csharp.sorted_global_using_namespaces",
+                    sorted_global_using_namespaces_memo,
                     || {
                         let mut namespaces: Vec<_> = CSharpSource::global_using_namespaces(self)
                             .iter()
@@ -1193,8 +1351,11 @@ impl CSharpSource for CSharpAnalyzer {
                         namespaces
                     },
                 )
-            })
-            .clone()
+                .as_ref()
+                .clone()
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        )
     }
 
     fn global_using_namespaces_limited(
@@ -1205,7 +1366,7 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::global_using_namespaces_limited(self, limit, continue_query)
     }
 
-    fn global_using_aliases(&self) -> &HashMap<String, String> {
+    fn global_using_aliases(&self) -> std::sync::Arc<HashMap<String, String>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
         CSharpAnalyzer::global_using_aliases(self, token)
@@ -1433,6 +1594,8 @@ impl CodeUnitIndex for CSharpAnalyzer {
 }
 
 impl IAnalyzer for CSharpAnalyzer {
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     fn statement_source_facts(
         &self,
         file: &ProjectFile,
@@ -1445,28 +1608,43 @@ impl IAnalyzer for CSharpAnalyzer {
         );
         let key = (snapshot.oid(), file.clone());
         let source = snapshot.source();
-        if let Some(rows) = self.memo_caches.statement_facts.get(&key) {
-            return Some(rows);
-        }
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-            .expect("C# grammar");
-        if let Some(ranges) = CSHARP_STRUCTURAL_SPEC.parser_included_ranges(source) {
-            parser
-                .set_included_ranges(&ranges)
-                .expect("C# preprocessor included ranges");
-        }
-        let tree = parser.parse(source, None)?;
-        let rows = Arc::new(capture_statement_facts(
-            &CSHARP_STRUCTURAL_SPEC,
-            tree.root_node(),
-            source,
-        ));
         self.memo_caches
             .statement_facts
-            .insert(key, Arc::clone(&rows));
-        Some(rows)
+            .read(&memo_attribution(self), |memo, capture| -> Result<_, ()> {
+                if let Some(rows) = memo.get(&key) {
+                    return Ok(rows);
+                }
+                let rows = Arc::new(capture.try_build_weighted(|| {
+                    self.record_read(
+                        brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::file(
+                            Language::CSharp,
+                            brokk_bifrost_core::path_utils::rel_path_string(file),
+                            snapshot.oid(),
+                        ),
+                    );
+                    let mut parser = tree_sitter::Parser::new();
+                    parser
+                        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+                        .expect("C# grammar");
+                    if let Some(ranges) = CSHARP_STRUCTURAL_SPEC.parser_included_ranges(source) {
+                        parser
+                            .set_included_ranges(&ranges)
+                            .expect("C# preprocessor included ranges");
+                    }
+                    let tree = parser.parse(source, None).ok_or(())?;
+                    let rows = Arc::new(capture_statement_facts(
+                        &CSHARP_STRUCTURAL_SPEC,
+                        tree.root_node(),
+                        source,
+                    ));
+                    let bytes = rows.estimated_retained_bytes();
+                    Ok((rows, bytes))
+                })?);
+                memo.insert(key, Arc::clone(&rows));
+                Ok(rows)
+            })
+            .ok()
+            .map(|rows| Arc::clone(&rows))
     }
 
     delegate_inner_procedure_fact_methods!();
@@ -1491,11 +1669,19 @@ impl IAnalyzer for CSharpAnalyzer {
     /// on a background thread for the generation, and the once-lock makes it
     /// idempotent.
     fn warm_query_indexes(&self) {
-        self.external_declaration_index();
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            self.external_declaration_index();
+        })
     }
 
     fn query_indexes_warm(&self) -> bool {
-        self.external_index.get().is_some()
+        self.external_index
+            .read(
+                &memo_attribution(self),
+                |cell| cell.get().map(|entry| entry.replay().as_ref()),
+                |_| AuthorityInputs::Unnamed,
+            )
+            .is_some()
     }
 
     fn semantic_diagnostics(
@@ -1600,26 +1786,28 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = brokk_bifrost_analysis::analyzer::updated_external_index(
-            &self.external_index,
-            changed_files,
-            dependency_discovery::is_csharp_dependency_input,
-        );
-        let updated = Self {
-            inner: self.inner.update(changed_files),
-            memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
-            csharp_config: self.csharp_config.clone(),
-            external_index,
-        };
-        if Arc::ptr_eq(&self.external_index, &updated.external_index)
-            && self.degraded_persistent_fills() > 0
-        {
-            updated.record_degraded_persistent_fill(
-                "retained_external_index",
-                "inherited_degraded_owner",
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let external_index = self.external_index.read(
+                &memo_attribution(self),
+                |cell| {
+                    Arc::new(WorkspaceAuthorityMemo::new(
+                        WorkspaceFactFamily::CSharpExternalDeclarations,
+                        brokk_bifrost_analysis::analyzer::updated_external_index(
+                            cell,
+                            changed_files,
+                            dependency_discovery::is_csharp_dependency_input,
+                        ),
+                    ))
+                },
+                |_| AuthorityInputs::Unnamed,
             );
-        }
-        updated
+            Self {
+                inner: self.inner.update(changed_files),
+                memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
+                csharp_config: self.csharp_config.clone(),
+                external_index,
+            }
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -1844,6 +2032,32 @@ fn csharp_branch_reference_site(
 }
 
 impl LanguageSupport for CSharpSupport {
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: WorkspaceFactFamily,
+        language: Language,
+        subject: &FactSubject,
+    ) -> Option<StableDigest> {
+        if language != Language::CSharp || *subject != FactSubject::Whole {
+            return None;
+        }
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
+        match family {
+            WorkspaceFactFamily::CSharpGlobalUsingAliases => {
+                let AuthorityInputs::Fact { answer, .. } = csharp.complete_global_alias_inputs()
+                else {
+                    unreachable!()
+                };
+                Some(answer)
+            }
+            WorkspaceFactFamily::CSharpCompilationConfiguration => {
+                csharp.compilation_config_digest()
+            }
+            _ => None,
+        }
+    }
+
     fn branch_current_object_fields(
         &self,
     ) -> Option<
@@ -2265,13 +2479,19 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
         let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
-        brokk_bifrost_analysis::analyzer::languages::build_fqn_dead_code_edges(
-            analyzer,
-            &csharp.memo_caches.dead_code_usage_edges,
-            candidates,
-            |token, callees| {
-                build_inbound_csharp_usage_edges_with_completeness(analyzer, token, callees)
+        csharp.memo_caches.dead_code_usage_edges.read(
+            &memo_attribution(analyzer),
+            |cache| {
+                brokk_bifrost_analysis::analyzer::languages::build_fqn_dead_code_edges(
+                    analyzer,
+                    cache,
+                    candidates,
+                    |token, callees| {
+                        build_inbound_csharp_usage_edges_with_completeness(analyzer, token, callees)
+                    },
+                )
             },
+            |_| csharp.compilation_authority_inputs(),
         )
     }
 }
@@ -2393,6 +2613,13 @@ mod dependency_packs {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for CSharpSupport {
+    fn precedence_rules(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::resolution::precedence::PrecedenceRules
+    {
+        brokk_bifrost_analysis::analyzer::resolution::precedence::CSHARP_PRECEDENCE_RULES
+    }
+
     /// MSBuild project, props and targets files decide compilation membership,
     /// so each revision retains their exact bytes.
     fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
@@ -2432,12 +2659,17 @@ mod dead_code_cache_tests {
         analyzer
             .memo_caches
             .dead_code_usage_edges
+            .read(
+                &memo_attribution(&analyzer),
+                |cache| cache,
+                |_| AuthorityInputs::Unnamed,
+            )
             .insert(key.clone(), Arc::new(UsageEdges::default()));
 
         brokk_bifrost_analysis::analyzer::test_support::assert_dead_code_cache_reset_after_update_paths(
             &analyzer,
             &key,
-            |analyzer| &analyzer.memo_caches.dead_code_usage_edges,
+            |analyzer| analyzer.memo_caches.dead_code_usage_edges.read(&memo_attribution(analyzer), |cache| cache, |_| AuthorityInputs::Unnamed),
             |analyzer| analyzer.update(&std::collections::BTreeSet::new()),
             |analyzer| analyzer.update_all(),
             |analyzer| analyzer.clone_with_project(fixture.project_dyn()),
@@ -2591,7 +2823,7 @@ mod package_inventory_gate_tests {
             vec!["Alpha", "Zeta"]
         );
         assert_eq!(
-            source.global_static_using_type_names(),
+            source.global_static_using_type_names().as_slice(),
             &["Helpers.Tools".to_owned()]
         );
     }
@@ -2785,5 +3017,212 @@ mod lexical_pattern_tests {
                 "{source}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod complete_external_index_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#7876: a degraded persistent cache fill was reused by a later request")]
+    fn failed_external_index_is_not_reused_by_a_later_request() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A.cs", "class A {}")
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let failed = {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let index = analyzer.external_index.read(
+                &memo_attribution(&analyzer),
+                |cell| {
+                    brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
+                        &analyzer,
+                        cell,
+                        || {
+                            analyzer.record_query_failure(
+                                brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                                    "injected store failure",
+                                ),
+                            );
+                            Arc::new(CSharpExternalDeclarationIndex::build_for_project(
+                                &analyzer.csharp_config,
+                                analyzer.inner.project(),
+                            ))
+                        },
+                    )
+                },
+                |_| AuthorityInputs::Unnamed,
+            );
+            assert!(
+                scope.store_error().is_some(),
+                "the transient failure really ran"
+            );
+            assert!(scope.read_completion().is_err());
+            assert!(analyzer.retained_external_index().is_none());
+            index
+        };
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let retry = analyzer.external_declaration_index();
+        assert!(retry.is_complete());
+        assert!(retry.production_diagnostics().is_empty());
+        assert!(scope.read_completion().is_ok());
+        assert!(!Arc::ptr_eq(&failed, &retry));
+        assert!(analyzer.retained_external_index().is_some());
+        assert!(Arc::ptr_eq(&retry, &analyzer.external_declaration_index()));
+    }
+
+    #[test]
+    fn metadata_budget_exhaustion_is_not_retained_by_a_later_request() {
+        for (row_count, string_len) in [(100_001, 0), (65_537, 1024)] {
+            // Test-only PE/CLI containers: one exceeds the metadata row budget;
+            // the other repeats a heap string until the decoded-byte budget runs
+            // out. No private fixture or injected diagnostic is needed.
+            let table_size = 28 + row_count * 8;
+            let metadata_size = 52 + table_size + string_len + 2;
+            let mut assembly = vec![0u8; 0x300 + metadata_size];
+            assembly[..2].copy_from_slice(b"MZ");
+            assembly[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            assembly[0x80..0x84].copy_from_slice(b"PE\0\0");
+            assembly[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes()); // i386
+            assembly[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // one section
+            assembly[0x94..0x96].copy_from_slice(&224u16.to_le_bytes());
+            assembly[0x98..0x9a].copy_from_slice(&0x10bu16.to_le_bytes()); // PE32
+            assembly[0xb8..0xbc].copy_from_slice(&0x2000u32.to_le_bytes()); // section alignment
+            assembly[0xbc..0xc0].copy_from_slice(&0x200u32.to_le_bytes()); // file alignment
+            assembly[0xf4..0xf8].copy_from_slice(&16u32.to_le_bytes()); // data directories
+            assembly[0x168..0x16c].copy_from_slice(&0x2000u32.to_le_bytes()); // CLI RVA
+            assembly[0x16c..0x170].copy_from_slice(&72u32.to_le_bytes());
+            assembly[0x178..0x180].copy_from_slice(b".text\0\0\0");
+            let section_size = (assembly.len() - 0x200) as u32;
+            assembly[0x180..0x184].copy_from_slice(&section_size.to_le_bytes());
+            assembly[0x184..0x188].copy_from_slice(&0x2000u32.to_le_bytes());
+            assembly[0x188..0x18c].copy_from_slice(&section_size.to_le_bytes());
+            assembly[0x18c..0x190].copy_from_slice(&0x200u32.to_le_bytes());
+            assembly[0x200..0x204].copy_from_slice(&72u32.to_le_bytes());
+            assembly[0x208..0x20c].copy_from_slice(&0x2100u32.to_le_bytes()); // metadata RVA
+            assembly[0x20c..0x210].copy_from_slice(&(metadata_size as u32).to_le_bytes());
+            let metadata = &mut assembly[0x300..];
+            metadata[..4].copy_from_slice(b"BSJB");
+            metadata[4..6].copy_from_slice(&1u16.to_le_bytes());
+            metadata[18..20].copy_from_slice(&2u16.to_le_bytes()); // stream count
+            metadata[20..24].copy_from_slice(&52u32.to_le_bytes());
+            metadata[24..28].copy_from_slice(&(table_size as u32).to_le_bytes());
+            metadata[28..32].copy_from_slice(b"#~\0\0");
+            metadata[32..36].copy_from_slice(&((52 + table_size) as u32).to_le_bytes());
+            metadata[36..40].copy_from_slice(&((string_len + 2) as u32).to_le_bytes());
+            metadata[40..49].copy_from_slice(b"#Strings\0");
+            metadata[52 + table_size + 1..52 + table_size + 1 + string_len].fill(b'a');
+            let tables = &mut metadata[52..52 + table_size];
+            tables[4] = 2; // metadata table major version
+            tables[8..16].copy_from_slice(&2u64.to_le_bytes()); // TypeRef table only
+            tables[24..28].copy_from_slice(&(row_count as u32).to_le_bytes());
+            for row in tables[28..].as_chunks_mut::<8>().0 {
+                row[4..6].copy_from_slice(&1u16.to_le_bytes()); // repeated type name
+            }
+
+            let fixture = InlineTestProject::with_language(Language::CSharp)
+                .file("A.cs", "class A {}")
+                .build();
+            std::fs::write(fixture.file("budget.dll").abs_path(), assembly).unwrap();
+            let mut config = AnalyzerConfig::default();
+            config.csharp.assembly_paths = vec![std::path::PathBuf::from("budget.dll")];
+            let analyzer =
+                CSharpAnalyzer::new_with_config(Arc::new(fixture.project().clone()), config);
+            let failed = {
+                let scope = AnalyzerQueryScope::new(&analyzer);
+                let index = analyzer.external_declaration_index();
+                assert!(
+                    index
+                        .production_diagnostics()
+                        .iter()
+                        .any(|diagnostic| { diagnostic.code == "csharp.metadata.budget" }),
+                    "{:?}",
+                    index.production_diagnostics()
+                );
+                assert!(matches!(
+                    scope.read_completion(),
+                    Err(QueryReadIncomplete::SemanticEvidenceUnavailable(_))
+                ));
+                assert!(analyzer.retained_external_index().is_none());
+                index
+            };
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let retry = analyzer.external_declaration_index();
+            assert!(
+                !Arc::ptr_eq(&failed, &retry),
+                "the metadata decode was rebuilt"
+            );
+            assert!(
+                retry
+                    .production_diagnostics()
+                    .iter()
+                    .any(|diagnostic| { diagnostic.code == "csharp.metadata.budget" }),
+                "{:?}",
+                retry.production_diagnostics()
+            );
+            assert!(matches!(
+                scope.read_completion(),
+                Err(QueryReadIncomplete::SemanticEvidenceUnavailable(_))
+            ));
+            assert!(analyzer.retained_external_index().is_none());
+        }
+    }
+
+    #[test]
+    fn stable_external_index_failure_is_retained_and_replays_to_later_requests() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A.cs", "class A {}")
+            .build();
+        std::fs::write(
+            fixture.file("broken.dll").abs_path(),
+            "MZ not a CLI assembly",
+        )
+        .unwrap();
+        let mut config = AnalyzerConfig::default();
+        config.csharp.assembly_paths = vec![std::path::PathBuf::from("broken.dll")];
+        let analyzer = CSharpAnalyzer::new_with_config(Arc::new(fixture.project().clone()), config);
+        let failed = {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let index = analyzer.external_declaration_index();
+            assert!(
+                !index.production_diagnostics().is_empty(),
+                "the artifact was decoded"
+            );
+            assert!(
+                matches!(
+                    scope.read_completion(),
+                    Err(QueryReadIncomplete::ArtifactUnavailable(_))
+                ),
+                "{:?}: {:?}",
+                scope.read_completion(),
+                index.production_diagnostics()
+            );
+            assert!(scope.store_error().is_none());
+            index
+        };
+        {
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let retained = analyzer
+                .retained_external_index()
+                .expect("stable failure retained");
+            assert!(std::ptr::eq(retained, failed.as_ref()));
+            assert!(
+                scope.read_completion().is_err(),
+                "diagnostics peek replays the reason"
+            );
+        }
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(scope.read_completion().is_ok());
+        let retry = analyzer.external_declaration_index();
+        assert!(Arc::ptr_eq(&failed, &retry));
+        assert!(matches!(
+            scope.read_completion(),
+            Err(QueryReadIncomplete::ArtifactUnavailable(_))
+        ));
+        assert!(scope.store_error().is_none());
     }
 }

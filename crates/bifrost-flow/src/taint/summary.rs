@@ -92,10 +92,6 @@ impl CarrierSummaryKey {
 pub struct StableTaintClassSet(Box<[SourceClassId]>);
 
 impl StableTaintClassSet {
-    pub fn classes(&self) -> &[SourceClassId] {
-        &self.0
-    }
-
     fn from_live(
         classes: &TaintClassSet,
         universe: &TaintUniverse,
@@ -137,20 +133,8 @@ pub struct StableTaintEdgeFunction {
 }
 
 impl StableTaintEdgeFunction {
-    pub fn generated(&self) -> &StableTaintClassSet {
-        &self.generated
-    }
-
     pub const fn default_identity(&self) -> bool {
         self.default_identity
-    }
-
-    pub fn overrides(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (&SourceClassId, &StableTaintClassSet)> {
-        self.overrides
-            .iter()
-            .map(|(source, targets)| (source, targets))
     }
 
     fn from_live(
@@ -279,20 +263,26 @@ enum StablePropagationTransfer {
     },
 }
 
-/// Source-generator and sanitizer/transform matching that changes propagation.
+/// Source-generator, transfer and local-value read requirements that change propagation.
+/// Observer metadata stays separate; a read's point/carrier affects liveness.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TaintPropagationEventMatchKey {
     sources: Box<[StableSourceGenerator]>,
     transfers: Box<[StablePropagationTransfer]>,
+    read_requirements: Box<[(ProgramPointId, ValueFlowCarrierKey)]>,
 }
 
 impl TaintPropagationEventMatchKey {
-    pub fn source_generators(&self) -> &[StableSourceGenerator] {
-        &self.sources
-    }
-
     fn retained_bytes(&self) -> usize {
-        size_of_val(self.sources.as_ref())
+        size_of_val(self.read_requirements.as_ref())
+            .saturating_add(
+                self.read_requirements
+                    .iter()
+                    .fold(0usize, |total, (_, carrier)| {
+                        total.saturating_add(carrier.retained_bytes())
+                    }),
+            )
+            .saturating_add(size_of_val(self.sources.as_ref()))
             .saturating_add(self.sources.iter().fold(0usize, |total, source| {
                 total
                     .saturating_add(source.event.retained_bytes())
@@ -373,10 +363,6 @@ impl StableSinkObserver {
 pub struct TaintSinkObserverMatchKey(Box<[StableSinkObserver]>);
 
 impl TaintSinkObserverMatchKey {
-    pub fn observers(&self) -> &[StableSinkObserver] {
-        &self.0
-    }
-
     fn observers_at(&self, point: ProgramPointId) -> &[StableSinkObserver] {
         let start = self.0.partition_point(|observer| observer.point < point);
         let end = start + self.0[start..].partition_point(|observer| observer.point == point);
@@ -384,7 +370,8 @@ impl TaintSinkObserverMatchKey {
     }
 }
 
-/// Full transfer validity. Sink observation is deliberately a separate overlay key.
+/// Full transfer validity, including local-value read requirements for liveness.
+/// Sink identity and accepted classes remain a separate observer overlay.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TaintTransferSummaryKey {
     carrier: CarrierSummaryKey,
@@ -635,7 +622,8 @@ impl TaintObservedPort {
     }
 }
 
-/// Complete symbolic entry-to-exit transfer plus sink-independent internal ports.
+/// Complete symbolic entry-to-exit transfer and internal ports under the keyed
+/// value-read requirements. Sink observer metadata remains an independent overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintTransferSummary {
     key: TaintTransferSummaryKey,
@@ -1002,9 +990,31 @@ impl TaintContractSet {
                 .sort_unstable_by(|left, right| left.event.cmp(&right.event));
             builder.transfers.sort_unstable();
             builder.observers.sort_unstable();
+            // Liveness depends on where a query reads local values. A new
+            // exit-point observer may need a value the old query dropped.
+            // Key only that semantic requirement, not sink identity, accepted
+            // labels, phase, or presentation: those remain observer overlays.
+            let mut read_requirements = builder
+                .observers
+                .iter()
+                .filter(|observer| matches!(observer.carrier, ValueFlowCarrierKey::Value { .. }))
+                .map(|observer| (observer.point, observer.carrier.clone()))
+                .collect::<Vec<_>>();
+            read_requirements.sort_unstable();
+            read_requirements.dedup();
+            if request
+                .reserve(SolverWork {
+                    callback_rows: read_requirements.len(),
+                    ..SolverWork::default()
+                })
+                .is_some()
+            {
+                return Ok(Self::empty());
+            }
             let propagation = TaintPropagationEventMatchKey {
                 sources: builder.sources.into_boxed_slice(),
                 transfers: builder.transfers.into_boxed_slice(),
+                read_requirements: read_requirements.into_boxed_slice(),
             };
             let procedure_key = carrier.procedure().clone();
             local.insert(
@@ -1613,7 +1623,8 @@ impl ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction> for TaintSummaryOr
             });
         }
         let mut reached = Vec::new();
-        let problem = super::client::TaintFlowProblem::new(self.plan);
+        let problem =
+            super::client::TaintFlowProblem::new(self.plan).with_cancellation(request.cancellation);
         for observation in &summary.observations[observation_range] {
             if request.cancellation.is_cancelled() {
                 return Err(SolverTermination::Cancelled);

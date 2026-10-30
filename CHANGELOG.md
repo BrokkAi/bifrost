@@ -7,6 +7,93 @@ projection and its commit history does not contain every source commit.
 
 ## Unreleased
 
+## [0.14.4] - 2026-10-29
+
+### Changed
+
+- `bifrost policy`, `bifrost scan` and MCP `run_policy` treat a run whose
+  completion is Bifrost's own `inconclusive` verdict as advisory. With no
+  finding at or above `--fail-on`, such a batch now exits `0` instead of `2`;
+  a gating finding from an inconclusive run exits `1` instead of `2`. Exit `2`
+  now means no verdict: the evaluation terminated, an error-severity or
+  truncated report diagnostic, or a run that failed, was unsupported, was an
+  explicitly requested `not_run`, or was a `proven_subset` with nothing to
+  gate. Inconclusive runs are still reported in human output, JSON and SARIF,
+  where SARIF keeps `executionSuccessful: true` and a warning
+  `BIFROST_POLICY_INCONCLUSIVE` notification. This matches how SlopCop reads
+  the same report. `--on-inconclusive unreliable` restores the previous exit
+  `2`; a policy's own `(on-unknown :verdict warn-unreliable)` or
+  `(on-unknown :verdict fail-closed)` still outranks the flag. The policy-scan
+  action gains a matching `on-inconclusive` input and lists inconclusive
+  policies as warnings and in the job summary (#8111).
+- Release binaries are built with symbol tables stripped, cutting the
+  native wheels and the npm `darwin-universal` package by about 20 MB each.
+  v0.14.3's `brokk-bifrost-searchtools` Linux aarch64 wheel and its npm
+  packages exceeded the PyPI and npm upload limits and were not published;
+  0.14.4 publishes all of them. Release qualification now fails any artifact
+  over its registry's limit and warns above 90% of it (#8078, #8077).
+
+### Fixed
+
+- Bounded declaration lookups, symbol search and hierarchy queries honor
+  unsaved editor buffers instead of returning declarations from saved files
+  (#7831).
+- Composed taint analysis requires one proven, complete path before
+  claiming certainty; it no longer combines proof from one alternative with
+  completeness from another. RQL witnesses also distinguish exceptional
+  returns from normal returns (#7956).
+- C# usage scans retain request caches across membership-scoped lookups,
+  restoring warm-scan performance without changing usage results (#7825).
+- C# type lookup respects the reference's enclosing namespace, avoiding
+  incorrect bindings to types in sibling namespaces (#7582).
+- Go binding navigation recognizes pointer-receiver methods through addressable
+  fields and promoted fields. Flow analysis also honors modeled non-returning
+  methods called using method-expression syntax (#7925, #7912).
+- JavaScript and TypeScript incremental checks track module-resolution inputs
+  more precisely, retaining reusable analysis across unrelated edits while
+  invalidating previously missing imports when their targets appear (#7902).
+- Self-assignment checks can prove that declaration-backed static or constant
+  values differ from the assigned local in Java, C# and Go, reducing unnecessary
+  incomplete results (#7824).
+- Python policy runs backed by reviewed standard-library summaries stay
+  conclusive when a test passes `sys.modules` to pytest's
+  `monkeypatch.setitem`/`delitem` or `unittest.mock.patch.dict`. These calls
+  are now read as edits of the module table, so storing `None` or an unrelated
+  module no longer makes every summarized call inconclusive (#8107).
+- External-command handling avoids spurious pipe-closure failures after a
+  process tree has exited, improving Go environment and JVM build-tool
+  discovery under load (#7983).
+- Go interface satisfaction no longer reports a decided mismatch while a
+  shallower member search is still open (#7968). A selector qualified by a
+  duplicate import alias stays ambiguous instead of binding an exact external
+  callee (#7969), and relative imports such as `import "./store"` resolve in
+  workspaces without `go.mod` (#7976).
+- C# flow analysis attaches an unresolved operator's abort route after its
+  operands are evaluated, removing a spurious exceptional path that skipped
+  operand reads, writes and calls (#8019).
+- Java qualified paths into nested types of external owners without sources
+  no longer fail with a store closure error (#7868), and exact owner-declared
+  external calls such as `File.getName()` no longer stay incomplete (#7779).
+- Taint analysis drops carriers for dead procedure-local values, so long
+  methods keep every finding's source origin instead of losing them when the
+  witness budget ran out (#7755).
+- A query no longer inherits read incompleteness from unrelated requests
+  running in parallel, which made resource-lifecycle results vary between
+  runs, and shared caches no longer keep a build that failed (#7876).
+- A nested function's cleanup no longer makes its enclosing procedure's
+  pending-cleanup analysis incomplete.
+- Scala collection contracts apply to packs generated from the real
+  `scala-library`, not only to complete packs (#3130).
+
+### Performance
+
+- Bounded Git subprocesses spawn without forking the analyzer and wake on
+  completion instead of polling, roughly halving `dead_code_smells` latency on
+  small repositories (#7002).
+- A clean full scan is recorded as a base evaluation even when the commit
+  contains a file that source admission refuses, so later `check --diff-base`
+  runs no longer re-evaluate the base.
+
 ## [0.14.3] - 2026-10-28
 
 ### Changed

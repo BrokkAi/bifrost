@@ -143,6 +143,8 @@ use crate::analyzer::{AnalyzerConfig, Language, ProjectFile, TestProject, Worksp
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::{FilesystemProject, Project};
 #[cfg(any(test, feature = "test-support"))]
+use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
+#[cfg(any(test, feature = "test-support"))]
 #[cfg(any(test, feature = "test-support"))]
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -247,56 +249,24 @@ pub fn incomplete_discovery_declaring(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[track_caller]
 #[doc(hidden)]
-pub fn activate_rust_declaration_pack(
+pub fn activate_semantic_model_fixture(
     analyzer: &dyn crate::analyzer::IAnalyzer,
+    catalog: &crate::analyzer::semantic_model::SemanticPackCatalog,
     pack_id: &str,
-    pack_json: &serde_json::Value,
-) {
+    evidence: crate::analyzer::semantic_model::SemanticModelActivationEvidence,
+) -> crate::analyzer::semantic_model::SemanticModelRuntimeOutcome {
     use crate::analyzer::semantic_model::{
-        CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
-        SemanticModelActivationEvidence, SemanticModelActivationRequest,
-        SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
-        SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-        SessionPackSource, SessionPackSourceKind, SourceFormat,
-        acquire_active_semantic_models_with_evidence, compile_source,
+        SemanticModelActivationControl, SemanticModelActivationRequest, SemanticModelControlAction,
+        SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
+        acquire_active_semantic_models,
     };
 
-    let pack = compile_source(
-        SourceFormat::Json,
-        &serde_json::to_vec(pack_json).expect("serialize the Rust declaration fixture"),
-        &CompilerOptions::default(),
-    )
-    .unwrap_or_else(|diagnostics| {
-        panic!("Rust declaration fixture must compile: {diagnostics:#?}")
-    });
-    let catalog =
-        SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).expect("ephemeral catalog");
-    catalog
-        .register_session_pack(
-            &pack,
-            &SessionPackSource {
-                kind: SessionPackSourceKind::Embedded,
-                source_id: pack_id.to_owned(),
-            },
-        )
-        .expect("register the Rust declaration fixture");
     let request = SemanticModelActivationRequest {
         approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
-        evidence: vec![SemanticModelActivationEvidence {
-            language: "rust".to_owned(),
-            ecosystem: "cargo".to_owned(),
-            package: Some(CatalogCoordinate {
-                name: "std".to_owned(),
-                version: None,
-            }),
-            module: None,
-            toolchain: None,
-            target: None,
-            configuration: None,
-            artifact_sha256: None,
-        }],
+        evidence: vec![evidence],
         controls: vec![SemanticModelActivationControl {
             scope: SemanticModelControlScope::Workspace,
             action: SemanticModelControlAction::Enable,
@@ -308,14 +278,49 @@ pub fn activate_rust_declaration_pack(
         }],
         limits: SemanticModelRuntimeLimits::default(),
     };
-    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models_with_evidence(
+    acquire_active_semantic_models(
         analyzer,
-        &catalog,
+        catalog,
         None,
         &request,
-        None,
         &crate::CancellationToken::new(),
-    ) else {
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[track_caller]
+#[doc(hidden)]
+pub fn activate_rust_declaration_pack(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    pack_id: &str,
+    pack_json: &serde_json::Value,
+) {
+    use crate::analyzer::semantic_model::{CatalogCoordinate, SemanticModelActivationEvidence};
+
+    let catalog = embedded_session_semantic_pack_fixture(
+        pack_id,
+        serde_json::to_vec(pack_json).expect("serialize the Rust declaration fixture"),
+    );
+    let crate::analyzer::semantic_model::SemanticModelRuntimeOutcome::Ready { .. } =
+        activate_semantic_model_fixture(
+            analyzer,
+            &catalog,
+            pack_id,
+            SemanticModelActivationEvidence {
+                language: "rust".to_owned(),
+                ecosystem: "cargo".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: "std".to_owned(),
+                    version: None,
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            },
+        )
+    else {
         panic!("Rust declaration fixture must activate");
     };
 }
@@ -820,16 +825,40 @@ pub fn runtime_contract_profile_support()
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn compile_semantic_pack_fixture(
-    source: &str,
+    source: impl AsRef<[u8]>,
 ) -> crate::analyzer::semantic_model::CompiledSemanticModelPack {
     use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
 
     compile_source(
         SourceFormat::Json,
-        source.as_bytes(),
+        source.as_ref(),
         &CompilerOptions::default(),
     )
     .unwrap_or_else(|diagnostics| panic!("fixture pack must compile: {diagnostics:#?}"))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn embedded_session_semantic_pack_fixture(
+    source_id: &str,
+    source: impl AsRef<[u8]>,
+) -> crate::analyzer::semantic_model::SemanticPackCatalog {
+    use crate::analyzer::semantic_model::{
+        CatalogOptions, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
+    };
+
+    let pack = compile_semantic_pack_fixture(source);
+    let catalog =
+        SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).expect("ephemeral catalog");
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: source_id.to_owned(),
+            },
+        )
+        .expect("register embedded session pack fixture");
+    catalog
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -893,19 +922,45 @@ pub fn go_semantic_model_activation_request(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[track_caller]
 #[doc(hidden)]
 pub fn resolved_reference_site(
     path: String,
     text: String,
     range: crate::analyzer::Range,
 ) -> crate::analyzer::usages::reference_site::ResolvedReferenceSite {
-    crate::analyzer::usages::reference_site::ResolvedReferenceSite {
+    crate::analyzer::usages::common::build_reference_site(
         path,
         text,
         range,
-        focus_start_byte: range.start_byte,
-        focus_end_byte: range.end_byte,
-    }
+        range.start_byte,
+        range.end_byte,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[track_caller]
+#[doc(hidden)]
+pub fn resolved_reference_site_from_range(
+    path: &str,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> crate::analyzer::usages::reference_site::ResolvedReferenceSite {
+    let start_line = source[..start_byte]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    resolved_reference_site(
+        path.to_owned(),
+        source[start_byte..end_byte].to_owned(),
+        crate::analyzer::Range {
+            start_byte,
+            end_byte,
+            start_line,
+            end_line: start_line,
+        },
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1016,6 +1071,7 @@ pub fn token_range(source: &str, marker: &str, token: &str) -> (usize, usize) {
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+#[track_caller]
 pub fn parse_fixture_tree(source: &str, language: tree_sitter::Language) -> tree_sitter::Tree {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -1025,26 +1081,34 @@ pub fn parse_fixture_tree(source: &str, language: tree_sitter::Language) -> tree
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[track_caller]
+pub fn parse_valid_fixture_tree(
+    source: &str,
+    language: tree_sitter::Language,
+    diagnostic_prefix: &str,
+) -> tree_sitter::Tree {
+    let tree = parse_fixture_tree(source, language);
+    assert!(
+        !tree.root_node().has_error(),
+        "{diagnostic_prefix}{}",
+        tree.root_node().to_sexp()
+    );
+    tree
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub fn activation_evidence(
     language: &str,
     ecosystem: &str,
     package: &str,
 ) -> crate::analyzer::semantic_model::SemanticModelActivationEvidence {
-    use crate::analyzer::semantic_model::{CatalogCoordinate, SemanticModelActivationEvidence};
-
-    SemanticModelActivationEvidence {
-        language: language.to_owned(),
-        ecosystem: ecosystem.to_owned(),
-        package: Some(CatalogCoordinate {
-            name: package.to_owned(),
-            version: None,
-        }),
-        module: None,
-        toolchain: None,
-        target: None,
-        configuration: None,
-        artifact_sha256: None,
-    }
+    let mut evidence = unscoped_activation_evidence(language, ecosystem);
+    evidence.package = Some(crate::analyzer::semantic_model::CatalogCoordinate {
+        name: package.to_owned(),
+        version: None,
+    });
+    evidence
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1241,12 +1305,19 @@ pub fn synthetic_oid(byte: u8) -> git2::Oid {
 /// Owns a `TempDir` workspace and the analyzer built over it.
 #[cfg(any(test, feature = "test-support"))]
 pub struct AnalyzerFixture {
-    _temp: TempDir,
+    _owner: AnalyzerFixtureOwner,
     #[doc(hidden)]
     pub analyzer: WorkspaceAnalyzer,
     #[allow(dead_code)]
     #[doc(hidden)]
     pub test_project: Option<TestProject>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)]
+enum AnalyzerFixtureOwner {
+    Filesystem(TempDir),
+    Inline(BuiltInlineTestProject),
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1269,28 +1340,22 @@ impl AnalyzerFixture {
             WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
                 .expect("ephemeral workspace should build");
         Self {
-            _temp: temp,
+            _owner: AnalyzerFixtureOwner::Filesystem(temp),
             analyzer,
             test_project: None,
         }
     }
 
     pub fn new_for_language(language: Language, files: &[(&str, &str)]) -> Self {
-        let temp = TempDir::new().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let mut builder = InlineTestProject::with_language(language);
         for (rel, content) in files {
-            ProjectFile::new(root.clone(), rel)
-                .write(content)
-                .unwrap_or_else(|err| panic!("failed to write {rel}: {err}"));
+            builder = builder.file(*rel, *content);
         }
-        let project = TestProject::new(root, language);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(project.clone()),
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
+        let owner = builder.build();
+        let project = owner.project().clone();
+        let analyzer = owner.workspace_analyzer(AnalyzerConfig::default());
         Self {
-            _temp: temp,
+            _owner: AnalyzerFixtureOwner::Inline(owner),
             analyzer,
             test_project: Some(project),
         }

@@ -57,7 +57,7 @@ pub fn build_cpp_visible_type_units(
             cpp.canonical_include_paths(token, &current)?
         };
         for include in imports {
-            for target in resolve_include_targets_with_index(&current, &include, include_targets) {
+            for target in resolve_include_targets_with_index(&current, &include, &include_targets) {
                 if visited.insert(target.clone()) {
                     pending.push(target);
                 }

@@ -38,6 +38,13 @@ struct DeclaredCarrierSyntax {
 
 struct GoBarrierContext<'a> {
     analyzer: &'a dyn IAnalyzer,
+    state: brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo<
+        GoBarrierState<'a>,
+    >,
+}
+
+struct GoBarrierState<'a> {
+    analyzer: &'a dyn IAnalyzer,
     go: &'a GoAnalyzer,
     native: RefCell<Option<Box<GoNativePointRequest<'a>>>>,
     decisions: RefCell<HashMap<(ValueHandle, ValueTypePredicate), ValueTypeBarrierDecision>>,
@@ -49,16 +56,47 @@ struct GoBarrierContext<'a> {
 pub(crate) fn open(analyzer: &dyn IAnalyzer) -> Box<dyn ValueTypeBarrierContext + '_> {
     Box::new(GoBarrierContext {
         analyzer,
-        go: resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go support belongs to a Go analyzer"),
-        native: RefCell::new(None),
-        decisions: RefCell::new(HashMap::default()),
-        syntax: RefCell::new(HashMap::default()),
-        native_refusals: RefCell::new(HashSet::default()),
-        observed: RefCell::new(HashMap::default()),
+        state: brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo::new(
+            GoBarrierState {
+                analyzer,
+                go: resolve_analyzer::<GoAnalyzer>(analyzer)
+                    .expect("Go support belongs to a Go analyzer"),
+                native: RefCell::new(None),
+                decisions: RefCell::new(HashMap::default()),
+                syntax: RefCell::new(HashMap::default()),
+                native_refusals: RefCell::new(HashSet::default()),
+                observed: RefCell::new(HashMap::default()),
+            },
+        ),
     })
 }
 
 impl ValueTypeBarrierContext for GoBarrierContext<'_> {
+    fn observed_type(
+        &self,
+        observation: &BarrierObservation,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ObservedValueType, SemanticProviderError> {
+        self.state.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self.analyzer),
+            |state| state.observed_type(observation, request),
+        )
+    }
+
+    fn classify(
+        &self,
+        observation: &BarrierObservation,
+        predicate: ValueTypePredicate,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ValueTypeBarrierDecision, SemanticProviderError> {
+        self.state.read(
+            &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self.analyzer),
+            |state| state.classify(observation, predicate, request),
+        )
+    }
+}
+
+impl GoBarrierState<'_> {
     fn observed_type(
         &self,
         observation: &BarrierObservation,
@@ -245,7 +283,7 @@ fn observed_call_binding_reference<'tree>(
     (reference.kind() == "identifier").then_some(reference)
 }
 
-impl GoBarrierContext<'_> {
+impl GoBarrierState<'_> {
     /// Inspect the declaration selected by native evidence, retaining its source revision.
     fn declared_carrier_syntax(
         &self,
@@ -513,5 +551,48 @@ impl GoBarrierContext<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::{
+        capture_query_reads,
+        workspace_authority::{CaptureScopedMemo, memo_attribution},
+    };
+
+    #[test]
+    fn barrier_state_refuses_a_foreign_capture() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            brokk_bifrost_core::analyzer::Language::Go,
+        )
+        .file("main.go", "package main\n")
+        .build();
+        let go = GoAnalyzer::new(project.project_dyn());
+        let state = CaptureScopedMemo::new(GoBarrierState {
+            analyzer: &go,
+            go: &go,
+            native: RefCell::new(None),
+            decisions: RefCell::new(HashMap::default()),
+            syntax: RefCell::new(HashMap::default()),
+            native_refusals: RefCell::new(HashSet::default()),
+            observed: RefCell::new(HashMap::default()),
+        });
+        let (_, first) = capture_query_reads(&go, || {
+            state.read(&memo_attribution(&go), |state| {
+                assert!(state.decisions.borrow().is_empty())
+            })
+        });
+        assert_eq!(first.unattributed_reads(), 0);
+        let (_, reads) = capture_query_reads(&go, || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.read(&memo_attribution(&go), |state| {
+                    state.native_refusals.borrow().is_empty()
+                })
+            }));
+            assert_eq!(result.is_err(), cfg!(debug_assertions));
+        });
+        assert_eq!(reads.unattributed_reads(), 1);
     }
 }

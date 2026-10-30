@@ -50,6 +50,13 @@ pub struct GoPackageStageUnit {
     pub source_role: String,
 }
 
+/// Completeness of an immutable prepared context; never persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum GoPreparationStage {
+    ImportBase,
+    Full,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum GoPreparedContextKind {
     File,
@@ -64,6 +71,7 @@ pub struct GoDemandContext {
     pub import_packages: HashMap<(SelectedResolutionMountOrdinal, SemanticId), i64>,
     pub(crate) context_completions: HashMap<SelectedResolutionMountOrdinal, ResolutionCompletion>,
     #[doc(hidden)]
+    /// External binder authority, including source-less GoTool packages.
     pub modeled_imports:
         HashMap<(SelectedResolutionMountOrdinal, SemanticId), GoSelectedExternalImport>,
 }
@@ -105,6 +113,7 @@ impl GoDemandContext {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct GoPreparedContextCacheKey {
     kind: GoPreparedContextKind,
+    stage: GoPreparationStage,
     routing_digest: [u8; 32],
     publication: super::super::GoContextIdentity,
     caller_mount: SelectedResolutionMountOrdinal,
@@ -117,14 +126,19 @@ pub(crate) struct GoPreparedContextCacheKey {
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct GoPreparedImportContext {
+    stage: GoPreparationStage,
     #[doc(hidden)]
     pub context: SelectedResolutionContextSet,
     #[doc(hidden)]
     pub demand: GoDemandContext,
+    #[doc(hidden)]
+    pub source_import_refusals: Vec<super::super::go_package_context::GoSourceImportRefusal>,
     pub(crate) package_inventory: GoPackageInventoryState,
     // Validated paths belong to this request's SQL token. Snapshots explicitly
     // discard this projection before crossing the request boundary.
     pub(crate) blueprint: Option<std::sync::Arc<SelectedFactOperationBlueprint>>,
+    // Canonical diagnostic evidence shares the prepared context snapshot lifetime.
+    diagnostic_view: Option<GoImportDiagnosticView>,
 }
 
 /// Exact preparation authority. Scope and staged content can change while an
@@ -133,6 +147,7 @@ pub struct GoPreparedImportContext {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct GoPreparedContextKey {
     kind: GoPreparedContextKind,
+    stage: GoPreparationStage,
     context_id: i64,
     caller_mount: SelectedResolutionMountOrdinal,
     caller_path: String,
@@ -154,6 +169,86 @@ pub(crate) struct GoPreparedImportContextSnapshot {
 
 #[cfg(any(test, feature = "test-support"))]
 impl SelectedResolutionOperation<'_, '_> {
+    /// Compare independently derived stages on a real selected fixture.
+    #[doc(hidden)]
+    pub fn assert_go_import_stages_equivalent_for_test(
+        &self,
+        context_id: i64,
+        path: &str,
+        role: &str,
+        cancellation: &CancellationToken,
+    ) {
+        let selection = self
+            .go_context_selection(context_id, role)
+            .unwrap()
+            .unwrap();
+        let derive = |stage| {
+            let GoPreparedImportContextOutcome::Ready(prepared) = self
+                .go_import_binding_context_for_selection(
+                    context_id,
+                    path,
+                    role,
+                    &selection,
+                    stage,
+                    cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("fixture preparation must complete")
+            };
+            prepared
+        };
+        let base = derive(GoPreparationStage::ImportBase);
+        let full = derive(GoPreparationStage::Full);
+        assert_eq!(base.demand.context_id, full.demand.context_id);
+        assert_eq!(base.demand.import_packages, full.demand.import_packages);
+        assert_eq!(base.demand.modeled_imports, full.demand.modeled_imports);
+        assert_eq!(
+            base.demand.context_completions,
+            full.demand.context_completions
+        );
+        let inputs = |context: SelectedResolutionContextSet| {
+            let SelectedResolutionContextValidationOutcome::Ready(inputs) = context
+                .validate_exact_mounts(
+                    self.mount_table().mount_count(),
+                    &selected_mount_lookup(self.mount_table()),
+                    cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("fixture context validates")
+            };
+            inputs.into_parts()
+        };
+        let base_inputs = inputs(base.context.clone());
+        let full_inputs = inputs(full.context.clone());
+        assert_eq!(base_inputs.0, full_inputs.0, "dot-import root bridges");
+        assert_eq!(base_inputs.1, full_inputs.1, "inventory completion");
+        assert_eq!(base_inputs.3, full_inputs.3, "context-owned gaps");
+        assert!(
+            base_inputs.5.is_empty(),
+            "ImportBase has no package bridges"
+        );
+        assert_eq!(base_inputs.6, full_inputs.6, "named import bindings");
+        assert_eq!(base_inputs.7, full_inputs.7, "callable import boundaries");
+        assert_eq!(
+            format!("{:?}", base.diagnostic_view),
+            format!("{:?}", full.diagnostic_view)
+        );
+        assert_eq!(
+            base.package_inventory.complete,
+            full.package_inventory.complete
+        );
+        assert_eq!(
+            base.package_inventory.fragments,
+            full.package_inventory.fragments
+        );
+        assert_eq!(
+            format!("{:?}", base.source_import_refusals),
+            format!("{:?}", full.source_import_refusals)
+        );
+    }
+
     /// Exercise the request-only mint boundary before preparing another file.
     #[doc(hidden)]
     pub fn mint_go_external_owner_for_test(&self) -> SemanticId {
@@ -193,7 +288,106 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
+/// Read-only projection of the import authority sealed by native preparation.
+/// This file-sized value shares the bounded prepared-context cache and its key.
+#[derive(Clone, Debug, Default)]
+#[doc(hidden)]
+pub struct GoImportDiagnosticView {
+    pub bindings: Vec<GoImportDiagnosticBinding>,
+    pub source_authority_gaps: Vec<GoSourceAuthorityGap>,
+}
+
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct GoSourceAuthorityGap {
+    pub code: String,
+    pub file: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct GoImportDiagnosticBinding {
+    /// Explicit alias, selected declared identifier, or incomplete presumed name.
+    /// Dot and blank imports retain their literal binder forms.
+    pub local_name: String,
+    pub source_spelling: String,
+    pub provider_package_id: Option<i64>,
+    pub provider_path: Option<String>,
+    pub has_source_declarations: bool,
+    pub completion: ResolutionCompletion,
+    pub named_reasons: Vec<(&'static str, Arc<str>)>,
+}
+
 impl GoPreparedImportContext {
+    /// Keep the snapshot's identity allow-list exhaustive, including projections.
+    /// Scalar fields have explicit types so they cannot silently become tokens.
+    fn assert_go_snapshot_safe(&self) {
+        let Self {
+            stage: _,
+            context,
+            demand: _,
+            source_import_refusals: _,
+            package_inventory: _,
+            blueprint: _,
+            diagnostic_view,
+        } = self;
+        let identities = context.identity_space();
+        identities.assert_go_snapshot_safe();
+        let Some(GoImportDiagnosticView {
+            bindings,
+            source_authority_gaps,
+        }) = diagnostic_view
+        else {
+            return;
+        };
+        for GoSourceAuthorityGap { code, file } in source_authority_gaps {
+            let _: &String = code;
+            let _: &std::path::PathBuf = file;
+        }
+        for GoImportDiagnosticBinding {
+            local_name,
+            source_spelling,
+            provider_package_id,
+            provider_path,
+            has_source_declarations,
+            completion,
+            named_reasons,
+        } in bindings
+        {
+            let _: &String = local_name;
+            let _: &String = source_spelling;
+            let _: &Option<i64> = provider_package_id;
+            let _: &Option<String> = provider_path;
+            let _: &bool = has_source_declarations;
+            let _: &Vec<(&'static str, Arc<str>)> = named_reasons;
+            // go_dot_import_context_for_selection builds inventory completion only
+            // from canonical named reasons; go_import_completion_for adds the same.
+            // go_import_binding_context_for_selection returns cancellation separately,
+            // and go_file_import_context_with_role snapshots only Ready preparations.
+            // This preparation path does not run a budgeted resolution session.
+            if let ResolutionCompletion::Incomplete(reasons) = completion {
+                for reason in reasons.iter() {
+                    match reason {
+                        ResolutionIncompleteReason::UnsupportedSemantic(identity) => assert!(
+                            identities.named_reason(*identity).is_some(),
+                            "diagnostic snapshot retains only canonical named reasons: {identity:?}"
+                        ),
+                        ResolutionIncompleteReason::Cancelled
+                        | ResolutionIncompleteReason::CyclicExpansion(_)
+                        | ResolutionIncompleteReason::CyclicPrefixDependency(_)
+                        | ResolutionIncompleteReason::InconsistentPrecedence(_)
+                        | ResolutionIncompleteReason::OpenBoundary { .. }
+                        | ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
+                        | ResolutionIncompleteReason::TimeBudgetExceeded(_)
+                        | ResolutionIncompleteReason::UnmountedFile { .. } => panic!(
+                            "request-only completion cannot enter a diagnostic snapshot: {reason:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     /// Allowed snapshot identities are bridges in unindexed_go_imports and
     /// their canonical numbers/named reasons. GoPreparedContextCacheKey covers
     /// their routing digest, publication identity, caller file/role, derivation
@@ -205,7 +399,7 @@ impl GoPreparedImportContext {
         source: &dyn BatchResolutionFragmentSource,
         cancellation: &CancellationToken,
     ) -> Result<Option<GoPreparedImportContextSnapshot>> {
-        self.context.identity_space().assert_go_snapshot_safe();
+        self.assert_go_snapshot_safe();
         let identities = self.context.identity_space().isolated_clone();
         let mut context = self.context.clone().with_identity_space(identities);
         let mut shared_names = HashMap::default();
@@ -220,10 +414,13 @@ impl GoPreparedImportContext {
         }
         Ok(Some(GoPreparedImportContextSnapshot {
             prepared: Self {
+                stage: self.stage,
                 context,
                 demand: self.demand.clone(),
+                source_import_refusals: self.source_import_refusals.clone(),
                 package_inventory: self.package_inventory.clone(),
                 blueprint: None,
+                diagnostic_view: self.diagnostic_view.clone(),
             },
             shared_names,
         }))
@@ -236,10 +433,7 @@ impl GoPreparedImportContextSnapshot {
         identities: &SelectedContextIdentities,
         names: &dyn SharedNameInterner,
     ) -> Result<GoPreparedImportContext> {
-        self.prepared
-            .context
-            .identity_space()
-            .assert_go_snapshot_safe();
+        self.prepared.assert_go_snapshot_safe();
         let mut context = self.prepared.context.clone();
         context.remap_shared_names(|identity| {
             let digest = self
@@ -250,10 +444,13 @@ impl GoPreparedImportContextSnapshot {
         })?;
         identities.copy_from_empty(&self.prepared.context.identity_space());
         Ok(GoPreparedImportContext {
+            stage: self.prepared.stage,
             context: context.with_identity_space(identities.clone()),
             demand: self.prepared.demand.clone(),
+            source_import_refusals: self.prepared.source_import_refusals.clone(),
             package_inventory: self.prepared.package_inventory.clone(),
             blueprint: None,
+            diagnostic_view: self.prepared.diagnostic_view.clone(),
         })
     }
 }
@@ -476,7 +673,17 @@ SELECT requested.value ->> 0, imports.source_spelling, imports.complete,
               WHERE provider.context_id=target.context_id
                 AND provider.package_id=target.package_id
                 AND (provider.source_role='go'
-                     OR (provider.source_role='test' AND target.for_test<>'')))
+                     OR (provider.source_role='test' AND target.for_test<>''))),
+       target.tool_import_path, target.provider_kind,
+       target.provider_module_path, target.provider_module_version, target.complete,
+       (SELECT anchor.package_name
+        FROM temp.selected_go_context_source_files provider
+        JOIN main.workspace_file_anchor_rows anchor ON anchor.file_version_id=provider.file_version_id
+          AND anchor.anchor_kind='own_module' AND anchor.anchor_pop=0
+        WHERE provider.context_id=target.context_id AND provider.package_id=target.package_id
+          AND (provider.source_role='go'
+               OR (provider.source_role='test' AND target.for_test<>''))
+        LIMIT 1)
 FROM json_each(?2) requested
 CROSS JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=requested.value ->> 0
 CROSS JOIN ({}) caller
@@ -534,6 +741,7 @@ WHERE i.alias='.'
 pub(super) struct GoFileImportRow {
     pub(super) complete: bool,
     pub(super) gaps: String,
+    pub(super) source_refusal: Option<super::super::go_package_context::GoSourceImportRefusal>,
     /// A missing or nameless tool provider has no authoritative package clause.
     pub(super) package_name: Option<String>,
     /// Retained as provider evidence even when its package clause is unknown.
@@ -541,6 +749,7 @@ pub(super) struct GoFileImportRow {
     pub(super) modeled_provider: Option<GoSelectedExternalImport>,
     /// Selected package files can supply native member declarations.
     pub(super) has_source_declarations: bool,
+    pub(super) provider_path: Option<String>,
 }
 
 /// Syntax inputs of one mounted Go file. Neither bindings nor dot aliases
@@ -593,8 +802,6 @@ struct GoSelectedImportInputs {
 pub struct GoImportInputCache {
     mounts: HashMap<u32, GoMountImportInputs>,
     selected: HashMap<GoImportAuthority, GoSelectedImportInputs>,
-    /// A captured absence must not fall through to a later publication.
-    model_overlay: Option<Option<Arc<dyn super::SelectedModelAuthority + Send + Sync>>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -669,25 +876,16 @@ impl SelectedResolutionOperation<'_, '_> {
         self,
         overlay: Option<Arc<dyn super::SelectedModelAuthority + Send + Sync>>,
     ) -> Self {
-        {
-            let mut inputs = self.go_import_inputs.borrow_mut();
-            assert!(
-                inputs.model_overlay.is_none() && inputs.mounts.is_empty(),
-                "Go model authority is captured before import preparation"
-            );
-            inputs.model_overlay = Some(overlay);
-        }
-        self
-    }
-
-    fn go_semantic_model_overlay(
-        &self,
-    ) -> Option<Arc<dyn super::SelectedModelAuthority + Send + Sync>> {
-        self.go_import_inputs
-            .borrow()
-            .model_overlay
-            .clone()
-            .unwrap_or_else(|| self.ready.analyzer.and_then(|a| a.model_authority()))
+        assert!(
+            self.ready.attached_model_authority.is_none()
+                && self.go_import_inputs.borrow().mounts.is_empty(),
+            "model authority is captured before import preparation"
+        );
+        let mut operation = self;
+        operation.ready.attached_model_authority = Some(overlay);
+        // Validate a captured authority against any analyzer service set now.
+        drop(operation.ready.model_authority());
+        operation
     }
 
     /// Overlay authority precedes missing durable import authority, like
@@ -700,7 +898,7 @@ impl SelectedResolutionOperation<'_, '_> {
         language: Language,
         import_path: &str,
     ) -> Option<GoSelectedExternalImport> {
-        let overlay = self.go_semantic_model_overlay()?;
+        let overlay = self.ready.model_authority()?;
         let identity = overlay.modeled_external_package_identity(language, import_path)?;
         Some(GoSelectedExternalImport {
             source_spelling: import_path.to_owned(),
@@ -762,7 +960,7 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         drop(rows);
         drop(statement);
-        if self.go_semantic_model_overlay().is_none() {
+        if self.ready.model_authority().is_none() {
             return Ok(imports);
         }
         for spelling in
@@ -818,6 +1016,40 @@ impl SelectedResolutionOperation<'_, '_> {
             imports.push(row.get(0)?);
         }
         Ok(imports)
+    }
+
+    /// Project the same cached file context used by ordinary native requests.
+    #[doc(hidden)]
+    pub fn go_import_diagnostic_view(
+        &self,
+        context_id: i64,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GoImportDiagnosticView>> {
+        let Some(source) = self.mount_table().mount_for_path("go", path)? else {
+            return Ok(None);
+        };
+        let Some(role) =
+            self.go_source_role_for_mount(context_id, source.ordinal(), cancellation)?
+        else {
+            return Ok(None);
+        };
+        let GoPreparedImportContextOutcome::Ready(prepared) = self
+            .go_file_import_context_at_stage(
+                context_id,
+                path,
+                &role,
+                GoPreparationStage::ImportBase,
+                cancellation,
+            )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            prepared
+                .diagnostic_view
+                .expect("file preparation retains diagnostic authority"),
+        ))
     }
 
     /// Prepare only this file's package and import context. Other Go files are
@@ -1066,6 +1298,7 @@ impl SelectedResolutionOperation<'_, '_> {
     ) -> GoPreparedContextKey {
         GoPreparedContextKey {
             kind: GoPreparedContextKind::File,
+            stage: GoPreparationStage::Full,
             context_id,
             caller_mount,
             caller_path: path.to_owned(),
@@ -1083,6 +1316,29 @@ impl SelectedResolutionOperation<'_, '_> {
         source_role: &str,
         cancellation: &CancellationToken,
     ) -> Result<GoPreparedImportContextOutcome> {
+        let outcome = self.go_file_import_context_at_stage(
+            context_id,
+            path,
+            source_role,
+            GoPreparationStage::Full,
+            cancellation,
+        )?;
+        if let GoPreparedImportContextOutcome::Ready(prepared) = &outcome {
+            assert_eq!(prepared.stage, GoPreparationStage::Full);
+        }
+        Ok(outcome)
+    }
+
+    // Only this module can request ImportBase. Resolution entry points always
+    // request Full and never receive a base product from either memo or cache.
+    fn go_file_import_context_at_stage(
+        &self,
+        context_id: i64,
+        path: &str,
+        source_role: &str,
+        stage: GoPreparationStage,
+        cancellation: &CancellationToken,
+    ) -> Result<GoPreparedImportContextOutcome> {
         if cancellation.is_cancelled() {
             return Ok(GoPreparedImportContextOutcome::Cancelled);
         }
@@ -1090,7 +1346,15 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GoPreparedImportContextOutcome::Unavailable);
         };
         assert_eq!(source.semantic_language(), Language::Go);
-        let key = self.go_file_preparation_key(context_id, source.ordinal(), path, source_role);
+        let mut key = self.go_file_preparation_key(context_id, source.ordinal(), path, source_role);
+        if stage == GoPreparationStage::ImportBase
+            && let Some(full) = self.go_prepared_contexts.get(&key)
+        {
+            assert_eq!(full.stage, GoPreparationStage::Full);
+            self.record_go_package_inventory_state(&full.package_inventory);
+            return Ok(GoPreparedImportContextOutcome::Ready(Box::new(full)));
+        }
+        key.stage = stage;
         // Keep non-ready outcomes outside the memo. Ordinary read admission
         // retains a completed preparation even if cancellation prevents its
         // optional cross-request snapshot at the end of the derivation.
@@ -1102,6 +1366,7 @@ impl SelectedResolutionOperation<'_, '_> {
             };
             let cache_key = GoPreparedContextCacheKey {
                 kind: GoPreparedContextKind::File,
+                stage,
                 routing_digest: self.ready.inventory.routing_digest(),
                 publication: selection.identity.clone(),
                 caller_mount: source.ordinal(),
@@ -1109,16 +1374,27 @@ impl SelectedResolutionOperation<'_, '_> {
                 source_role: source_role.to_owned(),
                 derivation_version: super::super::go_package_context::DERIVATION_VERSION,
                 active_model_set_hash: self
-                    .go_semantic_model_overlay()
+                    .ready
+                    .model_authority()
                     .map(|overlay| overlay.active_model_set_hash().to_owned()),
             };
-            if self.ready.context_identities.is_empty()
-                && let Some(cached) = self
-                    .ready
-                    .store
-                    .cache_budget
-                    .go_prepared_context(&cache_key)
-            {
+            let cached = self
+                .ready
+                .context_identities
+                .is_empty()
+                .then(|| {
+                    let budget = &self.ready.store.cache_budget;
+                    if stage == GoPreparationStage::ImportBase {
+                        let mut full_key = cache_key.clone();
+                        full_key.stage = GoPreparationStage::Full;
+                        if let Some(full) = budget.go_prepared_context(&full_key) {
+                            return Some(full);
+                        }
+                    }
+                    budget.go_prepared_context(&cache_key)
+                })
+                .flatten();
+            if let Some(cached) = cached {
                 return Ok(Some(cached.restored_for_request(
                     &self.ready.context_identities,
                     &self.ready.shared_names(),
@@ -1133,6 +1409,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 path,
                 source_role,
                 &selection,
+                stage,
                 cancellation,
             )? {
                 GoPreparedImportContextOutcome::Ready(context) => {
@@ -1346,11 +1623,74 @@ impl SelectedResolutionOperation<'_, '_> {
             let language = Language::from_config_label(&language_label).ok_or_else(|| {
                 StoreError::corrupt(format!("unknown selected language {language_label:?}"))
             })?;
+            let has_source_declarations: bool = row.get(9)?;
+            // Read the same canonical source anchor as SOURCE_INVENTORY_SQL,
+            // restricted to this already-selected provider's admitted source.
+            // ForTest names the tested package even on copied dependencies,
+            // and opaque tool ImportPath suffixes are never source FQN prefixes.
+            let provider_path: Option<String> = if has_source_declarations {
+                row.get::<_, Option<String>>(15)?
+                    .filter(|path| !path.is_empty())
+            } else {
+                row.get(10)?
+            };
+            let provider_kind: Option<String> = row.get(11)?;
             let modeled_provider = if package_name.is_none() {
                 self.model_declared_go_package(language, &spelling)
+            } else if !has_source_declarations
+                && row.get::<_, bool>(2)?
+                && row.get::<_, Option<bool>>(14)? == Some(true)
+                && provider_kind
+                    .as_deref()
+                    .is_some_and(|kind| matches!(kind, "standard" | "module"))
+            {
+                Some(GoSelectedExternalImport {
+                    source_spelling: spelling.clone(),
+                    import_path: row.get(10)?,
+                    package_name: package_name.clone().expect("confirmed package name"),
+                    provenance: GoExternalPackageProvenance::GoTool {
+                        provider_kind: provider_kind.expect("confirmed tool provider"),
+                        module_path: row.get(12)?,
+                        module_version: row.get(13)?,
+                    },
+                })
             } else {
                 None
             };
+            let gaps: String = row.get(3)?;
+            let gap_values: Vec<serde_json::Value> = serde_json::from_str(&gaps)
+                .map_err(|error| StoreError::new(format!("invalid Go import gaps: {error}")))?;
+            let source_refusal: Option<super::super::go_package_context::GoSourceImportRefusal> =
+                gap_values
+                    .into_iter()
+                    .find_map(|gap| {
+                        (gap["code"] == "incomplete_import_provider" && gap["evidence"].is_object())
+                            .then(|| serde_json::from_value(gap["evidence"].clone()))
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        StoreError::new(format!("invalid Go source import refusal: {error}"))
+                    })?;
+            if let Some(refusal) = &source_refusal {
+                use super::super::go_package_context::GoSourceImportRefusalReason;
+                let valid = match refusal.reason {
+                    GoSourceImportRefusalReason::RelativeImportInModuleMode => {
+                        refusal.module_manifest.is_some()
+                    }
+                    GoSourceImportRefusalReason::RelativeImportOutsideWorkspace => {
+                        refusal.directory.is_none()
+                    }
+                    GoSourceImportRefusalReason::SourcePackageDirectoryUnavailable
+                    | GoSourceImportRefusalReason::ConflictingSourcePackageNames => {
+                        refusal.directory.is_some()
+                    }
+                };
+                if !valid {
+                    return Err(StoreError::new(format!(
+                        "invalid Go source import refusal fields: {refusal:?}"
+                    )));
+                }
+            }
             let authority = GoImportAuthority {
                 mount,
                 context_id,
@@ -1365,11 +1705,13 @@ impl SelectedResolutionOperation<'_, '_> {
                     spelling,
                     GoFileImportRow {
                         complete: modeled_provider.is_some() || row.get::<_, bool>(2)?,
-                        gaps: row.get(3)?,
+                        gaps,
+                        source_refusal,
                         package_name,
                         package_id,
                         modeled_provider,
-                        has_source_declarations: row.get(9)?,
+                        has_source_declarations,
+                        provider_path,
                     },
                 );
         }
@@ -1396,6 +1738,41 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(true)
     }
 
+    fn go_import_diagnostic_binding(
+        &self,
+        local_name: &str,
+        source_spelling: String,
+        provider: Option<&GoFileImportRow>,
+        completion: ResolutionCompletion,
+    ) -> GoImportDiagnosticBinding {
+        let named_reasons = match &completion {
+            ResolutionCompletion::Complete => Vec::new(),
+            ResolutionCompletion::Incomplete(reasons) => reasons
+                .iter()
+                .filter_map(|reason| {
+                    if let ResolutionIncompleteReason::UnsupportedSemantic(id) = reason {
+                        self.ready.context_identities.named_reason(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        };
+        GoImportDiagnosticBinding {
+            local_name: local_name.into(),
+            source_spelling,
+            provider_package_id: provider.and_then(|row| row.package_id),
+            provider_path: provider.and_then(|row| {
+                row.provider_path
+                    .clone()
+                    .or_else(|| row.modeled_provider.as_ref().map(|p| p.import_path.clone()))
+            }),
+            has_source_declarations: provider.is_some_and(|row| row.has_source_declarations),
+            completion,
+            named_reasons,
+        }
+    }
+
     /// Bind explicit aliases and selected canonical package names in this file.
     /// Positioned prefixes are answered later by the demand-root provider.
     /// Package bindings never establish a nominal receiver type.
@@ -1418,6 +1795,7 @@ impl SelectedResolutionOperation<'_, '_> {
             caller_path,
             source_role,
             &selection,
+            GoPreparationStage::Full,
             cancellation,
         )
     }
@@ -1428,15 +1806,26 @@ impl SelectedResolutionOperation<'_, '_> {
         caller_path: &str,
         source_role: &str,
         selection: &GoContextSelection,
+        stage: GoPreparationStage,
         cancellation: &CancellationToken,
     ) -> Result<GoPreparedImportContextOutcome> {
-        let (context, package_inventory) = match self.go_package_context_for_selection(
-            context_id,
-            caller_path,
-            source_role,
-            selection,
-            cancellation,
-        )? {
+        let package_context = match stage {
+            GoPreparationStage::Full => self.go_package_context_for_selection(
+                context_id,
+                caller_path,
+                source_role,
+                selection,
+                cancellation,
+            )?,
+            GoPreparationStage::ImportBase => self.go_dot_import_context_for_selection(
+                context_id,
+                caller_path,
+                source_role,
+                selection,
+                cancellation,
+            )?,
+        };
+        let (context, package_inventory) = match package_context {
             GoDotImportContext::Ready { context, inventory } => (context, inventory),
             GoDotImportContext::Unavailable => {
                 return Ok(GoPreparedImportContextOutcome::Unavailable);
@@ -1489,6 +1878,56 @@ impl SelectedResolutionOperation<'_, '_> {
         let names = self.ready.shared_names();
         let lexical = self.ready.lexical_source();
         let completion = context.inventory_completion().clone();
+        let gaps: Vec<serde_json::Value> = serde_json::from_str(&selection.evidence)
+            .map_err(|error| StoreError::corrupt(format!("invalid Go context gaps: {error}")))?;
+        let mut diagnostic_view = GoImportDiagnosticView::default();
+        for gap in gaps {
+            if let Some(
+                code @ ("missing_source_package_authority" | "unavailable_source_publication"),
+            ) = gap.get("code").and_then(serde_json::Value::as_str)
+            {
+                let file = gap
+                    .get("evidence")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        StoreError::corrupt("Go source authority gap has no file evidence")
+                    })?;
+                diagnostic_view
+                    .source_authority_gaps
+                    .push(GoSourceAuthorityGap {
+                        code: code.into(),
+                        file: file.into(),
+                    });
+            }
+        }
+        // Dot and blank imports do not create lexical binding descriptors, but
+        // their selected provider authority is still diagnostic input.
+        for import in &imports {
+            let Some(alias @ ("." | "_")) = import.alias.as_deref() else {
+                continue;
+            };
+            let Some(path) = &import.path else {
+                continue;
+            };
+            let spelling = path.segments.join("/");
+            let provider = selected.imports.get(&spelling);
+            let import_completion = self.go_import_completion_for(
+                context_id,
+                version,
+                source_role,
+                &spelling,
+                provider,
+                &completion,
+            );
+            diagnostic_view
+                .bindings
+                .push(self.go_import_diagnostic_binding(
+                    alias,
+                    spelling,
+                    provider,
+                    import_completion,
+                ));
+        }
         let mut bindings = Vec::new();
         let mut import_packages = HashMap::default();
         let mut modeled_imports = HashMap::default();
@@ -1541,6 +1980,14 @@ impl SelectedResolutionOperation<'_, '_> {
                     "a presumed binder requires an unresolved provider"
                 );
             }
+            diagnostic_view
+                .bindings
+                .push(self.go_import_diagnostic_binding(
+                    name,
+                    spelling.clone(),
+                    selected,
+                    import_completion.clone(),
+                ));
             let Some(definition_node) =
                 lexical.lookup_definition_node(row.metadata.definition, cancellation)?
             else {
@@ -1604,10 +2051,17 @@ impl SelectedResolutionOperation<'_, '_> {
         self.record_go_package_inventory_state(&package_inventory);
         Ok(GoPreparedImportContextOutcome::Ready(Box::new(
             GoPreparedImportContext {
+                stage,
                 context,
                 demand,
+                source_import_refusals: selected
+                    .imports
+                    .values()
+                    .filter_map(|row| row.source_refusal.clone())
+                    .collect(),
                 package_inventory,
                 blueprint: None,
+                diagnostic_view: Some(diagnostic_view),
             },
         )))
     }
@@ -1979,7 +2433,46 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
                 }
             }
         }
+        heap.vec(&self.prepared.source_import_refusals);
+        for refusal in &self.prepared.source_import_refusals {
+            heap.add(
+                refusal.importer.capacity()
+                    + refusal.spelling.capacity()
+                    + refusal.role.capacity()
+                    + refusal.directory.as_ref().map_or(0, String::capacity)
+                    + refusal.module_manifest.as_ref().map_or(0, String::capacity),
+            );
+            heap.vec(&refusal.candidates);
+            heap.vec(&refusal.declared_names);
+            heap.add(
+                refusal
+                    .candidates
+                    .iter()
+                    .chain(&refusal.declared_names)
+                    .map(String::capacity)
+                    .sum(),
+            );
+        }
         heap.map(&self.prepared.package_inventory.fragments);
+        if let Some(view) = &self.prepared.diagnostic_view {
+            heap.vec(&view.bindings);
+            for binding in &view.bindings {
+                heap.add(
+                    binding.local_name.capacity()
+                        + binding.source_spelling.capacity()
+                        + binding.provider_path.as_ref().map_or(0, String::capacity),
+                );
+                binding.completion.charge_retained(&mut heap);
+                heap.vec(&binding.named_reasons);
+                for (_, reason) in &binding.named_reasons {
+                    heap.arc(reason, |_, _| {});
+                }
+            }
+            heap.vec(&view.source_authority_gaps);
+            for gap in &view.source_authority_gaps {
+                heap.add(gap.code.capacity() + gap.file.capacity());
+            }
+        }
         heap.total()
     }
 }
@@ -1994,6 +2487,7 @@ mod snapshot_tests {
     fn snapshot(identities: SelectedContextIdentities) -> GoPreparedImportContextSnapshot {
         GoPreparedImportContextSnapshot {
             prepared: GoPreparedImportContext {
+                stage: GoPreparationStage::Full,
                 context: SelectedResolutionContextSet::new(identities, Vec::new(), 0, &|_| {
                     Ok(None)
                 })
@@ -2004,11 +2498,56 @@ mod snapshot_tests {
                     context_completions: HashMap::default(),
                     modeled_imports: HashMap::default(),
                 },
+                source_import_refusals: Vec::new(),
                 package_inventory: GoPackageInventoryState::default(),
                 blueprint: None,
+                diagnostic_view: None,
             },
             shared_names: HashMap::default(),
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "diagnostic snapshot retains only canonical named reasons")]
+    fn prepared_context_snapshot_rejects_unregistered_diagnostic_identity() {
+        let mut cached = snapshot(SelectedContextIdentities::new());
+        cached.prepared.diagnostic_view = Some(GoImportDiagnosticView {
+            bindings: vec![GoImportDiagnosticBinding {
+                local_name: "missing".into(),
+                source_spelling: "example.test/missing".into(),
+                provider_package_id: None,
+                provider_path: None,
+                has_source_declarations: false,
+                completion: ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::context_local(1)),
+                ]),
+                named_reasons: Vec::new(),
+            }],
+            source_authority_gaps: Vec::new(),
+        });
+        let _prepared = cached.restored_for_request(
+            &SelectedContextIdentities::new(),
+            &PerRequestSharedNames::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "external provider type identities cannot enter a prepared-context snapshot"
+    )]
+    fn prepared_context_snapshot_rejects_go_provider_boundary() {
+        let names = PerRequestSharedNames::new();
+        let identities = SelectedContextIdentities::new();
+        let identity = SemanticId::shared_name(names.intern([1; 32]));
+        identities.record_jvm_external_provider_type_identity(
+            ExternalOwnerLanguage::Go,
+            identity,
+            identity,
+            identity,
+            identity,
+        );
+        let _prepared =
+            snapshot(identities).restored_for_request(&SelectedContextIdentities::new(), &names);
     }
 
     #[test]

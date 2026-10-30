@@ -324,7 +324,10 @@ pub(super) fn declared_document_gap(
     {
         return Some("is outside the configuration input's where and format scope");
     }
-    match state.configuration_cache.ingestion_of(document) {
+    match state
+        .configuration_cache
+        .ingestion_of(state.analyzer, document)
+    {
         ConfigurationDocumentIngestion::NotIngested => Some(
             "was not ingested by the configuration input: it is absent from the workspace, or the input stopped before reaching it",
         ),

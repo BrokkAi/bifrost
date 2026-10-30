@@ -16,6 +16,7 @@ use crate::graph::syntax::{
     symbol_or_string_value,
 };
 use crate::syntax::ruby_parameter_binding_name_nodes;
+use brokk_bifrost_core::analyzer::memo_attribution::MemoAttribution;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -27,10 +28,11 @@ use brokk_bifrost_core::analyzer::{
 };
 use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tree_sitter::Node;
-pub struct RubyFileScan<'a> {
+pub struct RubyFileScan<'a, A: MemoAttribution> {
     pub index: &'a dyn CodeUnitIndex,
-    pub semantic: &'a RubySemanticIndex<'a>,
+    pub semantic: &'a RubySemanticIndex<'a, A>,
     pub support: &'a dyn BoundedDefinitionLookup,
     pub file: &'a ProjectFile,
     pub source: &'a str,
@@ -41,7 +43,7 @@ pub struct RubyFileScan<'a> {
     pub unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
-impl RubyFileScan<'_> {
+impl<A: MemoAttribution> RubyFileScan<'_, A> {
     pub fn scan(&mut self, root: Node<'_>) {
         let mut state = RubyWalkState {
             scan: self,
@@ -60,8 +62,8 @@ impl RubyFileScan<'_> {
     }
 }
 
-struct RubyWalkState<'a, 'b> {
-    scan: &'a mut RubyFileScan<'b>,
+struct RubyWalkState<'a, 'b, A: MemoAttribution> {
+    scan: &'a mut RubyFileScan<'b, A>,
     locals: LocalInferenceEngine<String>,
     lexical_stack: Vec<String>,
     method_stack: Vec<ReceiverMode>,
@@ -69,7 +71,7 @@ struct RubyWalkState<'a, 'b> {
     exits: Vec<RubyScopeExit>,
 }
 
-impl RubyWalkState<'_, '_> {
+impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
     fn enter(&mut self, node: Node<'_>) -> TreeWalkAction {
         if let Some(declaration) = ruby_type_body_declaration(node) {
             let owner = self.type_owner(declaration);
@@ -461,8 +463,8 @@ pub fn first_precise(bindings: &LocalInferenceEngine<String>, symbol: &str) -> O
     brokk_bifrost_core::analyzer::usages::inverted_edges::first_precise(bindings, symbol)
 }
 
-pub fn ruby_type_owner(
-    semantic: &RubySemanticIndex<'_>,
+pub fn ruby_type_owner<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
     lexical_stack: &[String],
@@ -482,8 +484,8 @@ pub fn ruby_type_owner(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn ruby_receiver_type(
-    semantic: &RubySemanticIndex<'_>,
+pub fn ruby_receiver_type<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
     lexical_stack: &[String],
@@ -539,8 +541,8 @@ pub fn ruby_receiver_type(
     Some(receiver)
 }
 
-fn ruby_factory_return_receiver_type(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_factory_return_receiver_type<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     visible_files: &HashSet<ProjectFile>,
     class: &ReceiverType,
     method_name: &str,
@@ -555,8 +557,8 @@ fn ruby_factory_return_receiver_type(
 /// the method's inferred return instance (e.g. a factory method returning
 /// `Foo.new`). Works for both class receivers (`Klass.make.x`) and the enclosing
 /// instance receiver of a bare call (`get_foo.x`).
-fn ruby_method_return_receiver_type(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_method_return_receiver_type<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     visible_files: &HashSet<ProjectFile>,
     receiver: &ReceiverType,
     method_name: &str,
@@ -578,8 +580,8 @@ fn ruby_method_return_receiver_type(
     })
 }
 
-fn ruby_infer_method_return_instance_owner(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_infer_method_return_instance_owner<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     method_unit: CodeUnit,
     invocation_owner_fq_name: String,
 ) -> Option<String> {
@@ -588,59 +590,32 @@ fn ruby_infer_method_return_instance_owner(
         invocation_owner_fq_name,
     };
     let start_key = start.key();
-    if let Some(cached) = semantic.factory_return_cache.borrow().get(&start_key) {
-        return cached.clone();
-    }
-
-    let mut stack = vec![start];
-    let mut visited = HashSet::default();
-    while let Some(frame) = stack.pop() {
-        let key = frame.key();
-        let cached = semantic.factory_return_cache.borrow().get(&key).cloned();
-        if let Some(cached) = cached {
-            if cached.is_some() {
-                semantic
-                    .factory_return_cache
-                    .borrow_mut()
-                    .insert(start_key, cached.clone());
-                return cached.clone();
-            }
-            continue;
-        }
-        if !visited.insert(key.clone()) {
-            semantic.factory_return_cache.borrow_mut().insert(key, None);
-            continue;
-        }
-
-        match ruby_factory_method_outcome(semantic, &frame) {
-            FactoryMethodOutcome::Owner(owner) => {
-                semantic
-                    .factory_return_cache
-                    .borrow_mut()
-                    .insert(key, Some(owner.clone()));
-                semantic
-                    .factory_return_cache
-                    .borrow_mut()
-                    .insert(start_key, Some(owner.clone()));
-                return Some(owner);
-            }
-            FactoryMethodOutcome::Chain(next) => {
-                if next.is_empty() {
-                    semantic.factory_return_cache.borrow_mut().insert(key, None);
-                } else {
-                    stack.extend(next.into_iter().rev());
-                }
-            }
-            FactoryMethodOutcome::Unknown => {
-                semantic.factory_return_cache.borrow_mut().insert(key, None);
-            }
-        }
-    }
-    semantic
+    let result = semantic
         .factory_return_cache
-        .borrow_mut()
-        .insert(start_key, None);
-    None
+        .read(semantic.graph.attribution, |cache, capture| {
+            if let Some(entry) = cache.borrow().get(&start_key) {
+                return Ok::<_, std::convert::Infallible>(Arc::clone(entry));
+            }
+            let entry = Arc::new(capture.build(|| {
+                let mut stack = vec![start];
+                let mut visited = HashSet::default();
+                while let Some(frame) = stack.pop() {
+                    if !visited.insert(frame.key()) {
+                        continue;
+                    }
+                    match ruby_factory_method_outcome(semantic, &frame) {
+                        FactoryMethodOutcome::Owner(owner) => return Some(owner),
+                        FactoryMethodOutcome::Chain(next) => stack.extend(next.into_iter().rev()),
+                        FactoryMethodOutcome::Unknown => {}
+                    }
+                }
+                None
+            }));
+            cache.borrow_mut().insert(start_key, Arc::clone(&entry));
+            Ok(entry)
+        })
+        .expect("factory return build is infallible");
+    (*result).clone()
 }
 
 impl FactoryInferenceFrame {
@@ -652,8 +627,8 @@ impl FactoryInferenceFrame {
     }
 }
 
-fn ruby_factory_method_outcome(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_factory_method_outcome<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     frame: &FactoryInferenceFrame,
 ) -> FactoryMethodOutcome {
     let Some(owner) = semantic.graph.index.parent_of(&frame.method) else {
@@ -725,8 +700,8 @@ fn ruby_factory_method_outcome(
     )
 }
 
-fn ruby_bare_new_outcome(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_bare_new_outcome<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     frame: &FactoryInferenceFrame,
 ) -> FactoryMethodOutcome {
     let Some(overrides) = ruby_factory_method_frames(
@@ -743,8 +718,8 @@ fn ruby_bare_new_outcome(
     FactoryMethodOutcome::Chain(overrides)
 }
 
-fn ruby_factory_method_frames(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_factory_method_frames<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     file: &ProjectFile,
     owner_fq_name: &str,
     method_name: &str,
@@ -852,8 +827,8 @@ pub fn ruby_method_node_for_ranges<'tree>(
     None
 }
 
-fn ruby_factory_new_receiver_outcome(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_factory_new_receiver_outcome<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     file: &ProjectFile,
     source: &str,
     owner_fq_name: &str,
@@ -877,8 +852,8 @@ fn ruby_factory_new_receiver_outcome(
     FactoryMethodOutcome::Unknown
 }
 
-fn ruby_factory_class_receiver_owner(
-    semantic: &RubySemanticIndex<'_>,
+fn ruby_factory_class_receiver_owner<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     file: &ProjectFile,
     source: &str,
     lexical_stack: &[String],
@@ -961,8 +936,8 @@ pub fn ruby_field_reference_owner_and_scope(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn ruby_seed_assignment(
-    semantic: &RubySemanticIndex<'_>,
+pub fn ruby_seed_assignment<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
     lexical_stack: &[String],

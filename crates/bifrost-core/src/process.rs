@@ -93,13 +93,17 @@ pub fn run_bounded_process(
 /// This value closes that gap by making the direct child the root of a tree it
 /// owns: on Windows the child is created suspended, assigned to a job object
 /// with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and resumed, so every descendant
-/// stays in the job; on Unix the child is a session leader (`setsid`), so
+/// stays in the job; on Unix the child leads its own process group, so
 /// every descendant shares its process group. [`Self::terminate_tree_and_wait`]
 /// then kills the whole tree, and callers may join pipe readers afterwards:
 /// no writer survives the termination.
 ///
 /// Descendants stay in the tree unless they break away themselves
-/// (`CREATE_BREAKAWAY_FROM_JOB` on Windows, `setsid` on Unix).
+/// (`CREATE_BREAKAWAY_FROM_JOB` on Windows, `setsid` or `setpgid` on Unix).
+/// On Unix the child keeps the parent's session and controlling terminal; it
+/// does not call `setsid`. A tool opening `/dev/tty` can therefore block on a
+/// prompt until the bounded timeout kills it, where `setsid` made it fail at
+/// once. Descendants that need to break away must do so themselves.
 pub struct OwnedProcess {
     child: Child,
     #[cfg(windows)]
@@ -174,7 +178,9 @@ impl OwnedProcess {
     /// Kill every process of the owned tree, not only the direct child.
     #[cfg(unix)]
     pub fn terminate(&mut self) -> std::io::Result<()> {
-        terminate_process_id(self.child.id());
+        // A process group can outlive its leader. Only std's guarded kill may
+        // target the direct pid, since wait() may already have reaped it.
+        unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
         match self.child.kill() {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
@@ -186,6 +192,32 @@ impl OwnedProcess {
     #[cfg(all(not(unix), not(windows)))]
     pub fn terminate(&mut self) -> std::io::Result<()> {
         self.child.kill()
+    }
+
+    /// Whether a process of the owned tree may still be running.
+    ///
+    /// Once no such process remains, nothing the tree spawned holds the end of
+    /// a pipe that the caller's workers read or write, so those workers are
+    /// bound to finish. Only a probe that proves the tree empty answers
+    /// `false`; on Unix the unreaped direct child still counts as running.
+    #[cfg(unix)]
+    fn tree_may_be_running(&self) -> bool {
+        // The child leads its own process group, so signal 0 to the group
+        // probes whether any member remains.
+        let probe = unsafe { libc::kill(-(self.child.id() as libc::pid_t), 0) };
+        probe == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    /// Whether a process of the owned tree may still be running.
+    #[cfg(windows)]
+    fn tree_may_be_running(&self) -> bool {
+        !matches!(self.job.try_wait(), Ok(true))
+    }
+
+    /// Whether a process of the owned tree may still be running.
+    #[cfg(all(not(unix), not(windows)))]
+    fn tree_may_be_running(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     /// Terminate the owned tree and reap it, reporting what could not be done.
@@ -286,6 +318,78 @@ fn format_spawn_error(request: &BoundedProcessRequest, err: std::io::Error) -> S
     )
 }
 
+#[cfg(unix)]
+fn wait_for_process(
+    child: &mut OwnedProcess,
+    request: &BoundedProcessRequest,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<ExitStatus, String> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    let started = Instant::now();
+    let pid = child.child.id();
+    // The worker observes exit without reaping. The controller retains the
+    // Child and keeps its pid reserved until termination and joining finish.
+    let result = thread::scope(|scope| {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = scope.spawn(move || {
+            let status = observe_process_exit(pid);
+            sender
+                .send(status)
+                .expect("process wait controller is alive");
+        });
+        let result = loop {
+            if is_cancelled() {
+                break Err(format!("{} was cancelled", request.description));
+            }
+            let remaining = request.timeout.saturating_sub(started.elapsed());
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(status) => {
+                    break status.map_err(|err| {
+                        format!("failed to wait for {} group: {err}", request.description)
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) if started.elapsed() >= request.timeout => {
+                    break Err(format!(
+                        "{} timed out after {}",
+                        request.description,
+                        format_duration(request.timeout)
+                    ));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    break Err(format!("{} wait worker disconnected", request.description));
+                }
+            }
+        };
+        let result = result.map_err(|error| {
+            let cleanup = child
+                .terminate()
+                .map_err(|err| format!("termination failed: {err}"));
+            format!("{error}{}", cleanup_error_suffix(cleanup))
+        });
+        // Keep the receiver alive until the worker has sent its result, even
+        // when cancellation or the deadline wins the race with completion.
+        match worker.join() {
+            Ok(()) => result,
+            Err(_) => Err(format!("{} wait worker panicked", request.description)),
+        }
+    });
+    // No signal to the direct pid can race with this reap: the worker has
+    // joined and any cancellation/deadline termination already happened.
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait for {} group: {err}", request.description));
+    match result {
+        Ok(()) => status,
+        Err(error) => Err(format!(
+            "{error}{}",
+            cleanup_error_suffix(status.map(|_| ()))
+        )),
+    }
+}
+
+#[cfg(not(unix))]
 fn wait_for_process(
     child: &mut OwnedProcess,
     request: &BoundedProcessRequest,
@@ -376,7 +480,7 @@ fn collect_stdin_writer(
     worker: JoinHandle<StdinWriteResult>,
     child: &mut OwnedProcess,
 ) -> Result<(), StdinWriteFailure> {
-    let timed_out = !worker_finished_within(&worker, READER_GRACE);
+    let timed_out = worker_outlived_grace(&worker, child);
     let cleanup = timed_out.then(|| child.terminate_tree_and_wait());
     let joined = worker.join();
     // A writer still blocked at the deadline fails with a broken pipe once
@@ -401,7 +505,7 @@ fn collect_pipe(
     request: &BoundedProcessRequest,
     child: &mut OwnedProcess,
 ) -> Result<Vec<u8>, String> {
-    let timed_out = !worker_finished_within(&worker, READER_GRACE);
+    let timed_out = worker_outlived_grace(&worker, child);
     let cleanup = timed_out.then(|| child.terminate_tree_and_wait());
     match worker.join() {
         Ok(Ok(bytes)) if !timed_out => Ok(bytes),
@@ -416,6 +520,15 @@ fn collect_pipe(
         )),
         Err(_) => Err(format!("{} {name} reader panicked", request.description)),
     }
+}
+
+/// Whether `worker` is still running after the grace while a process of the
+/// owned tree survives to hold the other end of its pipe. A worker that is
+/// only late to be scheduled, as under a fully loaded test run, finishes on
+/// its own once the tree is gone, so it is joined rather than failing a child
+/// that succeeded (#7981).
+fn worker_outlived_grace<T>(worker: &JoinHandle<T>, child: &mut OwnedProcess) -> bool {
+    !worker_finished_within(worker, READER_GRACE) && child.tree_may_be_running()
 }
 
 fn worker_finished_within<T>(worker: &JoinHandle<T>, timeout: Duration) -> bool {
@@ -467,25 +580,36 @@ fn is_text_file_busy(err: &std::io::Error) -> bool {
 #[cfg(unix)]
 fn configure_process(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // Unlike a pre-exec closure, this preserves std's posix_spawn fast path.
+    command.process_group(0);
 }
 
 #[cfg(all(not(unix), not(windows)))]
 fn configure_process(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn terminate_process_id(pid: u32) {
-    let pid = pid as libc::pid_t;
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
+fn observe_process_exit(pid: u32) -> std::io::Result<()> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        // WNOWAIT leaves the child unreaped, reserving its pid until the
+        // controller has finished signalling the process tree.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ECHILD) => return Ok(()),
+            _ => return Err(error),
+        }
     }
 }
 
@@ -662,8 +786,52 @@ mod tests {
     fn bounded_process_timeout_cleans_up_descendants() {
         let temporary = tempfile::tempdir().unwrap();
         let marker = temporary.path().join("escaped-descendant");
+        let mut request = descendant_request(temporary.path(), &marker);
+        request.timeout = Duration::from_millis(100);
+        let error = run_bounded_process(&request, || false).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        thread::sleep(Duration::from_millis(700));
+        assert!(!marker.exists(), "descendant escaped timeout cleanup");
+    }
+
+    #[test]
+    fn bounded_process_cancellation_cleans_up_descendants() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let marker = temporary.path().join("escaped-descendant");
+        let ready = temporary.path().join("descendant-ready");
+        let mut request = descendant_request(temporary.path(), &marker);
+        request.env.push((
+            OsString::from("BIFROST_BOUNDED_PROCESS_HELPER_READY"),
+            ready.clone().into_os_string(),
+        ));
+        let cancelled = AtomicBool::new(false);
+        let error = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            run_bounded_process(&request, || {
+                cancelled.load(Ordering::Relaxed) && ready.exists()
+            })
+            .unwrap_err()
+        });
+        assert!(error.contains("was cancelled"), "{error}");
+        assert!(
+            ready.exists(),
+            "descendant must have started before cancellation"
+        );
+        thread::sleep(Duration::from_millis(700));
+        assert!(!marker.exists(), "descendant escaped cancellation cleanup");
+    }
+
+    fn descendant_request(
+        directory: &std::path::Path,
+        marker: &std::path::Path,
+    ) -> BoundedProcessRequest {
         let executable = std::env::current_exe().unwrap();
-        let request = BoundedProcessRequest {
+        BoundedProcessRequest {
             program: executable.into_os_string(),
             args: vec![
                 OsString::from("--exact"),
@@ -678,17 +846,13 @@ mod tests {
                 ),
             ],
             clear_env: false,
-            cwd: temporary.path().to_path_buf(),
+            cwd: directory.to_path_buf(),
             stdin: None,
-            timeout: Duration::from_millis(100),
+            timeout: Duration::from_secs(30),
             stdout_limit: 64 * 1024,
             stderr_limit: 64 * 1024,
             description: "bounded process cleanup test".to_string(),
-        };
-        let error = run_bounded_process(&request, || false).unwrap_err();
-        assert!(error.contains("timed out"), "{error}");
-        thread::sleep(Duration::from_millis(700));
-        assert!(!marker.exists(), "descendant escaped timeout cleanup");
+        }
     }
 
     #[test]
@@ -711,6 +875,9 @@ mod tests {
                 }
             }
             Some("child") => {
+                if let Some(ready) = std::env::var_os("BIFROST_BOUNDED_PROCESS_HELPER_READY") {
+                    std::fs::write(ready, b"running").unwrap();
+                }
                 thread::sleep(Duration::from_millis(500));
                 std::fs::write(std::env::var_os(HELPER_MARKER).unwrap(), b"escaped").unwrap();
             }
@@ -841,14 +1008,23 @@ mod tests {
         }
 
         #[test]
-        fn spawned_child_leads_its_own_session_and_group() {
+        #[hardwon(
+            "#7002: the bounded runner's pre_exec setsid forced an ordinary fork and 10 ms polling, doubling Gson dead_code_smells wall time"
+        )]
+        fn bounded_child_uses_a_process_group_and_not_a_pre_exec_hook() {
             let mut process = spawn_shell("exit 0", Stdio::null());
             let pid = process.child.id() as libc::pid_t;
             // The child may already have exited, but it stays unreaped until wait().
-            assert_eq!(unsafe { libc::getsid(pid) }, pid);
+            assert_eq!(unsafe { libc::getsid(pid) }, unsafe { libc::getsid(0) });
             assert_eq!(unsafe { libc::getpgid(pid) }, pid);
             assert_ne!(unsafe { libc::getpgid(0) }, pid);
             process.wait().unwrap();
+
+            let temporary = tempfile::tempdir().unwrap();
+            let output =
+                run_bounded_process(&shell_request("exit 0", None, temporary.path()), || false)
+                    .unwrap();
+            assert!(output.status.success());
         }
 
         #[test]
@@ -936,6 +1112,38 @@ mod tests {
             assert!(elapsed >= READER_GRACE, "gave up after only {elapsed:?}");
             assert!(elapsed < READER_GRACE * 5, "took {elapsed:?}");
             assert!(!child_alive, "timeout must terminate the child");
+        }
+
+        #[test]
+        #[hardwon("#7981: a pipe reader scheduled after the grace failed a child that had exited")]
+        fn a_reader_finishing_after_the_grace_is_joined_once_the_tree_has_exited() {
+            let temporary = tempfile::tempdir().unwrap();
+            let request = shell_request("exit 0", None, temporary.path());
+            let mut process = spawn_shell("exit 0", Stdio::null());
+            assert!(process.wait().unwrap().success());
+            // Stands in for a reader that load kept off the CPU past the grace.
+            let worker = thread::spawn(|| -> PipeReadResult {
+                thread::sleep(READER_GRACE * 2);
+                Ok(b"late".to_vec())
+            });
+            assert_eq!(
+                collect_pipe("stderr", worker, &request, &mut process),
+                Ok(b"late".to_vec())
+            );
+
+            // A descendant that still holds the pipe is a leak, not a late reader.
+            let started = Instant::now();
+            let error = run_bounded_process(
+                &shell_request("sleep 60 & echo $!", None, temporary.path()),
+                || false,
+            )
+            .unwrap_err();
+            assert_eq!(error, "shell test child did not close stdout");
+            assert!(
+                started.elapsed() < READER_GRACE * 5,
+                "took {:?}",
+                started.elapsed()
+            );
         }
 
         #[test]

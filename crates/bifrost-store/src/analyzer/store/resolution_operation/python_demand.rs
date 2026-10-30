@@ -1464,7 +1464,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         provenance: crate::analyzer::resolution::HierarchyProvenanceView<'_>,
         resume: crate::analyzer::resolution::CloseResume<'_>,
-    ) -> Result<crate::analyzer::resolution::CloseProgress<()>> {
+    ) -> Result<crate::analyzer::resolution::CloseProgress<Read<()>>> {
         use crate::analyzer::resolution::{CloseProgress, CloseResume};
         if !self.module_import_inputs.contains_key(&frame.endpoint) {
             assert!(matches!(resume, CloseResume::Start));
@@ -1527,8 +1527,14 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                         Read::Ready { value, .. } => {
                             aliases.extend(value.into_iter().map(|alias| (*identity, alias)))
                         }
-                        Read::Cancelled(completion) | Read::Unavailable { completion, .. } => {
+                        Read::Cancelled(completion) => {
                             return Ok(CloseProgress::Cancelled(completion));
+                        }
+                        Read::Unavailable { reason, completion } => {
+                            return Ok(CloseProgress::Ready(Read::Unavailable {
+                                reason,
+                                completion,
+                            }));
                         }
                     }
                 }
@@ -1593,7 +1599,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         }
         self.module_import_inputs
             .insert(frame.endpoint.clone(), prepared);
-        Ok(progress)
+        Ok(progress.map(|()| Read::ready(())))
     }
 
     fn qualified_members(&mut self) -> Option<QualifiedMembers<'_>> {
@@ -1617,12 +1623,10 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
     fn admit_endpoint(
         &mut self,
         endpoint: &EndpointSignature,
-        already_published: bool,
+        retained_completion: Option<&ResolutionCompletion>,
     ) -> Result<Read<EndpointAdmission>> {
-        if already_published {
-            return Ok(Read::ready(EndpointAdmission::Ready(
-                ResolutionCompletion::Complete,
-            )));
+        if let Some(completion) = retained_completion {
+            return Ok(Read::ready(EndpointAdmission::Ready(completion.clone())));
         }
         if endpoint.node() != BindingNodeId::universal_root()
             && endpoint.symbols().fixed().is_empty()
@@ -4458,6 +4462,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         definitions,
                         named_reasons,
                         external_members: Vec::new(),
+                        model_member_selection: None,
                         direct_target: None,
                         named_argument: None,
                         predeclared_go_symbol: false,

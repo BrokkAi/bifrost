@@ -1732,3 +1732,26 @@ pub(crate) mod tests {
         assert_eq!(config.ecosystems(), [DependencyPackEcosystem::Cargo]);
     }
 }
+
+#[cfg(test)]
+mod bootstrap_capture_tests {
+    use super::*;
+    use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+
+    #[test]
+    fn bootstrap_handle_selection_has_no_workspace_input() {
+        let analyzer = MultiAnalyzer::default();
+        let before = SEMANTIC_MODEL_CATALOG_BOOTSTRAP
+            .get()
+            .map(|hook| *hook as usize);
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert_eq!(
+                before,
+                SEMANTIC_MODEL_CATALOG_BOOTSTRAP
+                    .get()
+                    .map(|hook| *hook as usize)
+            );
+        });
+        assert!(reads.keys().is_empty());
+    }
+}

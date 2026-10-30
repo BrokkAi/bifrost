@@ -37,45 +37,31 @@ pub(crate) mod tests {
 
     use brokk_bifrost_core::analyzer::model::Language;
 
-    use brokk_bifrost_analysis::analyzer::semantic::ids::AdapterSemanticsVersion;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ConfigurationFingerprint;
-
     use crate::analyzer::semantic::ContentIdentity;
 
-    use crate::analyzer::semantic::DependencyFingerprint;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ids::SemanticArtifactKey;
-
     use brokk_bifrost_analysis::analyzer::semantic::capabilities::SemanticCapabilities;
-
-    use brokk_bifrost_analysis::analyzer::semantic::SemanticIrVersion;
 
     use brokk_bifrost_core::analyzer::model::LanguageDialect as SemanticLanguage;
 
     use brokk_bifrost_analysis::analyzer::semantic::ids::SourceRevision;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ids::WorkspaceMountId;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ids::WorkspaceRelativePath;
 
     fn file(path: &str) -> ProjectFile {
         brokk_bifrost_analysis::analyzer::common::project_file_for_test(&std::env::temp_dir(), path)
     }
 
     fn artifact(path: &str, source: &str) -> Arc<SemanticArtifact> {
-        let key = SemanticArtifactKey::new(
-            WorkspaceMountId::hash_bytes(b"semantic lease test mount"),
-            WorkspaceRelativePath::new(path).expect("portable fixture path"),
+        let key = crate::test_support::semantic_artifact_key_fixture(
+            "semantic lease test mount",
+            path,
             SemanticLanguage::Standard(Language::TypeScript),
             SourceRevision::Disk {
                 content: ContentIdentity::hash_bytes(source.as_bytes()),
             },
-            AdapterSemanticsVersion::hash_bytes("lease-test-typescript", b"adapter")
-                .expect("non-empty adapter name"),
-            SemanticIrVersion::hash_bytes(b"lease test IR"),
-            ConfigurationFingerprint::hash_bytes(b"lease test configuration"),
-            DependencyFingerprint::hash_bytes(b"lease test dependencies"),
+            "lease-test-typescript",
+            "adapter",
+            "lease test IR",
+            "lease test configuration",
+            "lease test dependencies",
         );
         Arc::new(
             SemanticArtifact::try_new(key, SemanticCapabilities::default(), Vec::new())

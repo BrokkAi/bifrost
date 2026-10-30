@@ -638,6 +638,12 @@ fn prepare_common_rows(
     use brokk_bifrost_core::analyzer::resolution_facts::{
         ResolutionRootImportAnchor, ResolutionRootImportDemandTarget, ResolutionRootImportKind,
     };
+    for fact in &common.shared_language.compilation_imports {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.compilation_imports.push(row![fact.import_site.get()]);
+    }
     for route in &common.root_imports {
         if cancellation.is_cancelled() {
             return false;
@@ -2567,6 +2573,18 @@ fn prepare_typed_fact_lookups(
             TypedFactRelation::DeferredMemberOwnerLookup,
             property.lookup(),
         );
+    }
+    for property in &lowered.common().name_lookups {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameLookupKind;
+        let relation = match property.kind {
+            ResolutionNameLookupKind::EmbeddedType => TypedFactRelation::EmbeddedTypeLookup,
+            ResolutionNameLookupKind::InterfaceMethod => TypedFactRelation::InterfaceMethodLookup,
+            ResolutionNameLookupKind::SupertypeName => TypedFactRelation::SupertypeNameLookup,
+        };
+        push_typed_fact_lookup(rows, identities, relation, property.lookup);
     }
     for property in typed.construction_requirements() {
         if cancellation.is_cancelled() {

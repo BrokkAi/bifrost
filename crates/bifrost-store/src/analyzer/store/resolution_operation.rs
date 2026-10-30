@@ -12,6 +12,7 @@ pub use services::{SelectedAnalyzerServices, SelectedModelAuthority};
 
 #[doc(hidden)]
 pub mod go_context;
+pub use go_context::GO_IMPORT_INCOMPLETE;
 #[doc(hidden)]
 pub mod go_named;
 pub(crate) use go_named::GoPreparedImportContext;
@@ -119,6 +120,12 @@ use super::resolution_stage::SelectedResolutionStageOutcome;
 use crate::analyzer::resolution::SeamProfiled;
 
 mod context_preparation;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod csharp_imports;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod csharp_namespaces;
 #[doc(hidden)]
 pub mod demand;
 #[doc(hidden)]
@@ -126,6 +133,9 @@ pub mod demand_closure;
 mod file_context;
 #[doc(hidden)]
 pub use file_context::{ContextBlueprintMemo, FileContextPeerMemoGuard};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod csharp_units;
 #[doc(hidden)]
 pub mod graph_stage;
 #[doc(hidden)]
@@ -1018,6 +1028,119 @@ struct PreparedMacroIncludeGlob {
     demand: ResolutionLookupSemanticRecipe,
 }
 
+/// Language-owned demand construction, selected by store language support.
+#[derive(Clone, Copy)]
+pub struct NativeDemandInstaller(&'static dyn DemandInstall);
+
+type NativeDemandPreparation = Arc<dyn std::any::Any>;
+
+#[derive(Clone)]
+pub(crate) enum NativeDemandPreparationOutcome {
+    Ready(NativeDemandPreparation),
+    Unavailable,
+    Cancelled,
+}
+
+pub(crate) struct NativeDemandPointRequest<'a, 'store, 'input> {
+    ready: &'a ReadySelectedResolution<'store, 'input>,
+    blueprint: &'a SelectedFactOperationBlueprint,
+    lexical: &'a dyn BatchResolutionFragmentSource,
+    paths: &'a dyn crate::analyzer::resolution::SelectedContextPathSource,
+    typed: &'a dyn crate::analyzer::resolution::SelectedTypedFactSource,
+    cancellation: &'a CancellationToken,
+    session: &'a ResolutionSession,
+    artifacts: Option<&'a mut crate::analyzer::resolution::ForwardCandidateArtifactCache>,
+}
+
+type NativeDemandCallback<'a> = dyn FnMut(
+        &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        &mut dyn crate::analyzer::resolution::DemandRootProvider,
+    ) -> Result<()>
+    + 'a;
+
+pub(crate) trait DemandInstall: Send + Sync {
+    fn prepare_caller(
+        &self,
+        operation: &SelectedResolutionOperation<'_, '_>,
+        caller: &Path,
+        cancellation: &CancellationToken,
+        session: Option<&ResolutionSession>,
+    ) -> Result<NativeDemandPreparationOutcome>;
+
+    fn run_point(
+        &self,
+        preparation: &dyn std::any::Any,
+        request: NativeDemandPointRequest<'_, '_, '_>,
+        run: &mut NativeDemandCallback<'_>,
+    ) -> Result<()>;
+}
+
+impl NativeDemandInstaller {
+    fn run_point<T>(
+        self,
+        preparation: &dyn std::any::Any,
+        request: NativeDemandPointRequest<'_, '_, '_>,
+        run: impl FnOnce(
+            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+            &mut dyn crate::analyzer::resolution::DemandRootProvider,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let mut run = Some(run);
+        let mut result = None;
+        self.0
+            .run_point(preparation, request, &mut |operation, provider| {
+                result = Some(run.take().expect("demand callback runs once")(
+                    operation, provider,
+                )?);
+                Ok(())
+            })?;
+        Ok(result.expect("demand installer invokes its callback"))
+    }
+}
+
+struct RetainedNativeCallerDemand {
+    language: Language,
+    caller: PathBuf,
+    prepared: NativeDemandPreparationOutcome,
+}
+
+impl SelectedResolutionOperation<'_, '_> {
+    fn native_demand_preparation(
+        &self,
+        installer: NativeDemandInstaller,
+        language: Language,
+        caller: &Path,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<NativeDemandPreparationOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(NativeDemandPreparationOutcome::Cancelled);
+        }
+        if let Some(retained) = self
+            .ready
+            .native_caller_demand
+            .borrow()
+            .as_ref()
+            .filter(|retained| retained.language == language && retained.caller == caller)
+        {
+            return Ok(retained.prepared.clone());
+        }
+        let prepared = installer
+            .0
+            .prepare_caller(self, caller, cancellation, Some(session))?;
+        if !matches!(prepared, NativeDemandPreparationOutcome::Cancelled) {
+            self.ready
+                .native_caller_demand
+                .replace(Some(RetainedNativeCallerDemand {
+                    language,
+                    caller: caller.to_path_buf(),
+                    prepared: prepared.clone(),
+                }));
+        }
+        Ok(prepared)
+    }
+}
+
 /// Preparation owned by one selected query; reader checkin retains only SQL state.
 #[doc(hidden)]
 pub struct QueryResolutionPreparation {
@@ -1034,6 +1157,7 @@ pub struct QueryResolutionPreparation {
         RefCell<HashMap<RustCallerRegistrationKey, Vec<RustCallerRegistrationFacts>>>,
     rust_caller_context: RefCell<Option<RetainedRustCallerContext>>,
     rust_caller_demand: RefCell<Option<RetainedRustCallerDemand>>,
+    native_caller_demand: RefCell<Option<RetainedNativeCallerDemand>>,
     /// Endpoint cells are immutable once closed under this retained selection.
     rust_workspace_relations: RefCell<ClosedRelations>,
 }
@@ -1582,6 +1706,8 @@ pub struct ReadySelectedResolution<'store, 'input> {
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
     project: &'input dyn Project,
     analyzer: Option<&'input dyn SelectedAnalyzerServices>,
+    /// Captured request authority, including an explicit captured absence.
+    attached_model_authority: Option<Option<Arc<dyn SelectedModelAuthority + Send + Sync>>>,
     analysis_generation: u64,
     /// What this request has already asked the crate rows about textual macro
     /// visibility. Built empty when the request opens and dropped when it
@@ -1702,6 +1828,38 @@ impl std::ops::DerefMut for ReadySelectedResolution<'_, '_> {
 }
 
 impl<'store> ReadySelectedResolution<'store, '_> {
+    pub(super) fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>> {
+        let services = self
+            .analyzer
+            .and_then(|analyzer| analyzer.model_authority());
+        if let Some(attached) = &self.attached_model_authority {
+            if let Some(attached) = attached {
+                if let Some(services) = &services {
+                    assert_eq!(
+                        attached.active_model_set_hash(),
+                        services.active_model_set_hash(),
+                        "one selected operation has one model authority set"
+                    );
+                }
+                if let Some(analyzer) = self.analyzer {
+                    assert_eq!(
+                        attached
+                            .active_models()
+                            .as_ref()
+                            .map(|models| models.active_model_set_hash()),
+                        analyzer
+                            .active_models()
+                            .as_ref()
+                            .map(|models| models.active_model_set_hash()),
+                        "attached authority and analyzer services have the same active model set"
+                    );
+                }
+            }
+            return attached.clone();
+        }
+        services
+    }
+
     #[doc(hidden)]
     pub fn identity_content_digest(
         &self,
@@ -1777,7 +1935,10 @@ impl<'store> ReadySelectedResolution<'store, '_> {
     #[doc(hidden)]
     pub fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
         let mut providers = nominal_rules::jvm_external_owner_relations().providers(self.analyzer);
-        let external_models = self.analyzer.and_then(|analyzer| analyzer.active_models());
+        let authority = self.model_authority();
+        let external_models = authority
+            .as_ref()
+            .and_then(|authority| authority.active_models());
         if let Some(models) = &external_models {
             providers.extend(
                 models
@@ -1793,10 +1954,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
             .with_context_identities(self.context_identities.clone())
             .with_external_providers(providers)
             .with_external_models(external_models)
-            .with_model_authority(
-                self.analyzer
-                    .and_then(|analyzer| analyzer.model_authority()),
-            )
+            .with_model_authority(authority)
     }
 
     /// Read route-prefix spellings from the selected ordinary or stage source.
@@ -2359,7 +2517,7 @@ pub struct SelectedResolutionOperation<'store, 'input> {
     jvm_package_presence_memo: RefCell<jvm_context::JvmPackagePresenceMemo>,
     /// Complete node/visibility reads for distinct selected JVM inputs.
     jvm_endpoint_memo: RefCell<jvm_context::JvmEndpointMemo>,
-    jvm_import_token_memo: RefCell<jvm_context::JvmImportTokenMemo>,
+    import_token_memo: RefCell<imports::ImportTokenMemo>,
     jvm_visibility_memo: RefCell<jvm_context::JvmVisibilityMemo>,
     /// Repeated member continuations retain the full input and owner-found effect.
     jvm_member_import_memo: RefCell<jvm_context::JvmMemberImportMemo>,
@@ -8695,7 +8853,7 @@ impl AnalyzerStore {
                             jvm_package_uncertainty_memo: RefCell::default(),
                             jvm_package_presence_memo: RefCell::default(),
                             jvm_endpoint_memo: RefCell::default(),
-                            jvm_import_token_memo: RefCell::default(),
+                            import_token_memo: RefCell::default(),
                             jvm_visibility_memo: RefCell::default(),
                             jvm_member_import_memo: RefCell::default(),
                         },
@@ -8810,6 +8968,7 @@ impl AnalyzerStore {
             registered_rust_caller_contexts: RefCell::default(),
             rust_caller_context: RefCell::new(None),
             rust_caller_demand: RefCell::new(None),
+            native_caller_demand: RefCell::new(None),
             rust_workspace_relations: RefCell::new(ClosedRelations::default()),
         });
         if cancellation.is_cancelled() {
@@ -8836,6 +8995,7 @@ impl AnalyzerStore {
                 content_mounts: input.content_mounts,
                 project: input.project,
                 analyzer: input.analyzer,
+                attached_model_authority: None,
                 analysis_generation: input.analysis_generation,
                 macro_walk: RefCell::default(),
                 crate_rows: RefCell::default(),
@@ -9187,9 +9347,12 @@ impl SelectedResolutionOperation<'_, '_> {
             };
             match located {
                 LocatedSemantic::Found(reference) => {
-                    let resolve =
+                    let resolve_with_provider =
                         |operation: &mut crate::analyzer::resolution::FactResolutionOperation<
                             '_,
+                        >,
+                         provider: Option<
+                            &mut dyn crate::analyzer::resolution::DemandRootProvider,
                         >| {
                             if let Some(overlay) = go_receiver_overlay {
                                 operation.set_go_receiver_slot_type_overlay(overlay);
@@ -9204,21 +9367,37 @@ impl SelectedResolutionOperation<'_, '_> {
                                 }
                             }
                             setup(operation, reference)?;
-                            let answer = operation.resolve_reference_with_metrics(
-                                reference,
-                                &mut resolution_metrics,
-                            )?;
+                            let answer = match provider {
+                                Some(provider) => match operation
+                                    .resolve_reference_by_demand(reference, provider)?
+                                {
+                                    FactDemandResolution::Ready(answer) => *answer,
+                                    FactDemandResolution::Cancelled(completion) => {
+                                        return Ok(std::ops::ControlFlow::Break(completion));
+                                    }
+                                },
+                                None => operation.resolve_reference_with_metrics(
+                                    reference,
+                                    &mut resolution_metrics,
+                                )?,
+                            };
                             if family.is_some() {
                                 self.profile_jvm_read("native_point_answer", (reference, &answer));
                             }
                             let completion = answer.completion().clone();
-                            Ok((
+                            Ok(std::ops::ControlFlow::Continue((
                                 SelectedResolutionLocated::Found(project(
                                     ready, operation, reference, answer,
                                 )?),
                                 completion,
-                            ))
+                            )))
                         };
+                    let resolve_plain = |outcome| match outcome {
+                        std::ops::ControlFlow::Continue(answer) => answer,
+                        std::ops::ControlFlow::Break(_) => {
+                            unreachable!("plain resolution has no demand cancellation")
+                        }
+                    };
                     if family.is_some() {
                         self.with_jvm_forward_operation(
                             locator.storage_language(),
@@ -9230,7 +9409,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             cancellation,
                             session,
                             selected_import_gap,
-                            resolve,
+                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
                         )?
                     } else if let Some(demand) = go_demand.take() {
                         assert_eq!(locator.storage_language(), "go");
@@ -9245,8 +9424,65 @@ impl SelectedResolutionOperation<'_, '_> {
                                 session,
                             },
                             artifacts.take(),
-                            resolve,
+                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
                         )?
+                    } else if let Some((language, installer)) = {
+                        // Locating the reference already memoized its mount ordinal. A
+                        // reference without one keeps the plain operation it had before.
+                        let language = reference
+                            .ordinal()
+                            .map(|ordinal| {
+                                self.mount_table()
+                                    .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))
+                                    .map(|mount| mount.semantic_language())
+                            })
+                            .transpose()?;
+                        language.and_then(|language| {
+                            super::store_language_support(language)
+                                .and_then(|support| support.demand_installer())
+                                .map(|installer| (language, installer))
+                        })
+                    } {
+                        let prepared = match self.native_demand_preparation(
+                            installer,
+                            language,
+                            Path::new(locator.relative_path()),
+                            cancellation,
+                            session,
+                        )? {
+                            NativeDemandPreparationOutcome::Ready(prepared) => prepared,
+                            NativeDemandPreparationOutcome::Unavailable => {
+                                return Err(StoreError::new(format!(
+                                    "native demand preparation unavailable for {locator:?}"
+                                )));
+                            }
+                            NativeDemandPreparationOutcome::Cancelled => {
+                                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                    cancelled_completion(),
+                                ));
+                            }
+                        };
+                        match installer.run_point(
+                            prepared.as_ref(),
+                            NativeDemandPointRequest {
+                                ready,
+                                blueprint: &blueprint,
+                                lexical: &observed_lexical,
+                                paths: &persisted_lexical,
+                                typed: &observed_typed,
+                                cancellation,
+                                session,
+                                artifacts: artifacts.take(),
+                            },
+                            |operation, provider| resolve_with_provider(operation, Some(provider)),
+                        )? {
+                            std::ops::ControlFlow::Continue(answer) => answer,
+                            std::ops::ControlFlow::Break(completion) => {
+                                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                    completion,
+                                ));
+                            }
+                        }
                     } else if let Some(artifacts) = artifacts.take() {
                         blueprint.with_forward_operation_in_session_using_artifacts(
                             &observed_lexical,
@@ -9257,7 +9493,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 session,
                                 artifacts,
                             },
-                            resolve,
+                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
                         )?
                     } else {
                         blueprint.with_forward_operation_in_session(
@@ -9266,7 +9502,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             &observed_typed,
                             cancellation,
                             session,
-                            resolve,
+                            |operation| resolve_with_provider(operation, None).map(resolve_plain),
                         )?
                     }
                 }
@@ -9710,20 +9946,23 @@ impl SelectedResolutionOperation<'_, '_> {
                 ));
             }
         }
-        let prepared = match self.rust_demand_preparation_for_caller_in_session(
+        // Rust point requests use this entry and call the installer directly, not the generic arm.
+        // Routing them through the generic arm changes statement counts (see the Rust point pins).
+        let prepared_handle = match rust_demand::RUST_DEMAND_INSTALLER.0.prepare_caller(
+            self,
             caller,
             operation_cancellation,
             Some(&session),
         )? {
-            SelectedRustCallerDemandOutcome::Ready(prepared) => prepared,
-            SelectedRustCallerDemandOutcome::Unavailable => {
+            NativeDemandPreparationOutcome::Ready(prepared) => prepared,
+            NativeDemandPreparationOutcome::Unavailable => {
                 return Ok(repeat_bounded_resolution(
                     locators.len(),
                     session.finish(()),
                     || SelectedRustCallerReferenceOutcome::UnsupportedCallerProfile,
                 ));
             }
-            SelectedRustCallerDemandOutcome::Cancelled => {
+            NativeDemandPreparationOutcome::Cancelled => {
                 return Ok(repeat_bounded_resolution(
                     locators.len(),
                     session.finish(()),
@@ -9735,13 +9974,16 @@ impl SelectedResolutionOperation<'_, '_> {
                 ));
             }
         };
+        let prepared = prepared_handle
+            .downcast_ref::<RustCallerDemand>()
+            .expect("Rust installer owns the caller preparation");
         let contexts = prepared.contexts.clone().with_declaration_access_source(
             RustDeclarationAccessKind::Caller.source(self, prepared.crate_keys.clone())?,
         );
         let mut context_metrics = SelectedResolutionContextMetrics;
         self.resolve_rust_reference_demand_projection_per_locator(
             caller,
-            &prepared,
+            prepared,
             contexts,
             locators,
             budget,
@@ -10531,38 +10773,20 @@ impl SelectedResolutionOperation<'_, '_> {
                     LocatedSemantics::Cancelled => Ok(
                         SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
                     ),
-                    LocatedSemantics::Found(references) => {
-                        let arena = RefCell::new(ClosedRelations::default());
-                        let source = ClosedForwardSource::new(
-                            &observed_lexical,
-                            &persisted_lexical,
-                            &arena,
-                            &point_session,
-                            crate::analyzer::resolution::CALLER_ENVIRONMENT,
-                        );
-                        let forward = PreparedForwardSource::new(
-                            ready,
-                            &prepared.demand,
-                            &observed_lexical,
-                            &persisted_lexical,
-                        );
-                        let mut provider = DemandProvider::new(ForwardProvider::new(
-                            &forward,
-                            &arena,
-                            &point_session,
-                            point_cancellation,
-                        ));
-                        blueprint.with_forward_operation_in_session(
-                            &source,
-                            &persisted_lexical,
-                            &observed_typed,
-                            point_cancellation,
-                            &point_session,
-                            |operation| {
-                                operation.enable_completed_root_reuse(
-                                    &ready.operation_demand_state,
-                                    RustDeclarationAccessKind::Caller as u64,
-                                );
+                    LocatedSemantics::Found(references) => rust_demand::RUST_DEMAND_INSTALLER
+                        .run_point(
+                            prepared,
+                            NativeDemandPointRequest {
+                                ready,
+                                blueprint: &blueprint,
+                                lexical: &observed_lexical,
+                                paths: &persisted_lexical,
+                                typed: &observed_typed,
+                                cancellation: point_cancellation,
+                                session: &point_session,
+                                artifacts: None,
+                            },
+                            |operation, provider| {
                                 let mut answers = Vec::with_capacity(references.len());
                                 for reference in references {
                                     if !point_session.scope_step()
@@ -10573,7 +10797,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                         ));
                                     }
                                     let resolution = match operation
-                                        .resolve_reference_by_demand(reference, &mut provider)?
+                                        .resolve_reference_by_demand(reference, provider)?
                                     {
                                         FactDemandResolution::Ready(resolution) => *resolution,
                                         FactDemandResolution::Cancelled(completion) => {
@@ -10603,10 +10827,8 @@ impl SelectedResolutionOperation<'_, '_> {
                                         operation,
                                         resolution,
                                         &mut |operation, reference| {
-                                            operation.resolve_reference_by_demand(
-                                                reference,
-                                                &mut provider,
-                                            )
+                                            operation
+                                                .resolve_reference_by_demand(reference, provider)
                                         },
                                         &mut project_rust_reference_unit,
                                     )? {
@@ -10640,8 +10862,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     SelectedResolutionLocated::Found(answers),
                                 ))
                             },
-                        )
-                    }
+                        ),
                 };
                 let bounded = point_session.finish(point_outcome?);
                 match bounded {
@@ -12313,11 +12534,6 @@ pub mod heap_pin;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use heap_pin::heap_pin_bytes;
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-#[path = "native_query_plan_go_support.rs"]
-pub mod native_query_plan_go_support;
 
 impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
     #[doc(hidden)]

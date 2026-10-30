@@ -1,7 +1,9 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::common::{IdentifierSeek, decorated_identifier_seeks};
 use crate::analyzer::languages::{language_support_for_hook, package_fq_name};
+use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::store::StoreError;
+use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry, memo_attribution};
 use crate::analyzer::{
     BoundedDefinitionLookup, CodeUnit, DefinitionLanguageScope, IAnalyzer, Language, ProjectFile,
     RelationalBatchOutcome, RelationalDefinitionFrontier, RelationalDefinitionQuery,
@@ -14,6 +16,7 @@ use brokk_bifrost_core::analyzer::{
     fq_name::{FqName, SegmentKind, segment_interner},
     symbol_path::parse_symbol_path_fq,
 };
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -26,6 +29,31 @@ type StructuredMemberLookupKey = (Language, FqName, String);
 // retaining a workspace-sized result set.
 const LIMITED_LOOKUP_CACHE_MAX_ENTRIES: usize = 512;
 const LIMITED_LOOKUP_CACHE_MAX_ROWS: usize = 32;
+
+#[track_caller]
+fn remember_limited<K: Eq + std::hash::Hash>(
+    cache: &Mutex<HashMap<K, Vec<CodeUnit>>>,
+    key: impl FnOnce() -> K,
+    units: Vec<CodeUnit>,
+    poison_message: &str,
+) {
+    if units.len() > LIMITED_LOOKUP_CACHE_MAX_ROWS {
+        return;
+    }
+    let mut cache = cache.lock().expect(poison_message);
+    let key = key();
+    if cache.len() < LIMITED_LOOKUP_CACHE_MAX_ENTRIES || cache.contains_key(&key) {
+        cache.insert(key, units);
+    }
+}
+
+struct PrefetchedExactName {
+    fqn: String,
+    spellings: Vec<FqName>,
+    parseable: bool,
+    units: Vec<CodeUnit>,
+    fallback_identifiers: Option<Vec<String>>,
+}
 
 #[doc(hidden)]
 pub trait ForwardQueryProvider {
@@ -123,30 +151,67 @@ pub use crate::impl_forward_query_provider;
 /// share a memo. It is deliberately language-agnostic: #2783 added a Java-only
 /// usage-evidence cache, and this path has to be fast for every language rather
 /// than grow a second special case.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DefinitionLookupMemo {
     #[doc(hidden)]
     pub fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
-    normalized_fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
-    identifier_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
+    normalized_fqn_cache: DefinitionAnswers<(Language, String), Vec<CodeUnit>>,
+    identifier_cache: DefinitionAnswers<(Language, String), Vec<CodeUnit>>,
     limited_fqn_cache: Mutex<HashMap<(Language, bool, String), Vec<CodeUnit>>>,
     limited_identifier_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
-    file_identifier_cache: Mutex<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
-    children_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
-    members_cache: Mutex<HashMap<MemberLookupKey, Vec<CodeUnit>>>,
-    structured_members_cache: Mutex<HashMap<StructuredMemberLookupKey, Vec<CodeUnit>>>,
-    package_cache: Mutex<HashMap<(Language, String), bool>>,
-    prefix_cache: Mutex<HashMap<(Language, String), bool>>,
+    file_identifier_cache: DefinitionAnswers<(ProjectFile, String), Vec<CodeUnit>>,
+    children_cache: DefinitionAnswers<(Language, String), Vec<CodeUnit>>,
+    members_cache: DefinitionAnswers<MemberLookupKey, Vec<CodeUnit>>,
+    structured_members_cache: DefinitionAnswers<StructuredMemberLookupKey, Vec<CodeUnit>>,
+    package_cache: DefinitionAnswers<(Language, String), bool>,
+    prefix_cache: DefinitionAnswers<(Language, String), bool>,
+}
+
+type DefinitionAnswers<K, V> =
+    ReplayingMemo<Mutex<HashMap<K, Arc<ReplayingMemoEntry<V, ReadKey>>>>>;
+
+impl Default for DefinitionLookupMemo {
+    fn default() -> Self {
+        Self {
+            fqn_cache: Mutex::default(),
+            limited_fqn_cache: Mutex::default(),
+            limited_identifier_cache: Mutex::default(),
+            normalized_fqn_cache: ReplayingMemo::new(Mutex::default()),
+            identifier_cache: ReplayingMemo::new(Mutex::default()),
+            file_identifier_cache: ReplayingMemo::new(Mutex::default()),
+            children_cache: ReplayingMemo::new(Mutex::default()),
+            members_cache: ReplayingMemo::new(Mutex::default()),
+            structured_members_cache: ReplayingMemo::new(Mutex::default()),
+            package_cache: ReplayingMemo::new(Mutex::default()),
+            prefix_cache: ReplayingMemo::new(Mutex::default()),
+        }
+    }
+}
+
+fn record_definition_scope(analyzer: &dyn IAnalyzer, language: Language) {
+    if crate::analyzer::read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
+        let key = analyzer.workspace_scope_read_key(&[language]);
+        analyzer.record_read(key.clone());
+        #[cfg(debug_assertions)]
+        if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+            debug_assert!(
+                keys.contains_read_key(&key),
+                "bounded definition hits record their scope"
+            );
+        }
+    }
 }
 
 impl DefinitionLookupMemo {
     #[doc(hidden)]
     pub fn limited_fqn(
         &self,
+        analyzer: &dyn IAnalyzer,
         language: Language,
         normalized: bool,
         fqn: &str,
     ) -> Option<Vec<CodeUnit>> {
+        record_definition_scope(analyzer, language);
         self.limited_fqn_cache
             .lock()
             .expect("limited definition fqn cache poisoned")
@@ -155,6 +220,7 @@ impl DefinitionLookupMemo {
     }
 
     #[doc(hidden)]
+    #[track_caller]
     pub fn remember_limited_fqn(
         &self,
         language: Language,
@@ -162,25 +228,22 @@ impl DefinitionLookupMemo {
         fqn: &str,
         units: Vec<CodeUnit>,
     ) {
-        if units.len() > LIMITED_LOOKUP_CACHE_MAX_ROWS {
-            return;
-        }
-        let mut cache = self
-            .limited_fqn_cache
-            .lock()
-            .expect("limited definition fqn cache poisoned");
-        let key = (language, normalized, fqn.to_owned());
-        if cache.len() < LIMITED_LOOKUP_CACHE_MAX_ENTRIES || cache.contains_key(&key) {
-            cache.insert(key, units);
-        }
+        remember_limited(
+            &self.limited_fqn_cache,
+            || (language, normalized, fqn.to_owned()),
+            units,
+            "limited definition fqn cache poisoned",
+        );
     }
 
     #[doc(hidden)]
     pub fn limited_identifier(
         &self,
+        analyzer: &dyn IAnalyzer,
         language: Language,
         identifier: &str,
     ) -> Option<Vec<CodeUnit>> {
+        record_definition_scope(analyzer, language);
         self.limited_identifier_cache
             .lock()
             .expect("limited definition identifier cache poisoned")
@@ -189,23 +252,19 @@ impl DefinitionLookupMemo {
     }
 
     #[doc(hidden)]
+    #[track_caller]
     pub fn remember_limited_identifier(
         &self,
         language: Language,
         identifier: &str,
         units: Vec<CodeUnit>,
     ) {
-        if units.len() > LIMITED_LOOKUP_CACHE_MAX_ROWS {
-            return;
-        }
-        let mut cache = self
-            .limited_identifier_cache
-            .lock()
-            .expect("limited definition identifier cache poisoned");
-        let key = (language, identifier.to_owned());
-        if cache.len() < LIMITED_LOOKUP_CACHE_MAX_ENTRIES || cache.contains_key(&key) {
-            cache.insert(key, units);
-        }
+        remember_limited(
+            &self.limited_identifier_cache,
+            || (language, identifier.to_owned()),
+            units,
+            "limited definition identifier cache poisoned",
+        );
     }
 }
 
@@ -342,7 +401,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         let languages = self
             .workspace_languages
             .get_or_init(|| self.analyzer.languages().into_iter().collect());
-        if self.analyzer.read_ledger_attached() {
+        if crate::analyzer::read_attribution_records_reads(|| self.analyzer.read_ledger_attached())
+        {
             return languages;
         }
         self.nonempty_workspace_languages.get_or_init(|| {
@@ -491,26 +551,18 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         identifier: &str,
     ) -> Vec<CodeUnit> {
         let key = (language, identifier.to_string());
-        if let Some(cached) = self
-            .memo
-            .identifier_cache
-            .lock()
-            .expect("definition identifier cache poisoned")
-            .get(&key)
-        {
-            return cached.clone();
-        }
-        let mut matches = self.identifier_candidates_for_language(language, identifier, None);
-        sort_units(&mut matches);
-        matches.dedup();
-        if self.can_publish() {
-            self.memo
-                .identifier_cache
-                .lock()
-                .expect("definition identifier cache poisoned")
-                .insert(key, matches.clone());
-        }
-        matches
+        self.memoized_answer(
+            &self.memo.identifier_cache,
+            key,
+            "definition identifier cache poisoned",
+            || {
+                let mut matches =
+                    self.identifier_candidates_for_language(language, identifier, None);
+                sort_units(&mut matches);
+                matches.dedup();
+                matches
+            },
+        )
     }
 
     /// The relational questions one set of identifier spellings asks: the bare
@@ -685,15 +737,47 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         {
             return;
         }
-        self.analyzer
-            .record_read(crate::analyzer::read_ledger::ReadKey::lookup(
-                crate::analyzer::read_ledger::LookupKind::ResolvedName,
-                crate::analyzer::read_ledger::LookupQuestion::Name {
-                    language,
-                    name: name.into(),
-                },
-                crate::analyzer::read_ledger::declaration_set_digest(matches),
-            ));
+        let key = crate::analyzer::read_ledger::ReadKey::lookup(
+            crate::analyzer::read_ledger::LookupKind::ResolvedName,
+            crate::analyzer::read_ledger::LookupQuestion::Name {
+                language,
+                name: name.into(),
+            },
+            crate::analyzer::read_ledger::declaration_set_digest(matches),
+        );
+        self.analyzer.record_read(key.clone());
+        #[cfg(debug_assertions)]
+        if let Some(keys) = crate::analyzer::i_analyzer::innermost_read_ledger() {
+            debug_assert!(
+                keys.contains_read_key(&key),
+                "exact definition hits record their answer"
+            );
+        }
+    }
+
+    fn memoized_answer<K: Eq + std::hash::Hash, V: Clone>(
+        &self,
+        memo: &DefinitionAnswers<K, V>,
+        key: K,
+        poison_message: &'static str,
+        compute: impl FnOnce() -> V,
+    ) -> V {
+        let value = memo
+            .read(&memo_attribution(self.analyzer), |cache, capture| {
+                if let Some(entry) = cache.lock().expect(poison_message).get(&key).cloned() {
+                    return Ok::<_, Infallible>(entry);
+                }
+                let entry = Arc::new(capture.build(compute));
+                if self.can_publish() {
+                    cache
+                        .lock()
+                        .expect(poison_message)
+                        .insert(key, Arc::clone(&entry));
+                }
+                Ok(entry)
+            })
+            .unwrap();
+        (*value).clone()
     }
 
     fn memoized_units<K: Eq + std::hash::Hash>(
@@ -786,6 +870,109 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             .any(|language| self.package_exists_in_language(package, language))
     }
 
+    #[track_caller]
+    fn prefetch_exact_names(
+        &self,
+        language: Language,
+        fqns: &[String],
+    ) -> Option<Vec<PrefetchedExactName>> {
+        let missing = {
+            let cache = self
+                .memo
+                .fqn_cache
+                .lock()
+                .expect("definition fqn cache poisoned");
+            let mut seen = HashSet::default();
+            fqns.iter()
+                .filter(|fqn| seen.insert(fqn.as_str()))
+                .filter(|fqn| !cache.contains_key(&(language, (*fqn).clone())))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut names = Vec::with_capacity(missing.len());
+        let mut questions = Vec::new();
+        let mut owners = Vec::new();
+        for fqn in missing {
+            let mut entry = PrefetchedExactName {
+                fqn,
+                spellings: Vec::new(),
+                parseable: false,
+                units: Vec::new(),
+                fallback_identifiers: None,
+            };
+            if let Some(name) = self.rendered_name(language, &entry.fqn) {
+                entry.spellings = self.source_spelling_names(language, &entry.fqn);
+                for question in Self::exact_questions(name, &entry.spellings) {
+                    questions.push(question);
+                    owners.push(names.len());
+                    entry.parseable = true;
+                }
+            }
+            names.push(entry);
+        }
+        if !questions.is_empty() {
+            let expected = questions.len();
+            let values = self.query_values(language, questions);
+            if values.len() != expected {
+                return None;
+            }
+            for (owner, value) in owners.into_iter().zip(values) {
+                match value {
+                    RelationalDefinitionValue::Definitions(units) => {
+                        names[owner].units.extend(units)
+                    }
+                    _ => panic!("an exact-name query returned the wrong result shape"),
+                }
+            }
+        }
+        for name in &mut names {
+            name.units
+                .retain(|unit| Self::answers_exact_request(unit, &name.fqn, &name.spellings));
+        }
+        Some(names)
+    }
+
+    #[track_caller]
+    fn prefetch_fqn_fallback_questions(
+        &self,
+        language: Language,
+        names: &mut [PrefetchedExactName],
+    ) -> (Vec<(RelationalName, RelationalDefinitionQuery)>, Vec<usize>) {
+        let mut questions = Vec::new();
+        let mut owners = Vec::new();
+        for (index, name) in names.iter_mut().enumerate() {
+            if !name.parseable || !name.units.is_empty() {
+                continue;
+            }
+            let identifiers = self.rendered_identifier_candidates(language, &name.fqn);
+            let queries = Self::identifier_queries(language, &identifiers, None);
+            owners.extend(std::iter::repeat_n(index, queries.len()));
+            questions.extend(queries);
+            name.fallback_identifiers = Some(identifiers);
+        }
+        (questions, owners)
+    }
+
+    #[track_caller]
+    fn apply_prefetched_fqn_fallback(
+        names: &mut [PrefetchedExactName],
+        owners: Vec<usize>,
+        values: Vec<RelationalDefinitionValue>,
+    ) {
+        let mut values_by_name = vec![Vec::new(); names.len()];
+        for (owner, value) in owners.into_iter().zip(values) {
+            values_by_name[owner].push(value);
+        }
+        for (name, values) in names.iter_mut().zip(values_by_name) {
+            let Some(identifiers) = name.fallback_identifiers.take() else {
+                continue;
+            };
+            name.units = Self::identifier_units_from_values(&identifiers, values);
+            name.units
+                .retain(|unit| Self::answers_exact_request(unit, &name.fqn, &name.spellings));
+        }
+    }
+
     /// Resolve many rendered names into the shared fqn memo with two batched
     /// relational reads per language instead of one point batch per name.
     ///
@@ -798,112 +985,47 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     /// memoizes nothing: every name stays unmemoized and the point path
     /// retries it with unchanged results.
     #[doc(hidden)]
+    #[track_caller]
     pub fn prefetch_fqns(&self, fqns: &[String]) {
         for language in self.query_languages() {
-            let missing: Vec<String> = {
-                let cache = self
-                    .memo
-                    .fqn_cache
-                    .lock()
-                    .expect("definition fqn cache poisoned");
-                let mut seen = HashSet::default();
-                fqns.iter()
-                    .filter(|fqn| seen.insert(fqn.as_str()))
-                    .filter(|fqn| !cache.contains_key(&(language, (*fqn).clone())))
-                    .cloned()
-                    .collect()
-            };
-            if missing.is_empty() {
-                continue;
-            }
-
-            let mut exact_owners = Vec::new();
-            let mut exact_questions = Vec::new();
-            let mut spellings_by_name = Vec::with_capacity(missing.len());
-            for (index, fqn) in missing.iter().enumerate() {
-                let Some(name) = self.rendered_name(language, fqn) else {
-                    spellings_by_name.push(Vec::new());
-                    continue;
-                };
-                let spellings = self.source_spelling_names(language, fqn);
-                for question in Self::exact_questions(name, &spellings) {
-                    exact_owners.push(index);
-                    exact_questions.push(question);
-                }
-                spellings_by_name.push(spellings);
-            }
-            // A name the language cannot even render as a path resolves to
-            // nothing without a fallback, exactly as the point path answers.
-            let mut parseable = vec![false; missing.len()];
-            let mut units_by_name: Vec<Vec<CodeUnit>> = vec![Vec::new(); missing.len()];
-            if !exact_questions.is_empty() {
-                let expected = exact_questions.len();
-                let values = self.query_values(language, exact_questions);
-                if values.len() != expected {
-                    return;
-                }
-                for (owner, value) in exact_owners.into_iter().zip(values) {
-                    parseable[owner] = true;
-                    match value {
-                        RelationalDefinitionValue::Definitions(units) => {
-                            units_by_name[owner].extend(units);
-                        }
-                        _ => panic!("an exact-name query returned the wrong result shape"),
-                    }
-                }
-            }
-
-            let mut fallback: Vec<(usize, std::ops::Range<usize>, Vec<String>)> = Vec::new();
-            let mut fallback_questions = Vec::new();
-            for (index, fqn) in missing.iter().enumerate() {
-                units_by_name[index].retain(|unit| {
-                    Self::answers_exact_request(unit, fqn, &spellings_by_name[index])
-                });
-                if !parseable[index] || !units_by_name[index].is_empty() {
-                    continue;
-                }
-                let identifiers = self.rendered_identifier_candidates(language, fqn);
-                let start = fallback_questions.len();
-                fallback_questions.extend(Self::identifier_queries(language, &identifiers, None));
-                fallback.push((index, start..fallback_questions.len(), identifiers));
-            }
-            if !fallback_questions.is_empty() {
-                let expected = fallback_questions.len();
-                let values = self.query_values(language, fallback_questions);
-                if values.len() != expected {
-                    return;
-                }
-                let mut values = values.into_iter().map(Some).collect::<Vec<_>>();
-                for (index, range, identifiers) in fallback {
-                    let name_values = values[range]
-                        .iter_mut()
-                        .map(|value| value.take().expect("each fallback value is consumed once"))
-                        .collect::<Vec<_>>();
-                    units_by_name[index] =
-                        Self::identifier_units_from_values(&identifiers, name_values);
-                    units_by_name[index].retain(|unit| {
-                        Self::answers_exact_request(
-                            unit,
-                            &missing[index],
-                            &spellings_by_name[index],
-                        )
-                    });
-                }
-            }
-
-            let mut cache = self
-                .memo
-                .fqn_cache
-                .lock()
-                .expect("definition fqn cache poisoned");
-            for (fqn, mut units) in missing.into_iter().zip(units_by_name) {
-                sort_units(&mut units);
-                units.dedup();
-                if self.can_publish() {
-                    cache.insert((language, fqn), units);
-                }
+            if !self.prefetch_fqns_for_language(language, fqns) {
+                return;
             }
         }
+    }
+
+    // All-language prefetch publishes unrenderable names as negative entries
+    // and requires a complete fallback batch before publishing any names.
+    #[track_caller]
+    fn prefetch_fqns_for_language(&self, language: Language, fqns: &[String]) -> bool {
+        let Some(mut names) = self.prefetch_exact_names(language, fqns) else {
+            return false;
+        };
+        if names.is_empty() {
+            return true;
+        }
+        let (questions, owners) = self.prefetch_fqn_fallback_questions(language, &mut names);
+        if !questions.is_empty() {
+            let expected = questions.len();
+            let values = self.query_values(language, questions);
+            if values.len() != expected {
+                return false;
+            }
+            Self::apply_prefetched_fqn_fallback(&mut names, owners, values);
+        }
+        let mut cache = self
+            .memo
+            .fqn_cache
+            .lock()
+            .expect("definition fqn cache poisoned");
+        for mut name in names {
+            sort_units(&mut name.units);
+            name.units.dedup();
+            if self.can_publish() {
+                cache.insert((language, name.fqn), name.units);
+            }
+        }
+        true
     }
 
     /// Populates the fqn cache for many names in one language with as few
@@ -912,120 +1034,52 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     /// `fqn_for_language` / `fqn_in_language` call afterward is a cache hit
     /// instead of its own round trip.
     #[doc(hidden)]
+    #[track_caller]
     pub fn prefetch_fqn_in_language(&self, language: Language, fqns: &[String]) {
-        let mut pending_fqns = Vec::new();
-        {
-            let cache = self
-                .memo
-                .fqn_cache
-                .lock()
-                .expect("definition fqn cache poisoned");
-            let mut seen = crate::hash::HashSet::default();
-            for fqn in fqns {
-                if !cache.contains_key(&(language, fqn.clone())) && seen.insert(fqn.clone()) {
-                    pending_fqns.push(fqn.clone());
-                }
-            }
-        }
-        if pending_fqns.is_empty() {
+        let Some(names) = self.prefetch_exact_names(language, fqns) else {
             return;
-        }
-        let mut queries = Vec::with_capacity(pending_fqns.len());
-        let mut query_owners = Vec::with_capacity(pending_fqns.len());
-        let mut named_fqns = Vec::with_capacity(pending_fqns.len());
-        for fqn in pending_fqns {
-            let Some(name) = self.rendered_name(language, &fqn) else {
-                continue;
-            };
-            let spellings = self.source_spelling_names(language, &fqn);
-            for question in Self::exact_questions(name, &spellings) {
-                queries.push(question);
-                query_owners.push(named_fqns.len());
-            }
-            named_fqns.push((fqn, spellings));
-        }
-        if queries.is_empty() {
-            return;
-        }
-        let expected = queries.len();
-        let results = self.query_values(language, queries);
-        if results.len() != expected {
-            return;
-        }
-        let mut units_by_name: Vec<Vec<CodeUnit>> = vec![Vec::new(); named_fqns.len()];
-        for (owner, value) in query_owners.into_iter().zip(results) {
-            match value {
-                RelationalDefinitionValue::Definitions(units) => {
-                    units_by_name[owner].extend(units);
-                }
-                _ => panic!("an exact-name query returned the wrong result shape"),
-            }
-        }
+        };
         let mut misses = Vec::new();
-        for ((fqn, spellings), mut units) in named_fqns.into_iter().zip(units_by_name) {
-            units.retain(|unit| Self::answers_exact_request(unit, &fqn, &spellings));
-            if units.is_empty() {
-                misses.push((fqn, spellings));
+        // Unlike all-language prefetch, skip unrenderable names and publish
+        // exact hits before attempting the fallback batch.
+        for mut name in names {
+            if !name.parseable {
+                continue;
+            }
+            if name.units.is_empty() {
+                misses.push(name);
             } else {
-                sort_units(&mut units);
-                units.dedup();
+                sort_units(&mut name.units);
+                name.units.dedup();
                 if self.can_publish() {
                     self.memo
                         .fqn_cache
                         .lock()
                         .expect("definition fqn cache poisoned")
-                        .insert((language, fqn), units);
+                        .insert((language, name.fqn), name.units);
                 }
             }
         }
         if misses.is_empty() {
             return;
         }
-        // Every miss above falls back to the identifier-candidate seek
-        // `exact_for_language` uses one name at a time. Batch that fallback
-        // across every miss too, tagging each query with which name it
-        // answers, so a workspace where most names take this path still
-        // resolves in one round trip instead of one per name (bifrost#15).
-        let mut fallback_queries = Vec::new();
-        let mut fallback_owner = Vec::new();
-        let mut identifiers_by_fqn = Vec::with_capacity(misses.len());
-        for (fqn, _) in &misses {
-            let identifiers = self.rendered_identifier_candidates(language, fqn);
-            let owner = identifiers_by_fqn.len();
-            let queries = Self::identifier_queries(language, &identifiers, None);
-            fallback_owner.extend(std::iter::repeat_n(owner, queries.len()));
-            fallback_queries.extend(queries);
-            identifiers_by_fqn.push(identifiers);
+        // Batch the same identifier-candidate fallback as the point path.
+        // This entry point retains partial fallback answers without checking
+        // batch cardinality, unlike all-language prefetch.
+        let (questions, owners) = self.prefetch_fqn_fallback_questions(language, &mut misses);
+        if !questions.is_empty() {
+            let values = self.query_values(language, questions);
+            Self::apply_prefetched_fqn_fallback(&mut misses, owners, values);
         }
-        let mut units_by_fqn: Vec<Vec<CodeUnit>> = vec![Vec::new(); misses.len()];
-        if !fallback_queries.is_empty() {
-            let fallback_results = self.query_values(language, fallback_queries);
-            for (owner, value) in fallback_owner.into_iter().zip(fallback_results) {
-                match value {
-                    RelationalDefinitionValue::Definitions(units) => {
-                        units_by_fqn[owner].extend(units);
-                    }
-                    _ => panic!("an identifier query returned the wrong result shape"),
-                }
-            }
-        }
-        for ((fqn, spellings), (identifiers, mut units)) in misses
-            .into_iter()
-            .zip(identifiers_by_fqn.into_iter().zip(units_by_fqn))
-        {
-            units.retain(|unit| {
-                identifiers.iter().any(|identifier| {
-                    crate::analyzer::common::identifier_addresses_target(unit, identifier)
-                }) && Self::answers_exact_request(unit, &fqn, &spellings)
-            });
-            sort_units(&mut units);
-            units.dedup();
+        for mut name in misses {
+            sort_units(&mut name.units);
+            name.units.dedup();
             if self.can_publish() {
                 self.memo
                     .fqn_cache
                     .lock()
                     .expect("definition fqn cache poisoned")
-                    .insert((language, fqn), units);
+                    .insert((language, name.fqn), name.units);
             }
         }
     }
@@ -1076,7 +1130,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         let mut units = Vec::new();
         for language in self.query_languages() {
             let key = (language, normalized.to_string());
-            units.extend(self.memoized_units(
+            units.extend(self.memoized_answer(
                 &self.memo.normalized_fqn_cache,
                 key,
                 "normalized definition cache poisoned",
@@ -1131,25 +1185,12 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         let key = (file.clone(), ident.to_string());
-        if let Some(cached) = self
-            .memo
-            .file_identifier_cache
-            .lock()
-            .expect("file identifier cache poisoned")
-            .get(&key)
-        {
-            return cached.clone();
-        }
-        let matches =
-            self.identifier_candidates_for_language(language_for_file(file), ident, Some(file));
-        if self.can_publish() {
-            self.memo
-                .file_identifier_cache
-                .lock()
-                .expect("file identifier cache poisoned")
-                .insert(key, matches.clone());
-        }
-        matches
+        self.memoized_answer(
+            &self.memo.file_identifier_cache,
+            key,
+            "file identifier cache poisoned",
+            || self.identifier_candidates_for_language(language_for_file(file), ident, Some(file)),
+        )
     }
 
     /// The trait default asks `file_identifier` once per file, so a caller
@@ -1193,43 +1234,34 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         let mut all_children = Vec::new();
         for language in self.query_languages() {
             let key = (language, fqn.to_string());
-            if let Some(cached) = self
-                .memo
-                .children_cache
-                .lock()
-                .expect("definition children cache poisoned")
-                .get(&key)
-            {
-                all_children.extend(cached.clone());
-                continue;
-            }
-            let mut owner_names = self
-                .fqn_for_language(fqn, language)
-                .into_iter()
-                .map(|owner| self.relational_name_for_unit(language, &owner))
-                .collect::<Vec<_>>();
-            if self.package_exists_in_language(fqn, language) {
-                owner_names.push(RelationalName::stable(package_fq_name(language, fqn)));
-            }
-            owner_names.sort_by_cached_key(|name| name.full_name().display(segment_interner()));
-            owner_names.dedup();
-            let children = Self::sorted_definition_units(
-                self.query_values(
-                    language,
-                    owner_names
+            let children = self.memoized_answer(
+                &self.memo.children_cache,
+                key,
+                "definition children cache poisoned",
+                || {
+                    let mut owner_names = self
+                        .fqn_for_language(fqn, language)
                         .into_iter()
-                        .map(|owner| (owner, RelationalDefinitionQuery::StructuralChildren))
-                        .collect(),
-                ),
-                "a structural-children query returned the wrong result shape",
+                        .map(|owner| self.relational_name_for_unit(language, &owner))
+                        .collect::<Vec<_>>();
+                    if self.package_exists_in_language(fqn, language) {
+                        owner_names.push(RelationalName::stable(package_fq_name(language, fqn)));
+                    }
+                    owner_names
+                        .sort_by_cached_key(|name| name.full_name().display(segment_interner()));
+                    owner_names.dedup();
+                    Self::sorted_definition_units(
+                        self.query_values(
+                            language,
+                            owner_names
+                                .into_iter()
+                                .map(|owner| (owner, RelationalDefinitionQuery::StructuralChildren))
+                                .collect(),
+                        ),
+                        "a structural-children query returned the wrong result shape",
+                    )
+                },
             );
-            if self.can_publish() {
-                self.memo
-                    .children_cache
-                    .lock()
-                    .expect("definition children cache poisoned")
-                    .insert(key, children.clone());
-            }
             all_children.extend(children);
         }
         sort_units(&mut all_children);
@@ -1255,42 +1287,34 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 normalized_owner_fqn.to_string(),
                 name.to_string(),
             );
-            if let Some(cached) = self
-                .memo
-                .members_cache
-                .lock()
-                .expect("definition members cache poisoned")
-                .get(&key)
-            {
-                all_members.extend(cached.clone());
-                continue;
-            }
-            let mut owners = self.fqn_for_language(owner_fqn, language);
-            owners.extend(self.normalized_for_language(normalized_owner_fqn, language));
-            sort_units(&mut owners);
-            owners.dedup();
-            let mut owner_names = owners
-                .into_iter()
-                .map(|owner| self.relational_name_for_unit(language, &owner))
-                .collect::<Vec<_>>();
-            if self.package_exists_in_language(owner_fqn, language) {
-                owner_names.push(RelationalName::stable(package_fq_name(language, owner_fqn)));
-            }
-            owner_names.sort_by_cached_key(|name| name.full_name().display(segment_interner()));
-            owner_names.dedup();
-            let members = self.structural_members(
-                language,
-                owner_names,
-                name,
-                "a structural-member query returned the wrong result shape",
+            let members = self.memoized_answer(
+                &self.memo.members_cache,
+                key,
+                "definition members cache poisoned",
+                || {
+                    let mut owners = self.fqn_for_language(owner_fqn, language);
+                    owners.extend(self.normalized_for_language(normalized_owner_fqn, language));
+                    sort_units(&mut owners);
+                    owners.dedup();
+                    let mut owner_names = owners
+                        .into_iter()
+                        .map(|owner| self.relational_name_for_unit(language, &owner))
+                        .collect::<Vec<_>>();
+                    if self.package_exists_in_language(owner_fqn, language) {
+                        owner_names
+                            .push(RelationalName::stable(package_fq_name(language, owner_fqn)));
+                    }
+                    owner_names
+                        .sort_by_cached_key(|name| name.full_name().display(segment_interner()));
+                    owner_names.dedup();
+                    self.structural_members(
+                        language,
+                        owner_names,
+                        name,
+                        "a structural-member query returned the wrong result shape",
+                    )
+                },
             );
-            if self.can_publish() {
-                self.memo
-                    .members_cache
-                    .lock()
-                    .expect("definition members cache poisoned")
-                    .insert(key, members.clone());
-            }
             all_members.extend(members);
         }
         sort_units(&mut all_members);
@@ -1301,30 +1325,20 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     fn members_for_owner(&self, owner: &CodeUnit, name: &str) -> Vec<CodeUnit> {
         let language = language_for_file(owner.source());
         let key = (language, owner.fq().clone(), name.to_string());
-        if let Some(cached) = self
-            .memo
-            .structured_members_cache
-            .lock()
-            .expect("structured definition members cache poisoned")
-            .get(&key)
-        {
-            return cached.clone();
-        }
-        let relational_owner = self.relational_name_for_unit(language, owner);
-        let members = self.structural_members(
-            language,
-            std::iter::once(relational_owner),
-            name,
-            "a structured-member query returned the wrong result shape",
-        );
-        if self.can_publish() {
-            self.memo
-                .structured_members_cache
-                .lock()
-                .expect("structured definition members cache poisoned")
-                .insert(key, members.clone());
-        }
-        members
+        self.memoized_answer(
+            &self.memo.structured_members_cache,
+            key,
+            "structured definition members cache poisoned",
+            || {
+                let relational_owner = self.relational_name_for_unit(language, owner);
+                self.structural_members(
+                    language,
+                    std::iter::once(relational_owner),
+                    name,
+                    "a structured-member query returned the wrong result shape",
+                )
+            },
+        )
     }
 
     fn package_exists(&self, package: &str) -> bool {
@@ -1333,82 +1347,132 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
 
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
         let key = (language, package.to_string());
-        if let Some(cached) = self
-            .memo
-            .package_cache
-            .lock()
-            .expect("package cache poisoned")
-            .get(&key)
-        {
-            return *cached;
-        }
-        let mut values = self.query_values(
-            language,
-            vec![(
-                RelationalName::stable(package_fq_name(language, package)),
-                RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
-            )],
-        );
-        let exists = values.pop().as_ref().is_some_and(package_exists_value);
-        if self.can_publish() {
-            self.memo
-                .package_cache
-                .lock()
-                .expect("package cache poisoned")
-                .insert(key, exists);
-        }
-        exists
+        self.memoized_answer(
+            &self.memo.package_cache,
+            key,
+            "package cache poisoned",
+            || {
+                let mut values = self.query_values(
+                    language,
+                    vec![(
+                        RelationalName::stable(package_fq_name(language, package)),
+                        RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
+                    )],
+                );
+                values.pop().as_ref().is_some_and(package_exists_value)
+            },
+        )
     }
 
     fn fqn_prefix_exists(&self, prefix: &str) -> bool {
         for language in self.query_languages() {
             let key = (language, prefix.to_string());
-            if let Some(cached) = self
-                .memo
-                .prefix_cache
-                .lock()
-                .expect("fqn prefix cache poisoned")
-                .get(&key)
-            {
-                if *cached {
-                    return true;
-                }
-                continue;
-            }
-            let package_exists = self.package_exists_in_language(prefix, language);
-            let has_descendants = if package_exists {
-                false
-            } else {
-                let mut descendants = self.query_values(
-                    language,
-                    vec![(
-                        RelationalName::stable(package_fq_name(language, prefix)),
-                        RelationalDefinitionQuery::PackageRelation(
-                            PackageRelationKind::Descendants,
-                        ),
-                    )],
-                );
-                matches!(
-                    descendants.pop(),
-                    Some(RelationalDefinitionValue::PackageRelation(
-                        PackageRelationValue::Packages(packages)
-                    )) if !packages.is_empty()
-                )
-            };
-            let exists = package_exists
-                || has_descendants
-                || !self.fqn_for_language(prefix, language).is_empty();
-            if self.can_publish() {
-                self.memo
-                    .prefix_cache
-                    .lock()
-                    .expect("fqn prefix cache poisoned")
-                    .insert(key, exists);
-            }
+            let exists = self.memoized_answer(
+                &self.memo.prefix_cache,
+                key,
+                "fqn prefix cache poisoned",
+                || {
+                    let package_exists = self.package_exists_in_language(prefix, language);
+                    let has_descendants = if package_exists {
+                        false
+                    } else {
+                        let mut descendants = self.query_values(
+                            language,
+                            vec![(
+                                RelationalName::stable(package_fq_name(language, prefix)),
+                                RelationalDefinitionQuery::PackageRelation(
+                                    PackageRelationKind::Descendants,
+                                ),
+                            )],
+                        );
+                        matches!(
+                            descendants.pop(),
+                            Some(RelationalDefinitionValue::PackageRelation(
+                                PackageRelationValue::Packages(packages)
+                            )) if !packages.is_empty()
+                        )
+                    };
+                    package_exists
+                        || has_descendants
+                        || !self.fqn_for_language(prefix, language).is_empty()
+                },
+            );
             if exists {
                 return true;
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::semantic::ids::StableDigest;
+    use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+
+    #[test]
+    fn definition_memo_hits_retain_negative_and_transitive_inputs() {
+        let analyzer = MultiAnalyzer::default();
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Python);
+        let key = ReadKey::Configuration(StableDigest::sha256(b"definition input"));
+        let read = || {
+            lookup.memoized_answer(
+                &lookup.memo.package_cache,
+                (Language::Python, "absent".into()),
+                "package cache poisoned",
+                || {
+                    analyzer.record_read(key.clone());
+                    false
+                },
+            )
+        };
+        assert!(!read());
+        for _ in 0..2 {
+            let (exists, reads) = capture_query_reads(&analyzer, read);
+            assert!(!exists);
+            assert_eq!(reads.keys(), vec![key.clone()]);
+            assert_eq!(reads.unattributed_reads(), 0);
+        }
+        // Exact names are caller-keyed: a prefilled empty answer must still
+        // produce its negative ResolvedName question inside a later capture.
+        lookup
+            .memo
+            .fqn_cache
+            .lock()
+            .unwrap()
+            .insert((Language::Python, "absent".into()), Vec::new());
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert!(
+                lookup
+                    .fqn_in_language("absent", Language::Python)
+                    .is_empty()
+            );
+        });
+        assert!(reads.keys().iter().any(|key| matches!(
+            key,
+            ReadKey::Lookup {
+                kind: crate::analyzer::LookupKind::ResolvedName,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn definition_language_selection_uses_registered_capabilities() {
+        let analyzer = MultiAnalyzer::default();
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Python);
+        assert_eq!(lookup.query_languages(), vec![Language::Python]);
+        assert!(lookup.workspace_languages().is_empty());
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            assert_eq!(lookup.query_languages(), vec![Language::Python]);
+            assert!(lookup.workspace_languages().is_empty());
+            lookup.set_language(Language::Ruby);
+            assert_eq!(lookup.query_languages(), vec![Language::Ruby]);
+        });
+        assert!(
+            reads.keys().is_empty(),
+            "language capabilities do not read source"
+        );
     }
 }

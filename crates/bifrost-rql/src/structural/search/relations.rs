@@ -5,6 +5,7 @@ use super::*;
 use crate::analyzer::DeclarationKind;
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::analyzer::semantic::LengthDelimitedDigest;
+use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Node;
 
@@ -36,7 +37,7 @@ pub(super) fn direct_member_expansions(
             exhausted = true;
             continue;
         };
-        indexed.record_owner(&unit, &declaration.unit);
+        indexed.record_owner(analyzer, &unit, &declaration.unit);
         expansions.push(budgeted_declaration_expansion(child));
     }
     (expansions, exhausted)
@@ -95,7 +96,11 @@ pub(super) fn call_site_expansions(
             let semantic_identity = semantic
                 .as_mut()
                 .and_then(|semantic| semantic.call_site_identity_at_source(&site.file, site.range));
-            let binding = bind_call_site_arguments(analyzer, &mut site, &mut cache.bindings);
+            let binding = cache
+                .bindings
+                .read_mut(&memo_attribution(analyzer), |memo| {
+                    bind_call_site_arguments(analyzer, &mut site, memo)
+                });
             let identity_facts = call_site_identity_facts(analyzer, &site, cancellation);
             if recursive_equals_identity_is_incomplete(&site, &identity_facts)
                 && !diagnostics.iter().any(|diagnostic| {
@@ -327,102 +332,104 @@ pub(super) fn cached_call_relation(
     } else {
         &mut cache.outgoing
     };
-    let layer = cache_profile.as_mut().map(|profile| {
-        if incoming {
-            &mut profile.incoming_call
-        } else {
-            &mut profile.outgoing_call
-        }
-    });
-    let result = if let Some(result) = results.get(unit) {
-        if let Some(layer) = layer {
-            layer.record_hit(
-                Some(call_relation_result_complete(result)),
-                result.sites.len(),
-            );
-        }
-        result.clone()
-    } else {
-        if let Some(layer) = layer {
-            layer.record_miss();
-        }
-        let relation_limits = CallRelationLimits {
-            max_files: limits
-                .max_scanned_files
-                .saturating_sub(budget.scanned_files)
-                .min(DEFAULT_MAX_FILES),
-            max_source_bytes: limits
-                .max_scanned_source_bytes
-                .saturating_sub(budget.scanned_source_bytes),
-            max_candidates: limits
-                .max_fact_nodes
-                .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references)),
-        };
-        let result = if relation_limits.max_files == 0
-            || relation_limits.max_source_bytes == 0
-            || relation_limits.max_candidates == 0
-        {
-            push_budget_diagnostic(diagnostics, budget);
-            CallRelationResult {
-                truncated: true,
-                ..CallRelationResult::default()
-            }
-        } else if incoming {
-            CallRelationService::incoming_bounded(
-                analyzer,
-                token,
-                unit,
-                relation_limits,
-                cancellation,
-            )
-        } else {
-            CallRelationService::outgoing_bounded(
-                analyzer,
-                token,
-                unit,
-                relation_limits,
-                cancellation,
-            )
-        };
-        let budget_exhausted = charge_reference_scan(
-            budget,
-            limits,
-            result.work.scanned_files,
-            result.work.scanned_source_bytes,
-            result.work.examined_candidates,
-        );
-        let mut result = result;
-        result.truncated |= budget_exhausted;
-        if budget_exhausted {
-            push_budget_diagnostic(diagnostics, budget);
-        }
-        if let Some(profile) = cache_profile {
-            let layer = if incoming {
+    results.read_mut(&memo_attribution(analyzer), |results| {
+        let layer = cache_profile.as_mut().map(|profile| {
+            if incoming {
                 &mut profile.incoming_call
             } else {
                 &mut profile.outgoing_call
+            }
+        });
+        let result = if let Some(result) = results.get(unit) {
+            if let Some(layer) = layer {
+                layer.record_hit(
+                    Some(call_relation_result_complete(result)),
+                    result.sites.len(),
+                );
+            }
+            result.clone()
+        } else {
+            if let Some(layer) = layer {
+                layer.record_miss();
+            }
+            let relation_limits = CallRelationLimits {
+                max_files: limits
+                    .max_scanned_files
+                    .saturating_sub(budget.scanned_files)
+                    .min(DEFAULT_MAX_FILES),
+                max_source_bytes: limits
+                    .max_scanned_source_bytes
+                    .saturating_sub(budget.scanned_source_bytes),
+                max_candidates: limits
+                    .max_fact_nodes
+                    .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references)),
             };
-            layer.record_build(Some(call_relation_result_complete(&result)));
-        }
-        results.insert(unit.clone(), result.clone());
-        result
-    };
-    let reported = if incoming {
-        &mut cache.reported_incoming
-    } else {
-        &mut cache.reported_outgoing
-    };
-    if reported.insert(unit.clone()) {
-        let language = crate::analyzer::common::language_for_file(unit.source()).config_label();
-        diagnostics.extend(
+            let result = if relation_limits.max_files == 0
+                || relation_limits.max_source_bytes == 0
+                || relation_limits.max_candidates == 0
+            {
+                push_budget_diagnostic(diagnostics, budget);
+                CallRelationResult {
+                    truncated: true,
+                    ..CallRelationResult::default()
+                }
+            } else if incoming {
+                CallRelationService::incoming_bounded(
+                    analyzer,
+                    token,
+                    unit,
+                    relation_limits,
+                    cancellation,
+                )
+            } else {
+                CallRelationService::outgoing_bounded(
+                    analyzer,
+                    token,
+                    unit,
+                    relation_limits,
+                    cancellation,
+                )
+            };
+            let budget_exhausted = charge_reference_scan(
+                budget,
+                limits,
+                result.work.scanned_files,
+                result.work.scanned_source_bytes,
+                result.work.examined_candidates,
+            );
+            let mut result = result;
+            result.truncated |= budget_exhausted;
+            if budget_exhausted {
+                push_budget_diagnostic(diagnostics, budget);
+            }
+            if let Some(profile) = cache_profile {
+                let layer = if incoming {
+                    &mut profile.incoming_call
+                } else {
+                    &mut profile.outgoing_call
+                };
+                layer.record_build(Some(call_relation_result_complete(&result)));
+            }
+            results.insert(unit.clone(), result.clone());
             result
-                .diagnostics
-                .iter()
-                .cloned()
-                .map(|diagnostic| map_call_relation_diagnostic(language, diagnostic)),
-        );
-    }
-    result
+        };
+        let reported = if incoming {
+            &mut cache.reported_incoming
+        } else {
+            &mut cache.reported_outgoing
+        };
+        if reported.insert(unit.clone()) {
+            let language = crate::analyzer::common::language_for_file(unit.source()).config_label();
+            diagnostics.extend(
+                result
+                    .diagnostics
+                    .iter()
+                    .cloned()
+                    .map(|diagnostic| map_call_relation_diagnostic(language, diagnostic)),
+            );
+        }
+        result
+    })
 }
 
 pub(super) fn call_relation_result_complete(result: &CallRelationResult) -> bool {
@@ -621,14 +628,16 @@ pub(super) fn outbound_reference_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
+    let outbound = &mut cache.outbound;
+    outbound.read_mut(&memo_attribution(analyzer), |outbound| {
     let source_file = declaration.unit.source();
-    let cache_hit = cache.outbound.contains_key(source_file);
+    let cache_hit = outbound.contains_key(source_file);
     let mut exhausted = cache_hit && cache.outbound_exhausted.contains(source_file);
     if let Some(profile) = cache_profile {
         if cache_hit {
             profile.outbound_reference.record_hit(
                 Some(!cache.outbound_incomplete.contains(source_file)),
-                cache.outbound.get(source_file).map_or(0, Vec::len),
+                outbound.get(source_file).map_or(0, Vec::len),
             );
         } else {
             profile.outbound_reference.record_miss();
@@ -661,12 +670,11 @@ pub(super) fn outbound_reference_expansions(
         if let Some(profile) = cache_profile {
             profile.outbound_reference.record_build(cache_complete);
         }
-        cache.outbound.insert(source_file.clone(), hits);
+        outbound.insert(source_file.clone(), hits);
     }
     let mut sites = Vec::new();
     let mut omitted = 0usize;
-    for hit in cache
-        .outbound
+    for hit in outbound
         .get(declaration.unit.source())
         .into_iter()
         .flatten()
@@ -713,6 +721,7 @@ pub(super) fn outbound_reference_expansions(
         .map(|site| reference_expansion(PipelineValue::Declaration(site.target.clone()), site))
         .collect();
     (expansions, exhausted)
+    })
 }
 
 pub(super) fn sort_reference_sites(sites: &mut [ReferenceSiteValue]) {

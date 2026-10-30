@@ -5,8 +5,11 @@ Actions and upload the SARIF report to GitHub code scanning. Findings appear
 as pull-request annotations, and the job gates on a strict exit-code
 contract: `0` is clean, `1` is a policy gate failure (a finding at or above
 the `fail-on` threshold or an orphaned suppression decision), and `2` is
-unreliable — a run that could not prove its own completeness and
-must never be treated as clean.
+unreliable — a run in which some part of the scan gave no verdict, which
+must never be treated as clean. A policy that ends `inconclusive` gave a
+verdict: it could not prove there is nothing more to find. It is listed as a
+warning and in the job summary and does not fail the job, matching SlopCop's
+`clean` status; set `on-inconclusive: unreliable` to fail on it instead.
 
 ## Quick start
 
@@ -91,9 +94,9 @@ restored a compatible snapshot. Only exhaustive `complete` policy-run reports
 publish cache snapshots; reliable but non-exhaustive `proven_subset` and
 `proven_by_summary` reports do not.
 
-The exit-code contract is strict: `0` is a clean completed scan, `1` is a
-completed policy-gate failure, and `2` is unreliable and must never be treated
-as clean.
+The exit-code contract is strict: `0` is a scan in which every policy gave a
+verdict and none gated, `1` is a completed policy-gate failure, and `2` is
+unreliable and must never be treated as clean.
 
 ## Source
 

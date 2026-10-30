@@ -34,6 +34,7 @@ pub fn acquire_usage_graph(
     use crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingGraph;
     use crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheBuildOutcome;
     let acquisition = analyzer.snapshot_caches.usage_graphs().acquire(
+        analyzer,
         usage_graph_key(analyzer, ecosystem),
         &crate::cancellation::CancellationToken::default(),
         || {

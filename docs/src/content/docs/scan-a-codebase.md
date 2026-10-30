@@ -100,9 +100,9 @@ Dependency models
   Details: --verbose or --format json
 ```
 
-The scan exits with status 2, and stderr ends with
-`bifrost: policy evaluation was incomplete or invalid; see the emitted report
-for details`.
+The scan exits with status 1, because two findings are warnings and the
+default `--fail-on` threshold is `warning`. The inconclusive policies are
+reported but do not change the status.
 
 Read the report from the top:
 
@@ -115,7 +115,10 @@ Read the report from the top:
   so its empty result proves nothing. These notes do not change the exit
   status.
 - Analysis warnings with `run_incomplete`, and the `inconclusive` lines, name
-  policies that could not finish. Any such policy makes the exit status 2.
+  policies that could not prove there is nothing more to find. They are
+  advisory: their findings gate like any other, and their empty results prove
+  nothing. Pass `--on-inconclusive unreliable` to make any such policy give
+  exit status 2.
 - **Dependency models** shows which semantic dependency packs were activated.
   Here the Python ecosystem was selected automatically.
 
@@ -143,13 +146,14 @@ Three default policies cannot finish on this fixture:
   that the analysis cannot know, such as `if x is None:` on a function
   parameter `x`, also ends inconclusive.
 
-Status 2 never means "no problems". It means that the report cannot support a
-claim that the code is clean. The three findings above are still real and
-proven.
+An inconclusive policy that reports nothing does not mean "no problems". The
+report cannot support a claim that the code is clean for that policy. The
+three findings above are still real and proven.
 
 ## Gate on Selected Policies
 
-To get a gate that can pass, select the policies you want to enforce. This
+To get a gate whose result is complete, select the policies you want to
+enforce. This
 command runs the three policies that report findings on this fixture:
 
 ```bash
@@ -231,8 +235,9 @@ Dependency models
 ```
 
 The run exits 0. The findings are gone because the code changed, not because
-anything was suppressed or configured. `bifrost scan .` still exits 2 on the
-fixed code, because the three policies described above still cannot finish.
+anything was suppressed or configured. `bifrost scan .` also exits 0 on the
+fixed code. It still reports the three policies described above as
+inconclusive, so its result is not a complete analysis.
 
 ## Exit Codes Are the Gate
 
@@ -241,13 +246,14 @@ statuses:
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Every requested policy completed, no active unsuppressed finding met the `--fail-on` threshold, and no suppression record is orphaned. |
-| `1` | Every requested policy completed, and at least one active unsuppressed finding met the threshold or at least one suppression record is orphaned. |
-| `2` | The run is unreliable: a policy was inconclusive, unsupported, or failed, or a suppression, schema, evaluation, output, or argument error occurred. Never read status 2 as clean. |
+| `0` | Every requested policy gave a verdict (complete or inconclusive), no active unsuppressed finding met the `--fail-on` threshold, and no suppression record is orphaned. |
+| `1` | At least one active unsuppressed finding met the threshold or at least one suppression record is orphaned. |
+| `2` | The run is unreliable: a policy was unsupported or failed, or a suppression, schema, evaluation, output, or argument error occurred. An inconclusive policy is reported but does not give status 2 unless you pass `--on-inconclusive unreliable`. Never read status 2 as clean. |
 
 The default threshold is `--fail-on warning`. In this tutorial, `bifrost scan
-.` exits 2 before and after the fix. The selected-policy command exits 1 while
-the two warnings are present and 0 once they are fixed.
+.` and the selected-policy command both exit 1 while the two warnings are
+present and 0 once they are fixed. Only the selected-policy command reports a
+complete analysis.
 
 ## Where to Go Next
 

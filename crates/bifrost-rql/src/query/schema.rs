@@ -14,12 +14,11 @@ use brokk_bifrost_core::analyzer::cpp_class_facts::CppClassFactKind;
 use brokk_bifrost_core::analyzer::cpp_facts::CppProvenanceRule;
 use brokk_bifrost_core::analyzer::statement_facts::StatementFactKind;
 use brokk_bifrost_core::analyzer::structural::control_relation::{
-    ALL_CONTROL_EXIT_PARTITIONS, ALL_CONTROL_RELATION_KINDS, ControlExitPartition,
-    ControlRelationKind,
+    ALL_CONTROL_EXIT_PARTITIONS, ALL_CONTROL_RELATION_KINDS,
 };
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_FLOW_SUBJECT_KINDS, ALL_STATE_EVENT_CLASSES,
-    ALL_STATE_EVENT_READ_CAUSES, FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
+    ALL_STATE_EVENT_READ_CAUSES,
 };
 use brokk_bifrost_core::analyzer::structural::materialization::{
     ALL_DECLARATION_ORIGINS, ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
@@ -32,7 +31,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     ALL_REJECTION_REASONS,
 };
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
-    ALL_REWRITE_DOMAIN_KINDS, ALL_REWRITE_OUTCOME_KINDS, RewriteDomainKind, RewriteOutcomeKind,
+    ALL_REWRITE_DOMAIN_KINDS, ALL_REWRITE_OUTCOME_KINDS,
 };
 use brokk_bifrost_core::analyzer::usages::model::{
     ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof,
@@ -315,9 +314,6 @@ impl RuntimeSourceOrigin {
     pub const fn label(self) -> &'static str {
         "pristine_input"
     }
-    pub fn from_label(label: &str) -> Option<Self> {
-        (label == Self::PristineInput.label()).then_some(Self::PristineInput)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,139 +479,6 @@ pub enum ValueShape {
 }
 
 impl ValueShape {
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::Query => "a query",
-            Self::QueryList => "two or more compatible typed queries",
-            Self::QuerySteps => "an ordered list of query steps",
-            Self::Pattern => "a pattern",
-            Self::PatternList => "a list/vector of patterns",
-            Self::PatternMap => "a map of names to patterns",
-            Self::String => "a string",
-            Self::CanonicalIntegerDecimal => "a canonical non-negative decimal integer string",
-            Self::ParameterName => "a non-empty parameter name",
-            Self::CaptureName => "a non-empty declared capture name",
-            Self::RegexString => "a regular expression string",
-            Self::StringList => "one or more strings",
-            Self::PathScope => {
-                "a flat list of alternative path globs, or nested lists whose groups all match"
-            }
-            Self::StringPredicate => "an exact string or regex predicate",
-            Self::RegexPredicate => "a regex predicate object",
-            Self::KindList => "a normalized kind or list of kinds",
-            Self::AssignmentSequenceKind => "list or tuple",
-            Self::DeclaredVisibilityList => {
-                "a declared-visibility label or list of labels (public, protected, internal, package_private, private, crate_or_module, unknown)"
-            }
-            Self::LanguageList => "one or more language labels",
-            Self::PositiveInteger => "a positive integer",
-            Self::PermissionBitMask => "a positive u32 permission bit mask",
-            Self::NonNegativeInteger => "a non-negative integer",
-            Self::Arity => "an exact non-negative count, or :min/:max argument-count bounds",
-            Self::ResultDetail => "compact or full",
-            Self::ExecutionMode => "results, explain, or profile",
-            Self::SchemaVersion => "a supported schema version",
-            Self::TrueBoolean => "the boolean true",
-            Self::ReferenceKindList => "one or more structured reference kinds",
-            Self::UsageProof => "proven or unproven",
-            Self::UsageSurface => "external_usages or lsp_references",
-            Self::CallTraversalCompleteness => "exhaustive or proven_subset",
-            Self::ProtocolRef => "a bounded protocol reference in namespace:name form",
-            Self::ValueFlowPlanRef => "a bounded value-flow plan reference in namespace:name form",
-            Self::TaintResultRef => {
-                "a bounded retained taint result reference in namespace:name form"
-            }
-            Self::OccurrenceFilter => "an occurrence class/role/namespace filter object",
-            Self::OccurrenceClassList => "one or more occurrence classes",
-            Self::OccurrenceRoleList => "one or more occurrence roles",
-            Self::NamespaceList => "one or more naming namespaces",
-            Self::ScopeFilter => "a lexical scope kind filter object",
-            Self::BindingFilter => "a binding kind/name/hoisting filter object",
-            Self::PathFilter => "a qualified path min-segments filter object",
-            Self::BindingKindList => "one or more binding kinds",
-            Self::BindingNameList => "one or more exact binding names",
-            Self::HoistingClassList => "one or more hoisting classes",
-            Self::PrecedenceTierList => "one or more precedence tiers, or unattributed",
-            Self::CandidateOutcomeList => {
-                "one or more candidate outcomes or typed rejection reasons"
-            }
-            Self::BoundaryStatusList => "one or more resolution boundary statuses",
-            Self::GenerationSiteFilter => "a generation-site kind/input filter object",
-            Self::ExportFilter => "an export form/name filter object",
-            Self::GenerationKindList => "one or more generation kinds",
-            Self::GenerationInputList => "literal or dynamic",
-            Self::ExportFormList => "one or more export forms",
-            Self::ExportNameList => "one or more exact exported names",
-            Self::DeclarationOriginList => "one or more declaration origins",
-            Self::ConfigurationFormatList => "one or more configuration formats",
-            Self::ConfigurationNodeKindList => "one or more configuration node kinds",
-            Self::ConfigurationRoleList => "one or more configuration member roles",
-            Self::ConfigurationScalarKindList => "one or more configuration scalar kinds",
-            Self::ConfigurationKeyList => "one or more exact configuration keys",
-            Self::ConfigurationRouteList => {
-                "ordered route alternatives; each is a sequence of key or index segments"
-            }
-            Self::ConfigurationFactOrdinalList => "one or more zero-based fact ordinals",
-            Self::ConfigurationProvenanceList => "one or more configuration value provenances",
-            Self::ConfigurationCompletenessList => "complete or incomplete",
-            Self::DependencyEvidenceFilter => "a static dependency evidence filter object",
-            Self::ConfigurationFactsFilter => {
-                "a configuration-fact format/node/role/key/value/route/provenance filter object"
-            }
-            Self::CrossDomainCorrelation => {
-                "a registered relation, a code query, and a configuration query"
-            }
-            Self::CrossDomainRequirement => "a code query and a configuration query",
-            Self::CrossDomainRelation => "one registered cross-domain relation",
-            Self::ConfigurationCodeRelation => {
-                "a configuration-to-code match kind and optional anti-join flag"
-            }
-            Self::CorrelationDocumentList => {
-                "one or more exact workspace-relative configuration document paths"
-            }
-            Self::DependencyConfigurationRelation => {
-                "an explicit dependency owner, supported versions, exact document set, override edges, and mitigating property values"
-            }
-            Self::CorrelationOverrideList => {
-                "ordered pairs of lower and higher precedence declared documents"
-            }
-            Self::Boolean => "a boolean",
-            Self::UsageKindList => "one or more usage kinds",
-            Self::OwnerRelationList => "one or more owner relations",
-            Self::SiteClassList => "use_site or declaration_site",
-            Self::StateEventClassList => "one or more state-event classes",
-            Self::StateEventReadCauseList => "one or more synthetic state-event read causes",
-            Self::FlowSubjectKindList => "binding or property",
-            Self::FlowRelationList => "one or more flow relations",
-            Self::FlowCertaintyList => "exact or may",
-            Self::FailureUseProvenanceList => "one or more failure-use provenance classes",
-            Self::FailureUseConsumerList => "one or more failure-use consumer classes",
-            Self::RewriteDomainList => "one or more rewrite domains",
-            Self::RewriteOutcomeList => "converged, cycle, or exceeded-budget",
-            Self::ControlRelationKindList => "one or more control relations",
-            Self::AssignmentRelationKindList => {
-                "self_assignment, failed_swap, or overwritten_unread"
-            }
-            Self::BranchRelationKindList => "one or more branch relations",
-            Self::CppProvenanceRuleList => "one or more C/C++ provenance rules",
-            Self::ControlExitPartitionList => "one or more control exit partitions",
-            Self::JsxElementIdentity => "intrinsic, component, or unknown",
-            Self::RuntimeFamily => "a supported runtime family",
-            Self::RuntimeGlobal => "a supported runtime root binding",
-            Self::RuntimeContainer => "a supported runtime container member",
-            Self::RuntimeSourceOrigin => "a supported runtime source-origin contract",
-            Self::RuntimeKeyKind => "static-property or static-index",
-            Self::CallIdentity => "a stable, qualified, or resolved typed call identity",
-            Self::ReceiverTypeConstraint => {
-                "an exact call identity or an assignable-to workspace receiver family"
-            }
-            Self::CallProof => "exact or declared",
-            Self::AbsentMemberProof => "proven, conditional, or any",
-            Self::RowPredicates => "one or more typed row predicates",
-            Self::RowProjectionColumns => "one or more row fields, optionally renamed",
-        }
-    }
-
     pub fn string_length_bounds(self) -> Option<(usize, usize)> {
         match self {
             Self::ParameterName => Some((1, MAX_KWARG_NAME_LENGTH)),
@@ -4213,10 +4076,6 @@ pub const RESULT_CONTRACT_FAILURE_USE_STEP_OPTIONS: &[QueryStepOption] = &[
     ),
 ];
 
-pub fn flow_state_option_for_rql_label(op: QueryStepOp, label: &str) -> Option<QueryStepOption> {
-    option_for_rql_label(op.options(), label)
-}
-
 /// Options of the `branch-relations` step.
 pub const BRANCH_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
     QueryStepField::BranchRelations,
@@ -4837,14 +4696,6 @@ fn filter_field_labels<T>(
     }
 }
 
-pub fn control_relation_kind_from_label(label: &str) -> Option<ControlRelationKind> {
-    ControlRelationKind::from_label(label)
-}
-
-pub fn control_exit_partition_from_label(label: &str) -> Option<ControlExitPartition> {
-    ControlExitPartition::from_label(label)
-}
-
 /// The constrained-value vocabulary each rewrite-path filter axis accepts, in
 /// canonical registry order, so parser, validator, hover and completion all
 /// read one table (#1480).
@@ -4866,42 +4717,11 @@ pub fn rewrite_path_filter_labels(field: QueryStepField) -> Vec<&'static str> {
     }
 }
 
-pub fn rewrite_domain_from_label(label: &str) -> Option<RewriteDomainKind> {
-    RewriteDomainKind::from_label(label)
-}
-
-pub fn rewrite_outcome_from_label(label: &str) -> Option<RewriteOutcomeKind> {
-    RewriteOutcomeKind::from_label(label)
-}
-
-pub fn state_event_class_from_label(label: &str) -> Option<StateEventClass> {
-    StateEventClass::from_label(label)
-}
-
-pub fn flow_subject_kind_from_label(label: &str) -> Option<FlowSubjectKind> {
-    FlowSubjectKind::from_label(label)
-}
-
-pub fn flow_relation_from_label(label: &str) -> Option<FlowRelation> {
-    FlowRelation::from_label(label)
-}
-
-pub fn flow_certainty_from_label(label: &str) -> Option<FlowCertainty> {
-    FlowCertainty::from_label(label)
-}
-
 pub fn usage_proof_label(proof: UsageProof) -> &'static str {
     match proof {
         UsageProof::Proven => "proven",
         UsageProof::Unproven => "unproven",
     }
-}
-
-pub fn jsx_element_identity_labels() -> Vec<&'static str> {
-    JsxElementIdentity::ALL
-        .iter()
-        .map(|identity| identity.label())
-        .collect()
 }
 
 pub fn jsx_element_identity_from_label(label: &str) -> Option<JsxElementIdentity> {
@@ -5208,3 +5028,6 @@ pub fn dependency_evidence_field_for_rql_label(
 /// Source forms accepted by the declaration type-kind property.
 pub(crate) const DECLARATION_TYPE_KINDS: &[&str] =
     &["class", "interface", "enum", "record", "annotation"];
+
+#[cfg(test)]
+mod authoring_tests;

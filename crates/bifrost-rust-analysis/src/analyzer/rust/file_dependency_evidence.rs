@@ -38,7 +38,9 @@ use crate::analyzer::semantic_model::{
     DependencyFileEvidenceLimits, DependencyPackLimits, DependencyProvenance, ResolvedDependency,
     SemanticModelActivationEvidence,
 };
-use brokk_bifrost_analysis::analyzer::dependency_support::dependency_diagnostic as diagnostic;
+use brokk_bifrost_analysis::analyzer::dependency_support::{
+    dependency_diagnostic as diagnostic, dependency_provenance_entry as entry,
+};
 
 use crate::analyzer::topology::DependencyScope;
 
@@ -149,7 +151,7 @@ fn acquire_cargo_discovery_rows(
         && !outcome.cancelled;
     (outcome, bytes as usize)
 }
-fn cargo_input(path: &Path) -> bool {
+pub(super) fn cargo_input(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
         Some("Cargo.toml" | "Cargo.lock")
@@ -692,12 +694,6 @@ fn cargo_file_discovery_rows(
     outcome
 }
 
-fn entry(key: &str, value: impl ToString) -> DependencyProvenance {
-    DependencyProvenance {
-        key: key.to_owned(),
-        value: value.to_string(),
-    }
-}
 fn display(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }

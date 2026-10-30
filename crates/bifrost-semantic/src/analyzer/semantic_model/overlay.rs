@@ -1228,9 +1228,14 @@ impl DeferredYieldContract {
 }
 
 impl CollectionFlowContract {
+    /// A collection-flow fact states its own coverage for one exact callable,
+    /// so that coverage decides it. The publishing pack's completeness does
+    /// not: a pack generated from a real library is partial whenever any
+    /// unrelated declaration produced a diagnostic, and that says nothing
+    /// about a callable whose contract the producer proved. This is the same
+    /// narrowing `callable_family_complete` applies to call binding (#3130).
     pub fn is_complete(&self) -> bool {
-        self.coverage == Some(Completeness::Complete)
-            && self.provenance.is_complete_and_unambiguous()
+        self.coverage == Some(Completeness::Complete) && !self.provenance.ambiguous
     }
 }
 

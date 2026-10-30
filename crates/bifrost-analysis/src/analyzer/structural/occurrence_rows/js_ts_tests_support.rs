@@ -1,17 +1,13 @@
 use super::super::resolution::BoundaryStatus;
 use super::*;
 
-use crate::analyzer::AnalyzerConfig;
 use crate::analyzer::Language;
-use crate::analyzer::Project;
-use crate::analyzer::TestProject;
 use crate::analyzer::WorkspaceAnalyzer;
-
+use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
 use std::path::PathBuf;
-use tempfile::TempDir;
 #[doc(hidden)]
 pub struct Fixture {
-    _temp: TempDir,
+    _project: BuiltInlineTestProject,
     #[doc(hidden)]
     pub workspace: WorkspaceAnalyzer,
     #[doc(hidden)]
@@ -34,23 +30,15 @@ impl Fixture {
         source: &str,
         supporting: &[(&str, &str)],
     ) -> Self {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root: PathBuf = temp.path().canonicalize().expect("canonical root");
-        let file = ProjectFile::new(root.clone(), relative_path);
-        file.write(source).expect("write fixture source");
+        let mut builder = InlineTestProject::with_language(language).file(relative_path, source);
         for (path, contents) in supporting {
-            ProjectFile::new(root.clone(), *path)
-                .write(contents)
-                .expect("write supporting source");
+            builder = builder.file(*path, *contents);
         }
-        let project = TestProject::new(root, language);
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::new(project) as Arc<dyn Project>,
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral workspace should build");
+        let project = builder.build();
+        let file = project.file(relative_path);
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
         Self {
-            _temp: temp,
+            _project: project,
             workspace,
             file,
             source: source.to_owned(),

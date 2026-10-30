@@ -2693,6 +2693,15 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
+            "go_native_module_manifests",
+            super::super::go_package_context::MODULE_MANIFESTS_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
             "go_native_source_inventory",
             super::super::go_package_context::SOURCE_INVENTORY_SQL,
             vec![
@@ -3769,6 +3778,158 @@ pub mod tests {
             }),
             "{state} {name}: {plan:#?}"
         );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn path_symbol_candidate_blob_batch_seeks_populated_tables_at_900_arity() {
+        use syn::visit::Visit;
+        // Select the production statement structurally, rather than maintaining
+        // a second SQL copy or changing the statement to obtain its plan.
+        struct Statement {
+            name: &'static str,
+            sql: Option<String>,
+        }
+        impl<'ast> Visit<'ast> for Statement {
+            fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+                if item.sig.ident == self.name {
+                    self.visit_block(&item.block);
+                }
+            }
+            fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+                if item.sig.ident == self.name {
+                    self.visit_block(&item.block);
+                }
+            }
+            fn visit_local(&mut self, local: &'ast syn::Local) {
+                if matches!(&local.pat, syn::Pat::Ident(name) if name.ident == "sql") {
+                    let syn::Expr::Macro(expression) = local.init.as_ref().unwrap().expr.as_ref()
+                    else {
+                        panic!("production path-symbol SQL must be a format literal");
+                    };
+                    assert!(expression.mac.path.is_ident("format"));
+                    let literal: syn::LitStr = syn::parse2(expression.mac.tokens.clone()).unwrap();
+                    assert!(self.sql.replace(literal.value()).is_none());
+                }
+                syn::visit::visit_local(self, local);
+            }
+        }
+        let source = syn::parse_file(include_str!("mod.rs")).unwrap();
+        let mut statement = Statement {
+            name: "path_symbol_rows_for_blob_keys_at_snapshots",
+            sql: None,
+        };
+        statement.visit_file(&source);
+        let placeholders = std::iter::repeat_n("?", 900).collect::<Vec<_>>().join(",");
+        let sql = statement
+            .sql
+            .expect("production path-symbol statement")
+            .replace("{placeholders}", &placeholders);
+        let mut imports = Statement {
+            name: "blobs_with_structured_imports_conn",
+            sql: None,
+        };
+        imports.visit_file(&source);
+        let import_sql = imports
+            .sql
+            .expect("production import-presence statement")
+            .replace("{placeholders}", &placeholders)
+            .replace(
+                "{PARSED_BLOB_COMPLETE_CONDITION}",
+                super::super::PARSED_BLOB_COMPLETE_CONDITION,
+            );
+        let parameters = std::iter::once(rusqlite::types::Value::Text("javascript".into()))
+            .chain((1..=900).map(|id| rusqlite::types::Value::Text(format!("{id:040x}"))))
+            .collect::<Vec<_>>();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .unwrap();
+        // Like adjacent access-plan fixtures, populate real rows independently
+        // of publication FKs. Every bound OID below names a populated blob.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;
+            WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<4096)
+            INSERT INTO blobs(id,blob_oid,lang,generation) SELECT id,printf('%040x',id),'javascript',0 FROM ids;
+            INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,stored_unit_count,range_count,signature_count,signature_metadata_count,supertype_count,child_count,import_statement_count,type_identifier_count,is_complete)
+            SELECT id,'javascript',0,'',0,0,0,0,0,0,0,0,1 FROM blobs;
+            INSERT INTO import_statements(blob_id,lang,ordinal,statement)
+            SELECT id,'javascript',0,'import value from module' FROM blobs;
+            UPDATE blob_meta SET import_statement_count=1;
+            INSERT INTO workspace_file_versions(file_version_id,workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from)
+            SELECT id,printf('%064d',0),'javascript',0,printf('src/module%d.js',id),blob_oid,printf('%064d',0),1 FROM blobs;
+            INSERT INTO workspace_file_path_symbol_rows(file_version_id,kind,package_name,short_name,exact_fqn,normalized_fqn,requires_imports)
+            SELECT id,3,'',printf('module%d.js',id),printf('src/module%d.js',id),printf('src/module%d.js',id),1 FROM blobs;
+            INSERT INTO temp.selected_workspace_revisions VALUES(printf('%064d',0),'javascript',0,1);").unwrap();
+        let mut plans = Vec::new();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let plan = super::pinned_plans::plan_rows_for_sql(&conn, &sql, &parameters).unwrap();
+            eprintln!("path-symbol candidate batch {state}: {plan:#?}");
+            let count = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |_| Ok(()))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .len();
+            assert_eq!(count, 900, "the bound production-arity probe must execute");
+            // The import-presence batch the set build issues beside it must
+            // seek by the same bound OIDs.
+            let import_plan =
+                super::pinned_plans::plan_rows_for_sql(&conn, &import_sql, &parameters).unwrap();
+            eprintln!("import-presence batch {state}: {import_plan:#?}");
+            let import_count = conn
+                .prepare(&import_sql)
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |_| Ok(()))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .len();
+            assert_eq!(import_count, 900, "the import probe must execute real OIDs");
+            plans.push((state, plan, import_plan));
+        }
+        for (state, plan, import_plan) in plans {
+            assert!(
+                plan.iter()
+                    .any(|line| line.starts_with("SEARCH candidates USING")
+                        && line.contains("blob_oid=?")),
+                "{state}: candidate lookup must seek the bound OIDs: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.starts_with("SEARCH blobs USING")
+                        && line.contains("blob_oid=?")),
+                "{state}: blob lookup must use its index: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| (line.starts_with("SEARCH versions USING")
+                        || line.starts_with("SEARCH files USING"))
+                        && line.contains("blob_oid=?")),
+                "{state}: selected files must seek the bound blob identities: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.starts_with("SCAN rows")
+                    || line.starts_with("SCAN files")
+                    || line.starts_with("SCAN versions")
+                    || line.contains("SCAN workspace_file_path_symbol_rows")
+                    || line.contains("SCAN workspace_file_versions")),
+                "{state}: path-symbol and file tables must not scan: {plan:#?}"
+            );
+            assert!(
+                import_plan
+                    .iter()
+                    .any(|line| line.starts_with("SEARCH") && line.contains("blob_oid=?")),
+                "{state}: import presence must seek the bound OIDs: {import_plan:#?}"
+            );
+            assert!(
+                !import_plan.iter().any(|line| line.starts_with("SCAN")),
+                "{state}: import presence must not scan: {import_plan:#?}"
+            );
+        }
     }
 
     #[cfg(test)]

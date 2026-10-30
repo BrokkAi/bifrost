@@ -1427,6 +1427,22 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                 child_context.mode = RustPrimaryDeclarationMode::Class;
                 child_context.parent = Some(code_unit);
             }
+            // A nightly trait alias (`trait A = B + C;`) names a trait but has
+            // no body, so it owns no member declarations.
+            "trait_alias" => {
+                code_unit = register_rust_class_like(
+                    self.file,
+                    self.source,
+                    node,
+                    parent,
+                    package_name,
+                    current.in_test_region,
+                    self.parsed,
+                    &mut source_bridge,
+                );
+                declaration_descend = false;
+                child_context.mode = RustPrimaryDeclarationMode::Disabled;
+            }
             "mod_item" => {
                 code_unit = register_rust_module(
                     self.file,
@@ -1519,7 +1535,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                     child_context.parent = Some(code_unit);
                 }
             }
-            "macro_definition" => {
+            "macro_definition" | "decl_macro" => {
                 code_unit = visit_rust_macro(
                     self.file,
                     self.source,
@@ -1625,6 +1641,7 @@ fn rust_primary_declaration_boundary(kind: &str) -> bool {
             | "enum_item"
             | "union_item"
             | "trait_item"
+            | "trait_alias"
             | "mod_item"
             | "function_item"
             | "function_signature_item"
@@ -1634,6 +1651,7 @@ fn rust_primary_declaration_boundary(kind: &str) -> bool {
             | "const_item"
             | "static_item"
             | "macro_definition"
+            | "decl_macro"
             | "macro_invocation"
             | "type_item"
             | "associated_type"
@@ -1650,12 +1668,14 @@ fn rust_primary_declaration_kind_allowed(mode: RustPrimaryDeclarationMode, kind:
                     | "enum_item"
                     | "union_item"
                     | "trait_item"
+                    | "trait_alias"
                     | "mod_item"
                     | "function_item"
                     | "foreign_mod_item"
                     | "const_item"
                     | "static_item"
                     | "macro_definition"
+                    | "decl_macro"
                     | "macro_invocation"
                     | "type_item"
                     | "impl_item"
@@ -5071,6 +5091,10 @@ fn rust_declaration_header<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 fn rust_type_signature(node: Node<'_>, source: &str) -> String {
+    // A trait alias ends at its semicolon; its bounds are the declaration.
+    if node.kind() == "trait_alias" {
+        return rust_bounded_declaration_label(node, source);
+    }
     let header = rust_declaration_header(node, source);
     format!("{header} {{")
 }
@@ -6057,6 +6081,11 @@ fn rust_parameter_pattern_label_node(pattern: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
+    // `macro name(params) { .. }` and `pub macro name { .. }`: the header runs
+    // to the braced body field.
+    if node.kind() == "decl_macro" {
+        return format!("{} {{", rust_declaration_header(node, source));
+    }
     let name = node
         .child_by_field_name("name")
         .expect("macro definition name");
@@ -8898,6 +8927,128 @@ type Alias = u8;
                 "missing or wrong kind for {name}"
             );
         }
+    }
+
+    #[test]
+    #[hardwon(
+        "#3074: nightly trait aliases and decl_macro items were unindexed, and before grammar 0.24.3 cut the file off at a parse error"
+    )]
+    fn nightly_trait_aliases_and_decl_macros_declare_traits_and_macros() {
+        // Shapes from clippy's
+        // tests/ui-toml/missing_docs_in_private_items/missing_docs_in_private_items.rs.
+        let source = r#"#![feature(decl_macro, trait_alias)]
+pub type TyAliasPub = u32;
+pub trait TraitAliasPub = Iterator;
+trait TraitAliasPrivate<T> = Clone + Into<T> where T: Copy;
+pub macro mac_pub {
+    () => {},
+}
+macro mac_private($x:expr) { $x }
+fn after() {}
+"#;
+        let tree = crate::test_helpers::parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let root = tree.root_node();
+        let item = |index: usize| root.named_child(index).unwrap();
+        let text = |node: Node<'_>| &source[node.byte_range()];
+
+        let alias = item(2);
+        assert_eq!(alias.kind(), "trait_alias");
+        let name = alias.child_by_field_name("name").unwrap();
+        assert_eq!(
+            (name.kind(), text(name)),
+            ("type_identifier", "TraitAliasPub")
+        );
+        let bounds = alias.child_by_field_name("bounds").unwrap();
+        assert_eq!(
+            (bounds.kind(), text(bounds)),
+            ("trait_alias_bounds", "Iterator")
+        );
+        let generic_alias = item(3);
+        assert_eq!(generic_alias.kind(), "trait_alias");
+        assert_eq!(
+            generic_alias
+                .child_by_field_name("type_parameters")
+                .unwrap()
+                .kind(),
+            "type_parameters"
+        );
+
+        let rules_macro = item(4);
+        assert_eq!(rules_macro.kind(), "decl_macro");
+        let name = rules_macro.child_by_field_name("name").unwrap();
+        assert_eq!((name.kind(), text(name)), ("identifier", "mac_pub"));
+        assert!(rules_macro.child_by_field_name("parameters").is_none());
+        assert_eq!(
+            rules_macro.child_by_field_name("body").unwrap().kind(),
+            "token_tree"
+        );
+        let parameterized_macro = item(5);
+        assert_eq!(parameterized_macro.kind(), "decl_macro");
+        let parameters = parameterized_macro
+            .child_by_field_name("parameters")
+            .unwrap();
+        assert_eq!(
+            (parameters.kind(), text(parameters)),
+            ("token_tree", "($x:expr)")
+        );
+
+        let (parsed, source) = parse_fixture(source);
+        let unit = |name: &str| {
+            parsed
+                .declarations()
+                .iter()
+                .find(|unit| unit.identifier() == name)
+                .unwrap_or_else(|| panic!("missing declaration for {name}"))
+        };
+        let signature = |name: &str| {
+            parsed
+                .signatures
+                .iter()
+                .find(|(unit, _)| unit.identifier() == name)
+                .and_then(|(_, signatures)| signatures.first())
+                .map(String::as_str)
+                .unwrap_or_else(|| panic!("missing signature for {name}"))
+        };
+        let facts = parsed.source_facts.as_ref().expect("source facts");
+        let kind_for = |name: &str| {
+            facts
+                .rust_declaration_properties
+                .iter()
+                .find(|fact| declaration_name(&parsed, &source, fact.declaration) == Some(name))
+                .map(|fact| fact.kind)
+        };
+        for (name, unit_type, kind, expected_signature) in [
+            (
+                "TraitAliasPub",
+                CodeUnitType::Class,
+                RustDeclarationKind::Trait,
+                "pub trait TraitAliasPub = Iterator;",
+            ),
+            (
+                "TraitAliasPrivate",
+                CodeUnitType::Class,
+                RustDeclarationKind::Trait,
+                "trait TraitAliasPrivate<T> = Clone + Into<T> where T: Copy;",
+            ),
+            (
+                "mac_pub",
+                CodeUnitType::Macro,
+                RustDeclarationKind::Macro,
+                "pub macro mac_pub {",
+            ),
+            (
+                "mac_private",
+                CodeUnitType::Macro,
+                RustDeclarationKind::Macro,
+                "macro mac_private($x:expr) {",
+            ),
+        ] {
+            assert_eq!(unit(name).kind(), unit_type, "{name}");
+            assert_eq!(kind_for(name), Some(kind), "{name}");
+            assert_eq!(signature(name), expected_signature, "{name}");
+        }
+        assert_eq!(unit("after").kind(), CodeUnitType::Function);
     }
 
     #[test]

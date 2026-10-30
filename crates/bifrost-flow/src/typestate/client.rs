@@ -859,10 +859,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
             .bindings
             .initial_seeds()
             .iter()
-            .filter(|binding| {
-                observation_site_procedure(binding.site())
-                    .is_some_and(|procedure| procedure == root)
-            })
+            .filter(|binding| observation_site_procedure(binding.site()) == root)
             .map(|binding| binding.subject())
             .collect::<BTreeSet<_>>();
         for binding in self.bindings.terminal_bindings() {
@@ -892,10 +889,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
         self.bindings
             .initial_seeds()
             .iter()
-            .filter(|binding| {
-                observation_site_procedure(binding.site())
-                    .is_some_and(|procedure| procedure == root)
-            })
+            .filter(|binding| observation_site_procedure(binding.site()) == root)
             .map(BoundTypestateInitialSeed::subject)
             .chain(entry_facts.iter().filter_map(|fact| fact.subject()))
             .collect()
@@ -1009,8 +1003,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     if seed.activation_edge().is_some()
                         && let Some(root) = &self.conditional_seed_root
                     {
-                        let procedure = observation_site_procedure(seed.site())
-                            .expect("validated initial seeds retain a procedure");
+                        let procedure = observation_site_procedure(seed.site());
                         if procedure != root {
                             continue;
                         }
@@ -1850,10 +1843,12 @@ impl<'plan> TypestateFlowProblem<'plan> {
     }
 }
 
-fn observation_site_procedure(site: &super::TypestateObservationSite) -> Option<&ProcedureHandle> {
+fn observation_site_procedure(site: &super::TypestateObservationSite) -> &ProcedureHandle {
     site.program_point_handle()
-        .map(|point| point.procedure())
-        .or_else(|| site.call_site_handle().map(|call| call.procedure()))
+        .expect(
+            "TypestateBindingPlan::try_new validates program-point seeds with validate_seed_site",
+        )
+        .procedure()
 }
 
 /// Solve a pre-resolved typestate plan while retaining its durable identity.

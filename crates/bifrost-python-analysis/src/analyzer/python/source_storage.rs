@@ -256,7 +256,12 @@ impl<A: LanguageAdapter> CanonicalPythonSourceFacts for TreeSitterAnalyzer<A> {
         }
         let generation = self.language_generation("python")?;
         let oid = self.resolve_live_oid_for_file(file)?;
-        self.record_read_key(self.file_read_key(file, oid));
+        let keys = self.file_read_key(file, oid);
+        debug_assert!(matches!(
+            keys,
+            brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::File { .. }
+        ));
+        self.record_read_key(keys);
         let key = Self::transient_cache_key(oid, file);
         let cache_key = (generation, oid, file.clone());
         if let Some(state) = self.retained_file_state(file, &key)

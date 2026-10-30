@@ -35,7 +35,12 @@ use brokk_bifrost_core::analyzer::model::Range;
 
 use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 
+use brokk_bifrost_analysis::analyzer::WorkspaceFactFamily;
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    AuthorityInputs, WorkspaceAuthorityMemo, memo_attribution,
+};
+use brokk_bifrost_core::analyzer::memo_attribution::CaptureScopedMemo;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -137,10 +142,6 @@ use crate::analyzer::usages::scala_graph::dead_code_bulk_eligibility;
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
 
 use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
-
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set;
-
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_vec_by_unit;
 
 use brokk_bifrost_core::analyzer::weighted_cache::weight_project_file_set;
 
@@ -792,7 +793,8 @@ pub(crate) enum ScalaResolvedSeedOutcome {
 }
 
 /// One file's lazily hydrated facts cell in [`ScalaQueryFileFactsProvider`].
-type ScalaQueryFileFactsCell = Arc<OnceLock<Option<Arc<ScalaFileFacts>>>>;
+type ScalaQueryFileFactsCell =
+    Arc<brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Option<Arc<ScalaFileFacts>>>>;
 
 /// The per-file facts source a targeted Scala usage query resolves through
 /// (#3142).
@@ -804,7 +806,7 @@ type ScalaQueryFileFactsCell = Arc<OnceLock<Option<Arc<ScalaFileFacts>>>>;
 /// caches `None`, the same answer its absence from the eager map gave.
 struct ScalaQueryFileFactsProvider {
     inner: TreeSitterAnalyzer<ScalaAdapter>,
-    cells: Mutex<HashMap<ProjectFile, ScalaQueryFileFactsCell>>,
+    cells: CaptureScopedMemo<Mutex<HashMap<ProjectFile, ScalaQueryFileFactsCell>>>,
     touched: Arc<AtomicUsize>,
 }
 
@@ -821,7 +823,11 @@ impl ScalaQueryFileFactsProvider {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 self.touched.fetch_add(1, Ordering::Relaxed);
-                entry.insert(Arc::new(OnceLock::new())).clone()
+                entry
+                    .insert(Arc::new(
+                        brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+                    ))
+                    .clone()
             }
         }
     }
@@ -829,39 +835,44 @@ impl ScalaQueryFileFactsProvider {
 
 impl ScalaFileFactsProvider for ScalaQueryFileFactsProvider {
     fn file_facts(&self, file: &ProjectFile) -> Option<Arc<ScalaFileFacts>> {
-        let cell = {
-            let mut guard = self
-                .cells
-                .lock()
-                .expect("Scala query file-facts cache poisoned");
-            self.cell_for(&mut guard, file)
-        };
-        cell.get_or_init(|| {
-            self.inner
-                .bulk_file_states([file.clone()], BulkFileStateSource::Omit)
-                .remove(file)
-                .map(|state| Arc::new(scala_file_facts(state)))
-        })
-        .clone()
+        let cell = self
+            .cells
+            .read(&self.inner.read_capability().memo_attribution(), |cells| {
+                let mut guard = cells.lock().expect("Scala query file-facts cache poisoned");
+                self.cell_for(&mut guard, file)
+            });
+        brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(
+            &self.inner,
+            &cell,
+            || {
+                self.inner
+                    .bulk_file_states([file.clone()], BulkFileStateSource::Omit)
+                    .remove(file)
+                    .map(|state| Arc::new(scala_file_facts(state)))
+            },
+        )
     }
 
     fn prefetch_file_facts(&self, files: &[ProjectFile]) {
-        let pending: Vec<(ProjectFile, ScalaQueryFileFactsCell)> = {
-            let mut guard = self
-                .cells
-                .lock()
-                .expect("Scala query file-facts cache poisoned");
-            files
-                .iter()
-                .map(|file| (file.clone(), self.cell_for(&mut guard, file)))
-                .filter(|(_, cell)| cell.get().is_none())
-                .collect()
-        };
+        let pending: Vec<(ProjectFile, ScalaQueryFileFactsCell)> =
+            self.cells
+                .read(&self.inner.read_capability().memo_attribution(), |cells| {
+                    let mut guard = cells.lock().expect("Scala query file-facts cache poisoned");
+                    files
+                        .iter()
+                        .map(|file| (file.clone(), self.cell_for(&mut guard, file)))
+                        .filter(|(_, cell)| cell.get().is_none())
+                        .collect()
+                });
         for chunk in pending.chunks(SCALA_QUERY_SWEEP_CHUNK_FILES) {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&self.inner);
             let mut states = self.inner.bulk_file_states(
                 chunk.iter().map(|(file, _)| file.clone()),
                 BulkFileStateSource::Omit,
             );
+            if !scope.captured_read_incompleteness().is_empty() {
+                continue;
+            }
             for (file, cell) in chunk {
                 cell.get_or_init(|| {
                     states
@@ -891,7 +902,7 @@ fn scala_query_file_facts_provider(
 ) -> Arc<dyn ScalaFileFactsProvider> {
     Arc::new(ScalaQueryFileFactsProvider {
         inner: inner.clone(),
-        cells: Mutex::new(HashMap::default()),
+        cells: CaptureScopedMemo::new(Mutex::new(HashMap::default())),
         touched,
     })
 }
@@ -929,11 +940,19 @@ fn build_scala_project_types_from_frontier(
 pub struct ScalaAnalyzer {
     inner: TreeSitterAnalyzer<ScalaAdapter>,
     java_config: JvmAnalyzerConfig,
-    external_index: Arc<OnceLock<Arc<JvmExternalDeclarationIndex>>>,
+    external_index: Arc<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+            brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
+                Arc<JvmExternalDeclarationIndex>,
+            >,
+        >,
+    >,
+    external_inputs: crate::analyzer::jvm::hierarchy::DerivedMemo<(), ()>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    imported_code_units:
+        crate::analyzer::jvm::hierarchy::DerivedMemo<ProjectFile, HashSet<CodeUnit>>,
+    referencing_files: Arc<WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    direct_ancestors: crate::analyzer::jvm::hierarchy::AncestorMemo,
     source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
@@ -942,22 +961,37 @@ pub struct ScalaAnalyzer {
         ),
         Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>,
     >,
-    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    file_dependency_index: Arc<OnceLock<imports::ScalaFileDependencyIndex>>,
-    importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
-    package_namespaces: Arc<OnceLock<Vec<String>>>,
-    same_package_reference_index:
-        Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    lazy_hierarchy_index: Arc<OnceLock<hierarchy::ScalaLazyHierarchyIndex>>,
+    reverse_import_index: ScalaProjectFileSetAuthority,
+    file_dependency_index: Arc<WorkspaceAuthorityMemo<OnceLock<imports::ScalaFileDependencyIndex>>>,
+    importable_declarations_by_package: ScalaImportableDeclarationsAuthority,
+    package_namespaces: Arc<
+        WorkspaceAuthorityMemo<
+            brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Arc<Vec<String>>>,
+        >,
+    >,
+    same_package_reference_index: ScalaProjectFileSetAuthority,
+    lazy_hierarchy_index: Arc<
+        WorkspaceAuthorityMemo<
+            brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+                Arc<hierarchy::ScalaLazyHierarchyIndex>,
+            >,
+        >,
+    >,
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
-    project_types: Arc<OnceLock<Arc<brokk_bifrost_jvm::scala::graph::inverted::ProjectTypes>>>,
+    project_types: Arc<
+        WorkspaceAuthorityMemo<
+            brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+                Arc<brokk_bifrost_jvm::scala::graph::inverted::ProjectTypes>,
+            >,
+        >,
+    >,
     /// The workspace's Scala seed with its hierarchy resolved on the
     /// relational frontier, built once per analyzer generation. Every
     /// targeted usage query and the analyzer-cached `project_types` build
     /// start from it instead of re-sweeping the workspace.
-    resolved_query_seed: Arc<OnceLock<ScalaResolvedQuerySeed>>,
-    pub(crate) dead_code_usage_edges: UsageEdgesCache,
+    resolved_query_seed: Arc<WorkspaceAuthorityMemo<OnceLock<ScalaResolvedQuerySeed>>>,
+    pub(crate) dead_code_usage_edges: WorkspaceAuthorityMemo<UsageEdgesCache>,
     project_types_build_count: Arc<AtomicUsize>,
     /// Files whose full per-file facts the current analyzer generation's
     /// targeted usage queries materialized through the lazy provider (#3142).
@@ -970,10 +1004,124 @@ pub struct ScalaAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     scala_query_walk_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
-    type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
+    type_relations: Arc<
+        WorkspaceAuthorityMemo<
+            brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Arc<Vec<TypeRelation>>>,
+        >,
+    >,
 }
 
 impl_forward_query_provider!(ScalaAnalyzer);
+
+type ScalaProjectFileSetMemo = Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>;
+type ScalaProjectFileSetAuthority = Arc<WorkspaceAuthorityMemo<ScalaProjectFileSetMemo>>;
+type ScalaImportableDeclarations = HashMap<String, Arc<Vec<CodeUnit>>>;
+type ScalaImportableDeclarationsAuthority = Arc<
+    WorkspaceAuthorityMemo<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Arc<ScalaImportableDeclarations>>,
+    >,
+>;
+
+fn new_scala_project_types_authority() -> Arc<
+    WorkspaceAuthorityMemo<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+            Arc<brokk_bifrost_jvm::scala::graph::inverted::ProjectTypes>,
+        >,
+    >,
+> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaProjectTypes,
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+    ))
+}
+
+fn new_scala_resolved_seed_authority()
+-> Arc<WorkspaceAuthorityMemo<OnceLock<ScalaResolvedQuerySeed>>> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaResolvedQuerySeed,
+        OnceLock::new(),
+    ))
+}
+
+fn new_scala_importable_declarations_authority() -> ScalaImportableDeclarationsAuthority {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaImportableDeclarations,
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+    ))
+}
+
+fn new_scala_package_namespaces_authority() -> Arc<
+    WorkspaceAuthorityMemo<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Arc<Vec<String>>>,
+    >,
+> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaPackageNamespaces,
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+    ))
+}
+
+fn new_scala_file_dependency_authority()
+-> Arc<WorkspaceAuthorityMemo<OnceLock<imports::ScalaFileDependencyIndex>>> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaFileDependencyIndex,
+        OnceLock::new(),
+    ))
+}
+
+fn new_scala_lazy_hierarchy_authority() -> Arc<
+    WorkspaceAuthorityMemo<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+            Arc<hierarchy::ScalaLazyHierarchyIndex>,
+        >,
+    >,
+> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaLazyHierarchyIndex,
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+    ))
+}
+
+fn new_scala_type_relations_authority() -> Arc<
+    WorkspaceAuthorityMemo<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<Arc<Vec<TypeRelation>>>,
+    >,
+> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaTypeRelations,
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+    ))
+}
+
+fn new_scala_referencing_files_authority(
+    memo_budget: u64,
+) -> Arc<WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<ProjectFile>>>>> {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaReferencingFiles,
+        build_weighted_cache(memo_budget, weight_project_file_set),
+    ))
+}
+
+fn new_scala_reverse_import_authority() -> ScalaProjectFileSetAuthority {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaReverseImportIndex,
+        Arc::new(PoolSafeMemo::new()),
+    ))
+}
+
+fn new_scala_same_package_authority() -> ScalaProjectFileSetAuthority {
+    Arc::new(WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaSamePackageReferenceIndex,
+        Arc::new(PoolSafeMemo::new()),
+    ))
+}
+
+fn new_scala_dead_code_authority(memo_budget: u64) -> WorkspaceAuthorityMemo<UsageEdgesCache> {
+    WorkspaceAuthorityMemo::new(
+        WorkspaceFactFamily::ScalaDeadCodeUsageEdges,
+        build_weighted_cache(memo_budget / 8, weight_usage_edges),
+    )
+}
 
 impl ScalaAnalyzer {
     pub(crate) fn tree_sitter_analyzer(&self) -> &TreeSitterAnalyzer<ScalaAdapter> {
@@ -984,11 +1132,13 @@ impl ScalaAnalyzer {
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        Self::from_inner(
-            self.inner.update_all_with_progress(progress),
-            self.memo_budget,
-            self.java_config.clone(),
-        )
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::from_inner(
+                self.inner.update_all_with_progress(progress),
+                self.memo_budget,
+                self.java_config.clone(),
+            )
+        })
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -1207,12 +1357,16 @@ impl ScalaAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
-        clone.external_index = Arc::new(OnceLock::new());
-        clone.file_dependency_index = Arc::new(OnceLock::new());
-        clone.project_types = Arc::new(OnceLock::new());
-        clone.resolved_query_seed = Arc::new(OnceLock::new());
-        clone.dead_code_usage_edges =
-            build_weighted_cache(self.memo_budget / 8, weight_usage_edges);
+        clone.external_index =
+            Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new());
+        clone.external_inputs = crate::analyzer::jvm::hierarchy::derived_memo(self.memo_budget / 8);
+        clone.file_dependency_index = new_scala_file_dependency_authority();
+        clone.project_types = new_scala_project_types_authority();
+        clone.resolved_query_seed = new_scala_resolved_seed_authority();
+        clone.referencing_files = new_scala_referencing_files_authority(self.memo_budget / 8);
+        clone.reverse_import_index = new_scala_reverse_import_authority();
+        clone.same_package_reference_index = new_scala_same_package_authority();
+        clone.dead_code_usage_edges = new_scala_dead_code_authority(self.memo_budget);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
         clone.scala_query_file_facts_touched = Arc::new(AtomicUsize::new(0));
         clone.scala_source_facts_by_file = new_scala_source_facts_cache(self.memo_budget / 8);
@@ -1251,26 +1405,29 @@ impl ScalaAnalyzer {
         Self {
             inner,
             java_config,
-            external_index: Arc::new(OnceLock::new()),
+            external_index: Arc::new(
+                brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
+            ),
+            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
             memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            imported_code_units: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 4),
+            referencing_files: new_scala_referencing_files_authority(memo_budget / 8),
+            direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(memo_budget / 8),
             source_facts: build_weighted_cache(
                 memo_budget / 8,
                 |_, facts: &Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>| {
                     u32::try_from(facts.estimated_retained_bytes()).unwrap_or(u32::MAX)
                 },
             ),
-            reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            file_dependency_index: Arc::new(OnceLock::new()),
-            importable_declarations_by_package: Arc::new(OnceLock::new()),
-            package_namespaces: Arc::new(OnceLock::new()),
-            same_package_reference_index: Arc::new(PoolSafeMemo::new()),
-            lazy_hierarchy_index: Arc::new(OnceLock::new()),
-            project_types: Arc::new(OnceLock::new()),
-            resolved_query_seed: Arc::new(OnceLock::new()),
-            dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
+            reverse_import_index: new_scala_reverse_import_authority(),
+            file_dependency_index: new_scala_file_dependency_authority(),
+            importable_declarations_by_package: new_scala_importable_declarations_authority(),
+            package_namespaces: new_scala_package_namespaces_authority(),
+            same_package_reference_index: new_scala_same_package_authority(),
+            lazy_hierarchy_index: new_scala_lazy_hierarchy_authority(),
+            project_types: new_scala_project_types_authority(),
+            resolved_query_seed: new_scala_resolved_seed_authority(),
+            dead_code_usage_edges: new_scala_dead_code_authority(memo_budget),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
             scala_query_file_facts_touched: Arc::new(AtomicUsize::new(0)),
             scala_source_facts_by_file: new_scala_source_facts_cache(memo_budget / 8),
@@ -1278,7 +1435,7 @@ impl ScalaAnalyzer {
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             scala_query_walk_count: Arc::new(AtomicUsize::new(0)),
-            type_relations: Arc::new(OnceLock::new()),
+            type_relations: new_scala_type_relations_authority(),
         }
     }
 
@@ -1299,28 +1456,35 @@ impl ScalaAnalyzer {
             '_,
         >,
     ) -> ScalaResolvedSeedOutcome {
-        if let Some(seed) = self.cached_resolved_query_seed(session) {
-            return ScalaResolvedSeedOutcome::Ready(seed);
-        }
-        let workspace_files = match self.inner.project().analyzable_files(Language::Scala) {
-            Ok(files) => files.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
-                return ScalaResolvedSeedOutcome::Failed(
-                    "the Scala workspace file set is unavailable",
-                );
-            }
-        };
-        let unresolved_seed = self.project_types_query_seed(&workspace_files);
-        self.resolve_query_seed(session, &unresolved_seed)
+        self.resolved_query_seed.read(
+            &memo_attribution(self),
+            |memo| {
+                if let Some(seed) = self.cached_resolved_query_seed(memo, session) {
+                    return ScalaResolvedSeedOutcome::Ready(seed);
+                }
+                let workspace_files = match self.inner.project().analyzable_files(Language::Scala) {
+                    Ok(files) => files.into_iter().collect::<Vec<_>>(),
+                    Err(_) => {
+                        return ScalaResolvedSeedOutcome::Failed(
+                            "the Scala workspace file set is unavailable",
+                        );
+                    }
+                };
+                let unresolved_seed = self.project_types_query_seed(&workspace_files);
+                self.resolve_query_seed(memo, session, &unresolved_seed)
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Scala]),
+        )
     }
 
     fn cached_resolved_query_seed(
         &self,
+        memo: &OnceLock<ScalaResolvedQuerySeed>,
         session: &brokk_bifrost_analysis::analyzer::relational_frontier::RelationalFrontierSession<
             '_,
         >,
     ) -> Option<ScalaProjectTypesSeed> {
-        let cached = self.resolved_query_seed.get()?;
+        let cached = memo.get()?;
         session.adopt_answers(&cached.answers);
         Some(
             cached
@@ -1338,6 +1502,7 @@ impl ScalaAnalyzer {
     /// map and targeted callers replace it with a fresh per-query provider.
     fn resolve_query_seed(
         &self,
+        memo: &OnceLock<ScalaResolvedQuerySeed>,
         session: &brokk_bifrost_analysis::analyzer::relational_frontier::RelationalFrontierSession<
             '_,
         >,
@@ -1349,7 +1514,7 @@ impl ScalaAnalyzer {
                 Arc::clone(&self.scala_query_file_facts_touched),
             )
         };
-        if let Some(seed) = self.cached_resolved_query_seed(session) {
+        if let Some(seed) = self.cached_resolved_query_seed(memo, session) {
             return ScalaResolvedSeedOutcome::Ready(seed);
         }
         let resolved_seed = match session.resolve_owned("scala_hierarchy", |frontier| {
@@ -1366,14 +1531,12 @@ impl ScalaAnalyzer {
         };
         // The cached copy carries a provider nothing hydrates through, so no
         // query's touched facts outlive it; each request gets its own.
-        let cached = self
-            .resolved_query_seed
-            .get_or_init(|| ScalaResolvedQuerySeed {
-                seed: resolved_seed
-                    .clone()
-                    .with_file_facts_provider(fresh_provider()),
-                answers: session.answer_snapshot(),
-            });
+        let cached = memo.get_or_init(|| ScalaResolvedQuerySeed {
+            seed: resolved_seed
+                .clone()
+                .with_file_facts_provider(fresh_provider()),
+            answers: session.answer_snapshot(),
+        });
         // A concurrent resolver may have published the winning seed. Its
         // hierarchy and recorded answers must travel together in this session.
         session.adopt_answers(&cached.answers);
@@ -1385,10 +1548,23 @@ impl ScalaAnalyzer {
         )
     }
 
-    pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
+    fn retained_external_declaration_index(&self) -> Option<&JvmExternalDeclarationIndex> {
+        crate::analyzer::jvm::authority::external_read(
+            self,
+            &self.external_index,
+            &self.external_inputs,
+        );
+        self.external_index
+            .get()
+            .map(|entry| entry.replay().as_ref())
+    }
+
+    pub(crate) fn external_declaration_index(&self) -> Arc<JvmExternalDeclarationIndex> {
         crate::analyzer::jvm::external::get_or_build_external_declaration_index(
             self,
             &self.external_index,
+            (Language::Scala, WorkspaceFactFamily::ScalaExternalIndex),
+            &self.external_inputs,
             &self.java_config,
             self.inner.project(),
             self.inner.analyzer_store(),
@@ -1673,8 +1849,9 @@ impl ScalaAnalyzer {
     where
         F: FnOnce() -> HashMap<ProjectFile, FileState>,
     {
-        self.project_types
-            .get_or_init(|| brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(self, "scala.project_types", || {
+        self.project_types.read(
+            &memo_attribution(self),
+            |memo| brokk_bifrost_analysis::analyzer::common::complete_query_cache_cell(self, memo, || {
                 self.project_types_build_count
                     .fetch_add(1, Ordering::Relaxed);
                 let file_states: HashMap<ProjectFile, ScalaFileFacts> = file_states()
@@ -1689,7 +1866,12 @@ impl ScalaAnalyzer {
                     self,
                     &uncancelled,
                 );
-                let types = match self.resolve_query_seed(&session, &unresolved_seed) {
+                let outcome = self.resolved_query_seed.read(
+                    &memo_attribution(self),
+                    |seed_memo| self.resolve_query_seed(seed_memo, &session, &unresolved_seed),
+                    |_| AuthorityInputs::SourceOf(&[Language::Scala]),
+                );
+                let types = match outcome {
                     ScalaResolvedSeedOutcome::Ready(seed) => build_scala_project_types_from_seed(
                         self.inner.clone(),
                         seed.with_eager_file_facts(file_states),
@@ -1698,13 +1880,14 @@ impl ScalaAnalyzer {
                     // resolves through the store backend and reports its own
                     // errors without reading any file twice.
                     ScalaResolvedSeedOutcome::Cancelled | ScalaResolvedSeedOutcome::Failed(_) => {
-                        self.record_degraded_persistent_fill("scala.project_types", "frontier_fallback");
+                        self.record_query_failure(brokk_bifrost_analysis::analyzer::store::StoreError::new("Scala project types frontier did not complete"));
                         build_scala_project_types_from_seed(self.inner.clone(), unresolved_seed)
                     }
                 };
                 Arc::new(types)
-            }))
-            .clone()
+                    }),
+            |_| AuthorityInputs::SourceOf(&[Language::Scala]),
+        )
     }
 
     pub(crate) fn new_with_config_store_context(
@@ -1845,7 +2028,7 @@ impl ScalaSource for ScalaAnalyzer {
 
         let imports = self.inner.import_info_of(token, file);
         let imported = self.imported_code_units_of(file);
-        let retained = self.external_index.get().map(Arc::as_ref);
+        let retained = self.retained_external_declaration_index();
         let declares_name = |declaration: &CodeUnit| {
             declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
         };
@@ -1929,7 +2112,7 @@ impl ScalaSource for ScalaAnalyzer {
         if self.declares_simple_type(file, &package_name, name) {
             return ScalaNameProof::Workspace;
         }
-        let retained = self.external_index.get().map(Arc::as_ref);
+        let retained = self.retained_external_declaration_index();
         if retained
             .is_some_and(|external| external.resolve_same_package(&package_name, name).is_some())
         {
@@ -2308,26 +2491,20 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = brokk_bifrost_analysis::analyzer::updated_external_index(
-            &self.external_index,
-            changed_files,
-            is_jvm_dependency_input,
-        );
-        let mut updated = Self::from_inner(
-            self.inner.update(changed_files),
-            self.memo_budget,
-            self.java_config.clone(),
-        );
-        updated.external_index = external_index;
-        if Arc::ptr_eq(&self.external_index, &updated.external_index)
-            && self.degraded_persistent_fills() > 0
-        {
-            updated.record_degraded_persistent_fill(
-                "retained_external_index",
-                "inherited_degraded_owner",
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
+                Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new())
+            } else {
+                Arc::clone(&self.external_index)
+            };
+            let mut updated = Self::from_inner(
+                self.inner.update(changed_files),
+                self.memo_budget,
+                self.java_config.clone(),
             );
-        }
-        updated
+            updated.external_index = external_index;
+            updated
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -3009,6 +3186,14 @@ impl LanguageSupport for ScalaSupport {
     }
 }
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for ScalaSupport {
+    fn precedence_rules(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::resolution::precedence::PrecedenceRules
+    {
+        use brokk_bifrost_analysis::analyzer::resolution::precedence;
+        precedence::SCALA_PRECEDENCE_RULES
+    }
+
     fn root_source_horizon_follows_provenance(&self) -> bool {
         // Local identities stay in their host mount, including nonshared stage
         // allocations. Selected root and JVM bridges cannot classify as Import
@@ -3258,7 +3443,9 @@ class Use(api: Api) { def call(): Int = api.choose(1) }
                 .any(|hit| hit.snippet.contains("api.choose(1)"))
         );
         assert!(
-            disk.project_types.get().is_some(),
+            disk.project_types
+                .account(|cell| usize::from(cell.get().is_some()))
+                > 0,
             "disk cache should be warm"
         );
         disk.prefetch_file_dependency_targets(
@@ -3267,7 +3454,9 @@ class Use(api: Api) { def call(): Int = api.choose(1) }
             &brokk_bifrost_core::cancellation::CancellationToken::new(),
         );
         assert!(
-            disk.file_dependency_index.get().is_some(),
+            disk.file_dependency_index
+                .account(|cell| usize::from(cell.get().is_some()))
+                > 0,
             "disk file-dependency index should be warm"
         );
 
@@ -3280,11 +3469,17 @@ class Use(api: Api) { def call(): Int = api.choose(1)("overlay") }
         assert!(overlay.set(file.abs_path(), overlay_source.to_string()));
         let snapshot = disk.clone_with_project(Arc::clone(&overlay) as Arc<dyn Project>);
         assert!(
-            snapshot.project_types.get().is_none(),
+            snapshot
+                .project_types
+                .account(|cell| usize::from(cell.get().is_some()))
+                == 0,
             "an overlay clone needs an independent source-facts generation"
         );
         assert!(
-            snapshot.file_dependency_index.get().is_none(),
+            snapshot
+                .file_dependency_index
+                .account(|cell| usize::from(cell.get().is_some()))
+                == 0,
             "an overlay clone needs an independent file-dependency index"
         );
         let overlay_target = snapshot
@@ -3474,10 +3669,7 @@ mod knownness_tests {
             ScalaSource::simple_type_proof(&analyzer, &consumer, name, &model);
             ScalaSource::simple_term_proof(&analyzer, &consumer, name, &model);
         }
-        assert!(
-            analyzer.external_index.get().is_none(),
-            "answering a bare Scala name must not build the classpath index"
-        );
+        assert!(analyzer.external_index.get().is_none());
     }
 
     #[test]
@@ -3594,13 +3786,19 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
-        brokk_bifrost_analysis::analyzer::languages::build_fqn_dead_code_edges(
-            analyzer,
-            &scala.dead_code_usage_edges,
-            candidates,
-            |token, callees| {
-                build_inbound_scala_usage_edges_with_completeness(analyzer, token, callees)
+        scala.dead_code_usage_edges.read(
+            &memo_attribution(scala),
+            |cache| {
+                brokk_bifrost_analysis::analyzer::languages::build_fqn_dead_code_edges(
+                    analyzer,
+                    cache,
+                    candidates,
+                    |token, callees| {
+                        build_inbound_scala_usage_edges_with_completeness(analyzer, token, callees)
+                    },
+                )
             },
+            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
         )
     }
 }
@@ -3623,16 +3821,30 @@ mod dead_code_cache_tests {
             .build();
         let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
         let key: Arc<[String]> = vec!["A".to_string()].into();
-        analyzer
-            .dead_code_usage_edges
-            .insert(key.clone(), Arc::new(UsageEdges::default()));
+        analyzer.dead_code_usage_edges.read(
+            &memo_attribution(&analyzer),
+            |cache| cache.insert(key.clone(), Arc::new(UsageEdges::default())),
+            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
+        );
 
         let updated = analyzer.update(&BTreeSet::new());
-        assert!(updated.dead_code_usage_edges.get(&key).is_none());
+        assert!(!updated.dead_code_usage_edges.read(
+            &memo_attribution(&updated),
+            |cache| cache.get(&key).is_some(),
+            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
+        ));
         let rebuilt = analyzer.update_all();
-        assert!(rebuilt.dead_code_usage_edges.get(&key).is_none());
+        assert!(!rebuilt.dead_code_usage_edges.read(
+            &memo_attribution(&rebuilt),
+            |cache| cache.get(&key).is_some(),
+            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
+        ));
         let overlay = analyzer.clone_with_project(fixture.project_dyn());
-        assert!(overlay.dead_code_usage_edges.get(&key).is_none());
+        assert!(!overlay.dead_code_usage_edges.read(
+            &memo_attribution(&overlay),
+            |cache| cache.get(&key).is_some(),
+            |_| AuthorityInputs::SourceOf(&[Language::Java, Language::Kotlin, Language::Scala]),
+        ));
     }
 }
 
@@ -3641,6 +3853,16 @@ mod project_types_seed_tests {
 
     use crate::analyzer::scala::*;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
+
+    fn assert_scala_scope(reads: &brokk_bifrost_analysis::analyzer::ReadLedger) {
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert!(reads.keys().iter().any(|key| matches!(
+            key,
+            ReadKey::Scope { languages, .. }
+                if languages.as_ref() == [Language::Scala]
+        )));
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -3676,5 +3898,105 @@ mod project_types_seed_tests {
         }
         assert!(Arc::ptr_eq(&types, &analyzer.project_types()));
         assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn project_types_authority_replays_scala_scope_on_warm_hits() {
+        let fixture = InlineTestProject::with_language(Language::Scala)
+            .file("Base.scala", "package sample\nclass Base\n")
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        for _ in 0..2 {
+            let (_, reads) = capture_query_reads(&analyzer, || analyzer.project_types());
+            assert_scala_scope(&reads);
+            assert!(
+                reads.keys().iter().any(|key| matches!(
+                    key,
+                    ReadKey::Scope { languages, .. } if languages.contains(&Language::Scala)
+                )),
+                "Scala scope keys: {:?}",
+                reads.keys()
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_seed_authority_replays_scala_scope_on_warm_hits() {
+        let fixture = InlineTestProject::with_language(Language::Scala)
+            .file("Base.scala", "package sample\nclass Base\n")
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        for _ in 0..2 {
+            let (_, reads) = capture_query_reads(&analyzer, || {
+                let token = brokk_bifrost_core::cancellation::CancellationToken::new();
+                let session = brokk_bifrost_analysis::analyzer::relational_frontier::RelationalFrontierSession::new(
+                    &analyzer,
+                    &token,
+                );
+                assert!(matches!(
+                    analyzer.resolved_query_seed(&session),
+                    ScalaResolvedSeedOutcome::Ready(_)
+                ));
+            });
+            assert_scala_scope(&reads);
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7496: warm Scala source-facts cache hits skipped the selected file read"
+    )]
+    fn source_facts_cache_hit_records_selected_file() {
+        let fixture = InlineTestProject::with_language(Language::Scala)
+            .file("A.scala", "package sample\nclass A\n")
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        let file = fixture.file("A.scala");
+        for _ in 0..2 {
+            let (_, reads) = capture_query_reads(&analyzer, || {
+                analyzer
+                    .canonical_source_facts(&file)
+                    .expect("Scala source facts")
+            });
+            assert_eq!(reads.unattributed_reads(), 0);
+            assert!(
+                reads.keys().iter().any(|key| matches!(
+                    key,
+                    ReadKey::File { rel_path, .. } if rel_path.as_ref() == "A.scala"
+                )),
+                "source read keys: {:?}",
+                reads.keys()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod external_receipt_budget_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#2445: evicted JVM external receipts certified live indexes using new inputs"
+    )]
+    fn live_external_indexes_refuse_after_receipt_eviction() {
+        let project = InlineTestProject::with_language(Language::Scala)
+            .file("App.scala", "class App {}")
+            .file("pom.xml", "<project/>")
+            .build();
+        let config = brokk_bifrost_analysis::analyzer::AnalyzerConfig {
+            memo_cache_budget_bytes: Some(8),
+            ..Default::default()
+        };
+        let analyzer = ScalaAnalyzer::new_with_config(project.project_arc(), config);
+        crate::analyzer::jvm::authority::assert_receipt_loss_refuses_live_index(
+            &analyzer,
+            &analyzer.external_index,
+            &analyzer.external_inputs,
+            || {
+                analyzer.external_declaration_index();
+            },
+        );
     }
 }

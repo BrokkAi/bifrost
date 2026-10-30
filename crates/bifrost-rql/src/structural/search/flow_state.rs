@@ -34,6 +34,7 @@ use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_rql::{FlowRelationFilter, StateEventFilter};
 use std::sync::Arc;
 
@@ -45,13 +46,14 @@ const FLOW_RELATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.flow_relation.v1";
 /// own completeness evidence; policy normalization deduplicates diagnostics.
 pub(super) struct FlowStateTraversalCache {
     /// One immutable activation snapshot for every file this request derives.
-    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    active_semantic_model_snapshot: CaptureScopedMemo<Option<Arc<ActiveSemanticModelSnapshot>>>,
     /// The same snapshot identity carried into every memo key. `None` remains
     /// distinct from the hash of an activated but empty model set.
-    active_model_set_hash: Option<Arc<str>>,
-    files: HashMap<FlowStateCacheKey, CachedFileFlowState>,
+    active_model_set_hash: CaptureScopedMemo<Option<Arc<str>>>,
+    files: CaptureScopedMemo<HashMap<FlowStateCacheKey, CachedFileFlowState>>,
 }
 
+#[derive(Clone)]
 struct CachedFileFlowState {
     /// Retain the exact artifact allocation whose handles the derivation
     /// accepts. `None` marks the standalone acquisition path, which cannot
@@ -144,15 +146,15 @@ impl FlowStateTraversalCache {
             .as_ref()
             .map(|snapshot| Arc::<str>::from(snapshot.active_models().active_model_set_hash()));
         Self {
-            active_semantic_model_snapshot,
-            active_model_set_hash,
-            files: HashMap::default(),
+            active_semantic_model_snapshot: CaptureScopedMemo::new(active_semantic_model_snapshot),
+            active_model_set_hash: CaptureScopedMemo::new(active_model_set_hash),
+            files: CaptureScopedMemo::default(),
         }
     }
 
     /// Release derived rows for a completed artifact-independent file window.
     pub(super) fn release_file_window(&mut self) {
-        self.files.clear();
+        self.files = CaptureScopedMemo::default();
     }
 
     /// Derive (or replay) the flow state of one file.
@@ -170,26 +172,37 @@ impl FlowStateTraversalCache {
     ) -> Arc<FileFlowState> {
         let key = FlowStateCacheKey {
             file: file.clone(),
-            active_model_set_hash: self.active_model_set_hash.clone(),
+            active_model_set_hash: self
+                .active_model_set_hash
+                .read(&memo_attribution(workspace.analyzer()), Clone::clone),
             scope: FlowStateCacheScope::File,
             outcome: FlowStateOutcomeIdentity::Standalone,
         };
-        if let Some(cached) = self.files.get(&key) {
+        if let Some(cached) = self
+            .files
+            .read(&memo_attribution(workspace.analyzer()), |files| {
+                files.get(&key).cloned()
+            })
+        {
             return Arc::clone(&cached.state);
         }
         let derived = Arc::new(flow_state_for_file_with_snapshot(
             workspace,
             file,
             cancellation,
-            self.active_semantic_model_snapshot.clone(),
+            self.active_semantic_model_snapshot
+                .read(&memo_attribution(workspace.analyzer()), Clone::clone),
         ));
-        self.files.insert(
-            key,
-            CachedFileFlowState {
-                artifact: None,
-                state: Arc::clone(&derived),
-            },
-        );
+        self.files
+            .read_mut(&memo_attribution(workspace.analyzer()), |files| {
+                files.insert(
+                    key,
+                    CachedFileFlowState {
+                        artifact: None,
+                        state: Arc::clone(&derived),
+                    },
+                )
+            });
         derived
     }
 
@@ -208,7 +221,6 @@ impl FlowStateTraversalCache {
             workspace.analyzer(),
             file,
             outcome,
-            artifact,
             FlowStateCacheScope::File,
             cancellation,
             |outcome, request| {
@@ -239,7 +251,6 @@ impl FlowStateTraversalCache {
             workspace.analyzer(),
             file,
             outcome,
-            artifact,
             FlowStateCacheScope::Procedure(procedure.id()),
             cancellation,
             |outcome, request| {
@@ -262,8 +273,10 @@ impl FlowStateTraversalCache {
         let state =
             self.for_materialized_procedure(workspace, file, outcome, procedure, cancellation);
         let token = cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token)
-            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
+        let mut request = FlowStateRequest::new(&token).with_active_semantic_model_snapshot(
+            self.active_semantic_model_snapshot
+                .read(&memo_attribution(workspace.analyzer()), Clone::clone),
+        );
         Arc::new(flow_state_for_selected_property(
             workspace,
             file,
@@ -280,7 +293,6 @@ impl FlowStateTraversalCache {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         outcome: SemanticOutcome<Arc<SemanticArtifact>>,
-        artifact: Option<Arc<SemanticArtifact>>,
         scope: FlowStateCacheScope,
         cancellation: Option<&CancellationToken>,
         derive: F,
@@ -291,23 +303,32 @@ impl FlowStateTraversalCache {
             &mut FlowStateRequest<'_>,
         ) -> FileFlowState,
     {
+        let artifact = outcome.available_value().cloned();
         let key = FlowStateCacheKey {
             file: file.clone(),
-            active_model_set_hash: self.active_model_set_hash.clone(),
+            active_model_set_hash: self
+                .active_model_set_hash
+                .read(&memo_attribution(analyzer), Clone::clone),
             scope,
             outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
         };
-        if let (Some(wanted), Some(cached)) = (artifact.as_ref(), self.files.get(&key))
-            && cached
-                .artifact
-                .as_ref()
-                .is_some_and(|retained| Arc::ptr_eq(retained, wanted))
+        if let (Some(wanted), Some(cached)) = (
+            artifact.as_ref(),
+            self.files.read(&memo_attribution(analyzer), |files| {
+                files.get(&key).cloned()
+            }),
+        ) && cached
+            .artifact
+            .as_ref()
+            .is_some_and(|retained| Arc::ptr_eq(retained, wanted))
         {
             return Arc::clone(&cached.state);
         }
         let token = cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token)
-            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
+        let mut request = FlowStateRequest::new(&token).with_active_semantic_model_snapshot(
+            self.active_semantic_model_snapshot
+                .read(&memo_attribution(analyzer), Clone::clone),
+        );
         let derived = Arc::new(derive(outcome, &mut request));
         if request.refusal_count() > 0 {
             brokk_bifrost_core::profiling::note_with(|| {
@@ -319,13 +340,15 @@ impl FlowStateTraversalCache {
             });
             analyzer.mark_execution_dependent();
         }
-        self.files.insert(
-            key,
-            CachedFileFlowState {
-                artifact,
-                state: Arc::clone(&derived),
-            },
-        );
+        self.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(
+                key,
+                CachedFileFlowState {
+                    artifact,
+                    state: Arc::clone(&derived),
+                },
+            )
+        });
         derived
     }
 

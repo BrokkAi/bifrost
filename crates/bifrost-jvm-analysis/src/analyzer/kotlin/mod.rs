@@ -79,7 +79,7 @@ use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
-use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
+mod workspace_facts;
 
 use brokk_bifrost_analysis::analyzer::clone_detection::detect_language_structural_clone_smells;
 
@@ -93,7 +93,6 @@ use crate::analyzer::jvm::external::JvmExternalDeclarations;
 
 use crate::analyzer::jvm::external::jvm_external_qualified_name_exists;
 
-use crate::analyzer::jvm::retained_external_index_state;
 mod call_applicability;
 
 use brokk_bifrost_analysis::analyzer::languages::DeadCodeBulkEdges;
@@ -147,10 +146,6 @@ use crate::analyzer::usages::kotlin_graph::build_kotlin_usage_edge_weights;
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
 
 use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
-
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set;
-
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_vec_by_unit;
 
 use brokk_bifrost_core::analyzer::weighted_cache::weight_project_file_set;
 
@@ -222,14 +217,23 @@ pub struct KotlinAnalyzer {
     /// artifacts. Built lazily because opening jars is expensive and many
     /// workspaces never ask a question that needs it.
     jvm_config: JvmAnalyzerConfig,
-    external_index: Arc<OnceLock<Arc<JvmExternalDeclarationIndex>>>,
+    external_index: Arc<
+        brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+            brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
+                Arc<JvmExternalDeclarationIndex>,
+            >,
+        >,
+    >,
+    external_inputs: crate::analyzer::jvm::hierarchy::DerivedMemo<(), ()>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    imported_code_units:
+        crate::analyzer::jvm::hierarchy::DerivedMemo<ProjectFile, HashSet<CodeUnit>>,
     /// Import and hierarchy answers computed with the whole JVM source realm
     /// in view. Kept apart from the Kotlin-only caches above because they
     /// answer a strictly wider question: serving one for the other would
     /// silently drop, or invent, cross-language results.
-    realm_imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    realm_imported_code_units:
+        crate::analyzer::jvm::hierarchy::DerivedMemo<ProjectFile, HashSet<CodeUnit>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// Coarse import targets projected directly to files. Built before the
@@ -238,9 +242,15 @@ pub struct KotlinAnalyzer {
     file_dependency_index: Arc<OnceLock<imports::KotlinFileDependencyIndex>>,
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    top_level_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    realm_direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    top_level_declarations_by_package: Arc<
+        brokk_bifrost_analysis::analyzer::WorkspaceAuthorityMemo<
+            brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+                Arc<workspace_facts::TopLevelInventory>,
+            >,
+        >,
+    >,
+    direct_ancestors: crate::analyzer::jvm::hierarchy::AncestorMemo,
+    realm_direct_ancestors: crate::analyzer::jvm::hierarchy::AncestorMemo,
     /// `PoolSafeMemo`, not `OnceLock`, for the same reason as the two sibling
     /// index cells above: these whole-workspace builds are reached from rayon
     /// workers during cold scans, and a blocking `get_or_init` parks every one
@@ -270,6 +280,12 @@ impl_forward_query_provider!(KotlinAnalyzer);
 mod hierarchy_tests;
 
 impl KotlinAnalyzer {
+    pub(crate) fn read_capability(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
+        self.inner.read_capability()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn tree_sitter_analyzer_for_test(&self) -> &TreeSitterAnalyzer<KotlinAdapter> {
@@ -284,11 +300,13 @@ impl KotlinAnalyzer {
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
-        Self::from_inner(
-            self.inner.update_all_with_progress(progress),
-            self.memo_budget,
-            self.jvm_config.clone(),
-        )
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            Self::from_inner(
+                self.inner.update_all_with_progress(progress),
+                self.memo_budget,
+                self.jvm_config.clone(),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -368,19 +386,22 @@ impl KotlinAnalyzer {
         Self {
             inner,
             jvm_config,
-            external_index: Arc::new(OnceLock::new()),
+            external_index: Arc::new(brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new()),
+            external_inputs: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
             memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
-            realm_imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
+            imported_code_units: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 8),
+            realm_imported_code_units: crate::analyzer::jvm::hierarchy::derived_memo(
+                memo_budget / 8,
+            ),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             file_dependency_index: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
-            top_level_declarations_by_package: Arc::new(OnceLock::new()),
-            direct_ancestors: build_weighted_cache(memo_budget / 16, weight_code_unit_vec_by_unit),
-            realm_direct_ancestors: build_weighted_cache(
+            top_level_declarations_by_package: Arc::new(brokk_bifrost_analysis::analyzer::WorkspaceAuthorityMemo::new(
+                brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinTopLevelDeclarations, brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new())),
+            direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(memo_budget / 16),
+            realm_direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(
                 memo_budget / 16,
-                weight_code_unit_vec_by_unit,
             ),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             realm_direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
@@ -434,10 +455,15 @@ impl KotlinAnalyzer {
     }
 
     /// Kotlin's view of the shared JVM dependency realm.
-    pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
+    pub(crate) fn external_declaration_index(&self) -> Arc<JvmExternalDeclarationIndex> {
         crate::analyzer::jvm::external::get_or_build_external_declaration_index(
             self,
             &self.external_index,
+            (
+                Language::Kotlin,
+                brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinExternalDeclarations,
+            ),
+            &self.external_inputs,
             &self.jvm_config,
             self.inner.project(),
             self.inner.analyzer_store(),
@@ -676,41 +702,24 @@ impl KotlinSource for KotlinAnalyzer {
             Some(_) => &self.realm_direct_ancestors,
             None => &self.direct_ancestors,
         };
-        if let Some(cached) = cache.get(owner) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
+        crate::analyzer::jvm::hierarchy::memoized_ancestors(cache, self, owner, || {
+            brokk_bifrost_jvm::kotlin::hierarchy::kotlin_resolve_ancestors_from_facts(
                 self,
-                "kotlin.realm_direct_ancestors",
-            );
-        let ancestors = brokk_bifrost_jvm::kotlin::hierarchy::kotlin_resolve_ancestors_from_facts(
-            self,
-            token,
-            owner,
-            raw_supertypes,
-            imports,
-            realm,
-            type_by_fqn,
-        );
-        let cache_key = owner.clone();
-        let cache_value = Arc::new(ancestors.clone());
-        persistent_fill_guard.installed("kotlin.realm_direct_ancestors");
-        cache.insert(cache_key, cache_value);
-        ancestors
+                token,
+                owner,
+                raw_supertypes,
+                imports,
+                realm,
+                type_by_fqn,
+            )
+        })
     }
 
     /// Built once per analyzer generation: a star import has to widen to a
     /// whole package, and repeating that scan per file would be quadratic in
     /// workspace size.
-    fn top_level_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
-        self.top_level_declarations_by_package.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "kotlin.top_level_declarations_by_package",
-                || build_kotlin_top_level_declarations_by_package(self),
-            )
-        })
+    fn top_level_declarations_by_package(&self) -> Arc<HashMap<String, Arc<Vec<CodeUnit>>>> {
+        Arc::clone(&self.top_level_inventory().by_package)
     }
 
     fn external_index_is_empty(&self) -> bool {
@@ -718,14 +727,23 @@ impl KotlinSource for KotlinAnalyzer {
     }
 
     fn external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
-        jvm_external_qualified_name_exists(self.external_declaration_index(), fqn, access_package)
+        jvm_external_qualified_name_exists(&self.external_declaration_index(), fqn, access_package)
     }
 
     fn retained_external_index(&self) -> JvmRetainedExternalIndex {
-        retained_external_index_state(self.external_index.get().map(Arc::as_ref))
+        crate::analyzer::jvm::authority::retained_external_index(
+            self,
+            &self.external_index,
+            &self.external_inputs,
+        )
     }
 
     fn retained_external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
+        crate::analyzer::jvm::authority::external_read(
+            self,
+            &self.external_index,
+            &self.external_inputs,
+        );
         self.external_index.get().is_some_and(|external| {
             jvm_external_qualified_name_exists(external, fqn, access_package)
         })
@@ -1028,28 +1046,22 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        // Every import- and package-derived index is rebuilt from the new
-        // generation: an edit anywhere can add, remove, or rename a
-        // declaration that some other file's import resolves to.
-        let mut updated = Self::from_inner(
-            self.inner.update(changed_files),
-            self.memo_budget,
-            self.jvm_config.clone(),
-        );
-        updated.external_index = brokk_bifrost_analysis::analyzer::updated_external_index(
-            &self.external_index,
-            changed_files,
-            is_jvm_dependency_input,
-        );
-        if Arc::ptr_eq(&self.external_index, &updated.external_index)
-            && self.degraded_persistent_fills() > 0
-        {
-            updated.record_degraded_persistent_fill(
-                "retained_external_index",
-                "inherited_degraded_owner",
+        brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+            // Every import- and package-derived index is rebuilt from the new
+            // generation: an edit anywhere can add, remove, or rename a
+            // declaration that some other file's import resolves to.
+            let mut updated = Self::from_inner(
+                self.inner.update(changed_files),
+                self.memo_budget,
+                self.jvm_config.clone(),
             );
-        }
-        updated
+            updated.external_index = brokk_bifrost_analysis::analyzer::updated_external_index(
+                &self.external_index,
+                changed_files,
+                is_jvm_dependency_input,
+            );
+            updated
+        })
     }
 
     fn update_all(&self) -> Self {
@@ -1360,6 +1372,19 @@ impl DeadCodeBulkProof for KotlinDeadCodeBulk {
         }
         let _scope = AnalyzerQueryScope::with_cancellation(analyzer, &cancellation);
         let kotlin = resolve_analyzer::<KotlinAnalyzer>(analyzer)?;
+        crate::analyzer::jvm::authority::source_read(
+            analyzer,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinDeadCodeEdges,
+        );
+        // A warm inbound graph bypasses resolver reads of the dependency realm
+        // and selected model set. Name them before consulting its bounded cache.
+        crate::analyzer::jvm::authority::external_read(
+            kotlin,
+            &kotlin.external_index,
+            &kotlin.external_inputs,
+        );
+        drop(analyzer.semantic_model_overlay());
+        drop(analyzer.active_semantic_models());
         brokk_bifrost_analysis::analyzer::languages::build_fqn_dead_code_edges(
             analyzer,
             &kotlin.dead_code_usage_edges,
@@ -1400,6 +1425,16 @@ impl KotlinSupport {
 }
 
 impl LanguageSupport for KotlinSupport {
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+        language: Language,
+        subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        workspace_facts::answer(analyzer, family, language, subject)
+    }
+
     fn supports_selected_resolution_overlays(&self) -> bool {
         true
     }
@@ -1800,6 +1835,14 @@ impl LanguageSupport for KotlinSupport {
     }
 }
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for KotlinSupport {
+    fn precedence_rules(
+        &self,
+    ) -> &'static dyn brokk_bifrost_analysis::analyzer::resolution::precedence::PrecedenceRules
+    {
+        use brokk_bifrost_analysis::analyzer::resolution::precedence;
+        precedence::KOTLIN_PRECEDENCE_RULES
+    }
+
     fn root_source_horizon_follows_provenance(&self) -> bool {
         // Local identities stay in their host mount, including nonshared stage
         // allocations. Selected root and JVM bridges cannot classify as Import

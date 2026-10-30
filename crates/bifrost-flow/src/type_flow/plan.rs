@@ -9,6 +9,7 @@
 //! each source id to its class atom and each sink id to its typed site, so the
 //! solver's meetings answer which classes reach that value.
 
+use crate::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -1547,6 +1548,9 @@ pub struct ProcedureRefinements {
 
 #[derive(Debug)]
 struct DerivedRefinement<T> {
+    keys: Option<Arc<[crate::analyzer::ReadKey]>>,
+    unattributed_reads: usize,
+    execution_dependences: usize,
     value: T,
     owner: Arc<()>,
     work: crate::analyzer::semantic::SemanticBudgetReplay,
@@ -1620,9 +1624,29 @@ impl RefinementCensus for HashSet<(ProgramPointId, ValueId)> {
     }
 }
 
+fn refinement_census(
+    value: &impl RefinementCensus,
+    keys: &Option<Arc<[crate::analyzer::ReadKey]>>,
+) -> SemanticWork {
+    let mut heap = RetainedHeap::default();
+    if let Some(keys) = keys {
+        heap.arc(keys, |keys, heap| {
+            for key in keys {
+                retained_read_key(heap, key);
+            }
+        });
+    }
+    let (bytes, entries) = heap.totals();
+    let mut census = value.census();
+    census.owned_text_bytes = census.owned_text_bytes.saturating_add(bytes);
+    census.nested_entries = census.nested_entries.saturating_add(entries);
+    census
+}
+
 /// Answer one refinement from the cache, deriving it on the first request.
 fn reused_or_derived<T: Clone + RefinementCensus>(
     cache: &mut HashMap<StableDigest, DerivedRefinement<T>>,
+    workspace: &WorkspaceAnalyzer,
     identity: StableDigest,
     budget: &mut SemanticBudget,
     cancellation: &CancellationToken,
@@ -1634,7 +1658,19 @@ fn reused_or_derived<T: Clone + RefinementCensus>(
         });
     }
     if let Some(derived) = cache.get(&identity) {
-        debug_assert_eq!(derived.work.retained, derived.value.census());
+        if let Some(keys) = &derived.keys {
+            workspace.analyzer().record_read_receipt(keys);
+        }
+        crate::analyzer::replay_query_read_receipt(
+            workspace.analyzer(),
+            [],
+            derived.unattributed_reads,
+            derived.execution_dependences,
+        );
+        debug_assert_eq!(
+            derived.work.retained,
+            refinement_census(&derived.value, &derived.keys)
+        );
         let already_held = budget.has_replay_holder(&derived.owner);
         let mut replay = derived.work;
         if already_held {
@@ -1656,8 +1692,16 @@ fn reused_or_derived<T: Clone + RefinementCensus>(
         )
     });
     let before = budget.replay_snapshot();
-    let value = budget.with_temporary_admissions(derive)?;
-    let census = value.census();
+    let (value, reads) = crate::analyzer::capture_query_reads(workspace.analyzer(), || {
+        budget.with_temporary_admissions(derive)
+    });
+    let value = value?;
+    let keys = reads.unordered_keys();
+    // Empty receipts must retain no allocation or residency entry.
+    let keys = (!keys.is_empty()).then(|| Arc::from(keys));
+    let unattributed_reads = reads.unattributed_reads();
+    let execution_dependences = reads.execution_dependences();
+    let census = refinement_census(&value, &keys);
     budget.admit(census).map_err(CorrelationError::Budget)?;
     let mut work = budget.replay_since(&before);
     work.retained = census;
@@ -1671,6 +1715,9 @@ fn reused_or_derived<T: Clone + RefinementCensus>(
     cache.insert(
         identity,
         DerivedRefinement {
+            keys,
+            unattributed_reads,
+            execution_dependences,
             value: value.clone(),
             owner,
             work,
@@ -1990,6 +2037,7 @@ impl TypeFlowPlan {
         for procedure in &closure.procedures {
             let bindings = reused_or_derived(
                 &mut refinements.bindings,
+                workspace,
                 procedure_semantics_identity(b"bifrost-type-flow-binding-refinement-v1", procedure)
                     .finish(),
                 semantic_budget,
@@ -2024,6 +2072,7 @@ impl TypeFlowPlan {
                 |(correlation_bindings, data_bindings, open_bindings, correlation_events)| {
                     reused_or_derived(
                         &mut refinements.correlations,
+                        workspace,
                         procedure_semantics_identity(
                             b"bifrost-type-flow-correlations-v1",
                             procedure,
@@ -2074,6 +2123,7 @@ impl TypeFlowPlan {
                     .map(|snapshot| snapshot.value());
                 match reused_or_derived(
                     &mut refinements.fields,
+                    workspace,
                     field_refinement_identity(
                         procedure,
                         local_structure_digests
@@ -2113,6 +2163,7 @@ impl TypeFlowPlan {
             }
             let closed_loads = match reused_or_derived(
                 &mut refinements.closed_loads,
+                workspace,
                 procedure_semantics_identity(b"bifrost-type-flow-closed-loads-v1", procedure)
                     .finish(),
                 semantic_budget,
@@ -2890,7 +2941,8 @@ impl TypeFlowPlan {
                     match alternative.version {
                         FieldVersion::Entry | FieldVersion::Open { .. } => {
                             if let Some(class) = adapter.enclosing_class(workspace, procedure)
-                                && let Some(slot) = field_slots.slot(&class, &field.member)
+                                && let Some(slot) =
+                                    field_slots.slot(workspace, adapter, &class, &field.member)
                             {
                                 budget
                                     .admit(SemanticWork {
@@ -2903,7 +2955,9 @@ impl TypeFlowPlan {
                                         (
                                             atom.clone(),
                                             site.clone(),
-                                            field_slots.atom_is_open_bound(slot, atom_index),
+                                            field_slots.atom_is_open_bound(
+                                                workspace, adapter, slot, atom_index,
+                                            ),
                                         )
                                     },
                                 ));
@@ -3808,13 +3862,13 @@ fn seed_procedure(
                     let modeled_slot = if let Some(field) = refinement
                         && let Some(class) = enclosing_class.as_ref()
                     {
-                        field_slots.slot(class, &field.member)
+                        field_slots.slot(workspace, adapter, class, &field.member)
                     } else if let MemoryLocationKind::Field { base, .. } = &location_row.kind
                         && receiver_values.contains(base)
                         && let Some(class) = enclosing_class.as_ref()
                         && let Some(member) = member.as_deref()
                     {
-                        field_slots.slot(class, member)
+                        field_slots.slot(workspace, adapter, class, member)
                     } else {
                         None
                     };
@@ -3866,7 +3920,8 @@ fn seed_procedure(
                                 carrier.clone(),
                                 atom.clone(),
                                 site.clone(),
-                                field_slots.atom_is_open_bound(slot, atom_index),
+                                field_slots
+                                    .atom_is_open_bound(workspace, adapter, slot, atom_index),
                             );
                         }
                         if refinement.is_some_and(|field| {
@@ -4245,6 +4300,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refinement_hits_replay_inputs_into_later_captures() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Python,
+        )
+        .file("a.py", "pass\n")
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let identity = StableDigest::sha256(b"captured-refinement");
+        let key = test_read(b"refinement-input");
+        let cancellation = CancellationToken::default();
+        let mut cache = HashMap::default();
+        let mut first_budget = SemanticBudget::default();
+        let (first, reads) = crate::analyzer::capture_query_reads(workspace.analyzer(), || {
+            reused_or_derived(
+                &mut cache,
+                &workspace,
+                identity,
+                &mut first_budget,
+                &cancellation,
+                |_| {
+                    workspace.analyzer().record_read(key.clone());
+                    workspace.analyzer().record_unattributed_read();
+                    Ok(TestRefinement(3))
+                },
+            )
+            .expect("derive the refinement")
+        });
+        assert_eq!(first, TestRefinement(3));
+        assert_eq!(reads.keys(), vec![key.clone()]);
+        assert_eq!(reads.unattributed_reads(), 1);
+        let mut later_budget = SemanticBudget::default();
+        let (later, reads) = crate::analyzer::capture_query_reads(workspace.analyzer(), || {
+            reused_or_derived(
+                &mut cache,
+                &workspace,
+                identity,
+                &mut later_budget,
+                &cancellation,
+                |_| panic!("a retained refinement must hit in the later capture"),
+            )
+            .expect("reuse the refinement")
+        });
+        assert_eq!(later, first);
+        assert_eq!(reads.keys(), vec![key]);
+        assert_eq!(reads.unattributed_reads(), 1);
+    }
+
     /// One root solve builds its plan several times. Every build after the
     /// first must reuse the refinement the first build derived, and must not
     /// admit another retained copy (#3163).
@@ -4253,21 +4356,33 @@ mod tests {
         "#2295+#3124+#3129+#3163+#3165+3e81228fb0ab: repeated root-plan construction duplicated procedure refinements, so repeated lookups must retain one derivation."
     )]
     fn repeated_refinement_lookups_hold_one_derivation() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Python,
+        )
+        .file("a.py", "pass\n")
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
         let identity = StableDigest::sha256(b"one-refinement");
         let mut cache = HashMap::default();
         let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
         let cancellation = CancellationToken::default();
         let mut derivations = 0_usize;
         for _ in 0..5 {
-            let value =
-                reused_or_derived(&mut cache, identity, &mut budget, &cancellation, |budget| {
+            let value = reused_or_derived(
+                &mut cache,
+                &workspace,
+                identity,
+                &mut budget,
+                &cancellation,
+                |budget| {
                     derivations += 1;
                     budget
                         .admit(nested(400))
                         .map_err(CorrelationError::Budget)?;
                     Ok(TestRefinement(400))
-                })
-                .expect("the refinement derives and then reuses");
+                },
+            )
+            .expect("the refinement derives and then reuses");
             assert_eq!(value, TestRefinement(400));
         }
         assert_eq!(derivations, 1, "one ledger derives the refinement once");
@@ -4284,6 +4399,12 @@ mod tests {
     #[test]
     #[hardwon("#3163: separate refinement identities must each debit the shared request budget")]
     fn one_ledger_holds_only_one_derivation_of_this_size() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Python,
+        )
+        .file("a.py", "pass\n")
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
         let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
         let cancellation = CancellationToken::default();
         let mut held_caches = Vec::new();
@@ -4294,6 +4415,7 @@ mod tests {
             let mut cache = HashMap::default();
             let outcome = reused_or_derived(
                 &mut cache,
+                &workspace,
                 StableDigest::sha256(label),
                 &mut budget,
                 &cancellation,
@@ -4318,31 +4440,51 @@ mod tests {
     #[test]
     #[hardwon("#5113: a live refinement holder skipped traversal work in a fresh root")]
     fn a_later_root_ledger_reuses_and_pays_for_the_refinement() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Python,
+        )
+        .file("a.py", "pass\n")
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
         let identity = StableDigest::sha256(b"one-refinement");
         let mut cache = HashMap::default();
         let mut first = SemanticBudget::uniform(1_000).expect("a finite budget");
         let cancellation = CancellationToken::default();
-        reused_or_derived(&mut cache, identity, &mut first, &cancellation, |budget| {
-            budget
-                .admit(nested(400))
-                .map_err(CorrelationError::Budget)?;
-            budget.charge_work(SemanticWork {
-                events: 300,
-                ..SemanticWork::default()
-            });
-            Ok(TestRefinement(400))
-        })
+        reused_or_derived(
+            &mut cache,
+            &workspace,
+            identity,
+            &mut first,
+            &cancellation,
+            |budget| {
+                budget
+                    .admit(nested(400))
+                    .map_err(CorrelationError::Budget)?;
+                budget.charge_work(SemanticWork {
+                    events: 300,
+                    ..SemanticWork::default()
+                });
+                Ok(TestRefinement(400))
+            },
+        )
         .expect("the first ledger derives the refinement");
 
         let mut fresh = SemanticBudget::new_root_child(&first);
         let mut derivations = 0_usize;
-        reused_or_derived(&mut cache, identity, &mut fresh, &cancellation, |budget| {
-            derivations += 1;
-            budget
-                .admit(nested(400))
-                .map_err(CorrelationError::Budget)?;
-            Ok(TestRefinement(400))
-        })
+        reused_or_derived(
+            &mut cache,
+            &workspace,
+            identity,
+            &mut fresh,
+            &cancellation,
+            |budget| {
+                derivations += 1;
+                budget
+                    .admit(nested(400))
+                    .map_err(CorrelationError::Budget)?;
+                Ok(TestRefinement(400))
+            },
+        )
         .expect("the fresh ledger reuses the refinement");
         assert_eq!(derivations, 0, "the cached value is reused, not rederived");
         assert_eq!(fresh.resident().nested_entries, 400);
@@ -4356,9 +4498,14 @@ mod tests {
             events: 500,
             ..SemanticWork::default()
         });
-        let replayed = reused_or_derived(&mut cache, identity, &mut fresh, &cancellation, |_| {
-            panic!("the cached refinement must not be rederived")
-        });
+        let replayed = reused_or_derived(
+            &mut cache,
+            &workspace,
+            identity,
+            &mut fresh,
+            &cancellation,
+            |_| panic!("the cached refinement must not be rederived"),
+        );
         assert_eq!(replayed.unwrap(), TestRefinement(400));
         assert_eq!(fresh.root_work_peak().events, 1_100);
         assert_eq!(fresh.resident().nested_entries, 400);

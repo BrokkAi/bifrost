@@ -3,7 +3,10 @@ use super::demand::{
     ClosedForwardSource, ClosedRelations, LanguageContextPreparation, LanguageRootDiscovery,
 };
 use super::demand_closure::{BaseEligibility, ClosureWitness, Read};
-use super::imports::SelectedImportRouteKind;
+use super::imports::{
+    ImportBindingRules, ImportTokenMetadata, authored_reference_local_path_evidence,
+    import_bindings_for_lookup,
+};
 use super::jvm_context::{
     JvmImportContext, JvmImportContextGap, jvm_prefix_defers_member_selection,
 };
@@ -32,185 +35,135 @@ pub(in crate::analyzer) fn jvm_root_import_origin(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// JVM import order is origin rank before lexical depth.
 pub(super) struct JvmBindingPrecedence {
-    // Match shared path precedence: binding origin before lexical depth.
     pub(super) rank: u32,
     depth: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct JvmImportBinding {
-    pub(super) reference: SemanticId,
-    pub(super) token: SemanticId,
-    pub(super) precedence: JvmBindingPrecedence,
-}
+pub(super) type JvmImportBinding = super::imports::ImportBinding<JvmBindingPrecedence>;
 
-impl SelectedResolutionOperation<'_, '_> {
-    /// Internal lowering references publish no authored metadata. Every JVM
-    /// precedence scan must establish the published kind before a lexical read.
-    fn jvm_authored_reference_local_path_evidence(
+pub(super) struct JvmImportBindingRules<'a, 'store, 'input>(
+    &'a SelectedResolutionOperation<'store, 'input>,
+);
+
+impl ImportBindingRules for JvmImportBindingRules<'_, '_, '_> {
+    type Precedence = JvmBindingPrecedence;
+
+    fn token_metadata(
         &self,
-        reference: SemanticId,
+        blob: i64,
+        mount: SelectedResolutionMountOrdinal,
+        token: SemanticId,
         cancellation: &CancellationToken,
-    ) -> Result<Option<crate::analyzer::resolution::ReferenceLocalPathEvidence>> {
-        let lexical = self.ready.lexical_source();
-        let Some(seed) = lexical.reference_seed(ResolutionQuery::new(reference), cancellation)?
-        else {
-            return Ok(None);
-        };
-        if !seed
-            .site_metadata()
-            .is_some_and(|metadata| metadata.site_kind() != ResolutionSiteKind::SyntheticReference)
-        {
-            return Ok(None);
-        }
-        lexical.reference_local_path_evidence(reference, cancellation)
+    ) -> Result<Option<std::sync::Arc<ImportTokenMetadata>>> {
+        self.0
+            .import_token_metadata(blob, mount, token, cancellation)
     }
 
-    /// Match import binders against the existing lexical path evidence. The
-    /// reader already walked these scopes; JVM code only supplies import rules.
-    pub(super) fn jvm_import_bindings_for_lookup(
-        &self,
-        mount: SelectedResolutionMountOrdinal,
-        lookup: &ResolutionLookupSemanticRecipe,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<Vec<JvmImportBinding>>> {
-        let record = self.ready.inventory.mount_record_by_ordinal(mount)?;
-        let connection = self.ready.inventory.connection();
-        let lexical = self.ready.lexical_source();
-        let names = self.ready.shared_names();
-        let lookup_semantic = lookup.semantic(&names);
-        let mut binders = Vec::new();
-        let outcome = crate::analyzer::resolution::visit_selected_root_import_half_pages(
-            &self.ready.context_identities,
-            &lexical,
-            &lexical,
-            Some(&[mount]),
-            cancellation,
-            &mut FactPageVisitor::new(&mut |page| {
-                for half in page {
-                    let SelectedRootPathHalf::Import {
-                        token,
-                        demand,
-                        source_scope_head,
-                        activation,
-                        ..
-                    } = half
-                    else {
-                        continue;
-                    };
-                    // The half's demand is the lookup bound in the importing
-                    // scope, including for wildcard imports. The owner route
-                    // is separate; another demand through that same wildcard
-                    // is not a competing binder for this name or namespace.
-                    if *demand != lookup_semantic {
-                        continue;
-                    }
-                    let Some(metadata) = self.jvm_import_token_metadata(
-                        record.blob_id(),
-                        mount,
-                        *token,
-                        cancellation,
-                    )?
-                    else {
-                        return Ok(false);
-                    };
-                    let selector = &metadata.selector;
-                    let route = &metadata.route;
-                    let wildcard = selector
-                        .as_ref()
-                        .is_some_and(|selector| selector.source_name.is_none())
-                        || route.as_ref().is_some_and(|route| {
-                            matches!(
-                                route.kind,
-                                SelectedImportRouteKind::TypeOnDemand
-                                    | SelectedImportRouteKind::StaticOnDemand
-                            )
-                        });
-                    let origin = jvm_root_import_origin(
-                        record.semantic_language(),
-                        if wildcard {
-                            ResolutionRootImportKind::Glob
-                        } else {
-                            ResolutionRootImportKind::Named
-                        },
-                    );
-                    let rank = binding_origin_rank(record.semantic_language(), origin);
-                    if let Some(rank) = rank {
-                        binders.push((*token, *source_scope_head, *activation, rank));
-                    }
-                }
-                Ok(true)
-            }),
-        )?;
-        if outcome.is_cancelled() || cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        binders.sort_unstable();
-        binders.dedup();
-        // SyntheticReference publishes no site kind or authored metadata.
-        // Only published, lowered sites can enter the lexical metadata reader.
-        let mut statement = connection.prepare_cached(
-            "SELECT DISTINCT semantic.semantic_key
-             FROM main.resolution_identities AS lookup
-             CROSS JOIN main.resolution_paths AS path
-               ON path.blob_id=?1 AND path.end_lead_identity=lookup.id
-             JOIN main.resolution_node_catalog AS node
-               ON node.blob_id=path.blob_id AND node.local_key=path.start_node
-             JOIN main.resolution_semantic_sites AS semantic
-               ON semantic.blob_id=node.blob_id AND semantic.semantic_key=node.semantic_local_key
-              AND semantic.semantic_role='reference'
-             JOIN main.resolution_sites AS authored
-               ON authored.blob_id=semantic.blob_id AND authored.site=semantic.source_site
-              AND authored.site_kind IS NOT NULL
-             WHERE lookup.identity_digest=?2",
-        )?;
-        let references = statement.query_map(
-            rusqlite::params![record.blob_id(), lookup.name_digest().as_slice()],
-            |row| row.get::<_, u32>(0),
-        )?;
-        let mut result = Vec::new();
-        for reference in references {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let reference = SemanticId::local(mount.get(), reference?);
-            let Some(evidence) =
-                self.jvm_authored_reference_local_path_evidence(reference, cancellation)?
-            else {
-                continue;
-            };
-            if !evidence.metadata().unqualified()
-                || !evidence.local_bindings_certified()
-                || !evidence.local_definitions().is_empty()
-            {
-                continue;
-            }
-            for &(token, scope, activation, rank) in &binders {
-                if activation.is_some_and(|start| evidence.metadata().start_byte() < start as usize)
-                {
-                    continue;
-                }
-                if let Some(depth) = evidence
-                    .lexical_scopes()
-                    .iter()
-                    .filter(|(node, _)| *node == scope)
-                    .map(|(_, depth)| *depth)
-                    .min()
-                {
-                    result.push(JvmImportBinding {
-                        reference,
-                        token,
-                        precedence: JvmBindingPrecedence { depth, rank },
-                    });
-                }
-            }
-        }
-        result
-            .sort_unstable_by_key(|binding| (binding.reference, binding.precedence, binding.token));
-        result.dedup_by_key(|binding| (binding.reference, binding.precedence, binding.token));
-        self.profile_jvm_read("import_bound_references", (lookup, &result));
-        Ok(Some(result))
+    fn binder_rank(&self, language: Language, metadata: &ImportTokenMetadata) -> Option<u32> {
+        let wildcard = metadata
+            .selector
+            .as_ref()
+            .is_some_and(|selector| selector.source_name.is_none())
+            || metadata.route.as_ref().is_some_and(|route| {
+                matches!(
+                    route.kind,
+                    super::imports::SelectedImportRouteKind::TypeOnDemand
+                        | super::imports::SelectedImportRouteKind::StaticOnDemand
+                )
+            });
+        let origin = jvm_root_import_origin(
+            language,
+            if wildcard {
+                ResolutionRootImportKind::Glob
+            } else {
+                ResolutionRootImportKind::Named
+            },
+        );
+        binding_origin_rank(language, origin)
+    }
+
+    fn precedence(&self, depth: u32, rank: u32) -> Self::Precedence {
+        JvmBindingPrecedence { rank, depth }
+    }
+}
+
+pub(super) fn jvm_import_bindings_for_lookup(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    mount: SelectedResolutionMountOrdinal,
+    lookup: &ResolutionLookupSemanticRecipe,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<JvmImportBinding>>> {
+    let Some(bindings) = import_bindings_for_lookup(
+        &operation.ready,
+        &JvmImportBindingRules(operation),
+        mount,
+        lookup,
+        cancellation,
+    )?
+    else {
+        return Ok(None);
+    };
+    operation.profile_jvm_read("import_bound_references", (lookup, &bindings));
+    Ok(Some(bindings))
+}
+
+#[cfg(test)]
+mod import_precedence_tests {
+    use super::super::imports::sort_import_bindings;
+    use super::*;
+
+    #[test]
+    fn jvm_import_bindings_order_origin_rank_then_depth_then_token() {
+        let reference = SemanticId::local(0, 1);
+        let named_deep = JvmBindingPrecedence { rank: 1, depth: 8 };
+        let named_shallow = JvmBindingPrecedence { rank: 1, depth: 0 };
+        let wildcard_shallow = JvmBindingPrecedence { rank: 2, depth: 0 };
+        let mut bindings = vec![
+            JvmImportBinding {
+                reference,
+                token: SemanticId::local(0, 9),
+                precedence: named_deep,
+            },
+            JvmImportBinding {
+                reference,
+                token: SemanticId::local(0, 3),
+                precedence: wildcard_shallow,
+            },
+            JvmImportBinding {
+                reference,
+                token: SemanticId::local(0, 5),
+                precedence: named_deep,
+            },
+            JvmImportBinding {
+                reference,
+                token: SemanticId::local(0, 5),
+                precedence: named_deep,
+            },
+            // Same rank, shallower depth: sorts before both deeper bindings
+            // even though its token is larger than one of theirs.
+            JvmImportBinding {
+                reference,
+                token: SemanticId::local(0, 7),
+                precedence: named_shallow,
+            },
+        ];
+
+        sort_import_bindings(&mut bindings);
+
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| (binding.precedence, binding.token))
+                .collect::<Vec<_>>(),
+            [
+                (named_shallow, SemanticId::local(0, 7)),
+                (named_deep, SemanticId::local(0, 5)),
+                (named_deep, SemanticId::local(0, 9)),
+                (wildcard_shallow, SemanticId::local(0, 3)),
+            ]
+        );
     }
 }
 
@@ -380,8 +333,7 @@ impl JvmDemandState<'_, '_, '_> {
             return Ok(Some(bindings.clone()));
         }
         let Some(bindings) =
-            self.operation
-                .jvm_import_bindings_for_lookup(mount, lookup, self.cancellation)?
+            jvm_import_bindings_for_lookup(self.operation, mount, lookup, self.cancellation)?
         else {
             return Ok(None);
         };
@@ -508,7 +460,7 @@ impl JvmDemandState<'_, '_, '_> {
                     .mount_by_ordinal(mount.ordinal())?;
                 if self.family.admits(record.semantic_language()) {
                     let SelectedPackageRows::Ready(references) =
-                        self.operation.selected_package_reference_for_token(
+                        self.operation.ready.selected_package_reference_for_token(
                             mount.ordinal(),
                             token,
                             self.cancellation,
@@ -719,14 +671,17 @@ impl JvmDemandState<'_, '_, '_> {
         for &token in tokens {
             let SelectedPackageRows::Ready(rows) = self
                 .operation
+                .ready
                 .selected_package_reference_for_token(source.mount, token, self.cancellation)?
             else {
                 return Ok(None);
             };
             for row in rows {
-                let Some(evidence) = self
-                    .operation
-                    .jvm_authored_reference_local_path_evidence(row.reference, self.cancellation)?
+                let Some(evidence) = authored_reference_local_path_evidence(
+                    &self.operation.ready,
+                    row.reference,
+                    self.cancellation,
+                )?
                 else {
                     continue;
                 };
@@ -1011,9 +966,11 @@ impl JvmDemandState<'_, '_, '_> {
             return Ok(false);
         }
         let receiver = receivers[0];
-        let Some(local) = self
-            .operation
-            .jvm_authored_reference_local_path_evidence(receiver, self.cancellation)?
+        let Some(local) = authored_reference_local_path_evidence(
+            &self.operation.ready,
+            receiver,
+            self.cancellation,
+        )?
         else {
             return Ok(false);
         };
@@ -1203,6 +1160,7 @@ impl JvmDemandState<'_, '_, '_> {
         for &token in source_tokens {
             let SelectedPackageRows::Ready(rows) = self
                 .operation
+                .ready
                 .selected_package_reference_for_token(mount, token, self.cancellation)?
             else {
                 return Ok(BTreeSet::new());
@@ -1317,7 +1275,7 @@ impl JvmDemandState<'_, '_, '_> {
         ) && local_rank < default_rank
         {
             let SelectedPackageRows::Ready(rows) =
-                self.operation.selected_package_reference_for_token(
+                self.operation.ready.selected_package_reference_for_token(
                     source.mount,
                     source_token,
                     self.cancellation,
@@ -1335,9 +1293,11 @@ impl JvmDemandState<'_, '_, '_> {
                 .map(|row| row.reference)
                 .collect::<BTreeSet<_>>();
             for row in rows {
-                let Some(local) = self
-                    .operation
-                    .jvm_authored_reference_local_path_evidence(row.reference, self.cancellation)?
+                let Some(local) = authored_reference_local_path_evidence(
+                    &self.operation.ready,
+                    row.reference,
+                    self.cancellation,
+                )?
                 else {
                     continue;
                 };
@@ -1495,17 +1455,12 @@ impl JvmDemandState<'_, '_, '_> {
         &mut self,
         endpoint: &EndpointSignature,
     ) -> Result<LanguageRootDiscovery<JvmSourceDemand>> {
-        if endpoint.node() != BindingNodeId::universal_root() {
+        if let Some(retained) = self.arena.borrow().registered_endpoint(endpoint) {
             return Ok(LanguageRootDiscovery::AlreadyReady {
-                completion: ResolutionCompletion::Complete,
+                completion: retained.completion.clone(),
             });
         }
-        if self
-            .arena
-            .borrow()
-            .endpoints
-            .contains_key(&DemandRelationKey::caller(endpoint.clone()))
-        {
+        if endpoint.node() != BindingNodeId::universal_root() {
             return Ok(LanguageRootDiscovery::AlreadyReady {
                 completion: ResolutionCompletion::Complete,
             });
@@ -2456,7 +2411,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
     fn admit_endpoint(
         &mut self,
         endpoint: &EndpointSignature,
-        _: bool,
+        _: Option<&ResolutionCompletion>,
     ) -> Result<Read<super::demand_closure::EndpointAdmission>> {
         use super::demand_closure::{Admission, ContextId, EndpointAdmission, RootFrame};
         self.state

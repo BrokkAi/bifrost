@@ -9,8 +9,7 @@ use rusqlite::params;
 
 use crate::analyzer::ProjectFile;
 use crate::analyzer::store::file_state::FileState;
-use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, ParsedFile, TreeSitterAnalyzer};
-use tree_sitter::Parser;
+use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 #[doc(hidden)]
 pub const WORKSPACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub fn parsed_fixture_state<A: LanguageAdapter>(
@@ -24,21 +23,7 @@ pub fn parsed_fixture_state<A: LanguageAdapter>(
             .join("selected-resolution-context-does-not-touch-disk"),
         relative_path,
     );
-    let mut parser = Parser::new();
-    parser
-        .set_language(&adapter.parser_language_for_file(&file))
-        .expect("configure fixture grammar");
-    let tree = parser.parse(source, None).expect("parse fixture source");
-    let mut parsed: ParsedFile = adapter.parse_file(&file, source, &tree);
-    parsed.add_file_scope(&file, source);
-    let contains_tests = adapter.contains_tests(&file, source, &tree, &parsed);
-    TreeSitterAnalyzer::<A>::file_state_from_parsed(
-        source.to_owned(),
-        parsed,
-        contains_tests,
-        Some(Vec::new()),
-        true,
-    )
+    super::test_support::file_state_from_source(adapter, &file, source)
 }
 #[doc(hidden)]
 pub struct SelectionFixture {

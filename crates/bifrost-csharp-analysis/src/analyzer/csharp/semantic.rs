@@ -149,7 +149,8 @@ fn compound_division_can_throw(context: CSharpCompoundContext) -> bool {
 // change; the code-query tutorial pages elide such ids (#5016).
 // Initializer, event-accessor, arity and parser changes reach the lowerer (v23).
 // Compound assignments and built-in binary result types reach it (v24, #7344, #7345).
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v24";
+// Operator aborts and gaps follow operand evaluation (v27, #8019).
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v27";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -2782,23 +2783,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         source: ValueId,
         target: ValueId,
     ) -> Result<(), CSharpLoweringError> {
-        self.append_effect(
-            builder,
-            point,
-            SemanticEffect::Assignment {
-                target,
-                value: source,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            point,
-            SemanticEffect::ValueFlow {
-                kind,
-                source,
-                target,
-            },
-        )
+        self.session
+            .append_assignment_value_flow(builder, point, kind, source, target)
     }
 
     /// Publish the exact user-defined operator a conversion selects as the
@@ -2821,6 +2807,59 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         target: ValueId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<ProgramPointId, CSharpLoweringError> {
+        self.emit_conversion_call(
+            builder,
+            point,
+            node,
+            scope,
+            CallableTargetResolution::Proven(CallableTarget::Local(operator.procedure)),
+            source,
+            target,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_unknown_conversion(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        node: Node<'tree>,
+        scope: ScopeFrameId,
+        source: ValueId,
+        target: ValueId,
+        alias: ValueFlowKind,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(ProgramPointId, ValueId), CSharpLoweringError> {
+        let converted = self
+            .session
+            .add_node_value(builder, node, SemanticValueKind::Temporary)?;
+        let normal = self.emit_conversion_call(
+            builder,
+            point,
+            node,
+            scope,
+            CallableTargetResolution::Unknown,
+            source,
+            converted,
+            stack,
+        )?;
+        self.emit_assignment_flow(builder, normal, alias, converted, target)?;
+        Ok((normal, converted))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_conversion_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        node: Node<'tree>,
+        scope: ScopeFrameId,
+        resolution: CallableTargetResolution,
+        source: ValueId,
+        target: ValueId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, CSharpLoweringError> {
         let normal = self.session.add_node_point(builder, node, Vec::new())?;
         let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
         let callee = self
@@ -2829,8 +2868,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let thrown = self
             .session
             .add_node_value(builder, node, SemanticValueKind::Exception)?;
-        let resolution =
-            CallableTargetResolution::Proven(CallableTarget::Local(operator.procedure));
         let metadata = self.metadata(point)?;
         self.append_effect(
             builder,
@@ -2846,7 +2883,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             },
         )?;
-        self.session.add_call_site(
+        let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
                 point,
@@ -2861,10 +2898,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 normal_results: Box::new([]),
                 result: Some(target),
                 thrown: Some(thrown),
-                declared_targets: resolution,
+                declared_targets: resolution.clone(),
                 normal_continuation: normal,
                 exceptional_continuation: exceptional,
             },
+        )?;
+        // A proven user-defined operator records nothing here. An unresolved
+        // conversion carries the standard callee and call-site pair, as every
+        // other unresolved call does.
+        self.session.add_callable_resolution_gaps(
+            builder,
+            point,
+            callee,
+            call_site,
+            &resolution,
+            "C# implicit conversion callee is unknown",
+            "C# implicit conversion call target is unknown",
         )?;
         self.session
             .add_target_edge(builder, point, EdgeTarget::normal(normal))?;
@@ -3096,14 +3145,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target,
                     )?;
                 }
-                None => {
+                // A ref initializer binds an alias, not a converted value.
+                None if initializer.kind() == "ref_expression" => {
                     self.session.record_gap(
                         builder,
                         terminals[index],
                         SemanticGapSubject::Value(target),
                         SemanticCapability::Values,
                         SemanticGapKind::Unknown,
-                        "explicitly typed C# local initialization may invoke a user-defined conversion",
+                        "C# ref binding alias identity is not yet lowered",
+                    )?;
+                }
+                None => {
+                    (continuation, _) = self.emit_unknown_conversion(
+                        builder,
+                        terminals[index],
+                        initializers[index].0,
+                        scope,
+                        value,
+                        target,
+                        ValueFlowKind::Local,
+                        stack,
                     )?;
                 }
             }
@@ -3727,8 +3789,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(text) = node_text(self.prepared.source(), node) else {
             return self.expression_value(builder, node, kind);
         };
-        if let Some(value) = self.constant_index_values.get(text).copied() {
-            self.expression_values.insert(node.id(), value);
+        if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
+            &self.constant_index_values,
+            &mut self.expression_values,
+            text,
+            node.id(),
+        ) {
             return Ok(value);
         }
         let value = self.expression_value(builder, node, kind)?;
@@ -4272,6 +4338,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
 
         let mut continuation = terminal;
+        let mut converted = None;
         // A simple name that denotes a member writes `this.name`, exactly as
         // a member access target does. An object initializer's names are
         // handled as initializer members below.
@@ -4345,15 +4412,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     None if preserved => {
                         self.emit_assignment_flow(builder, terminal, alias, value, target)?;
                     }
-                    None => {
+                    // Ref reassignment rebinds storage; it is not an
+                    // unresolved implicit value conversion (#2661).
+                    None if right.kind() == "ref_expression" => {
                         self.session.record_gap(
                             builder,
                             terminal,
                             SemanticGapSubject::Value(target),
                             SemanticCapability::Values,
                             SemanticGapKind::Unknown,
-                            "C# assignment target identity is unavailable until implicit conversion resolution is available",
+                            "C# ref binding alias identity is not yet lowered",
                         )?;
+                    }
+                    None => {
+                        let (normal, value) = self.emit_unknown_conversion(
+                            builder, terminal, node, scope, value, target, alias, stack,
+                        )?;
+                        continuation = normal;
+                        converted = Some(value);
                     }
                 }
             }
@@ -4368,6 +4444,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         value,
                     },
                 )?;
+            } else if let Some(converted) = converted {
+                self.append_effect(
+                    builder,
+                    continuation,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value: converted,
+                    },
+                )?;
             } else {
                 self.session.record_gap(
                     builder,
@@ -4375,7 +4460,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapSubject::Value(result),
                     SemanticCapability::Values,
                     SemanticGapKind::Unknown,
-                    "C# assignment result identity is unavailable until implicit conversion resolution is available",
+                    if right.kind() == "ref_expression" {
+                        "C# ref assignment result alias identity is not yet lowered"
+                    } else {
+                        "C# assignment result identity is unavailable until implicit conversion resolution is available"
+                    },
                 )?;
             }
             vec![right]
@@ -5393,41 +5482,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     alternative,
                     expression_value_kind(self.prepared.source(), alternative),
                 )?;
-                if conditional_branches_have_identity_preserving_construction(
-                    consequence,
-                    alternative,
-                    self.prepared.source(),
-                ) {
-                    self.append_effect(
+                let identity_preserving =
+                    conditional_branches_have_identity_preserving_construction(
+                        consequence,
+                        alternative,
+                        self.prepared.source(),
+                    );
+                for (branch, terminal, value) in [
+                    (consequence, consequence_terminal, consequence_value),
+                    (alternative, alternative_terminal, alternative_value),
+                ] {
+                    self.conditional_branch_result(
                         builder,
-                        consequence_terminal,
-                        SemanticEffect::Assignment {
-                            target: result,
-                            value: consequence_value,
-                        },
-                    )?;
-                    self.append_effect(
-                        builder,
-                        alternative_terminal,
-                        SemanticEffect::Assignment {
-                            target: result,
-                            value: alternative_value,
-                        },
-                    )?;
-                } else {
-                    self.session.record_gap(
-                        builder,
-                        consequence_terminal,
-                        SemanticGapSubject::Value(result),
-                        SemanticCapability::Values,
-                        SemanticGapKind::Unknown,
-                        "C# conditional-expression result identity is unavailable until branch conversions are resolved",
+                        branch,
+                        terminal,
+                        result,
+                        identity_preserving.then_some(value),
+                        next,
+                        scope,
+                        stack,
                     )?;
                 }
-                self.session
-                    .add_target_edge(builder, consequence_terminal, next)?;
-                self.session
-                    .add_target_edge(builder, alternative_terminal, next)?;
                 stack.push(Work::Expression {
                     node: alternative,
                     entry: alternative_entry,
@@ -5817,31 +5892,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "declaration_expression"
             | "sizeof_expression"
             | "typeof_expression" => {
-                if node.kind() == "assignment_expression" || is_update_expression(node) {
+                let assignment_gap =
+                    node.kind() == "assignment_expression" || is_update_expression(node);
+                let can_throw = operation_can_throw_implicitly(node);
+                let invokes = may_invoke_user_code(node);
+                let children = runtime_expression_children(node);
+                if !(assignment_gap || can_throw || invokes) {
+                    // Containers such as argument lists and declarators only
+                    // sequence their children; they have no operation point.
+                    return self
+                        .schedule_expressions(builder, entry, &children, next, scope, stack);
+                }
+                // C# evaluates operands left to right before the operator
+                // applies, so its fault and its user-code call follow them.
+                let operation = self.session.add_node_point(builder, node, Vec::new())?;
+                if assignment_gap {
                     self.session.record_gap(
                         builder,
-                        entry,
+                        operation,
                         SemanticGapSubject::Point,
                         SemanticCapability::Assignments,
                         SemanticGapKind::Unsupported,
                         "compound or increment/decrement assignment flow is not yet lowered",
                     )?;
                 }
-                if operation_can_throw_implicitly(node) {
-                    self.implicit_abort_route(builder, node, entry, scope, stack)?;
+                if can_throw {
+                    self.implicit_abort_route(builder, node, operation, scope, stack)?;
                 }
-                if may_invoke_user_code(node) {
+                if invokes {
                     self.session.record_gap(
                         builder,
-                        entry,
+                        operation,
                         SemanticGapSubject::Point,
                         SemanticCapability::Calls,
                         SemanticGapKind::Unknown,
                         "property, indexer, conversion, or overloaded-operator invocation requires type refinement",
                     )?;
                 }
-                let children = runtime_expression_children(node);
-                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+                self.session.add_target_edge(builder, operation, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(operation),
+                    scope,
+                    stack,
+                )
             }
             kind if is_runtime_leaf(kind) => self.session.add_target_edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry, next),
@@ -6133,6 +6229,44 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope: switch_scope,
         });
         Ok(())
+    }
+
+    /// Complete a selected branch only after its operand has been evaluated.
+    /// An unproven conversion can run user code and throw before the shared
+    /// continuation, even when evaluating the operand itself cannot throw.
+    #[allow(clippy::too_many_arguments)]
+    fn conditional_branch_result(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        branch: Node<'tree>,
+        terminal: ProgramPointId,
+        result: ValueId,
+        identity_value: Option<ValueId>,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        if let Some(value) = identity_value {
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::Assignment {
+                    target: result,
+                    value,
+                },
+            )?;
+        } else {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "C# conditional-expression result identity is unavailable until branch conversions are resolved",
+            )?;
+            self.implicit_abort_route(builder, branch, terminal, scope, stack)?;
+        }
+        self.session.add_target_edge(builder, terminal, next)
     }
 
     fn switch_expression(
@@ -6438,13 +6572,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.session
             .add_target_edge(builder, monitor, EdgeTarget::normal(body_entry))?;
-        let cleanup_destination = if next.kind == ControlEdgeKind::Normal {
-            next.point
-        } else {
-            let relay = self.session.add_node_point(builder, node, Vec::new())?;
-            self.session.add_target_edge(builder, relay, next)?;
-            relay
-        };
+        let cleanup_destination = self.session.cleanup_next_target(builder, node, next)?.point;
         let body_exit = self.session.add_node_point(builder, body, Vec::new())?;
         let normal_route = builder.normal_cleanup_completion(region, cleanup_destination);
         self.route(builder, body_exit, &normal_route, stack)?;
@@ -7121,14 +7249,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
-        let Some(route) =
-            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        let Some((route, abort)) = self.session.prepare_implicit_abort(builder, node, scope)?
         else {
             return Err(CSharpLoweringError::Invalid(
                 "implicit abort has no matching structured continuation".into(),
             ));
         };
-        let abort = self.session.add_node_point(builder, node, Vec::new())?;
         self.session.add_target_edge(
             builder,
             operation,
@@ -8815,8 +8941,8 @@ mod tests {
                 "{expression}"
             );
         }
-        // A floating operand and a `ref` formal keep the assignment gap, which
-        // the lowering records at the enclosing statement's entry.
+        // A floating operand and a `ref` formal keep the assignment gap at
+        // the update operation, after its operand evaluation.
         let gapped = run
             .gaps
             .iter()
@@ -8825,7 +8951,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             gapped,
-            ["d++;", "r++;"].into_iter().collect(),
+            ["d++", "r++"].into_iter().collect(),
             "{:?}",
             run.gaps
         );

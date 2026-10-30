@@ -66,7 +66,8 @@ pub(super) fn execute_plan(
 ) -> PlanExecution {
     let mut continuations = Vec::new();
     let mut current_node_id = node_id;
-    let mut current_terminal_cap = terminal_cap;
+    let caps = plan.terminal_caps(node_id, terminal_cap);
+    let mut current_terminal_cap = caps[node_id.index()];
     let chain_diagnostic_start = diagnostics.len();
 
     loop {
@@ -84,9 +85,9 @@ pub(super) fn execute_plan(
                     dependency_started: profiling.then(Instant::now),
                 });
                 current_node_id = node.dependencies()[0];
-                current_terminal_cap = None;
+                current_terminal_cap = caps[current_node_id.index()];
             }
-            (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { count, .. }) => {
+            (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { .. }) => {
                 let dependency = node.dependencies()[0];
                 continuations.push(UnaryPlanContinuation {
                     node_id: current_node_id,
@@ -95,8 +96,7 @@ pub(super) fn execute_plan(
                     dependency_started: profiling.then(Instant::now),
                 });
                 current_node_id = dependency;
-                current_terminal_cap = (state.source_row_boundary != Some(dependency))
-                    .then_some(count.saturating_add(1));
+                current_terminal_cap = caps[dependency.index()];
             }
             _ => break,
         }
@@ -224,7 +224,7 @@ fn execute_plan_node(
     let mut cache_started = state.cache_profile;
     let mut own_diagnostic_start = diagnostics.len();
 
-    let mut execution = match (physical_operator, logical_operator) {
+    let execution = match (physical_operator, logical_operator) {
         (PhysicalQueryOperator::OccurrenceScan, LogicalQueryOperator::OccurrenceSeed(seed)) => {
             if state
                 .cancellation
@@ -543,7 +543,10 @@ fn execute_plan_node(
                     child.rows,
                     state,
                     limits,
-                    terminal_cap,
+                    plan.logical_node(node_id)
+                        .operator()
+                        .step_output_cap(terminal_cap)
+                        .resolve(limits.max_pipeline_rows),
                     diagnostics,
                     instrumentation.as_mut(),
                 );
@@ -795,7 +798,11 @@ fn execute_plan_node(
                         // the files the first attempt already charged free, so
                         // the rescan resumes at the frontier instead of paying
                         // for the whole branch again.
-                        state.seed_cache.retain(|_, cached| !cached.truncated);
+                        state
+                            .seed_cache
+                            .read_mut(&memo_attribution(state.analyzer), |cache| {
+                                cache.retain(|_, cached| !cached.truncated)
+                            });
                     }
                     for index in 0..branch_attempts.len() {
                         if !branch_attempts[index].starved {
@@ -907,7 +914,7 @@ fn execute_plan_node(
                             rows.iter().all(|row| match &row.value {
                                 PipelineValue::Binding(binding) => state
                                     .environment_cache
-                                    .binding_use_completeness(binding)
+                                    .binding_use_completeness(state.analyzer, binding)
                                     .is_some(),
                                 _ => false,
                             })
@@ -933,7 +940,9 @@ fn execute_plan_node(
                             let before = rows.len();
                             rows.retain(|row| match &row.value {
                                 PipelineValue::Binding(binding) => {
-                                    state.environment_cache.binding_use_completeness(binding)
+                                    state
+                                        .environment_cache
+                                        .binding_use_completeness(state.analyzer, binding)
                                         == Some(true)
                                 }
                                 _ => false,
@@ -1172,24 +1181,6 @@ fn execute_plan_node(
         _ => unreachable!("physical operator must implement its logical query node"),
     };
 
-    if state.source_row_boundary == Some(node_id) {
-        let source_rows = state
-            .scope
-            .source_selection()
-            .expect("a source-row boundary requires source-row selection")
-            .source_rows();
-        execution.rows.retain(|row| {
-            let evidence = detailed_evidence_for_pipeline_value(0, &row.value, None, None);
-            source_rows.iter().any(|source| {
-                source.domain == evidence.domain
-                    && source.key == evidence.key
-                    && source.file == evidence.file
-                    && source.byte_span == evidence.byte_span
-                    && source.identities == evidence.identities
-            })
-        });
-    }
-
     if profiling {
         append_diagnostic_terminations(
             &mut terminations,
@@ -1320,7 +1311,6 @@ pub(super) fn execute_parallel_seed_union(
     let cancellation = state.cancellation;
     let scope = state.scope.clone();
     let scanned_languages = &state.scanned_languages;
-    let source_row_boundary = state.source_row_boundary;
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
     let retained_value_census = state.retained_value_census.clone();
@@ -1344,11 +1334,10 @@ pub(super) fn execute_parallel_seed_union(
                     cancellation,
                     scope: scope.clone(),
                     scanned_languages: scanned_languages.clone(),
-                    source_row_boundary,
                     step_outputs: vec![0; plan.node_count()],
                     receiver_budget_override,
                     budget: base_budget,
-                    seed_cache: HashMap::default(),
+                    seed_cache: CaptureScopedMemo::default(),
                     // Parallel branches dedupe shared per-file charges
                     // through the coordinator ledger, not this one.
                     seed_scan_ledger: SeedScanLedger::default(),
@@ -1416,10 +1405,34 @@ pub(super) fn execute_parallel_seed_union(
                 debug_assert!(branch_state.direct_import_layer.is_none());
                 debug_assert!(branch_state.direct_import_layer_content.is_none());
                 debug_assert!(branch_state.deferred_derived_builds.is_empty());
-                debug_assert!(branch_state.reference_cache.inbound.is_empty());
-                debug_assert!(branch_state.reference_cache.outbound.is_empty());
-                debug_assert!(branch_state.call_cache.incoming.is_empty());
-                debug_assert!(branch_state.call_cache.outgoing.is_empty());
+                debug_assert!(
+                    branch_state
+                        .reference_cache
+                        .inbound
+                        .read(&memo_attribution(branch_state.analyzer), |cache| cache
+                            .is_empty())
+                );
+                debug_assert!(
+                    branch_state
+                        .reference_cache
+                        .outbound
+                        .read(&memo_attribution(branch_state.analyzer), |cache| cache
+                            .is_empty())
+                );
+                debug_assert!(
+                    branch_state
+                        .call_cache
+                        .incoming
+                        .read(&memo_attribution(branch_state.analyzer), |cache| cache
+                            .is_empty())
+                );
+                debug_assert!(
+                    branch_state
+                        .call_cache
+                        .outgoing
+                        .read(&memo_attribution(branch_state.analyzer), |cache| cache
+                            .is_empty())
+                );
                 let (operators, access_path) = branch_state.profile.take().map_or_else(
                     || (Vec::new(), QueryAccessPathProfile::default()),
                     |profile| (profile.operators, profile.access_path),
@@ -1427,7 +1440,9 @@ pub(super) fn execute_parallel_seed_union(
                 ParallelSeedBranchResult {
                     execution,
                     diagnostics: branch_diagnostics,
-                    seed_cache: branch_state.seed_cache,
+                    seed_cache: branch_state
+                        .seed_cache
+                        .read_mut(&memo_attribution(branch_state.analyzer), std::mem::take),
                     cache_profile: branch_state.cache_profile,
                     operators,
                     access_path,
@@ -1469,7 +1484,11 @@ pub(super) fn execute_parallel_seed_union(
 
         for (key, cached) in result.seed_cache {
             assert!(
-                state.seed_cache.insert(key, cached).is_none(),
+                state
+                    .seed_cache
+                    .read_mut(&memo_attribution(state.analyzer), |cache| cache
+                        .insert(key, cached))
+                    .is_none(),
                 "parallel union eligibility requires distinct seed cache keys"
             );
         }

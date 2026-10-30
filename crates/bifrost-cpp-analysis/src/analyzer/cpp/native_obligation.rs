@@ -226,7 +226,13 @@ impl<'a> CppNativeProof<'a> {
         let type_node = unwrap_type_descriptor(return_type);
         let roots = HashSet::from_iter([target.source().clone()]);
         let graph = CppGraphSource::from_source(self.cpp, self.token);
-        let visibility = VisibilityIndex::build(self.cpp, self.token, &graph, &roots);
+        let visibility = VisibilityIndex::build(
+            self.cpp.read_capability(),
+            self.cpp,
+            self.token,
+            &graph,
+            &roots,
+        );
         let imports = initialized_ordinary_type_imports(
             prepared.tree().root_node(),
             &graph,

@@ -1292,6 +1292,22 @@ fn function_type_shape(
     remaining: &mut usize,
     cancellation: Option<&CancellationToken>,
 ) -> Result<GoFunctionTypeShape, GoDeclaredTypeUnknown> {
+    let (parameters, results) =
+        function_parameter_result_shapes(file, node, remaining, cancellation)?;
+    Ok(GoFunctionTypeShape {
+        function_type: type_node_location(file, node),
+        parameters,
+        results,
+        declaration_chain: chain.to_vec(),
+    })
+}
+
+fn function_parameter_result_shapes(
+    file: &str,
+    node: Node<'_>,
+    remaining: &mut usize,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<GoFunctionParameterShape>, Vec<GoFunctionParameterShape>), GoDeclaredTypeUnknown> {
     let parameters = node
         .child_by_field_name("parameters")
         .ok_or(GoDeclaredTypeUnknown::InvalidAstShape)?;
@@ -1307,12 +1323,7 @@ fn function_type_shape(
         }],
         None => Vec::new(),
     };
-    Ok(GoFunctionTypeShape {
-        function_type: type_node_location(file, node),
-        parameters,
-        results,
-        declaration_chain: chain.to_vec(),
-    })
+    Ok((parameters, results))
 }
 
 fn function_literal_signature_shape(
@@ -1352,21 +1363,8 @@ fn callable_signature_shape(
         return function_literal_signature_shape(file, node, chain, max_nodes, cancellation);
     }
     let mut remaining = max_nodes;
-    let parameters = node
-        .child_by_field_name("parameters")
-        .ok_or(GoDeclaredTypeUnknown::InvalidAstShape)?;
-    let parameters = function_parameter_shapes(file, parameters, &mut remaining, cancellation)?;
-    let results = match node.child_by_field_name("result") {
-        Some(result) if result.kind() == "parameter_list" => {
-            function_parameter_shapes(file, result, &mut remaining, cancellation)?
-        }
-        Some(result) => vec![GoFunctionParameterShape {
-            type_node: type_node_location(file, result),
-            variadic: false,
-            arity: 1,
-        }],
-        None => Vec::new(),
-    };
+    let (parameters, results) =
+        function_parameter_result_shapes(file, node, &mut remaining, cancellation)?;
     let signature_end = node
         .child_by_field_name("body")
         .map_or(node.end_byte(), |body| body.start_byte());

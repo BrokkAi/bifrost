@@ -61,6 +61,9 @@ use tree_sitter::Node;
 /// different filtering, ordering, fallback or index -- are recorded on the
 /// methods themselves.
 pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
+    /// Read attribution tied to this source's exact generation and query registry.
+    fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability;
+
     // --- bounded declaration lookups ---
 
     /// Declarations the persisted store records under `fqn`, keyed exactly or,
@@ -298,7 +301,7 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// directives, sorted and deduplicated, memoized whole. Names rather than
     /// resolved units: a reachability proof cannot treat an unresolvable name
     /// as an absent one.
-    fn global_static_using_type_names(&self) -> &[String];
+    fn global_static_using_type_names(&self) -> std::sync::Arc<Vec<String>>;
 
     /// [`Self::global_static_using_type_names`] under a budget. It fills the
     /// same memo cell when the batch completes.
@@ -309,19 +312,19 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     ) -> LimitedQueryRows<String>;
 
     /// Those `global using static` targets resolved against the persisted
-    /// store, memoized whole. Borrowed out of the memo cell, so it has no
-    /// budgeted form: there is nothing to cap once the cell is filled.
-    fn global_static_using_types(&self) -> &[CodeUnit];
+    /// store, memoized whole. Completed values share an owned handle; a failed
+    /// build returns its local handle without populating the memo.
+    fn global_static_using_types(&self) -> std::sync::Arc<Vec<CodeUnit>>;
 
     /// [`Self::global_static_using_types`] resolved against the
     /// usage-definition index instead of the persisted store. Two cells because
     /// the index differs, not the walk.
-    fn usage_global_static_using_types(&self) -> &[CodeUnit];
+    fn usage_global_static_using_types(&self) -> std::sync::Arc<Vec<CodeUnit>>;
 
     /// The normalized namespaces of every `global using` directive in the
-    /// workspace, memoized whole. Borrowed out of the memo cell, so it cannot
-    /// be expressed as a default over the budgeted spelling below.
-    fn global_using_namespaces(&self) -> &HashSet<String>;
+    /// workspace, memoized whole. Completed values share an owned handle; a
+    /// failed build remains local to the caller.
+    fn global_using_namespaces(&self) -> std::sync::Arc<HashSet<String>>;
 
     /// [`file_using_namespaces`] with whatever per-file memo the
     /// implementation keeps (#2679). The visible-type search asks this once
@@ -353,7 +356,7 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// Alias to target for every `global using X = Y;` in the workspace,
     /// memoized whole. Borrowed out of the memo cell, so it cannot be expressed
     /// as a default over the budgeted spelling below.
-    fn global_using_aliases(&self) -> &HashMap<String, String>;
+    fn global_using_aliases(&self) -> std::sync::Arc<HashMap<String, String>>;
 
     /// [`Self::global_using_aliases`] under a budget, as pairs, from one
     /// store-wide import walk. It fills the same memo cell when the batch
@@ -708,7 +711,7 @@ pub fn compute_using_namespaces_of(
         .iter()
         .filter_map(csharp_using_namespace)
         .collect();
-    for namespace in source.global_using_namespaces() {
+    for namespace in source.global_using_namespaces().iter() {
         if !namespaces.contains(namespace) {
             namespaces.push(namespace.clone());
         }
@@ -901,7 +904,7 @@ impl CSharpReachabilityFacts {
             .iter()
             .filter_map(csharp_using_alias_from_import)
             .collect();
-        for (alias, target) in source.global_using_aliases() {
+        for (alias, target) in source.global_using_aliases().iter() {
             aliases
                 .entry(alias.clone())
                 .or_insert_with(|| target.clone());
@@ -1109,7 +1112,7 @@ pub fn compute_using_aliases_of(
         .iter()
         .filter_map(csharp_using_alias_from_import)
         .collect();
-    for (alias, target) in source.global_using_aliases() {
+    for (alias, target) in source.global_using_aliases().iter() {
         aliases
             .entry(alias.clone())
             .or_insert_with(|| target.clone());

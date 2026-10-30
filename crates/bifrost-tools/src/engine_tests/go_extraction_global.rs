@@ -1392,7 +1392,7 @@ mod go_extraction_tests_global {
 
         use brokk_bifrost_test_macros::hardwon;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: native_query_plan_go_support :: go_global_support_4 :: registry ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: tests :: native_query_plan_tests :: shared_support :: registry ;
 
         #[test]
         #[hardwon("#5658: Go alias summaries materialized occurrence arenas for unrelated blobs")]
@@ -1515,6 +1515,7 @@ mod go_extraction_tests_global {
                 .unwrap()
                 .unwrap();
             let SelectedPackageRows::Ready(ordinary) = operation
+                .ready
                 .selected_package_members_by_lookup(mount.ordinal(), &cancellation)
                 .unwrap()
             else {
@@ -1578,6 +1579,7 @@ mod go_extraction_tests_global {
         .unwrap();
 
             let SelectedPackageRows::Ready(grouped) = operation
+                .ready
                 .selected_package_members_by_lookup(mount.ordinal(), &cancellation)
                 .unwrap()
             else {
@@ -1587,6 +1589,7 @@ mod go_extraction_tests_global {
             let mut oracle = BTreeSet::new();
             for lookup in lookups {
                 let SelectedPackageRows::Ready(members) = operation
+                    .ready
                     .selected_package_members_for_lookup(mount.ordinal(), lookup, &cancellation)
                     .unwrap()
                 else {

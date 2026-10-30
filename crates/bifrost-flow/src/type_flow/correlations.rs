@@ -1657,7 +1657,6 @@ struct DefinitionTable {
     entry_point: ProgramPointId,
     data_records: Vec<DefinitionRecord>,
     data_lookup: HashMap<DefinitionRecord, usize>,
-    boolean_records: HashMap<BooleanDefinition, BooleanDefinition>,
     uninitialized_data: HashSet<usize>,
     unknown_data: HashSet<usize>,
 }
@@ -1793,7 +1792,6 @@ impl DefinitionTable {
     }
 
     fn intern_boolean(&mut self, definition: BooleanDefinition) -> BooleanDefinition {
-        self.boolean_records.insert(definition, definition);
         definition
     }
 

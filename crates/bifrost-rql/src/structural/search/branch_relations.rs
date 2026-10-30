@@ -21,6 +21,7 @@ use crate::analyzer::usages::get_definition::{
     resolve_definition_batch_with_source_and_cancellation,
 };
 use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
 use brokk_bifrost_rql::{BranchRelationFilter, BranchRelationKind};
@@ -30,10 +31,12 @@ const MAX_BRANCH_SOURCE_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct BranchRelationTraversalCache {
-    syntax: HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
-    regions: HashMap<ProjectFile, ConditionalRegions>,
-    reference_proofs: HashMap<ProjectFile, BranchReferenceProofs>,
-    scalar: HashMap<ProcedureHandle, Result<ScalarConditionDerivation, ScalarConditionGap>>,
+    syntax: CaptureScopedMemo<HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>>,
+    reference_proofs: CaptureScopedMemo<HashMap<ProjectFile, Arc<BranchReferenceProofs>>>,
+    scalar: CaptureScopedMemo<
+        HashMap<ProcedureHandle, Result<Arc<ScalarConditionDerivation>, ScalarConditionGap>>,
+    >,
+    regions: CaptureScopedMemo<HashMap<ProjectFile, ConditionalRegions>>,
     reported: HashSet<(ProjectFile, &'static str, &'static str)>,
 }
 
@@ -283,7 +286,9 @@ pub(super) fn branch_relation_expansions(
         );
     }
 
-    if !cache.syntax.contains_key(&seed.file) {
+    if !cache.syntax.read(&memo_attribution(analyzer), |syntax| {
+        syntax.contains_key(&seed.file)
+    }) {
         let outcome = analyzer
             .structural_fact_providers()
             .into_iter()
@@ -295,9 +300,20 @@ pub(super) fn branch_relation_expansions(
                     cancellation,
                 )
             });
-        cache.syntax.insert(seed.file.clone(), outcome);
+        cache
+            .syntax
+            .read_mut(&memo_attribution(analyzer), |syntax| {
+                syntax.insert(seed.file.clone(), Arc::new(outcome))
+            });
     }
-    let (syntax, failure) = match cache.syntax.get(&seed.file).expect("syntax was cached") {
+    let (syntax, failure) = match cache
+        .syntax
+        .read(&memo_attribution(analyzer), |syntax| {
+            syntax.get(&seed.file).cloned()
+        })
+        .expect("syntax was cached")
+        .as_ref()
+    {
         StructuralSyntaxLimitedOutcome::Available(syntax) => {
             let actual = ContentIdentity::from_digest(StableDigest::from_array(
                 syntax.prepared().source_sha256(),
@@ -370,27 +386,54 @@ pub(super) fn branch_relation_expansions(
                 relation,
                 BranchRelationKind::IdenticalBodies | BranchRelationKind::RepeatedCondition
             )
-        }) && !cache.reference_proofs.contains_key(&seed.file)
+        }) && !cache
+            .reference_proofs
+            .read(&memo_attribution(analyzer), |proofs| {
+                proofs.contains_key(&seed.file)
+            })
         {
-            let proofs = resolve_branch_references(
-                analyzer,
-                seed,
-                &syntax,
-                &env,
-                &mut cache.syntax,
-                cancellation,
-            );
-            cache.reference_proofs.insert(seed.file.clone(), proofs);
+            let proofs = cache
+                .syntax
+                .read_mut(&memo_attribution(analyzer), |syntax_cache| {
+                    resolve_branch_references(
+                        analyzer,
+                        seed,
+                        &syntax,
+                        &env,
+                        syntax_cache,
+                        cancellation,
+                    )
+                });
+            cache
+                .reference_proofs
+                .read_mut(&memo_attribution(analyzer), |cache| {
+                    cache.insert(seed.file.clone(), Arc::new(proofs))
+                });
         }
-        let empty = BranchReferenceProofs::default();
-        let members = cache.reference_proofs.get(&seed.file).unwrap_or(&empty);
-        let regions = cache.regions.entry(seed.file.clone()).or_insert_with(|| {
-            brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
-                .expect("branch language is registered")
-                .structural_spec()
-                .conditional_regions(syntax.tree().root_node(), syntax.source())
-        });
-        branch_relations::relations_for_if(&syntax, seed.language, owner, &env, members, regions)
+        let members = cache
+            .reference_proofs
+            .read(&memo_attribution(analyzer), |proofs| {
+                proofs.get(&seed.file).cloned()
+            })
+            .unwrap_or_default();
+        cache
+            .regions
+            .read_mut(&memo_attribution(analyzer), |regions| {
+                let regions = regions.entry(seed.file.clone()).or_insert_with(|| {
+                    brokk_bifrost_analysis::analyzer::languages::language_knowledge(seed.language)
+                        .expect("branch language is registered")
+                        .structural_spec()
+                        .conditional_regions(syntax.tree().root_node(), syntax.source())
+                });
+                branch_relations::relations_for_if(
+                    &syntax,
+                    seed.language,
+                    owner,
+                    &env,
+                    &members,
+                    regions,
+                )
+            })
     } else {
         Vec::new()
     };
@@ -540,9 +583,14 @@ fn scalar_outcomes_for_procedure(
     procedure: &SemanticProcedureValue,
     syntax: &Arc<PreparedSyntaxTree>,
     cancellation: &CancellationToken,
-) -> Result<ScalarConditionDerivation, ScalarConditionGap> {
-    if let Some(outcomes) = cache.scalar.get(&procedure.handle) {
-        return outcomes.clone();
+) -> Result<Arc<ScalarConditionDerivation>, ScalarConditionGap> {
+    if let Some(outcomes) = cache
+        .scalar
+        .read(&memo_attribution(workspace.analyzer()), |scalar| {
+            scalar.get(&procedure.handle).cloned()
+        })
+    {
+        return outcomes;
     }
     let reference_calls = semantic.reference_receiver_calls(file, &procedure.handle);
     let outcomes = scalar_condition_outcomes(
@@ -552,10 +600,13 @@ fn scalar_outcomes_for_procedure(
         Arc::clone(syntax),
         cancellation,
         &reference_calls,
-    );
+    )
+    .map(Arc::new);
     cache
         .scalar
-        .insert(procedure.handle.clone(), outcomes.clone());
+        .read_mut(&memo_attribution(workspace.analyzer()), |scalar| {
+            scalar.insert(procedure.handle.clone(), outcomes.clone())
+        });
     outcomes
 }
 
@@ -700,7 +751,7 @@ fn resolve_branch_references(
     seed: &SeedMatch,
     syntax: &PreparedSyntaxTree,
     env: &super::super::lexical_environment::EnvironmentFileResult,
-    syntax_cache: &mut HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
+    syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
     cancellation: Option<&CancellationToken>,
 ) -> BranchReferenceProofs {
     let mut proofs = BranchReferenceProofs::default();
@@ -791,7 +842,7 @@ fn branch_storage_field(
     support: &dyn crate::analyzer::languages::LanguageSupport,
     spec: &branch_relations::BranchCurrentObjectFields,
     target: &CodeUnit,
-    syntax_cache: &mut HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
+    syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<BranchStorageField> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -803,15 +854,17 @@ fn branch_storage_field(
     }
     let file = target.source();
     let syntax = syntax_cache.entry(file.clone()).or_insert_with(|| {
-        analyzer
-            .structural_fact_providers()
-            .into_iter()
-            .find(|provider| provider.structural_language() == support.knowledge().language())
-            .map_or(StructuralSyntaxLimitedOutcome::Unavailable, |provider| {
-                provider.structural_syntax_limited(file, MAX_BRANCH_SOURCE_BYTES, cancellation)
-            })
+        Arc::new(
+            analyzer
+                .structural_fact_providers()
+                .into_iter()
+                .find(|provider| provider.structural_language() == support.knowledge().language())
+                .map_or(StructuralSyntaxLimitedOutcome::Unavailable, |provider| {
+                    provider.structural_syntax_limited(file, MAX_BRANCH_SOURCE_BYTES, cancellation)
+                }),
+        )
     });
-    let StructuralSyntaxLimitedOutcome::Available(syntax) = syntax else {
+    let StructuralSyntaxLimitedOutcome::Available(syntax) = syntax.as_ref() else {
         return None;
     };
     let syntax = syntax.prepared();
@@ -988,16 +1041,21 @@ fn scalar_condition_expansions(
     let reference_calls = semantic.reference_receiver_calls(&seed.file, &procedure.handle);
     let outcome = cache
         .scalar
-        .entry(procedure.handle.clone())
-        .or_insert_with(|| {
-            scalar_condition_outcomes(
-                workspace,
-                &seed.file,
-                &procedure.handle,
-                Arc::clone(syntax),
-                cancellation.unwrap_or(&uncancelled),
-                &reference_calls,
-            )
+        .read_mut(&memo_attribution(workspace.analyzer()), |scalar| {
+            scalar
+                .entry(procedure.handle.clone())
+                .or_insert_with(|| {
+                    scalar_condition_outcomes(
+                        workspace,
+                        &seed.file,
+                        &procedure.handle,
+                        Arc::clone(syntax),
+                        cancellation.unwrap_or(&uncancelled),
+                        &reference_calls,
+                    )
+                    .map(Arc::new)
+                })
+                .clone()
         });
     let verdicts = conditions
         .into_iter()
@@ -1011,7 +1069,7 @@ fn scalar_condition_expansions(
                     .named_child(0)
                     .expect("one named expression child");
             }
-            let verdict = match outcome {
+            let verdict = match &outcome {
                 Err(gap) => Ok(ScalarConditionVerdict::Open(*gap)),
                 Ok(derivation) => {
                     let outcomes = &derivation.outcomes;
@@ -1076,7 +1134,7 @@ fn scalar_condition_expansions(
             (ordinal, range, verdict)
         })
         .collect::<Vec<_>>();
-    let related = match outcome {
+    let related = match &outcome {
         Ok(derivation) => Some((&derivation.procedure_gaps, &derivation.producer_gaps)),
         Err(_) => None,
     };

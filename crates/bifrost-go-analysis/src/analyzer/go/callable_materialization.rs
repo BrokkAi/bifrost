@@ -942,15 +942,7 @@ fn go_factory_publication_matches(
     factory: &brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol,
     shard: &brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActiveSemanticModelShard,
 ) -> bool {
-    let provenance = &factory.provenance;
-    provenance.pack_digest == shard.manifest.semantic_sha256
-        && provenance.pack_id == shard.manifest.pack_id
-        && provenance.pack_version == shard.manifest.version
-        && provenance.activation.source_id == shard.source_id
-        && provenance.activation.matched_evidence
-            == brokk_bifrost_analysis::analyzer::semantic_model::matched_evidence(
-                &shard.matched_evidence,
-            )
+    brokk_bifrost_analysis::analyzer::semantic_model::callable_publication_matches(shard, factory)
 }
 
 fn go_factory_location_matches(

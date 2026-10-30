@@ -22,8 +22,20 @@ fn check_composition_cancellation(
 }
 
 use crate::analyzer::semantic_model::{
-    ActivatedSemanticModelRecord, CompiledProcedureSummary, ProcedureSummaryMemberKey,
+    ActivatedSemanticModelRecord, CompiledProcedureSummary, ModelProvider,
+    ProcedureSummaryMemberKey, SemanticModelProvenance,
 };
+
+fn admits_defining_owner(
+    defining: Option<&SemanticModelProvenance>,
+    provider: &ModelProvider,
+    extraction: Option<&crate::analyzer::semantic_model::ArtifactExtraction>,
+) -> bool {
+    defining.is_none_or(|defining| {
+        (defining.extraction.is_some() && extraction.is_none())
+            || ModelProvider::from(defining) == *provider
+    })
+}
 
 /// Reads outside one alias group. The decoded and catalog implementations
 /// apply the same selection rules before returning records.
@@ -32,7 +44,12 @@ pub trait CompositionReads {
         &self,
         id: &str,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>>;
-    fn types_with_id(&self, id: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>>;
+    fn types_with_id(&self, id: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
+        Ok(crate::analyzer::store::active_models::resolve_records(
+            self.all_type_records_with_id(id)?,
+        )
+        .records)
+    }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>>;
     fn all_member_records_with_id(
         &self,
@@ -41,7 +58,12 @@ pub trait CompositionReads {
     fn members_with_id(
         &self,
         id: &str,
-    ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>>;
+    ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
+        Ok(crate::analyzer::store::active_models::resolve_records(
+            self.all_member_records_with_id(id)?,
+        )
+        .records)
+    }
     fn procedure_summaries_for_member(
         &self,
         key: ProcedureSummaryMemberKey<'_>,
@@ -92,12 +114,6 @@ impl CompositionReads for DecodedCompositionReads<'_> {
             .filter(|r| r.shard.manifest.language == self.language)
             .collect())
     }
-    fn types_with_id(&self, id: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(crate::analyzer::store::active_models::resolve_records(
-            self.all_type_records_with_id(id)?,
-        )
-        .records)
-    }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
         if let Some(rows) = &self.rows {
             return rows.types_named(name);
@@ -122,15 +138,6 @@ impl CompositionReads for DecodedCompositionReads<'_> {
             .all_member_records_with_id(id)
             .filter(|r| r.shard.manifest.language == self.language)
             .collect())
-    }
-    fn members_with_id(
-        &self,
-        id: &str,
-    ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
-        Ok(crate::analyzer::store::active_models::resolve_records(
-            self.all_member_records_with_id(id)?,
-        )
-        .records)
     }
     fn procedure_summaries_for_member(
         &self,

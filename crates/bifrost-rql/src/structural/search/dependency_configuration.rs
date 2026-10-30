@@ -99,7 +99,10 @@ pub(super) fn execute_dependency_configuration(
             gaps.push(format!("{path}: {reason}"));
             reasons.push(ConfigurationIncompleteReason::MissingInclude);
         }
-        let Some(mut document) = state.configuration_cache.ingested_document(path) else {
+        let Some(mut document) = state
+            .configuration_cache
+            .ingested_document(state.analyzer, path)
+        else {
             continue;
         };
         version_hash.push(path.as_bytes());

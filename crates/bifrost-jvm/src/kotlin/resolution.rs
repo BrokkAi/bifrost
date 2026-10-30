@@ -586,6 +586,7 @@ impl<'source, 'collector, 'declarations>
         self.finish_package_references();
         self.finish_scope_wide_activations();
         self.finish_applied_type_arguments();
+        crate::implicit_supertype::publish_written_supertype_names(&mut self.facts);
         assert_eq!(
             self.site_occurrences.len(),
             self.facts.sites.len(),
@@ -1464,6 +1465,8 @@ impl<'source, 'collector, 'declarations>
             .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()));
         if let Some(target_node) = target_node {
             let target = self.ensure_type_slot(target_node, context.scope, context.declaration);
+            let reference = self.facts.type_slots[target.index()].site;
+            crate::implicit_supertype::publish_alias_supertype_name(&mut self.facts, reference);
             let identity = self.add_type_identity(site);
             self.type_identity_slots.insert(site, identity);
             self.facts.type_transfers.push(ResolutionTypeTransferFact {

@@ -27,6 +27,11 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub trait RubySource: CodeUnitIndex + TypeHierarchyProvider + ImportAnalysisProvider {
+    /// Probe one structurally selected load candidate, including absent paths.
+    fn required_file_exists(&self, file: &ProjectFile) -> bool {
+        file.exists()
+    }
+
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
     fn all_files(&self) -> Vec<ProjectFile>;
 
@@ -36,7 +41,9 @@ pub trait RubySource: CodeUnitIndex + TypeHierarchyProvider + ImportAnalysisProv
 
     /// Workspace-wide `autoload :Const, "path"` edges, keyed by the `$`-joined
     /// constant name. Built by [`crate::imports::build_autoload_constant_files`].
-    fn autoload_constant_files(&self) -> Option<&HashMap<String, HashSet<ProjectFile>>>;
+    fn autoload_constant_files(
+        &self,
+    ) -> Option<std::sync::Arc<HashMap<String, HashSet<ProjectFile>>>>;
 
     /// Complete canonical load syntax; None means unavailable and must not be
     /// cached as an empty set or reconstructed from source bytes.
@@ -49,11 +56,11 @@ pub trait RubySource: CodeUnitIndex + TypeHierarchyProvider + ImportAnalysisProv
     /// [`crate::imports::detect_zeitwerk_autoload_conventions`].
     fn has_zeitwerk_autoload_conventions(&self) -> bool;
 
-    fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile>;
+    fn zeitwerk_autoload_files(&self) -> std::sync::Arc<HashSet<ProjectFile>>;
 
-    fn zeitwerk_consumer_files(&self) -> &HashSet<ProjectFile>;
+    fn zeitwerk_consumer_files(&self) -> std::sync::Arc<HashSet<ProjectFile>>;
 
-    fn zeitwerk_autoload_code_units(&self) -> &HashSet<CodeUnit>;
+    fn zeitwerk_autoload_code_units(&self) -> std::sync::Arc<HashSet<CodeUnit>>;
 
     /// `required_files` inverted over the whole workspace, memoized through the
     /// analyzer's `PoolSafeMemo`.
@@ -61,14 +68,14 @@ pub trait RubySource: CodeUnitIndex + TypeHierarchyProvider + ImportAnalysisProv
 
     /// The resolved `include`/`prepend`/`extend` graph. Built by
     /// [`crate::mixins::ruby_collect_mixin_relations`].
-    fn mixin_relations(&self) -> &[TypeRelation];
+    fn mixin_relations(&self) -> std::sync::Arc<Vec<TypeRelation>>;
 
     /// Built by [`build_ruby_semantic_facts`].
-    fn semantic_facts(&self) -> &RubySemanticFacts;
+    fn semantic_facts(&self) -> std::sync::Arc<RubySemanticFacts>;
 
     /// Class/module declarations indexed by trailing identifier. Built by
     /// [`crate::hierarchy::build_ruby_types_by_identifier`].
-    fn types_by_identifier(&self) -> &HashMap<String, Vec<CodeUnit>>;
+    fn types_by_identifier(&self) -> std::sync::Arc<HashMap<String, Vec<CodeUnit>>>;
 
     /// The persisted per-method dispatch mode, defaulting to `Instance`.
     fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode;
@@ -106,7 +113,7 @@ pub fn build_ruby_semantic_facts(ruby: &dyn RubySource) -> RubySemanticFacts {
         ancestors.insert(unit.fq_name(), direct);
     }
 
-    for relation in ruby.mixin_relations() {
+    for relation in ruby.mixin_relations().iter() {
         let entry = match relation.kind {
             TypeRelationKind::MixinInclude => &mut mixin_included_owners,
             TypeRelationKind::MixinPrepend => &mut mixin_prepended_owners,

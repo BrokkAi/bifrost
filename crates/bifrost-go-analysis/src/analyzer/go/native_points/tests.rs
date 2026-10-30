@@ -94,18 +94,19 @@ fn site(source: &str) -> ResolvedReferenceSite {
 
 fn site_for(source: &str, identifier: &str) -> ResolvedReferenceSite {
     let start_byte = source.rfind(identifier).unwrap();
-    ResolvedReferenceSite {
-        path: CALLER.into(),
-        text: identifier.into(),
-        range: Range {
-            start_byte,
-            end_byte: start_byte + identifier.len(),
-            start_line: 0,
-            end_line: 0,
-        },
-        focus_start_byte: start_byte,
-        focus_end_byte: start_byte + identifier.len(),
-    }
+    let range = Range {
+        start_byte,
+        end_byte: start_byte + identifier.len(),
+        start_line: 0,
+        end_line: 0,
+    };
+    brokk_bifrost_analysis::analyzer::usages::common::build_reference_site(
+        CALLER.into(),
+        identifier.into(),
+        range,
+        start_byte,
+        start_byte + identifier.len(),
+    )
 }
 
 fn selector_field_start(source: &str, name: &str, ordinal: usize) -> usize {
@@ -941,9 +942,7 @@ func (p *Pool) use() { p.once.Do(func() {}) }
         .build();
     let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
-    let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
-    let _overlay_scope =
-        brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::with_semantic_model_overlay(analyzer, Some(overlay));
+    let _catalog = activate_receiver_models_for_test(analyzer);
     let file = fixture.file(CALLER);
     let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source)
         .expect("parse imported external receiver field call");
@@ -1107,9 +1106,7 @@ fn go_native_point_binds_model_backed_import_without_discovery() {
         .build();
     let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
-    let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
-    let _overlay_scope =
-        brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::with_semantic_model_overlay(analyzer, Some(overlay));
+    let _catalog = activate_receiver_models_for_test(analyzer);
     let file = fixture.file(CALLER);
     let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source)
         .expect("parse model-backed Go import");
@@ -1166,9 +1163,7 @@ func caller(file *os.File) {
         .build();
     let analyzer = GoAnalyzer::new(fixture.project_dyn());
     crate::analyzer::go::persist_live_go_sources_for_test(&analyzer);
-    let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
-    let _overlay_scope =
-        brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::with_semantic_model_overlay(&analyzer, Some(overlay));
+    let _catalog = activate_receiver_models_for_test(&analyzer);
     let file = fixture.file(CALLER);
     let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source)
         .expect("parse modeled os receiver call");
@@ -1190,6 +1185,8 @@ func caller(file *os.File) {
                 ExactExternalCallProof::call_application,
             );
             GoNativeDefinitionResolution {
+                native_resolution: None,
+                model_member_selection: None,
                 outcome: value.0,
                 call_application,
                 exact_external_call: value.1,
@@ -1218,14 +1215,15 @@ func caller(file *os.File) {
 #[test]
 #[hardwon("#3790: live Go discovery failures must surface as setup failures")]
 fn go_native_external_receiver_calls_use_typed_imported_models() {
-    // The imported standard-library models come from live Go dependency
-    // discovery, which spawns the host Go toolchain.
+    // Live Go discovery proves the environment; a small activated synthetic
+    // pack supplies deterministic selected receiver declarations.
     if !go_toolchain_available() {
         return;
     }
     let source = r#"package consumer
 
 import (
+    "bytes"
 	"image"
 	"os"
 	"strings"
@@ -1240,6 +1238,19 @@ func use() {
 
 	var file *os.File
 	_ = file.Close()
+}
+
+func pair() ([]byte, error) { return nil, nil }
+func argumentShapes(args []byte) {
+    var spreadBuffer bytes.Buffer
+    spreadBuffer.Write(args...)
+    var unknownBuffer bytes.Buffer
+    unknownBuffer.Write(missing())
+    var pairBuffer bytes.Buffer
+    pairBuffer.Write(pair())
+}
+func variadicReceiver(variadicBuffer ...bytes.Buffer) {
+    variadicBuffer.Write(nil)
 }
 
 func useUnknown[T interface{ Release() error }](receiver T) {
@@ -1286,9 +1297,34 @@ func useUnknown[T interface{ Release() error }](receiver T) {
     let file = fixture.file(CALLER);
     let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source)
         .expect("parse external receiver calls");
-    let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
-    let _overlay_scope =
-        brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::with_semantic_model_overlay(analyzer, Some(overlay));
+    let _catalog = activate_receiver_models_for_test(analyzer);
+    // GoTool confirms these packages; selected model packs declare their types.
+    // Keep that provenance intact while minting through the native request.
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go delegate");
+    let GoNativePointRequestOpen::Ready(mut request) =
+        GoNativePointRequest::open(go, analyzer.semantic_model_overlay(), &cancellation).unwrap()
+    else {
+        panic!("native Go request")
+    };
+    let context = request
+        .file_context(CALLER, &cancellation)
+        .unwrap()
+        .expect("selected file");
+    for import in ["image", "os", "strings"] {
+        assert!(
+            context
+                .selected_imports
+                .iter()
+                .any(|selected| selected.import_path == import
+                    && matches!(
+                        selected.provenance,
+                        GoExternalPackageProvenance::GoTool { .. }
+                    )),
+            "{import}: {:?}",
+            context.selected_imports
+        );
+    }
+    drop(request);
     let resolve_at = |selector: &str| {
         let selector_start = source
             .find(selector)
@@ -1340,6 +1376,22 @@ func useUnknown[T interface{ Release() error }](receiver T) {
         ("file.Close", "os.File.Close"),
     ] {
         let resolution = resolve_at(selector);
+        assert!(
+            resolution
+                .model_member_selection
+                .as_ref()
+                .is_some_and(
+                    |selection| selection
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.selected
+                            && format!(
+                                "{}.{}",
+                                candidate.owner.owner_fqn, candidate.declaration.name
+                            ) == expected)
+                ),
+            "{selector} must select a real model owner on the GoTool-bound path"
+        );
         assert_eq!(
             resolution.outcome.status,
             DefinitionLookupStatus::UnresolvableImportBoundary,
@@ -1374,6 +1426,23 @@ func useUnknown[T interface{ Release() error }](receiver T) {
         unknown.exact_external_call.is_none(),
         "unknown receiver has no exact model proof"
     );
+    for selector in [
+        "spreadBuffer.Write",
+        "unknownBuffer.Write",
+        "variadicBuffer.Write",
+    ] {
+        let resolution = resolve_at(selector);
+        assert!(
+            resolution.exact_external_call.is_none(),
+            "{selector}: {resolution:?}"
+        );
+    }
+    let pair = resolve_at("pairBuffer.Write");
+    let proof = pair
+        .exact_external_call
+        .expect("known sole-call tuple has a receiver candidate");
+    assert_eq!(proof.canonical_callee(), "bytes.Buffer.Write");
+    assert_eq!(proof.parameter_count, 2);
 }
 
 #[test]

@@ -355,7 +355,7 @@ pub(super) fn render_pipeline_item(
             value: Box::new(dependency_evidence::public_row(&value)),
         },
         PipelineValue::ConfigurationFact(value) => CodeQueryResultValue::ConfigurationFact {
-            value: Box::new(render_configuration_fact(&value, cache)),
+            value: Box::new(render_configuration_fact(analyzer, &value, cache)),
         },
         PipelineValue::CrossDomain(value) => CodeQueryResultValue::CrossDomain {
             value: Box::new(render_cross_domain(analyzer, *value, detail, cache)),
@@ -794,7 +794,9 @@ pub(super) fn render_trace_value_ref(
             id: value.row.id(),
             path: rel_path_string(value.file()),
         },
-        PipelineTraceValue::ConfigurationFact(value) => render_configuration_fact_ref(value, cache),
+        PipelineTraceValue::ConfigurationFact(value) => {
+            render_configuration_fact_ref(analyzer, value, cache)
+        }
         PipelineTraceValue::CrossDomain(value) => {
             let row = render_cross_domain(analyzer, (**value).clone(), detail, cache);
             CodeQueryResultRef::CrossDomain {
@@ -2047,10 +2049,11 @@ pub(super) fn render_qualified_path_ref(
 }
 
 pub(super) fn render_configuration_fact_ref(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &ConfigurationFactValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
-    let range = render_configuration_fact_range(value, cache);
+    let range = render_configuration_fact_range(analyzer, value, cache);
     CodeQueryResultRef::ConfigurationFact {
         id: value.id(),
         fact_id: value.fact_id(),
@@ -2093,7 +2096,7 @@ pub(super) fn render_cross_domain(
             configuration_contributors = value
                 .contributors
                 .iter()
-                .map(|fact| render_configuration_fact(fact, cache))
+                .map(|fact| render_configuration_fact(analyzer, fact, cache))
                 .collect();
             {
                 let binding = value
@@ -2134,11 +2137,13 @@ pub(super) fn render_cross_domain(
             0,
             code,
             None,
-            pipeline_export_binding_range(code, cache),
+            pipeline_export_binding_range(analyzer, code, cache),
         );
         let span = evidence.byte_span?;
         cache
-            .coordinates_for(&evidence.file, || analyzer.indexed_source(&evidence.file))
+            .coordinates_for(analyzer, &evidence.file, || {
+                analyzer.indexed_source(&evidence.file)
+            })
             .map(|coordinates| {
                 range_for_offsets(
                     &coordinates.source,
@@ -2156,7 +2161,7 @@ pub(super) fn render_cross_domain(
         render_trace_value_ref(analyzer, &value, detail, cache)
     });
     let configuration = configuration
-        .map(|configuration| Box::new(render_configuration_fact(&configuration, cache)));
+        .map(|configuration| Box::new(render_configuration_fact(analyzer, &configuration, cache)));
     let range = match (&code_range, &configuration) {
         (Some(range), _) => *range,
         (None, Some(configuration)) => Some(configuration.range),
@@ -2187,12 +2192,13 @@ pub(super) fn render_cross_domain(
 }
 
 pub(super) fn render_configuration_fact(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &ConfigurationFactValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryConfigurationFact {
     let fact = value.fact();
     let evidence = fact.evidence();
-    let range = render_configuration_fact_range(value, cache);
+    let range = render_configuration_fact_range(analyzer, value, cache);
     let format = value.format();
     let (role, key, occurrence) = match fact.kind() {
         ConfigurationNodeKind::Member { role, key, .. } => {
@@ -2264,11 +2270,12 @@ pub(super) fn render_configuration_fact(
 }
 
 fn render_configuration_fact_range(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     value: &ConfigurationFactValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryRange {
     let evidence = value.fact().evidence();
-    match cache.coordinates_for(&value.file, || Some(value.source.to_string())) {
+    match cache.coordinates_for(analyzer, &value.file, || Some(value.source.to_string())) {
         Some(coordinates) => range_for_offsets(
             &coordinates.source,
             &coordinates.line_starts,
@@ -2859,7 +2866,7 @@ pub(super) fn render_expression_site(
     };
     let file = &site.call_site.0.file;
     let text = cache
-        .coordinates_for(file, || analyzer.indexed_source(file))
+        .coordinates_for(analyzer, file, || analyzer.indexed_source(file))
         .and_then(|coordinates| {
             coordinates
                 .source
@@ -3176,7 +3183,7 @@ pub(super) fn render_runtime_keyed_read_value(
     let endpoint = value.endpoint.as_ref();
     let range = endpoint.map_or(value.range, |endpoint| endpoint.expression);
     let text = cache
-        .source_snapshot(&value.file)
+        .source_snapshot(analyzer, &value.file)
         .and_then(|source| source.get(range.start_byte..range.end_byte))
         .map(snippet)
         .unwrap_or_default();
@@ -3975,8 +3982,9 @@ fn absent_member_receiver_text(
     cache: &mut PipelineRenderCache,
 ) -> Option<String> {
     const MAX_RECEIVER_TEXT_BYTES: usize = 80;
-    let coordinates =
-        cache.coordinates_for(&value.file, || analyzer.indexed_source(&value.file))?;
+    let coordinates = cache.coordinates_for(analyzer, &value.file, || {
+        analyzer.indexed_source(&value.file)
+    })?;
     let text = coordinates
         .source
         .get(value.range.start_byte..value.range.end_byte)?;
@@ -4439,7 +4447,7 @@ pub(super) fn render_source_range(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryRange {
     cache
-        .coordinates_for(file, || analyzer.indexed_source(file))
+        .coordinates_for(analyzer, file, || analyzer.indexed_source(file))
         .map(|coordinates| {
             range_for_offsets(
                 &coordinates.source,

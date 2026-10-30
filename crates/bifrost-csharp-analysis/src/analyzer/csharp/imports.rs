@@ -5,6 +5,8 @@
 //! import index and the implicit same-namespace reference index stay here
 //! because they read the analyzer's own cells.
 
+use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
+
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
@@ -61,104 +63,109 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
     }
 
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
-            return cached;
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-csharp-analysis/src/analyzer/csharp/imports.rs",
-            );
-        let namespaces = self.using_namespaces_of(token, file);
-        let aliases = self.using_aliases_of(token, file);
-        if namespaces.is_empty() && aliases.is_empty() {
-            return Arc::new(HashSet::default());
-        }
-        let mut imported: HashSet<CodeUnit> = HashSet::default();
-        for namespace in &namespaces {
-            imported.extend(
-                self.inner
-                    .class_declarations_in_package(namespace)
-                    .iter()
-                    .cloned(),
-            );
-        }
-        for target in aliases.values() {
-            imported.extend(visible_type_candidates(self, token, file, target));
-        }
-        let imported = Arc::new(imported);
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::clone(&imported);
-            persistent_fill_guard.installed("imported_code_units");
-            self.memo_caches
-                .imported_code_units
-                .insert(cache_key, cache_value);
-        };
-        imported
+        self.memo_caches.imported_code_units.read(
+            &memo_attribution(self),
+            |imported_code_units_memo| {
+                let scope = AnalyzerQueryScope::new(self);
+                let token = scope.token();
+                if let Some(cached) = imported_code_units_memo.get(file) {
+                    return cached;
+                }
+                let cache_fill =
+                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                let namespaces = self.using_namespaces_of(token, file);
+                let aliases = self.using_aliases_of(token, file);
+                if namespaces.is_empty() && aliases.is_empty() {
+                    return Arc::new(HashSet::default());
+                }
+                let mut imported: HashSet<CodeUnit> = HashSet::default();
+                for namespace in &namespaces {
+                    imported.extend(
+                        self.inner
+                            .class_declarations_in_package(namespace)
+                            .iter()
+                            .cloned(),
+                    );
+                }
+                for target in aliases.values() {
+                    imported.extend(visible_type_candidates(self, token, file, target));
+                }
+                let imported = Arc::new(imported);
+                if cache_fill.is_complete() {
+                    imported_code_units_memo.insert(file.clone(), Arc::clone(&imported));
+                }
+                imported
+            },
+            |_| self.compilation_authority_inputs(),
+        )
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        if let Some(cached) = self.memo_caches.referencing_files.get(file) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-csharp-analysis/src/analyzer/csharp/imports.rs",
-            );
-        let target_classes = self
-            .declarations(file)
-            .into_iter()
-            .filter(|unit| unit.kind() == CodeUnitType::Class)
-            .collect::<Vec<_>>();
-        let target_namespaces: HashSet<String> = target_classes
-            .iter()
-            .map(|unit| unit.package_name().to_string())
-            .collect();
-        if target_namespaces.is_empty() {
-            return HashSet::default();
-        }
-        let reverse_index =
-            brokk_bifrost_core::analyzer::capabilities::memoized_reverse_import_index(
-                &self.memo_caches.reverse_import_index,
-                || {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "csharp.reverse_file_index",
-                        || self.inner.all_files(),
-                    )
-                },
-                |candidate| {
-                    brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                        self,
-                        "csharp.reverse_file_index",
-                        || self.imported_code_units_of(candidate),
-                    )
-                },
-            );
-        let mut result = reverse_index
-            .get(file)
-            .map(|files| (**files).clone())
-            .unwrap_or_default();
+        self.memo_caches.referencing_files.read(
+            &memo_attribution(self),
+            |referencing_files_memo| {
+                self.memo_caches.reverse_import_index.read(
+                    &memo_attribution(self),
+                    |reverse_import_index_memo| {
+                        let scope = AnalyzerQueryScope::new(self);
+                        let token = scope.token();
+                        if let Some(cached) = referencing_files_memo.get(file) {
+                            return (*cached).clone();
+                        }
+                        let cache_fill =
+                            brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                        let target_classes = self
+                            .declarations(file)
+                            .into_iter()
+                            .filter(|unit| unit.kind() == CodeUnitType::Class)
+                            .collect::<Vec<_>>();
+                        let target_namespaces: HashSet<String> = target_classes
+                            .iter()
+                            .map(|unit| unit.package_name().to_string())
+                            .collect();
+                        if target_namespaces.is_empty() {
+                            return HashSet::default();
+                        }
+                        let parallel = || {
+                            brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                                &self.inner.all_files(),
+                                |candidate| self.imported_code_units_of(candidate),
+                                true,
+                            )
+                        };
+                        let serial = || {
+                            brokk_bifrost_core::analyzer::capabilities::build_reverse_import_index(
+                                &self.inner.all_files(),
+                                |candidate| self.imported_code_units_of(candidate),
+                                false,
+                            )
+                        };
+                        let reverse_index =
+                            brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
+                                self,
+                                reverse_import_index_memo,
+                                parallel,
+                                serial,
+                            );
+                        let mut result = reverse_index
+                            .get(file)
+                            .map(|files| (**files).clone())
+                            .unwrap_or_default();
 
-        if let Some(files) = self.implicit_reference_index(token).get(file) {
-            result.extend(files.iter().cloned());
-        }
+                        if let Some(files) = self.implicit_reference_index(token).get(file) {
+                            result.extend(files.iter().cloned());
+                        }
 
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::new(result.clone());
-            persistent_fill_guard.installed("referencing_files");
-            self.memo_caches
-                .referencing_files
-                .insert(cache_key, cache_value);
-        };
-        result
+                        if cache_fill.is_complete() {
+                            referencing_files_memo.insert(file.clone(), Arc::new(result.clone()));
+                        }
+                        result
+                    },
+                    |_| self.compilation_authority_inputs(),
+                )
+            },
+            |_| self.compilation_authority_inputs(),
+        )
     }
 
     fn import_info_of(
@@ -306,12 +313,12 @@ impl CSharpAnalyzer {
         &self,
     ) -> Arc<HashMap<ProjectFile, brokk_bifrost_csharp::graph_support::CSharpReachabilityFacts>>
     {
-        self.memo_caches
-            .reachability
-            .get_or_build_on_dedicated_pool(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.memo_caches.reachability.read(
+            &memo_attribution(self),
+            |reachability_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_on_dedicated_pool(
                     self,
-                    "csharp.reachability",
+                    reachability_memo,
                     || {
                         let scope = AnalyzerQueryScope::new(self);
                         let files = self.inner.all_files();
@@ -330,20 +337,22 @@ impl CSharpAnalyzer {
                             .into_iter()
                             .map(|file| {
                                 let facts =
-                            brokk_bifrost_csharp::graph_support::CSharpReachabilityFacts::build(
-                                self,
-                                scope.token(),
-                                &file,
-                                declarations.remove(&file).unwrap_or_default(),
-                                identifiers.remove(&file),
-                                imports.get(&file).map(Vec::as_slice).unwrap_or_default(),
-                            );
+                                brokk_bifrost_csharp::graph_support::CSharpReachabilityFacts::build(
+                                    self,
+                                    scope.token(),
+                                    &file,
+                                    declarations.remove(&file).unwrap_or_default(),
+                                    identifiers.remove(&file),
+                                    imports.get(&file).map(Vec::as_slice).unwrap_or_default(),
+                                );
                                 (file, facts)
                             })
                             .collect()
                     },
                 )
-            })
+            },
+            |_| AuthorityInputs::SourceOf(&[brokk_bifrost_core::analyzer::model::Language::CSharp]),
+        )
     }
 
     pub(crate) fn referencing_candidate_files(
@@ -379,12 +388,12 @@ impl CSharpAnalyzer {
     }
 
     fn file_dependencies_by_namespace(&self) -> Arc<HashMap<String, Arc<Vec<ProjectFile>>>> {
-        self.memo_caches
-            .file_dependencies_by_namespace
-            .get_or_build_on_dedicated_pool(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.memo_caches.file_dependencies_by_namespace.read(
+            &memo_attribution(self),
+            |file_dependencies_by_namespace_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_on_dedicated_pool(
                     self,
-                    "csharp.file_dependencies_by_namespace",
+                    file_dependencies_by_namespace_memo,
                     || {
                         let mut grouped: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
                         for unit in self
@@ -407,28 +416,26 @@ impl CSharpAnalyzer {
                             .collect()
                     },
                 )
-            })
+            },
+            |_| AuthorityInputs::SourceOf(&[brokk_bifrost_core::analyzer::model::Language::CSharp]),
+        )
     }
 
     fn implicit_reference_index(
         &self,
         token: QueryToken<'_>,
     ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.memo_caches.implicit_reference_index.get_or_build(
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.memo_caches.implicit_reference_index.read(
+            &memo_attribution(self),
+            |implicit_reference_index_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_pool(
                     self,
-                    "csharp.implicit_reference_index",
+                    implicit_reference_index_memo,
                     || compute_implicit_reference_index(self, token, true),
-                )
-            },
-            || {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                    self,
-                    "csharp.implicit_reference_index",
                     || compute_implicit_reference_index(self, token, false),
                 )
             },
+            |_| AuthorityInputs::SourceOf(&[brokk_bifrost_core::analyzer::model::Language::CSharp]),
         )
     }
 }

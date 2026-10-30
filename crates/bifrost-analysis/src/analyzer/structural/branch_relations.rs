@@ -3534,20 +3534,13 @@ pub mod js_ts_tests_support;
 mod tests {
     use super::*;
     use std::path::Path;
-    use tree_sitter::{Parser, Tree};
+    use tree_sitter::Tree;
 
+    #[track_caller]
     fn parse(source: &str, language: Language, path: &str) -> Tree {
         let grammar = crate::analyzer::parser_language_for_path(language, Path::new(path))
             .expect("registered grammar");
-        let mut parser = Parser::new();
-        parser.set_language(&grammar).unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        assert!(
-            !tree.root_node().has_error(),
-            "{}",
-            tree.root_node().to_sexp()
-        );
-        tree
+        crate::test_support::parse_valid_fixture_tree(source, grammar, "")
     }
 
     fn environment(source: &str, root: Node<'_>, names: &[Node<'_>]) -> EnvironmentFileResult {

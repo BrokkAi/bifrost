@@ -742,9 +742,16 @@ fn apply_conversion_proofs(report: &mut CallBindingReport, proofs: Vec<IndexedCo
 }
 
 /// One indexed source/tree per file, scoped to the caller's query snapshot.
-#[derive(Default)]
 pub struct CallConversionCache {
-    sources: HashMap<ProjectFile, Option<Arc<ConversionSource>>>,
+    sources: super::common::QueryReadMemo<ProjectFile, Option<Arc<ConversionSource>>>,
+}
+
+impl Default for CallConversionCache {
+    fn default() -> Self {
+        Self {
+            sources: super::common::query_read_memo(),
+        }
+    }
 }
 
 impl CallConversionCache {
@@ -753,14 +760,12 @@ impl CallConversionCache {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Option<Arc<ConversionSource>> {
-        self.sources
-            .entry(file.clone())
-            .or_insert_with(|| {
-                let source = analyzer.indexed_source(file)?;
-                let tree = parse_tree_for_language(file, language_for_file(file), &source)?;
-                Some(Arc::new(ConversionSource { source, tree }))
-            })
-            .clone()
+        let value = super::common::query_memo_value(&self.sources, analyzer, file, || {
+            let source = analyzer.indexed_source(file)?;
+            let tree = parse_tree_for_language(file, language_for_file(file), &source)?;
+            Some(Arc::new(ConversionSource { source, tree }))
+        });
+        (*value).clone()
     }
 
     /// Resolve conversion typing for a selected source signature and project

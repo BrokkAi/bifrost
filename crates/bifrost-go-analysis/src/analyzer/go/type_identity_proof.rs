@@ -218,7 +218,7 @@ fn go_target_declaration_node<'tree>(root: Node<'tree>, ranges: Vec<Range>) -> O
     exact.or_else(|| enclosing.map(|(_, node)| node))
 }
 
-fn go_result_type_node(declaration: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
+pub(crate) fn go_result_type_node(declaration: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
     let result = declaration.child_by_field_name("result")?;
     if result.kind() != "parameter_list" {
         return (ordinal == 0).then_some(result);

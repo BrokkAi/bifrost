@@ -1320,3 +1320,29 @@ fn declaration_attributes_and_expression_roles_have_editor_support() {
         );
     }
 }
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "642720bc5ee9: valid call traversal completeness produced authoring errors"
+)]
+fn call_traversal_completeness_has_source_validation_and_help() {
+    for (form, completeness) in [
+        ("callers", "exhaustive"),
+        ("callers", "proven-subset"),
+        ("callees", "exhaustive"),
+    ] {
+        let source = format!(
+            "({form} :proof proven :completeness {completeness} (enclosing-decl (function)))"
+        );
+        CodeQuery::from_sexp(&source).expect("supported call traversal");
+        assert!(
+            validate_query_source(&source).is_empty(),
+            "{source}: {:?}",
+            validate_query_source(&source)
+        );
+        let help = query_source_help_at(&source, source.find(":completeness").unwrap())
+            .expect("completeness help");
+        assert_eq!(help.signature, ":completeness exhaustive|proven-subset");
+        assert_eq!(help.description, QueryStepField::Completeness.description());
+    }
+}

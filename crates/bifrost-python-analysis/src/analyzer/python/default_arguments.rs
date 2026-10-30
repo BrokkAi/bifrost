@@ -30,6 +30,8 @@ use brokk_bifrost_python::syntax::python_plain_string_literal;
 use tree_sitter::Node;
 
 mod escapes;
+#[cfg(test)]
+mod saved_default_facts;
 
 /// Keep parsing, binding discovery, and the AST walk bounded for very large
 /// workspaces. An incomplete scan never authorizes an implicit default.
@@ -50,6 +52,9 @@ pub(crate) fn saved_default_argument_safety(
         let mut safety = SavedDefaultArgumentSafety::default();
         safety.mark_workspace_open(SavedDefaultKind::Positional);
         safety.mark_workspace_open(SavedDefaultKind::KeywordOnly);
+        safety
+            .finalize_fact_fingerprint(|_| None)
+            .expect("open survey has no function identities");
         safety
     })
 }
@@ -109,7 +114,103 @@ fn scan_workspace(
             }
         }
     }
+    // Identity projection is independently bounded. It must not consume the
+    // completed safety survey's budget and change its availability answers.
+    let mut identity_nodes = MAX_METADATA_SCAN_NODES;
+    let mut identity_source_bytes = MAX_METADATA_SCAN_SOURCE_BYTES;
+    finalize_fact_fingerprint(
+        analyzer,
+        token,
+        &mut safety,
+        &mut identity_nodes,
+        &mut identity_source_bytes,
+    )?;
     Some(safety)
+}
+
+/// Resolve only the bounded unsafe-function set. These maps live for this
+/// survey, and the memo retains only the resulting scalar digest.
+fn finalize_fact_fingerprint(
+    analyzer: &PythonAnalyzer,
+    token: QueryToken<'_>,
+    safety: &mut SavedDefaultArgumentSafety,
+    remaining_nodes: &mut usize,
+    remaining_source_bytes: &mut usize,
+) -> Option<()> {
+    use brokk_bifrost_analysis::analyzer::canonical_hash::CanonicalHasher;
+    use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
+    let wanted = safety
+        .open_functions()
+        .cloned()
+        .collect::<brokk_bifrost_core::hash::HashSet<_>>();
+    let paths = wanted
+        .iter()
+        .map(|function| function.path())
+        .collect::<brokk_bifrost_core::hash::HashSet<_>>();
+    let mut identities = HashMap::default();
+    if !wanted.is_empty() {
+        for file in analyzer.analyzed_files() {
+            let path =
+                brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::try_from_path(
+                    file.rel_path(),
+                )
+                .ok()?;
+            if !paths.contains(&path) {
+                continue;
+            }
+            let (_, prepared) = analyzer
+                .inner
+                .prepared_syntax_limited(
+                    token,
+                    &file,
+                    (*remaining_source_bytes).min(MAX_METADATA_SCAN_FILE_BYTES),
+                )
+                .ok()??;
+            *remaining_source_bytes =
+                remaining_source_bytes.checked_sub(prepared.source().len())?;
+            let mut root = CanonicalHasher::new(b"bifrost-python-saved-default-declaration/v1");
+            root.value(path.as_str().as_bytes());
+            let mut stack = vec![(
+                prepared.tree().root_node(),
+                StableDigest::from_array(root.finish()),
+            )];
+            // Same-named definitions are numbered in source order within their
+            // lexical owner. Ancestor identities carry their own ordinals too.
+            let mut ordinals = HashMap::default();
+            while let Some((node, mut owner)) = stack.pop() {
+                consume(remaining_nodes)?;
+                if matches!(
+                    node.kind(),
+                    "function_definition" | "class_definition" | "lambda"
+                ) {
+                    let name = node
+                        .child_by_field_name("name")
+                        .map(|name| name.utf8_text(prepared.source().as_bytes()))
+                        .transpose()
+                        .ok()?
+                        .unwrap_or("");
+                    let ordinal = ordinals.entry((owner, node.kind(), name)).or_insert(0_u64);
+                    let mut digest =
+                        CanonicalHasher::new(b"bifrost-python-saved-default-declaration/v1");
+                    digest.value(owner.as_bytes());
+                    digest.value(node.kind().as_bytes());
+                    digest.value(name.as_bytes());
+                    digest.value(&ordinal.to_be_bytes());
+                    *ordinal += 1;
+                    owner = StableDigest::from_array(digest.finish());
+                    if matches!(node.kind(), "function_definition" | "lambda") {
+                        let function = function_key(&path, node);
+                        if wanted.contains(&function) {
+                            identities.insert(function, owner);
+                        }
+                    }
+                }
+                let children = named_children_iter(node).collect::<Vec<_>>();
+                stack.extend(children.into_iter().rev().map(|child| (child, owner)));
+            }
+        }
+    }
+    safety.finalize_fact_fingerprint(|function| identities.get(function).copied())
 }
 
 fn scan_prepared(

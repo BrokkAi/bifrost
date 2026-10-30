@@ -1,12 +1,12 @@
-use std::{error::Error, fmt, mem::size_of_val, sync::Arc};
+use std::{borrow::Cow, error::Error, fmt, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic::{
     AbstractLocation, AccessPath, AccessPathRoot, AccessPathTail, AccessSelector, CallSiteHandle,
     DurableIdentityError, DurableObjectIdentity, DurablePortIdentity, DurableValueIdentity,
-    EvidenceCompleteness, IndexSelector, OracleCallContext, ProcedureHandle, ProcedurePortHandle,
-    ProgramPointHandle, ProofStatus, ScopedSemanticLocator, SemanticArtifact, SemanticLocator,
-    StableDigest, ValueFlowEndpoint, ValueHandle,
+    EvidenceCompleteness, IndexSelector, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle,
+    ProofStatus, ScopedSemanticLocator, SemanticArtifact, SemanticLocator, StableDigest,
+    ValueFlowEndpoint, ValueHandle,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -267,16 +267,6 @@ fn same_call(left: &CallSiteHandle, right: &CallSiteHandle) -> bool {
     left.id() == right.id() && same_procedure(left.procedure(), right.procedure())
 }
 
-fn same_call_context(left: &OracleCallContext, right: &OracleCallContext) -> bool {
-    left.was_truncated() == right.was_truncated()
-        && left.calls().len() == right.calls().len()
-        && left
-            .calls()
-            .iter()
-            .zip(right.calls())
-            .all(|(left, right)| same_call(left, right))
-}
-
 fn same_scoped_locator(left: &ScopedSemanticLocator, right: &ScopedSemanticLocator) -> bool {
     left.scope().key() == right.scope().key() && left.locator() == right.locator()
 }
@@ -297,16 +287,36 @@ fn same_field_selector(left: &ScopedSemanticLocator, right: &ScopedSemanticLocat
     }
 }
 
+/// Compare roots using `carrier_key`'s flow-slot projection. When either side
+/// is a substitution, that projection is the identity: its durable base has
+/// no artifact key and can contain nested substitutions or contextual call
+/// results that the flow-slot contract erases. Ordinary roots retain the
+/// artifact-scoped handle checks below.
 fn same_root(mut left: &AccessPathRoot, mut right: &AccessPathRoot) -> bool {
     loop {
+        if matches!(left, AccessPathRoot::CallSubstitution { .. })
+            || matches!(right, AccessPathRoot::CallSubstitution { .. })
+        {
+            fn durable_base(
+                root: &AccessPathRoot,
+            ) -> Result<Cow<'_, DurableObjectIdentity>, DurableIdentityError> {
+                match root {
+                    AccessPathRoot::CallSubstitution { base, .. } => Ok(Cow::Borrowed(base)),
+                    _ => root.durable_identity().map(Cow::Owned),
+                }
+            }
+            let (Ok(left_identity), Ok(right_identity)) = (durable_base(left), durable_base(right))
+            else {
+                return false;
+            };
+            return carrier_key(&left_identity) == carrier_key(&right_identity);
+        }
         return match (left, right) {
             (AccessPathRoot::Value(left), AccessPathRoot::Value(right)) => same_value(left, right),
             (AccessPathRoot::CallResult(left), AccessPathRoot::CallResult(right)) => {
                 same_call(left.call(), right.call())
                     && same_value(left.result(), right.result())
                     && same_procedure(left.callee(), right.callee())
-                    && same_call_context(left.caller_context(), right.caller_context())
-                    && same_call_context(left.callee_context(), right.callee_context())
             }
             (AccessPathRoot::ProcedurePort(left), AccessPathRoot::ProcedurePort(right))
             | (AccessPathRoot::CaptureSlot(left), AccessPathRoot::CaptureSlot(right)) => {
@@ -343,25 +353,6 @@ fn same_root(mut left: &AccessPathRoot, mut right: &AccessPathRoot) -> bool {
                 left = left_base;
                 right = right_base;
                 continue;
-            }
-            (
-                AccessPathRoot::CallSubstitution {
-                    procedure: left_procedure,
-                    context: left_context,
-                    base: left_base,
-                    base_cardinality: left_cardinality,
-                },
-                AccessPathRoot::CallSubstitution {
-                    procedure: right_procedure,
-                    context: right_context,
-                    base: right_base,
-                    base_cardinality: right_cardinality,
-                },
-            ) => {
-                same_procedure(left_procedure, right_procedure)
-                    && same_call_context(left_context, right_context)
-                    && left_base == right_base
-                    && left_cardinality == right_cardinality
             }
             _ => false,
         };
@@ -963,13 +954,6 @@ impl ValueFlowEventKey {
         });
     }
 
-    /// Checkout-independent fingerprint for one resolved semantic event.
-    pub fn stable_fingerprint(&self) -> StableDigest {
-        stable_fingerprint_with(b"bifrost-value-flow-event-key-v1", |digest| {
-            self.push_stable_identity(digest)
-        })
-    }
-
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(semantic_locator_heap_bytes(&self.site))
     }
@@ -1453,3 +1437,7 @@ mod tests {
         assert_ne!(carrier.stable_fingerprint().as_bytes(), &[0; 32]);
     }
 }
+
+#[cfg(test)]
+#[path = "identity_boundaries.rs"]
+mod identity_boundaries;

@@ -49,7 +49,6 @@ use brokk_bifrost_jvm::kotlin::hierarchy::{
     build_kotlin_external_root_hierarchy, kotlin_resolve_direct_ancestors,
 };
 use brokk_bifrost_jvm::realm::JvmSourceRealm;
-use std::sync::Arc;
 
 use crate::analyzer::kotlin::KotlinAnalyzer;
 
@@ -141,65 +140,15 @@ impl KotlinAnalyzer {
             return ExternalMemberFamilyAnswer::stopped(status, hierarchy.visited);
         }
 
-        let mut visited = hierarchy.visited;
-        let mut candidates = Vec::new();
-        for descendant in hierarchy.descendants {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return ExternalMemberFamilyAnswer::stopped(
-                    ExternalMemberFamilyStatus::Cancelled,
-                    visited,
-                );
-            }
-            let children = analyzer.direct_children(&descendant);
-            if children.len() > max_visits.saturating_sub(visited) {
-                return ExternalMemberFamilyAnswer::stopped(
-                    ExternalMemberFamilyStatus::BudgetExhausted,
-                    visited,
-                );
-            }
-            visited += children.len();
-            let mut matching = Vec::new();
-            for candidate in children {
-                if !candidate.is_function() || candidate.identifier() != identity.member() {
-                    continue;
-                }
-                let Some(facts) = MemberFacts::read(analyzer, &candidate) else {
-                    return ExternalMemberFamilyAnswer::incomplete(
-                        ExternalMemberFamilyIncompleteReason::MemberFactsUnavailable,
-                        visited,
-                    );
-                };
-                if facts.universal_exclusion().is_some() || facts.is_static() {
-                    continue;
-                }
-                let Some(arity) = facts.arity() else {
-                    return ExternalMemberFamilyAnswer::incomplete(
-                        ExternalMemberFamilyIncompleteReason::MemberFactsUnavailable,
-                        visited,
-                    );
-                };
-                if arity.accepts(identity.arity()) {
-                    matching.push(candidate);
-                }
-            }
-            match matching.as_slice() {
-                [] => {}
-                [candidate] => candidates.push(candidate.clone()),
-                _ => {
-                    return ExternalMemberFamilyAnswer::incomplete(
-                        ExternalMemberFamilyIncompleteReason::OverloadIdentityUnproven,
-                        visited,
-                    );
-                }
-            }
-        }
-        candidates.sort();
-        candidates.dedup();
-        ExternalMemberFamilyAnswer {
-            status: ExternalMemberFamilyStatus::Complete,
-            candidates,
-            visited,
-        }
+        MemberFacts::external_descendant_family(
+            analyzer,
+            hierarchy.descendants,
+            hierarchy.visited,
+            identity.member(),
+            identity.arity(),
+            max_visits,
+            cancellation,
+        )
     }
 
     fn external_root_hierarchy(
@@ -249,20 +198,9 @@ impl KotlinAnalyzer {
             Some(_) => &self.realm_direct_ancestors,
             None => &self.direct_ancestors,
         };
-        if let Some(cached) = cache.get(code_unit) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "kotlin.direct_ancestors",
-            );
-        let ancestors = kotlin_resolve_direct_ancestors(self, token, code_unit, realm);
-        let cache_key = code_unit.clone();
-        let cache_value = Arc::new(ancestors.clone());
-        persistent_fill_guard.installed("kotlin.direct_ancestors");
-        cache.insert(cache_key, cache_value);
-        ancestors
+        crate::analyzer::jvm::hierarchy::memoized_ancestors(cache, self, code_unit, || {
+            kotlin_resolve_direct_ancestors(self, token, code_unit, realm)
+        })
     }
 
     pub(crate) fn direct_descendants_in_realm(
@@ -272,6 +210,10 @@ impl KotlinAnalyzer {
         realm: Option<&JvmSourceRealm<'_>>,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
+        crate::analyzer::jvm::authority::source_read(self, match realm {
+            Some(_) => brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinRealmDescendantIndex,
+            None => brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinDescendantIndex,
+        });
         let index = match realm {
             Some(_) => &self.realm_direct_descendant_index,
             None => &self.direct_descendant_index,

@@ -34,13 +34,17 @@ use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::path_utils::rel_path_string;
-use brokk_bifrost_analysis::analyzer::store::cache_budget::{RetainedBytes, RetainedHeap};
+use brokk_bifrost_analysis::analyzer::store::cache_budget::{
+    RetainedBytes, RetainedHeap, retained_read_key,
+};
 use brokk_bifrost_analysis::analyzer::store::class_set_root_results::{
     ClassSetRootResultGenerationKey, ClassSetRootResultLookup, FindingFreeClassSetRootKey,
     FindingFreeClassSetRootResult, PersistedClassSetAtom, PersistedClassSetRootRow,
     PersistedClassSetStatus,
 };
-use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads, replay_query_read_keys};
+use brokk_bifrost_analysis::analyzer::{
+    ReadKey, capture_query_reads, capture_subsumed_query_reads,
+};
 use brokk_bifrost_core::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValuePermit,
 };
@@ -75,6 +79,19 @@ pub struct CodeQueryRootAllotment {
 }
 
 impl CodeQueryRootAllotment {
+    /// Select the same shared products used by evaluation under this allotment.
+    pub fn summary_state(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        partitions: &brokk_bifrost_flow::type_flow::TypeFlowSummaryPartitions,
+    ) -> brokk_bifrost_flow::type_flow::TypeFlowSummaryState {
+        partitions.select(workspace, self.solver, self.semantic)
+    }
+
+    pub fn semantic_budget(&self) -> SemanticBudget {
+        SemanticBudget::new(self.semantic).expect("root allotment has positive semantic limits")
+    }
+
     /// Derive root limits once from the original query, before any continuation.
     pub fn from_execution_limits(limits: &super::CodeQueryExecutionLimits) -> Self {
         let solver = limits.value_flow.solver_work;
@@ -221,6 +238,7 @@ struct TypeFlowRootProduct {
     semantic_work: SemanticWork,
     reads: Vec<ReadKey>,
     unattributed_reads: usize,
+    execution_dependences: usize,
 }
 
 impl TypeFlowRootProduct {
@@ -304,6 +322,7 @@ impl TypeFlowRootProduct {
             semantic_work,
             reads: Vec::new(),
             unattributed_reads: 0,
+            execution_dependences: 0,
         }
     }
 }
@@ -541,58 +560,6 @@ fn retained_witness(
     }
 }
 
-fn retained_read_key(heap: &mut RetainedHeap, key: &ReadKey) {
-    use brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion;
-    match key {
-        ReadKey::File { rel_path, .. } | ReadKey::PathAbsent { rel_path, .. } => {
-            heap.add(rel_path.len());
-            heap.add_entries(1);
-        }
-        ReadKey::Index { key, .. } => {
-            heap.add(key.len());
-            heap.add_entries(1);
-        }
-        ReadKey::Lookup { question, .. } => match question {
-            LookupQuestion::Name { name, .. } => {
-                heap.add(name.len());
-                heap.add_entries(1);
-            }
-            LookupQuestion::Declaration {
-                rel_path,
-                fq_name,
-                signature,
-                ..
-            } => {
-                heap.add(rel_path.len().saturating_add(fq_name.len()));
-                heap.add_entries(2);
-                if let Some(signature) = signature {
-                    retained_text(heap, signature);
-                }
-            }
-            LookupQuestion::File { rel_path }
-            | LookupQuestion::CallSite { rel_path, .. }
-            | LookupQuestion::ProcedureCallSite { rel_path, .. } => {
-                heap.add(rel_path.len());
-                heap.add_entries(1);
-            }
-            LookupQuestion::Summary { .. } => {}
-        },
-        ReadKey::Artifact { rel_path, .. } => {
-            if let Some(path) = rel_path {
-                heap.add(path.len());
-                heap.add_entries(1);
-            }
-        }
-        ReadKey::Scope { languages, .. } => {
-            heap.slice(languages);
-        }
-        ReadKey::Models(_)
-        | ReadKey::Policy { .. }
-        | ReadKey::Configuration(_)
-        | ReadKey::Epoch(_) => {}
-    }
-}
-
 impl TypeFlowRootProduct {
     fn output_census(&self) -> RetainedHeap {
         let mut heap = RetainedHeap::default();
@@ -748,9 +715,17 @@ pub(super) struct ReceiverDispatchQuery<'a> {
     pub(super) active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
 }
 
+type QueryFieldSlotInputs = (
+    &'static dyn TypeFlowAdapter,
+    IcfgProviderBehaviorIdentity,
+    Arc<FieldSlotIndex>,
+);
+
 #[derive(Clone)]
 struct QueryFieldSlots {
     index: Arc<FieldSlotIndex>,
+    unattributed_reads: usize,
+    execution_dependences: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,8 +747,13 @@ pub(super) struct TypeFlowQueryState {
     provider_stats_baseline: ValueFlowCacheStatsSnapshot,
     cache: HashMap<TypeFlowCacheKey, CachedTypeFlowAnalysis>,
     field_slots: HashMap<FieldSlotCacheKey, Option<QueryFieldSlots>>,
-    witness_projection_cache:
-        HashMap<AbsentMemberWitnessProjectionKey, Option<AbsentMemberWitnessValue>>,
+    witness_projection_cache: HashMap<
+        AbsentMemberWitnessProjectionKey,
+        (
+            Option<AbsentMemberWitnessValue>,
+            Arc<brokk_bifrost_analysis::analyzer::ReadLedger>,
+        ),
+    >,
     diagnostics: Vec<CodeQueryDiagnostic>,
     /// Roots whose solve stopped before a fixed point, and roots whose solve
     /// could not pay a semantic charge, each with the lane that stopped it.
@@ -810,12 +790,13 @@ impl Default for TypeFlowQueryState {
 }
 
 impl TypeFlowQueryState {
-    fn select_summary_partition(&mut self) {
+    fn select_summary_partition(&mut self, workspace: &WorkspaceAnalyzer) {
         if self.summary_state.is_none() {
-            self.summary_state = Some(
-                self.summary_partitions
-                    .select(self.allotment.solver, self.allotment.semantic),
-            );
+            self.summary_state = Some(self.summary_partitions.select(
+                workspace,
+                self.allotment.solver,
+                self.allotment.semantic,
+            ));
         }
     }
 
@@ -1318,7 +1299,8 @@ impl TypeFlowQueryState {
                 max_steps,
                 max_bytes,
             };
-            if let Some(cached) = self.witness_projection_cache.get(&key) {
+            if let Some((cached, reads)) = self.witness_projection_cache.get(&key) {
+                crate::analyzer::i_analyzer::replay_query_reads(workspace.analyzer(), reads);
                 if let Some(row) = cached {
                     rows.push(row.clone());
                 }
@@ -1333,7 +1315,8 @@ impl TypeFlowQueryState {
                 // branch must not inflate the omitted count or diagnostics
                 // after this aggregate cap has already been observed.
                 self.record_witness_budget(1);
-                self.witness_projection_cache.insert(key, None);
+                self.witness_projection_cache
+                    .insert(key, (None, Arc::default()));
                 continue;
             }
             let remaining_steps = limits
@@ -1344,15 +1327,28 @@ impl TypeFlowQueryState {
                 .saturating_sub(usize::try_from(self.work.witness_bytes).unwrap_or(usize::MAX));
             // This only projects already retained evidence. Do not charge old
             // reconstruction work again or spend an evidence-expansion budget.
-            let public = super::witness_projection::public_absent_member_witness(
-                workspace,
-                finding,
-                root,
-                witness_index,
-                max_steps.min(remaining_steps),
-                max_bytes.min(remaining_bytes),
-                &mut self.witness_render_cache,
-            );
+            let (public, reads) = capture_query_reads(workspace.analyzer(), || {
+                // Coordinate and indexed-source caches may both be warm.
+                // Name the exact snapshot source even when neither loads it.
+                if let Some(blob) = workspace.analyzer().indexed_blob_oid(&finding.file) {
+                    workspace.analyzer().record_read(ReadKey::file(
+                        language_for_file(&finding.file),
+                        crate::path_utils::rel_path_string(&finding.file),
+                        blob,
+                    ));
+                } else {
+                    workspace.analyzer().record_unattributed_read();
+                }
+                super::witness_projection::public_absent_member_witness(
+                    workspace,
+                    finding,
+                    root,
+                    witness_index,
+                    max_steps.min(remaining_steps),
+                    max_bytes.min(remaining_bytes),
+                    &mut self.witness_render_cache,
+                )
+            });
             if let Err(error) = &root.witness {
                 self.record_witness_unavailable(error);
             }
@@ -1373,7 +1369,8 @@ impl TypeFlowQueryState {
                 file: finding.file.clone(),
                 byte_span: finding.range.start_byte..finding.range.end_byte,
             };
-            self.witness_projection_cache.insert(key, Some(row.clone()));
+            self.witness_projection_cache
+                .insert(key, (Some(row.clone()), reads));
             rows.push(row);
         }
         rows
@@ -1432,7 +1429,7 @@ impl TypeFlowQueryState {
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Option<CachedTypeFlowAnalysis> {
-        self.select_summary_partition();
+        self.select_summary_partition(workspace);
         if is_python_iterator_method(procedure) {
             return self.solve_live(
                 workspace,
@@ -1443,13 +1440,14 @@ impl TypeFlowQueryState {
                 active_semantic_model_snapshot,
             );
         }
-        let (adapter, provider_behavior, field_slots) = self.query_field_slots(
+        let (inputs, input_reads) = self.capture_root_inputs(
             workspace,
             procedure,
             semantic_budget,
             cancellation,
             active_semantic_model_snapshot.clone(),
-        )?;
+        );
+        let (adapter, provider_behavior, field_slots) = inputs?;
         let cache_key = TypeFlowCacheKey {
             root: SemanticProcedureReference::of(&procedure.handle),
             provider_behavior,
@@ -1457,14 +1455,34 @@ impl TypeFlowQueryState {
         };
         match self.cache.get(&cache_key).cloned() {
             Some(CachedTypeFlowAnalysis::Failed) => {
+                workspace.analyzer().record_unattributed_read();
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return None;
             }
             Some(CachedTypeFlowAnalysis::Owned(result)) if result.product.failure.is_some() => {
+                crate::analyzer::replay_query_read_receipt(
+                    workspace.analyzer(),
+                    result.product.reads.iter().cloned(),
+                    result.product.unattributed_reads,
+                    result.product.execution_dependences,
+                );
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return None;
             }
             Some(result) => {
+                if matches!(result, CachedTypeFlowAnalysis::FindingFreeRows(_)) {
+                    // These legacy projections carry no read receipt. Refuse
+                    // reuse rather than publish a capture without their inputs.
+                    workspace.analyzer().record_unattributed_read();
+                }
+                if let CachedTypeFlowAnalysis::Owned(owned) = &result {
+                    crate::analyzer::replay_query_read_receipt(
+                        workspace.analyzer(),
+                        owned.product.reads.iter().cloned(),
+                        owned.product.unattributed_reads,
+                        owned.product.execution_dependences,
+                    );
+                }
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return Some(result);
             }
@@ -1511,6 +1529,9 @@ impl TypeFlowQueryState {
                         persisted_class_set_rows(procedure.file(), *persisted).into();
                     self.work.root_result_persistence_hits =
                         self.work.root_result_persistence_hits.saturating_add(1);
+                    // SQLite legacy projections have no derivation receipt,
+                    // just like the later in-memory projection hit.
+                    workspace.analyzer().record_unattributed_read();
                     let cached = CachedTypeFlowAnalysis::FindingFreeRows(rows);
                     self.cache.insert(cache_key, cached.clone());
                     return Some(cached);
@@ -1554,6 +1575,7 @@ impl TypeFlowQueryState {
             cancellation,
             active_semantic_model_snapshot,
             memo_permit,
+            input_reads,
         )
     }
 
@@ -1573,14 +1595,15 @@ impl TypeFlowQueryState {
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Option<CachedTypeFlowAnalysis> {
-        self.select_summary_partition();
-        let (adapter, provider_behavior, field_slots) = self.query_field_slots(
+        self.select_summary_partition(workspace);
+        let (inputs, input_reads) = self.capture_root_inputs(
             workspace,
             procedure,
             semantic_budget,
             cancellation,
             active_semantic_model_snapshot.clone(),
-        )?;
+        );
+        let (adapter, provider_behavior, field_slots) = inputs?;
         let cache_key = TypeFlowCacheKey {
             root: SemanticProcedureReference::of(&procedure.handle),
             provider_behavior,
@@ -1588,6 +1611,12 @@ impl TypeFlowQueryState {
         };
         match self.cache.get(&cache_key).cloned() {
             Some(CachedTypeFlowAnalysis::Owned(result)) => {
+                crate::analyzer::replay_query_read_receipt(
+                    workspace.analyzer(),
+                    result.product.reads.iter().cloned(),
+                    result.product.unattributed_reads,
+                    result.product.execution_dependences,
+                );
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return result
                     .product
@@ -1596,6 +1625,7 @@ impl TypeFlowQueryState {
                     .then_some(CachedTypeFlowAnalysis::Owned(result));
             }
             Some(CachedTypeFlowAnalysis::Failed) => {
+                workspace.analyzer().record_unattributed_read();
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return None;
             }
@@ -1641,10 +1671,39 @@ impl TypeFlowQueryState {
             cancellation,
             active_semantic_model_snapshot,
             memo_permit,
+            input_reads,
         )
     }
 
-    /// This query's field-slot index for the root's language, acquired once.
+    /// Capture the selected root artifact and the shared field-slot acquisition.
+    fn capture_root_inputs(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &SemanticProcedureValue,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> (
+        Option<QueryFieldSlotInputs>,
+        Arc<brokk_bifrost_analysis::analyzer::ReadLedger>,
+    ) {
+        capture_query_reads(workspace.analyzer(), || {
+            // Resolution selected this exact artifact before entering type flow.
+            // Record that selection inside the root's dependency boundary.
+            let artifact = procedure.handle.artifact();
+            workspace
+                .analyzer()
+                .record_read(ReadKey::semantic_artifact(artifact.key()));
+            self.query_field_slots(
+                workspace,
+                procedure,
+                semantic_budget,
+                cancellation,
+                active_semantic_model_snapshot.clone(),
+            )
+        })
+    }
+
     fn query_field_slots(
         &mut self,
         workspace: &WorkspaceAnalyzer,
@@ -1652,157 +1711,178 @@ impl TypeFlowQueryState {
         semantic_budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-    ) -> Option<(
-        &'static dyn TypeFlowAdapter,
-        IcfgProviderBehaviorIdentity,
-        Arc<FieldSlotIndex>,
-    )> {
-        let language = language_for_file(procedure.file());
-        let Some(adapter) = type_flow_adapter(language) else {
-            push_deduplicated_diagnostic(
-                &mut self.diagnostics,
-                CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
-                format!(
-                    "class-set propagation is unsupported for {}",
-                    language.config_label()
-                ),
+    ) -> Option<QueryFieldSlotInputs> {
+        // Per-class field-slot keys cover the slots and survey a root reads.
+        // They subsume acquisition's build keys, but not unattributed reads.
+        let (inputs, _) = capture_subsumed_query_reads(workspace.analyzer(), || {
+            let language = language_for_file(procedure.file());
+            let Some(adapter) = type_flow_adapter(language) else {
+                push_deduplicated_diagnostic(
+                    &mut self.diagnostics,
+                    CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+                    format!(
+                        "class-set propagation is unsupported for {}",
+                        language.config_label()
+                    ),
+                );
+                return None;
+            };
+            let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+                workspace,
+                active_semantic_model_snapshot.clone(),
             );
-            return None;
-        };
-        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
-            workspace,
-            active_semantic_model_snapshot.clone(),
-        );
-        let provider_behavior = provider.behavior_identity();
-        let field_slot_key = FieldSlotCacheKey {
-            language,
-            provider_behavior,
-        };
-        let query_field_slots = match self.field_slots.get(&field_slot_key).cloned() {
-            Some(Some(index)) => index,
-            Some(None) => return None,
-            None => {
-                let parent_scope = semantic_budget.scope_snapshot();
-                // Shared field slots use the same engine-owned allotment as roots.
-                let mut field_slot_budget =
-                    SemanticBudget::new_child(self.allotment.semantic, &parent_scope);
-                let field_slot_cache = self
-                    .summary_state
-                    .as_ref()
-                    .expect("partition selected before field slots")
-                    .field_slot_indexes();
-                let acquired = {
-                    let _timing = crate::profiling::scope("type_flow.field_slot_acquire");
-                    FieldSlotIndex::acquire(
-                        workspace,
-                        adapter,
-                        provider_behavior,
-                        active_semantic_model_snapshot.clone(),
-                        &field_slot_cache,
-                        self.value_flow_cache.clone(),
-                        &mut field_slot_budget,
-                        cancellation,
-                    )
-                };
-                // The prepass has finished using its procedure handles. Keep
-                // cumulative work and peaks, but release its admissions before
-                // folding the independently bounded child into the query.
-                field_slot_budget.release_resident();
-                semantic_budget.absorb_root_work(field_slot_budget);
-                match acquired {
-                    Ok(acquired) => {
-                        match acquired.kind {
-                            FieldSlotIndexAcquisitionKind::MemoryHit => {
-                                self.work.field_slot_memory_hits =
-                                    self.work.field_slot_memory_hits.saturating_add(1);
-                            }
-                            FieldSlotIndexAcquisitionKind::PersistentHit => {
-                                self.work.field_slot_persistence_hits =
-                                    self.work.field_slot_persistence_hits.saturating_add(1);
-                            }
-                            FieldSlotIndexAcquisitionKind::Built => {
-                                self.work.field_slot_builds =
-                                    self.work.field_slot_builds.saturating_add(1);
-                                match acquired.miss_reason {
-                                    Some(FieldSlotIndexMissReason::KeyMiss) => {
-                                        self.work.field_slot_persistence_misses = self
-                                            .work
-                                            .field_slot_persistence_misses
-                                            .saturating_add(1);
+            let provider_behavior = provider.behavior_identity();
+            let field_slot_key = FieldSlotCacheKey {
+                language,
+                provider_behavior,
+            };
+            let query_field_slots = match self.field_slots.get(&field_slot_key).cloned() {
+                Some(Some(index)) => {
+                    crate::analyzer::replay_query_read_receipt(
+                        workspace.analyzer(),
+                        std::iter::empty(),
+                        index.unattributed_reads,
+                        index.execution_dependences,
+                    );
+                    index
+                }
+                Some(None) => {
+                    workspace.analyzer().record_unattributed_read();
+                    return None;
+                }
+                None => {
+                    let parent_scope = semantic_budget.scope_snapshot();
+                    // Shared field slots use the same engine-owned allotment as roots.
+                    let mut field_slot_budget =
+                        SemanticBudget::new_child(self.allotment.semantic, &parent_scope);
+                    let field_slot_cache = self
+                        .summary_state
+                        .as_ref()
+                        .expect("partition selected before field slots")
+                        .field_slot_indexes();
+                    let (acquired, receipt) =
+                        brokk_bifrost_analysis::analyzer::capture_subsumed_query_read_receipt(
+                            workspace.analyzer(),
+                            || {
+                                let _timing =
+                                    crate::profiling::scope("type_flow.field_slot_acquire");
+                                FieldSlotIndex::acquire(
+                                    workspace,
+                                    adapter,
+                                    provider_behavior,
+                                    active_semantic_model_snapshot.clone(),
+                                    &field_slot_cache,
+                                    self.value_flow_cache.clone(),
+                                    &mut field_slot_budget,
+                                    cancellation,
+                                )
+                            },
+                        );
+                    // The prepass has finished using its procedure handles. Keep
+                    // cumulative work and peaks, but release its admissions before
+                    // folding the independently bounded child into the query.
+                    field_slot_budget.release_resident();
+                    semantic_budget.absorb_root_work(field_slot_budget);
+                    match acquired {
+                        Ok(acquired) => {
+                            match acquired.kind {
+                                FieldSlotIndexAcquisitionKind::MemoryHit => {
+                                    self.work.field_slot_memory_hits =
+                                        self.work.field_slot_memory_hits.saturating_add(1);
+                                }
+                                FieldSlotIndexAcquisitionKind::PersistentHit => {
+                                    self.work.field_slot_persistence_hits =
+                                        self.work.field_slot_persistence_hits.saturating_add(1);
+                                }
+                                FieldSlotIndexAcquisitionKind::Built => {
+                                    self.work.field_slot_builds =
+                                        self.work.field_slot_builds.saturating_add(1);
+                                    match acquired.miss_reason {
+                                        Some(FieldSlotIndexMissReason::KeyMiss) => {
+                                            self.work.field_slot_persistence_misses = self
+                                                .work
+                                                .field_slot_persistence_misses
+                                                .saturating_add(1);
+                                        }
+                                        Some(
+                                            FieldSlotIndexMissReason::PersistenceValidation
+                                            | FieldSlotIndexMissReason::PersistenceReplayBudget,
+                                        ) => {
+                                            self.work.field_slot_persistence_rejections = self
+                                                .work
+                                                .field_slot_persistence_rejections
+                                                .saturating_add(1);
+                                        }
+                                        Some(
+                                            FieldSlotIndexMissReason::NoSemanticKey
+                                            | FieldSlotIndexMissReason::NoPersistentStore
+                                            | FieldSlotIndexMissReason::MemoryReplayBudget
+                                            | FieldSlotIndexMissReason::StoreFailure,
+                                        )
+                                        | None => {}
                                     }
-                                    Some(
-                                        FieldSlotIndexMissReason::PersistenceValidation
-                                        | FieldSlotIndexMissReason::PersistenceReplayBudget,
-                                    ) => {
-                                        self.work.field_slot_persistence_rejections = self
-                                            .work
-                                            .field_slot_persistence_rejections
-                                            .saturating_add(1);
-                                    }
-                                    Some(
-                                        FieldSlotIndexMissReason::NoSemanticKey
-                                        | FieldSlotIndexMissReason::NoPersistentStore
-                                        | FieldSlotIndexMissReason::MemoryReplayBudget
-                                        | FieldSlotIndexMissReason::StoreFailure,
-                                    )
-                                    | None => {}
                                 }
                             }
+                            if acquired.published {
+                                self.work.field_slot_publications =
+                                    self.work.field_slot_publications.saturating_add(1);
+                            }
+                            let index = acquired.index;
+                            for refusal in index.source_refusals() {
+                                push_deduplicated_diagnostic(
+                                    &mut self.diagnostics,
+                                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                    refusal.to_string(),
+                                );
+                            }
+                            if index.semantic_budget_exhausted() {
+                                self.semantic_budget_exhausted = true;
+                                let detail = index.semantic_budget_exhaustion().map_or_else(
+                                    || "bounded adapter class resolution".to_string(),
+                                    |exhaustion| exhaustion.to_string(),
+                                );
+                                push_deduplicated_diagnostic(
+                                    &mut self.diagnostics,
+                                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                                    format!(
+                                        "class-set field index exceeded its semantic budget: {}",
+                                        detail
+                                    ),
+                                );
+                            }
+                            let cached = QueryFieldSlots {
+                                index,
+                                unattributed_reads: receipt.unattributed_reads,
+                                execution_dependences: receipt.execution_dependences,
+                            };
+                            self.field_slots
+                                .insert(field_slot_key.clone(), Some(cached.clone()));
+                            cached
                         }
-                        if acquired.published {
-                            self.work.field_slot_publications =
-                                self.work.field_slot_publications.saturating_add(1);
-                        }
-                        let index = acquired.index;
-                        for refusal in index.source_refusals() {
+                        Err(error) => {
+                            let code = if matches!(error, TypeFlowPlanError::Cancelled) {
+                                CodeQueryDiagnosticCode::Cancelled
+                            } else {
+                                CodeQueryDiagnosticCode::SemanticProviderFailed
+                            };
                             push_deduplicated_diagnostic(
                                 &mut self.diagnostics,
-                                CodeQueryDiagnosticCode::SemanticProviderFailed,
-                                refusal.to_string(),
+                                code,
+                                format!("class-set field index failed: {error}"),
                             );
+                            self.field_slots.insert(field_slot_key, None);
+                            return None;
                         }
-                        if index.semantic_budget_exhausted() {
-                            self.semantic_budget_exhausted = true;
-                            let detail = index.semantic_budget_exhaustion().map_or_else(
-                                || "bounded adapter class resolution".to_string(),
-                                |exhaustion| exhaustion.to_string(),
-                            );
-                            push_deduplicated_diagnostic(
-                                &mut self.diagnostics,
-                                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                                format!(
-                                    "class-set field index exceeded its semantic budget: {}",
-                                    detail
-                                ),
-                            );
-                        }
-                        let cached = QueryFieldSlots { index };
-                        self.field_slots
-                            .insert(field_slot_key.clone(), Some(cached.clone()));
-                        cached
-                    }
-                    Err(error) => {
-                        let code = if matches!(error, TypeFlowPlanError::Cancelled) {
-                            CodeQueryDiagnosticCode::Cancelled
-                        } else {
-                            CodeQueryDiagnosticCode::SemanticProviderFailed
-                        };
-                        push_deduplicated_diagnostic(
-                            &mut self.diagnostics,
-                            code,
-                            format!("class-set field index failed: {error}"),
-                        );
-                        self.field_slots.insert(field_slot_key, None);
-                        return None;
                     }
                 }
-            }
-        };
-        Some((
-            adapter,
-            provider_behavior,
-            Arc::clone(&query_field_slots.index),
-        ))
+            };
+            Some((
+                adapter,
+                provider_behavior,
+                Arc::clone(&query_field_slots.index),
+            ))
+        });
+        inputs
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1820,6 +1900,7 @@ impl TypeFlowQueryState {
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         memo_permit: Option<RootMemoPermit>,
+        input_reads: Arc<brokk_bifrost_analysis::analyzer::ReadLedger>,
     ) -> Option<CachedTypeFlowAnalysis> {
         self.work.solves = self.work.solves.saturating_add(1);
         let mut solver_budget = SolverBudget::new(self.allotment.solver);
@@ -1827,6 +1908,7 @@ impl TypeFlowQueryState {
         let mut child_budget =
             SemanticBudget::new_child(self.allotment.semantic, &semantic_budget.scope_snapshot());
         let (product, reads) = capture_query_reads(workspace.analyzer(), || {
+            crate::analyzer::i_analyzer::replay_query_reads(workspace.analyzer(), &input_reads);
             let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
             let outcome = solve_type_flow_for_root_with_refinements(
                 workspace,
@@ -1941,6 +2023,7 @@ impl TypeFlowQueryState {
                         semantic_work,
                         reads: Vec::new(),
                         unattributed_reads: 0,
+                        execution_dependences: 0,
                     };
                     Some(product)
                 }
@@ -1949,6 +2032,7 @@ impl TypeFlowQueryState {
         let mut product = product?;
         product.reads = reads.keys();
         product.unattributed_reads = reads.unattributed_reads();
+        product.execution_dependences = reads.execution_dependences();
         let product = Arc::new(product);
         // No memo reentry from the flow engine. A cancelled leader leaves its
         // permit unpublished so a live follower can retry as leader.
@@ -1995,10 +2079,11 @@ impl TypeFlowQueryState {
                 });
             }
             RootProductSource::Memo => {
-                replay_query_read_keys(
+                crate::analyzer::replay_query_read_receipt(
                     workspace.analyzer(),
                     product.reads.iter().cloned(),
                     product.unattributed_reads,
+                    product.execution_dependences,
                 );
                 self.work.root_memo_hits = self.work.root_memo_hits.saturating_add(1);
                 self.work.root_memo_solver_work = self
@@ -2834,7 +2919,7 @@ mod tests {
     use super::{
         AbsentMemberFindingValue, AbsentMemberProof, AbsentMemberRootEvidence,
         CodeQueryRootAllotment, ROOT_RESULT_ALGORITHM_ID, SourceSiteKind, TypeFlowQueryState,
-        root_result_semantics_digest,
+        capture_query_reads, root_result_semantics_digest,
     };
     use crate::analyzer::semantic::{
         ProcedureHandle, SemanticBudget, SemanticBudgetDimension, SemanticRequest, SemanticWork,
@@ -3057,6 +3142,1748 @@ mod tests {
         );
     }
 
+    // The oracle is an independent head solve, not a second read-ledger capture.
+    // Kept beside the order test to exercise private products through solve_live.
+    mod read_set_mutations {
+        use super::super::{CachedTypeFlowAnalysis, TypeFlowRootMemo, TypeFlowRootProduct};
+        use super::*;
+        use crate::structural::search::semantic::SemanticQueryContext;
+        use brokk_bifrost_analysis::analyzer::invalidation::{
+            DerivedArtifactId, DerivedArtifactKind,
+        };
+        use brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest;
+        use brokk_bifrost_analysis::analyzer::{
+            ChangedFacts, LookupMemo, LookupReplayLimits, ReadVerdict, verify_read_set_for_artifact,
+        };
+        use brokk_bifrost_analysis::analyzer::{FactSubject, LookupQuestion, WorkspaceFactFamily};
+        use brokk_bifrost_test_macros::hardwon;
+        use std::sync::Arc;
+
+        const CLASSES: &str = "class Item:\n    def ping(self):\n        return self\n\nclass Other:\n    pass\n\nclass Box:\n    def __init__(self):\n        alias = self\n        alias.value = Item()\n";
+        const CHILDREN: &str = "from classes import Item, Box, Other\n\nclass Child(Item):\n    pass\n\nclass ExistingChild(Item):\n    def ping(self):\n        return Other()\n\nclass SubBox(Box):\n    pass\n\ndef write_child():\n    box = SubBox()\n    box.value = Item()\n    return box.value.missing\n";
+        const CALLEE: &str = "from classes import Item, Other\n\ndef make():\n    return Item()\n";
+        const APP: &str = "from classes import Item, Box\nfrom children import Child, SubBox\nfrom callee import make\n\ndef dispatch():\n    value = Child()\n    return value.ping().missing\n\ndef base_dispatch():\n    value = Item()\n    return value.ping().missing\n\ndef alias_field():\n    box = Box()\n    alias = box\n    return alias.value.missing\n\ndef subclass_field():\n    box = SubBox()\n    return box.value.missing\n\ndef cross_file():\n    return make().missing\n\ndef independent():\n    return Item().missing\n";
+
+        fn solve(
+            workspace: &WorkspaceAnalyzer,
+            state: &mut TypeFlowQueryState,
+            root: &super::super::SemanticProcedureValue,
+        ) -> Arc<TypeFlowRootProduct> {
+            state.release_file_window();
+            let result = state.solve_live(
+                workspace,
+                root,
+                &mut SemanticBudget::default(),
+                CodeQueryValueFlowLimits::default(),
+                &CancellationToken::default(),
+                workspace.analyzer().active_semantic_model_snapshot(),
+            );
+            let Some(CachedTypeFlowAnalysis::Owned(result)) = result else {
+                panic!(
+                    "expected owned root product: {:?}",
+                    state.take_diagnostics()
+                );
+            };
+            assert_eq!(
+                result.product.unattributed_reads, 0,
+                "every differential capture must name its inputs"
+            );
+            result.product
+        }
+
+        // Same semantic fields as the order oracle, split out to name each gap.
+        fn observations(p: &TypeFlowRootProduct) -> Vec<(&'static str, String)> {
+            vec![
+                ("root", format!("{:?}", p.root)),
+                ("failure", format!("{:?}", p.failure)),
+                ("projected_rows", format!("{:?}", p.projected_rows)),
+                ("class_sets", format!("{:?}", p.class_sets)),
+                ("findings", format!("{:?}", p.findings)),
+                ("complete", format!("{:?}", p.complete)),
+                (
+                    "semantic_budget_exhausted",
+                    format!("{:?}", p.semantic_budget_exhausted),
+                ),
+                (
+                    "incomplete_evidence",
+                    format!("{:?}", p.incomplete_evidence),
+                ),
+                ("persistence_status", format!("{:?}", p.persistence_status)),
+            ]
+        }
+
+        struct HeadFieldSlotAnswers(Arc<super::super::FieldSlotIndex>);
+
+        impl brokk_bifrost_analysis::analyzer::SummaryAnswers for HeadFieldSlotAnswers {
+            fn summary_content(
+                &self,
+                _identity: super::super::StableDigest,
+            ) -> Option<super::super::StableDigest> {
+                None
+            }
+            fn workspace_fact(
+                &self,
+                family: WorkspaceFactFamily,
+                language: Language,
+                subject: &FactSubject,
+            ) -> Option<super::super::StableDigest> {
+                match (family, language, subject) {
+                    (WorkspaceFactFamily::FieldSlots, _, FactSubject::Class { class }) => {
+                        Some(self.0.class_content(*class))
+                    }
+                    (WorkspaceFactFamily::FieldSlots, _, FactSubject::Whole) => {
+                        Some(self.0.digest())
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        fn head_field_answers(
+            workspace: &WorkspaceAnalyzer,
+            root: &super::super::SemanticProcedureValue,
+        ) -> HeadFieldSlotAnswers {
+            let mut state = TypeFlowQueryState::default();
+            state.select_summary_partition(workspace);
+            let (_, _, index) = state
+                .query_field_slots(
+                    workspace,
+                    root,
+                    &mut SemanticBudget::default(),
+                    &CancellationToken::default(),
+                    workspace.analyzer().active_semantic_model_snapshot(),
+                )
+                .expect("head field-slot acquisition");
+            HeadFieldSlotAnswers(index)
+        }
+
+        fn before_field_slot_reads(
+            product: &TypeFlowRootProduct,
+        ) -> Vec<brokk_bifrost_analysis::analyzer::ReadKey> {
+            product
+                .reads
+                .iter()
+                .filter(|key| {
+                    !matches!(
+                        key,
+                        brokk_bifrost_analysis::analyzer::ReadKey::Lookup {
+                            kind: brokk_bifrost_analysis::analyzer::LookupKind::WorkspaceFact,
+                            question: LookupQuestion::WorkspaceFact {
+                                family: WorkspaceFactFamily::FieldSlots,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn check(case: &str, path: &str, replacement: &str) {
+            let project = InlineTestProject::with_language(Language::Python)
+                .with_git()
+                .file("classes.py", CLASSES)
+                .file("children.py", CHILDREN)
+                .file("callee.py", CALLEE)
+                .file("app.py", APP)
+                .file(
+                    "dynamic.py",
+                    "from classes import Item\n\nsetattr(Item, 'dynamic', Item())\n",
+                )
+                .file("unrelated.py", "def unrelated():\n    return 1\n")
+                .build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let mut context = SemanticQueryContext::new(&base, None, Default::default());
+            let mut state = TypeFlowQueryState::default();
+            state.set_root_memo(Some(TypeFlowRootMemo::default()));
+            let mut products = Vec::new();
+            for path in [
+                "app.py",
+                "children.py",
+                "classes.py",
+                "callee.py",
+                "dynamic.py",
+                "unrelated.py",
+            ] {
+                for reference in context.procedure_references(&project.file(path)) {
+                    let root = context
+                        .resolve_procedure_reference(&reference)
+                        .expect("base root");
+                    products.push((reference, solve(&base, &mut state, &root)));
+                }
+            }
+            assert!(products.len() >= 10, "must actually solve multiple roots");
+            assert!(
+                products.iter().any(|(_, p)| !p.class_sets.is_empty()),
+                "must exercise class-set products"
+            );
+            project
+                .file(path)
+                .write(replacement)
+                .expect("single-file mutation");
+            let head = project.workspace_analyzer(AnalyzerConfig::default());
+            let changed = ChangedFacts::between(&base, &head);
+            assert!(
+                changed.is_complete(),
+                "incomplete difference: {:?}",
+                changed.incompleteness()
+            );
+            assert_eq!(changed.changed_path_count(), 1);
+            // Root capture has no policy wrapper. These fixed inputs must never
+            // accidentally reject a product for an unrelated policy/config key.
+            let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+            let head_root = named_root(&head, &project, "app.py", "independent");
+            let answers = head_field_answers(&head, &head_root);
+            let mut memo = LookupMemo::new();
+            let mut head_context = SemanticQueryContext::new(&head, None, Default::default());
+            let mut rejected = 0;
+            let mut before_rejected = 0;
+            let mut accepted = 0;
+            let mut gaps = Vec::new();
+            let mut rejected_roots = Vec::new();
+            let mut empty_captures = 0;
+            for (reference, product) in &products {
+                let root_name = format!(
+                    "{}::{:?}",
+                    reference.public.path,
+                    reference
+                        .locator
+                        .declaration()
+                        .segments()
+                        .iter()
+                        .filter_map(|segment| segment.name())
+                        .collect::<Vec<_>>()
+                );
+                empty_captures += usize::from(product.reads.is_empty());
+                assert!(
+                    !product.reads.iter().any(|key| matches!(
+                        key,
+                        brokk_bifrost_analysis::analyzer::ReadKey::Models(_)
+                            | brokk_bifrost_analysis::analyzer::ReadKey::Policy { .. }
+                            | brokk_bifrost_analysis::analyzer::ReadKey::Configuration(_)
+                            | brokk_bifrost_analysis::analyzer::ReadKey::Epoch(_)
+                    )),
+                    "root unexpectedly captured policy wrapper inputs"
+                );
+                let artifact = DerivedArtifactId::new(
+                    DerivedArtifactKind::PolicyEvaluationUnit,
+                    read_set_digest(&product.reads).digest(),
+                );
+                let verdict = verify_read_set_for_artifact(
+                    artifact,
+                    &head,
+                    &changed,
+                    &inputs,
+                    &product.reads,
+                    LookupReplayLimits::default(),
+                    &answers,
+                    &mut memo,
+                );
+                let before = verify_read_set_for_artifact(
+                    artifact,
+                    &head,
+                    &changed,
+                    &inputs,
+                    &before_field_slot_reads(product),
+                    LookupReplayLimits::default(),
+                    &answers,
+                    &mut memo,
+                );
+                before_rejected += usize::from(before != ReadVerdict::Unchanged);
+                assert!(
+                    before == ReadVerdict::Unchanged || verdict != ReadVerdict::Unchanged,
+                    "adding field-slot reads must not retain a previously rejected root"
+                );
+                eprintln!(
+                    "{case} root={root_name} reads={:?} verdict={verdict:?}",
+                    product.reads
+                );
+                if verdict != ReadVerdict::Unchanged {
+                    rejected += 1;
+                    rejected_roots.push(root_name);
+                    continue;
+                }
+                accepted += 1;
+                let head_reference = head_context
+                    .procedure_references(&reference.file)
+                    .into_iter()
+                    .find(|candidate| candidate.locator == reference.locator);
+                let Some(root) = head_reference
+                    .as_ref()
+                    .and_then(|reference| head_context.resolve_procedure_reference(reference))
+                else {
+                    gaps.push(format!(
+                        "case={case} root={root_name} field=root_resolution"
+                    ));
+                    continue;
+                };
+                let mut fresh = TypeFlowQueryState::default();
+                fresh.set_root_memo(Some(TypeFlowRootMemo::default()));
+                let fresh = solve(&head, &mut fresh, &root);
+                for ((field, before), (_, after)) in
+                    observations(product).into_iter().zip(observations(&fresh))
+                {
+                    if before != after {
+                        gaps.push(format!("case={case} root={root_name} field={field}\nbefore={before}\nafter={after}"));
+                    }
+                }
+            }
+            eprintln!(
+                "M4A case={case} total={} rejected={rejected} accepted={accepted} differing_fields={}",
+                products.len(),
+                gaps.len()
+            );
+            eprintln!(
+                "M4A case={case} before_rejected={before_rejected} after_rejected={rejected}"
+            );
+            eprintln!(
+                "M4A case={case} empty_captures={empty_captures} rejected_roots={rejected_roots:?}"
+            );
+            assert!(accepted > 0, "verification must actually accept products");
+            if case == "unrelated" {
+                let expected = [
+                    // Known false rejection, not a dependency on the edit: this
+                    // product records receiver-hinted and unhinted ProcedureDispatch
+                    // answers under one question, so it is always rejected.
+                    // #7758 will remove this root from the expected set.
+                    "app.py::[\"app.py\", \"base_dispatch\"]",
+                    // The edit changes this root's own body.
+                    "unrelated.py::[\"unrelated.py\", \"unrelated\"]",
+                ];
+                let mut actual = rejected_roots
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                actual.sort_unstable();
+                assert_eq!(
+                    actual, expected,
+                    "unexpected unrelated-edit rejections: {rejected_roots:?}"
+                );
+            }
+            if case == "add_override" {
+                assert!(
+                    rejected_roots
+                        .iter()
+                        .any(|name| name.contains("\"dispatch\"")),
+                    "override must reject dispatching root: {rejected_roots:?}"
+                );
+            }
+            assert!(
+                gaps.is_empty(),
+                "accepted stale products:\n{}",
+                gaps.join("\n")
+            );
+        }
+
+        fn named_root(
+            workspace: &WorkspaceAnalyzer,
+            project: &BuiltInlineTestProject,
+            path: &str,
+            name: &str,
+        ) -> super::super::SemanticProcedureValue {
+            let file = project.file(path);
+            let declarations = workspace
+                .analyzer()
+                .declarations_named(&file, name)
+                .into_iter()
+                .filter(|unit| unit.is_function())
+                .collect::<Vec<_>>();
+            let [declaration] = declarations.as_slice() else {
+                panic!("named fixture declaration {path}::{name}: {declarations:?}");
+            };
+            let ranges = workspace.analyzer().ranges_of(declaration);
+            let [range] = ranges.as_slice() else {
+                panic!("named fixture declaration ranges {path}::{name}: {ranges:?}");
+            };
+            let source = workspace
+                .analyzer()
+                .indexed_source(&file)
+                .expect("fixture source");
+            let mut context = SemanticQueryContext::new(workspace, None, Default::default());
+            // Source/declaration lookup is shared by every language; the cheap
+            // pre-lowering inventory hook is not implemented by every adapter.
+            let procedures = context.procedure_of_source_range(
+                &file,
+                *range,
+                crate::analyzer::semantic::ContentIdentity::hash_bytes(source.as_bytes()),
+            );
+            let mut matching = procedures
+                .into_iter()
+                .filter(|procedure| {
+                    procedure
+                        .handle
+                        .semantics()
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .is_some_and(|segment| segment.name() == Some(name))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "named fixture root {path}::{name}: {matching:?}"
+            );
+            matching.remove(0)
+        }
+
+        fn names_path(key: &brokk_bifrost_analysis::analyzer::ReadKey, path: &str) -> bool {
+            use brokk_bifrost_analysis::analyzer::LookupQuestion;
+            use brokk_bifrost_analysis::analyzer::ReadKey;
+            match key {
+                ReadKey::File { rel_path, .. } | ReadKey::PathAbsent { rel_path, .. } => {
+                    rel_path.as_ref() == path
+                }
+                ReadKey::Artifact { rel_path, .. } => rel_path.as_deref() == Some(path),
+                ReadKey::Lookup { question, .. } => match question {
+                    LookupQuestion::Declaration { rel_path, .. }
+                    | LookupQuestion::File { rel_path }
+                    | LookupQuestion::CallSite { rel_path, .. }
+                    | LookupQuestion::ProcedureCallSite { rel_path, .. } => {
+                        rel_path.as_ref() == path
+                    }
+                    LookupQuestion::Name { .. }
+                    | LookupQuestion::Summary { .. }
+                    | LookupQuestion::WorkspaceFact { .. } => false,
+                },
+                _ => false,
+            }
+        }
+
+        // Compare even rejected roots here: the fresh solve also proves whether
+        // the mutation changed the product, independently of the expected verdict.
+        fn targeted_verdict(
+            case: &str,
+            project: &BuiltInlineTestProject,
+            base: &WorkspaceAnalyzer,
+            product: &TypeFlowRootProduct,
+            root_path: &str,
+            root_name: &str,
+        ) -> (ReadVerdict, Vec<&'static str>) {
+            let head = project.workspace_analyzer(AnalyzerConfig::default());
+            let changed = ChangedFacts::between(base, &head);
+            assert!(changed.is_complete(), "{:?}", changed.incompleteness());
+            assert_eq!(changed.changed_path_count(), 1);
+            let artifact = DerivedArtifactId::new(
+                DerivedArtifactKind::PolicyEvaluationUnit,
+                read_set_digest(&product.reads).digest(),
+            );
+            let root = named_root(&head, project, root_path, root_name);
+            let answers = head_field_answers(&head, &root);
+            let verdict = verify_read_set_for_artifact(
+                artifact,
+                &head,
+                &changed,
+                &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                &product.reads,
+                LookupReplayLimits::default(),
+                &answers,
+                &mut LookupMemo::new(),
+            );
+            let before = verify_read_set_for_artifact(
+                artifact,
+                &head,
+                &changed,
+                &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                &before_field_slot_reads(product),
+                LookupReplayLimits::default(),
+                &answers,
+                &mut LookupMemo::new(),
+            );
+            if let Some(family) = match case {
+                "T8" => Some(WorkspaceFactFamily::PythonSavedDefaults),
+                "T13" => Some(WorkspaceFactFamily::PythonModuleMemberMutation),
+                _ => None,
+            } {
+                // Prove this family's certificate rejects independently of
+                // field-slot coverage or any other named input in the product.
+                let family_reads = before_field_slot_reads(product)
+                    .into_iter()
+                    .filter(|key| {
+                        matches!(key,
+                            brokk_bifrost_analysis::analyzer::ReadKey::Lookup {
+                                question: LookupQuestion::WorkspaceFact { family: recorded, .. }, ..
+                            } if *recorded == family
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !family_reads.is_empty(),
+                    "{case} must name {family:?}: {:?}",
+                    product.reads
+                );
+                let family_verdict = verify_read_set_for_artifact(
+                    artifact,
+                    &head,
+                    &changed,
+                    &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                    &family_reads,
+                    LookupReplayLimits::default(),
+                    &answers,
+                    &mut LookupMemo::new(),
+                );
+                assert_ne!(
+                    family_verdict,
+                    ReadVerdict::Unchanged,
+                    "{case} own Fact accepted: {family_reads:?}"
+                );
+                eprintln!("M4A {case} family_verdict={family_verdict:?}");
+            }
+            eprintln!("M4A {case} before_verdict={before:?} after_verdict={verdict:?}");
+            assert!(before == ReadVerdict::Unchanged || verdict != ReadVerdict::Unchanged);
+            if product.reads.iter().any(|key| {
+                matches!(
+                    key,
+                    brokk_bifrost_analysis::analyzer::ReadKey::Lookup {
+                        kind: brokk_bifrost_analysis::analyzer::LookupKind::WorkspaceFact,
+                        question: LookupQuestion::WorkspaceFact {
+                            family: WorkspaceFactFamily::FieldSlots,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            }) {
+                let unavailable = verify_read_set_for_artifact(
+                    artifact,
+                    &head,
+                    &changed,
+                    &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                    &product.reads,
+                    LookupReplayLimits::default(),
+                    &brokk_bifrost_analysis::analyzer::NoSummaryAnswers,
+                    &mut LookupMemo::new(),
+                );
+                assert!(
+                    unavailable != ReadVerdict::Unchanged,
+                    "unanswerable field reads must invalidate"
+                );
+            }
+            let root = named_root(&head, project, root_path, root_name);
+            let fresh = solve(&head, &mut TypeFlowQueryState::default(), &root);
+            let mut differences = Vec::new();
+            for ((field, before), (_, after)) in
+                observations(product).into_iter().zip(observations(&fresh))
+            {
+                if before != after {
+                    differences.push(field);
+                    eprintln!("{case} field={field}\nbefore={before}\nafter={after}");
+                }
+            }
+            eprintln!(
+                "M4A {case} verdict={verdict:?} differing_fields={differences:?} reads={:?}",
+                product.reads
+            );
+            (verdict, differences)
+        }
+
+        fn field_fixture() -> BuiltInlineTestProject {
+            InlineTestProject::with_language(Language::Python).with_git()
+                .file("c.py", "class Item:\n    pass\n\nclass Other:\n    pass\n\nclass C:\n    def __init__(self):\n        self.attr = Item()\n")
+                .file("r.py", "from c import C\n\nclass Reader(C):\n    def R(self):\n        value = self.attr\n        return value.missing\n")
+                .file("u.py", "marker = 0\n").build()
+        }
+
+        fn mutate_external_field(project: &BuiltInlineTestProject) {
+            project
+                .file("u.py")
+                .write("from c import C, Other\n\nAlias = C\nAlias.attr = Other()\n")
+                .expect("external alias field write");
+        }
+
+        #[test]
+        #[hardwon(
+            "#2445: external alias stores change field slots without invalidating root reads"
+        )]
+        fn read_set_mutation_external_field_slots() {
+            let project = field_fixture();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "r.py", "R");
+            let mut state = TypeFlowQueryState::default();
+            let product = solve(&base, &mut state, &root);
+            assert_eq!(
+                state.work().field_slot_builds,
+                1,
+                "T1 must build cold field slots"
+            );
+            assert!(
+                !product.reads.iter().any(|key| names_path(key, "u.py")),
+                "T1 requires u.py outside root reads: {:?}",
+                product.reads
+            );
+            mutate_external_field(&project);
+            let (verdict, differences) =
+                targeted_verdict("T1", &project, &base, &product, "r.py", "R");
+            assert_eq!(
+                differences,
+                vec!["projected_rows", "class_sets", "findings"],
+                "mutation must change the slots consumed by R"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "external field-slot edit accepted; fresh differences={differences:?}"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_warm_value_flow() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("c.py", "class Item:\n    pass\n\nclass Other:\n    pass\n")
+                .file("f.py", "from c import Item, Other\n\ndef f():\n    return Item()\n")
+                .file("r.py", "from f import f\n\ndef A():\n    return f().missing\n\ndef B():\n    return f().missing\n").build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let mut state = TypeFlowQueryState::default();
+            let a = named_root(&base, &project, "r.py", "A");
+            let b = named_root(&base, &project, "r.py", "B");
+            let before_a = state.value_flow_cache.stats();
+            let _a = solve(&base, &mut state, &a);
+            let after_a = state.value_flow_cache.stats();
+            let product = solve(&base, &mut state, &b);
+            let b_stats = state.value_flow_cache.stats().saturating_sub(after_a);
+            eprintln!(
+                "T2 A_stats={:?} B_stats={b_stats:?}",
+                after_a.saturating_sub(before_a)
+            );
+            assert!(
+                b_stats.snapshot_hits > 0,
+                "B must hit warmed value-flow snapshots: {b_stats:?}"
+            );
+            let names_f_artifact = product.reads.iter().any(|key| matches!(key,
+                brokk_bifrost_analysis::analyzer::ReadKey::Artifact { rel_path: Some(path), .. } if path.as_ref() == "f.py"));
+            eprintln!("T2 B_names_f_artifact={names_f_artifact}");
+            project
+                .file("f.py")
+                .write("from c import Item, Other\n\ndef f():\n    return Other()\n")
+                .expect("callee mutation");
+            let (verdict, differences) =
+                targeted_verdict("T2", &project, &base, &product, "r.py", "B");
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "warm callee edit accepted; fresh differences={differences:?}"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_added_typescript_alias_target() {
+            use brokk_bifrost_analysis::analyzer::ReadKey;
+            let project = InlineTestProject::with_language(Language::TypeScript).with_git()
+                .file("src/app.ts", "import { Owner } from '@/owner';\nfunction root(value: Owner) { return value.missing; }\n")
+                .file("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}"#)
+                .build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "src/app.ts", "root");
+            let product = solve(&base, &mut TypeFlowQueryState::default(), &root);
+            let negative_reads = product.reads.iter().filter(|key| matches!(key, ReadKey::PathAbsent { rel_path, .. } if rel_path.as_ref() == "src/owner.ts")).cloned().collect::<Vec<_>>();
+            assert!(
+                !negative_reads.is_empty(),
+                "alias miss did not name its target: {:?}",
+                product.reads
+            );
+            project
+                .file("src/owner.ts")
+                .write("export class Owner {}\n")
+                .unwrap();
+            let (verdict, differences) = targeted_verdict(
+                "added_typescript_alias_target",
+                &project,
+                &base,
+                &product,
+                "src/app.ts",
+                "root",
+            );
+            assert_ne!(verdict, ReadVerdict::Unchanged);
+            assert!(
+                !differences.is_empty(),
+                "adding the imported class must change the fresh root product"
+            );
+            let head = project.workspace_analyzer(AnalyzerConfig::default());
+            let changed = ChangedFacts::between(&base, &head);
+            let artifact = DerivedArtifactId::new(
+                DerivedArtifactKind::PolicyEvaluationUnit,
+                read_set_digest(&negative_reads).digest(),
+            );
+            assert_ne!(
+                verify_read_set_for_artifact(
+                    artifact,
+                    &head,
+                    &changed,
+                    &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                    &negative_reads,
+                    LookupReplayLimits::default(),
+                    &brokk_bifrost_analysis::analyzer::NoSummaryAnswers,
+                    &mut LookupMemo::new()
+                ),
+                ReadVerdict::Unchanged
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_new_file_dispatch() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("c.py", "class Item:\n    pass\n\nclass Other:\n    pass\n\nclass C:\n    def method(self):\n        return Item()\n")
+                .file("r.py", "from c import C\n\ndef R(value: C):\n    return value.method().missing\n").build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "r.py", "R");
+            let product = solve(&base, &mut TypeFlowQueryState::default(), &root);
+            assert!(
+                !product.reads.iter().any(|key| names_path(key, "s.py")),
+                "new file must not have been probed"
+            );
+            project.file("s.py").write("from c import C, Other\n\nclass Sub(C):\n    def method(self):\n        return Other()\n\ninstance = Sub()\n").expect("new subclass file");
+            let (verdict, differences) =
+                targeted_verdict("T3", &project, &base, &product, "r.py", "R");
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "new dispatch subclass accepted; fresh differences={differences:?}"
+            );
+        }
+
+        #[test]
+        #[hardwon("#2445: memory-cached field slots replay no dependency keys into root capture")]
+        fn read_set_mutation_field_slot_memory_hit() {
+            let project = field_fixture();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let flow = brokk_bifrost_flow::FlowWorkspaceState::new();
+            let root = named_root(&base, &project, "r.py", "R");
+            let mut first = TypeFlowQueryState::new(
+                flow.value_flow_cache(),
+                flow.type_flow_summaries(),
+                CodeQueryRootAllotment::from_execution_limits(
+                    &crate::structural::CodeQueryExecutionLimits::default(),
+                ),
+            );
+            let _first = solve(&base, &mut first, &root);
+            let mut second = TypeFlowQueryState::new(
+                flow.value_flow_cache(),
+                flow.type_flow_summaries(),
+                CodeQueryRootAllotment::from_execution_limits(
+                    &crate::structural::CodeQueryExecutionLimits::default(),
+                ),
+            );
+            let product = solve(&base, &mut second, &root);
+            eprintln!(
+                "T4 first_work={:?} second_work={:?}",
+                first.work(),
+                second.work()
+            );
+            assert_eq!(
+                second.work().field_slot_memory_hits,
+                1,
+                "second query must acquire memory-cached field slots"
+            );
+            assert_eq!(second.work().field_slot_builds, 0);
+            assert!(
+                !product.reads.iter().any(|key| names_path(key, "u.py")),
+                "T4 requires u.py outside root reads: {:?}",
+                product.reads
+            );
+            mutate_external_field(&project);
+            let (verdict, differences) =
+                targeted_verdict("T4", &project, &base, &product, "r.py", "R");
+            assert_eq!(
+                differences,
+                vec!["projected_rows", "class_sets", "findings"],
+                "mutation must change the slots consumed by R"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "memory-hit field-slot edit accepted; fresh differences={differences:?}"
+            );
+        }
+
+        #[test]
+        #[hardwon(
+            "#2445: external subclass-instance stores must invalidate inherited field-slot reads"
+        )]
+        fn read_set_mutation_external_subclass_field() {
+            let project = field_fixture();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "r.py", "R");
+            let product = solve(&base, &mut TypeFlowQueryState::default(), &root);
+            assert!(
+                !product.reads.iter().any(|key| names_path(key, "u.py")),
+                "external write file must not be read"
+            );
+            project.file("u.py").write("from c import C, Other\n\nclass Child(C):\n    pass\n\nobj = Child()\nalias = obj\nalias.attr = Other()\n").expect("subclass instance write");
+            let (verdict, differences) =
+                targeted_verdict("T5", &project, &base, &product, "r.py", "R");
+            assert!(
+                !differences.is_empty(),
+                "subclass-instance mutation must change the fresh product"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "subclass-instance field write accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_first_external_field_write() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("c.py", "class Other:\n    pass\n\nclass C:\n    pass\n")
+                .file("r.py", "from c import C\n\nclass Reader(C):\n    def R(self):\n        return self.attr\n")
+                .file("u.py", "marker = 0\n").build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "r.py", "R");
+            let product = solve(&base, &mut TypeFlowQueryState::default(), &root);
+            assert!(!product.reads.iter().any(|key| names_path(key, "u.py")));
+            assert!(product.reads.iter().any(|key| matches!(key,
+                brokk_bifrost_analysis::analyzer::ReadKey::Lookup {
+                    kind: brokk_bifrost_analysis::analyzer::LookupKind::WorkspaceFact,
+                            question: LookupQuestion::WorkspaceFact { family: WorkspaceFactFamily::FieldSlots, .. }, digest, ..
+                } if *digest == brokk_bifrost_analysis::analyzer::read_ledger::absent_summary_digest()
+            )), "the root must record a class with no slots: {:?}", product.reads);
+            mutate_external_field(&project);
+            let (verdict, differences) =
+                targeted_verdict("T6", &project, &base, &product, "r.py", "R");
+            assert!(!differences.is_empty());
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "first external write must reject an absent-slot read"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_warm_mro_change() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("base.py", "class Item:\n    pass\n\nclass Other:\n    pass\n\nclass A:\n    def pick(self):\n        return Item()\n\nclass A2:\n    def pick(self):\n        return Other()\n")
+                .file("mid.py", "from base import A, A2\n\nclass B(A):\n    pass\n")
+                .file("r.py", "from mid import B\n\nclass Reader(B):\n    def R(self):\n        return self.pick().missing\n").build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let root = named_root(&base, &project, "r.py", "R");
+            let mut state = TypeFlowQueryState::default();
+            let _cold = solve(&base, &mut state, &root);
+            let before = state.value_flow_cache.stats();
+            let product = solve(&base, &mut state, &root);
+            eprintln!(
+                "T7 warm_stats={:?}",
+                state.value_flow_cache.stats().saturating_sub(before)
+            );
+            assert!(
+                state
+                    .value_flow_cache
+                    .stats()
+                    .saturating_sub(before)
+                    .dispatch_hits
+                    > 0
+            );
+            project
+                .file("mid.py")
+                .write("from base import A, A2\n\nclass B(A2):\n    pass\n")
+                .expect("base-class mutation without new method names");
+            let (verdict, differences) =
+                targeted_verdict("T7", &project, &base, &product, "r.py", "R");
+            assert!(
+                !differences.is_empty(),
+                "inheritance edit must change dispatch's product"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "warm hierarchy edit accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        #[hardwon(
+            "#2445: cached call bindings omit workspace Python default-mutation dependencies"
+        )]
+        fn read_set_mutation_warm_binding_default_metadata() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("c.py", "class Item:\n    pass\n\nclass Other:\n    pass\n")
+                .file("h.py", "from c import Item\n\ndef h(value=Item()):\n    return value\n")
+                .file("f.py", "from h import h\n\ndef f():\n    return h()\n")
+                .file("r.py", "from f import f\n\ndef A():\n    return f().missing\n\ndef B():\n    return f().missing\n")
+                .file("u.py", "marker = 0\n").build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let mut state = TypeFlowQueryState::default();
+            let a = named_root(&base, &project, "r.py", "A");
+            let b = named_root(&base, &project, "r.py", "B");
+            let _a = solve(&base, &mut state, &a);
+            // Keep provider entries warm, but require full discovery of the
+            // shared wrapper rather than cutting it with a class-set summary.
+            state.summary_state = None;
+            state.summary_partitions = Default::default();
+            let before = state.value_flow_cache.stats();
+            let product = solve(&base, &mut state, &b);
+            let hits = state.value_flow_cache.stats().saturating_sub(before);
+            eprintln!(
+                "T8 B_stats={hits:?} complete={} persistence={:?}",
+                product.complete, product.persistence_status
+            );
+            assert_eq!(
+                product.unattributed_reads, 0,
+                "the missing metadata dependency must not already be reported as unattributed"
+            );
+            assert!(
+                hits.snapshot_hits > 0 && hits.binding_hits > 0,
+                "must hit both value-flow caches"
+            );
+            assert!(
+                !product.reads.iter().any(|key| names_path(key, "u.py")),
+                "default mutation file must be outside the capture"
+            );
+            project
+                .file("u.py")
+                .write("from h import h\nfrom c import Other\n\nh.__defaults__ = (Other(),)\n")
+                .expect("external callee-default mutation");
+            let (verdict, differences) =
+                targeted_verdict("T8", &project, &base, &product, "r.py", "B");
+            assert!(
+                !differences.is_empty(),
+                "default metadata edit must affect binding precision"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "warm default metadata edit accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        #[hardwon("#2445: cached module-global seeds omit cross-file module mutation safety")]
+        fn read_set_mutation_external_module_global() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .with_git()
+                .file(
+                    "c.py",
+                    "class Item:\n    pass\n\nvalue = Item()\n\ndef get():\n    return value\n",
+                )
+                .file(
+                    "r.py",
+                    "from c import get\n\ndef R():\n    return get().missing\n",
+                )
+                .file("u.py", "marker = 0\n")
+                .build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "r.py", "R");
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let mut state = TypeFlowQueryState::default();
+            // Warm generation/query authorities and provider caches before the
+            // measured capture; keep solving through the production root path.
+            let _warm = solve(&base, &mut state, &root);
+            state.summary_state = None;
+            state.summary_partitions = Default::default();
+            let product = solve(&base, &mut state, &root);
+            assert_eq!(product.unattributed_reads, 0);
+            assert_eq!(state.work().cache_hits, 0);
+            assert_eq!(state.work().root_memo_hits, 0);
+            assert!(
+                !product.reads.iter().any(|key| names_path(key, "u.py")),
+                "reads={:?}",
+                product.reads
+            );
+            project
+                .file("u.py")
+                .write("import c\n\nc.value = None\n")
+                .expect("external module global replacement");
+            let (verdict, differences) =
+                targeted_verdict("T13", &project, &base, &product, "r.py", "R");
+            assert!(
+                !differences.is_empty(),
+                "module mutation must change the fresh product"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "external module global accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        #[hardwon("#2445: per-class field-slot content omits the dynamic store survey")]
+        fn read_set_mutation_external_dynamic_survey() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .with_git()
+                .file("c.py", "class C:\n    pass\n")
+                .file(
+                    "r.py",
+                    "from c import C\n\ndef R():\n    return C().missing\n",
+                )
+                .file("u.py", "marker = 0\n")
+                .build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "r.py", "R");
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let mut state = TypeFlowQueryState::default();
+            // Warm generation/query authorities and provider caches before the
+            // measured capture; keep solving through the production root path.
+            let _warm = solve(&base, &mut state, &root);
+            state.summary_state = None;
+            state.summary_partitions = Default::default();
+            let product = solve(&base, &mut state, &root);
+            assert_eq!(product.unattributed_reads, 0);
+            assert_eq!(state.work().cache_hits, 0);
+            assert_eq!(state.work().root_memo_hits, 0);
+            assert!(
+                !product.reads.iter().any(|key| names_path(key, "u.py")),
+                "reads={:?}",
+                product.reads
+            );
+            assert!(
+                product.reads.iter().any(|key| matches!(
+                    key,
+                    brokk_bifrost_analysis::analyzer::ReadKey::Lookup {
+                        kind: brokk_bifrost_analysis::analyzer::LookupKind::WorkspaceFact,
+                        question: LookupQuestion::WorkspaceFact {
+                            family: WorkspaceFactFamily::FieldSlots,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                "the existing per-class key must actually be captured"
+            );
+            project.file("u.py").write("from c import C\n\ndef mutate(obj, name, value):\n    setattr(obj, name, value)\n\nmutate(C(), input(), None)\n")
+                .expect("external dynamic write survey change");
+            let (verdict, differences) =
+                targeted_verdict("T14", &project, &base, &product, "r.py", "R");
+            assert!(
+                !differences.is_empty(),
+                "dynamic survey must change the fresh product"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "external dynamic survey accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        #[hardwon("#2445: source-root module discovery omits package path-extension authority")]
+        fn read_set_mutation_external_package_path_authority() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .with_git()
+                .file(
+                    "pyproject.toml",
+                    "[tool.setuptools.packages.find]\nwhere = ['.']\n",
+                )
+                .file("pkg/__init__.py", "marker = 0\n")
+                .file("pkg/pkg/__init__.py", "")
+                .file(
+                    "pkg/pkg/mod.py",
+                    "class Item:\n    pass\n\ndef get():\n    return Item()\n",
+                )
+                .file(
+                    "r.py",
+                    "from pkg.mod import get\n\ndef R():\n    return get().missing\n",
+                )
+                .build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let root = named_root(&base, &project, "r.py", "R");
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let mut state = TypeFlowQueryState::default();
+            let _warm = solve(&base, &mut state, &root);
+            state.summary_state = None;
+            state.summary_partitions = Default::default();
+            let product = solve(&base, &mut state, &root);
+            assert_eq!(product.unattributed_reads, 0);
+            assert_eq!(state.work().cache_hits, 0);
+            assert_eq!(state.work().root_memo_hits, 0);
+            assert!(
+                !product
+                    .reads
+                    .iter()
+                    .any(|key| names_path(key, "pkg/__init__.py")),
+                "the marker must be outside the captured paths: {:?}",
+                product.reads
+            );
+            project
+                .file("pkg/__init__.py")
+                .write(
+                    "import os\n__path__.append(os.path.join(os.path.dirname(__file__), 'pkg'))\n",
+                )
+                .expect("package search path mutation");
+            let (verdict, differences) =
+                targeted_verdict("T15", &project, &base, &product, "r.py", "R");
+            assert!(
+                !differences.is_empty(),
+                "package path authority must change the fresh product"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "package path authority accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_runtime_summary_transitive_callee() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("c.py", "class Item:\n    pass\n\nclass Other:\n    pass\n")
+                .file("leaf.py", "from c import Other\n\ndef leaf(value):\n    return value\n")
+                .file("f.py", "from leaf import leaf\n\ndef f(value):\n    return leaf(value)\n")
+                .file("r.py", "from c import Item\nfrom f import f\n\ndef A():\n    return f(Item()).missing\n\ndef B():\n    return f(Item()).missing\n").build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let mut state = TypeFlowQueryState::default();
+            let a = named_root(&base, &project, "r.py", "A");
+            let b = named_root(&base, &project, "r.py", "B");
+            let a = solve(&base, &mut state, &a);
+            assert!(
+                a.work.published_summaries > 0,
+                "A must publish runtime class-set summaries"
+            );
+            let product = solve(&base, &mut state, &b);
+            eprintln!("T9 B_work={:?}", product.work);
+            assert!(
+                product.work.summary_cache_hits > product.work.root_summary_cache_hits,
+                "B must use runtime summaries"
+            );
+            for path in ["f.py", "leaf.py"] {
+                let artifact = product.reads.iter().any(|key| matches!(key,
+                    brokk_bifrost_analysis::analyzer::ReadKey::Artifact { rel_path: Some(recorded), .. }
+                    if recorded.as_ref() == path));
+                eprintln!("T9 artifact({path})={artifact}");
+                assert!(
+                    artifact,
+                    "runtime summary closure must record {path} artifact"
+                );
+            }
+            project
+                .file("leaf.py")
+                .write("from c import Other\n\ndef leaf(value):\n    return Other()\n")
+                .expect("transitive summary callee mutation");
+            let (verdict, differences) =
+                targeted_verdict("T9", &project, &base, &product, "r.py", "B");
+            assert!(!differences.is_empty());
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "summary closure edit accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_same_query_refinement_hits() {
+            let project = field_fixture();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let root = named_root(&base, &project, "r.py", "R");
+            let mut state = TypeFlowQueryState::default();
+            let cold = solve(&base, &mut state, &root);
+            let product = solve(&base, &mut state, &root);
+            assert_eq!(observations(&cold), observations(&product));
+            assert!(
+                state.work().cache_hits == 0 && state.work().root_memo_hits == 0,
+                "must solve again through shared ProcedureRefinements, not product memo"
+            );
+            mutate_external_field(&project);
+            let (verdict, differences) =
+                targeted_verdict("T10", &project, &base, &product, "r.py", "R");
+            assert!(!differences.is_empty());
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "refinement-hit field edit accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_warm_subclass_reparenting() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("base.py", "class Item:\n    pass\n\nclass Other:\n    pass\n\nclass A:\n    def method(self):\n        return Item()\n\nclass A2:\n    pass\n")
+                .file("b.py", "from base import A, A2, Other\n\nclass B(A2):\n    def method(self):\n        return Other()\n")
+                .file("r.py", "from base import A\n\ndef R(value: A):\n    return value.method().missing\n").build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let _query = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(base.analyzer());
+            let root = named_root(&base, &project, "r.py", "R");
+            let mut state = TypeFlowQueryState::default();
+            let _cold = solve(&base, &mut state, &root);
+            let before = state.value_flow_cache.stats();
+            let product = solve(&base, &mut state, &root);
+            eprintln!(
+                "T12 warm_stats={:?}",
+                state.value_flow_cache.stats().saturating_sub(before)
+            );
+            assert!(
+                state
+                    .value_flow_cache
+                    .stats()
+                    .saturating_sub(before)
+                    .dispatch_hits
+                    > 0
+            );
+            eprintln!(
+                "T12 names_b={}",
+                product.reads.iter().any(|key| names_path(key, "b.py"))
+            );
+            project.file("b.py").write("from base import A, A2, Other\n\nclass B(A):\n    def method(self):\n        return Other()\n").expect("reparent existing override, preserving definition names");
+            let (verdict, differences) =
+                targeted_verdict("T12", &project, &base, &product, "r.py", "R");
+            assert!(
+                !differences.is_empty(),
+                "reparenting must change dispatch's product"
+            );
+            assert!(
+                verdict != ReadVerdict::Unchanged,
+                "warm reparenting accepted: {differences:?}"
+            );
+        }
+
+        #[test]
+        fn read_set_mutation_add_override() {
+            check(
+                "add_override",
+                "children.py",
+                &CHILDREN.replace(
+                    "class Child(Item):\n    pass",
+                    "class Child(Item):\n    def ping(self):\n        return Other()",
+                ),
+            );
+        }
+        #[test]
+        fn read_set_mutation_field_write() {
+            check(
+                "field_write",
+                "classes.py",
+                &CLASSES.replace("alias.value = Item()", "alias.value = Other()"),
+            );
+        }
+        #[test]
+        fn read_set_mutation_new_subclass() {
+            check(
+                "new_subclass",
+                "children.py",
+                &format!(
+                    "{CHILDREN}\nclass NewChild(Item):\n    def ping(self):\n        return Other()\n"
+                ),
+            );
+        }
+        #[test]
+        fn read_set_mutation_unrelated() {
+            check(
+                "unrelated",
+                "unrelated.py",
+                "def unrelated():\n    return 2\n",
+            );
+        }
+        #[test]
+        fn read_set_mutation_callee_same_behavior() {
+            check(
+                "callee_same_behavior",
+                "callee.py",
+                &CALLEE.replace("return Item()", "value = Item()\n    return value"),
+            );
+        }
+        #[test]
+        fn read_set_mutation_callee_return_class() {
+            check(
+                "callee_return_class",
+                "callee.py",
+                &CALLEE.replace("return Item()", "return Other()"),
+            );
+        }
+    }
+
+    mod cached_read_replay {
+        use super::super::{
+            CachedTypeFlowAnalysis, ClassSetRootResultLookup, FindingFreeClassSetRootResult,
+            TypeFlowRootProduct, root_result_persistence_key,
+        };
+        use super::*;
+        use crate::structural::search::semantic::SemanticQueryContext;
+        use brokk_bifrost_analysis::analyzer::invalidation::{
+            DerivedArtifactId, DerivedArtifactKind,
+        };
+        use brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest;
+        use brokk_bifrost_analysis::analyzer::{
+            AnalyzerQueryScope, ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
+            ReadKey, ReadVerdict, verify_read_set_for_artifact,
+        };
+        use brokk_bifrost_test_macros::hardwon;
+        use std::sync::Arc;
+
+        #[test]
+        #[hardwon("#2445: a warm missing-source memo omitted its negative path input")]
+        fn cached_missing_source_records_its_absent_path() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .file("present.py", "class Present: pass\n")
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let analyzer = workspace.analyzer();
+            let missing = brokk_bifrost_analysis::analyzer::ProjectFile::new(
+                analyzer.project().root(),
+                "missing.py",
+            );
+            let _query = AnalyzerQueryScope::new(analyzer);
+            assert!(analyzer.indexed_source(&missing).is_none());
+            let (_, reads) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(analyzer, || {
+                    assert!(analyzer.indexed_source(&missing).is_none());
+                });
+            assert!(
+                reads.keys().iter().any(|key| matches!(key,
+                    ReadKey::PathAbsent { language: Language::Python, rel_path }
+                        if rel_path.as_ref() == "missing.py"
+                )),
+                "warm source absence must retain its input: {:?}",
+                reads.keys()
+            );
+        }
+
+        fn root(
+            workspace: &WorkspaceAnalyzer,
+            project: &BuiltInlineTestProject,
+            name: &str,
+        ) -> super::super::SemanticProcedureValue {
+            let mut context = SemanticQueryContext::new(workspace, None, Default::default());
+            let reference = context
+                .procedure_references(&project.file("roots.py"))
+                .into_iter()
+                .find(|reference| {
+                    reference
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .is_some_and(|segment| segment.name() == Some(name))
+                })
+                .expect("named root");
+            context
+                .resolve_procedure_reference(&reference)
+                .expect("root resolves")
+        }
+
+        fn solve(
+            workspace: &WorkspaceAnalyzer,
+            state: &mut TypeFlowQueryState,
+            root: &super::super::SemanticProcedureValue,
+        ) -> Arc<TypeFlowRootProduct> {
+            state.release_file_window();
+            let result = state.solve_live(
+                workspace,
+                root,
+                &mut SemanticBudget::default(),
+                CodeQueryValueFlowLimits::default(),
+                &CancellationToken::default(),
+                workspace.analyzer().active_semantic_model_snapshot(),
+            );
+            let Some(CachedTypeFlowAnalysis::Owned(result)) = result else {
+                panic!("owned root: {:?}", state.take_diagnostics());
+            };
+            result.product
+        }
+
+        #[test]
+        #[hardwon("#2445: later roots lost warm snapshot, binding and guard-refinement inputs")]
+        fn shared_snapshots_bindings_and_refinements_replay_changed_callee_inputs() {
+            for (callee, edited) in [
+                (
+                    "from classes import Item, Other\n\ndef make():\n    return Item()\n",
+                    "from classes import Item, Other\n\ndef make():\n    return Other()\n",
+                ),
+                (
+                    "from classes import Item, Other\n\ndef make():\n    value = Item()\n    if isinstance(value, Item):\n        return value\n    return Other()\n",
+                    "from classes import Item, Other\n\ndef make():\n    value = Other()\n    if isinstance(value, Item):\n        return value\n    return Other()\n",
+                ),
+            ] {
+                let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("classes.py", "class Item:\n    pass\n\nclass Other:\n    pass\n")
+                .file("callee.py", callee)
+                .file("roots.py", "from callee import make\n\ndef first():\n    return make().missing\n\ndef second():\n    return make().missing\n")
+                .build();
+                let base = project.workspace_analyzer(AnalyzerConfig::default());
+                let _query = AnalyzerQueryScope::new(base.analyzer());
+                let mut state = TypeFlowQueryState::default();
+                let a = root(&base, &project, "first");
+                let b = root(&base, &project, "second");
+                let first = solve(&base, &mut state, &a);
+                // Force discovery while retaining value-flow and refinement entries.
+                state.summary_state = None;
+                state.summary_partitions = Default::default();
+                let before = state.value_flow_cache.stats();
+                let second = solve(&base, &mut state, &b);
+                let hits = state.value_flow_cache.stats().saturating_sub(before);
+                assert!(
+                    hits.snapshot_hits > 0 && hits.binding_hits > 0,
+                    "must consume shared derivations: {hits:?}"
+                );
+                let callee_inputs: Vec<_> = first.reads.iter().filter(|key| matches!(key,
+                ReadKey::Artifact { rel_path: Some(path), .. } if path.as_ref() == "callee.py"
+            )).collect();
+                assert!(
+                    !callee_inputs.is_empty(),
+                    "root A must read the shared callee artifact"
+                );
+                assert!(
+                    callee_inputs.iter().all(|key| second.reads.contains(key)),
+                    "root B must inherit shared inputs"
+                );
+                project
+                    .file("callee.py")
+                    .write(edited)
+                    .expect("edit shared input");
+                let head = project.workspace_analyzer(AnalyzerConfig::default());
+                let changed = ChangedFacts::between(&base, &head);
+                assert!(changed.is_complete());
+                let verdict = verify_read_set_for_artifact(
+                    DerivedArtifactId::new(
+                        DerivedArtifactKind::PolicyEvaluationUnit,
+                        read_set_digest(&second.reads).digest(),
+                    ),
+                    &head,
+                    &changed,
+                    &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                    &second.reads,
+                    LookupReplayLimits::default(),
+                    &NoSummaryAnswers,
+                    &mut LookupMemo::new(),
+                );
+                assert_ne!(
+                    verdict,
+                    ReadVerdict::Unchanged,
+                    "edited shared input must reject B"
+                );
+                let fresh = solve(
+                    &head,
+                    &mut TypeFlowQueryState::default(),
+                    &root(&head, &project, "second"),
+                );
+                assert_ne!(
+                    format!("{:?}", second.class_sets),
+                    format!("{:?}", fresh.class_sets),
+                    "fresh solve must change its semantic answer"
+                );
+            }
+        }
+
+        #[test]
+        fn runtime_summary_replays_the_publishing_roots_inputs() {
+            let project = InlineTestProject::with_language(Language::Python).with_git()
+                .file("classes.py", "class Item:\n    pass\n\nclass Other:\n    pass\n")
+                .file("leaf.py", "from classes import Other\n\ndef leaf(value):\n    return value\n")
+                .file("helper.py", "from leaf import leaf\n\ndef relay(value):\n    return leaf(value)\n")
+                .file("warm.py", "from classes import Item\nfrom helper import relay\n\ndef first():\n    return relay(Item()).missing\n")
+                .file("roots.py", "from classes import Item\nfrom helper import relay\n\ndef second():\n    return relay(Item()).missing\n")
+                .build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let _query = AnalyzerQueryScope::new(base.analyzer());
+            let mut context = SemanticQueryContext::new(&base, None, Default::default());
+            let reference = context
+                .procedure_references(&project.file("warm.py"))
+                .into_iter()
+                .find(|reference| {
+                    reference
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .is_some_and(|segment| segment.name() == Some("first"))
+                })
+                .expect("publishing root");
+            let a = context
+                .resolve_procedure_reference(&reference)
+                .expect("publishing root resolves");
+            let b = root(&base, &project, "second");
+            let mut state = TypeFlowQueryState::default();
+            let first = solve(&base, &mut state, &a);
+            assert!(
+                first.work.published_summaries > 0,
+                "A must publish runtime rows: {:?}",
+                first.work
+            );
+            let second = solve(&base, &mut state, &b);
+            assert!(
+                second.work.summary_cache_hits > second.work.root_summary_cache_hits,
+                "B must reuse runtime callee rows: {:?}",
+                second.work
+            );
+            assert!(second.reads.iter().any(|key| matches!(key, ReadKey::Artifact { rel_path: Some(path), .. } if path.as_ref() == "warm.py")), "B must inherit A's own artifact as part of the publication superset: {:?}", second.reads);
+            let leaf_input = first.reads.iter().find(|key| matches!(key, ReadKey::Artifact { rel_path: Some(path), .. } if path.as_ref() == "leaf.py")).expect("A reads the transitive leaf artifact");
+            assert!(
+                second.reads.contains(leaf_input),
+                "B must inherit the summary's input"
+            );
+            project
+                .file("leaf.py")
+                .write("from classes import Other\n\ndef leaf(value):\n    return Other()\n")
+                .expect("summary input edit");
+            let head = project.workspace_analyzer(AnalyzerConfig::default());
+            let verdict = verify_read_set_for_artifact(
+                DerivedArtifactId::new(
+                    DerivedArtifactKind::PolicyEvaluationUnit,
+                    read_set_digest(&second.reads).digest(),
+                ),
+                &head,
+                &ChangedFacts::between(&base, &head),
+                &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                &second.reads,
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            );
+            assert_ne!(
+                verdict,
+                ReadVerdict::Unchanged,
+                "an edited summary input must reject B"
+            );
+            let fresh = solve(
+                &head,
+                &mut TypeFlowQueryState::default(),
+                &root(&head, &project, "second"),
+            );
+            assert_ne!(
+                format!("{:?}", second.class_sets),
+                format!("{:?}", fresh.class_sets),
+                "a fresh solve must observe the edited summary input"
+            );
+        }
+
+        #[test]
+        #[hardwon(
+            "#2445: query root cache hits must replay inputs or refuse receipt-free projections"
+        )]
+        fn query_root_cache_replays_owned_products_and_refuses_unattributed_projections() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .with_git()
+                .file(
+                    "roots.py",
+                    "class Item:\n    pass\n\ndef first():\n    return Item().missing\n",
+                )
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let procedure = root(&workspace, &project, "first");
+            let mut state = TypeFlowQueryState::default();
+            let read = |state: &mut TypeFlowQueryState| {
+                state.solve_live(
+                    &workspace,
+                    &procedure,
+                    &mut SemanticBudget::default(),
+                    CodeQueryValueFlowLimits::default(),
+                    &CancellationToken::default(),
+                    workspace.analyzer().active_semantic_model_snapshot(),
+                )
+            };
+            let (first, fill) = capture_query_reads(workspace.analyzer(), || read(&mut state));
+            let (second, hit) = capture_query_reads(workspace.analyzer(), || read(&mut state));
+            let (
+                Some(CachedTypeFlowAnalysis::Owned(first)),
+                Some(CachedTypeFlowAnalysis::Owned(second)),
+            ) = (first, second)
+            else {
+                panic!("the fixture must produce owned root products");
+            };
+            assert!(Arc::ptr_eq(&first.product, &second.product));
+            assert_eq!(state.work().cache_hits, 1);
+            let keys = hit.keys();
+            assert!(!fill.keys().is_empty());
+            assert!(fill.keys().iter().all(|key| keys.contains(key)));
+            let key = state
+                .cache
+                .keys()
+                .next()
+                .expect("the root was memoized")
+                .clone();
+            state.cache.insert(
+                key,
+                CachedTypeFlowAnalysis::FindingFreeRows(Arc::from(
+                    first.product.projected_rows.clone(),
+                )),
+            );
+            let (projection, projection_reads) = capture_query_reads(workspace.analyzer(), || {
+                state.solve(
+                    &workspace,
+                    &procedure,
+                    &mut SemanticBudget::default(),
+                    CodeQueryValueFlowLimits::default(),
+                    &CancellationToken::default(),
+                    workspace.analyzer().active_semantic_model_snapshot(),
+                )
+            });
+            assert!(matches!(
+                projection,
+                Some(CachedTypeFlowAnalysis::FindingFreeRows(_))
+            ));
+            assert_eq!(state.work().cache_hits, 2);
+            assert!(projection_reads.unattributed_reads() > 0);
+        }
+
+        #[test]
+        #[hardwon("#2445: the first SQLite projection hit published a receipt-free product")]
+        fn first_persisted_projection_hit_refuses_publication_under_a_fresh_capture() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .with_git()
+                .file("roots.py", "def first():\n    return 1\n")
+                .build();
+            let workspace = WorkspaceAnalyzer::build_persisted(
+                project.project_dyn(),
+                AnalyzerConfig::default(),
+            )
+            .unwrap();
+            let procedure = root(&workspace, &project, "first");
+            let cancellation = CancellationToken::default();
+            let limits = CodeQueryValueFlowLimits::default();
+            let models = workspace.analyzer().active_semantic_model_snapshot();
+            let mut seed_state = TypeFlowQueryState::default();
+            seed_state.select_summary_partition(&workspace);
+            let (inputs, _) = seed_state.capture_root_inputs(
+                &workspace,
+                &procedure,
+                &mut SemanticBudget::default(),
+                &cancellation,
+                models.clone(),
+            );
+            let (adapter, behavior, fields) = inputs.unwrap();
+            let key = root_result_persistence_key(
+                &workspace,
+                adapter,
+                behavior,
+                &fields,
+                &procedure.handle,
+                models.as_deref(),
+                limits,
+                seed_state.allotment,
+            )
+            .unwrap();
+            let attachment = workspace
+                .semantic_artifact_store_attachment(procedure.handle.artifact().key())
+                .unwrap()
+                .unwrap();
+            let persisted =
+                FindingFreeClassSetRootResult::try_new(key.clone(), attachment, vec![]).unwrap();
+            let store = workspace.store().unwrap();
+            assert!(!store.is_ephemeral());
+            assert!(
+                store
+                    .publish_finding_free_class_set_root_result(persisted, &cancellation)
+                    .unwrap()
+            );
+            assert!(matches!(
+                store
+                    .finding_free_class_set_root_result(
+                        &key,
+                        limits.max_retained_relations,
+                        limits.max_retained_bytes,
+                        &cancellation
+                    )
+                    .unwrap(),
+                ClassSetRootResultLookup::Hit(_)
+            ));
+            drop(seed_state);
+            let mut hydrated = TypeFlowQueryState::default();
+            assert!(hydrated.cache.is_empty());
+            let (projection, reads) = capture_query_reads(workspace.analyzer(), || {
+                hydrated.solve(
+                    &workspace,
+                    &procedure,
+                    &mut SemanticBudget::default(),
+                    limits,
+                    &cancellation,
+                    models,
+                )
+            });
+            assert!(matches!(
+                projection,
+                Some(CachedTypeFlowAnalysis::FindingFreeRows(_))
+            ));
+            assert_eq!(hydrated.work().root_result_persistence_hits, 1);
+            assert_eq!(hydrated.work().cache_hits, 0);
+            assert_eq!(hydrated.work().solves, 0);
+            assert!(reads.unattributed_reads() > 0);
+            assert!(
+                !reads.is_bounded(),
+                "the hydrated legacy product must not license publication"
+            );
+        }
+
+        #[test]
+        fn subsumed_acquisition_preserves_unattributed_reads() {
+            let project = InlineTestProject::with_language(Language::Python)
+                .file("roots.py", "def first():\n    return 1\n")
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let procedure = root(&workspace, &project, "first");
+            let artifact_key = ReadKey::semantic_artifact(procedure.handle.artifact().key());
+            let (_, reads) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(workspace.analyzer(), || {
+                    workspace.analyzer().record_read(artifact_key.clone());
+                    let (_, unattributed) =
+                        brokk_bifrost_analysis::analyzer::capture_subsumed_query_reads(
+                            workspace.analyzer(),
+                            || {
+                                workspace.analyzer().record_read(ReadKey::Epoch(
+                                    super::super::StableDigest::sha256(b"subsumed build"),
+                                ));
+                                workspace.analyzer().record_unattributed_read();
+                                workspace.analyzer().record_unattributed_read();
+                            },
+                        );
+                    assert_eq!(unattributed, 2);
+                });
+            assert_eq!(reads.keys(), vec![artifact_key]);
+            assert_eq!(reads.unattributed_reads(), 2);
+        }
+
+        #[test]
+        #[hardwon("#2445: a warm witness projection omitted its coordinate source dependency")]
+        fn cached_witness_projection_replays_its_source_input() {
+            let project = InlineTestProject::with_language(Language::Rust)
+                .with_git()
+                .file("lib.rs", "pub fn root() {}\n")
+                .build();
+            let base = project.workspace_analyzer(AnalyzerConfig::default());
+            let finding = absent_finding(
+                &project,
+                &base,
+                "projection",
+                Err(SummaryWitnessError::RetentionDisabled),
+            );
+            let mut state = TypeFlowQueryState::default();
+            let traversal = crate::WitnessTraversal::default();
+            let limits = CodeQueryValueFlowLimits::default();
+            let (first, reads_a) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(base.analyzer(), || {
+                    state.absent_member_witnesses(&base, &finding, &traversal, limits)
+                });
+            let (second, reads_b) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(base.analyzer(), || {
+                    state.absent_member_witnesses(&base, &finding, &traversal, limits)
+                });
+            assert_eq!(first[0].public, second[0].public);
+            assert_eq!(
+                state.work().witnesses,
+                1,
+                "second consumer must hit the projection cache"
+            );
+            let keys = reads_b.keys();
+            assert!(keys.iter().any(|key| matches!(key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == "lib.rs")), "projection must name its actual source: {keys:?}");
+            assert!(reads_a.keys().iter().all(|key| keys.contains(key)));
+            project
+                .file("lib.rs")
+                .write("\npub fn root() {}\n")
+                .expect("source coordinate edit");
+            let head = project.workspace_analyzer(AnalyzerConfig::default());
+            let verdict = verify_read_set_for_artifact(
+                DerivedArtifactId::new(
+                    DerivedArtifactKind::PolicyEvaluationUnit,
+                    read_set_digest(&keys).digest(),
+                ),
+                &head,
+                &ChangedFacts::between(&base, &head),
+                &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+                &keys,
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            );
+            assert_ne!(verdict, ReadVerdict::Unchanged);
+            let fresh_finding = absent_finding(
+                &project,
+                &head,
+                "projection",
+                Err(SummaryWitnessError::RetentionDisabled),
+            );
+            let fresh = TypeFlowQueryState::default().absent_member_witnesses(
+                &head,
+                &fresh_finding,
+                &traversal,
+                limits,
+            );
+            assert_ne!(
+                second[0].public.range, fresh[0].public.range,
+                "fresh projection must observe changed coordinates"
+            );
+        }
+    }
+
     #[test]
     fn type_flow_root_memo_products_are_independent_of_root_order() {
         use super::super::semantic::SemanticQueryContext;
@@ -3091,20 +4918,29 @@ mod tests {
         let solve = |state: &mut TypeFlowQueryState, root: &super::SemanticProcedureValue| {
             state.release_file_window();
             let mut budget = SemanticBudget::default();
-            let result = state.solve_live(
-                &workspace,
-                root,
-                &mut budget,
-                CodeQueryValueFlowLimits::default(),
-                &cancellation,
-                snapshot.clone(),
-            );
+            let (result, captured) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(workspace.analyzer(), || {
+                    state.solve_live(
+                        &workspace,
+                        root,
+                        &mut budget,
+                        CodeQueryValueFlowLimits::default(),
+                        &cancellation,
+                        snapshot.clone(),
+                    )
+                });
             let Some(CachedTypeFlowAnalysis::Owned(result)) = result else {
                 panic!(
                     "fixture root must produce owned evidence: {:?}",
                     state.take_diagnostics()
                 );
             };
+            let keys = captured.keys();
+            assert!(!result.product.reads.is_empty());
+            assert!(
+                result.product.reads.iter().all(|key| keys.contains(key)),
+                "each fresh capture, including a later memo hit, must inherit the fill keys: {keys:?}"
+            );
             result.product
         };
         // Compare semantic observations, excluding work and captured dependency reads.
@@ -3141,7 +4977,10 @@ mod tests {
             state.set_root_memo(Some(memo.clone()));
             let mut products = vec![None; roots.len()];
             for index in order {
-                let product = solve(&mut state, &roots[index]);
+                let (product, reads) =
+                    capture_query_reads(workspace.analyzer(), || solve(&mut state, &roots[index]));
+                assert!(product.reads.iter().all(|key| reads.keys().contains(key)));
+                assert!(!product.reads.is_empty(), "the producer must name inputs");
                 assert_eq!(
                     observations(&product),
                     fresh[index],
@@ -3154,8 +4993,18 @@ mod tests {
             for (index, root) in roots.iter().enumerate() {
                 let mut consumer = TypeFlowQueryState::default();
                 consumer.set_root_memo(Some(memo.clone()));
-                let replay = solve(&mut consumer, root);
+                let (replay, replay_reads) =
+                    capture_query_reads(workspace.analyzer(), || solve(&mut consumer, root));
                 let produced = products[index].as_ref().unwrap();
+                assert!(
+                    produced
+                        .reads
+                        .iter()
+                        .all(|key| replay_reads.keys().contains(key)),
+                    "a later capture must inherit the fill's keys: {:?}",
+                    replay_reads.keys()
+                );
+                assert!(replay_reads.unattributed_reads() >= produced.unattributed_reads);
                 assert!(
                     Arc::ptr_eq(&replay, produced),
                     "consumer must read the memo product"
@@ -3264,6 +5113,7 @@ mod tests {
             semantic_work: Default::default(),
             reads: Vec::new(),
             unattributed_reads: 0,
+            execution_dependences: 0,
         });
         let census = product.census();
         assert_eq!(census.owned_text_bytes, product.retained_bytes());

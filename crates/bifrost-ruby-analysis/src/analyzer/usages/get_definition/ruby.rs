@@ -156,7 +156,10 @@ impl<'a> RubyDefinitionProvider<'a> {
 
     fn visible_files_from(
         &self,
-        semantic: &RubySemanticIndex<'_>,
+        semantic: &RubySemanticIndex<
+            '_,
+            brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+        >,
         file: &ProjectFile,
     ) -> Option<HashSet<ProjectFile>> {
         let files = self.session.query_limited_rows(|limit| {
@@ -640,8 +643,11 @@ fn ruby_bounded_method_candidates(
         consume(&bounded_definitions);
     };
     let scope = AnalyzerQueryScope::new(provider.ruby);
+    let attribution =
+        brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(provider.ruby);
     let semantic = RubySemanticIndex::build_for_lookup(
         RubyGraphSource {
+            attribution: &attribution,
             token: scope.token(),
             index: provider.ruby,
             definitions: &definitions,
@@ -698,7 +704,10 @@ fn ruby_dispatch_mode_matches(
 
 fn ruby_default_constructor_candidates(
     support: &dyn BoundedDefinitionLookup,
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     visible_files: &HashSet<ProjectFile>,
     receiver: &RubyReceiverType,
     member: &str,
@@ -1731,8 +1740,11 @@ pub(crate) fn resolve_ruby(
         consume(&bounded_definitions);
     };
     let scope = AnalyzerQueryScope::new(analyzer);
+    let attribution =
+        brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer);
     let semantic = RubySemanticIndex::build_for_lookup(
         RubyGraphSource {
+            attribution: &attribution,
             token: scope.token(),
             index: analyzer,
             definitions: &definitions,
@@ -1889,7 +1901,10 @@ fn ruby_focused_constant_path(node: Node<'_>) -> Node<'_> {
 }
 
 fn ruby_constant_outcome(
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
     context: &RubyLookupContext,
@@ -1931,7 +1946,10 @@ fn ruby_constant_outcome(
 /// file requiring it, and an unreached workspace declaration is a plain miss,
 /// never a route out of the workspace.
 fn ruby_constant_path_leaves_the_workspace(
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     context: &RubyLookupContext<'_>,
     node: Node<'_>,
     source: &str,
@@ -1946,7 +1964,10 @@ fn ruby_constant_path_leaves_the_workspace(
 }
 
 fn ruby_autoload_symbol_outcome(
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
     context: &RubyLookupContext,
@@ -1974,7 +1995,10 @@ fn ruby_autoload_symbol_outcome(
 fn ruby_field_outcome(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     context: &RubyLookupContext,
     node: Node<'_>,
     source: &str,
@@ -2059,7 +2083,10 @@ fn ruby_is_indexed_field_declaration_site(
 
 fn ruby_method_outcome(
     support: &dyn BoundedDefinitionLookup,
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     visible_files: &HashSet<ProjectFile>,
     context: &RubyLookupContext,
     call: Option<Node<'_>>,
@@ -2160,7 +2187,10 @@ fn ruby_method_outcome(
 /// identity is the call's own `<receiver>.<member>` spelling -- the same one
 /// `call_bindings` reports for the call site.
 fn ruby_unresolved_receiver_outcome(
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     context: &RubyLookupContext<'_>,
     receiver: Option<Node<'_>>,
     member: &str,
@@ -2560,8 +2590,11 @@ fn ruby_closed_ancestry(
         consume(&bounded_definitions);
     };
     let scope = AnalyzerQueryScope::new(provider.ruby);
+    let attribution =
+        brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(provider.ruby);
     let semantic = RubySemanticIndex::build_for_lookup(
         RubyGraphSource {
+            attribution: &attribution,
             token: scope.token(),
             index: provider.ruby,
             definitions: &definitions,
@@ -3117,7 +3150,10 @@ struct RubyOwnerRoutes {
 
 impl RubyOwnerRoutes {
     fn build(
-        semantic: &RubySemanticIndex<'_>,
+        semantic: &RubySemanticIndex<
+            '_,
+            brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+        >,
         support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         base: &str,
@@ -3164,7 +3200,10 @@ impl RubyOwnerRoutes {
 /// The lookup returns the first non-empty group it reaches, so one owner, one
 /// hop distance and one bucket describe every candidate in it.
 fn ruby_stage_member_attribution(
-    semantic: &RubySemanticIndex<'_>,
+    semantic: &RubySemanticIndex<
+        '_,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
+    >,
     support: &dyn BoundedDefinitionLookup,
     visible_files: &HashSet<ProjectFile>,
     receiver: &RubyReceiverType,
@@ -3257,7 +3296,10 @@ fn ruby_stage_member_attribution(
 }
 
 struct RubyLookupContext<'a> {
-    semantic: &'a RubySemanticIndex<'a>,
+    semantic: &'a RubySemanticIndex<
+        'a,
+        brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'a>,
+    >,
     file: &'a ProjectFile,
     source: &'a str,
     visible_files: &'a HashSet<ProjectFile>,
@@ -3272,7 +3314,10 @@ struct RubyLookupContext<'a> {
 impl<'a> RubyLookupContext<'a> {
     fn build(
         _analyzer: &'a dyn IAnalyzer,
-        semantic: &'a RubySemanticIndex<'a>,
+        semantic: &'a RubySemanticIndex<
+            'a,
+            brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'a>,
+        >,
         file: &'a ProjectFile,
         source: &'a str,
         visible_files: &'a HashSet<ProjectFile>,

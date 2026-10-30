@@ -22,6 +22,8 @@
 //! type is not proven, a `dynamic` value -- is left unchecked rather than
 //! guessed at, because an outcome is a claim about a lookup that happened.
 
+use brokk_bifrost_core::analyzer::memo_attribution::CaptureScopedMemo;
+
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
@@ -213,7 +215,7 @@ pub fn collect_csharp_semantic_diagnostics(
         scope_is_visible: true,
         type_parameters: Vec::new(),
         partial_declarations: HashSet::default(),
-        visible_types: RefCell::new(HashMap::default()),
+        visible_types: CaptureScopedMemo::default(),
         report,
         diagnostic_count: 0,
     };
@@ -267,7 +269,7 @@ struct CSharpDiagnosticCollector<'a> {
     /// search costs a store query per candidate spelling per namespace it
     /// probes, which is what made repetition expensive rather than merely
     /// redundant (#1806).
-    visible_types: RefCell<HashMap<String, Vec<CodeUnit>>>,
+    visible_types: CaptureScopedMemo<RefCell<HashMap<String, Vec<CodeUnit>>>>,
     report: SemanticDiagnosticReport,
     diagnostic_count: usize,
 }
@@ -587,14 +589,19 @@ impl CSharpDiagnosticCollector<'_> {
     /// name this pass calls absent is one the definition route also fails to
     /// find.
     fn visible_types(&self, token: QueryToken<'_>, identity: &str) -> Vec<CodeUnit> {
-        if let Some(known) = self.visible_types.borrow().get(identity) {
-            return known.clone();
-        }
-        let candidates = visible_type_candidates(self.csharp, token, self.file, identity);
-        self.visible_types
-            .borrow_mut()
-            .insert(identity.to_string(), candidates.clone());
-        candidates
+        self.visible_types.read(
+            &self.csharp.read_capability().memo_attribution(),
+            |visible_types| {
+                if let Some(known) = visible_types.borrow().get(identity) {
+                    return known.clone();
+                }
+                let candidates = visible_type_candidates(self.csharp, token, self.file, identity);
+                visible_types
+                    .borrow_mut()
+                    .insert(identity.to_string(), candidates.clone());
+                candidates
+            },
+        )
     }
 
     fn workspace_types(&self, token: QueryToken<'_>, identity: &str) -> WorkspaceTypes {

@@ -138,12 +138,11 @@ impl CallRelationProvider for GoNativeCallRelationProvider {
 }
 
 fn diagnostic(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationDiagnostic {
-    CallRelationDiagnostic {
-        code: CallRelationDiagnosticCode::AnalysisFailed,
-        message: message.into(),
-        context: caller.fq_name().to_string(),
-        reason_kind: Some(kind.to_owned()),
-    }
+    CallRelationDiagnostic::analysis_failed(
+        message.into(),
+        caller.fq_name().to_string(),
+        kind.to_owned(),
+    )
 }
 
 fn failed(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationResult {
@@ -319,7 +318,9 @@ fn resolve_outgoing(
             .analyzer_store()
             .open_selected_resolution_operation(input, cancellation)?
         {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => (*operation).with_go_model_authority(
+                go.inner.semantic_model_overlay().map(|overlay| overlay as std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>)
+            ),
             SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
                 return Ok(SelectedResolutionOperationOutcome::Unavailable(reason));
             }
@@ -444,8 +445,10 @@ fn resolve_outgoing(
         }
         let file = caller.source().clone();
         let mut selected_call_indices = HashSet::default();
+        let mut receiver_candidate_calls = Vec::new();
         let mut files = HashSet::default();
         files.insert(file.clone());
+        let identities = operation.ready.context_identities.clone();
         let staged = operation.stage_go_reference_edge_batches_in_files(
             go,
             context.context_id,
@@ -541,12 +544,18 @@ fn resolve_outgoing(
                                 result.sites.push(site);
                                 continue;
                             }
+                            let model_selection = answer.answer().model_member_selection().and_then(|selection| brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::project_native_model_member_selection(selection, cancellation));
+                            let legacy_reasons = super::model_receiver::legacy_model_reasons(
+                                model_selection.as_deref(), answer.answer().completion(), &identities,
+                            );
                             let exact_external = exact_external_call(
                                 go,
                                 caller,
                                 &source,
                                 &tree,
                                 &shapes[call_index],
+                                model_selection.as_deref(),
+                                &legacy_reasons,
                                 &selected_imports,
                                 &session,
                                 budget,
@@ -566,7 +575,7 @@ fn resolve_outgoing(
                                         caller,
                                     ));
                                 }
-                                result.diagnostics.push(diagnostic(
+                                receiver_candidate_calls.push((call_index, model_selection.is_none() && binding.targets().is_empty(), diagnostic(
                                     "native_call_target_unavailable",
                                     format!(
                                         "call at {}..{} has no workspace target and no exact external proof; site kind {:?}, namespace {:?}, targets {:?}, completion {:?}",
@@ -578,7 +587,7 @@ fn resolve_outgoing(
                                         binding.completion(),
                                     ),
                                     caller,
-                                ));
+                                )));
                             }
                             // An exact external proof is a complete, known
                             // non-workspace callee; omit it without an error.
@@ -691,6 +700,64 @@ fn resolve_outgoing(
                 ResolutionCompletion::incomplete([ResolutionIncompleteReason::Cancelled]),
             ));
         }
+        if !receiver_candidate_calls.is_empty() {
+            let prepared =
+                operation.go_file_import_context(context.context_id, &caller_path, cancellation)?;
+            for (call_index, unmodeled, unavailable) in receiver_candidate_calls {
+                let shape = &shapes[call_index];
+                let range = shape
+                    .callee_range
+                    .expect("selected call has a callee range");
+                let site = ResolvedReferenceSite {
+                    path: caller_path.clone(),
+                    text: source[range.start_byte..range.end_byte].to_owned(),
+                    range,
+                    focus_start_byte: range.start_byte,
+                    focus_end_byte: range.end_byte,
+                };
+                let proof = if unmodeled {
+                    if let brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoPreparedImportContextOutcome::Ready(prepared) = &prepared {
+                        let answer = super::native_points::declared_external_receiver_call(
+                            &mut operation, (**prepared).clone(), BoundedReceiverQuery {
+                                analyzer: go, file: caller.source(), source: &source, tree: Some(&tree),
+                                site: &site, budget: session.remaining_budget().expect("bounded outgoing session"), cancellation: Some(cancellation),
+                            },
+                        )?;
+                        // Each queued call consumes the outgoing request's remaining
+                        // allowance; do not reset the budget for the next call.
+                        let hook_work = answer.work();
+                        session.scope_steps(hook_work.scope_nodes);
+                        for _ in 0..hook_work.summary_expansions { if !session.summary_step() { break; } }
+                        for _ in 0..hook_work.resolution_rounds { if !session.round_step() { break; } }
+                        match answer {
+                            BoundedResolution::Complete { value, .. } => value,
+                            BoundedResolution::Exceeded { .. } => {
+                                result.truncated = true;
+                                None
+                            }
+                            BoundedResolution::Cancelled { .. } => {
+                                result.cancelled = true;
+                                None
+                            }
+                        }
+                    } else { None }
+                } else {
+                    None
+                };
+                if let Some(proof) = proof {
+                    result.diagnostics.push(diagnostic(
+                        "native_call_resolution_incomplete",
+                        format!(
+                            "external Go receiver member {} has no indexed declaration",
+                            proof.canonical_callee()
+                        ),
+                        caller,
+                    ));
+                } else {
+                    result.diagnostics.push(unavailable);
+                }
+            }
+        }
         for (index, shape) in shapes.iter().enumerate() {
             if shape.coverage.is_exact()
                 && shape.callee_range.is_some()
@@ -702,6 +769,8 @@ fn resolve_outgoing(
                     &source,
                     &tree,
                     shape,
+                    None,
+                    &std::collections::BTreeSet::new(),
                     &selected_imports,
                     &session,
                     budget,
@@ -811,6 +880,10 @@ fn exact_external_call(
     source: &str,
     tree: &tree_sitter::Tree,
     shape: &GoCallShape,
+    model_selection: Option<&brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>,
+    legacy_reasons: &std::collections::BTreeSet<
+        brokk_bifrost_analysis::analyzer::resolution::seam_profile::GoModelLegacyReason,
+    >,
     selected_imports: &[brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoSelectedExternalImport],
     session: &ResolutionSession,
     budget: ReceiverAnalysisBudget,
@@ -854,12 +927,31 @@ fn exact_external_call(
             }
         }
     }
-    crate::analyzer::usages::get_definition::go::go_native_external_receiver_call_resolution(
-        query,
-        session,
-        selected_imports,
-    )
-    .map(|(_, proof)| proof)
+    if model_selection.is_none() && !legacy_reasons.is_empty() {
+        return crate::analyzer::usages::get_definition::go::go_g1b_legacy_model_receiver(
+            query,
+            session,
+            legacy_reasons,
+        )?
+        .external_call;
+    }
+    let selection = model_selection?;
+    let descriptor = super::model_receiver::transient_selection(query, selection)?;
+    let super::model_receiver::GoModelReceiverSelection::Handled(selected) =
+        super::model_receiver::go_selected_model_receiver_call(
+            query,
+            Some(selection),
+            &descriptor,
+            session,
+        )
+    else {
+        return None;
+    };
+    // Only a proved, fully prepared external route can suppress native
+    // incompleteness diagnostics. Promoted model storage remains open.
+    selected
+        .proof
+        .filter(|proof| selected.reasons.is_empty() && proof.dispatch_extensibility().is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -937,7 +1029,6 @@ mod tests {
     use crate::analyzer::go::native_outgoing::*;
 
     use crate::inline_project::InlineTestProject;
-    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
     fn fixture() -> (
         crate::inline_project::BuiltInlineTestProject,
@@ -1004,9 +1095,10 @@ mod tests {
     #[test]
     fn native_outgoing_projects_workspace_calls_and_omits_conversions() {
         let (_fixture, go, caller) = fixture();
-        let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
-        let _overlay_scope =
-            AnalyzerQueryScope::with_semantic_model_overlay(&go, Some(overlay.clone()));
+        let _catalog = crate::analyzer::go::native_points::activate_receiver_models_for_test(&go);
+        let overlay = go
+            .semantic_model_overlay()
+            .expect("activated receiver models");
         let result = GoNativeCallRelationProvider.outgoing(
             &go,
             &caller,
@@ -1117,12 +1209,42 @@ mod tests {
             arguments: Vec::new(),
             coverage: CallShapeCoverage::Exact,
         };
+        let range = external_call.callee_range.unwrap();
+        let site = ResolvedReferenceSite {
+            path: brokk_bifrost_core::path_utils::rel_path_string(caller.source()),
+            text: source[range.start_byte..range.end_byte].to_owned(),
+            range,
+            focus_start_byte: range.start_byte,
+            focus_end_byte: range.end_byte,
+        };
+        let selected =
+            crate::analyzer::go::native_points::resolve_go_definition_with_evidence_bounded(
+                BoundedReceiverQuery {
+                    analyzer: &go,
+                    file: caller.source(),
+                    source: &source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: ReceiverAnalysisBudget::default(),
+                    cancellation: None,
+                },
+                || {},
+            );
+        let brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete {
+            value: selected,
+            ..
+        } = selected
+        else {
+            panic!("native selected model receiver")
+        };
         let exact_proof = exact_external_call(
             &go,
             &caller,
             &source,
             &tree,
             &external_call,
+            selected.model_member_selection.as_deref(),
+            &std::collections::BTreeSet::new(),
             &model_backed_imports,
             &ResolutionSession::unbounded(),
             ReceiverAnalysisBudget::default(),

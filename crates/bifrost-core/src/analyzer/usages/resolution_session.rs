@@ -22,6 +22,18 @@ pub enum BoundedResolution<T> {
 }
 
 impl<T> BoundedResolution<T> {
+    /// Transform only a completed value, retaining work and terminal outcomes.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> BoundedResolution<U> {
+        match self {
+            Self::Complete { value, work } => BoundedResolution::Complete {
+                value: map(value),
+                work,
+            },
+            Self::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+            Self::Cancelled { work } => BoundedResolution::Cancelled { work },
+        }
+    }
+
     pub fn work(&self) -> ReceiverAnalysisWork {
         match self {
             Self::Complete { work, .. }

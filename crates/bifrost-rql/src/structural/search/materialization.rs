@@ -27,6 +27,7 @@ use super::results::{
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_rql::{ExportFilter, GenerationSiteFilter};
 use std::sync::Arc;
 
@@ -42,7 +43,7 @@ const DECLARATION_STATE_ID_DOMAIN: &[u8] = b"bifrost.code_query.declaration_stat
 /// once.
 #[derive(Default)]
 pub(super) struct MaterializationTraversalCache {
-    files: HashMap<ProjectFile, Arc<MaterializationFileResult>>,
+    files: CaptureScopedMemo<HashMap<ProjectFile, Arc<MaterializationFileResult>>>,
     reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
     reported_axes: HashSet<(Language, MaterializationAxis)>,
 }
@@ -54,11 +55,15 @@ impl MaterializationTraversalCache {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Arc<MaterializationFileResult> {
-        if let Some(cached) = self.files.get(file) {
-            return Arc::clone(cached);
+        if let Some(cached) = self.files.read(&memo_attribution(analyzer), |files| {
+            files.get(file).cloned()
+        }) {
+            return cached;
         }
         let derived = Arc::new(materialization_for_file(analyzer, file));
-        self.files.insert(file.clone(), Arc::clone(&derived));
+        self.files.read_mut(&memo_attribution(analyzer), |files| {
+            files.insert(file.clone(), Arc::clone(&derived))
+        });
         derived
     }
 

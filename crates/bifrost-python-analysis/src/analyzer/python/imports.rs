@@ -50,51 +50,37 @@ impl ImportAnalysisProvider for PythonAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        if let Some(cached) = self.imported_code_units.get(file) {
-            return cached;
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-python-analysis/src/analyzer/python/imports.rs",
-            );
-
-        let resolved = Arc::new(
-            resolve_import_bindings(self, token, file)
-                .into_values()
-                .collect(),
-        );
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::clone(&resolved);
-            persistent_fill_guard.installed("imported_code_units");
-            self.imported_code_units.insert(cache_key, cache_value);
-        };
-        resolved
+        super::read_memo(
+            self,
+            &self.imported_code_units,
+            file.clone(),
+            || {
+                Arc::new(
+                    resolve_import_bindings(self, token, file)
+                        .into_values()
+                        .collect(),
+                )
+            },
+            super::weight_code_unit_set,
+        )
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        if let Some(cached) = self.referencing_files.get(file) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-python-analysis/src/analyzer/python/imports.rs",
-            );
-
-        let referencing = self
-            .build_reverse_import_index()
-            .get(file)
-            .map(|files| (**files).clone())
-            .unwrap_or_default();
-        {
-            let cache_key = file.clone();
-            let cache_value = Arc::new(referencing.clone());
-            persistent_fill_guard.installed("referencing_files");
-            self.referencing_files.insert(cache_key, cache_value);
-        };
-        referencing
+        let value = super::read_memo(
+            self,
+            &self.referencing_files,
+            file.clone(),
+            || {
+                Arc::new(
+                    self.build_reverse_import_index()
+                        .get(file)
+                        .map(|files| (**files).clone())
+                        .unwrap_or_default(),
+                )
+            },
+            super::weight_project_file_set,
+        );
+        (*value).clone()
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {

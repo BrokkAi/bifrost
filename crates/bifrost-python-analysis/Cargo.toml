@@ -19,10 +19,10 @@ name = "brokk_bifrost_python_analysis"
 workspace = true
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3" }
-brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.3" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3" }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.3" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.4" }
+brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.4" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.4" }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.4" }
 configparser = "3.3.0"
 git2 = { version = "0.20.2", default-features = false }
 moka = { version = "0.12.11", features = ["sync"] }
@@ -57,10 +57,10 @@ randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
 [dev-dependencies]
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.4", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.3", features = ["test-support"] }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.3", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.4", features = ["test-support"] }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.14.4", features = ["test-support"] }
 rusqlite = { version = "0.40.2", default-features = false, features = [
 "bundled",
 "cache",

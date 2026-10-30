@@ -136,7 +136,10 @@ impl SelectedDemandState {
             matches!(completion, ResolutionCompletion::Incomplete(reasons) if reasons.iter().any(|reason| matches!(reason,
                 ResolutionIncompleteReason::Cancelled | ResolutionIncompleteReason::ReceiverBudgetExhausted(_) | ResolutionIncompleteReason::TimeBudgetExceeded(_))))
         };
-        if stopped(answer.completion())
+        // Request-minted model candidate identities and metadata are a
+        // projection for this operation, never completed-root memo payload.
+        if answer.model_member_selection.is_some()
+            || stopped(answer.completion())
             || stopped(answer.binding().completion())
             || stopped(&answer.call_target_boundary)
             || answer
@@ -164,6 +167,7 @@ impl SelectedDemandState {
             application_completion,
             member_owners,
             member_rejections,
+            model_member_selection,
             absent_member,
             type_bound_receiver: _,
             observed_type_identity,
@@ -225,7 +229,9 @@ impl SelectedDemandState {
                 && semantic(owner.receiver)
                 && owner.owner_path.iter().copied().all(semantic)
         };
-        site_metadata.is_none_or(|site| site.reference_owner().flatten().is_none_or(semantic))
+        model_member_selection.is_none()
+            && site_metadata
+                .is_none_or(|site| site.reference_owner().flatten().is_none_or(semantic))
             && callable_receiver_dispositions
                 .iter()
                 .all(|row| semantic(row.target))

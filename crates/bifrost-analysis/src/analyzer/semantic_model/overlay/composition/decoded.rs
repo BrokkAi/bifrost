@@ -1,6 +1,7 @@
 //! Selected decoded-shard input for the shared group projection and kernel.
 
 use super::*;
+use crate::analyzer::semantic_model::ArtifactExtraction;
 use crate::analyzer::store::active_models::resolve_records;
 
 pub(in crate::analyzer::semantic_model::overlay) struct SelectedDecodedReads<'a> {
@@ -21,11 +22,7 @@ impl SelectedDecodedReads<'_> {
             pack_digest: shard.manifest.semantic_sha256.clone(),
         };
         shard.manifest.language == self.language
-            && self.selection.contains(&provider)
-            && self.defining_owner.is_none_or(|defining| {
-                (defining.extraction.is_some() && shard.manifest.extraction.is_none())
-                    || ModelProvider::from(defining) == provider
-            })
+            && self.admits_provider(&provider, shard.manifest.extraction.as_ref())
     }
 
     fn shards(&self) -> impl Iterator<Item = &Arc<ActiveSemanticModelShard>> {
@@ -40,11 +37,16 @@ impl SelectedDecodedReads<'_> {
         self.active.shards.iter().any(|shard| {
             shard.manifest.language == self.language
                 && shard.manifest.semantic_sha256 == provenance.pack_digest
-        }) && self.selection.contains(&provider)
-            && self.defining_owner.is_none_or(|defining| {
-                (defining.extraction.is_some() && provenance.extraction.is_none())
-                    || ModelProvider::from(defining) == provider
-            })
+        }) && self.admits_provider(&provider, provenance.extraction.as_ref())
+    }
+
+    fn admits_provider(
+        &self,
+        provider: &ModelProvider,
+        extraction: Option<&ArtifactExtraction>,
+    ) -> bool {
+        self.selection.contains(provider)
+            && super::admits_defining_owner(self.defining_owner, provider, extraction)
     }
 }
 
@@ -59,9 +61,6 @@ impl CompositionReads for SelectedDecodedReads<'_> {
             .filter(|r| self.admits_shard(&r.shard))
             .collect())
     }
-    fn types_with_id(&self, id: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(resolve_records(self.all_type_records_with_id(id)?).records)
-    }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
         Ok(resolve_records(self.all_types_named(name)?).records)
     }
@@ -74,12 +73,6 @@ impl CompositionReads for SelectedDecodedReads<'_> {
             .decoded_member_records_with_id(id)
             .filter(|r| self.admits_shard(&r.shard))
             .collect())
-    }
-    fn members_with_id(
-        &self,
-        id: &str,
-    ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
-        Ok(resolve_records(self.all_member_records_with_id(id)?).records)
     }
     fn procedure_summaries_for_member(
         &self,

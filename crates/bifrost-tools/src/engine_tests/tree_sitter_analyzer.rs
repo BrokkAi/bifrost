@@ -2610,10 +2610,10 @@ mod tests {
             .selected_source_admission_refusals()
             .expect("recorded refusals")
             .into_iter()
-            .map(|(file, reason)| {
+            .map(|row| {
                 (
-                    file.rel_path().to_path_buf(),
-                    serde_json::from_str::<serde_json::Value>(&reason).unwrap(),
+                    row.file.rel_path().to_path_buf(),
+                    serde_json::from_str::<serde_json::Value>(&row.reason).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
@@ -3211,6 +3211,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer.prefetch_definitions(&["Foo.target".to_string(), "Foo.other".to_string()]);
         assert_eq!(
@@ -3219,6 +3220,7 @@ mod tests {
             "batched lookup must retain the same empty-prefix declaration"
         );
         analyzer.end_query(&scope);
+        drop(scope_attribution);
     }
 
     /// #1774: every caller of the non-persisted workspace declaration scan used
@@ -3235,6 +3237,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer.reset_workspace_path_scan_count_for_test();
         for index in 0..3 {
@@ -3245,6 +3248,7 @@ mod tests {
         }
         let scans_in_one_request = analyzer.workspace_path_scan_count_for_test();
         analyzer.end_query(&scope);
+        drop(scope_attribution);
 
         assert_eq!(
             1, scans_in_one_request,
@@ -3267,9 +3271,11 @@ mod tests {
             let scope = Arc::new(
                 brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default(),
             );
+            let scope_attribution = scope.enter();
             analyzer.begin_query(&scope);
             let _ = CodeUnitIndex::lookup_candidates_by_identifier(&analyzer, "Widget0");
             analyzer.end_query(&scope);
+            drop(scope_attribution);
         }
 
         assert_eq!(
@@ -3297,6 +3303,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         let scoped: Vec<BTreeSet<CodeUnit>> = (0..3)
             .map(|index| {
@@ -3304,6 +3311,7 @@ mod tests {
             })
             .collect();
         analyzer.end_query(&scope);
+        drop(scope_attribution);
 
         assert_eq!(unscoped, scoped);
         for (index, matches) in scoped.iter().enumerate() {
@@ -3325,6 +3333,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer.reset_definition_candidates_query_count_for_test();
         let first: Vec<CodeUnit> =
@@ -3333,6 +3342,7 @@ mod tests {
             CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
         let queries = analyzer.definition_candidates_query_count_for_test();
         analyzer.end_query(&scope);
+        drop(scope_attribution);
 
         assert_eq!(first, second, "the memo must not change what is resolved");
         assert_eq!(
@@ -3355,6 +3365,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer.reset_definition_candidates_query_count_for_test();
         let pool = rayon::ThreadPoolBuilder::new()
@@ -3368,6 +3379,7 @@ mod tests {
         });
         let queries = analyzer.definition_candidates_query_count_for_test();
         analyzer.end_query(&scope);
+        drop(scope_attribution);
 
         assert!(
             concurrent.iter().all(|answer| answer == &expected),
@@ -3425,6 +3437,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer.reset_definition_candidates_query_count_for_test();
         analyzer.reset_definition_candidate_row_read_count_for_test();
@@ -3435,6 +3448,7 @@ mod tests {
         let row_reads = analyzer.definition_candidate_row_read_count_for_test();
         let point_lookups = analyzer.definition_candidates_query_count_for_test();
         analyzer.end_query(&scope);
+        drop(scope_attribution);
 
         assert_eq!(point, memoized, "the memo must not change any answer");
         assert_eq!(
@@ -3467,6 +3481,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer.reset_definition_candidate_row_read_count_for_test();
         let pool = rayon::ThreadPoolBuilder::new()
@@ -3483,6 +3498,7 @@ mod tests {
         });
         let row_reads = analyzer.definition_candidate_row_read_count_for_test();
         analyzer.end_query(&scope);
+        drop(scope_attribution);
 
         assert_eq!(
             sequential, concurrent,
@@ -3514,6 +3530,7 @@ mod tests {
 
         let scope =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer.reset_definition_candidates_query_count_for_test();
         analyzer.reset_definition_prefetch_batch_count_for_test();
@@ -3525,6 +3542,7 @@ mod tests {
             .collect();
         let point_lookups = analyzer.definition_candidates_query_count_for_test();
         analyzer.end_query(&scope);
+        drop(scope_attribution);
 
         assert_eq!(point, prefetched, "batched rows must resolve identically");
         assert_eq!(1, batches, "one batched read serves the whole key set");
@@ -4461,28 +4479,24 @@ mod tests {
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
 
-        let healthy =
-            Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
-        analyzer.begin_query(&healthy);
+        let healthy = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(&analyzer);
         assert!(analyzer.definitions("Missing").next().is_none());
         assert!(healthy.store_error().is_none());
-        analyzer.end_query(&healthy);
+        drop(healthy);
 
         analyzer
             .store_context
             .store
             .ensure_language_epoch_value("java", "cutover-before-definition-read")
             .unwrap();
-        let stale =
-            Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
-        analyzer.begin_query(&stale);
+        let stale = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(&analyzer);
         assert!(analyzer.definitions("Model").next().is_none());
         let error = stale
             .store_error()
             .expect("stale definition query should report its store error");
         assert!(error.to_string().contains("querying definition candidates"));
         assert!(error.to_string().contains("stale analyzer generation"));
-        analyzer.end_query(&stale);
+        drop(stale);
     }
 
     #[test]
@@ -4497,9 +4511,7 @@ mod tests {
             .store
             .ensure_language_epoch_value("java", "cutover-before-bounded-candidate-read")
             .unwrap();
-        let context =
-            Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
-        analyzer.begin_query(&context);
+        let context = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(&analyzer);
 
         let by_identifier =
             analyzer.lookup_declarations_by_identifier_limited("Model", 16, || true);
@@ -4523,7 +4535,7 @@ mod tests {
                 .to_string()
                 .contains("stale analyzer generation")
         );
-        analyzer.end_query(&context);
+        drop(context);
     }
 
     #[brokk_bifrost_test_macros::hardwon(
@@ -4620,15 +4632,18 @@ mod tests {
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
         let inner =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let outer_attribution = outer.enter();
         analyzer.begin_query(&outer);
         for file in &files {
             assert!(analyzer.fetch_file_state(file).is_some());
         }
+        let inner_attribution = inner.enter();
         analyzer.begin_query(&inner);
         for file in &files {
             assert!(analyzer.fetch_file_state(file).is_some());
         }
         analyzer.end_query(&inner);
+        drop(inner_attribution);
 
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
@@ -4637,6 +4652,7 @@ mod tests {
         );
 
         analyzer.end_query(&outer);
+        drop(outer_attribution);
         assert!(analyzer.fetch_file_state(&files[0]).is_some());
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
@@ -4655,12 +4671,14 @@ mod tests {
         let mut cache = QueryReadCache::default();
         let files = vec![ProjectFile::new(std::env::temp_dir(), "src/lib.rs")];
 
+        let attribution = context.enter();
         cache.begin(&context);
         assert!(cache.analyzed_live_files().is_none());
         cache.retain_analyzed_live_files(files.clone());
         assert_eq!(cache.analyzed_live_files(), Some(files));
 
         cache.end(&context);
+        drop(attribution);
         assert!(
             cache.analyzed_live_files().is_none(),
             "a later analyzer request must validate its own live-file snapshot"
@@ -4688,6 +4706,7 @@ mod tests {
 
         let first =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let first_attribution = first.enter();
         analyzer.begin_query(&first);
         let files_first = analyzer.analyzed_live_files();
         assert_eq!(files_first.len(), 1, "files: {files_first:?}");
@@ -4702,6 +4721,7 @@ mod tests {
             "the analyzed-file pass should seed live OIDs for the rest of its query scope"
         );
         analyzer.end_query(&first);
+        drop(first_attribution);
 
         // An out-of-band edit remains invisible until the caller reports it.
         std::fs::write(
@@ -4712,12 +4732,14 @@ mod tests {
         brokk_bifrost_analysis::analyzer::store::liveness::reset_stat_call_count_for_test();
         let second =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let second_attribution = second.enter();
         analyzer.begin_query(&second);
         let files_second = analyzer.analyzed_live_files();
         let oid_before_update = analyzer
             .resolve_live_oid_for_file(&files_second[0])
             .expect("retained live oid");
         analyzer.end_query(&second);
+        drop(second_attribution);
         assert_eq!(files_second, files_first);
         assert_eq!(oid_before_update, oid_first);
         assert_eq!(
@@ -4734,12 +4756,14 @@ mod tests {
         brokk_bifrost_analysis::analyzer::store::liveness::reset_stat_call_count_for_test();
         let third =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let third_attribution = third.enter();
         updated.begin_query(&third);
         let files_third = updated.analyzed_live_files();
         let oid_after_update = updated
             .resolve_live_oid_for_file(&files_third[0])
             .expect("updated live oid");
         updated.end_query(&third);
+        drop(third_attribution);
         assert_eq!(files_third.len(), 1, "files: {files_third:?}");
         assert_ne!(oid_after_update, oid_first);
         assert_eq!(
@@ -4752,9 +4776,11 @@ mod tests {
         brokk_bifrost_analysis::analyzer::store::liveness::reset_stat_call_count_for_test();
         let fourth =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let fourth_attribution = fourth.enter();
         updated.begin_query(&fourth);
         let files_fourth = updated.analyzed_live_files();
         updated.end_query(&fourth);
+        drop(fourth_attribution);
         assert_eq!(files_fourth, files_third);
         assert_eq!(
             brokk_bifrost_analysis::analyzer::store::liveness::stat_call_count_for_test(),
@@ -5493,7 +5519,12 @@ mod tests {
             retain_source_facts_state_without_publication(&analyzer, &GoAdapter, &file, source);
         let expected = retained.source_facts.as_ref().unwrap().go.clone().unwrap();
         let facts = analyzer
-            .canonical_go_source_facts(&file, &moka::sync::Cache::new(1))
+            .canonical_go_source_facts(
+                &file,
+                &brokk_bifrost_core::analyzer::memo_attribution::ReplayingMemo::new(
+                    moka::sync::Cache::new(1),
+                ),
+            )
             .unwrap();
         assert_eq!(facts.facts, expected);
         assert!(!facts.declaration_units.is_empty());
@@ -5728,6 +5759,7 @@ mod tests {
 
         let first =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let first_attribution = first.enter();
         analyzer.begin_query(&first);
         analyzer.reset_full_hydration_count_for_test();
         analyzer.bulk_file_states_for_query([file.clone()], BulkFileStateSource::Include);
@@ -5797,6 +5829,7 @@ mod tests {
         assert_eq!(analyzer.full_hydration_count_for_test(), 0);
 
         analyzer.end_query(&first);
+        drop(first_attribution);
         assert!(
             analyzer.query_file_state_snapshot.load().as_ref().is_none(),
             "ending the outer query must clear the immutable snapshot"
@@ -5805,6 +5838,7 @@ mod tests {
         project.set_source("fn changed() {}\n");
         let second =
             Arc::new(brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default());
+        let second_attribution = second.enter();
         analyzer.begin_query(&second);
         analyzer.reset_full_hydration_count_for_test();
         let changed = analyzer
@@ -5817,6 +5851,7 @@ mod tests {
             "a new query must hydrate the changed OID after snapshot reset"
         );
         analyzer.end_query(&second);
+        drop(second_attribution);
     }
 
     /// #1450: the per-request cell above is dropped when the outer scope ends,

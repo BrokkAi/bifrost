@@ -552,6 +552,10 @@ impl NavigationLookupOutcome {
 
 #[derive(Debug, Clone)]
 pub struct CallTargetLookupOutcome {
+    #[doc(hidden)]
+    pub native_resolution: Option<Box<NativeResolutionCompletion>>,
+    #[doc(hidden)]
+    pub model_member_selection: Option<Box<crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
     pub outcome: DefinitionLookupOutcome,
     /// Which definition operation supplied this call target. The call-binding
     /// consumer may retain a source candidate from an incomplete answer only
@@ -597,6 +601,8 @@ impl CallTargetLookupOutcome {
     #[doc(hidden)]
     pub fn from_resolution(resolution: DefinitionResolution) -> Self {
         Self {
+            native_resolution: resolution.evidence.native_resolution,
+            model_member_selection: resolution.evidence.model_member_selection,
             outcome: resolution.outcome,
             authority: resolution.evidence.authority,
             call_application: resolution.evidence.call_application,
@@ -777,6 +783,26 @@ impl ExactExternalCallProof {
         }
     }
 
+    #[track_caller]
+    fn bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
+        assert!(
+            !owner.is_empty(),
+            "an external receiver owner must be named"
+        );
+        assert!(!member.is_empty(), "an external member must be named");
+        Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
+    }
+
+    #[track_caller]
+    fn static_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
+        assert!(
+            !owner.is_empty(),
+            "an external receiver owner must be named"
+        );
+        assert!(!member.is_empty(), "an external member must be named");
+        Self::package_function(format!("{owner}.{member}"), parameter_count)
+    }
+
     #[doc(hidden)]
     pub fn go_package_function(
         canonical_callee: impl Into<Box<str>>,
@@ -830,17 +856,7 @@ impl ExactExternalCallProof {
         canonical_callee: impl Into<Box<str>>,
         parameter_count: u32,
     ) -> Self {
-        Self {
-            canonical_callee: canonical_callee.into(),
-            call_application: CallApplicationKind::BoundReceiver,
-            dispatch_extensibility: None,
-            parameter_count,
-            source_jdk_artifact: None,
-            python_runtime_artifact: None,
-            python_model_manifest_sha256: None,
-            python_formal_slots: None,
-            external_member_identity: None,
-        }
+        Self::bound_receiver(canonical_callee, parameter_count)
     }
 
     #[doc(hidden)]
@@ -885,16 +901,12 @@ impl ExactExternalCallProof {
     }
 
     #[doc(hidden)]
+    #[track_caller]
     pub fn js_ts_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
-        assert!(
-            !owner.is_empty(),
-            "an external receiver owner must be named"
-        );
-        assert!(!member.is_empty(), "an external member must be named");
         // JavaScript and TypeScript permit runtime prototype changes. The
         // active callable family proves the selected declaration, not that
         // the language has a closed dispatch universe.
-        Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
+        Self::bound_external_member(owner, member, parameter_count)
     }
 
     /// A call written as `Owner::Path.member(...)` whose owner path an
@@ -906,13 +918,9 @@ impl ExactExternalCallProof {
     /// proves the selected declaration, not that the language has a closed
     /// dispatch universe.
     #[doc(hidden)]
+    #[track_caller]
     pub fn ruby_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
-        assert!(
-            !owner.is_empty(),
-            "an external receiver owner must be named"
-        );
-        assert!(!member.is_empty(), "an external member must be named");
-        Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
+        Self::bound_external_member(owner, member, parameter_count)
     }
 
     #[doc(hidden)]
@@ -921,13 +929,9 @@ impl ExactExternalCallProof {
     ///
     /// Java instance methods can be overridden, so the selected signature does
     /// not prove that dispatch is closed.
+    #[track_caller]
     pub fn java_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
-        assert!(
-            !owner.is_empty(),
-            "an external receiver owner must be named"
-        );
-        assert!(!member.is_empty(), "an external member must be named");
-        Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
+        Self::bound_external_member(owner, member, parameter_count)
     }
 
     #[doc(hidden)]
@@ -935,39 +939,27 @@ impl ExactExternalCallProof {
     /// signature. The receiver shape is the proof that no written value
     /// participates; it does not by itself close every other declaration of
     /// the same name.
+    #[track_caller]
     pub fn java_static_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
-        assert!(
-            !owner.is_empty(),
-            "an external receiver owner must be named"
-        );
-        assert!(!member.is_empty(), "an external member must be named");
-        Self::package_function(format!("{owner}.{member}"), parameter_count)
+        Self::static_external_member(owner, member, parameter_count)
     }
 
     /// A C# type-qualified call whose modeled declaration proves one static
     /// signature. The receiverless application is kept with the canonical
     /// owner/member identity so an activated summary can select its formals.
     #[doc(hidden)]
+    #[track_caller]
     pub fn csharp_static_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
-        assert!(
-            !owner.is_empty(),
-            "an external receiver owner must be named"
-        );
-        assert!(!member.is_empty(), "an external member must be named");
-        Self::package_function(format!("{owner}.{member}"), parameter_count)
+        Self::static_external_member(owner, member, parameter_count)
     }
 
     /// A C# instance call whose external declaration proves the receiver's
     /// owner and one applicable signature. The target may still dispatch to
     /// an external override, so the proof leaves dispatch extensibility open.
     #[doc(hidden)]
+    #[track_caller]
     pub fn csharp_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
-        assert!(
-            !owner.is_empty(),
-            "an external receiver owner must be named"
-        );
-        assert!(!member.is_empty(), "an external member must be named");
-        Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
+        Self::bound_external_member(owner, member, parameter_count)
     }
 
     #[doc(hidden)]
@@ -1006,16 +998,9 @@ impl ExactExternalCallProof {
     }
 
     #[doc(hidden)]
+    #[track_caller]
     pub fn python_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
-        assert!(
-            !owner.is_empty(),
-            "an external Python receiver owner must be named"
-        );
-        assert!(
-            !member.is_empty(),
-            "an external Python member must be named"
-        );
-        Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
+        Self::bound_external_member(owner, member, parameter_count)
     }
 
     #[doc(hidden)]
@@ -1110,17 +1095,7 @@ impl ExactExternalCallProof {
             "a header module identity must round-trip through the C/C++ separator: {header_module:?}"
         );
         assert!(!function.is_empty(), "a header function must be named");
-        Self {
-            canonical_callee: format!("{header_module}::{function}").into_boxed_str(),
-            call_application: CallApplicationKind::PackageFunction,
-            dispatch_extensibility: None,
-            parameter_count,
-            source_jdk_artifact: None,
-            python_runtime_artifact: None,
-            python_model_manifest_sha256: None,
-            python_formal_slots: None,
-            external_member_identity: None,
-        }
+        Self::package_function(format!("{header_module}::{function}"), parameter_count)
     }
 
     /// A namespace-qualified C++ call whose compile-database-scoped header
@@ -1131,17 +1106,7 @@ impl ExactExternalCallProof {
     pub fn cpp_header_function(namespace: &str, function: &str, parameter_count: u32) -> Self {
         assert!(!namespace.is_empty(), "a C++ namespace must be named");
         assert!(!function.is_empty(), "a C++ function must be named");
-        Self {
-            canonical_callee: format!("{namespace}::{function}").into_boxed_str(),
-            call_application: CallApplicationKind::PackageFunction,
-            dispatch_extensibility: None,
-            parameter_count,
-            source_jdk_artifact: None,
-            python_runtime_artifact: None,
-            python_model_manifest_sha256: None,
-            python_formal_slots: None,
-            external_member_identity: None,
-        }
+        Self::package_function(format!("{namespace}::{function}"), parameter_count)
     }
 
     #[doc(hidden)]
@@ -1236,6 +1201,15 @@ pub enum CallApplicationKind {
     Unknown,
 }
 
+/// Typed native completion and its request's reason identities. This evidence
+/// is query-local, never persisted or reused across selected operations.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct NativeResolutionCompletion {
+    pub completion: crate::analyzer::resolution::ResolutionCompletion,
+    pub identities: crate::analyzer::resolution::selected_context::SelectedContextIdentities,
+}
+
 /// What one language resolver proved about a call beyond the declarations it
 /// selected.
 ///
@@ -1249,6 +1223,10 @@ pub enum CallApplicationKind {
 #[derive(Debug, Clone, Default)]
 #[doc(hidden)]
 pub struct CallEvidence {
+    #[doc(hidden)]
+    pub native_resolution: Option<Box<NativeResolutionCompletion>>,
+    #[doc(hidden)]
+    pub model_member_selection: Option<Box<crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
     #[doc(hidden)]
     pub authority: DefinitionResolutionAuthority,
     #[doc(hidden)]
@@ -1353,6 +1331,7 @@ pub enum DefinitionResolutionAuthority {
     NativeGoSelected,
 }
 
+#[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct DefinitionResolution {
     #[doc(hidden)]
@@ -2685,6 +2664,7 @@ pub(crate) struct ScalarCallTargetSession<'a> {
 }
 
 struct ScalarDefinitionMemo {
+    reads: Option<super::common::QueryMemoReads>,
     language_state: HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
     sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
@@ -2716,6 +2696,29 @@ impl<'a> ScalarCallTargetSession<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve(
+        &mut self,
+        token: QueryToken<'_>,
+        requests: Vec<DefinitionLookupRequest>,
+        file: ProjectFile,
+        source: Arc<str>,
+        primary_tree: &Tree,
+        cancellation: Option<&CancellationToken>,
+    ) -> Vec<CallTargetLookupOutcome> {
+        let analyzer = self.analyzer;
+        let (outcomes, reads) = super::common::capture_memo_reads(analyzer, || {
+            if let Some(reads) = self.memo.as_ref().and_then(|memo| memo.reads.as_ref()) {
+                crate::analyzer::usages::common::replay_memo_reads(reads, analyzer);
+            }
+            self.resolve_with_memo(token, requests, file, source, primary_tree, cancellation)
+        });
+        if let Some(memo) = &mut self.memo {
+            memo.reads = Some(reads);
+        }
+        outcomes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with_memo(
         &mut self,
         token: QueryToken<'_>,
         requests: Vec<DefinitionLookupRequest>,
@@ -2804,6 +2807,7 @@ impl<'a> ScalarCallTargetSession<'a> {
             return outcomes;
         }
         self.memo = Some(ScalarDefinitionMemo {
+            reads: None,
             language_state: context.language_state,
             sources: context.sources,
             trees: context.trees,
@@ -2894,6 +2898,16 @@ pub(crate) fn resolve_generic_call_target_batch(
 ) -> Vec<CallTargetLookupOutcome> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token());
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        context.native_points = language_support_for_hook(
+            language_for_file(&file),
+            "native_point_batch",
+        )
+        .and_then(|support| {
+            support.native_point_batch(analyzer, file.clone(), Arc::clone(&source), cancellation)
+        });
+    }
     context.sources.insert(file.clone(), Ok(source));
     context.primary_source_tree = primary_tree.map(|tree| (file.clone(), tree));
     debug_assert!(
@@ -2916,6 +2930,8 @@ pub(crate) fn resolve_generic_call_target_batch(
         )
         .into_iter()
         .map(|navigation| CallTargetLookupOutcome {
+            native_resolution: navigation.evidence.native_resolution,
+            model_member_selection: navigation.evidence.model_member_selection,
             authority: navigation.evidence.authority,
             call_application: navigation.evidence.call_application,
             dispatch_extensibility: navigation.evidence.dispatch_extensibility,
@@ -3052,6 +3068,8 @@ pub fn resolve_call_reference_definition_with_source(
 
 #[doc(hidden)]
 pub struct DefinitionBatchContext<'a: 'token, 'token> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub native_points: Option<crate::analyzer::native_points::NativePointBatch>,
     #[doc(hidden)]
     pub analyzer: &'a dyn IAnalyzer,
     /// Proof that the batch's request scope is open for the batch's whole life
@@ -3087,6 +3105,8 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
             analyzer,
             token,
             bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
+            #[cfg(any(test, feature = "test-support"))]
+            native_points: None,
             language_state: HashMap::default(),
             sources: HashMap::default(),
             trees: HashMap::default(),
@@ -3370,7 +3390,7 @@ pub fn resolve_one_with_evidence<'a>(
                 budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
                 cancellation,
             };
-            support.trial_definition(query)
+            support.trial_definition_in_batch(query, context.native_points.as_ref())
         })
     {
         return resolution;
@@ -4009,11 +4029,27 @@ pub fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
 /// `// gated upstream:` comment naming where its guard lives.
 #[doc(hidden)]
 pub fn boundary_unchecked(message: String, claim: UnindexedClaim) -> DefinitionLookupOutcome {
+    boundary_unchecked_with_cause(message, claim, None)
+}
+
+/// A language's structured explanation of an import refusal, already rendered
+/// from that language's typed evidence rather than from diagnostic text.
+pub struct ImportBoundaryCause {
+    pub message: String,
+}
+
+#[doc(hidden)]
+pub fn boundary_unchecked_with_cause(
+    message: String,
+    claim: UnindexedClaim,
+    cause: Option<ImportBoundaryCause>,
+) -> DefinitionLookupOutcome {
+    let claim = cause.is_none().then_some(claim);
     diagnostic_outcome_with_claim(
         DefinitionLookupStatus::UnresolvableImportBoundary,
         "unresolvable_import_boundary",
-        import_boundary_workspace_message(message),
-        Some(claim),
+        import_boundary_workspace_message(message, cause),
+        claim,
     )
 }
 
@@ -4103,7 +4139,13 @@ pub fn cross_language_declarations(
     units
 }
 
-fn import_boundary_workspace_message(message: String) -> String {
+fn import_boundary_workspace_message(
+    message: String,
+    cause: Option<ImportBoundaryCause>,
+) -> String {
+    if let Some(cause) = cause {
+        return cause.message;
+    }
     let message = message.replace(
         "outside this partial ",
         "outside the indexed workspace, including this partial ",
@@ -4251,3 +4293,177 @@ mod tests {
 pub mod test_support;
 
 pub use crate::analyzer::resolution::diagnostic_kinds::GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND;
+
+#[cfg(test)]
+mod tree_memo_input_tests {
+    use super::*;
+    use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+
+    #[test]
+    fn tree_parse_memo_hits_are_selected_by_the_exact_source() {
+        let memo = TreeParseMemo::new();
+        let analyzer = MultiAnalyzer::default();
+        let file = ProjectFile::new(std::env::temp_dir(), "memo.py");
+        let first = "value = 1\n";
+        let (tree, reads) = capture_query_reads(&analyzer, || {
+            memo.parse(first, |source| {
+                parse_tree_for_language(&file, Language::Python, source)
+            })
+        });
+        let tree = tree.expect("first source parses");
+        let (hit, hit_reads) = capture_query_reads(&analyzer, || {
+            memo.parse(first, |_| {
+                panic!("an exact-source hit must reuse its parse")
+            })
+        });
+        assert_eq!(
+            tree.root_node().to_sexp(),
+            hit.unwrap().root_node().to_sexp()
+        );
+        assert_eq!(reads.keys(), hit_reads.keys());
+        let changed = memo
+            .parse("def value():\n    return 1\n", |source| {
+                parse_tree_for_language(&file, Language::Python, source)
+            })
+            .unwrap();
+        assert_ne!(tree.root_node().to_sexp(), changed.root_node().to_sexp());
+    }
+}
+
+// Exhaustive projected-outcome admission checks for the file-scoped point memo.
+#[cfg(any(test, feature = "test-support"))]
+mod native_point_identity {
+    use super::*;
+    use crate::analyzer::native_points::NativePointRegistryIndependent;
+    macro_rules! fields {
+        ($ty:ty, $($field:ident),+ $(,)?) => {
+            impl NativePointRegistryIndependent for $ty {
+                fn registry_independent(&self) -> bool {
+                    let Self { $($field),+ } = self;
+                    true $(&& $field.registry_independent())+
+                }
+            }
+        };
+    }
+    fields!(DefinitionResolution, outcome, evidence);
+    fields!(
+        DefinitionLookupOutcome,
+        modeled_definitions,
+        status,
+        reference,
+        definitions,
+        lexical_definition,
+        diagnostics
+    );
+    fields!(DefinitionLookupDiagnostic, kind, message, claim);
+    fields!(UnindexedClaim, kind, subjects, role);
+    impl NativePointRegistryIndependent for CallEvidence {
+        fn registry_independent(&self) -> bool {
+            let Self {
+                native_resolution,
+                model_member_selection,
+                authority,
+                call_application,
+                dispatch_extensibility,
+                exact_external_call,
+                external_callee_identity,
+            } = self;
+            // NativeResolutionCompletion carries SelectedContextIdentities:
+            // its query-local registry must never cross selected operations.
+            // Java currently leaves this field None; only Go publishes it.
+            native_resolution.is_none()
+                && model_member_selection.registry_independent()
+                && authority.registry_independent()
+                && call_application.registry_independent()
+                && dispatch_extensibility.registry_independent()
+                && exact_external_call.registry_independent()
+                && external_callee_identity.registry_independent()
+        }
+    }
+    fields!(
+        crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection,
+        native_target_count,
+        candidates,
+        complete
+    );
+    fields!(
+        crate::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMember,
+        member,
+        declaration,
+        owner,
+        owner_path,
+        receiver_owner,
+        receiver_pointer_depth,
+        receiver_addressable,
+        receiver_runtime,
+        receiver_proven,
+        selected,
+        selection_complete,
+        interface,
+        route_exact,
+        receiver_route_proven,
+        complete,
+        incomplete_reasons,
+        rejected
+    );
+    fields!(
+        ExactExternalCallProof,
+        canonical_callee,
+        call_application,
+        dispatch_extensibility,
+        parameter_count,
+        source_jdk_artifact,
+        python_runtime_artifact,
+        python_formal_slots,
+        python_model_manifest_sha256,
+        external_member_identity
+    );
+    impl NativePointRegistryIndependent for DefinitionLookupStatus {
+        fn registry_independent(&self) -> bool {
+            match self {
+                Self::Resolved
+                | Self::Unavailable
+                | Self::Incomplete
+                | Self::Cancelled
+                | Self::NoDefinition
+                | Self::UnresolvableImportBoundary
+                | Self::Ambiguous
+                | Self::UnsupportedLanguage
+                | Self::InvalidLocation
+                | Self::NotFound
+                | Self::ExceededBudget(_) => true,
+            }
+        }
+    }
+    impl NativePointRegistryIndependent for DefinitionResolutionAuthority {
+        fn registry_independent(&self) -> bool {
+            match self {
+                Self::Incumbent | Self::NativeJavaSelected | Self::NativeGoSelected => true,
+            }
+        }
+    }
+    impl NativePointRegistryIndependent for CallApplicationKind {
+        fn registry_independent(&self) -> bool {
+            match self {
+                Self::PackageFunction
+                | Self::BoundReceiver
+                | Self::ReceiverBindingUnknown
+                | Self::Unknown => true,
+            }
+        }
+    }
+    impl NativePointRegistryIndependent for UnindexedClaimKind {
+        fn registry_independent(&self) -> bool {
+            match self {
+                Self::ExternalBoundary | Self::ResolvedExternal | Self::UnindexedOwner => true,
+            }
+        }
+    }
+    impl NativePointRegistryIndependent for ClaimSubjectRole {
+        fn registry_independent(&self) -> bool {
+            match self {
+                Self::Module | Self::Type | Self::Member | Self::Any => true,
+            }
+        }
+    }
+}

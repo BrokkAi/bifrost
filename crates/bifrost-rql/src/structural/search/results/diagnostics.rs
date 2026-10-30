@@ -456,9 +456,11 @@ impl CodeQueryExhaustedRoot {
 pub const MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES: usize = 3_584;
 
 /// Render one exhausted-work diagnostic message: the reason, then one line
-/// per attributed entry, bounded by `max_bytes` so a policy report keeps the
-/// prose it validates (`MAX_REPORT_PROSE_BYTES`). Entries the bound cuts stay
-/// in `exhausted_roots`.
+/// per attributed entry. The result is bounded by `max_bytes` provided the
+/// reason/count header plus an elision line fits within that bound. Product
+/// callers use short fixed reasons and `MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES`
+/// so a policy report keeps the prose it validates (`MAX_REPORT_PROSE_BYTES`).
+/// Entries the bound cuts stay in `exhausted_roots`.
 pub fn render_exhausted_roots(
     reason: &str,
     roots: &[CodeQueryExhaustedRoot],

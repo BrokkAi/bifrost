@@ -250,18 +250,22 @@ fn mark_scope_body(
     code: &mut [bool],
 ) {
     let mut next = next_non_empty(comments, index);
-    let mut in_docstring = false;
+    let mut docstring_delimiter = None;
     while let Some(next_index) = next {
         let comment = &comments[next_index];
-        if in_docstring {
+        if let Some(delimiter) = docstring_delimiter {
             code[next_index] = true;
-            in_docstring = !contains_triple_quote(&comment.text);
+            if comment.text.contains(delimiter) {
+                docstring_delimiter = None;
+            }
             next = next_non_empty(comments, next_index + 1);
             continue;
         }
-        if contains_triple_quote(&comment.text) {
+        if let Some(delimiter) = triple_quote_delimiter(&comment.text) {
             code[next_index] = true;
-            in_docstring = triple_quote_delimiter_count(&comment.text) == 1;
+            if comment.text.matches(delimiter).count() == 1 {
+                docstring_delimiter = Some(delimiter);
+            }
             next = next_non_empty(comments, next_index + 1);
             continue;
         }
@@ -277,12 +281,12 @@ fn mark_scope_body(
     }
 }
 
-fn contains_triple_quote(text: &str) -> bool {
-    text.contains("\"\"\"") || text.contains("'''")
-}
-
-fn triple_quote_delimiter_count(text: &str) -> usize {
-    text.match_indices("\"\"\"").count() + text.match_indices("'''").count()
+fn triple_quote_delimiter(text: &str) -> Option<&'static str> {
+    [(r#"""""#, text.find(r#"""""#)), ("'''", text.find("'''"))]
+        .into_iter()
+        .filter_map(|(delimiter, index)| index.map(|index| (delimiter, index)))
+        .min_by_key(|(_, index)| *index)
+        .map(|(delimiter, _)| delimiter)
 }
 
 fn next_non_empty(comments: &[CommentLine], mut index: usize) -> Option<usize> {

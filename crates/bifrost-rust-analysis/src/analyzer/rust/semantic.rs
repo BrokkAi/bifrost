@@ -503,6 +503,8 @@ fn enumerate_procedures<'tree>(
             Ok(ProcedureWalkStep::Continue {
                 value,
                 scopes: ProcedureWalkScopes {
+                    child_lexical_parent: frame.lexical_parent,
+                    child_declaration_path: frame.declaration_path,
                     container_body,
                     callable_body,
                 },
@@ -3449,13 +3451,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RustOwnershipIncomplete> {
         match (source, target) {
             (RustValueType::Declared(source), RustValueType::Declared(target)) => {
-                match self.ownership.classify_reference_coercion(source, target) {
-                    RustReferenceCoercion::SharedAlias
-                    | RustReferenceCoercion::MutableAlias
-                    | RustReferenceCoercion::MutableToSharedReborrow
-                    | RustReferenceCoercion::ArrayReferenceToSlice => Ok(()),
-                    RustReferenceCoercion::Incomplete(reason) => Err(reason),
-                }
+                Self::exact_reference_coercion_result(
+                    self.ownership.classify_reference_coercion(source, target),
+                )
             }
             (RustValueType::Borrowed { mutable, referent }, RustValueType::Declared(target)) => {
                 let target_referent = rust_reference_type_referent(target)
@@ -3500,12 +3498,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         target_mutable: bool,
         target_referent: Node<'tree>,
     ) -> Result<(), RustOwnershipIncomplete> {
-        match self.ownership.classify_reference_parts(
+        Self::exact_reference_coercion_result(self.ownership.classify_reference_parts(
             mutable,
             referent,
             target_mutable,
             target_referent,
-        ) {
+        ))
+    }
+
+    fn exact_reference_coercion_result(
+        coercion: RustReferenceCoercion,
+    ) -> Result<(), RustOwnershipIncomplete> {
+        match coercion {
             RustReferenceCoercion::SharedAlias
             | RustReferenceCoercion::MutableAlias
             | RustReferenceCoercion::MutableToSharedReborrow
@@ -3826,23 +3830,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         target: ValueId,
         kind: ValueFlowKind,
     ) -> Result<(), RustLoweringError> {
-        self.append_effect(
-            builder,
-            point,
-            SemanticEffect::Assignment {
-                target,
-                value: source,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            point,
-            SemanticEffect::ValueFlow {
-                kind,
-                source,
-                target,
-            },
-        )
+        self.session
+            .append_assignment_value_flow(builder, point, kind, source, target)
     }
 
     fn append_consumed_move(
@@ -4236,7 +4225,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some(value) = brokk_bifrost_analysis::analyzer::common::reuse_cached_expression_value(
             &self.constant_index_values,
             &mut self.expression_values,
-            index,
+            &index,
             node.id(),
         ) {
             return Ok(Some((value, index)));
@@ -10316,11 +10305,11 @@ fn rust_boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
     match node.kind() {
         "true" => Some(true),
         "false" => Some(false),
-        "boolean_literal" => match source.get(node.byte_range())? {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
+        "boolean_literal" => {
+            brokk_bifrost_core::analyzer::structural::adapter_helpers::boolean_literal_value(
+                source.get(node.byte_range())?,
+            )
+        }
         _ => None,
     }
 }
@@ -12093,11 +12082,7 @@ fn rust_transparent_value_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn rust_boolean_operator(node: Node<'_>) -> Option<&'static str> {
-    match node.child_by_field_name("operator")?.kind() {
-        "&&" => Some("&&"),
-        "||" => Some("||"),
-        _ => None,
-    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::short_circuit_operator(node)
 }
 
 fn control_label(node: Node<'_>, source: &str) -> Option<Box<str>> {
@@ -12293,20 +12278,19 @@ fn is_compile_time_syntax(kind: &str) -> bool {
         )
 }
 
-pub(crate) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+fn meaningful_named_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
+    brokk_bifrost_core::analyzer::tree_walk::named_children_iter(node)
         .filter(|child| !is_comment_kind(child.kind()))
         .filter(|child| child.kind() != "attributes")
         .map(unwrap_attributes)
-        .collect()
+}
+
+pub(crate) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    meaningful_named_children(node).collect()
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| !is_comment_kind(child.kind()) && child.kind() != "attributes")
-        .map(unwrap_attributes)
+    meaningful_named_children(node).next()
 }
 
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RustLoweringError> {
@@ -13450,17 +13434,13 @@ mod grouped_attribute_ast_tests {
 
     use crate::analyzer::rust::semantic::*;
 
+    #[track_caller]
     fn parse(source: &str) -> tree_sitter::Tree {
-        let tree = brokk_bifrost_analysis::test_support::parse_fixture_tree(
+        brokk_bifrost_analysis::test_support::parse_valid_fixture_tree(
             source,
             tree_sitter_rust::LANGUAGE.into(),
-        );
-        assert!(
-            !tree.root_node().has_error(),
-            "fixture must parse without recovery:\n{}",
-            tree.root_node().to_sexp()
-        );
-        tree
+            "fixture must parse without recovery:\n",
+        )
     }
 
     #[test]
@@ -13561,14 +13541,13 @@ mod grouped_attribute_ast_tests {
 mod receiver_type_fact_tests {
 
     use crate::analyzer::rust::semantic::*;
-    use tree_sitter::Parser;
 
+    #[track_caller]
     fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Rust grammar");
-        parser.parse(source, None).expect("Rust tree")
+        brokk_bifrost_analysis::test_support::parse_fixture_tree(
+            source,
+            tree_sitter_rust::LANGUAGE.into(),
+        )
     }
 
     #[test]

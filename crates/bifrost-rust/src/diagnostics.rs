@@ -294,7 +294,8 @@ impl RustDiagnosticCollector<'_, '_> {
                     ScanFrame::Node,
                 );
             }
-            "struct_item" | "enum_item" | "trait_item" | "type_item" | "impl_item" => {
+            "struct_item" | "enum_item" | "trait_item" | "trait_alias" | "type_item"
+            | "impl_item" => {
                 scopes.enter();
                 seed_type_parameters(node, self.source, scopes);
                 stack.push(ScanFrame::ExitScope);
@@ -922,7 +923,9 @@ fn seed_item_name(node: Node<'_>, source: &str, scopes: &mut RustScopeStack) {
     let node = unwrap_attributes(node);
     let kind = match node.kind() {
         "function_item" | "const_item" | "static_item" => SymbolKind::Value,
-        "struct_item" | "enum_item" | "trait_item" | "type_item" => SymbolKind::Type,
+        "struct_item" | "enum_item" | "trait_item" | "trait_alias" | "type_item" => {
+            SymbolKind::Type
+        }
         "mod_item" => SymbolKind::Value,
         _ => return,
     };

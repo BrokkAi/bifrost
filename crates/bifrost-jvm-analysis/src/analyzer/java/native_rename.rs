@@ -8,7 +8,8 @@
 use crate::analyzer::java::JavaAnalyzer;
 use brokk_bifrost_analysis::analyzer::rename::exact::{
     AssembledExactRename, ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue,
-    RenameAssemblyLimits, RenameSourceIssue, assemble_exact_rename, check_rename_authority,
+    RenameAssemblyLimits, RenameEditCoordinateSegments, RenameSourceIssue,
+    admit_selected_native_source, assemble_exact_rename, check_rename_authority,
 };
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeSite;
 
@@ -101,25 +102,23 @@ impl CounterfactualFile {
 
     fn hypothetical_offset_to_original(&self, offset: usize) -> Option<usize> {
         let mut delta = 0_i128;
-        for edit in &self.edits {
-            let hypothetical_start = usize::try_from(edit.start_byte as i128 + delta).ok()?;
-            let hypothetical_end = hypothetical_start.checked_add(edit.new_text.len())?;
-            if offset < hypothetical_start {
+        for segment in RenameEditCoordinateSegments::new(&self.edits) {
+            let segment = segment.ok()?;
+            if offset < segment.hypothetical_start {
                 break;
             }
-            if offset == hypothetical_start {
-                return Some(edit.start_byte);
+            if offset == segment.hypothetical_start {
+                return Some(segment.original_start);
             }
-            if offset < hypothetical_end {
+            if offset < segment.hypothetical_end {
                 return None;
             }
-            if offset == hypothetical_end {
-                return Some(edit.end_byte);
+            if offset == segment.hypothetical_end {
+                return Some(segment.original_end);
             }
-            delta +=
-                edit.new_text.len() as i128 - edit.end_byte.checked_sub(edit.start_byte)? as i128;
+            delta = segment.delta_after;
         }
-        usize::try_from(offset as i128 - delta).ok()
+        usize::try_from(i128::try_from(offset).ok()?.checked_sub(delta)?).ok()
     }
 }
 
@@ -351,13 +350,7 @@ impl ExactRenameHooks for JavaRenameHooks<'_> {
     type FileState = Tree;
 
     fn admit_source(&self, file: &ProjectFile, source: &str) -> Result<Tree, RenameSourceIssue> {
-        if !self
-            .0
-            .inner
-            .source_matches_selected_native_content(file, source)
-        {
-            return Err(RenameSourceIssue::ContentChanged);
-        }
+        admit_selected_native_source(&self.0.inner, file, source)?;
         brokk_bifrost_jvm::java::declarations::parse_tree(source)
             .ok_or(RenameSourceIssue::ParseFailed)
     }

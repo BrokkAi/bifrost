@@ -290,18 +290,21 @@ pub fn find_files_containing(
     };
 
     let files: Vec<ProjectFile> = all_files.into_iter().collect();
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let mut matched: Vec<String> = files
         .into_par_iter()
         .filter_map(|file| {
-            if !is_searchable_text_file(&file) {
-                return None;
-            }
-            let contents = project.read_source(&file).ok()?;
-            if regexes.iter().any(|regex| regex.is_match(&contents)) {
-                Some(rel_path_string(&file))
-            } else {
-                None
-            }
+            attribution.run(|| {
+                if !is_searchable_text_file(&file) {
+                    return None;
+                }
+                let contents = project.read_source(&file).ok()?;
+                if regexes.iter().any(|regex| regex.is_match(&contents)) {
+                    Some(rel_path_string(&file))
+                } else {
+                    None
+                }
+            })
         })
         .collect();
 
@@ -394,56 +397,59 @@ pub fn search_file_contents(
             .collect()
     };
 
+    let attribution = brokk_bifrost_analysis::analyzer::CarriedContext::current();
     let mut groups: Vec<FileMatchGroup> = candidates
         .into_par_iter()
         .filter_map(|file| {
-            if !is_searchable_text_file(&file) {
-                return None;
-            }
-            let contents = project.read_source(&file).ok()?;
-            // Bound the per-file line count before allocating `Vec<&str>`.
-            // A 5 MB single-byte-line file would otherwise produce ~5M slices
-            // (≈120 MB of Vec headers) across rayon workers — a memory-pressure
-            // amplifier despite the byte cap.
-            if contents.bytes().filter(|&b| b == b'\n').count() > MAX_LINES_PER_FILE_SCAN {
-                return None;
-            }
-            let lines: Vec<&str> = contents.split('\n').collect();
-            let mut hits = Vec::new();
-            let mut file_truncated = false;
-            for (idx, line) in lines.iter().enumerate() {
-                if hits.len() >= MAX_PER_FILE_SEARCH_MATCHES {
-                    file_truncated = true;
-                    break;
+            attribution.run(|| {
+                if !is_searchable_text_file(&file) {
+                    return None;
                 }
-                if regexes.iter().any(|regex| regex.is_match(line)) {
-                    let before_start = idx.saturating_sub(context);
-                    let before = lines[before_start..idx]
-                        .iter()
-                        .map(|l| model_context::truncate_line(l))
-                        .collect();
-                    let after_end = (idx + 1 + context).min(lines.len());
-                    let after = lines[idx + 1..after_end]
-                        .iter()
-                        .map(|l| model_context::truncate_line(l))
-                        .collect();
-                    hits.push(LineMatch {
-                        line: idx + 1,
-                        text: model_context::truncate_line(line),
-                        before,
-                        after,
-                    });
+                let contents = project.read_source(&file).ok()?;
+                // Bound the per-file line count before allocating `Vec<&str>`.
+                // A 5 MB single-byte-line file would otherwise produce ~5M slices
+                // (≈120 MB of Vec headers) across rayon workers — a memory-pressure
+                // amplifier despite the byte cap.
+                if contents.bytes().filter(|&b| b == b'\n').count() > MAX_LINES_PER_FILE_SCAN {
+                    return None;
                 }
-            }
-            if hits.is_empty() {
-                None
-            } else {
-                Some(FileMatchGroup {
-                    path: rel_path_string(&file),
-                    matches: hits,
-                    truncated: file_truncated,
-                })
-            }
+                let lines: Vec<&str> = contents.split('\n').collect();
+                let mut hits = Vec::new();
+                let mut file_truncated = false;
+                for (idx, line) in lines.iter().enumerate() {
+                    if hits.len() >= MAX_PER_FILE_SEARCH_MATCHES {
+                        file_truncated = true;
+                        break;
+                    }
+                    if regexes.iter().any(|regex| regex.is_match(line)) {
+                        let before_start = idx.saturating_sub(context);
+                        let before = lines[before_start..idx]
+                            .iter()
+                            .map(|l| model_context::truncate_line(l))
+                            .collect();
+                        let after_end = (idx + 1 + context).min(lines.len());
+                        let after = lines[idx + 1..after_end]
+                            .iter()
+                            .map(|l| model_context::truncate_line(l))
+                            .collect();
+                        hits.push(LineMatch {
+                            line: idx + 1,
+                            text: model_context::truncate_line(line),
+                            before,
+                            after,
+                        });
+                    }
+                }
+                if hits.is_empty() {
+                    None
+                } else {
+                    Some(FileMatchGroup {
+                        path: rel_path_string(&file),
+                        matches: hits,
+                        truncated: file_truncated,
+                    })
+                }
+            })
         })
         .collect();
 

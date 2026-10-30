@@ -9,7 +9,9 @@ use crate::analyzer::semantic::{
     SemanticValueKind, SourceMappingKind, ValueId,
 };
 use crate::analyzer::{Language, Range, WorkspaceAnalyzer};
-use brokk_bifrost_core::analyzer::tree_walk::node_range;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    find_node_or_ancestor, node_range, subtree_contains,
+};
 use brokk_bifrost_js_ts::syntax::ts_type_wrapper_operand;
 use brokk_bifrost_rust::ownership::rust_dereference_operand;
 use std::collections::{HashMap, HashSet};
@@ -148,15 +150,7 @@ fn pilot_plain_assignment_candidates(
             if language == Language::Python
                 && matches!(node.kind(), "global_statement" | "nonlocal_statement")
             {
-                let mut cursor = node.walk();
-                for name in node
-                    .named_children(&mut cursor)
-                    .filter(|child| child.kind() == "identifier")
-                {
-                    if let Some(text) = syntax.source().get(name.byte_range()) {
-                        python_directives.insert(text);
-                    }
-                }
+                python_directives.extend(python_directive_identifiers(node, syntax.source()));
             }
         },
     ) {
@@ -778,15 +772,7 @@ pub fn python_overwritten_local_candidates(
         |node| match node.kind() {
             "assignment" | "augmented_assignment" => nodes.push(node),
             "global_statement" | "nonlocal_statement" => {
-                let mut cursor = node.walk();
-                for name in node
-                    .named_children(&mut cursor)
-                    .filter(|child| child.kind() == "identifier")
-                {
-                    if let Some(text) = source.get(name.byte_range()) {
-                        python_directives.insert(text);
-                    }
-                }
+                python_directives.extend(python_directive_identifiers(node, source));
             }
             _ => {}
         },
@@ -877,6 +863,22 @@ pub fn python_overwritten_local_candidates(
         complete: true,
         reason: None,
     }
+}
+
+#[track_caller]
+fn python_directive_identifiers<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Vec<&'source str> {
+    debug_assert!(matches!(
+        node.kind(),
+        "global_statement" | "nonlocal_statement"
+    ));
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+        .filter_map(|name| source.get(name.byte_range()))
+        .collect()
 }
 
 /// Go local establishments by `=`, `:=` and `var name = value`. A tuple
@@ -1682,6 +1684,22 @@ fn next_statement(statement: Node<'_>) -> Option<Node<'_>> {
     Some(next)
 }
 
+fn next_block_assignment_expression(assignment: Node<'_>) -> Option<usize> {
+    assignment
+        .parent()
+        .filter(|statement| {
+            statement.kind() == "expression_statement"
+                && statement
+                    .parent()
+                    .is_some_and(|block| block.kind() == "block")
+        })
+        .and_then(next_statement)
+        .filter(|next| next.kind() == "expression_statement" && next.named_child_count() == 1)
+        .and_then(|next| next.named_child(0))
+        .filter(|next| next.kind() == "assignment_expression")
+        .map(|next| next.start_byte())
+}
+
 /// The declared type spelling of a C# local or parameter named `name`, when
 /// it is spelled rather than inferred with `var`.
 fn csharp_swap_type(name: Node<'_>, source: &str) -> Option<Box<str>> {
@@ -1751,19 +1769,7 @@ fn csharp_plain_write<'tree>(node: Node<'tree>, source: &str) -> Option<PlainWri
         }
         _ => return Some(PlainWrite::Open(node, "destructuring_target_unmodeled")),
     }
-    let next = node
-        .parent()
-        .filter(|statement| {
-            statement.kind() == "expression_statement"
-                && statement
-                    .parent()
-                    .is_some_and(|block| block.kind() == "block")
-        })
-        .and_then(next_statement)
-        .filter(|next| next.kind() == "expression_statement" && next.named_child_count() == 1)
-        .and_then(|next| next.named_child(0))
-        .filter(|next| next.kind() == "assignment_expression")
-        .map(|next| next.start_byte());
+    let next = next_block_assignment_expression(node);
     Some(PlainWrite::Candidate {
         assignment: node,
         left,
@@ -1867,19 +1873,7 @@ fn rust_plain_write<'tree>(node: Node<'tree>, source: &str) -> Option<PlainWrite
         }
         _ => return Some(PlainWrite::Open(node, "destructuring_target_unmodeled")),
     }
-    let next = node
-        .parent()
-        .filter(|statement| {
-            statement.kind() == "expression_statement"
-                && statement
-                    .parent()
-                    .is_some_and(|block| block.kind() == "block")
-        })
-        .and_then(next_statement)
-        .filter(|next| next.kind() == "expression_statement" && next.named_child_count() == 1)
-        .and_then(|next| next.named_child(0))
-        .filter(|next| next.kind() == "assignment_expression")
-        .map(|next| next.start_byte());
+    let next = next_block_assignment_expression(node);
     Some(PlainWrite::Candidate {
         assignment: node,
         left,
@@ -2216,13 +2210,8 @@ fn php_procedure_has_reference_parameter(procedure: Node<'_>) -> bool {
     false
 }
 
-fn nearest_php_procedure(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        if is_php_assignment_procedure(node) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
+fn nearest_php_procedure(node: Node<'_>) -> Option<Node<'_>> {
+    find_node_or_ancestor(node, is_php_assignment_procedure)
 }
 
 fn is_php_assignment_procedure(node: Node<'_>) -> bool {
@@ -2450,13 +2439,8 @@ fn ruby_dynamic_scope_reason(node: Node<'_>, source: &str) -> Option<&'static st
     None
 }
 
-fn nearest_ruby_assignment_procedure(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        if ruby_assignment_procedure(node) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
+fn nearest_ruby_assignment_procedure(node: Node<'_>) -> Option<Node<'_>> {
+    find_node_or_ancestor(node, ruby_assignment_procedure)
 }
 
 fn ruby_assignment_procedure(node: Node<'_>) -> bool {
@@ -2498,15 +2482,7 @@ fn ruby_block_writes_local(block: Node<'_>) -> bool {
 }
 
 fn ruby_target_contains_identifier(node: Node<'_>) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "identifier" {
-            return true;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    false
+    subtree_contains(node, |current| current.kind() == "identifier")
 }
 
 fn ruby_procedure_declares_name(procedure: Node<'_>, source: &str, name: Node<'_>) -> bool {
@@ -2538,15 +2514,9 @@ fn ruby_procedure_declares_name(procedure: Node<'_>, source: &str, name: Node<'_
 }
 
 fn ruby_target_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "identifier" && source.get(current.byte_range()) == Some(name) {
-            return true;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    false
+    subtree_contains(node, |current| {
+        current.kind() == "identifier" && source.get(current.byte_range()) == Some(name)
+    })
 }
 
 fn ruby_identifier_value_position(node: Node<'_>) -> bool {
@@ -3666,16 +3636,9 @@ mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[track_caller]
     fn parse(source: &str, language: tree_sitter::Language) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&language).unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        assert!(
-            !tree.root_node().has_error(),
-            "{}",
-            tree.root_node().to_sexp()
-        );
-        tree
+        crate::test_support::parse_valid_fixture_tree(source, language, "")
     }
 
     fn nodes<'tree>(tree: &'tree tree_sitter::Tree, kind: &str) -> Vec<Node<'tree>> {

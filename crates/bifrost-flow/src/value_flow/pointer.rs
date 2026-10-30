@@ -149,7 +149,7 @@ enum LifecycleFact {
 struct LifecyclePlacement {
     procedure: ProcedureHandle,
     point: ProgramPointId,
-    pointer: ValueId,
+    observation: usize,
     trigger_alias: usize,
 }
 
@@ -174,6 +174,7 @@ pub struct PointerProvenancePlan {
     lifecycle: Box<[LifecycleFact]>,
     sources: HashMap<ValueFlowSourceId, SourceMetadata>,
     sinks: HashMap<ValueFlowSinkId, AccessSeed>,
+    placement_observations: Box<[ValueFlowSinkId]>,
     unsupported_procedures: HashSet<(SemanticArtifactKey, ProcedureId)>,
 }
 
@@ -483,6 +484,9 @@ impl PointerProvenancePlan {
             });
         }
 
+        let mut sink_specs = Vec::<ValueFlowSinkSpec>::new();
+        let mut observation_indices = HashMap::default();
+        let mut observation_keys = Vec::new();
         let initial_lifecycle_len = lifecycle.len();
         let mut summarized_invalidations = Vec::new();
         let mut seen_placements = HashSet::default();
@@ -529,10 +533,11 @@ impl PointerProvenancePlan {
                 }
                 let call = call_bindings.call();
                 let caller = call.procedure();
-                let Some(ControlContinuation::Target(continuation)) = caller
+                let call_site = caller
                     .semantics()
                     .call_site(call.id())
-                    .map(|call| call.normal_continuation)
+                    .expect("validated call binding names a live call site");
+                let ControlContinuation::Target(continuation) = call_site.normal_continuation
                 else {
                     continue;
                 };
@@ -544,9 +549,9 @@ impl PointerProvenancePlan {
                     if !formal_kinds.contains(&formal) {
                         continue;
                     }
-                    // The origin may have been created in any callee and returned to this
-                    // caller. The conditional lifecycle source filters these candidates by
-                    // exact value-flow identity at the callee's invalidation point.
+                    // Origins may come from any callee in the closure. Accept a
+                    // placement only when its alias source reaches this caller's
+                    // actual pointer observation before the call effects.
                     for origin_procedure in called_procedures.iter() {
                         for alias_index in alias_indices_by_procedure
                             .get(origin_procedure)
@@ -554,10 +559,37 @@ impl PointerProvenancePlan {
                             .flatten()
                             .copied()
                         {
+                            let observation = match observation_indices.entry((
+                                caller.durable_key(),
+                                call_site.point,
+                                actual,
+                            )) {
+                                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    if sink_specs.len() == MAX_VALUE_FLOW_SINKS {
+                                        return Err(ValueFlowPlanError::LimitExceeded);
+                                    }
+                                    let point = caller
+                                        .point_handle(call_site.point)
+                                        .expect("validated call site names a live point");
+                                    let key = sink_event_key(&point, sink_specs.len())?;
+                                    sink_specs.push(ValueFlowSinkSpec::new(
+                                        key.clone(),
+                                        point,
+                                        ValueFlowObservationPhase::BeforeEffects,
+                                        value_carrier(caller, actual),
+                                        ProofStatus::Proven,
+                                        EvidenceCompleteness::Complete,
+                                    ));
+                                    let index = observation_keys.len();
+                                    observation_keys.push(key);
+                                    *entry.insert(index)
+                                }
+                            };
                             let placement = LifecyclePlacement {
                                 procedure: caller.clone(),
                                 point: continuation,
-                                pointer: actual,
+                                observation,
                                 trigger_alias: alias_index,
                             };
                             if seen_placements.insert((fact_index, placement.clone())) {
@@ -578,7 +610,6 @@ impl PointerProvenancePlan {
         }
         lifecycle.extend(summarized_invalidations);
 
-        let mut sink_specs = Vec::<ValueFlowSinkSpec>::new();
         let mut sink_metadata = HashMap::<ValueFlowEventKey, AccessSeed>::default();
         for procedure in &procedures {
             for access in procedure.semantics().pointer_accesses() {
@@ -629,22 +660,8 @@ impl PointerProvenancePlan {
                 // Seed the invalidation on the operation's actual pointer
                 // value. Alias-origin sources activate it only when they reach
                 // that same carrier, including through actual/formal bindings.
-                let placement = match fact {
-                    LifecycleFact::Invalidation { placement, .. } => placement.as_ref(),
-                    LifecycleFact::ScopeEnd { .. } => None,
-                };
-                let alias_sources: Vec<(usize, ValueFlowSourceId)> =
-                    if let Some(placement) = placement {
-                        let alias = &aliases[placement.trigger_alias];
-                        vec![(placement.trigger_alias, alias.trigger_id)]
-                    } else {
-                        aliases
-                            .iter()
-                            .enumerate()
-                            .map(|(alias_index, alias)| (alias_index, alias.trigger_id))
-                            .collect()
-                    };
-                for (alias_index, trigger) in alias_sources {
+                for (alias_index, alias) in aliases.iter().enumerate() {
+                    let trigger = alias.trigger_id;
                     append_lifecycle_source(
                         fact,
                         fact_index,
@@ -769,8 +786,22 @@ impl PointerProvenancePlan {
                 (id, metadata)
             })
             .collect();
+        let sink_ids = flow
+            .sinks()
+            .map(|(id, sink)| (sink.key(), id))
+            .collect::<HashMap<_, _>>();
+        let placement_observations = observation_keys
+            .iter()
+            .map(|key| {
+                *sink_ids
+                    .get(key)
+                    .expect("each placement observation has a bound sink")
+            })
+            .collect();
+        let observation_keys = observation_keys.into_iter().collect::<HashSet<_>>();
         let sinks = flow
             .sinks()
+            .filter(|(_, sink)| !observation_keys.contains(sink.key()))
             .map(|(id, sink)| {
                 let seed = sink_metadata
                     .get(sink.key())
@@ -785,12 +816,9 @@ impl PointerProvenancePlan {
             lifecycle: lifecycle.into_boxed_slice(),
             sources,
             sinks,
+            placement_observations,
             unsupported_procedures,
         })
-    }
-
-    pub fn root(&self) -> &ProcedureHandle {
-        self.flow.root()
     }
 }
 
@@ -845,6 +873,12 @@ impl PointerProvenancePlan {
             .collect::<HashMap<_, _>>();
         let mut origins_by_access =
             HashMap::<(usize, OriginIdentity, PointerByteOffset), usize>::default();
+        let observation_meetings = flow
+            .meetings()
+            .iter()
+            .filter(|meeting| !self.sinks.contains_key(&meeting.sink()))
+            .map(|meeting| (meeting.sink(), meeting.source()))
+            .collect::<HashSet<_>>();
 
         for meeting in flow.meetings() {
             let Some(&access_index) = sink_indices.get(&meeting.sink()) else {
@@ -863,7 +897,7 @@ impl PointerProvenancePlan {
                 .or_insert_with(|| {
                     let bounds = bounds_for(
                         &seed.origin_procedure,
-                        &seed.procedure,
+                        &accesses[access_index].procedure,
                         &seed.origin,
                         seed.alias.byte_offset,
                         accesses[access_index].access.width,
@@ -939,6 +973,10 @@ impl PointerProvenancePlan {
                     continue;
                 };
                 if placement.trigger_alias == alias_index
+                    && observation_meetings.contains(&(
+                        self.placement_observations[placement.observation],
+                        self.aliases[placement.trigger_alias].trigger_id,
+                    ))
                     && placement.procedure == access_procedure
                     && control_reaches(&placement.procedure, placement.point, access_point)
                 {

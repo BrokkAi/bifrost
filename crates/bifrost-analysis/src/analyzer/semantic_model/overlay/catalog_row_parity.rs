@@ -9,9 +9,10 @@ use crate::analyzer::semantic_model::artifact::{CompiledPayload, compiled_from_w
 use crate::analyzer::semantic_model::catalog::{
     CatalogOptions, SessionPackSource, SessionPackSourceKind, validate_pack,
 };
+#[cfg(test)]
+use crate::analyzer::semantic_model::runtime::SemanticModelRuntimeLimits;
 use crate::analyzer::semantic_model::runtime::{
-    EvidenceRank, MatcherIndexes, SemanticModelActivationEvidence, SemanticModelActivationReport,
-    SemanticModelRuntimeLimits,
+    EvidenceRank, MatcherIndexes, SemanticModelActivationEvidence, resolved_active_models_fixture,
 };
 use crate::analyzer::semantic_model::{
     CatalogPackSourceKind, CompiledSemanticModelPack, SemanticPackCatalog,
@@ -40,25 +41,10 @@ fn put(snapshot: &mut Snapshot, family: &str, key: Vec<String>, value: impl Seri
         .insert(canonical(value));
 }
 
+#[track_caller]
 fn active(shards: Vec<ActiveSemanticModelShard>) -> ResolvedActiveSemanticModels {
     let shards = shards.into_iter().map(Arc::new).collect::<Vec<_>>();
-    let mut report = SemanticModelActivationReport::default();
-    let indexes = MatcherIndexes::build(
-        &shards,
-        SemanticModelRuntimeLimits::default(),
-        &CancellationToken::new(),
-        &mut report,
-    )
-    .unwrap();
-    ResolvedActiveSemanticModels {
-        active_model_set_hash: "catalog-row-parity".into(),
-        source_reader: None,
-        shards,
-        indexes,
-        extraction_gaps: Vec::new(),
-        extraction_gaps_by_declaration: HashMap::default(),
-        report,
-    }
+    resolved_active_models_fixture("catalog-row-parity", shards)
 }
 
 fn matcher_snapshot(active: &ResolvedActiveSemanticModels) -> Snapshot {
@@ -1881,18 +1867,7 @@ fn assert_active_keyed_parity(
     fn records<T: Serialize>(
         records: Vec<crate::analyzer::semantic_model::ActivatedSemanticModelRecord<T>>,
     ) -> Vec<String> {
-        records
-            .into_iter()
-            .map(|r| {
-                canonical((
-                    r.record,
-                    &r.shard.manifest.content_sha256,
-                    &r.shard.descriptor.shard_id,
-                    r.shard.source_kind,
-                    &r.shard.source_id,
-                ))
-            })
-            .collect()
+        payloads(records.into_iter().map(|r| (r.record, r.shard)))
     }
     fn matched<T: Serialize>(
         label: &str,

@@ -7,6 +7,8 @@
 //! and this module propagates those owner identities through the structured
 //! C# type hierarchy without invoking the interactive definition resolver.
 
+use brokk_bifrost_analysis::analyzer::workspace_authority::{AuthorityInputs, memo_attribution};
+
 use crate::analyzer::csharp::CSharpAnalyzer;
 
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::HierarchyDeclarationFacts;
@@ -31,12 +33,12 @@ use std::sync::Arc;
 
 impl CSharpAnalyzer {
     pub(crate) fn hierarchy_test_files(&self) -> Arc<HashSet<ProjectFile>> {
-        self.memo_caches
-            .hierarchy_test_files
-            .get_or_build_on_dedicated_pool(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+        self.memo_caches.hierarchy_test_files.read(
+            &memo_attribution(self),
+            |hierarchy_test_files_memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_on_dedicated_pool(
                     self,
-                    "csharp.hierarchy_test_files",
+                    hierarchy_test_files_memo,
                     || {
                         let Some(mut facts) = self
                             .inner
@@ -54,7 +56,9 @@ impl CSharpAnalyzer {
                         inherited_test_files(&facts)
                     },
                 )
-            })
+            },
+            |_| AuthorityInputs::SourceOf(&[brokk_bifrost_core::analyzer::model::Language::CSharp]),
+        )
     }
 }
 

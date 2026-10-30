@@ -1253,6 +1253,9 @@ jobs:
         shell: bash
         run: bash scripts/public/check-qualification-inventory.sh qualification-bundle
 
+      - name: Verify every artifact fits its registry's upload limit
+        run: node scripts/public/check-release-size-limits.mjs qualification-bundle
+
       - name: Verify source qualification bundle before relabeling
         env:
           BUNDLE_DIR: qualification-bundle
@@ -1405,6 +1408,8 @@ jobs:
       - name: Verify expected release inventory is present
         shell: bash
         run: bash scripts/public/check-qualification-inventory.sh qualification-bundle
+      - name: Verify every artifact fits its registry's upload limit
+        run: node scripts/public/check-release-size-limits.mjs qualification-bundle
       - name: Write qualification identity
         shell: bash
         env:

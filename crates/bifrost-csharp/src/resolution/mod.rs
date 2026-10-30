@@ -171,37 +171,43 @@ pub fn produce<'s>(
         let mut skip = false;
         match node.kind() {
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
-                // Namespace containment and package placement are distinct
-                // interpretations of the same primary syntax occurrence.
-                let owner = p.site(node, ctx.scope, ResolutionSiteKind::ModuleDeclaration);
-                let declaration = p.site(node, ctx.scope, ResolutionSiteKind::PackageDeclaration);
-                let name = node.child_by_field_name("name");
+                let Some(name) = node.child_by_field_name("name") else {
+                    p.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+                    continue;
+                };
+                let Some(parts) = p.path(name) else {
+                    p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
+                    continue;
+                };
                 let mut path = p.namespace_paths[&ctx.package].clone();
-                if let Some(name) = name {
-                    let Some(parts) = p.path(name) else {
-                        p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
-                        continue;
-                    };
-                    for part in parts {
-                        path.push(p.name(part));
-                    }
-                    p.claim_tree(name);
-                }
                 let end = if node.kind() == "file_scoped_namespace_declaration" {
                     source.len()
                 } else {
                     node.end_byte()
                 };
-                let scope = p.facts.allocate_lexical_scope(
-                    ctx.scope,
-                    Some(owner),
-                    ResolutionScopeKind::Package,
-                    node.start_byte(),
-                    end,
-                );
-                p.package(scope, Some(declaration), declaration, path);
-                ctx.scope = scope;
-                ctx.package = scope;
+                // Nested declarations and dotted namespaces lower identically:
+                // C# resolves each level separately (ECMA-334 14.5 and 7.6),
+                // so A.B.X and A.X must belong to different scope choices.
+                for (index, part) in parts.into_iter().enumerate() {
+                    // Preserve the whole-declaration sites for existing readers.
+                    // Later segments have their own AST occurrences and scopes.
+                    let site_node = if index == 0 { node } else { part };
+                    let owner = p.site(site_node, ctx.scope, ResolutionSiteKind::ModuleDeclaration);
+                    let declaration =
+                        p.site(site_node, ctx.scope, ResolutionSiteKind::PackageDeclaration);
+                    path.push(p.name(part));
+                    let scope = p.facts.allocate_lexical_scope(
+                        ctx.scope,
+                        Some(owner),
+                        ResolutionScopeKind::Package,
+                        node.start_byte(),
+                        end,
+                    );
+                    p.package(scope, Some(declaration), declaration, path.clone());
+                    ctx.scope = scope;
+                    ctx.package = scope;
+                }
+                p.claim_tree(name);
                 if node.kind() == "file_scoped_namespace_declaration" {
                     // File namespaces extend beyond a transparent preprocessor
                     // container too, not only direct compilation-unit siblings.

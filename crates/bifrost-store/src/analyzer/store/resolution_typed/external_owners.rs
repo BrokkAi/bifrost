@@ -3,8 +3,8 @@ use super::super::resolution_operation::nominal_rules::jvm_external_owner_relati
 use super::*;
 use crate::analyzer::resolution::ExternalOwnerIdentity;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberQualifierCompatibility,
-    ResolutionNamespace,
+    DeclarationTypeRole, ResolutionMemberAccess, ResolutionMemberKind,
+    ResolutionMemberQualifierCompatibility, ResolutionNamespace,
 };
 use std::sync::Arc;
 
@@ -653,6 +653,8 @@ pub(super) struct ExternalSignatureMemo {
         SemanticId,
         Option<SelectedTypedRow<LoweredCallableSignatureProperty>>,
     >,
+    declarations:
+        crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
     seeds: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicSeed>>,
     parameter_slots: crate::hash::HashSet<SemanticId>,
     components: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredTypeComponent>>,
@@ -678,11 +680,10 @@ impl SelectedResolutionTypedSource<'_, '_> {
         })
     }
 
-    pub(super) fn visit_external_callable_signatures(
+    fn materialize_external_declaration_types(
         &self,
         definitions: &[SemanticId],
         cancellation: &CancellationToken,
-        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallableSignatureProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
         use crate::analyzer::resolution::{
             LoweredCallableParameterApplicability, LoweredCallableParameterProperty,
@@ -726,7 +727,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 .map_err(|error| StoreError::new(error.to_string()))?;
             let rows = self.read_statement(cancellation, |connection| {
                 let mut statement = connection
-                    .prepare_cached(jvm_external_owner_relations().callable_signatures)?;
+                    .prepare_cached(jvm_external_owner_relations().declaration_signatures)?;
                 let mut cursor = statement.query([coordinates, providers])?;
                 let mut rows = Vec::new();
                 while let Some(row) = cursor.next()? {
@@ -739,6 +740,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                         row.get::<_, u32>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                     ));
                 }
                 Ok(Some(rows))
@@ -748,15 +750,15 @@ impl SelectedResolutionTypedSource<'_, '_> {
             };
             let mut decoded = Vec::new();
             let mut type_names = BTreeSet::new();
-            for (provider, owner, ordinal, parameters, result) in rows {
+            for (provider, owner, ordinal, parameters, result, kind) in rows {
                 let parameters: Vec<Parameter> =
                     serde_json::from_str(&parameters).map_err(|error| {
-                        invalid_fact(format!("external callable parameters: {error}"))
+                        invalid_fact(format!("external declaration parameters: {error}"))
                     })?;
                 let result: Option<TypeRef> = result
                     .map(|value| serde_json::from_str(&value))
                     .transpose()
-                    .map_err(|error| invalid_fact(format!("external callable result: {error}")))?;
+                    .map_err(|error| invalid_fact(format!("external declaration type: {error}")))?;
                 let mut pending = parameters
                     .iter()
                     .map(|parameter| &parameter.r#type)
@@ -820,6 +822,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     parameters,
                     result,
                     generic,
+                    kind,
                 ));
             }
             let missing = type_names
@@ -876,7 +879,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
             for definition in requested.values() {
                 memo.signatures.insert(*definition, None);
             }
-            for (definition, owner, ordinal, parameters, result, generic) in decoded {
+            for (definition, owner, ordinal, parameters, result, generic, kind) in decoded {
+                let callable = matches!(kind.as_str(), "method" | "function" | "constructor");
                 let member = crate::analyzer::resolution::ExternalMemberIdentity {
                     owner: owner.clone(),
                     ordinal,
@@ -909,28 +913,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     // A source formal carries its value type, rather than a
                     // type qualifier. Preserve the same category for external
                     // formals so ordinary applicability can compare them.
-                    let seed = memo.seeds.get(&slot).expect("lowered parameter has a seed");
-                    let row = seed.row();
-                    let frontier = crate::analyzer::resolution::TypedFrontierState::new(
-                        slot,
-                        row.frontier()
-                            .possible_values()
-                            .iter()
-                            .map(|value| {
-                                crate::analyzer::resolution::ResolutionSlotValue::runtime(
-                                    value.ty(),
-                                    false,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                        row.frontier().completion().clone(),
-                    );
-                    let seed = seed.with_row(LoweredIntrinsicSeed::new(
-                        row.kind(),
-                        row.spelling(),
-                        frontier,
-                    ));
-                    memo.seeds.insert(slot, seed);
+                    memo.materialize_value_seed(slot);
                     memo.parameter_slots.insert(slot);
                     properties.push(LoweredCallableParameterProperty::new(
                         position,
@@ -961,7 +944,29 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     ) else {
                         return cancelled();
                     };
+                    memo.declarations.insert(
+                        definition,
+                        SelectedTypedRow::external_member(
+                            owner.clone(),
+                            ordinal,
+                            LoweredDeclarationTypeProperty::new(
+                                definition,
+                                slot,
+                                if callable {
+                                    DeclarationTypeRole::Return
+                                } else {
+                                    DeclarationTypeRole::Value
+                                },
+                            ),
+                        ),
+                    );
+                    if !callable {
+                        memo.materialize_value_seed(slot);
+                    }
                     result_types.push(LoweredCallableResultTypeProperty::new(0, slot));
+                }
+                if !callable {
+                    continue;
                 }
                 let completion = if generic {
                     // No erased signature or unconstrained inference is a proof
@@ -997,6 +1002,58 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     Some(SelectedTypedRow::external_member(owner, ordinal, signature)),
                 );
             }
+        }
+        Ok(TypedFactReadOutcome::exhausted(
+            ResolutionCompletion::Complete,
+        ))
+    }
+
+    pub(super) fn visit_external_declaration_types(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let outcome = self.materialize_external_declaration_types(definitions, cancellation)?;
+        if !outcome.is_exhausted() {
+            return Ok(outcome);
+        }
+        let memo = self.external_signatures.borrow();
+        let rows = definitions
+            .iter()
+            .filter_map(|definition| memo.declarations.get(definition).cloned())
+            .collect();
+        self.external_signature_rows(rows, cancellation, visitor)
+    }
+
+    pub(super) fn visit_external_declaration_types_for_slots(
+        &self,
+        slots: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let memo = self.external_signatures.borrow();
+        let rows = slots
+            .iter()
+            .filter_map(|slot| {
+                memo.declarations
+                    .values()
+                    .find(|property| property.row().slot() == *slot)
+                    .cloned()
+            })
+            .collect();
+        self.external_signature_rows(rows, cancellation, visitor)
+    }
+
+    pub(super) fn visit_external_callable_signatures(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallableSignatureProperty>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let outcome = self.materialize_external_declaration_types(definitions, cancellation)?;
+        if !outcome.is_exhausted() {
+            return Ok(outcome);
         }
         let memo = self.external_signatures.borrow();
         let rows = definitions
@@ -1090,7 +1147,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
     }
 }
 
-pub(in crate::analyzer::store) const EXTERNAL_CALLABLE_SIGNATURES_SQL: &str = r#"
+pub(in crate::analyzer::store) const EXTERNAL_DECLARATION_SIGNATURES_SQL: &str = r#"
 WITH requested AS (
     SELECT json_extract(value,'$[0]') provider_id,
            json_extract(value,'$[1]') owner_fqn,
@@ -1098,13 +1155,13 @@ WITH requested AS (
     FROM json_each(?1)
 )
 SELECT DISTINCT member.provider_id,member.owner_fqn,member.ordinal,
-       json(member.parameters_jsonb),json(member.return_type_jsonb)
+       json(member.parameters_jsonb),json(member.return_type_jsonb),member.member_kind
 FROM requested
 JOIN jvm_external_owner_members selected USING(provider_id,owner_fqn,ordinal)
 JOIN jvm_external_owner_members member
   ON member.provider_id=selected.provider_id AND member.owner_fqn=selected.owner_fqn
  AND member.member_name=selected.member_name AND member.member_kind=selected.member_kind
-WHERE member.signature_present=1 AND member.member_kind IN ('method','function','constructor')
+WHERE member.signature_present=1 AND member.member_kind IN ('method','function','constructor','field','constant')
   AND member.provider_id IN (SELECT value FROM json_each(?2))
 ORDER BY member.provider_id,member.owner_fqn,member.ordinal
 "#;
@@ -1118,6 +1175,43 @@ ORDER BY owner_fqn,provider_id
 "#;
 
 impl ExternalSignatureMemo {
+    pub(super) fn type_frontier(
+        &self,
+        slot: SemanticId,
+    ) -> &crate::analyzer::resolution::TypedFrontierState {
+        self.seeds
+            .get(&slot)
+            .expect("lowered type has a seed")
+            .row()
+            .frontier()
+    }
+
+    /// Parameters and fields carry runtime values of their declared types.
+    fn materialize_value_seed(&mut self, slot: SemanticId) {
+        let seed = self
+            .seeds
+            .get(&slot)
+            .expect("lowered declaration type has a seed");
+        let row = seed.row();
+        let frontier = crate::analyzer::resolution::TypedFrontierState::new(
+            slot,
+            row.frontier()
+                .possible_values()
+                .iter()
+                .map(|value| {
+                    crate::analyzer::resolution::ResolutionSlotValue::runtime(value.ty(), false)
+                })
+                .collect::<Vec<_>>(),
+            row.frontier().completion().clone(),
+        );
+        let seed = seed.with_row(LoweredIntrinsicSeed::new(
+            row.kind(),
+            row.spelling(),
+            frontier,
+        ));
+        self.seeds.insert(slot, seed);
+    }
+
     /// Lower the structured declaration term without parsing display text or
     /// erasing a generic variable to its bound. The explicit postorder stack
     /// also keeps deeply nested array signatures off the Rust call stack.
@@ -1132,173 +1226,266 @@ impl ExternalSignatureMemo {
         identities: &crate::analyzer::resolution::SelectedContextIdentities,
         cancellation: &CancellationToken,
     ) -> Option<SemanticId> {
-        use crate::analyzer::resolution::{
-            ResolutionSlotValue, ResolutionTypeRef, TypedFrontierState,
-        };
-        use crate::analyzer::semantic_model::TypeRef;
-        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-        use brokk_bifrost_core::analyzer::resolution_facts::{
-            IntrinsicTypeKind, ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
-        };
-        let owner = &member.owner;
-        let member_ordinal = member.ordinal;
-        let mut allocate = || {
-            let mut hash = CanonicalHasher::new(b"bifrost-jvm-external-signature-slot:v1");
-            hash.field("provider", owner.provider_id.as_bytes());
-            hash.field("owner", owner.owner_fqn.as_bytes());
-            match coordinate {
-                crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(
-                    ordinal,
-                ) => {
-                    hash.field("member", &ordinal.to_be_bytes());
-                }
-                crate::analyzer::resolution::ExternalMemberCoordinate::ModelMember(member) => {
-                    hash.field("pack-id", member.provider.pack_id.as_bytes());
-                    hash.field("pack-version", member.provider.pack_version.as_bytes());
-                    hash.field("pack-digest", member.provider.pack_digest.as_bytes());
-                    hash.field("symbol-id", member.symbol_id.as_bytes());
-                }
+        // The JVM hook retains its existing allocation domain and provenance.
+        lower_type_term(
+            self,
+            term,
+            &mut JvmTypeTermHooks {
+                member,
+                coordinate,
+                next_slot,
+                names,
+                identities,
+            },
+            identities,
+            cancellation,
+        )
+        .expect("JVM nominal lookup is infallible")
+    }
+}
+
+use crate::analyzer::semantic_model::TypeRef;
+use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
+
+/// The traversal and slot producers are shared; a language supplies nominal
+/// authority, constructors, allocation coordinates and selected provenance.
+pub(super) trait TypeTermHooks {
+    fn allocate(&mut self) -> (SemanticId, [u8; 32]);
+    fn wrap<T>(&self, row: T) -> SelectedTypedRow<T>;
+    fn nominal(
+        &mut self,
+        term: &TypeRef,
+        owners: &crate::hash::HashMap<String, Option<ExternalOwnerIdentity>>,
+    ) -> StoreResult<Option<(SemanticId, IntrinsicTypeKind, String)>>;
+    fn exact_nominal(&self, term: &TypeRef) -> bool;
+    fn sequence_element<'a>(&self, _term: &'a TypeRef) -> Option<&'a TypeRef> {
+        None
+    }
+    fn pointer_element<'a>(&self, _term: &'a TypeRef) -> Option<&'a TypeRef> {
+        None
+    }
+}
+
+struct JvmTypeTermHooks<'a> {
+    member: &'a crate::analyzer::resolution::ExternalMemberIdentity,
+    coordinate: &'a crate::analyzer::resolution::ExternalMemberCoordinate,
+    next_slot: &'a mut u32,
+    names: &'a dyn SharedNameInterner,
+    identities: &'a crate::analyzer::resolution::SelectedContextIdentities,
+}
+
+impl TypeTermHooks for JvmTypeTermHooks<'_> {
+    fn allocate(&mut self) -> (SemanticId, [u8; 32]) {
+        let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-jvm-external-signature-slot:v1",
+        );
+        hash.field("provider", self.member.owner.provider_id.as_bytes());
+        hash.field("owner", self.member.owner.owner_fqn.as_bytes());
+        match self.coordinate {
+            crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(ordinal) => {
+                hash.field("member", &ordinal.to_be_bytes());
             }
-            hash.field("slot", &next_slot.to_be_bytes());
-            *next_slot = next_slot
-                .checked_add(1)
-                .expect("external signature slots fit u32");
-            let digest = hash.finish();
-            (SemanticId::shared_name(names.intern(digest)), digest)
-        };
-        let root = allocate();
-        let mut pending = vec![(term, root, None)];
-        while let Some((term, (slot, digest), component)) = pending.pop() {
-            if cancellation.is_cancelled() {
-                return None;
+            crate::analyzer::resolution::ExternalMemberCoordinate::ModelMember(member) => {
+                hash.field("pack-id", member.provider.pack_id.as_bytes());
+                hash.field("pack-version", member.provider.pack_version.as_bytes());
+                hash.field("pack-digest", member.provider.pack_digest.as_bytes());
+                hash.field("symbol-id", member.symbol_id.as_bytes());
             }
-            if let Some(element) = component {
-                let child = self
+        }
+        hash.field("slot", &self.next_slot.to_be_bytes());
+        *self.next_slot = self
+            .next_slot
+            .checked_add(1)
+            .expect("external signature slots fit u32");
+        let digest = hash.finish();
+        (SemanticId::shared_name(self.names.intern(digest)), digest)
+    }
+
+    fn wrap<T>(&self, row: T) -> SelectedTypedRow<T> {
+        SelectedTypedRow::external_member(self.member.owner.clone(), self.member.ordinal, row)
+    }
+    fn nominal(
+        &mut self,
+        term: &TypeRef,
+        owners: &crate::hash::HashMap<String, Option<ExternalOwnerIdentity>>,
+    ) -> StoreResult<Option<(SemanticId, IntrinsicTypeKind, String)>> {
+        Ok(if let TypeRef::Named { name, .. } = term {
+            if brokk_bifrost_jvm::java::primitives::primitive_for_name(name).is_some() {
+                let digest = crate::analyzer::resolution::universe::intrinsic_type_identity_digest(
+                    Language::Java,
+                    IntrinsicTypeKind::Primitive,
+                    name,
+                );
+                Some((
+                    SemanticId::shared_name(self.names.intern(digest)),
+                    IntrinsicTypeKind::Primitive,
+                    name.clone(),
+                ))
+            } else {
+                owners.get(name).and_then(Option::as_ref).map(|owner| {
+                    (
+                        self.identities.external_owner_semantic(owner, self.names),
+                        IntrinsicTypeKind::LanguageBuiltin,
+                        name.clone(),
+                    )
+                })
+            }
+        } else {
+            None
+        })
+    }
+    fn exact_nominal(&self, term: &TypeRef) -> bool {
+        !matches!(term, TypeRef::Named { arguments, nullable, .. } if !arguments.is_empty() || *nullable)
+    }
+    fn sequence_element<'a>(&self, term: &'a TypeRef) -> Option<&'a TypeRef> {
+        if let TypeRef::Array { element } = term {
+            Some(element)
+        } else {
+            None
+        }
+    }
+}
+
+/// Iterative postorder lowering retains unsupported terms as incomplete slots.
+pub(super) fn lower_type_term(
+    memo: &mut ExternalSignatureMemo,
+    term: &TypeRef,
+    hooks: &mut impl TypeTermHooks,
+    identities: &crate::analyzer::resolution::SelectedContextIdentities,
+    cancellation: &CancellationToken,
+) -> StoreResult<Option<SemanticId>> {
+    use crate::analyzer::resolution::{ResolutionSlotValue, ResolutionTypeRef, TypedFrontierState};
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
+    };
+    let root = hooks.allocate();
+    let mut pending = vec![(term, root, None)];
+    while let Some((term, (slot, digest), component)) = pending.pop() {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some((element, pointer)) = component {
+            if pointer {
+                let child = memo
                     .seeds
                     .get(&element)
-                    .expect("external array component was lowered first");
-                let completion = child.row().frontier().completion().clone();
-                self.components.insert(
-                    slot,
-                    SelectedTypedRow::external_member(
-                        owner.clone(),
-                        member_ordinal,
-                        LoweredTypeComponent::new(
-                            slot,
-                            ResolutionTypeConstructorKind::Sequence,
-                            ResolutionTypeComponentKind::Element,
-                            element,
-                        ),
-                    ),
-                );
-                self.seeds.insert(
-                    slot,
-                    SelectedTypedRow::external_member(
-                        owner.clone(),
-                        member_ordinal,
-                        LoweredIntrinsicSeed::new(
-                            IntrinsicTypeKind::Structural,
-                            "structural-type",
-                            TypedFrontierState::new(
-                                slot,
-                                vec![ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                                    slot, 0,
-                                ))],
-                                completion,
-                            ),
-                        ),
-                    ),
-                );
-                continue;
-            }
-            if let TypeRef::Array { element } = term {
-                let child = allocate();
-                pending.push((term, (slot, digest), Some(child.0)));
-                pending.push((element, child, None));
-                continue;
-            }
-            let known = if let TypeRef::Named { name, .. } = term {
-                if brokk_bifrost_jvm::java::primitives::primitive_for_name(name).is_some() {
-                    let digest =
-                        crate::analyzer::resolution::universe::intrinsic_type_identity_digest(
-                            Language::Java,
-                            IntrinsicTypeKind::Primitive,
-                            name,
-                        );
-                    Some((
-                        SemanticId::shared_name(names.intern(digest)),
-                        IntrinsicTypeKind::Primitive,
-                        name.as_str(),
-                    ))
-                } else {
-                    self.owners.get(name).and_then(Option::as_ref).map(|owner| {
-                        (
-                            identities.external_owner_semantic(owner, names),
-                            IntrinsicTypeKind::LanguageBuiltin,
-                            name.as_str(),
-                        )
+                    .expect("pointer operand was lowered first");
+                let frontier = child.row().frontier();
+                let values: Vec<_> = frontier
+                    .possible_values()
+                    .iter()
+                    .map(|value| {
+                        let ty = value.ty();
+                        ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                            ty.identity(),
+                            ty.indirection()
+                                .checked_add(1)
+                                .expect("type depth fits u32"),
+                        ))
                     })
-                }
-            } else {
-                None
-            };
-            let incomplete_type = || {
-                let reason = identities.named_semantic(
-                    digest,
-                    "UnsupportedExternalSignatureType",
-                    "The external declaration type term has no proven exact native substitution",
+                    .collect();
+                memo.seeds.insert(
+                    slot,
+                    hooks.wrap(LoweredIntrinsicSeed::new(
+                        IntrinsicTypeKind::Structural,
+                        "pointer-type",
+                        TypedFrontierState::new(slot, values, frontier.completion().clone()),
+                    )),
                 );
-                ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
-                    reason,
-                )])
-            };
-            let (kind, spelling, values, completion) = if let Some((identity, kind, spelling)) =
-                known
-            {
-                self.descriptors.insert(
-                    identity,
-                    SelectedTypedRow::external_member(
-                        owner.clone(),
-                        member_ordinal,
-                        LoweredIntrinsicTypeDescriptor::new(identity, kind, spelling),
-                    ),
-                );
-                (
-                    kind,
-                    spelling,
-                    vec![ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                        identity, 0,
-                    ))],
-                    if matches!(term, TypeRef::Named { arguments, nullable, .. } if !arguments.is_empty() || *nullable)
-                    {
-                        incomplete_type()
-                    } else {
-                        ResolutionCompletion::Complete
-                    },
-                )
-            } else {
-                (
-                    IntrinsicTypeKind::Structural,
-                    "unknown-external-type",
-                    Vec::new(),
-                    incomplete_type(),
-                )
-            };
-            self.seeds.insert(
+                continue;
+            }
+            let child = memo
+                .seeds
+                .get(&element)
+                .expect("external array component was lowered first");
+            let completion = child.row().frontier().completion().clone();
+            memo.components.insert(
                 slot,
-                SelectedTypedRow::external_member(
-                    owner.clone(),
-                    member_ordinal,
-                    LoweredIntrinsicSeed::new(
-                        kind,
-                        spelling,
-                        TypedFrontierState::new(slot, values, completion),
-                    ),
-                ),
+                hooks.wrap(LoweredTypeComponent::new(
+                    slot,
+                    ResolutionTypeConstructorKind::Sequence,
+                    ResolutionTypeComponentKind::Element,
+                    element,
+                )),
             );
+            memo.seeds.insert(
+                slot,
+                hooks.wrap(LoweredIntrinsicSeed::new(
+                    IntrinsicTypeKind::Structural,
+                    "structural-type",
+                    TypedFrontierState::new(
+                        slot,
+                        vec![ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                            slot, 0,
+                        ))],
+                        completion,
+                    ),
+                )),
+            );
+            continue;
         }
-        Some(root.0)
+        if let Some(element) = hooks.pointer_element(term) {
+            let child = hooks.allocate();
+            pending.push((term, (slot, digest), Some((child.0, true))));
+            pending.push((element, child, None));
+            continue;
+        }
+        if let Some(element) = hooks.sequence_element(term) {
+            let child = hooks.allocate();
+            pending.push((term, (slot, digest), Some((child.0, false))));
+            pending.push((element, child, None));
+            continue;
+        }
+        let known = hooks.nominal(term, &memo.owners)?;
+        let incomplete_type = || {
+            let reason = identities.named_semantic(
+                digest,
+                "UnsupportedExternalSignatureType",
+                "The external declaration type term has no proven exact native substitution",
+            );
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                reason,
+            )])
+        };
+        let (kind, spelling, values, completion) = if let Some((identity, kind, spelling)) = known {
+            memo.descriptors.insert(
+                identity,
+                hooks.wrap(LoweredIntrinsicTypeDescriptor::new(
+                    identity,
+                    kind,
+                    spelling.as_str(),
+                )),
+            );
+            (
+                kind,
+                spelling.clone(),
+                vec![ResolutionSlotValue::type_object(ResolutionTypeRef::new(
+                    identity, 0,
+                ))],
+                if !hooks.exact_nominal(term) {
+                    incomplete_type()
+                } else {
+                    ResolutionCompletion::Complete
+                },
+            )
+        } else {
+            (
+                IntrinsicTypeKind::Structural,
+                "unknown-external-type".to_owned(),
+                Vec::new(),
+                incomplete_type(),
+            )
+        };
+        memo.seeds.insert(
+            slot,
+            hooks.wrap(LoweredIntrinsicSeed::new(
+                kind,
+                spelling,
+                TypedFrontierState::new(slot, values, completion),
+            )),
+        );
     }
+    Ok(Some(root.0))
 }
 
 impl SelectedResolutionTypedSource<'_, '_> {

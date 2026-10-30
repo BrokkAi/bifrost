@@ -9806,6 +9806,7 @@ mod tests {
         let scope = std::sync::Arc::new(
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext::default(),
         );
+        let scope_attribution = scope.enter();
         analyzer.begin_query(&scope);
         analyzer
             .test_hooks()
@@ -9843,6 +9844,7 @@ mod tests {
             "a name warmed by prefetch_definitions must not fall back to a point lookup"
         );
         analyzer.end_query(&scope);
+        drop(scope_attribution);
     }
 
     #[test]

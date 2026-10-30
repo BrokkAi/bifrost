@@ -1443,6 +1443,9 @@ pub enum ProviderPreparation<K> {
 /// closer owns placement proofs, authority grouping and bridge publication.
 #[doc(hidden)]
 pub struct ProviderRows {
+    /// Explicit keyed admission evidence, separate from closure completion.
+    /// Only a successful Go model-owner mint behind an open import sets this.
+    pub endpoint_completion: Option<ResolutionCompletion>,
     pub language: Language,
     pub exports: Vec<SelectedRootPathHalf>,
     pub recipe: ResolutionLookupSemanticRecipe,
@@ -1603,15 +1606,22 @@ pub struct ClosureWitness {
     pub positive_binding_providers: BTreeMap<SemanticId, BTreeSet<SemanticId>>,
 }
 impl ClosureWitness {
-    fn retain_read(read: Read<Self>, evidence: &mut ResolutionCompletion) -> Option<Self> {
+    fn retain_read(
+        read: Read<Self>,
+        evidence: &mut ResolutionCompletion,
+    ) -> std::ops::ControlFlow<LanguageClosure, Self> {
         match read {
             Read::Ready { value, completion } => {
                 *evidence = evidence.combine(&completion);
-                Some(value)
+                std::ops::ControlFlow::Continue(value)
             }
-            Read::Unavailable { completion, .. } | Read::Cancelled(completion) => {
+            Read::Unavailable { completion, .. } => {
                 *evidence = evidence.combine(&completion);
-                None
+                std::ops::ControlFlow::Break(LanguageClosure::settled(evidence.clone()))
+            }
+            Read::Cancelled(completion) => {
+                *evidence = evidence.combine(&completion);
+                std::ops::ControlFlow::Break(LanguageClosure::cancelled(evidence.clone()))
             }
         }
     }
@@ -1810,10 +1820,13 @@ pub trait DemandRules {
     fn admit_endpoint(
         &mut self,
         endpoint: &EndpointSignature,
-        already_published: bool,
+        retained_completion: Option<&ResolutionCompletion>,
     ) -> Result<Read<EndpointAdmission>> {
+        if let Some(completion) = retained_completion {
+            return Ok(Read::ready(EndpointAdmission::Ready(completion.clone())));
+        }
         Ok(Read::ready(
-            if endpoint.node() != BindingNodeId::universal_root() || already_published {
+            if endpoint.node() != BindingNodeId::universal_root() {
                 EndpointAdmission::Ready(ResolutionCompletion::Complete)
             } else {
                 EndpointAdmission::Discover
@@ -1843,8 +1856,10 @@ pub trait DemandRules {
         _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         _provenance: crate::analyzer::resolution::HierarchyProvenanceView<'_>,
         _resume: crate::analyzer::resolution::CloseResume<'_>,
-    ) -> Result<crate::analyzer::resolution::CloseProgress<()>> {
-        Ok(crate::analyzer::resolution::CloseProgress::Ready(()))
+    ) -> Result<crate::analyzer::resolution::CloseProgress<Read<()>>> {
+        Ok(crate::analyzer::resolution::CloseProgress::Ready(
+            Read::ready(()),
+        ))
     }
 
     fn resolve_prefix_operands(
@@ -1977,6 +1992,55 @@ pub(super) struct ExactMemberSelection {
     pub override_target: Option<(BindingFragmentId, BindingNodeId)>,
 }
 
+/// Read exact first-symbol bindings at one scope head, without following parents.
+pub(super) fn scope_binding_paths(
+    base: &dyn BatchResolutionFragmentSource,
+    scope_head: BindingNodeId,
+    lookup: SemanticId,
+    cancellation: &CancellationToken,
+) -> Result<Option<(Vec<PartialPath>, ResolutionCompletion)>> {
+    let request = BatchCandidateRequest::new(
+        0,
+        EndpointSignature::new(
+            scope_head,
+            StackPattern::closed([lookup]),
+            StackPattern::closed([]),
+        ),
+    );
+    let outcome = base.match_forward_candidates(std::slice::from_ref(&request), cancellation)?;
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let [branch] = outcome.branch_completions() else {
+        panic!(
+            "one candidate request has one branch completion: {:?}",
+            outcome.branch_completions()
+        );
+    };
+    let completion = outcome.unconditional_completion().combine(branch);
+    let candidates = outcome
+        .matches()
+        .iter()
+        .map(|matched| matched.candidate())
+        .collect::<Vec<_>>();
+    // Candidate bucketing is coarse. Hydration proves the exact first symbol.
+    let paths = base
+        .hydrate_candidate_paths(&candidates, cancellation)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| {
+            path.start().node() == scope_head
+                && path
+                    .start()
+                    .symbols()
+                    .fixed()
+                    .first()
+                    .is_some_and(|symbol| symbol.symbol() == lookup)
+        })
+        .collect();
+    Ok(Some((paths, completion)))
+}
+
 /// Select an exact declaration within the supplied owners, without following
 /// outward lexical paths or inventing hierarchy edges. Only a unique declaring
 /// owner admits continuation. A unique override takes precedence over its
@@ -2010,39 +2074,14 @@ pub(super) fn select_unique_exact_member(
     scopes.dedup();
     let mut binding = Vec::new();
     for (definition, scope_head) in scopes {
-        let request = BatchCandidateRequest::new(
-            0,
-            EndpointSignature::new(
-                scope_head,
-                StackPattern::closed([owners.lookup]),
-                StackPattern::closed([]),
-            ),
-        );
-        let outcome =
-            base.match_forward_candidates(std::slice::from_ref(&request), cancellation)?;
-        if cancellation.is_cancelled() {
+        // The helper's hydration proves the exact first symbol, so a different
+        // member cannot introduce owner ambiguity.
+        let Some((paths, _completion)) =
+            scope_binding_paths(base, scope_head, owners.lookup, cancellation)?
+        else {
             return Ok(None);
-        }
-        // Candidate bucketing is coarse. Hydration proves the exact first
-        // symbol, so a different member cannot introduce owner ambiguity.
-        let candidates = outcome
-            .matches()
-            .iter()
-            .map(|matched| matched.candidate())
-            .collect::<Vec<_>>();
-        let binds = base
-            .hydrate_candidate_paths(&candidates, cancellation)?
-            .into_iter()
-            .any(|(_, path)| {
-                path.start().node() == scope_head
-                    && path
-                        .start()
-                        .symbols()
-                        .fixed()
-                        .first()
-                        .is_some_and(|symbol| symbol.symbol() == owners.lookup)
-            });
-        if binds {
+        };
+        if !paths.is_empty() {
             binding.push((definition, scope_head));
         }
     }
@@ -2168,6 +2207,18 @@ impl<R> DemandLanguage for SharedDemand<'_, '_, '_, R>
 where
     R: DemandRules,
 {
+    fn finalize_closure(
+        &mut self,
+        endpoint: &EndpointSignature,
+        closure: LanguageClosure,
+    ) -> Result<LanguageClosure> {
+        settle_root(self, endpoint, closure)
+    }
+    fn root_has_receipt(&self, endpoint: &EndpointSignature) -> bool {
+        let arena = self.arena.borrow();
+        let key = DemandRelationKey::caller(endpoint.clone());
+        arena.base_ready.contains(&key) || arena.endpoints.contains_key(&key)
+    }
     fn qualified_members(
         &mut self,
     ) -> Option<&mut dyn crate::analyzer::resolution::QualifiedMemberProvider> {
@@ -2202,7 +2253,13 @@ where
                 .rules
                 .prepare_module_imports(frame, inputs, provenance, resume)?
             {
-                CloseProgress::Ready(()) => CloseResume::Start,
+                CloseProgress::Ready(Read::Ready { .. }) => CloseResume::Start,
+                CloseProgress::Ready(Read::Unavailable { completion, .. }) => {
+                    return Ok(CloseProgress::Ready(LanguageClosure::settled(completion)));
+                }
+                CloseProgress::Ready(Read::Cancelled(completion)) => {
+                    return Ok(CloseProgress::Cancelled(completion));
+                }
                 CloseProgress::Reference {
                     continuation,
                     key,
@@ -2236,11 +2293,9 @@ where
                 })
                 .combine(member_completion);
             if self.cancellation.is_cancelled() || !self.session.scope_step() {
-                return Ok(CloseProgress::Ready(LanguageClosure {
-                    completion: evidence.combine(&cancelled_completion()),
-                    closed: false,
-                    discharges: None,
-                }));
+                return Ok(CloseProgress::Ready(LanguageClosure::cancelled(
+                    evidence.combine(&cancelled_completion()),
+                )));
             }
         }
         // A failed call drops its removed slot. No outstanding token or prepared
@@ -2265,7 +2320,10 @@ where
                     .is_none()
             );
         }
-        Ok(progress)
+        match progress {
+            CloseProgress::Ready(closure) => Ok(CloseProgress::Ready(closure)),
+            other => Ok(other),
+        }
     }
 
     type RootQuestion = RootFrame;
@@ -2340,40 +2398,31 @@ where
             })
             .combine(&selection.completion);
         if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&cancelled_completion()),
+            ));
         }
         let Some(evidence) =
             frame.normalized_prefix_evidence(inputs, &self.rules, &selection.completion)?
         else {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&cancelled_completion()),
+            ));
         };
         // Incomplete member inventory cannot certify a closed empty endpoint.
         if selection.completion != ResolutionCompletion::Complete {
-            return Ok(LanguageClosure {
-                completion: evidence,
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::settled(evidence));
         }
         let rows = match close_member_rows(self, frame, selection)? {
             Read::Ready { value, completion } => (value, evidence.combine(&completion)),
-            Read::Unavailable { completion, .. } | Read::Cancelled(completion) => {
-                return Ok(LanguageClosure {
-                    completion: evidence.combine(&completion),
-                    closed: false,
-                    discharges: None,
-                });
+            Read::Unavailable { completion, .. } => {
+                return Ok(LanguageClosure::settled(evidence.combine(&completion)));
+            }
+            Read::Cancelled(completion) => {
+                return Ok(LanguageClosure::cancelled(evidence.combine(&completion)));
             }
         };
-        publish_closure(
+        let closure = publish_closure(
             self,
             endpoint,
             frame,
@@ -2381,7 +2430,8 @@ where
             rows.0,
             rows.1,
             Some(selection),
-        )
+        )?;
+        Ok(closure)
     }
     fn close_root(
         &mut self,
@@ -2412,13 +2462,12 @@ where
             })
             .combine(member_completion);
         if self.cancellation.is_cancelled() || !self.session.scope_step() {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         }
-        close_root(self, endpoint, frame, inputs, member_completion)
+        let closure = close_root(self, endpoint, frame, inputs, member_completion)?;
+        Ok(closure)
     }
     fn reverse_dependencies(
         &mut self,
@@ -2532,7 +2581,15 @@ pub(super) fn discover_root<R: DemandRules>(
     if shared.cancellation.is_cancelled() || !shared.session.scope_step() {
         return Ok(LanguageRootDiscovery::Cancelled(stopped()));
     }
-    let (mut admission_completion, context) = match shared.rules.admit_endpoint(endpoint, false)? {
+    let retained_completion = shared
+        .arena
+        .borrow()
+        .registered_endpoint(endpoint)
+        .map(|registered| registered.completion.clone());
+    let (mut admission_completion, context) = match shared
+        .rules
+        .admit_endpoint(endpoint, retained_completion.as_ref())?
+    {
         Read::Ready {
             value: EndpointAdmission::Ready(completion),
             completion: admission,
@@ -5506,6 +5563,7 @@ pub(super) fn close_provider_rows<R: DemandRules>(
     for (index, half) in frame.halves.iter().enumerate() {
         let half_id = HalfId(index);
         let ProviderRows {
+            endpoint_completion,
             language,
             exports,
             recipe,
@@ -5525,6 +5583,12 @@ pub(super) fn close_provider_rows<R: DemandRules>(
                 return Ok(Some(route));
             }
         };
+        if let Some(completion) = endpoint_completion {
+            route.endpoint_completion = Some(match route.endpoint_completion.take() {
+                Some(previous) => previous.combine(&completion),
+                None => completion,
+            });
+        }
         let mut placement_observations = R::PlacementObservations::default();
         let mut authorities = TargetProofGroups::default();
         let mut alternatives = HashMap::<_, Vec<_>>::default();
@@ -5872,13 +5936,17 @@ fn poll_suspended_source<R: DemandRules>(
                 None,
             )?))
         }
-        Read::Cancelled(completion) | Read::Unavailable { completion, .. } => {
+        Read::Cancelled(completion) => {
             let retained = slot.take().expect("a stopped source cursor is invalidated");
-            Ok(CloseProgress::Ready(LanguageClosure {
-                completion: retained.evidence.combine(&completion),
-                closed: false,
-                discharges: None,
-            }))
+            Ok(CloseProgress::Ready(LanguageClosure::cancelled(
+                retained.evidence.combine(&completion),
+            )))
+        }
+        Read::Unavailable { completion, .. } => {
+            let retained = slot.take().expect("a stopped source cursor is invalidated");
+            Ok(CloseProgress::Ready(LanguageClosure::settled(
+                retained.evidence.combine(&completion),
+            )))
         }
     }
 }
@@ -5907,11 +5975,7 @@ pub fn close_root<R: DemandRules>(
         CloseProgress::Members { .. } | CloseProgress::Reference { .. } => {
             panic!("suspended source closure requires a scheduler")
         }
-        CloseProgress::Cancelled(completion) => Ok(LanguageClosure {
-            completion,
-            closed: false,
-            discharges: None,
-        }),
+        CloseProgress::Cancelled(completion) => Ok(LanguageClosure::cancelled(completion)),
     }
 }
 
@@ -5957,31 +6021,24 @@ fn poll_root<R: DemandRules>(
         );
     }
     assert!(matches!(resume, CloseResume::Start));
-    if let Some(retained) = shared
-        .arena
-        .borrow()
-        .registrations
-        .get(&DemandRelationKey::caller(endpoint.clone()))
-    {
+    if let Some(retained) = shared.arena.borrow().registered_endpoint(endpoint) {
         return Ok(CloseProgress::Ready(LanguageClosure {
-            completion: retained.completion.clone(),
-            closed: true,
+            outcome: crate::analyzer::resolution::RootClosure::Published(
+                retained.completion.clone(),
+            ),
             discharges: None,
         }));
     }
     let Some(evidence) =
         plan.normalized_prefix_evidence(inputs, &shared.rules, member_completion)?
     else {
-        return Ok(CloseProgress::Ready(LanguageClosure {
-            completion: plan
-                .prefix_evidence_with(inputs, |prefix| {
-                    shared.rules.raw_prefix_completion(prefix.answer)
-                })
-                .combine(member_completion)
-                .combine(&cancelled_completion()),
-            closed: false,
-            discharges: None,
-        }));
+        return Ok(CloseProgress::Ready(LanguageClosure::cancelled(
+            plan.prefix_evidence_with(inputs, |prefix| {
+                shared.rules.raw_prefix_completion(prefix.answer)
+            })
+            .combine(member_completion)
+            .combine(&cancelled_completion()),
+        )));
     };
     let closed_rows = match shared.rules.provider_preparation(plan, inputs)? {
         Some(preparation) => close_provider_rows(shared, plan, inputs, preparation)?,
@@ -5995,13 +6052,99 @@ fn poll_root<R: DemandRules>(
         }
     };
     let Some(rows) = closed_rows else {
-        return Ok(CloseProgress::Ready(LanguageClosure {
-            completion: evidence.combine(&cancelled_completion()),
-            closed: false,
-            discharges: None,
-        }));
+        return Ok(CloseProgress::Ready(LanguageClosure::cancelled(
+            evidence.combine(&cancelled_completion()),
+        )));
     };
     publish_closure(shared, endpoint, plan, inputs, rows, evidence, None).map(CloseProgress::Ready)
+}
+
+/// Publish an exhausted root through the same context/overlay machinery as
+/// successful roots. No language certificate or provisional candidates survive.
+fn settle_root<R: DemandRules>(
+    shared: &mut SharedDemand<'_, '_, '_, R>,
+    endpoint: &EndpointSignature,
+    closure: LanguageClosure,
+) -> Result<LanguageClosure> {
+    use crate::analyzer::resolution::RootClosure;
+    let RootClosure::Settled(_) = &closure.outcome else {
+        return Ok(closure);
+    };
+    let completion = closure.outcome.completion();
+    if shared.cancellation.is_cancelled()
+        || !shared.session.observe_cancellation()
+        || completion.contains_reason(ResolutionIncompleteReason::Cancelled)
+    {
+        return Ok(LanguageClosure::cancelled(
+            completion.combine(&cancelled_completion()),
+        ));
+    }
+    let mounts = SelectedMountTable::new(&shared.ready.inventory);
+    let contexts = empty_contexts_for(
+        mounts,
+        completion,
+        &selected_mount_lookup(mounts),
+        shared.ready.context_identities.clone(),
+    )?;
+    let SelectedResolutionContextValidationOutcome::Ready(contexts) = contexts
+        .validate_exact_mounts_in_session(
+            mounts.mount_count(),
+            &selected_mount_lookup(mounts),
+            shared.cancellation,
+            shared.session,
+        )?
+    else {
+        return Ok(LanguageClosure::cancelled(
+            completion.combine(&cancelled_completion()),
+        ));
+    };
+    let Some(registration) = shared.ready.publish_prepared_context(
+        contexts,
+        shared.cancellation,
+        shared.session,
+        shared.projection_memo,
+        |registration| {
+            shared.ready.register_context_in_session(
+                registration,
+                shared.cancellation,
+                shared.session,
+            )
+        },
+    )?
+    else {
+        return Ok(LanguageClosure::cancelled(
+            completion.combine(&cancelled_completion()),
+        ));
+    };
+    let relation = DemandSelectedOverlayBlueprint::new(registration.context_token());
+    let Some(paths) = relation.added_candidate_paths(shared.paths, shared.cancellation)? else {
+        return Ok(LanguageClosure::cancelled(
+            completion.combine(&cancelled_completion()),
+        ));
+    };
+    assert!(paths.is_empty(), "settled roots publish no candidate paths");
+    // Publication is atomic after the last cancellation/budget checkpoint.
+    if shared.cancellation.is_cancelled() || !shared.session.observe_cancellation() {
+        return Ok(LanguageClosure::cancelled(
+            completion.combine(&cancelled_completion()),
+        ));
+    }
+    let key = DemandRelationKey::caller(endpoint.clone());
+    let mut arena = shared.arena.borrow_mut();
+    arena.publish_without_base(key.clone(), relation, paths, completion.clone());
+    assert!(
+        arena
+            .registrations
+            .insert(
+                key,
+                ClosedEndpointRegistration {
+                    blueprint: registration,
+                    completion: completion.clone(),
+                }
+            )
+            .is_none()
+    );
+    Ok(closure)
 }
 
 pub(super) fn publish_closure<R: DemandRules>(
@@ -6025,6 +6168,9 @@ pub(super) fn publish_closure<R: DemandRules>(
         completion: route_completion,
     } = rows;
     evidence = evidence.combine(&route_completion);
+    if disposition == RouteDisposition::ClosedIncomplete {
+        return Ok(LanguageClosure::settled(evidence));
+    }
     if disposition != RouteDisposition::Publish {
         assert!(descriptors.is_empty() && preparation.is_none());
         let answers = prefix_answers(plan, inputs);
@@ -6032,12 +6178,9 @@ pub(super) fn publish_closure<R: DemandRules>(
             shared
                 .rules
                 .closure_witness(plan, &PrefixAnswers { entries: &answers }, members)?;
-        let Some(witness) = ClosureWitness::retain_read(retained_witness, &mut evidence) else {
-            return Ok(LanguageClosure {
-                completion: evidence,
-                closed: false,
-                discharges: None,
-            });
+        let witness = match ClosureWitness::retain_read(retained_witness, &mut evidence) {
+            std::ops::ControlFlow::Continue(witness) => witness,
+            std::ops::ControlFlow::Break(closure) => return Ok(closure),
         };
         let facts = ClosureFacts {
             witness: &witness,
@@ -6055,31 +6198,25 @@ pub(super) fn publish_closure<R: DemandRules>(
                 evidence = evidence.combine(&completion).combine(&value.completion);
                 value
             }
-            Read::Unavailable { completion, .. } | Read::Cancelled(completion) => {
-                return Ok(LanguageClosure {
-                    completion: evidence.combine(&completion),
-                    closed: false,
-                    discharges: None,
-                });
+            Read::Unavailable { completion, .. } => {
+                return Ok(LanguageClosure::settled(evidence.combine(&completion)));
+            }
+            Read::Cancelled(completion) => {
+                return Ok(LanguageClosure::cancelled(evidence.combine(&completion)));
             }
         };
         if shared.cancellation.is_cancelled() || !shared.session.observe_cancellation() {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&cancelled_completion()),
+            ));
         }
-        if disposition == RouteDisposition::RetainBase {
-            assert!(policy.base == BaseEligibility::Retain);
-            shared
-                .arena
-                .borrow_mut()
-                .base_ready
-                .insert(DemandRelationKey::caller(endpoint.clone()));
-        } else {
-            assert!(matches!(evidence, ResolutionCompletion::Incomplete(_)));
-        }
+        assert!(disposition == RouteDisposition::RetainBase);
+        assert!(policy.base == BaseEligibility::Retain);
+        shared
+            .arena
+            .borrow_mut()
+            .base_ready
+            .insert(DemandRelationKey::caller(endpoint.clone()));
         if let Some(completion) = endpoint_completion {
             assert!(
                 shared
@@ -6092,8 +6229,7 @@ pub(super) fn publish_closure<R: DemandRules>(
         }
         let discharges = policy.into_discharges();
         return Ok(LanguageClosure {
-            completion: evidence,
-            closed: true,
+            outcome: crate::analyzer::resolution::RootClosure::Published(evidence),
             discharges,
         });
     }
@@ -6104,11 +6240,9 @@ pub(super) fn publish_closure<R: DemandRules>(
             shared.cancellation,
             CloserWork::DescriptorEvidence,
         ) {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         }
         evidence = evidence.combine(descriptor.completion());
     }
@@ -6138,12 +6272,9 @@ pub(super) fn publish_closure<R: DemandRules>(
                 shared.cancellation,
                 CloserWork::InventoryDescriptor,
             ) {
-                return Ok(LanguageClosure {
-                    completion: evidence
-                        .combine(&crate::analyzer::resolution::cancelled_completion()),
-                    closed: false,
-                    discharges: None,
-                });
+                return Ok(LanguageClosure::cancelled(
+                    evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+                ));
             }
             if let ResolutionCompletion::Incomplete(reasons) = completion {
                 for reason in reasons.iter() {
@@ -6152,12 +6283,9 @@ pub(super) fn publish_closure<R: DemandRules>(
                         shared.cancellation,
                         CloserWork::InventoryReason,
                     ) {
-                        return Ok(LanguageClosure {
-                            completion: evidence
-                                .combine(&crate::analyzer::resolution::cancelled_completion()),
-                            closed: false,
-                            discharges: None,
-                        });
+                        return Ok(LanguageClosure::cancelled(
+                            evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+                        ));
                     }
                     if let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason
                         && !shared
@@ -6185,12 +6313,9 @@ pub(super) fn publish_closure<R: DemandRules>(
                 shared.cancellation,
                 CloserWork::ContextInventoryReason,
             ) {
-                return Ok(LanguageClosure {
-                    completion: evidence
-                        .combine(&crate::analyzer::resolution::cancelled_completion()),
-                    closed: false,
-                    discharges: None,
-                });
+                return Ok(LanguageClosure::cancelled(
+                    evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+                ));
             }
             contexts = contexts.with_context_owned_inventory_reason(reason);
         }
@@ -6201,11 +6326,9 @@ pub(super) fn publish_closure<R: DemandRules>(
             &selected_mount_of,
         )?;
         let Some(contexts) = contexts else {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         };
         let SelectedResolutionContextValidationOutcome::Ready(contexts) = contexts
             .validate_exact_mounts_in_session(
@@ -6215,11 +6338,9 @@ pub(super) fn publish_closure<R: DemandRules>(
                 shared.session,
             )?
         else {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         };
         let Some(registration) = shared.ready.publish_prepared_context(
             contexts,
@@ -6237,11 +6358,9 @@ pub(super) fn publish_closure<R: DemandRules>(
             },
         )?
         else {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         };
         registration
     };
@@ -6259,20 +6378,17 @@ pub(super) fn publish_closure<R: DemandRules>(
             evidence = evidence.combine(&completion);
             value
         }
-        Read::Unavailable { completion, .. } | Read::Cancelled(completion) => {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&completion),
-                closed: false,
-                discharges: None,
-            });
+        Read::Unavailable { completion, .. } => {
+            return Ok(LanguageClosure::settled(evidence.combine(&completion)));
+        }
+        Read::Cancelled(completion) => {
+            return Ok(LanguageClosure::cancelled(evidence.combine(&completion)));
         }
     };
     if shared.cancellation.is_cancelled() || !shared.session.scope_step() {
-        return Ok(LanguageClosure {
-            completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-            closed: false,
-            discharges: None,
-        });
+        return Ok(LanguageClosure::cancelled(
+            evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+        ));
     }
     let generated = if preparation.is_some() {
         // Prepared context-only publication has no continuation endings.
@@ -6286,11 +6402,9 @@ pub(super) fn publish_closure<R: DemandRules>(
         )
     };
     let Some(generated) = generated else {
-        return Ok(LanguageClosure {
-            completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-            closed: false,
-            discharges: None,
-        });
+        return Ok(LanguageClosure::cancelled(
+            evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+        ));
     };
     for _ in inputs {
         if !closer_step(
@@ -6298,11 +6412,9 @@ pub(super) fn publish_closure<R: DemandRules>(
             shared.cancellation,
             CloserWork::PrefixAnswer,
         ) {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         }
     }
     let answers = prefix_answers(plan, inputs);
@@ -6310,12 +6422,9 @@ pub(super) fn publish_closure<R: DemandRules>(
         shared
             .rules
             .closure_witness(plan, &PrefixAnswers { entries: &answers }, members)?;
-    let Some(witness) = ClosureWitness::retain_read(witness, &mut evidence) else {
-        return Ok(LanguageClosure {
-            completion: evidence,
-            closed: false,
-            discharges: None,
-        });
+    let witness = match ClosureWitness::retain_read(witness, &mut evidence) {
+        std::ops::ControlFlow::Continue(witness) => witness,
+        std::ops::ControlFlow::Break(closure) => return Ok(closure),
     };
     let facts = ClosureFacts {
         witness: &witness,
@@ -6330,12 +6439,11 @@ pub(super) fn publish_closure<R: DemandRules>(
     };
     let (policy, policy_evidence) = match shared.rules.closure_policy(plan, &facts)? {
         Read::Ready { value, completion } => (value, completion),
-        Read::Unavailable { completion, .. } | Read::Cancelled(completion) => {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&completion),
-                closed: false,
-                discharges: None,
-            });
+        Read::Unavailable { completion, .. } => {
+            return Ok(LanguageClosure::settled(evidence.combine(&completion)));
+        }
+        Read::Cancelled(completion) => {
+            return Ok(LanguageClosure::cancelled(evidence.combine(&completion)));
         }
     };
     evidence = evidence
@@ -6348,11 +6456,9 @@ pub(super) fn publish_closure<R: DemandRules>(
             shared.cancellation,
             CloserWork::ContinuationPublication,
         ) {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         }
     }
     for _ in &policy.associations {
@@ -6361,11 +6467,9 @@ pub(super) fn publish_closure<R: DemandRules>(
             shared.cancellation,
             CloserWork::AssociationPublication,
         ) {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
+            return Ok(LanguageClosure::cancelled(
+                evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+            ));
         }
     }
     // The last cooperative boundary precedes every arena mutation. Publication
@@ -6374,11 +6478,9 @@ pub(super) fn publish_closure<R: DemandRules>(
         || !shared.session.observe_cancellation()
         || evidence.contains_reason(ResolutionIncompleteReason::Cancelled)
     {
-        return Ok(LanguageClosure {
-            completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-            closed: false,
-            discharges: None,
-        });
+        return Ok(LanguageClosure::cancelled(
+            evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
+        ));
     }
     let PublicationMaterial {
         registration,
@@ -6435,8 +6537,7 @@ pub(super) fn publish_closure<R: DemandRules>(
     shared.rules.note_closure_work("demand_close_published");
     let discharges = policy.into_discharges();
     Ok(LanguageClosure {
-        completion: evidence,
-        closed: true,
+        outcome: crate::analyzer::resolution::RootClosure::Published(evidence),
         discharges,
     })
 }

@@ -110,7 +110,13 @@ pub(crate) fn cpp_callable_definitions_share_identity_evidence(
     }
     let dispatch = CppDispatch::new(analyzer, token);
     let graph = dispatch.source();
-    let visibility = VisibilityIndex::build(cpp, token, &graph, &HashSet::default());
+    let visibility = VisibilityIndex::build(
+        cpp.read_capability(),
+        cpp,
+        token,
+        &graph,
+        &HashSet::default(),
+    );
     visibility.member_declaration_bridges_to_body(&graph, left, right, &related)
         || visibility.member_declaration_bridges_to_body(&graph, right, left, &related)
 }

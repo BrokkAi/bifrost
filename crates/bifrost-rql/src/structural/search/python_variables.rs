@@ -932,21 +932,23 @@ fn assignment_value(node: Node<'_>, kind: &str) -> (Option<(usize, usize)>, bool
 }
 
 fn statement_may_exit(node: Node<'_>) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.id() != node.id()
-            && (scope_kind(current).is_some()
-                || matches!(current.kind(), "for_statement" | "while_statement"))
-        {
+    let mut stack = vec![(node, false)];
+    while let Some((current, inside_loop)) = stack.pop() {
+        if scope_kind(current).is_some() {
             continue;
         }
-        if matches!(
-            current.kind(),
-            "break_statement" | "continue_statement" | "return_statement"
-        ) {
+        if current.kind() == "return_statement"
+            || (!inside_loop && matches!(current.kind(), "break_statement" | "continue_statement"))
+        {
             return true;
         }
-        stack.extend(named_children(current));
+        let inside_loop =
+            inside_loop || matches!(current.kind(), "for_statement" | "while_statement");
+        stack.extend(
+            named_children(current)
+                .into_iter()
+                .map(|child| (child, inside_loop)),
+        );
     }
     false
 }
@@ -1454,38 +1456,40 @@ fn is_builtin_name(
 }
 
 fn is_range_call(
-    node: Node<'_>,
+    mut node: Node<'_>,
     source: &str,
     scopes: &[LexicalScope<'_>],
     scope_by_node: &HashMap<usize, usize>,
     locals: &[HashSet<String>],
 ) -> bool {
-    if node.kind() != "call" {
-        return false;
+    loop {
+        if node.kind() != "call" {
+            return false;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return false;
+        };
+        if function.kind() != "identifier" {
+            return false;
+        }
+        let Some(name) = super::python_rule_facts::node_text(source, function) else {
+            return false;
+        };
+        if name == "range" && is_builtin_name(name, function, scopes, scope_by_node, locals) {
+            return true;
+        }
+        if name != "list" || !is_builtin_name(name, function, scopes, scope_by_node, locals) {
+            return false;
+        }
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return false;
+        };
+        let args = named_children(arguments);
+        let Some(argument) = args.first() else {
+            return false;
+        };
+        node = *argument;
     }
-    let Some(function) = node.child_by_field_name("function") else {
-        return false;
-    };
-    if function.kind() != "identifier" {
-        return false;
-    }
-    let Some(name) = super::python_rule_facts::node_text(source, function) else {
-        return false;
-    };
-    if name == "range" && is_builtin_name(name, function, scopes, scope_by_node, locals) {
-        return true;
-    }
-    if name != "list" || !is_builtin_name(name, function, scopes, scope_by_node, locals) {
-        return false;
-    }
-    let Some(arguments) = node.child_by_field_name("arguments") else {
-        return false;
-    };
-    let args = named_children(arguments);
-    let Some(argument) = args.first() else {
-        return false;
-    };
-    is_range_call(*argument, source, scopes, scope_by_node, locals)
 }
 
 fn loop_iterable_is_range(
@@ -2183,6 +2187,7 @@ pub(super) fn variable_of_binding_expansions(
         diagnostics,
     );
     let Some(index) = environment_cache.python_variable_index_for(
+        analyzer,
         value.file(),
         value.row().content_identity,
         &source,
@@ -2216,6 +2221,7 @@ pub(super) fn variable_of_occurrence_expansions(
         return Vec::new();
     };
     let Some(index) = environment_cache.python_variable_index_for(
+        analyzer,
         &value.row.file,
         value.row.content_identity,
         &source,
@@ -2264,6 +2270,7 @@ pub(super) fn variable_peer_expansions(
         diagnostics,
     );
     let Some(index) = environment_cache.python_variable_index_for(
+        analyzer,
         &value.file,
         facts.content_identity,
         &source,

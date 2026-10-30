@@ -397,8 +397,9 @@ impl SelectedResolutionOperation<'_, '_> {
         let Some(peers) = self.read_package_peers(&peer_request, cancellation)? else {
             return Ok(GoDotImportContext::Cancelled);
         };
-        let SelectedPackageRows::Ready(references) =
-            self.selected_package_references(source.ordinal(), cancellation)?
+        let SelectedPackageRows::Ready(references) = self
+            .ready
+            .selected_package_references(source.ordinal(), cancellation)?
         else {
             return Ok(GoDotImportContext::Cancelled);
         };

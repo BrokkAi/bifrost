@@ -5,13 +5,75 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-support"))]
+#[track_caller]
+#[allow(clippy::too_many_arguments)] // Keep discovery inputs and panic attribution at their callers.
+pub(crate) fn publish_go_discovery_tail_for_test(
+    analyzer: &crate::analyzer::go::GoAnalyzer,
+    store: &AnalyzerStore,
+    project: &dyn brokk_bifrost_core::analyzer::project::Project,
+    root: &Path,
+    snapshot: &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId,
+    before: &brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservation,
+    profile: [u8; 32],
+    discovery: brokk_bifrost_go::package_discovery::GoPackageDiscovery,
+    cancellation: &CancellationToken,
+    observation_unavailable: &'static str,
+    publication_unavailable: &'static str,
+) -> i64 {
+    use brokk_bifrost_analysis::analyzer::store::go_package_context::{
+        GoContextPublicationOutcome, GoInputObservationOutcome,
+    };
+
+    let GoInputObservationOutcome::Ready(after) = store
+        .observe_go_context_inputs(snapshot, project, cancellation)
+        .unwrap()
+    else {
+        panic!("{observation_unavailable}");
+    };
+    let GoContextPublicationOutcome::Published(publication) = store
+        .publish_go_package_context(
+            snapshot.clone(),
+            root.to_path_buf(),
+            None,
+            before,
+            &after,
+            discovery,
+            cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("{publication_unavailable}");
+    };
+    assert!(analyzer.activate_native_context_profile(snapshot, profile));
+    publication.context_id
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn reconcile_go_summaries_for_test(
+    store: &AnalyzerStore,
+    snapshot: &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId,
+    profile: [u8; 32],
+    context_id: i64,
+    cancellation: &CancellationToken,
+) -> brokk_bifrost_analysis::analyzer::store::Result<
+    brokk_bifrost_analysis::analyzer::store::unit_summaries::UnitSummaryReconciliation,
+> {
+    store.reconcile_unit_summaries(
+        snapshot,
+        brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
+            context_id,
+            profile,
+        },
+        cancellation,
+    )
+}
+
 pub fn go_discovery_analyzer(
     project: Arc<dyn brokk_bifrost_core::analyzer::project::Project>,
     config: brokk_bifrost_core::analyzer::config::AnalyzerConfig,
 ) -> (crate::analyzer::go::GoAnalyzer, Arc<AnalyzerStore>) {
     use crate::analyzer::go::GoAnalyzer;
-
-    use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome;
 
     use brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome;
 
@@ -105,37 +167,22 @@ pub fn go_discovery_analyzer(
         source_inventory_profile(),
         "the tool authority is distinct"
     );
-    let GoInputObservationOutcome::Ready(after) = store
-        .observe_go_context_inputs(&snapshot, project.as_ref(), &cancellation)
-        .unwrap()
-    else {
-        panic!("fixture Go inputs must remain selected");
-    };
-    let GoContextPublicationOutcome::Published(publication) = store
-        .publish_go_package_context(
-            snapshot.clone(),
-            project.root().to_path_buf(),
-            None,
-            &before,
-            &after,
-            canonical,
-            &cancellation,
-        )
-        .unwrap()
-    else {
-        panic!("Go-tool context publication must succeed");
-    };
-    assert!(go.activate_native_context_profile(&snapshot, profile));
-    let report = store
-        .reconcile_unit_summaries(
-            &snapshot,
-            brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
-                context_id: publication.context_id,
-                profile,
-            },
-            &cancellation,
-        )
-        .unwrap();
+    let context_id = publish_go_discovery_tail_for_test(
+        &go,
+        &store,
+        project.as_ref(),
+        project.root(),
+        &snapshot,
+        &before,
+        profile,
+        canonical,
+        &cancellation,
+        "fixture Go inputs must remain selected",
+        "Go-tool context publication must succeed",
+    );
+    let report =
+        reconcile_go_summaries_for_test(&store, &snapshot, profile, context_id, &cancellation)
+            .unwrap();
     assert!(
         report.failed.is_empty(),
         "Go-tool summary derivations: {:?}",

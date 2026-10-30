@@ -343,6 +343,8 @@ pub enum PropertySourceQueryIncompleteReason {
     /// The procedure projection retained property rows but could not prove
     /// its complete CFG/evidence coverage.
     PropertyProjectionIncomplete,
+    /// Preserve typed execution refusals even when no focused read was projected.
+    PropertyProjection(Box<PropertyReachingIncompleteReason>),
     ControlFlow(CfgAlgorithmError<ProgramPointId>),
     RecursiveProcedure(crate::analyzer::semantic::ids::ProcedureId),
     Cancelled,
@@ -400,6 +402,34 @@ impl PropertySourceQueryResult {
             && self.matches.iter().all(PropertySourceResult::is_complete)
     }
 
+    /// Execution dependence is distinct from deterministic semantic uncertainty.
+    /// Partial rows and their completeness remain available in either case.
+    pub fn properties_execution_dependent(&self) -> bool {
+        self.incomplete_reasons.iter().any(|reason| match reason {
+            PropertySourceQueryIncompleteReason::MaterializationFailure(_)
+            | PropertySourceQueryIncompleteReason::ControlFlow(_)
+            | PropertySourceQueryIncompleteReason::RecursiveProcedure(_)
+            | PropertySourceQueryIncompleteReason::Cancelled => true,
+            PropertySourceQueryIncompleteReason::Materialization(state)
+            | PropertySourceQueryIncompleteReason::ProcedureRelations(state) => matches!(
+                state,
+                PropertySourceQueryState::ExceededBudget | PropertySourceQueryState::Cancelled
+            ),
+            PropertySourceQueryIncompleteReason::PropertyProjection(reason) => {
+                property_reason_execution_dependent(reason)
+            }
+            PropertySourceQueryIncompleteReason::CapabilityUnsupported
+            | PropertySourceQueryIncompleteReason::Unknown
+            | PropertySourceQueryIncompleteReason::PropertyProjectionIncomplete => false,
+        }) || self.matches.iter().any(|result| {
+            result.coverage == CandidateCoverage::Truncated
+                || result
+                    .incomplete_reasons
+                    .iter()
+                    .any(property_reason_execution_dependent)
+        })
+    }
+
     pub fn evaluations_complete(&self) -> bool {
         self.evaluation_incomplete_reasons.is_empty()
             && self
@@ -455,6 +485,8 @@ fn evaluation_acquisition_reason_is_local_complete(
         | PropertySourceQueryIncompleteReason::ControlFlow(_)
         | PropertySourceQueryIncompleteReason::RecursiveProcedure(_)
         | PropertySourceQueryIncompleteReason::Cancelled => false,
+        // Property projection failures do not describe evaluation relations.
+        PropertySourceQueryIncompleteReason::PropertyProjection(_) => true,
         PropertySourceQueryIncompleteReason::Materialization(_)
         | PropertySourceQueryIncompleteReason::ProcedureRelations(_)
         | PropertySourceQueryIncompleteReason::Unknown
@@ -590,6 +622,39 @@ pub enum PropertyReachingIncompleteReason {
     Dominators(CfgAlgorithmError<ProgramPointId>),
     /// Enumerating store-to-read pairs exhausted the shared CFG work budget.
     ReachingPairs(CfgAlgorithmError<ProgramPointId>),
+}
+
+fn property_reason_execution_dependent(reason: &PropertyReachingIncompleteReason) -> bool {
+    match reason {
+        PropertyReachingIncompleteReason::InputRelationBudgetExceeded { .. }
+        | PropertyReachingIncompleteReason::ReachingPairBudgetExceeded { .. }
+        | PropertyReachingIncompleteReason::Cancelled
+        | PropertyReachingIncompleteReason::ReachingDefinitions(_)
+        | PropertyReachingIncompleteReason::Reachability(_)
+        | PropertyReachingIncompleteReason::Dominators(_)
+        | PropertyReachingIncompleteReason::ReachingPairs(_)
+        | PropertyReachingIncompleteReason::DurableIdentityUnavailable { .. }
+        | PropertyReachingIncompleteReason::SourceMappingUnavailable { .. } => true,
+        PropertyReachingIncompleteReason::CandidateCoverage(coverage) => {
+            *coverage == CandidateCoverage::Truncated
+        }
+        PropertyReachingIncompleteReason::SelectedSemanticGap { gap } => {
+            gap.kind == crate::analyzer::semantic::ir::SemanticGapKind::ExceededBudget
+        }
+        PropertyReachingIncompleteReason::SelectedReadMissing { .. }
+        | PropertyReachingIncompleteReason::SelectedReadAmbiguous { .. }
+        | PropertyReachingIncompleteReason::SelectedRelationEndpointUnavailable { .. }
+        | PropertyReachingIncompleteReason::SelectedRuntimeAccess { .. }
+        | PropertyReachingIncompleteReason::SelectedAncestorStore { .. }
+        | PropertyReachingIncompleteReason::SelectedAliasClosureUnavailable { .. }
+        | PropertyReachingIncompleteReason::UnsupportedLocation { .. }
+        | PropertyReachingIncompleteReason::StoreEvidenceIncomplete { .. }
+        | PropertyReachingIncompleteReason::ReadEvidenceIncomplete { .. }
+        | PropertyReachingIncompleteReason::FieldMemoryEndpointUnavailable { .. }
+        | PropertyReachingIncompleteReason::EvaluationEndpointUnavailable { .. }
+        | PropertyReachingIncompleteReason::EvaluationEvidenceIncomplete { .. }
+        | PropertyReachingIncompleteReason::EvaluationSourceUnknown => false,
+    }
 }
 
 fn property_evidence_is_complete(

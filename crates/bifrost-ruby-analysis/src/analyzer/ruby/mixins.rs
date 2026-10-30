@@ -11,6 +11,7 @@
 //! `collect_bounded` precedent) and no `FileState` is exposed.
 
 use crate::analyzer::ruby::RubyAnalyzer;
+use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -20,16 +21,18 @@ use brokk_bifrost_ruby::mixins::{
 };
 
 impl RubyAnalyzer {
-    pub(crate) fn mixin_relations(&self) -> &[TypeRelation] {
-        self.mixin_relations
-            .get_or_init(|| {
-                brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
+    pub(crate) fn mixin_relations(&self) -> std::sync::Arc<Vec<TypeRelation>> {
+        self.mixin_relations.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
                     self,
-                    "ruby.mixin_relations",
+                    memo,
                     || ruby_collect_mixin_relations(self),
                 )
-            })
-            .as_slice()
+            },
+            |_| self.authority_inputs(),
+        )
     }
 
     pub(crate) fn forward_owner_relation_facts(

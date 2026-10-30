@@ -4,6 +4,7 @@ use crate::analyzer::cpp::cpp_header_body_files_are_related;
 use crate::analyzer::usages::cpp_graph::CppDispatch;
 use brokk_bifrost_analysis::analyzer::QueryToken;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus;
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 use brokk_bifrost_analysis::analyzer::usages::applicability::ApplicabilityOutcome;
 use brokk_bifrost_analysis::analyzer::usages::applicability::CandidateApplicability;
@@ -17,6 +18,9 @@ use brokk_bifrost_analysis::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
 };
 use brokk_bifrost_analysis::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    ReplayingMemo, ReplayingMemoEntry, memo_attribution,
+};
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerDefinitionLookup, AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, ProjectFile,
     Range, resolve_analyzer,
@@ -127,13 +131,35 @@ use std::time::Instant;
 use tree_sitter::Parser;
 use tree_sitter::{Node, Tree};
 
+// A definition batch opens a separate capture per request. Each reusable
+// projection therefore carries its build receipt, including the negative case.
+type DefinitionMemo<K, V> = ReplayingMemo<HashMap<K, Arc<ReplayingMemoEntry<V, ReadKey>>>>;
+
+fn definition_memo_value<K: Eq + std::hash::Hash, V: Clone>(
+    memo: &mut DefinitionMemo<K, V>,
+    analyzer: &dyn IAnalyzer,
+    key: K,
+    build: impl FnOnce() -> V,
+) -> V {
+    let value = memo
+        .read_mut(&memo_attribution(analyzer), |entries, capture| {
+            Ok::<_, std::convert::Infallible>(Arc::clone(
+                entries
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(capture.build(build))),
+            ))
+        })
+        .expect("infallible definition memo build");
+    (*value).clone()
+}
+
 #[derive(Default)]
 pub(crate) struct CppDefinitionState {
     cpp_visibility:
-        HashMap<ProjectFile, Arc<brokk_bifrost_cpp::graph::resolver::VisibilityIndexData>>,
-    cpp_live_sources_seeded: bool,
-    cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
-    cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
+        DefinitionMemo<ProjectFile, Arc<brokk_bifrost_cpp::graph::resolver::VisibilityIndexData>>,
+    cpp_live_sources_seeded: DefinitionMemo<(), ()>,
+    cpp_structural_alias_paths: DefinitionMemo<CodeUnit, Vec<String>>,
+    cpp_class_ranges: DefinitionMemo<ProjectFile, Arc<ClassRangeIndex>>,
     #[cfg(test)]
     pub(crate) cpp_class_range_builds: usize,
 }
@@ -147,29 +173,22 @@ impl CppDefinitionState {
         file: &ProjectFile,
     ) -> Arc<CppVisibilityIndex<'a>> {
         let dispatch = CppDispatch::new(analyzer, token);
-        if !self.cpp_live_sources_seeded {
-            // Visibility construction walks include edges before it builds the
-            // per-root declaration set. Those edges can read a candidate's
-            // live source directly, while the declaration walk seeds the
-            // complete live-source snapshot. Seed it first so a candidate
-            // file is validated once per request, independent of whether a
-            // warmed import cache changes which visibility phase reaches it
-            // first.
+        definition_memo_value(&mut self.cpp_live_sources_seeded, analyzer, (), || {
+            // Seed live sources before include-edge reads; each request must
+            // receive the listing receipt even when this batch is already warm.
             let _ = cpp.analyzed_files();
-            self.cpp_live_sources_seeded = true;
-        }
-        if let Some(index) = self.cpp_visibility.get(file) {
-            return Arc::new(CppVisibilityIndex::from_data(cpp, token, Arc::clone(index)));
-        }
-        let data = self
-            .cpp_visibility
-            .entry(file.clone())
-            .or_insert_with(|| {
-                let mut roots = HashSet::default();
-                roots.insert(file.clone());
-                CppVisibilityIndex::build(cpp, token, &dispatch.source(), &roots).data()
-            })
-            .clone();
+        });
+        let data = definition_memo_value(&mut self.cpp_visibility, analyzer, file.clone(), || {
+            let roots = HashSet::from_iter([file.clone()]);
+            CppVisibilityIndex::build(
+                cpp.read_capability(),
+                cpp,
+                token,
+                &dispatch.source(),
+                &roots,
+            )
+            .data()
+        });
         Arc::new(CppVisibilityIndex::from_data(cpp, token, data))
     }
 
@@ -178,17 +197,13 @@ impl CppDefinitionState {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Arc<ClassRangeIndex> {
-        if let Some(index) = self.cpp_class_ranges.get(file) {
-            return Arc::clone(index);
-        }
-        let index = analyzer.class_range_index(file);
-        self.cpp_class_ranges
-            .insert(file.clone(), Arc::clone(&index));
-        #[cfg(test)]
-        {
-            self.cpp_class_range_builds += 1;
-        }
-        index
+        definition_memo_value(&mut self.cpp_class_ranges, analyzer, file.clone(), || {
+            #[cfg(test)]
+            {
+                self.cpp_class_range_builds += 1;
+            }
+            analyzer.class_range_index(file)
+        })
     }
 }
 
@@ -1342,7 +1357,7 @@ impl<'a, 'tree> CppBoundedProvider<'a, 'tree> {
         let memo = self.analyzer.definition_lookup_memo();
         if let Some(cached) = memo
             .as_ref()
-            .and_then(|memo| memo.limited_identifier(Language::Cpp, identifier))
+            .and_then(|memo| memo.limited_identifier(self.analyzer, Language::Cpp, identifier))
         {
             return self.session.query_limited_rows(|limit| {
                 if cached.len() >= limit {
@@ -1371,7 +1386,7 @@ impl<'a, 'tree> CppBoundedProvider<'a, 'tree> {
         let memo = self.analyzer.definition_lookup_memo();
         if let Some(cached) = memo
             .as_ref()
-            .and_then(|memo| memo.limited_fqn(Language::Cpp, normalized, fqn))
+            .and_then(|memo| memo.limited_fqn(self.analyzer, Language::Cpp, normalized, fqn))
         {
             return self.session.query_limited_rows(|limit| {
                 if cached.len() >= limit {
@@ -1487,7 +1502,13 @@ fn cpp_bounded_canonical_type_candidates(
     let dispatch = CppDispatch::new(provider.analyzer, token);
     let mut roots = HashSet::default();
     roots.insert(file.clone());
-    let visibility = CppVisibilityIndex::build(provider.cpp, token, &dispatch.source(), &roots);
+    let visibility = CppVisibilityIndex::build(
+        provider.cpp.read_capability(),
+        provider.cpp,
+        token,
+        &dispatch.source(),
+        &roots,
+    );
     candidates
         .into_iter()
         .filter_map(|candidate| {
@@ -2399,7 +2420,13 @@ fn cpp_bounded_field_type(
     let dispatch = CppDispatch::new(provider.analyzer, token);
     let mut roots = HashSet::default();
     roots.insert(file.clone());
-    let visibility = CppVisibilityIndex::build(provider.cpp, token, &dispatch.source(), &roots);
+    let visibility = CppVisibilityIndex::build(
+        provider.cpp.read_capability(),
+        provider.cpp,
+        token,
+        &dispatch.source(),
+        &roots,
+    );
     let field_type =
         cpp_unanimous_field_type(provider.analyzer, &visibility, file, definitions.iter())?;
     let unit = field_type.unit?;
@@ -4000,7 +4027,9 @@ fn cpp_incomplete_type_outcome(
                 "C++ type candidate resolution could not read indexed syntax for {file}; results are incomplete"
             ),
         ),
-        QueryReadIncomplete::SemanticEvidenceUnavailable(detail) => no_definition(
+        QueryReadIncomplete::SemanticEvidenceUnavailable(detail)
+        | QueryReadIncomplete::ArtifactUnavailable(detail)
+        | QueryReadIncomplete::SemanticEvidenceGap(detail) => no_definition(
             "analysis_incomplete",
             format!("C++ type candidate resolution lacked structured semantic evidence: {detail}"),
         ),
@@ -4082,6 +4111,7 @@ fn cpp_macro_candidates(
     let include_targets =
         resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.include_target_index());
     let scope = AnalyzerQueryScope::new(analyzer);
+    let include_targets = include_targets.as_deref();
     let dispatch = CppDispatch::new(analyzer, scope.token());
     let source = dispatch.source();
     let includes = source.canonical_include_paths(file).unwrap_or_default();
@@ -5556,25 +5586,23 @@ fn cpp_structural_alias_paths(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Vec<String> {
-    if let Some(paths) = context
-        .language_state::<CppDefinitionState>()
-        .cpp_structural_alias_paths
-        .get(unit)
-    {
-        return paths.clone();
-    }
-    let mut paths: Vec<_> = cpp_canonical_declaration_properties(analyzer, unit)
-        .into_iter()
-        .flatten()
-        .map(|fact| fact.lexical_path.join("::"))
-        .collect();
-    paths.sort();
-    paths.dedup();
-    context
-        .language_state::<CppDefinitionState>()
-        .cpp_structural_alias_paths
-        .insert(unit.clone(), paths.clone());
-    paths
+    definition_memo_value(
+        &mut context
+            .language_state::<CppDefinitionState>()
+            .cpp_structural_alias_paths,
+        analyzer,
+        unit.clone(),
+        || {
+            let mut paths: Vec<_> = cpp_canonical_declaration_properties(analyzer, unit)
+                .into_iter()
+                .flatten()
+                .map(|fact| fact.lexical_path.join("::"))
+                .collect();
+            paths.sort();
+            paths.dedup();
+            paths
+        },
+    )
 }
 
 fn cpp_type_definition_candidates(
@@ -12257,7 +12285,7 @@ mod batch_context_tests {
     use brokk_bifrost_test_macros::hardwon;
     #[test]
     #[hardwon(
-        "#784: Real C++ references verify class-range preparation is reused across many focused qualifiers in one file"
+        "#784+#2445: focused qualifiers share class ranges across nested per-definition captures"
     )]
     fn cpp_focused_qualifiers_build_class_ranges_once_per_file() {
         const REFERENCE_COUNT: usize = 32;
@@ -12292,8 +12320,10 @@ mod batch_context_tests {
 
         let scope = AnalyzerQueryScope::new(&analyzer);
         let token = scope.token();
-        let outcomes =
-            resolve_definition_requests(&analyzer, token, &mut context, requests, None, None);
+        let (outcomes, _reads) =
+            brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(&analyzer, || {
+                resolve_definition_requests(&analyzer, token, &mut context, requests, None, None)
+            });
 
         assert_eq!(outcomes.len(), REFERENCE_COUNT);
         assert!(outcomes.iter().all(|outcome| {

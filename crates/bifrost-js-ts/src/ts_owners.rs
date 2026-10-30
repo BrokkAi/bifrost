@@ -3079,3 +3079,24 @@ mod parameter_grammar_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod resolution_guard_tests {
+    use super::*;
+
+    #[test]
+    fn receiver_resolution_guards_release_active_keys() {
+        let resolution = TsReceiverResolution::default();
+        let key = TsReceiverResolutionKey {
+            scope_id: 1,
+            receiver: "owner".to_owned(),
+            byte: 0,
+        };
+        let guard = resolution.enter(key.clone()).unwrap();
+        assert!(resolution.enter(key.clone()).is_none());
+        drop(guard);
+        assert!(resolution.active.borrow().is_empty());
+        assert_eq!(resolution.depth.get(), 0);
+        assert!(resolution.enter(key).is_some());
+    }
+}

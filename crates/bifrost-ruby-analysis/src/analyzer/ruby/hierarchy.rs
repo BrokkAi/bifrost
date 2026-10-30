@@ -16,14 +16,18 @@ use brokk_bifrost_ruby::hierarchy::{
 use std::sync::Arc;
 
 impl RubyAnalyzer {
-    pub(crate) fn types_by_identifier(&self) -> &HashMap<String, Vec<CodeUnit>> {
-        self.types_by_identifier.get_or_init(|| {
-            brokk_bifrost_analysis::analyzer::common::persistent_cache_fill(
-                self,
-                "ruby.types_by_identifier",
-                || build_ruby_types_by_identifier(self),
-            )
-        })
+    pub(crate) fn types_by_identifier(&self) -> std::sync::Arc<HashMap<String, Vec<CodeUnit>>> {
+        self.types_by_identifier.read(
+            &memo_attribution(self),
+            |memo| {
+                brokk_bifrost_analysis::analyzer::common::complete_query_cache_arc_cell(
+                    self,
+                    memo,
+                    || build_ruby_types_by_identifier(self),
+                )
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::Ruby]),
+        )
     }
 }
 
@@ -33,23 +37,26 @@ impl TypeHierarchyProvider for RubyAnalyzer {
     }
 
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-        let persistent_fill_guard =
-            brokk_bifrost_analysis::analyzer::common::PersistentCacheFill::new(
-                self,
-                "crates/bifrost-ruby-analysis/src/analyzer/ruby/hierarchy.rs",
-            );
-
-        let ancestors = ruby_direct_ancestors(self, code_unit);
-        {
-            let cache_key = code_unit.clone();
-            let cache_value = Arc::new(ancestors.clone());
-            persistent_fill_guard.installed("direct_ancestors");
-            self.direct_ancestors.insert(cache_key, cache_value);
-        };
-        ancestors
+        let ancestors = self
+            .direct_ancestors
+            .read(&memo_attribution(self), |cache, capture| {
+                Ok::<_, std::convert::Infallible>(cache.get(code_unit).unwrap_or_else(|| {
+                    let cache_fill =
+                        brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                    let entry = Arc::new(capture.build_weighted(|| {
+                        let ancestors: Vec<CodeUnit> = ruby_direct_ancestors(self, code_unit);
+                        let ancestors = Arc::new(ancestors);
+                        let bytes = weight_code_unit_vec(code_unit, &ancestors) as usize;
+                        (ancestors, bytes)
+                    }));
+                    if cache_fill.is_complete() {
+                        cache.insert(code_unit.clone(), Arc::clone(&entry));
+                    }
+                    entry
+                }))
+            })
+            .expect("ancestor memo build is infallible");
+        (**ancestors).clone()
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
@@ -65,12 +72,19 @@ impl TypeHierarchyProvider for RubyAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
-        descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
-            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                build_direct_descendant_index(self, self, scope)
-            })
-            .ok()
-            .flatten()
-        })
+        self.direct_descendant_index.read(
+            &memo_attribution(self),
+            |memo| {
+                descendants_from_variant_index(memo, scope, code_unit, || {
+                    brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+                        self,
+                        || build_direct_descendant_index(self, self, scope),
+                    )
+                    .ok()
+                    .flatten()
+                })
+            },
+            |_| self.authority_inputs(),
+        )
     }
 }

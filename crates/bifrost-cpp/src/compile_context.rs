@@ -654,6 +654,33 @@ fn macro_name(definition: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Pins one compile database while borrowing a source file's configurations.
+#[derive(Debug, Clone)]
+pub struct CppCompileContextView {
+    contexts: std::sync::Arc<CppCompileContexts>,
+    source: PathBuf,
+}
+impl std::ops::Deref for CppCompileContextView {
+    type Target = [CppCompileContext];
+    fn deref(&self) -> &Self::Target {
+        self.contexts
+            .by_source
+            .get(&self.source)
+            .map_or(&[], Vec::as_slice)
+    }
+}
+impl CppCompileContexts {
+    pub fn shared_contexts_for(
+        self: &std::sync::Arc<Self>,
+        file: &ProjectFile,
+    ) -> CppCompileContextView {
+        CppCompileContextView {
+            contexts: std::sync::Arc::clone(self),
+            source: canonical_or_normalized_path(&file.abs_path()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CompiledLanguage, CppCompileContexts, CppExternalIncludeResolution};

@@ -1384,7 +1384,8 @@ impl WitnessArena {
         )
     }
 
-    pub(crate) fn into_store(self) -> WitnessStore {
+    pub(crate) fn into_store(mut self) -> WitnessStore {
+        self.nodes.shrink_to_fit();
         WitnessStore {
             retention_enabled: self.limits.is_enabled(),
             nodes: self.nodes,
@@ -1429,12 +1430,21 @@ impl WitnessTarget<'_> {
 
 impl WitnessStore {
     pub(crate) fn retained_bytes(&self) -> usize {
-        size_of::<Self>().saturating_add(
-            self.nodes
-                .iter()
-                .map(WitnessEvidenceNode::retained_bytes)
-                .fold(0usize, usize::saturating_add),
-        )
+        size_of::<Self>()
+            .saturating_add(
+                self.nodes
+                    .capacity()
+                    .saturating_mul(size_of::<WitnessEvidenceNode>()),
+            )
+            .saturating_add(
+                self.nodes
+                    .iter()
+                    .map(|node| {
+                        node.retained_bytes()
+                            .saturating_sub(size_of::<WitnessEvidenceNode>())
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 
     pub(crate) fn reconstruct(
@@ -2114,3 +2124,6 @@ fn full_best_effort_alternative_slot_is_checked_before_candidate_allocation() {
     assert!(staged.is_empty());
     assert_eq!(staged_bytes, 0);
 }
+
+#[cfg(test)]
+mod witness_limits;

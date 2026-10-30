@@ -432,7 +432,7 @@ fn missing_header_guard(
             let Some((include, _)) = include_path_from_node(node, &candidate_source) else {
                 continue;
             };
-            if resolve_include_targets_with_index(&candidate, include, cpp.include_target_index())
+            if resolve_include_targets_with_index(&candidate, include, &cpp.include_target_index())
                 .into_iter()
                 .any(|target| target == *file)
             {

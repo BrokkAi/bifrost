@@ -151,6 +151,75 @@ impl PolicyFailOn {
     }
 }
 
+/// What the batch exit status makes of a run whose completion is Bifrost's own
+/// `inconclusive` verdict: it ran, and could not prove there is nothing more
+/// to find (#8111).
+///
+/// A policy's own `(on-unknown :verdict ...)` declaration (#2506) outranks
+/// this caller choice where it says something: `warn-unreliable` keeps the run
+/// advisory and `fail-closed` gates it as a finding, under either value.
+/// `abstain`, the default, and `treat-may-as-finding`, which changes only what
+/// is published, leave the run to this choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyOnInconclusive {
+    /// Advisory: the run is reported, never gates, and the batch exits clean
+    /// when no finding crosses the threshold. This is how SlopCop reads the
+    /// same verdict, so the two never disagree on one report.
+    #[default]
+    Pass,
+    /// The run is unreliable and the batch exits 2, whatever else it found.
+    Unreliable,
+}
+
+impl PolicyOnInconclusive {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Unreliable => "unreliable",
+        }
+    }
+}
+
+/// How one run bears on the batch exit status. Every consumer of that
+/// decision -- the exit status, the diff base's aggregate verdict, SARIF's
+/// `executionSuccessful` -- classifies runs here, so they cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRunGate {
+    /// The run proves a clean negative: complete, proven by authored-complete
+    /// summaries, or a default selection that could not run.
+    Clean,
+    /// A verdict that never searched the whole program (a proven subset). It
+    /// condemns the batch only when no finding gates it.
+    Subset,
+    /// Bifrost's own inconclusive verdict, advisory: reported, never gating.
+    Inconclusive,
+    /// No verdict the batch may rely on: the run failed, was unsupported, was
+    /// explicitly requested and could not run, or was inconclusive under
+    /// [`PolicyOnInconclusive::Unreliable`] with no policy declaration.
+    Unreliable,
+}
+
+impl PolicyRunGate {
+    pub fn of(run: &PolicyRun, on_inconclusive: PolicyOnInconclusive) -> Self {
+        let completion = run.completion();
+        if completion.permits_clean_negative() {
+            Self::Clean
+        } else if completion.is_reliable() {
+            Self::Subset
+        } else if completion.inconclusive_scope().is_some()
+            && (on_inconclusive == PolicyOnInconclusive::Pass
+                || matches!(
+                    run.unknown_verdict(),
+                    Some(UnknownVerdict::WarnUnreliable | UnknownVerdict::FailClosed)
+                ))
+        {
+            Self::Inconclusive
+        } else {
+            Self::Unreliable
+        }
+    }
+}
+
 /// Which changed range a run asks about.
 ///
 /// The range narrows only the taint composition's sinks. Every
@@ -203,6 +272,7 @@ pub struct PolicyEvaluationOptions {
     baseline: PolicyBaselineOptions,
     require_explicit_schema_versions: bool,
     fail_on: PolicyFailOn,
+    on_inconclusive: PolicyOnInconclusive,
     diff_base: Option<String>,
     /// Whether this batch may publish or reuse complete policy units in the
     /// repository's analyzer cache. Either kind of scan verifies a unit's
@@ -253,6 +323,7 @@ impl PolicyEvaluationOptions {
             ),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
+            on_inconclusive: PolicyOnInconclusive::Pass,
             diff_base: None,
             incremental: true,
             policy_timings: false,
@@ -295,6 +366,11 @@ impl PolicyEvaluationOptions {
 
     pub const fn with_fail_on(mut self, fail_on: PolicyFailOn) -> Self {
         self.fail_on = fail_on;
+        self
+    }
+
+    pub const fn with_on_inconclusive(mut self, on_inconclusive: PolicyOnInconclusive) -> Self {
+        self.on_inconclusive = on_inconclusive;
         self
     }
 
@@ -343,6 +419,10 @@ impl PolicyEvaluationOptions {
 
     pub const fn fail_on(&self) -> PolicyFailOn {
         self.fail_on
+    }
+
+    pub const fn on_inconclusive(&self) -> PolicyOnInconclusive {
+        self.on_inconclusive
     }
 
     pub fn diff_base(&self) -> Option<&str> {
@@ -3992,8 +4072,20 @@ fn evaluate_prepared_policy_inputs(
     if let Some(baseline) = diff_baseline.as_ref().map(|outcome| &outcome.baseline) {
         for policy in &baseline.unqualified_policies {
             diff_base_policy_unqualified.push(policy.policy_id().clone());
-            secondary_diagnostics.push(report_diagnostic(
+            // An unqualified policy gates every head finding in full, so no
+            // new finding hides behind it. When its base run was Bifrost's own
+            // inconclusive verdict the comparison it could not make is
+            // advisory, as SlopCop reads it (#8111); a base that an unreliable
+            // reading condemns already carries `diff-base-unreliable`. Any
+            // other unqualified base run reached no verdict and stays an error.
+            let severity = if policy.completion() == "inconclusive" {
+                PolicyDiagnosticSeverity::Warning
+            } else {
+                PolicyDiagnosticSeverity::Error
+            };
+            secondary_diagnostics.push(report_diagnostic_with_severity(
                 PolicyReportDiagnosticCode::DiffBasePolicyUnqualified,
+                severity,
                 format!(
                     "diff base policy `{}` is unqualified ({}, {}); diagnostics: {:?}",
                     policy.policy_id(),
@@ -4456,7 +4548,7 @@ fn evaluate_prepared_policy_inputs(
     }
     let taint_findings = taint.take_public_findings();
     let taint_analysis_results = taint.take_retained_analyses();
-    let exit_status = report_exit_status(&report, threshold_exceeded);
+    let exit_status = report_exit_status(&report, threshold_exceeded, options.on_inconclusive());
     Ok(PolicyBatchOutcome {
         report,
         stage_attribution,
@@ -4569,11 +4661,14 @@ fn base_evaluation_key(
 ) -> PolicyEvaluationRowKey {
     // The base's own options, not the head's: it evaluates with the head's
     // suppression and gate configuration deliberately stripped, and the
-    // budgets and registry limits it inherits decide what it retains.
+    // budgets and registry limits it inherits decide what it retains. The
+    // head's handling of inconclusive runs is kept: it decides the base's
+    // recorded aggregate verdict.
     let base_options = format!(
-        "{:?}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}\u{1}{scope:?}",
+        "{:?}\u{1}{}\u{1}{}\u{1}{batch_budget:?}\u{1}{registry_limits:?}\u{1}{scope:?}",
         options.evaluation_date(),
         options.require_explicit_schema_versions(),
+        options.on_inconclusive().label(),
     );
     PolicyEvaluationRowKey {
         base_tree_oid: String::new(),
@@ -5107,6 +5202,7 @@ fn evaluate_policy_diff_baseline(
     // scope differs or the head intentionally has no scope document.
     let mut base_options = PolicyEvaluationOptions::new(head_options.evaluation_date())
         .with_required_schema_versions(head_options.require_explicit_schema_versions())
+        .with_on_inconclusive(head_options.on_inconclusive())
         .with_policy_cost_hints(head_options.policy_cost_hints.clone());
     base_options.scope_override = Some(head_scope.cloned());
     // The base evaluates unit by unit for the same reason the head does: a
@@ -5272,9 +5368,10 @@ fn head_evaluation_publication(
     let changed =
         ChangedFacts::from_committed_tree(head, subtree.blobs(), &|blob| subtree.source(blob));
     if !changed.is_complete() || changed.changed_path_count() != 0 {
+        let changed_paths = changed.changed_paths().collect::<Vec<_>>();
         brokk_bifrost_analysis::profiling::note_with(|| {
             format!(
-                "policy.units head_unrecorded changed_paths={} complete={}",
+                "policy.units head_unrecorded changed_paths={} paths={changed_paths:?} complete={}",
                 changed.changed_path_count(),
                 changed.is_complete()
             )
@@ -5312,6 +5409,7 @@ fn head_evaluation_publication(
         report,
         tree_diagnostics(report),
         report_has_orphaned_suppression(report),
+        options.on_inconclusive(),
     );
     let baseline = PolicyDiffBaseline {
         requested_revision: "HEAD".to_string(),
@@ -6565,7 +6663,11 @@ fn failed_evaluation_run(
 /// the report here rather than passed in, so it survives the audit-retention
 /// rollback that drops every review: a rollback leaves no orphan evidence, and
 /// a gate must not fire on evidence the report does not carry.
-fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -> u8 {
+fn report_exit_status(
+    report: &PolicyReportDocument,
+    threshold_exceeded: bool,
+    on_inconclusive: PolicyOnInconclusive,
+) -> u8 {
     // An accepted decision that no longer resolves to any finding is a defect
     // in the decision record, not in the code (#2418). Without this the
     // rotation is silent: the record stops matching, the finding it covered
@@ -6573,7 +6675,12 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
     // projection whose base already contains the rotation it goes quiet again
     // with the dead record still in the document.
     let threshold_exceeded = threshold_exceeded || report_has_orphaned_suppression(report);
-    if report_unreliable(report, report.diagnostics(), threshold_exceeded) {
+    if report_unreliable(
+        report,
+        report.diagnostics(),
+        threshold_exceeded,
+        on_inconclusive,
+    ) {
         return POLICY_EXIT_UNRELIABLE;
     }
     if threshold_exceeded {
@@ -6597,6 +6704,25 @@ fn report_unreliable<'a>(
     report: &PolicyReportDocument,
     diagnostics: impl IntoIterator<Item = &'a PolicyReportDiagnostic>,
     threshold_exceeded: bool,
+    on_inconclusive: PolicyOnInconclusive,
+) -> bool {
+    report_lacks_verdict(report, diagnostics, on_inconclusive)
+        || (!threshold_exceeded
+            && report
+                .runs()
+                .iter()
+                .any(|run| PolicyRunGate::of(run, on_inconclusive) == PolicyRunGate::Subset))
+}
+
+/// Whether some part of `report` reached no verdict at all, so no exit status
+/// but unreliable may describe it, whatever it found. This is SlopCop's sense
+/// of unreliable (#8111): the evaluation terminated, an error report
+/// diagnostic, truncated report diagnostics, or a run [`PolicyRunGate`]
+/// classifies as unreliable.
+pub(crate) fn report_lacks_verdict<'a>(
+    report: &PolicyReportDocument,
+    diagnostics: impl IntoIterator<Item = &'a PolicyReportDiagnostic>,
+    on_inconclusive: PolicyOnInconclusive,
 ) -> bool {
     // A report diagnostic condemns the run when it is an error. Every load,
     // parse, and activation failure is one, so this is the same rule the
@@ -6610,7 +6736,7 @@ fn report_unreliable<'a>(
     // for the findings' own status and `fail-closed` already contributed to the
     // finding gate, so neither may also condemn the batch for being incomplete.
     // TreatMayAsFinding changes publication only; its marker never waives
-    // coverage obligations or the unreliable exit status.
+    // coverage obligations, so the caller's `on_inconclusive` decides it.
     // The marker is set only on an `Inconclusive` run, so a failed or
     // unsupported run still exits unreliable whatever the policy declared.
     report.execution().termination().is_some()
@@ -6618,25 +6744,32 @@ fn report_unreliable<'a>(
             .into_iter()
             .any(|diagnostic| diagnostic.severity() == PolicyDiagnosticSeverity::Error)
         || report.diagnostics_truncated()
-        || report.runs().iter().any(|run| {
-            !run.completion().is_reliable()
-                && !matches!(
-                    run.unknown_verdict(),
-                    Some(UnknownVerdict::WarnUnreliable | UnknownVerdict::FailClosed)
-                )
-        })
-        || (!threshold_exceeded
-            && report.runs().iter().any(|run| {
-                !run.completion().permits_clean_negative()
-                    && !matches!(
-                        run.unknown_verdict(),
-                        Some(UnknownVerdict::WarnUnreliable | UnknownVerdict::FailClosed)
-                    )
-            }))
+        || report
+            .runs()
+            .iter()
+            .any(|run| PolicyRunGate::of(run, on_inconclusive) == PolicyRunGate::Unreliable)
 }
 
 fn report_diagnostic(
     code: PolicyReportDiagnosticCode,
+    message: impl Into<String>,
+    source: Option<PolicySourceIdentity>,
+    byte_range: Option<PolicySourceRange>,
+    related: Vec<PolicySourceRelatedDiagnostic>,
+) -> Result<PolicyReportDiagnostic, PolicyCoordinatorError> {
+    report_diagnostic_with_severity(
+        code,
+        PolicyDiagnosticSeverity::Error,
+        message,
+        source,
+        byte_range,
+        related,
+    )
+}
+
+fn report_diagnostic_with_severity(
+    code: PolicyReportDiagnosticCode,
+    severity: PolicyDiagnosticSeverity,
     message: impl Into<String>,
     source: Option<PolicySourceIdentity>,
     byte_range: Option<PolicySourceRange>,
@@ -6647,7 +6780,7 @@ fn report_diagnostic(
     }
     PolicyReportDiagnostic::try_new(
         code,
-        PolicyDiagnosticSeverity::Error,
+        severity,
         safe_report_text(message.into()),
         source,
         byte_range,
@@ -8697,7 +8830,7 @@ pub fn run() {
         .expect("deadline report");
 
         assert_eq!(
-            report_exit_status(outcome.report(), false),
+            report_exit_status(outcome.report(), false, PolicyOnInconclusive::Pass),
             POLICY_EXIT_UNRELIABLE
         );
     }
@@ -8719,17 +8852,142 @@ pub fn run() {
         // require-model contract, so it exits clean rather than unreliable.
         let proven_by_summary = single_run_report(PolicyRunCompletion::ProvenBySummary);
         assert_eq!(
-            report_exit_status(&proven_by_summary, false),
+            report_exit_status(&proven_by_summary, false, PolicyOnInconclusive::Unreliable),
             POLICY_EXIT_CLEAN
         );
 
-        // A genuinely inconclusive run with no findings still exits unreliable.
+        // A genuinely inconclusive run with no findings exits unreliable when
+        // the caller asks for the strict reading.
         let inconclusive = single_run_report(
             PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
                 .unwrap(),
         );
         assert_eq!(
-            report_exit_status(&inconclusive, false),
+            report_exit_status(&inconclusive, false, PolicyOnInconclusive::Unreliable),
+            POLICY_EXIT_UNRELIABLE
+        );
+    }
+
+    /// SlopCop's reading of one stored `completion`, transcribed from
+    /// `bifrost-service` `server/src/check.rs` (`IncompleteReason::of` and
+    /// `IncompletePolicy::is_unproven`): whether the run keeps a clean check
+    /// from being clean. A timed-out run blocks; Bifrost's own `inconclusive`
+    /// verdict never does, whatever its reasons; every other completion that
+    /// is not complete blocks. `SLOPCOP_CLEAN_TYPES` are the completions the
+    /// runner does not record as incomplete at all.
+    fn slopcop_blocks_clean(completion: &serde_json::Value) -> bool {
+        const SLOPCOP_CLEAN_TYPES: [&str; 2] = ["complete", "proven_by_summary"];
+        let deadline = completion["reasons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|reason| reason == "rule_deadline_exceeded");
+        if SLOPCOP_CLEAN_TYPES.contains(&completion["type"].as_str().unwrap_or_default()) {
+            return false;
+        }
+        deadline || completion["type"] != "inconclusive"
+    }
+
+    #[test]
+    #[hardwon(
+        "#8111: an inconclusive verdict SlopCop reads as clean failed the published policy-scan action as unreliable"
+    )]
+    fn issue_8111_exit_status_agrees_with_slopcop_on_one_report() {
+        let inconclusive = || {
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
+                .unwrap()
+        };
+        let failed =
+            || PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant]).unwrap();
+        // Done when 1: a report whose only non-complete runs are inconclusive
+        // passes by default, as SlopCop calls it clean; done when 2: a run
+        // with no verdict still exits unreliable, as SlopCop blocks it.
+        for (label, completion, default_status) in [
+            ("complete", PolicyRunCompletion::Complete, POLICY_EXIT_CLEAN),
+            (
+                "proven_by_summary",
+                PolicyRunCompletion::ProvenBySummary,
+                POLICY_EXIT_CLEAN,
+            ),
+            ("inconclusive", inconclusive(), POLICY_EXIT_CLEAN),
+            (
+                "inconclusive deadline",
+                PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::DeadlineExceeded])
+                    .unwrap(),
+                POLICY_EXIT_CLEAN,
+            ),
+            ("failed", failed(), POLICY_EXIT_UNRELIABLE),
+        ] {
+            let report = single_run_report(completion);
+            let stored = serde_json::to_value(report.runs()[0].completion()).unwrap();
+            let status = report_exit_status(&report, false, PolicyOnInconclusive::default());
+            assert_eq!(status, default_status, "{label}");
+            // A deadline Bifrost records as an inconclusive reason is not
+            // SlopCop's `rule_deadline_exceeded`, which its runner writes for a
+            // rule it stopped itself; every other row reads identically.
+            if label != "inconclusive deadline" {
+                assert_eq!(
+                    status == POLICY_EXIT_UNRELIABLE,
+                    slopcop_blocks_clean(&stored),
+                    "{label}: {stored}"
+                );
+            }
+        }
+
+        // Findings win over an inconclusive run: the gate names the finding
+        // rather than the tooling.
+        let report = single_run_report(inconclusive());
+        assert_eq!(
+            report_exit_status(&report, true, PolicyOnInconclusive::Pass),
+            POLICY_EXIT_FINDING
+        );
+        // The strict reading keeps the behavior before #8111.
+        assert_eq!(
+            report_exit_status(&report, false, PolicyOnInconclusive::Unreliable),
+            POLICY_EXIT_UNRELIABLE
+        );
+        assert_eq!(
+            report_exit_status(&report, true, PolicyOnInconclusive::Unreliable),
+            POLICY_EXIT_UNRELIABLE
+        );
+
+        // Report-level causes keep a batch of inconclusive runs unreliable
+        // under the default: an error report diagnostic and truncated report
+        // diagnostics. Termination is pinned by #1296 above.
+        let error = report_diagnostic(
+            PolicyReportDiagnosticCode::PacksLoadFailed,
+            "pack failed to load",
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let with_report_diagnostics = |diagnostics, truncated, omitted| {
+            let run = report.runs()[0].clone();
+            PolicyReportDocument::try_new(
+                report.rules().to_vec(),
+                vec![run],
+                diagnostics,
+                truncated,
+                omitted,
+                truncated.then_some(PolicyDiagnosticSeverity::Warning),
+            )
+            .expect("canonical report")
+        };
+        assert_eq!(
+            report_exit_status(
+                &with_report_diagnostics(vec![error], false, 0),
+                false,
+                PolicyOnInconclusive::Pass
+            ),
+            POLICY_EXIT_UNRELIABLE
+        );
+        assert_eq!(
+            report_exit_status(
+                &with_report_diagnostics(Vec::new(), true, 1),
+                false,
+                PolicyOnInconclusive::Pass
+            ),
             POLICY_EXIT_UNRELIABLE
         );
     }
@@ -9269,9 +9527,13 @@ pub fn run() {
         )
         .expect("warm mixed evaluation");
         for outcome in [&cold, &warm] {
-            assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+            // The inconclusive base run is advisory (#8111), so the base's
+            // aggregate verdict holds and the policy it leaves unqualified
+            // gates its head finding in full: the finding, not the tooling,
+            // decides the exit status.
+            assert_eq!(outcome.exit_status(), POLICY_EXIT_FINDING);
             let review = outcome.report().diff().expect("diff review");
-            assert!(review.degraded());
+            assert!(!review.degraded());
             assert_eq!(review.persisting_count(), 1);
             assert_eq!(review.unqualified_policies().len(), 1);
             assert_eq!(
@@ -9493,7 +9755,9 @@ pub fn run() {
         };
         let cold = evaluate();
         let warm = evaluate();
-        assert_eq!(cold.exit_status(), POLICY_EXIT_UNRELIABLE);
+        // The truncated run is inconclusive and advisory (#8111), and no
+        // threshold gates, so the batch is clean.
+        assert_eq!(cold.exit_status(), POLICY_EXIT_CLEAN);
         assert_eq!(cold.report().diff(), warm.report().diff());
         assert_eq!(
             warm.report().incremental().expect("warm review").base(),

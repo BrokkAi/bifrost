@@ -331,6 +331,23 @@ target's wildcard export-name surface and `wildcard_inventory_closed`, then
 publish a synthetic route binding with an absence proof. They do not enumerate
 export halves. Python already reads `resolution_import_selectors` directly.
 
+### Ordered root import pairing
+
+The shared root pairing step reads one target's export inventory through a
+language hook, selects export halves lazily, and appends admitted bridges in
+encounter order. One invocation keeps one assembler admission-set boundary;
+separate members or targets must not be grouped. The language owns inventory
+memoization, read evidence, export filters and first-witness stops. Unavailable
+and cancelled reads or admission remain distinct outcomes. All temporary
+inventories and descriptors belong to the current query.
+
+Go dot imports use the shared import loop around this step. Caller authority
+loading precedes the language precheck, which gates the import inventory read.
+The loop visits imports in inventory order, prepares recipes and completion
+once per import, then visits source mounts in the target hook's order. Demand
+equality remains an admission rule. Cancellation is checked per import and
+target. JVM route, prefix, alias and member search rules remain JVM-owned.
+
 ### Three kinds of derived data
 
 Everything the engine stores or computes is one of three kinds, and each kind
@@ -621,7 +638,9 @@ first, then explicit imports, wildcard imports and package declarations from
 other files. Java ranks local declarations, explicit imports, package
 declarations and on-demand imports in that order. Kotlin ranks local
 declarations, explicit imports, same-package declarations and star imports.
-The shared precedence module supplies each language's ranks and lowering form.
+Each language's store support supplies its precedence rules. Shared lowering
+assembles scope-choice steps; each language classifies its bindings into the
+choices at each scope level.
 
 ### Typed member lookup
 

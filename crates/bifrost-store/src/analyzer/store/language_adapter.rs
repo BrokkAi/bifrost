@@ -95,6 +95,15 @@ pub trait StoreLanguageAdapter: Send + Sync + 'static {
     fn path_synthetic_module_unit(&self, _file: &ProjectFile) -> Option<CodeUnit> {
         None
     }
+    /// Construct a predicate candidate from the selected path projection,
+    /// without reading declaration content or looking up the published name.
+    fn path_synthetic_module_from_published_name(
+        &self,
+        file: &ProjectFile,
+        _name: &str,
+    ) -> Result<Option<CodeUnit>> {
+        Ok(self.path_synthetic_module_unit(file))
+    }
     /// Query-side module hydration can reuse the selected path publication.
     fn hydrate_path_synthetic_module_unit(&self, file: &ProjectFile) -> Result<Option<CodeUnit>> {
         Ok(self.path_synthetic_module_unit(file))

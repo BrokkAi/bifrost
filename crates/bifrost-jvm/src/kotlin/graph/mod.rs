@@ -31,8 +31,9 @@ use tree_sitter::Node;
 /// reach as much as Java does -- the JVM realm is one candidate space (#1237),
 /// so a Kotlin file naming a Java or Scala class next door resolves only
 /// through the workspace frontier.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct KotlinGraphSource<'a> {
+    pub reads: brokk_bifrost_core::analyzer::project_reads::ReadCapability,
     pub index: &'a dyn CodeUnitIndex,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     pub imports: Option<&'a dyn ImportAnalysisProvider>,

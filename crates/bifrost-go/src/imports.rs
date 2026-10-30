@@ -69,10 +69,10 @@ pub fn path_suffixes(path: &str) -> impl Iterator<Item = &str> {
 ///
 /// Grouping the three maps keeps the free functions below from taking the same
 /// three arguments each; every field is data the caller already owns.
-pub struct GoImportTables<'a> {
-    pub package_files: &'a HashMap<String, Arc<Vec<ProjectFile>>>,
-    pub dir_parent_files: &'a HashMap<String, Arc<Vec<ProjectFile>>>,
-    pub dir_parent_suffix_files: &'a HashMap<String, Arc<Vec<ProjectFile>>>,
+pub struct GoImportTables {
+    pub package_files: Arc<HashMap<String, Arc<Vec<ProjectFile>>>>,
+    pub dir_parent_files: Arc<HashMap<String, Arc<Vec<ProjectFile>>>>,
+    pub dir_parent_suffix_files: Arc<HashMap<String, Arc<Vec<ProjectFile>>>>,
 }
 
 /// Files that `import_path` resolves to from `source_file`.
@@ -82,7 +82,7 @@ pub struct GoImportTables<'a> {
 /// back to the directory-suffix heuristic only when no canonical package
 /// matches (module-less or vendored layouts).
 pub fn go_matching_import_files(
-    tables: &GoImportTables<'_>,
+    tables: &GoImportTables,
     source_file: &ProjectFile,
     import_path: &str,
 ) -> Vec<ProjectFile> {
@@ -143,7 +143,7 @@ pub fn go_directory_sibling_import_files(
 /// Every non-module top-level declaration `file`'s imports bring into scope.
 pub fn go_imported_code_units_of(
     index: &dyn CodeUnitIndex,
-    tables: &GoImportTables<'_>,
+    tables: &GoImportTables,
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> HashSet<CodeUnit> {

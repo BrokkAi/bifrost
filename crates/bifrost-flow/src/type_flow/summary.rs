@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::analyzer::read_ledger::read_set_digest;
+use crate::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
 use crate::analyzer::semantic::{
     CancellationToken, ClassAtom, ClassIdentity, DispatchBoundaryKind, IcfgProvider,
     IcfgProviderBehaviorIdentity, LengthDelimitedDigest, OracleCallContext, ProcedureHandle,
@@ -38,7 +39,11 @@ use crate::analyzer::store::class_set_summaries::{
     ClassSetSummaryRow, ClassSetSummaryRowKey, class_set_summary_output_digest,
 };
 use crate::analyzer::store::{AnalyzerStore, StoreError};
-use crate::analyzer::{ProjectFile, ReadKey, WorkspaceAnalyzer, procedure_dispatch_read_call};
+use crate::analyzer::workspace_authority::{AuthorityInputs, record_workspace_authority_read};
+use crate::analyzer::{
+    ProjectFile, ReadKey, ReadLedger, WorkspaceAnalyzer, capture_query_reads,
+    procedure_dispatch_read_call, replay_query_read_keys,
+};
 use crate::dataflow::{
     DataflowRequest, FactId, PathQuality, PathQualityFrontier, ProcedureSummaryIdentity,
     ProcedureSummaryKey, ProductionSemanticSummaryRepository, ReusableEndSummary,
@@ -81,6 +86,7 @@ const CLASS_SET_SUMMARY_CALL_CONTRACT: &[u8] = b"bifrost-class-set-summary-call-
 const CLASS_SET_SUMMARY_BINDING_CONTRACT: &[u8] = b"bifrost-class-set-summary-binding-contract-v1";
 const CLASS_SET_SUMMARY_SOURCE_BEHAVIOR: &[u8] = b"bifrost-class-set-source-behavior-v1";
 const MAX_CLASS_SET_SUMMARIES: usize = 16_384;
+const MAX_CLASS_SET_SUMMARY_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLASS_SET_ENTRY_SELECTOR_PROBES: usize = 16_384;
 const MAX_CLASS_SET_SUMMARY_ROWS: usize = 262_144;
 const MAX_CLASS_SET_SURFACE_CANDIDATES: usize = 64;
@@ -329,8 +335,9 @@ impl TypeFlowSummaryProfile {
 /// The table retains at most eight partitions,
 /// each capped by `DEFAULT_SUMMARY_REPOSITORY_ENTRIES` and
 /// `DEFAULT_SUMMARY_REPOSITORY_BYTES` (semantic summaries),
-/// `MAX_CLASS_SET_SUMMARIES` and `MAX_CLASS_SET_ENTRY_SELECTOR_PROBES`
-/// (class-set summaries and selector probes) and `FIELD_SLOT_CACHE_BYTES`
+/// `MAX_CLASS_SET_SUMMARIES`, `MAX_CLASS_SET_SUMMARY_INPUT_BYTES` and
+/// `MAX_CLASS_SET_ENTRY_SELECTOR_PROBES` (class-set rows, shared input receipts
+/// and selector probes) and `FIELD_SLOT_CACHE_BYTES`
 /// (ready field-slot values), so eight times those caps in total. Queries pin
 /// their selected state, so eviction does not invalidate active consumers: an
 /// evicted partition stays alive while an in-flight query holds it, and live
@@ -344,11 +351,16 @@ pub struct TypeFlowSummaryPartitions {
 #[derive(Debug)]
 struct TypeFlowSummaryPartition {
     limits: (SolverWork, SemanticWork),
-    state: TypeFlowSummaryState,
+    state: TypeFlowSummaryStorage,
 }
 
 impl TypeFlowSummaryPartitions {
-    pub fn select(&self, solver: SolverWork, semantic: SemanticWork) -> TypeFlowSummaryState {
+    pub fn select(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        solver: SolverWork,
+        semantic: SemanticWork,
+    ) -> TypeFlowSummaryState {
         const CAPACITY: usize = 8;
         let key = (solver, semantic);
         let mut entries = self.entries.lock().expect("type-flow partitions poisoned");
@@ -358,13 +370,32 @@ impl TypeFlowSummaryPartitions {
             if entries.len() == CAPACITY {
                 entries.remove(0);
             }
-            TypeFlowSummaryState::default()
+            TypeFlowSummaryStorage::default()
         };
         entries.push(TypeFlowSummaryPartition {
             limits: key,
             state: state.clone(),
         });
-        state
+        state.reader(workspace)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TypeFlowSummaryStorage {
+    semantic: Arc<crate::dataflow::ProductionSemanticSummaryStorage>,
+    class_set: Arc<ClassSetSummaryRepository>,
+    field_slots: FieldSlotIndexCache,
+}
+
+impl TypeFlowSummaryStorage {
+    fn reader(&self, workspace: &WorkspaceAnalyzer) -> TypeFlowSummaryState {
+        TypeFlowSummaryState {
+            semantic: Arc::new(self.semantic.reader(
+                crate::analyzer::workspace_authority::workspace_memo_attribution(workspace),
+            )),
+            class_set: Arc::clone(&self.class_set),
+            field_slots: self.field_slots.clone(),
+        }
     }
 }
 
@@ -376,23 +407,9 @@ pub struct TypeFlowSummaryState {
     field_slots: FieldSlotIndexCache,
 }
 
-impl Default for TypeFlowSummaryState {
-    fn default() -> Self {
-        Self::with_semantic(Arc::new(ProductionSemanticSummaryRepository::new()))
-    }
-}
-
 impl TypeFlowSummaryState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn with_semantic(semantic: Arc<ProductionSemanticSummaryRepository>) -> Self {
-        Self {
-            semantic,
-            class_set: Arc::new(ClassSetSummaryRepository::default()),
-            field_slots: FieldSlotIndexCache::default(),
-        }
+    pub fn new(workspace: &WorkspaceAnalyzer) -> Self {
+        TypeFlowSummaryStorage::default().reader(workspace)
     }
 
     pub fn field_slot_indexes(&self) -> FieldSlotIndexCache {
@@ -704,6 +721,93 @@ fn merge_projection_frontier(retained: &mut PathQualityFrontier, incoming: PathQ
     }
 }
 
+// Each validation memo retains the complete inputs read while it was built.
+struct ValidatedInputs<T> {
+    value: T,
+    reads: Arc<ReadLedger>,
+}
+
+impl<T> ValidatedInputs<T> {
+    fn replay(&self, workspace: &WorkspaceAnalyzer) -> &T {
+        crate::analyzer::i_analyzer::replay_query_reads(workspace.analyzer(), &self.reads);
+        &self.value
+    }
+}
+
+fn record_field_slot_compatibility(
+    workspace: &WorkspaceAnalyzer,
+    language: crate::analyzer::Language,
+    digest: StableDigest,
+) {
+    record_workspace_authority_read(
+        workspace.analyzer(),
+        WorkspaceFactFamily::FieldSlots,
+        AuthorityInputs::Fact {
+            language,
+            subject: FactSubject::Whole,
+            answer: digest,
+        },
+    );
+}
+
+/// A tabulation's publishing capture is a sound superset of every entry's
+/// derivation reads. Reuse therefore inherits the publishing root's inputs.
+/// All rows from that publication share the same allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSummaryInputs {
+    keys: Arc<[ReadKey]>,
+    unattributed_reads: usize,
+    execution_dependences: usize,
+}
+
+impl Default for RuntimeSummaryInputs {
+    fn default() -> Self {
+        Self {
+            keys: Arc::default(),
+            unattributed_reads: 1,
+            execution_dependences: 0,
+        }
+    }
+}
+
+impl RuntimeSummaryInputs {
+    fn capture(workspace: &WorkspaceAnalyzer) -> Self {
+        match workspace.analyzer().current_thread_read_ledger() {
+            Some(reads) => Self {
+                // Summary envelopes compare their arrays; keep this publication canonical.
+                keys: reads.canonical_keys(),
+                unattributed_reads: reads.unattributed_reads(),
+                execution_dependences: reads.execution_dependences(),
+            },
+            None => Self::default(),
+        }
+    }
+
+    fn retained_key_bytes(&self) -> usize {
+        use crate::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+        let mut heap = RetainedHeap::default();
+        heap.arc(&self.keys, |keys, heap| {
+            for key in keys {
+                retained_read_key(heap, key);
+            }
+        });
+        heap.total()
+    }
+
+    fn allocation_id(&self) -> usize {
+        Arc::as_ptr(&self.keys).cast::<()>() as usize
+    }
+
+    fn replay(&self, workspace: &WorkspaceAnalyzer) {
+        crate::analyzer::i_analyzer::replay_shared_query_read_receipt(
+            workspace.analyzer(),
+            &self.keys,
+            self.unattributed_reads,
+            self.execution_dependences,
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClassSetProcedureSummary {
     key: ClassSetSummaryLookupKey,
@@ -712,6 +816,20 @@ struct ClassSetProcedureSummary {
     dependencies: Box<[ClassSetRelationDependency]>,
     reads: Box<[ReadKey]>,
     output_digest: ClassSetSummaryOutputDigest,
+    inputs: RuntimeSummaryInputs,
+}
+
+/// Publication provenance can differ while the exact derived relation agrees.
+fn same_summary_derivation(
+    left: &ClassSetProcedureSummary,
+    right: &ClassSetProcedureSummary,
+) -> bool {
+    left.key == right.key
+        && left.exits == right.exits
+        && left.reached == right.reached
+        && left.dependencies == right.dependencies
+        && left.reads == right.reads
+        && left.output_digest == right.output_digest
 }
 
 struct ValidatedClassSetSummary {
@@ -830,9 +948,105 @@ impl ClassSetSummaryPersistence {
     }
 }
 
+/// Bounded metadata for the receipt allocations retained by runtime rows.
+#[derive(Debug)]
+struct RuntimeReceiptOwner {
+    rows: usize,
+    bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeSummaryStore {
+    values: HashMap<ClassSetRuntimeLookupKey, Arc<ClassSetProcedureSummary>>,
+    receipt_owners: HashMap<usize, RuntimeReceiptOwner>,
+    receipt_bytes: usize,
+}
+
+// Read-only map access preserves existing lookups; production writes use insert.
+impl std::ops::Deref for RuntimeSummaryStore {
+    type Target = HashMap<ClassSetRuntimeLookupKey, Arc<ClassSetProcedureSummary>>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl RuntimeSummaryStore {
+    #[cfg(test)]
+    fn retain(
+        &mut self,
+        mut keep: impl FnMut(&ClassSetRuntimeLookupKey, &Arc<ClassSetProcedureSummary>) -> bool,
+    ) {
+        self.values.retain(|key, row| keep(key, row));
+        self.receipt_owners.clear();
+        self.receipt_bytes = 0;
+        for row in self.values.values() {
+            let owner = self
+                .receipt_owners
+                .entry(row.inputs.allocation_id())
+                .or_insert_with(|| RuntimeReceiptOwner {
+                    rows: 0,
+                    bytes: row.inputs.retained_key_bytes(),
+                });
+            if owner.rows == 0 {
+                self.receipt_bytes += owner.bytes;
+            }
+            owner.rows += 1;
+        }
+    }
+
+    fn insert(
+        &mut self,
+        key: ClassSetRuntimeLookupKey,
+        summary: Arc<ClassSetProcedureSummary>,
+        byte_limit: usize,
+    ) -> bool {
+        let new_id = summary.inputs.allocation_id();
+        let old_id = self.values.get(&key).map(|old| old.inputs.allocation_id());
+        let removed_bytes = old_id.filter(|old| *old != new_id).map_or(0, |old| {
+            let owner = &self.receipt_owners[&old];
+            if owner.rows == 1 { owner.bytes } else { 0 }
+        });
+        let added_bytes = if self.receipt_owners.contains_key(&new_id) {
+            0
+        } else {
+            summary.inputs.retained_key_bytes()
+        };
+        let retained = self
+            .receipt_bytes
+            .saturating_sub(removed_bytes)
+            .saturating_add(added_bytes);
+        if retained > byte_limit {
+            return false;
+        }
+        if old_id != Some(new_id) {
+            if let Some(old_id) = old_id {
+                let owner = self
+                    .receipt_owners
+                    .get_mut(&old_id)
+                    .expect("retained row owns a receipt");
+                owner.rows -= 1;
+                if owner.rows == 0 {
+                    self.receipt_owners.remove(&old_id);
+                }
+            }
+            let owner = self
+                .receipt_owners
+                .entry(new_id)
+                .or_insert(RuntimeReceiptOwner {
+                    rows: 0,
+                    bytes: added_bytes,
+                });
+            owner.rows += 1;
+        }
+        self.receipt_bytes = retained;
+        self.values.insert(key, summary);
+        true
+    }
+}
+
 #[derive(Debug, Default)]
 struct ClassSetSummaryRepository {
-    runtime: Mutex<HashMap<ClassSetRuntimeLookupKey, Arc<ClassSetProcedureSummary>>>,
+    runtime: Mutex<RuntimeSummaryStore>,
     surfaces: Mutex<HashMap<StableDigest, Arc<ClassSetProcedureSurfaceRow>>>,
 }
 
@@ -933,7 +1147,12 @@ impl ClassSetSummaryRepository {
         // Entry lookup is an owner-local mutable head. Exact dependency and
         // witness evidence validates the current relation before it replaces
         // an older answer under the same local key.
-        runtime.insert(runtime_key, summary);
+        if !runtime.insert(runtime_key, summary, MAX_CLASS_SET_SUMMARY_INPUT_BYTES) {
+            return RuntimeSummaryPublication {
+                published: false,
+                retained_write: false,
+            };
+        }
         RuntimeSummaryPublication {
             published,
             retained_write,
@@ -990,12 +1209,13 @@ pub(crate) struct ClassSetAcquisitionCuts<'workspace, 'provider> {
     validation_work: usize,
     replay_aborted: bool,
     disabled_cuts: HashSet<DurableProcedureKey>,
-    pre_dispatch_attempted: HashSet<DurableProcedureKey>,
     manifest: ClassSetCutManifest,
     staged_expected_surfaces: Option<HashMap<DurableProcedureKey, StableDigest>>,
     hydrated_surfaces: Vec<HydratedProcedureSurface>,
-    exact_identity_snapshots:
-        HashMap<ClassSetProcedureIdentityRow, (ProcedureHandle, ValueFlowInput<ValueFlowSnapshot>)>,
+    exact_identity_snapshots: HashMap<
+        ClassSetProcedureIdentityRow,
+        ValidatedInputs<(ProcedureHandle, ValueFlowInput<ValueFlowSnapshot>)>,
+    >,
     // One artifact key can have several partial materializations. Procedure
     // IDs are meaningful only with the exact row set that assigned them.
     exact_identity_lineage_indexes: HashMap<
@@ -1003,7 +1223,8 @@ pub(crate) struct ClassSetAcquisitionCuts<'workspace, 'provider> {
         HashMap<StableDigest, Option<ProcedureId>>,
     >,
     runtime_zero_surfaces: Option<HashSet<StableDigest>>,
-    replayed_surfaces: HashMap<(DurableProcedureKey, StableDigest), Arc<ReplayedClassSetSurface>>,
+    replayed_surfaces:
+        HashMap<(DurableProcedureKey, StableDigest), ValidatedInputs<Arc<ReplayedClassSetSurface>>>,
 }
 
 impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
@@ -1026,7 +1247,6 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
             validation_work: 0,
             replay_aborted: false,
             disabled_cuts,
-            pre_dispatch_attempted: HashSet::default(),
             manifest: ClassSetCutManifest::default(),
             staged_expected_surfaces: None,
             hydrated_surfaces: Vec::new(),
@@ -1122,12 +1342,9 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
                 Ok(Some(candidates)) => candidates,
                 Ok(None) => return None,
                 Err(error) => {
-                    self.workspace
-                        .analyzer()
-                        .record_query_failure(store_error_context(
-                            error,
-                            "loading class-set procedure surface candidates",
-                        ));
+                    self.workspace.analyzer().record_query_failure(
+                        error.context("loading class-set procedure surface candidates"),
+                    );
                     return None;
                 }
             };
@@ -1149,12 +1366,9 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
                         Ok(Some(row)) => row,
                         Ok(None) => return None,
                         Err(error) => {
-                            self.workspace
-                                .analyzer()
-                                .record_query_failure(store_error_context(
-                                    error,
-                                    "loading a class-set procedure surface",
-                                ));
+                            self.workspace.analyzer().record_query_failure(
+                                error.context("loading a class-set procedure surface"),
+                            );
                             return None;
                         }
                     };
@@ -1191,6 +1405,9 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         request: &mut SemanticRequest<'_>,
     ) -> Option<(ProcedureHandle, ValueFlowInput<ValueFlowSnapshot>)> {
         let procedure = self.provider.canonical_procedure(procedure);
+        self.workspace
+            .analyzer()
+            .record_read(ReadKey::semantic_artifact(procedure.artifact().key()));
         let outcome =
             match self
                 .provider
@@ -1233,8 +1450,27 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
             return None;
         }
         if let Some(retained) = self.exact_identity_snapshots.get(identity) {
-            return Some(retained.clone());
+            return Some(retained.replay(self.workspace).clone());
         }
+        let (retained, reads) = capture_query_reads(self.workspace.analyzer(), || {
+            self.acquire_exact_identity_uncached(identity, request)
+        });
+        let retained = retained?;
+        self.exact_identity_snapshots.insert(
+            identity.clone(),
+            ValidatedInputs {
+                value: retained.clone(),
+                reads,
+            },
+        );
+        Some(retained)
+    }
+
+    fn acquire_exact_identity_uncached(
+        &mut self,
+        identity: &ClassSetProcedureIdentityRow,
+        request: &mut SemanticRequest<'_>,
+    ) -> Option<(ProcedureHandle, ValueFlowInput<ValueFlowSnapshot>)> {
         let analyzer = self.workspace.analyzer();
         let file = ProjectFile::new(
             analyzer.project().root().to_path_buf(),
@@ -1305,8 +1541,6 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         {
             return None;
         }
-        self.exact_identity_snapshots
-            .insert(identity.clone(), retained.clone());
         Some(retained)
     }
 
@@ -1631,8 +1865,41 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         let local_structure = class_set_local_structure_digest(snapshot).ok()?;
         let memo_key = (procedure.durable_key(), local_structure);
         if let Some(replayed) = self.replayed_surfaces.get(&memo_key) {
-            return Some(Arc::clone(replayed));
+            return Some(Arc::clone(replayed.replay(self.workspace)));
         }
+        let (selected, reads) = capture_query_reads(self.workspace.analyzer(), || {
+            self.replayed_surface_uncached(procedure, snapshot, local_structure, request)
+        });
+        let selected = selected?;
+        let previous = self.replayed_surfaces.insert(
+            memo_key,
+            ValidatedInputs {
+                value: selected.clone(),
+                reads,
+            },
+        );
+        assert!(
+            previous.is_none(),
+            "one surface validation populates one memo entry"
+        );
+        Some(selected)
+    }
+
+    fn replayed_surface_uncached(
+        &mut self,
+        procedure: &ProcedureHandle,
+        snapshot: &ValueFlowInput<ValueFlowSnapshot>,
+        local_structure: StableDigest,
+        request: &mut SemanticRequest<'_>,
+    ) -> Option<Arc<ReplayedClassSetSurface>> {
+        self.workspace
+            .analyzer()
+            .record_read(ReadKey::semantic_artifact(procedure.artifact().key()));
+        record_field_slot_compatibility(
+            self.workspace,
+            procedure.artifact().key().language().language(),
+            self.field_slots,
+        );
         if !self.spend_validation_work(request, 1) {
             return None;
         }
@@ -1673,10 +1940,10 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
             }
         }
         let selected = Arc::new(selected?);
-        let previous = self.replayed_surfaces.insert(memo_key, selected.clone());
-        assert!(
-            previous.is_none(),
-            "one local surface validation populates one acquisition memo entry"
+        replay_query_read_keys(
+            self.workspace.analyzer(),
+            selected.hydrated.dispatch_reads.iter().cloned(),
+            0,
         );
         Some(selected)
     }
@@ -1750,6 +2017,9 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         );
         let (root, descendants, expected_surfaces) =
             self.validated_surface_closure(procedure, snapshot, request)?;
+        // Validation acquires current descendant artifacts and records their
+        // inputs, certified dispatch reads, and field-slot compatibility.
+        // Surface and acquisition memo hits replay the same certificate.
         self.staged_expected_surfaces = Some(expected_surfaces);
         self.hydrated_surfaces = descendants;
         Some(root)
@@ -1823,12 +2093,9 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
             }
             Ok(None) => ZeroSummaryAvailability::Indeterminate,
             Err(error) => {
-                self.workspace
-                    .analyzer()
-                    .record_query_failure(store_error_context(
-                        error,
-                        "loading a class-set summary family for a surface",
-                    ));
+                self.workspace.analyzer().record_query_failure(
+                    error.context("loading a class-set summary family for a surface"),
+                );
                 ZeroSummaryAvailability::Indeterminate
             }
         }
@@ -1845,29 +2112,7 @@ impl ClosureCutDecider for ClassSetAcquisitionCuts<'_, '_> {
         if self.disabled_cuts.contains(&procedure.durable_key()) {
             return None;
         }
-        self.pre_dispatch_attempted.insert(procedure.durable_key());
         self.stage_validated_cut(procedure, snapshot, request)
-    }
-
-    fn should_cut(
-        &mut self,
-        procedure: &ProcedureHandle,
-        snapshot: &ValueFlowInput<ValueFlowSnapshot>,
-        _coverage: &HashMap<
-            (DurableProcedureKey, crate::analyzer::semantic::CallSiteId),
-            CallSiteCoverage,
-        >,
-        request: &mut SemanticRequest<'_>,
-    ) -> bool {
-        if self.disabled_cuts.contains(&procedure.durable_key())
-            || self
-                .pre_dispatch_attempted
-                .contains(&procedure.durable_key())
-        {
-            return false;
-        }
-        self.stage_validated_cut(procedure, snapshot, request)
-            .is_some()
     }
 
     fn take_hydrated_surfaces(&mut self) -> Vec<HydratedProcedureSurface> {
@@ -3112,12 +3357,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        self.workspace
-                            .analyzer()
-                            .record_query_failure(store_error_context(
-                                error,
-                                "probing an exact persisted root class-set summary",
-                            ));
+                        self.workspace.analyzer().record_query_failure(
+                            error.context("probing an exact persisted root class-set summary"),
+                        );
                     }
                 }
             }
@@ -3158,12 +3400,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             ) {
                 Ok(present) => present,
                 Err(error) => {
-                    self.workspace
-                        .analyzer()
-                        .record_query_failure(store_error_context(
-                            error,
-                            "probing persisted class-set summaries",
-                        ));
+                    self.workspace.analyzer().record_query_failure(
+                        error.context("probing persisted class-set summaries"),
+                    );
                     false
                 }
             }
@@ -3274,10 +3513,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             Err(error) => {
                 self.workspace
                     .analyzer()
-                    .record_query_failure(store_error_context(
-                        error,
-                        "loading demanded class-set root summary",
-                    ));
+                    .record_query_failure(error.context("loading demanded class-set root summary"));
                 return false;
             }
         };
@@ -3362,12 +3598,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     Ok(Some(row)) => row,
                     Ok(None) => return false,
                     Err(error) => {
-                        self.workspace
-                            .analyzer()
-                            .record_query_failure(store_error_context(
-                                error,
-                                "loading demanded class-set dependency",
-                            ));
+                        self.workspace.analyzer().record_query_failure(
+                            error.context("loading demanded class-set dependency"),
+                        );
                         return false;
                     }
                 };
@@ -3473,10 +3706,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                             }
                             Err(error) => {
                                 self.workspace.analyzer().record_query_failure(
-                                    store_error_context(
-                                        error,
-                                        "validating current demanded class-set summary",
-                                    ),
+                                    error.context("validating current demanded class-set summary"),
                                 );
                                 return false;
                             }
@@ -3484,12 +3714,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        self.workspace
-                            .analyzer()
-                            .record_query_failure(store_error_context(
-                                error,
-                                "loading current demanded class-set summary",
-                            ));
+                        self.workspace.analyzer().record_query_failure(
+                            error.context("loading current demanded class-set summary"),
+                        );
                         return false;
                     }
                 };
@@ -3586,12 +3813,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             ) {
                 Ok(rows) => rows,
                 Err(error) => {
-                    self.workspace
-                        .analyzer()
-                        .record_query_failure(store_error_context(
-                            error,
-                            "loading demanded reverse class-set dependencies",
-                        ));
+                    self.workspace.analyzer().record_query_failure(
+                        error.context("loading demanded reverse class-set dependencies"),
+                    );
                     return false;
                 }
             };
@@ -3645,12 +3869,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                 ) {
                     Ok(replaced) => self.retained_maintenance_writes |= replaced,
                     Err(error) => {
-                        self.workspace
-                            .analyzer()
-                            .record_query_failure(store_error_context(
-                                error,
-                                "rebinding equal-output class-set dependency",
-                            ));
+                        self.workspace.analyzer().record_query_failure(
+                            error.context("rebinding equal-output class-set dependency"),
+                        );
                         return false;
                     }
                 }
@@ -4093,16 +4314,21 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     Ok(Some(row)) => row,
                     Ok(None) => return Ok(None),
                     Err(error) => {
-                        self.workspace
-                            .analyzer()
-                            .record_query_failure(store_error_context(
-                                error,
-                                "loading persisted class-set summary",
-                            ));
+                        self.workspace.analyzer().record_query_failure(
+                            error.context("loading persisted class-set summary"),
+                        );
                         return Ok(None);
                     }
                 }
             };
+            self.workspace
+                .analyzer()
+                .record_read(ReadKey::semantic_artifact(frame.procedure.artifact().key()));
+            record_field_slot_compatibility(
+                self.workspace,
+                frame.procedure.artifact().key().language().language(),
+                frame.key.contract.field_slots,
+            );
             let reads = match self
                 .type_plan
                 .dispatch_read_contract(&frame.procedure.durable_key())
@@ -4113,6 +4339,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             if row.reads.iter().map(|read| &read.key).ne(reads.iter()) {
                 return Ok(None);
             }
+            replay_query_read_keys(self.workspace.analyzer(), reads.iter().cloned(), 0);
             let mut summary = match restore_persisted_summary(self.plan, &frame.key, &reads, row) {
                 Ok(Some(summary)) => summary,
                 Ok(None) => {
@@ -4120,12 +4347,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     return Ok(None);
                 }
                 Err(error) => {
-                    self.workspace
-                        .analyzer()
-                        .record_query_failure(store_error_context(
-                            error,
-                            "validating persisted class-set summary",
-                        ));
+                    self.workspace.analyzer().record_query_failure(
+                        error.context("validating persisted class-set summary"),
+                    );
                     return Ok(None);
                 }
             };
@@ -4175,12 +4399,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                         Ok(Some(row)) => row,
                         Ok(None) => return Ok(None),
                         Err(error) => {
-                            self.workspace
-                                .analyzer()
-                                .record_query_failure(store_error_context(
-                                    error,
-                                    "loading current class-set summary dependency",
-                                ));
+                            self.workspace.analyzer().record_query_failure(
+                                error.context("loading current class-set summary dependency"),
+                            );
                             return Ok(None);
                         }
                     };
@@ -4230,6 +4451,25 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         let Some(root) = validated.remove(&root_lookup) else {
             return Ok(None);
         };
+        // Preparation preceded restore. Its live plan inputs and this closure's
+        // validation reads together cover the relation. Retain the active
+        // capture's sound superset, shared by every restored row, so subsequent
+        // roots inherit these inputs. No attached capture stays fail closed.
+        let inputs = RuntimeSummaryInputs::capture(self.workspace);
+        let root_lookup = class_set_runtime_lookup_key(&root.key);
+        let publications = publications
+            .into_iter()
+            .map(|summary| {
+                let mut summary = summary.as_ref().clone();
+                summary.inputs = inputs.clone();
+                Arc::new(summary)
+            })
+            .collect::<Vec<_>>();
+        let root = publications
+            .iter()
+            .find(|summary| class_set_runtime_lookup_key(&summary.key) == root_lookup)
+            .expect("the validated root is published with its closure")
+            .clone();
         Ok(Some(ValidatedClassSetSummary {
             summary: root,
             publications: publications
@@ -4370,6 +4610,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     dependencies: Box::default(),
                     reads,
                     output_digest,
+                    inputs: RuntimeSummaryInputs::default(),
                 },
                 entry,
                 required_children: Vec::new(),
@@ -4544,7 +4785,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             if self
                 .used
                 .get(&runtime_key)
-                .is_some_and(|used| used.as_ref() != &row.summary)
+                .is_some_and(|used| !same_summary_derivation(used, &row.summary))
             {
                 row.valid = false;
                 self.profile
@@ -4563,14 +4804,15 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                 // while carrying different reached, exit, or dependency relations.
                 // Such a collision has no deterministic reusable answer, so retain
                 // the row only to invalidate publication for that key.
-                let deterministic = left.summary == right.summary;
+                let deterministic = same_summary_derivation(&left.summary, &right.summary);
                 left.valid &= right.valid && deterministic;
                 true
             } else {
                 false
             }
         });
-        projected.into_iter().fold(0usize, |published, row| {
+        let inputs = RuntimeSummaryInputs::capture(self.workspace);
+        projected.into_iter().fold(0usize, |published, mut row| {
             if !row.valid {
                 return published;
             }
@@ -4602,6 +4844,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     return published;
                 }
             }
+            row.summary.inputs = inputs.clone();
             let runtime_publication = self.state.class_set.publish_tracked(row.summary.clone());
             let persisted = if self
                 .state
@@ -4642,12 +4885,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                 // difference.
                 Ok(_) => self.retained_publication_writes = true,
                 Err(error) => {
-                    self.workspace
-                        .analyzer()
-                        .record_query_failure(store_error_context(
-                            error,
-                            "publishing persisted class-set procedure surface",
-                        ));
+                    self.workspace.analyzer().record_query_failure(
+                        error.context("publishing persisted class-set procedure surface"),
+                    );
                 }
             }
         }
@@ -4707,10 +4947,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             Err(error) => {
                 self.workspace
                     .analyzer()
-                    .record_query_failure(store_error_context(
-                        error,
-                        "publishing persisted class-set summary",
-                    ));
+                    .record_query_failure(error.context("publishing persisted class-set summary"));
                 ClassSetSummaryPersistence::Unavailable
             }
         }
@@ -5432,6 +5669,7 @@ fn restore_persisted_summary(
         ));
     }
     Ok(Some(ClassSetProcedureSummary {
+        inputs: RuntimeSummaryInputs::default(),
         key: expected.clone(),
         exits: exits.into_boxed_slice(),
         reached: reached.into_boxed_slice(),
@@ -5547,10 +5785,6 @@ fn qualities_from_mask(mask: u8) -> Result<Box<[PathQuality]>, StoreError> {
         .into_iter()
         .filter(|quality| mask & (1_u8 << quality.ordinal()) != 0)
         .collect())
-}
-
-fn store_error_context(error: StoreError, context: &str) -> StoreError {
-    StoreError::new(format!("{context}: {error}"))
 }
 
 fn value_flow_fact_for_stable_entry(
@@ -5916,6 +6150,7 @@ impl PreparedClassSetSummaries<'_> {
         let Some(reusable) = reusable else {
             return Ok(None);
         };
+        used_summary.inputs.replay(self.workspace);
         if root_probe {
             let pending = self
                 .pending_root_summary
@@ -5979,9 +6214,9 @@ impl PreparedClassSetSummaries<'_> {
         used_summary: Arc<ClassSetProcedureSummary>,
     ) {
         if let Some(existing) = self.used.get(&runtime_key) {
-            assert_eq!(
-                existing, &used_summary,
-                "one query-local class-set lookup consumes one exact answer"
+            assert!(
+                same_summary_derivation(existing, &used_summary),
+                "one query-local class-set lookup consumes one exact answer: existing={existing:?}, used={used_summary:?}"
             );
         } else {
             self.used.insert(runtime_key, used_summary);
@@ -6344,6 +6579,74 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#2445: shared runtime-summary input receipts were omitted from cache accounting")]
+    fn runtime_summary_receipts_count_shared_allocations_and_bound_replacements() {
+        let (_project, workspace, fields, procedures) = runtime_fixture(
+            "class Present:\n    def member(self):\n        pass\n\ndef leaf(value):\n    return value\n\ndef root():\n    return leaf(Present()).member\n",
+        );
+        let state = TypeFlowSummaryState::new(&workspace);
+        let result = solve_runtime_root(
+            &workspace,
+            &fields,
+            &procedures["root"],
+            state.clone(),
+            ValueFlowCache::default(),
+        );
+        assert!(result.published_summaries > 0);
+        let rows = state.class_set.runtime_snapshot();
+        let mut first = rows
+            .first()
+            .expect("a real runtime summary")
+            .as_ref()
+            .clone();
+        first.inputs.keys = Arc::from([ReadKey::path_absent(
+            Language::Python,
+            "a/long/receipt/input.py",
+        )]);
+        let expected = 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<ReadKey>()
+            + "a/long/receipt/input.py".len();
+        assert_eq!(first.inputs.retained_key_bytes(), expected);
+        let mut second = first.clone();
+        second.key.root_surface = StableDigest::sha256(b"second receipt-sharing row");
+        let first_key = class_set_runtime_lookup_key(&first.key);
+        let second_key = class_set_runtime_lookup_key(&second.key);
+        let mut store = RuntimeSummaryStore::default();
+        assert!(!store.insert(first_key, Arc::new(first.clone()), expected - 1));
+        assert!(store.is_empty());
+        assert_eq!(store.receipt_bytes, 0);
+        assert!(store.insert(first_key, Arc::new(first.clone()), expected));
+        assert!(store.insert(second_key, Arc::new(second.clone()), expected));
+        assert_eq!(
+            store.receipt_bytes, expected,
+            "two rows share one receipt allocation"
+        );
+        assert_eq!(store.receipt_owners.len(), 1);
+        second.inputs.keys = Arc::from([ReadKey::path_absent(Language::Python, "other.py")]);
+        let second_bytes = second.inputs.retained_key_bytes();
+        assert!(!store.insert(second_key, Arc::new(second.clone()), expected));
+        assert_eq!(store.receipt_bytes, expected);
+        assert!(store.insert(
+            second_key,
+            Arc::new(second.clone()),
+            expected + second_bytes
+        ));
+        assert_eq!(store.receipt_bytes, expected + second_bytes);
+        first.inputs = second.inputs.clone();
+        assert!(store.insert(first_key, Arc::new(first), expected + second_bytes));
+        assert_eq!(
+            store.receipt_bytes, second_bytes,
+            "last owner releases the old receipt"
+        );
+        assert_eq!(store.receipt_owners.len(), 1);
+        store.retain(|key, _| *key != first_key);
+        assert_eq!(store.receipt_bytes, second_bytes);
+        store.retain(|_, _| false);
+        assert_eq!(store.receipt_bytes, 0);
+        assert!(store.receipt_owners.is_empty());
+    }
+
+    #[test]
     #[hardwon(
         "70822778aaef: computed values must not inherit operand class identity through transfer projection"
     )]
@@ -6351,7 +6654,7 @@ mod tests {
         let (_project, workspace, field_slots, procedures) = runtime_fixture(
             "class Result:\n    def present(self):\n        pass\n\nclass Operand:\n    def __truediv__(self, other):\n        return Result()\n\ndef root():\n    value = Operand() / Operand()\n    value.present()\n",
         );
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -6673,7 +6976,7 @@ mod tests {
             &adapter,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
 
@@ -6698,7 +7001,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
 
@@ -6742,7 +7045,7 @@ mod tests {
             &measurement_workspace,
             &measurement_field_slots,
             &measurement_procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&measurement_workspace),
             ValueFlowCache::default(),
             FeedbackLimits::new(1),
             &mut one_pass_semantic_budget,
@@ -6771,7 +7074,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
             FeedbackLimits::default(),
             &mut feedback_semantic_budget,
@@ -7335,7 +7638,7 @@ mod tests {
         ));
         let (plan, provider) = runtime_plan(&workspace, &slots, &procedures["root"]);
         let mut prepared = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &plan,
             &slots,
@@ -7566,7 +7869,7 @@ mod tests {
             "def wrapper(value):\n    guarded(value)\n",
             "def root():\n    wrapper(A())\n    wrapper(None)\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -7607,7 +7910,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert!(
@@ -7626,7 +7929,7 @@ mod tests {
             "class Present:\n    def member(self):\n        pass\n",
             "def root():\n    value = Present()\n    return value.member\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -7655,7 +7958,7 @@ mod tests {
             "class Present:\n    def member(self):\n        pass\n",
             "def root():\n    value = Present()\n    return value.member\n",
         ));
-        let cold_state = TypeFlowSummaryState::default();
+        let cold_state = TypeFlowSummaryState::new(&workspace);
         let cold = solve_runtime_root(
             &workspace,
             &field_slots,
@@ -7682,7 +7985,7 @@ mod tests {
             .expect("the persisted root lookup succeeds")
             .expect("the persisted root relation exists");
 
-        let restored_state = TypeFlowSummaryState::default();
+        let restored_state = TypeFlowSummaryState::new(&workspace);
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
         let mut prepared = PreparedClassSetSummaries::new(
             restored_state.clone(),
@@ -7723,7 +8026,7 @@ mod tests {
             .expect("the persisted root relation remains present");
         assert_eq!(persisted_after, persisted_before);
 
-        let staged_state = TypeFlowSummaryState::default();
+        let staged_state = TypeFlowSummaryState::new(&workspace);
         let mut prepared = PreparedClassSetSummaries::new(
             staged_state.clone(),
             &workspace,
@@ -7769,15 +8072,15 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert!(cold.published_summaries > 0, "{cold:#?}");
 
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
         let mut recursive_callee = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &plan,
             &field_slots,
@@ -7869,7 +8172,7 @@ mod tests {
             "    else:\n        value = A()\n",
             "    return value.member\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -7906,7 +8209,7 @@ mod tests {
             .build();
         let (_project, workspace, field_slots, procedures) =
             runtime_fixture_from_project_with_adapter(project, &adapter);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root_with_adapter(
             &workspace,
@@ -7965,7 +8268,7 @@ mod tests {
             "        return value.missing\n",
             "    return 1\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -8025,7 +8328,7 @@ mod tests {
             "    return value\n",
             "def root():\n    return guarded(A())\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cold = solve_runtime_root(
             &workspace,
             &field_slots,
@@ -8064,7 +8367,7 @@ mod tests {
         fn guarded_lookup(source: &str) -> (StableDigest, StableDigest) {
             let (_project, workspace, field_slots, procedures) = runtime_fixture(source);
             let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
-            let state = TypeFlowSummaryState::default();
+            let state = TypeFlowSummaryState::new(&workspace);
             let mut prepared =
                 PreparedClassSetSummaries::new(state, &workspace, &plan, &field_slots, behavior);
             let guarded = &procedures["guarded"];
@@ -8151,7 +8454,7 @@ mod tests {
             "def first_root():\n    return guarded(A())\n",
             "def second_root():\n    unrelated = A()\n    return guarded(A())\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -8193,7 +8496,7 @@ mod tests {
             "def second_root():\n",
             "    return wrapper(Present())\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -8292,7 +8595,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["second_root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert!(reused.reusable_summary_hits > 0, "{reused:#?}");
@@ -8341,7 +8644,7 @@ mod tests {
         let changed_source = format!("{source}def unresolved_call():\n    return 2\n");
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -8423,7 +8726,7 @@ mod tests {
             "def second_root():\n",
             "    return wrapper(2)\n",
         ));
-        let cold_state = TypeFlowSummaryState::default();
+        let cold_state = TypeFlowSummaryState::new(&workspace);
         let cold = solve_runtime_root(
             &workspace,
             &field_slots,
@@ -8470,7 +8773,7 @@ mod tests {
             )
             .expect("stale dependency provenance replaces atomically");
 
-        let restored_state = TypeFlowSummaryState::default();
+        let restored_state = TypeFlowSummaryState::new(&workspace);
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["second_root"]);
         let mut prepared = PreparedClassSetSummaries::new(
             restored_state,
@@ -8523,7 +8826,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["second_root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert!(warm.reusable_summary_hits > 0, "{warm:#?}");
@@ -8557,7 +8860,7 @@ mod tests {
             )
             .expect("the changed child replaces atomically");
 
-        let rejected_state = TypeFlowSummaryState::default();
+        let rejected_state = TypeFlowSummaryState::new(&workspace);
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["second_root"]);
         let mut prepared = PreparedClassSetSummaries::new(
             rejected_state,
@@ -8602,7 +8905,7 @@ mod tests {
             "def root():\n",
             "    return wrapper(1)\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         solve_runtime_root(
             &workspace,
             &field_slots,
@@ -8715,12 +9018,12 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
         let mut limited = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &plan,
             &field_slots,
@@ -8755,7 +9058,7 @@ mod tests {
         assert_eq!(exhaustion.attempted(), 2);
 
         let mut prepared = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &plan,
             &field_slots,
@@ -8789,7 +9092,7 @@ mod tests {
             "def root():\n",
             "    return leaf(1)\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         solve_runtime_root(
             &workspace,
             &field_slots,
@@ -8846,7 +9149,7 @@ mod tests {
             "def root():\n",
             "    return wrapper(1)\n",
         ));
-        let source_state = TypeFlowSummaryState::default();
+        let source_state = TypeFlowSummaryState::new(&workspace);
         solve_runtime_root(
             &workspace,
             &field_slots,
@@ -8867,7 +9170,7 @@ mod tests {
         stale.reads = Box::default();
         stale.key.dispatch_reads = read_set_digest(&stale.reads).digest();
 
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         assert!(state.class_set.publish(stale.clone()));
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
         let mut prepared =
@@ -8898,7 +9201,7 @@ mod tests {
         );
         let (_source_project, source_workspace, source_fields, source_procedures) =
             runtime_fixture(source);
-        let source_state = TypeFlowSummaryState::default();
+        let source_state = TypeFlowSummaryState::new(&source_workspace);
         solve_runtime_root(
             &source_workspace,
             &source_fields,
@@ -8946,7 +9249,7 @@ mod tests {
             "the provider read-behavior rotation must separate persisted lookup"
         );
 
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&source_workspace);
         assert!(state.class_set.publish(legacy));
         assert!(
             state.class_set.publish(current.clone()),
@@ -8973,7 +9276,7 @@ mod tests {
             "def root():\n",
             "    return wrapper()\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         solve_runtime_root(
             &workspace,
             &field_slots,
@@ -9085,14 +9388,14 @@ mod tests {
             &second_procedures["root"],
         );
         let first = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&first_workspace),
             &first_workspace,
             &first_plan,
             &first_fields,
             first_behavior,
         );
         let second = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&second_workspace),
             &second_workspace,
             &second_plan,
             &second_fields,
@@ -9143,14 +9446,14 @@ mod tests {
             &second_procedures["root"],
         );
         let first = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&first_workspace),
             &first_workspace,
             &first_plan,
             &first_fields,
             first_behavior,
         );
         let second = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&second_workspace),
             &second_workspace,
             &second_plan,
             &second_fields,
@@ -9238,14 +9541,14 @@ mod tests {
         let (second_plan, second_behavior) =
             runtime_plan(&workspace, &field_slots, &procedures["second_root"]);
         let first_prepared = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &first_plan,
             &field_slots,
             first_behavior,
         );
         let second_prepared = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &second_plan,
             &field_slots,
@@ -9288,7 +9591,7 @@ mod tests {
             "the exact procedure/read lookup remains stable"
         );
 
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -9319,7 +9622,7 @@ mod tests {
             "def wrapper(value):\n    return leaf(value)\n",
             "def root():\n    return wrapper(Present())\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -9367,7 +9670,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert!(cold.published_summaries > 0, "{cold:#?}");
@@ -9389,7 +9692,7 @@ mod tests {
             "the cold state must publish through SQLite"
         );
 
-        let fresh_state = TypeFlowSummaryState::default();
+        let fresh_state = TypeFlowSummaryState::new(&workspace);
         let (cut_plan, _) = runtime_cut_plan(
             &workspace,
             &field_slots,
@@ -9434,7 +9737,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert!(cold.published_summaries > 0, "{cold:#?}");
@@ -9459,7 +9762,7 @@ mod tests {
                 &workspace,
                 &field_slots,
                 &procedures[name],
-                TypeFlowSummaryState::default(),
+                TypeFlowSummaryState::new(&workspace),
                 ValueFlowCache::default(),
             );
             assert!(
@@ -9468,7 +9771,7 @@ mod tests {
             );
         }
 
-        let fresh_state = TypeFlowSummaryState::default();
+        let fresh_state = TypeFlowSummaryState::new(&workspace);
         let cut_cache = ValueFlowCache::default();
         let (cut_plan, _) = runtime_cut_plan_with_cache(
             &workspace,
@@ -9528,7 +9831,7 @@ mod tests {
         };
         let (_first_project, first_workspace, first_fields, first_procedures) =
             fixture("def unrelated():\n    return 1\n");
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -9635,7 +9938,7 @@ mod tests {
             &second_workspace,
             &second_fields,
             &second_procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&second_workspace),
             ValueFlowCache::default(),
         );
         assert_eq!(warm.class_sets, fresh.class_sets);
@@ -9653,7 +9956,7 @@ mod tests {
         );
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -9766,10 +10069,10 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
-        let fresh_state = TypeFlowSummaryState::default();
+        let fresh_state = TypeFlowSummaryState::new(&workspace);
         let (cut_plan, _) = runtime_cut_plan(
             &workspace,
             &field_slots,
@@ -9806,7 +10109,7 @@ mod tests {
         );
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -9880,7 +10183,7 @@ mod tests {
         );
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -10010,7 +10313,7 @@ mod tests {
             ValueFlowCache::default(),
         );
         let mut cuts = ClassSetAcquisitionCuts::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &discovery,
             provider.behavior_identity(),
@@ -10072,7 +10375,7 @@ mod tests {
             "    return leaf(value)\n",
             "def root():\n    value = wrapper(Present())\n    return value.member\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -10117,7 +10420,7 @@ mod tests {
             runtime_fixture(source);
         let (_second_project, second_workspace, second_fields, second_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &first_workspace,
@@ -10278,7 +10581,7 @@ mod tests {
         );
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -10371,7 +10674,7 @@ mod tests {
         );
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -10439,7 +10742,7 @@ mod tests {
         );
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let populated = TypeFlowSummaryState::default();
+        let populated = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -10559,7 +10862,7 @@ mod tests {
             "def wrapper(value):\n    return leaf(value)\n",
             "def root():\n    value = wrapper(Missing())\n    return value.absent\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root(
             &workspace,
@@ -10592,7 +10895,7 @@ mod tests {
             "def wrapper(value):\n    return leaf(value)\n",
             "def root():\n    return wrapper(1)\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         solve_runtime_root(
             &workspace,
             &field_slots,
@@ -10606,7 +10909,9 @@ mod tests {
                 .runtime
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Deliberately corrupt only the contract, preserving its receipt owner.
             let (_, row) = runtime
+                .values
                 .iter_mut()
                 .find(|(_, row)| {
                     summary_name(row) == "wrapper"
@@ -10682,7 +10987,7 @@ mod tests {
             "the added structured field access is a new fallback-reachable location"
         );
 
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -10704,7 +11009,7 @@ mod tests {
             .cloned()
             .expect("the first solve publishes a wrapper carrier relation");
         let first_prepared = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&first_workspace),
             &first_workspace,
             &first_plan,
             &first_fields,
@@ -10852,7 +11157,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
             FeedbackLimits::new(1),
             &mut SemanticBudget::default(),
@@ -10882,7 +11187,7 @@ mod tests {
             &workspace,
             &incomplete_field_slots,
             &procedures["root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert_eq!(
@@ -10901,7 +11206,7 @@ mod tests {
             "    return value\n",
             "def root():\n    return guarded(A())\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cold = solve_runtime_root(
             &workspace,
             &field_slots,
@@ -10924,7 +11229,7 @@ mod tests {
             .expect("the source-sensitive guarded entry is persisted");
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
         let mut prepared = PreparedClassSetSummaries::new(
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             &workspace,
             &plan,
             &field_slots,
@@ -11107,7 +11412,7 @@ mod tests {
             "    value = wrapper()\n",
             "    return value.__class__\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let first = solve_runtime_root(
             &workspace,
@@ -11146,7 +11451,7 @@ mod tests {
             &workspace,
             &field_slots,
             &procedures["second_root"],
-            TypeFlowSummaryState::default(),
+            TypeFlowSummaryState::new(&workspace),
             ValueFlowCache::default(),
         );
         assert!(reused.reusable_summary_hits > 0, "{reused:#?}");
@@ -11180,7 +11485,7 @@ mod tests {
             "def root():\n",
             "    return wrapper(1)\n",
         ));
-        let source_state = TypeFlowSummaryState::default();
+        let source_state = TypeFlowSummaryState::new(&workspace);
         solve_runtime_root(
             &workspace,
             &field_slots,
@@ -11221,7 +11526,7 @@ mod tests {
                 .expect("the demanded wrapper carrier remains in the live plan"),
             ValueFlowUncertainty::from_semantic_uncertainty(*uncertain),
         );
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let mut prepared =
             PreparedClassSetSummaries::new(state, &workspace, &plan, &field_slots, behavior);
         let wrapper_source_sensitive = prepared.procedures[&procedures["wrapper"]].source_sensitive;
@@ -11287,7 +11592,7 @@ mod tests {
         );
         let (_first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&first_workspace);
         let cold = solve_runtime_root(
             &first_workspace,
             &first_fields,
@@ -11346,7 +11651,7 @@ mod tests {
             "    value = Present()\n",
             "    return consume(value.member)\n",
         ));
-        let state = TypeFlowSummaryState::default();
+        let state = TypeFlowSummaryState::new(&workspace);
         let cold = solve_runtime_root(
             &workspace,
             &field_slots,

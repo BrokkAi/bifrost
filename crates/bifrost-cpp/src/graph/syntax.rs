@@ -834,7 +834,7 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: line splicing split macro field tokens"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: line splicing split macro field tokens"
     )]
     fn macro_splices_join_tokens() {
         for newline in ["\n", "\r\n"] {
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: recovered aggregate lost repeated declarators"
+        "e3c20990a105: quicksilver round 4 on brokk-bifrost-cpp: recovered aggregate lost repeated declarators"
     )]
     fn quicksilver_recovered_aggregate_multi_declarators() {
         let source = "int left, right;";

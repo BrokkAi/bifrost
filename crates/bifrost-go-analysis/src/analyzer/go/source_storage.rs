@@ -1,6 +1,8 @@
 //! One generation-checked snapshot of Go syntax and its mounted projections.
 
+use super::cache::GoSourceMemo;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
+use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
 
@@ -360,10 +362,7 @@ pub trait CanonicalGoSourceFacts {
     fn canonical_go_source_facts(
         &self,
         file: &ProjectFile,
-        cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
-            Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>,
-        >,
+        cache: &GoSourceMemo,
     ) -> Option<Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>>;
 }
 
@@ -371,14 +370,17 @@ impl<A: LanguageAdapter> CanonicalGoSourceFacts for TreeSitterAnalyzer<A> {
     fn canonical_go_source_facts(
         &self,
         file: &ProjectFile,
-        cache: &moka::sync::Cache<
-            (GenerationId, Oid, ProjectFile),
-            Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>,
-        >,
+        cache: &GoSourceMemo,
     ) -> Option<Arc<brokk_bifrost_go::source_facts::GoFileSourceFacts>> {
         let generation = self.language_generation("go")?;
         let oid = self.resolve_live_oid_for_file(file)?;
-        self.record_read_key(self.file_read_key(file, oid));
+        let file_key = self.file_read_key(file, oid);
+        self.record_read_key(file_key.clone());
+        debug_assert!(
+            brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers(
+                self, &file_key,
+            )
+        );
         let key = Self::transient_cache_key(oid, file);
         if let Some(state) = self.retained_file_state(file, &key)
             && let Some(source) = state.source_facts.as_ref()
@@ -394,22 +396,36 @@ impl<A: LanguageAdapter> CanonicalGoSourceFacts for TreeSitterAnalyzer<A> {
             ));
         }
         let cache_key = (generation, oid, file.clone());
-        if let Some(facts) = cache.get(&cache_key) {
-            return Some(facts);
-        }
-        let facts = self.store_query_or_record(
-            |sink| sink.push(self.file_read_key(file, oid)),
-            self.store_context.store.go_source_facts(
-                oid,
-                generation,
-                self.adapter.as_ref(),
-                file,
-                &|| true,
-            ),
-            format!("reading canonical Go declaration facts for {file:?} ({oid})"),
-        )??;
-        let facts = Arc::new(facts);
-        cache.insert(cache_key, Arc::clone(&facts));
-        Some(facts)
+        let value =
+            cache
+                .read(&memo_attribution(self), |cache, capture| {
+                    if let Some(facts) = cache.get(&cache_key) {
+                        return Ok(facts);
+                    }
+                    let entry =
+                        Arc::new(capture.try_build_weighted(|| {
+                            // Capture the original module receipt even when the caller
+                            // has no capture. A later probe can describe a different
+                            // module namespace than the one mounted into this value.
+                            self.record_read_key(self.file_read_key(file, oid));
+                            let facts = self.store_query_or_record(
+                        |sink| sink.push(self.file_read_key(file, oid)),
+                        self.store_context.store.go_source_facts(
+                            oid,
+                            generation,
+                            self.adapter.as_ref(),
+                            file,
+                            &|| true,
+                        ),
+                        format!("reading canonical Go declaration facts for {file:?} ({oid})"),
+                    ).flatten().ok_or(())?;
+                            let bytes = facts.estimated_retained_bytes();
+                            Ok::<_, ()>((Arc::new(facts), bytes))
+                        })?);
+                    cache.insert(cache_key, Arc::clone(&entry));
+                    Ok::<_, ()>(entry)
+                })
+                .ok()?;
+        Some(Arc::clone(&value))
     }
 }

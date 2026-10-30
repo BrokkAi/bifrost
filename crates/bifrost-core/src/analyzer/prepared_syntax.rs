@@ -90,6 +90,8 @@ pub enum PreparedSourceOrigin {
 pub struct PreparedSyntaxTree {
     source: PreparedSyntaxSource,
     source_sha256: OnceLock<[u8; 32]>,
+    #[cfg(debug_assertions)]
+    source_key: (usize, usize),
     tree: Tree,
     line_starts: Vec<usize>,
     dialect: LanguageDialect,
@@ -109,9 +111,16 @@ impl PreparedSyntaxTree {
         origin: PreparedSourceOrigin,
         overlay_revision: Option<OverlayRevision>,
     ) -> Self {
+        #[cfg(debug_assertions)]
+        let source_key = {
+            let bytes = source.source();
+            (bytes.as_ptr() as usize, bytes.len())
+        };
         Self {
             source,
             source_sha256: OnceLock::new(),
+            #[cfg(debug_assertions)]
+            source_key,
             tree,
             line_starts,
             dialect,
@@ -127,6 +136,16 @@ impl PreparedSyntaxTree {
     /// SHA-256 of the exact immutable source bytes, computed once per prepared
     /// snapshot. Revalidating several nodes must not rehash the whole file.
     pub fn source_sha256(&self) -> [u8; 32] {
+        #[cfg(debug_assertions)]
+        {
+            let source = self.source();
+            let key = (source.as_ptr() as usize, source.len());
+            // Bind hits to the exact immutable backing without rehashing a file.
+            debug_assert_eq!(
+                key, self.source_key,
+                "prepared source backing must stay immutable"
+            );
+        }
         *self
             .source_sha256
             .get_or_init(|| crate::analyzer::canonical_hash::sha256_bytes(self.source().as_bytes()))

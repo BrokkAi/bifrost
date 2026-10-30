@@ -42,6 +42,79 @@ pub struct ProjectedNativeExternalMember {
     pub is_static: bool,
 }
 
+/// Stable coordinates and shape facts projected from one reached native
+/// candidate. Request-minted SemanticIds never leave the selected operation
+/// through call-target caches, even though its fact answer uses them locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ProjectedNativeModelMember {
+    pub member: crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+    pub declaration: crate::analyzer::semantic_model::overlay::SemanticModelSymbol,
+    pub owner: crate::analyzer::resolution::ExternalOwnerIdentity,
+    pub owner_path: Box<[Option<crate::analyzer::resolution::ExternalOwnerIdentity>]>,
+    pub receiver_owner: Option<crate::analyzer::resolution::ExternalOwnerIdentity>,
+    pub receiver_pointer_depth: u32,
+    pub receiver_addressable: Option<bool>,
+    pub receiver_runtime: bool,
+    pub receiver_proven: bool,
+    pub selected: bool,
+    pub selection_complete: bool,
+    pub interface: bool,
+    pub route_exact: bool,
+    pub receiver_route_proven: bool,
+    pub complete: bool,
+    pub incomplete_reasons: Vec<String>,
+    pub rejected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ProjectedNativeModelMemberSelection {
+    pub native_target_count: usize,
+    pub candidates: Vec<ProjectedNativeModelMember>,
+    pub complete: bool,
+}
+
+#[doc(hidden)]
+pub fn project_native_model_member_selection(
+    selection: &crate::analyzer::resolution::FactModelMemberSelection,
+    cancellation: &CancellationToken,
+) -> Option<Box<ProjectedNativeModelMemberSelection>> {
+    let mut candidates = Vec::with_capacity(selection.candidates.len());
+    for candidate in &selection.candidates {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        candidates.push(ProjectedNativeModelMember {
+            member: candidate.member.clone(),
+            declaration: candidate.declaration.clone(),
+            owner: candidate.owner.clone(),
+            owner_path: candidate.owner_coordinates.clone(),
+            receiver_owner: candidate.receiver_owner.clone(),
+            receiver_pointer_depth: candidate.receiver.ty().indirection(),
+            receiver_addressable: candidate.receiver.addressable(),
+            receiver_runtime: matches!(
+                candidate.receiver,
+                crate::analyzer::resolution::ResolutionSlotValue::Runtime { .. }
+            ),
+            receiver_proven: candidate.receiver_proven,
+            selected: candidate.selected,
+            selection_complete: candidate.selection_complete,
+            interface: candidate.interface,
+            route_exact: candidate.route_exact,
+            receiver_route_proven: candidate.receiver_route_proven,
+            complete: candidate.completion == ResolutionCompletion::Complete,
+            incomplete_reasons: candidate.incomplete_reasons.clone(),
+            rejected: candidate.rejected,
+        });
+    }
+    Some(Box::new(ProjectedNativeModelMemberSelection {
+        native_target_count: selection.native_target_count,
+        candidates,
+        complete: selection.completion == ResolutionCompletion::Complete,
+    }))
+}
+
 #[doc(hidden)]
 pub struct SelectedNativeReferenceUnits {
     #[doc(hidden)]
@@ -50,6 +123,7 @@ pub struct SelectedNativeReferenceUnits {
     pub definitions: SelectedNativeDefinitions,
     #[doc(hidden)]
     pub external_members: Vec<ProjectedNativeExternalMember>,
+    pub model_member_selection: Option<Box<ProjectedNativeModelMemberSelection>>,
     #[doc(hidden)]
     pub direct_target: Option<NativeExternalMemberTarget>,
     #[doc(hidden)]
@@ -255,7 +329,52 @@ fn assignment_value_answer(
 pub type SelectedLocalDeclarationOutcome =
     SelectedResolutionOperationOutcome<Option<(SemanticId, LexicalDefinition)>>;
 
+/// The canonical path of one selected unindexed Go import, if unique.
+#[doc(hidden)]
+pub type SelectedGoUnindexedImportOutcome = SelectedResolutionOperationOutcome<
+    super::SelectedResolutionLocated<Option<std::sync::Arc<str>>>,
+>;
+
 impl SelectedResolutionOperation<'_, '_> {
+    /// Project a unique unindexed Go import selected at this package reference.
+    /// The binder, rather than source spelling, owns aliases and shadowing.
+    #[doc(hidden)]
+    pub fn resolve_go_unindexed_import_bounded(
+        &mut self,
+        prepared: super::GoPreparedImportContext,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedResolution<SelectedGoUnindexedImportOutcome>> {
+        let session = ResolutionSession::bounded(budget, Some(cancellation));
+        let projected = self.resolve_reference_with_projection(
+            super::NativeReferenceQuery {
+                context: prepared.context,
+                locator,
+                cancellation,
+                context_metrics: &mut SelectedResolutionContextMetrics,
+                session: &session,
+                artifacts: None,
+                go_demand: Some(prepared.demand),
+                selected_import_gap: None,
+                go_receiver_overlay: None,
+                query_result_slot: None,
+                point_metrics: None,
+            },
+            |ready, _, _, answer| {
+                Ok(match answer.binding().targets() {
+                    [binder] => ready
+                        .context_identities
+                        .unindexed_go_import(*binder)
+                        .filter(|frontier| frontier.member.is_none())
+                        .map(|frontier| frontier.provider_path),
+                    _ => None,
+                })
+            },
+        )?;
+        Ok(session.finish(projected))
+    }
+
     /// Select only a certified, unique local declaration through lexical facts.
     /// This does not dispatch members, imports, or callable definitions.
     #[doc(hidden)]
@@ -1104,9 +1223,12 @@ impl SelectedResolutionOperation<'_, '_> {
                         });
                     }
                 }
+                let model_targets = answer.model_member_selection().into_iter().flat_map(|selection| selection.candidates.iter().map(|member| member.target)).collect::<BTreeSet<_>>();
+                let model_member_selection = answer.model_member_selection().and_then(|selection| project_native_model_member_selection(selection, cancellation));
+                let source_targets = answer.binding().targets().iter().copied().filter(|target| !model_targets.contains(target)).collect::<Vec<_>>();
                 let mut definitions = project_native_definition_units(
                     ready,
-                    answer.binding().targets(),
+                    &source_targets,
                     cancellation,
                     session,
                 )?;
@@ -1139,6 +1261,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     .iter()
                     .copied()
                     .filter(|target| !selected_targets.contains(target))
+                    .filter(|target| !model_targets.contains(target))
                     .collect::<Vec<_>>();
                 let callable_applicability_candidates = match project_native_definition_units(
                     ready,
@@ -1208,6 +1331,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     answer,
                     definitions,
                     external_members,
+                    model_member_selection,
                     direct_target,
                     named_argument,
                     predeclared_go_symbol,
@@ -2343,6 +2467,16 @@ fn project_native_member_contexts(
             std::iter::once(rejection.owner().target())
                 .chain(rejection.owner().owner_path().iter().copied())
         }))
+        .filter(|identity| {
+            ready.context_identities.external_owner_language(*identity)
+                != Some(crate::analyzer::resolution::ExternalOwnerLanguage::Go)
+                && !answer.model_member_selection().is_some_and(|selection| {
+                    selection
+                        .candidates
+                        .iter()
+                        .any(|member| member.target == *identity)
+                })
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();

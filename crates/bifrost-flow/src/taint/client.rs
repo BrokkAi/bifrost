@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, error::Error, fmt, sync::Arc};
 
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits,
@@ -532,16 +532,58 @@ impl TaintObservationHook for NoTaintObservations {
     type Evidence = ();
 }
 
+#[derive(Debug)]
+struct ProcedureValueLiveness {
+    live: crate::analyzer::semantic::cfg_algorithms::LiveValueSets,
+    retained: Vec<bool>,
+}
+
+impl ProcedureValueLiveness {
+    fn retains(liveness: Option<&Self>, point: usize, value: usize) -> bool {
+        liveness
+            .is_none_or(|liveness| liveness.retained[value] || liveness.live.live_in(point, value))
+    }
+}
+
+struct LiveTaintOutput<'a, Hook> {
+    problem: &'a TaintFlowProblem<'a, Hook>,
+    target: &'a crate::analyzer::semantic::ProgramPointHandle,
+    output: &'a mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
+}
+
+impl<Hook: TaintObservationHook> DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>
+    for LiveTaintOutput<'_, Hook>
+{
+    fn should_continue(&self) -> bool {
+        self.output.should_continue()
+    }
+
+    fn emit(&mut self, transition: IdeTransition<TaintFact, TaintEdgeFunction>) -> bool {
+        if self
+            .problem
+            .keeps_live_fact(self.target, *transition.fact())
+        {
+            self.output.emit(transition)
+        } else {
+            self.output.should_continue()
+        }
+    }
+}
+
 pub struct TaintFlowProblem<'plan, Hook = NoTaintObservations> {
     plan: &'plan TaintAnalysisPlan,
     observations: Hook,
+    cancellation: brokk_bifrost_core::cancellation::CancellationToken,
+    liveness: RefCell<HashMap<ProcedureHandle, Option<ProcedureValueLiveness>>>,
 }
 
 impl<'plan> TaintFlowProblem<'plan> {
-    pub const fn new(plan: &'plan TaintAnalysisPlan) -> Self {
+    pub fn new(plan: &'plan TaintAnalysisPlan) -> Self {
         Self {
             plan,
             observations: NoTaintObservations,
+            cancellation: Default::default(),
+            liveness: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -549,7 +591,182 @@ impl<'plan> TaintFlowProblem<'plan> {
 #[allow(private_bounds)]
 impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
     pub(crate) fn with_observations(plan: &'plan TaintAnalysisPlan, observations: Hook) -> Self {
-        Self { plan, observations }
+        Self {
+            plan,
+            observations,
+            cancellation: Default::default(),
+            liveness: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn with_cancellation(
+        mut self,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
+    fn keeps_live_fact(
+        &self,
+        target: &crate::analyzer::semantic::ProgramPointHandle,
+        fact: TaintFact,
+    ) -> bool {
+        use crate::analyzer::semantic::cfg_algorithms::{
+            CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, live_values,
+            value_liveness_facts,
+        };
+        use crate::analyzer::semantic::{CaptureSource, SemanticEffect, SemanticValueKind};
+        use crate::value_flow::ValueFlowCarrier;
+        let TaintFactKind::Carrier { carrier, .. } = fact.0 else {
+            return true;
+        };
+        let Some(ValueFlowCarrier::Value(value)) = self.plan.value_flow().carrier(carrier) else {
+            return true;
+        };
+        let procedure = target.procedure();
+        let semantics = procedure.semantics();
+        if value.procedure() != procedure
+            || target.id() == semantics.exceptional_exit_point()
+            || self.cancellation.is_cancelled()
+        {
+            return true;
+        }
+        // live-in(q) is the may-union over all successors, including exceptional
+        // edges: drop a value only when no path from q reads it. Summary/open-call
+        // transfer runs before this filter, so its result exists at q and is
+        // judged by its own liveness; argument temporaries consumed at p can go.
+        // Callee exit facts (parameters, receiver, heap, return) are never killable.
+        // Unavailable liveness means everything live, including budget/cancellation
+        // and incomplete semantics. Location and Port carriers are never killed.
+        let mut cache = self.liveness.borrow_mut();
+        let liveness = cache.entry(procedure.clone()).or_insert_with(|| {
+            if !self.plan.value_flow().procedure_flow_is_complete(procedure) {
+                return None;
+            }
+            // classify_snapshot_openness admits only call-target gaps for
+            // Refinable snapshots; Complete snapshots have no remaining gaps.
+            // The eligibility predicate above therefore guarantees Gap effects
+            // cannot hide local operands. Rely on it instead of rescanning all
+            // procedure effects here.
+            // A flat per-procedure cap, independent of the request's remaining budget.
+            const PROCEDURE_LIVENESS_BUDGET: usize = 1_000_000;
+            let mut budget = CfgAlgorithmBudget::uniform(PROCEDURE_LIVENESS_BUDGET);
+            let mut request = CfgAlgorithmRequest::new(&mut budget, &self.cancellation);
+            let computed = value_liveness_facts(semantics, &mut request).and_then(|mut facts| {
+                // A query can read a value at a point where the IR itself does
+                // not: an authored transfer may consume an argument at the
+                // continuation, and a sink can observe a value at procedure
+                // exit. These are uses at their exact query points, not reasons
+                // to retain the carrier for the remainder of the procedure.
+                let mut record_use = |point: crate::analyzer::semantic::ProgramPointId,
+                                      carrier: ValueFlowCarrierId,
+                                      request: &mut CfgAlgorithmRequest<'_>|
+                 -> Result<
+                    (),
+                    CfgAlgorithmError<crate::analyzer::semantic::ProgramPointId>,
+                > {
+                    request.visit_node()?;
+                    if let Some(ValueFlowCarrier::Value(value)) =
+                        self.plan.value_flow().carrier(carrier)
+                        && value.procedure() == procedure
+                    {
+                        facts.record_generated(point.index(), value.id().index());
+                    }
+                    Ok(())
+                };
+                for point in semantics.points() {
+                    request.visit_node()?;
+                    let handle = procedure.point_handle(point.id).expect("validated point");
+                    let uses = self
+                        .plan
+                        .value_flow()
+                        .local_rule_views(&handle)
+                        .map(|rule| rule.source)
+                        .chain(
+                            [
+                                ValueFlowObservationPhase::BeforeEffects,
+                                ValueFlowObservationPhase::AfterEffects,
+                            ]
+                            .into_iter()
+                            .flat_map(|phase| {
+                                self.plan
+                                    .value_flow()
+                                    .sink_bindings_at(&handle, phase)
+                                    .map(|(_, carrier)| carrier)
+                            }),
+                        );
+                    for carrier in uses {
+                        record_use(point.id, carrier, &mut request)?;
+                    }
+                }
+                for (point, carrier) in self
+                    .plan
+                    .transforms()
+                    .iter()
+                    .map(|binding| (binding.point(), binding.carrier()))
+                    .chain(
+                        self.plan
+                            .sanitizers()
+                            .iter()
+                            .map(|binding| (binding.point(), binding.carrier())),
+                    )
+                    .filter(|(point, _)| point.procedure() == procedure)
+                {
+                    record_use(point.id(), carrier, &mut request)?;
+                }
+                live_values(semantics, &facts, &mut request)
+            });
+            let live = match computed {
+                Ok(live) => live,
+                Err(CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::Cancelled { .. }) => {
+                    return None;
+                }
+                Err(CfgAlgorithmError::InvalidNode(node)) => {
+                    panic!("validated CFG contains invalid node {node:?}")
+                }
+            };
+            let mut retained = vec![false; semantics.values().len()];
+            for value in semantics.values() {
+                retained[value.id.index()] = matches!(
+                    value.kind,
+                    SemanticValueKind::Parameter { .. }
+                        | SemanticValueKind::Receiver { .. }
+                        | SemanticValueKind::Return
+                        | SemanticValueKind::Exception
+                );
+            }
+            for point in semantics.points() {
+                for event in &point.events {
+                    if let SemanticEffect::ProcedureReturn { value: Some(value) }
+                    | SemanticEffect::Throw { value: Some(value) } = event.effect
+                    {
+                        retained[value.index()] = true;
+                    }
+                }
+            }
+            for call in semantics.call_sites() {
+                if let Some(thrown) = call.thrown {
+                    retained[thrown.index()] = true;
+                }
+            }
+            for capture in semantics.captures() {
+                retained[capture.callable.index()] = true;
+                match capture.captured {
+                    CaptureSource::Value(value) => retained[value.index()] = true,
+                    CaptureSource::Location(location) => {
+                        let location = semantics
+                            .memory_location(location)
+                            .expect("validated capture location");
+                        for value in semantics.values() {
+                            retained[value.id.index()] |= location.kind.uses_value(value.id);
+                        }
+                    }
+                }
+            }
+            Some(ProcedureValueLiveness { live, retained })
+        });
+        ProcedureValueLiveness::retains(liveness.as_ref(), target.id().index(), value.id().index())
     }
 
     fn observe(
@@ -1248,7 +1465,11 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
             .into_iter()
             .filter_map(|(fact, function, evidence)| {
                 self.observations.emitted(fact, &function, &evidence);
-                (fact == output_fact).then_some(function)
+                (fact == output_fact
+                    && step
+                        .target()
+                        .is_none_or(|target| self.keeps_live_fact(target, fact)))
+                .then_some(function)
             })
             .collect()
     }
@@ -1668,7 +1889,12 @@ impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hoo
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
-        self.ordinary_edge_flow(edge, fact, out);
+        let mut filtered = LiveTaintOutput {
+            problem: self,
+            target: edge.target(),
+            output: out,
+        };
+        self.ordinary_edge_flow(edge, fact, &mut filtered);
     }
 
     fn call_flow(
@@ -1677,7 +1903,12 @@ impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hoo
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
-        self.call_flow(edge, fact, out);
+        let mut filtered = LiveTaintOutput {
+            problem: self,
+            target: edge.target(),
+            output: out,
+        };
+        self.call_flow(edge, fact, &mut filtered);
     }
 
     fn return_flow(
@@ -1686,7 +1917,12 @@ impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hoo
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
-        self.return_flow(edge, fact, out);
+        let mut filtered = LiveTaintOutput {
+            problem: self,
+            target: edge.target(),
+            output: out,
+        };
+        self.return_flow(edge, fact, &mut filtered);
     }
 
     fn call_to_return_flow(
@@ -1695,7 +1931,12 @@ impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hoo
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
-        self.boundary_flow(edge, fact, out);
+        let mut filtered = LiveTaintOutput {
+            problem: self,
+            target: edge.target(),
+            output: out,
+        };
+        self.boundary_flow(edge, fact, &mut filtered);
     }
 
     fn exceptional_flow(
@@ -1704,7 +1945,12 @@ impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hoo
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
-        self.ordinary_edge_flow(edge, fact, out);
+        let mut filtered = LiveTaintOutput {
+            problem: self,
+            target: edge.target(),
+            output: out,
+        };
+        self.ordinary_edge_flow(edge, fact, &mut filtered);
     }
 }
 
@@ -2956,7 +3202,7 @@ where
         return Err(TaintSolveError::RootMismatch);
     }
     let input = IdeSummarySolveInput::new(root, &[]).with_witness_retention(witness_retention);
-    let problem = TaintFlowProblem::new(plan);
+    let problem = TaintFlowProblem::new(plan).with_cancellation(request.cancellation);
     let result = if plan.value_flow().has_contextual_bindings() {
         solve_ide_with_summaries_with_call_context(
             input,
@@ -2995,7 +3241,7 @@ where
         return Err(TaintSolveError::RootMismatch);
     }
     let input = IdeSummarySolveInput::new(root, &[]).with_witness_retention(witness_retention);
-    let problem = TaintFlowProblem::new(plan);
+    let problem = TaintFlowProblem::new(plan).with_cancellation(request.cancellation);
     let result = if plan.value_flow().has_contextual_bindings() {
         solve_ide_with_reusable_summaries_with_call_context(
             input,
@@ -3075,3 +3321,50 @@ impl From<BackwardSnapshotDataflowError> for TaintSolveError {
         Self::Backward(error)
     }
 }
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::ProcedureValueLiveness;
+    use crate::analyzer::semantic::cfg_algorithms::{
+        CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, DenseUsizeGraph, GenKillFacts,
+        live_values,
+    };
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    #[test]
+    fn exhausted_liveness_budget_keeps_every_value() {
+        let graph = DenseUsizeGraph::new(2, [(0, 1)]);
+        let mut facts = GenKillFacts::new(2, 2);
+        facts.record_generated(1, 0);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(0);
+        let computed = live_values(
+            &graph,
+            &facts,
+            &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+        );
+        assert!(matches!(
+            computed,
+            Err(CfgAlgorithmError::ExceededBudget(_))
+        ));
+        let unavailable = match computed {
+            Ok(live) => Some(ProcedureValueLiveness {
+                live,
+                retained: vec![false; 2],
+            }),
+            Err(CfgAlgorithmError::ExceededBudget(_)) => None,
+            other => panic!("expected budget exhaustion: {other:?}"),
+        };
+        for value in 0..2 {
+            assert!(ProcedureValueLiveness::retains(
+                unavailable.as_ref(),
+                0,
+                value
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "edge_relations.rs"]
+mod edge_relations;

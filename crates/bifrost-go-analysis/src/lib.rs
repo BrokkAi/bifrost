@@ -1,5 +1,28 @@
 pub mod analyzer {
     pub mod go;
+
+    #[cfg(test)]
+    pub(crate) fn prepared_go_test_syntax(
+        source: &str,
+        tree: tree_sitter::Tree,
+    ) -> brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree {
+        use std::sync::Arc;
+
+        use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
+        use brokk_bifrost_core::analyzer::prepared_syntax::{
+            PreparedSourceOrigin, PreparedSyntaxSource, PreparedSyntaxTree,
+        };
+
+        PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            brokk_bifrost_core::text_utils::compute_line_starts(source),
+            LanguageDialect::Standard(Language::Go),
+            PreparedSourceOrigin::Disk,
+            None,
+        )
+    }
+
     pub use go::GoArtifactCallableTarget;
     pub use go::build_evidence::{
         GoBuildSnapshot, collect_go_build_evidence, go_build_project, go_build_workspace,

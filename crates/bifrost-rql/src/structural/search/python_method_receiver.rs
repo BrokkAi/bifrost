@@ -49,6 +49,7 @@ pub(super) fn receiver_evidence(
         return PythonMethodReceiverEvidence::default();
     };
     let Ok(tree) = environment_cache.python_syntax_tree_for(
+        analyzer,
         declaration.unit.source(),
         ContentIdentity::hash_bytes(source.as_bytes()),
         &source,

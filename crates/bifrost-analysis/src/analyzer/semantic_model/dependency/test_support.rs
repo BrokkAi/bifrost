@@ -2,10 +2,8 @@ use super::*;
 use crate::analyzer::semantic_model::{
     artifact::CompiledSemanticModelPack,
     catalog::{DurablePackSource, DurablePackSourceKind, SemanticPackCatalog},
-    compiler::{CompilerOptions, compile_source},
     model::Producer,
     producer::ArtifactProducerLimits,
-    source::SourceFormat,
 };
 use std::sync::Mutex;
 
@@ -106,12 +104,7 @@ fn recording_hook(
 
 #[doc(hidden)]
 pub fn compiled_pack(source: &str) -> CompiledSemanticModelPack {
-    compile_source(
-        SourceFormat::Json,
-        source.as_bytes(),
-        &CompilerOptions::default(),
-    )
-    .unwrap_or_else(|diagnostics| panic!("fixture compilation failed: {diagnostics:#?}"))
+    crate::test_support::compile_semantic_pack_fixture(source)
 }
 
 #[doc(hidden)]

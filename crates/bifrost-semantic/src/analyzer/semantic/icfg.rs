@@ -174,8 +174,27 @@ pub const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #7849: Java observed value types name selected external owners such as java.nio.file.Path.
 // #7509 M3a part 2: Go failure-handler binding proofs come from native
 // binder selection and declared slots, so handler shapes change for unchanged bytes.
+// Quicksilver round 13: Go non-return discovery admits method expressions that
+// write the receiver as an argument, so flow-state control changes for unchanged bytes.
+// #7918: Go field selections through addressable or pointer receivers admit
+// pointer-receiver methods, so receiver and call answers change for unchanged bytes.
+// #7915: flow carrier comparison follows the carrier key, so plans that held one
+// slot both plain and substituted now build instead of refusing.
+// #7803: external field values share declared type materialization with call results.
+// #7779: exact owner-declared calls close open external member inventories.
+// #7509 PR B: native Go model-owner selection changes receiver and call answers.
+// #7868: settled roots publish readable incomplete relations without stopping siblings.
+// #7876: incomplete cache builds must not replay stale finding-free persisted results.
+// #7509: source contexts resolve module-less relative Go imports.
+// Quicksilver round 13 value_flow: caller-origin walks keep every alias path's
+// evidence deficit, so type-flow call-location certainty changes for unchanged bytes.
+// #7351: Go failure handlers decide error values and non-handlers by native method sets.
+// #7886: native call evidence propagates nested budget and cancellation stops.
+// #8036: retain native Go declared external receiver call identities.
+// #7968: Go interface satisfaction decides members by the shared membership rule.
+// #7509 G1b-1: native Go owners behind incomplete imports replace the legacy receiver answer.
 pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v100";
+    b"bifrost-icfg-provider/workspace-behavior/v149";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
@@ -194,8 +213,22 @@ pub const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
 // #7789: read identities also invalidate JVM import destinations.
 // #7849: read identities also invalidate Java guard proofs over external-owner carriers.
 // #7509 M3a part 2: rotate read-side reuse with the native Go binding proofs.
+// Quicksilver round 13: rotate read-side reuse with Go method-expression non-return discovery.
+// #7918: rotate read-side reuse with Go field selector addressability.
+// #7915: rotate read-side reuse with the flow carrier comparison.
+// #7779: invalidate read-side reuse for exact owner inventory proofs.
+// #7509 PR B: rotate read-side reuse with native Go model-owner selection.
+// #7868: forward and reverse reads retain settled-root evidence.
+// #7876: invalidate read-side reuse for incomplete cache builds.
+// #7509: rotate read-side reuse with relative Go source imports.
+// Quicksilver round 13 value_flow: rotate read-side reuse with caller-origin evidence.
+// #7351: rotate read-side reuse with native Go method-set failure-handler proofs.
+// #7886: read reuse follows native nested budget and cancellation propagation.
+// #8036: invalidate reads for native Go external receiver call identities.
+// #7968: rotate read-side reuse with shared Go satisfaction membership.
+// #7509 G1b-1: rotate read-side reuse with native owners behind incomplete Go imports.
 pub const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v99";
+    b"bifrost-icfg-provider/workspace-read-behavior/v148";
 
 #[cfg(test)]
 mod domain_tests {
